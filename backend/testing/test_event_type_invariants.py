@@ -135,6 +135,41 @@ def test_all_snapshot_entries_have_audience():
         )
 
 
+def test_snapshot_audience_matches_runtime_registry():
+    """Every snapshot entry's ``audience`` must match the live ``route_event`` registry.
+
+    The snapshot is the ledger-side declaration; ``message_audience._EVENT_AUDIENCE_REGISTRY``
+    is the runtime resolver. If they drift — e.g. someone edits the registry without updating
+    the snapshot or vice-versa — an event type would resolve to a different audience at
+    runtime than the one declared in the snapshot, silently leaking internal notices to
+    the operator or suppressing operator-visible items.
+    """
+    import importlib
+
+    snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
+    with open(snapshot_path) as f:
+        snapshot = json.load(f)
+
+    ma = importlib.import_module("app.message_audience")
+
+    mismatches: list[str] = []
+    for entry in snapshot["event_types"]:
+        name = entry["name"]
+        expected_audience = entry["audience"]
+        actual_audience = ma.route_event(name)
+        if actual_audience != expected_audience:
+            mismatches.append(
+                f"  {name!r}: snapshot={expected_audience!r}, registry={actual_audience!r}"
+            )
+
+    assert not mismatches, (
+        "Snapshot audience does not match runtime registry for:\n"
+        + "\n".join(mismatches)
+        + "\n\n→ Update either event_type_snapshot.json or message_audience._EVENT_AUDIENCE_REGISTRY"
+        " so they agree."
+    )
+
+
 def test_high_signal_note_set_matches_snapshot():
     """Cross-layer invariant: HIGH_SIGNAL_NOTE_EVENT_TYPES must equal the snapshot's
     high_signal NOTE entries — in both notification_dispatch and admin_notifications.

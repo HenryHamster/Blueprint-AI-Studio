@@ -36,7 +36,8 @@ import shutil
 import signal
 import subprocess
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 
 # ── Task classes / backends ──────────────────────────────────────────────────
 
@@ -179,6 +180,10 @@ class Capabilities:
     # Daemon accepts CDI GPU devices (--device nvidia.com/gpu=N). Rootless/CDI
     # daemons reject the legacy --gpus flag, so the argv builder keys on this.
     docker_cdi_gpu: bool = False
+    # Functional proof produced by launching nvidia-smi through the exact
+    # selected runtime/flag path used by compute jobs.  Presence of a runtime or
+    # a host GPU is deliberately not proof that the two work together.
+    container_gpu_passthrough: dict = field(default_factory=dict)
     podman_usable: bool = False
     apptainer_path: str | None = None
     enroot_path: str | None = None
@@ -207,7 +212,6 @@ class Capabilities:
             self.docker_usable
             or self.podman_usable
             or bool(self.apptainer_path)
-            or bool(self.enroot_path)
         )
 
     def preferred_container(self) -> str | None:
@@ -218,8 +222,6 @@ class Capabilities:
             return BACKEND_PODMAN
         if self.apptainer_path:
             return BACKEND_APPTAINER
-        if self.enroot_path:
-            return BACKEND_ENROOT
         return None
 
 
@@ -328,6 +330,137 @@ def probe_docker_cdi_gpu(binary: str = "docker") -> bool:
             except OSError:
                 continue
     return False
+
+
+_GPU_PROBE_IMAGE = "nvidia/cuda:12.6.3-base-ubuntu24.04"
+_GPU_PROBE_IMAGE_ENV = "BLUEPRINT_RUNNER_GPU_PROBE_IMAGE"
+
+
+def _gpu_probe_image(image: str | None = None) -> str:
+    """Return an explicitly supplied or operator-configured probe image.
+
+    The default public CUDA image remains useful for a stock runner.  Runners
+    behind a registry egress policy can instead configure a project image they
+    can already pull (and which includes ``nvidia-smi``).  Resolve this at each
+    probe rather than at import/startup so a transient failed proof can recover
+    after an operator changes the runner service configuration.
+    """
+    if image:
+        return image
+    return os.environ.get(_GPU_PROBE_IMAGE_ENV, "").strip() or _GPU_PROBE_IMAGE
+
+
+def probe_container_gpu_passthrough(
+    caps: Capabilities,
+    *,
+    image: str | None = None,
+    timeout: int = 45,
+) -> dict[str, dict[str, object]]:
+    """Functionally verify GPU passthrough for the selected container runtime.
+
+    The probe uses the same argv builders and GPU flag mode as a real compute
+    job, is bounded, and forwards no runner/orchestrator credentials.  It uses
+    an explicit image or ``BLUEPRINT_RUNNER_GPU_PROBE_IMAGE`` when configured,
+    allowing registry-restricted runners to prove their project image path.
+    Only the preferred runtime is probed because that is the runtime the job
+    planner will actually execute.  A missing GPU, timeout, launch error, empty
+    GPU listing, or non-zero result is explicit negative evidence rather than
+    inferred capability.
+    """
+    runtime = caps.preferred_container()
+    if runtime is None:
+        return {}
+    mode = "cdi" if runtime == BACKEND_DOCKER and caps.docker_cdi_gpu else (
+        "nv" if runtime == BACKEND_APPTAINER else "hook"
+    )
+    if not caps.gpu_indices:
+        return {runtime: {"verified": False, "mode": mode, "reason": "no_host_gpu"}}
+    image = _gpu_probe_image(image)
+    # This probe runs before stale-container recovery.  Make its name unique to
+    # this daemon invocation so a probe left by a crashed predecessor cannot
+    # turn a name collision into negative capability evidence for this process.
+    probe_container_name = (
+        f"bp-gpu-passthrough-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        if runtime in (BACKEND_DOCKER, BACKEND_PODMAN)
+        else None
+    )
+    client_env = {
+        key: value
+        for key in (
+            "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG",
+            "DOCKER_CERT_PATH", "DOCKER_TLS_VERIFY", "XDG_RUNTIME_DIR",
+        )
+        if (value := os.environ.get(key))
+    }
+    try:
+        if runtime in (BACKEND_DOCKER, BACKEND_PODMAN):
+            argv = build_docker_argv(
+                image=image,
+                command="nvidia-smi -L",
+                container_name=probe_container_name,
+                gpu_indices=[caps.gpu_indices[0]],
+                binds=[],
+                env_keys=[],
+                cwd=None,
+                runtime=runtime,
+                gpu_cdi=(runtime == BACKEND_DOCKER and caps.docker_cdi_gpu),
+            )
+        elif runtime == BACKEND_APPTAINER and caps.apptainer_path:
+            argv = build_apptainer_argv(
+                apptainer_path=caps.apptainer_path,
+                image=image,
+                command="nvidia-smi -L",
+                gpu=True,
+                binds=[],
+                cwd=None,
+            )
+        else:
+            return {runtime: {"verified": False, "mode": mode, "reason": "unsupported_runtime"}}
+        completed = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=client_env,
+        )
+    except subprocess.TimeoutExpired:
+        _force_remove_container(runtime, probe_container_name, client_env)
+        return {runtime: {"verified": False, "mode": mode, "reason": "probe_timeout"}}
+    except (OSError, subprocess.SubprocessError):
+        return {runtime: {"verified": False, "mode": mode, "reason": "probe_launch_failed"}}
+    verified = completed.returncode == 0 and "GPU " in (completed.stdout or "")
+    if verified:
+        reason = "verified"
+    elif completed.returncode == 0:
+        reason = "no_gpu_visible"
+    else:
+        reason = f"probe_exit_{completed.returncode}"
+    return {runtime: {"verified": verified, "mode": mode, "reason": reason}}
+
+
+def container_gpu_passthrough_needs_retry(caps: Capabilities) -> bool:
+    """Return whether a failed container GPU proof may recover without restart.
+
+    A missing host GPU is stable for this daemon's detected hardware snapshot;
+    retrying it just burns a container launch on every heartbeat. Runtime launch,
+    pull, and hook failures are deliberately retried because those depend on
+    recoverable container-store and registry state.
+    """
+    runtime = caps.preferred_container()
+    if runtime is None:
+        return False
+    report = caps.container_gpu_passthrough.get(runtime)
+    if not isinstance(report, dict) or report.get("verified") is True:
+        return False
+    return report.get("reason") not in {"no_host_gpu", "unsupported_runtime"}
+
+
+def refresh_container_gpu_passthrough(caps: Capabilities) -> Capabilities:
+    """Re-probe only the cached container GPU proof, preserving host capability facts."""
+    return replace(
+        caps,
+        container_gpu_passthrough=probe_container_gpu_passthrough(caps),
+    )
 
 
 def probe_systemd_run() -> str | None:
@@ -455,7 +588,7 @@ def probe_llm_clis(*, env: dict[str, str] | None = None) -> dict[str, dict]:
     for name in _LLM_CLI_NAMES:
         path = _which(name)
         executable_found = path is not None
-        if not executable_found:
+        if path is None:
             result[name] = _unavailable_llm_cli("not_found")
             continue
         try:
@@ -548,7 +681,10 @@ def detect_capabilities() -> Capabilities:
     docker_cdi_gpu = probe_docker_cdi_gpu() if docker_usable else False
     podman_usable = probe_container_runtime_usable("podman")
     apptainer_path = _which("apptainer") or _which("singularity")
-    enroot_path = _which("enroot")
+    # Enroot is intentionally not advertised: the execution planner has no real
+    # Enroot argv path.  Treating binary presence as support routed it through
+    # Apptainer and could crash before launch.
+    enroot_path = None
     systemd_run_path = probe_systemd_run()
     gpu_indices, gpu_names = detect_gpus()
 
@@ -558,7 +694,7 @@ def detect_capabilities() -> Capabilities:
     if bwrap_path and not userns_ok:
         notes.append("bwrap present but unprivileged userns unavailable — bwrap unusable")
 
-    return Capabilities(
+    caps = Capabilities(
         bwrap_path=bwrap_path,
         unshare_path=unshare_path,
         userns_ok=userns_ok,
@@ -571,6 +707,10 @@ def detect_capabilities() -> Capabilities:
         gpu_indices=gpu_indices,
         gpu_names=gpu_names,
         notes=tuple(notes),
+    )
+    return replace(
+        caps,
+        container_gpu_passthrough=probe_container_gpu_passthrough(caps),
     )
 
 
@@ -758,7 +898,7 @@ def capabilities_inventory(caps: Capabilities) -> dict[str, bool]:
         "docker_cdi_gpu": caps.docker_cdi_gpu,
         "podman_usable": caps.podman_usable,
         "apptainer_ok": bool(caps.apptainer_path),
-        "enroot_ok": bool(caps.enroot_path),
+        "enroot_ok": False,
         "systemd_run_ok": bool(caps.systemd_run_path),
     }
 
@@ -1700,8 +1840,8 @@ def plan_compute_execution(
             container_name=container_name, gpu_indices=list(gpu_indices),
         )
 
-    # ---- apptainer / enroot (image, HPC-style) -------------------------------
-    if backend in (BACKEND_APPTAINER, BACKEND_ENROOT):
+    # ---- apptainer (image, HPC-style) ----------------------------------------
+    if backend == BACKEND_APPTAINER:
         assert caps.apptainer_path is not None
         result_in = _rel_to_sandbox(result_file_host, workspace_host, "/workspace")
         artifacts_in = _rel_to_sandbox(artifact_dir_host, workspace_host, "/workspace")

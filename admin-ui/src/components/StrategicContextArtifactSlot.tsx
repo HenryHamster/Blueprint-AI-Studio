@@ -748,13 +748,14 @@ function DescriptorCard({
 
       {/* Omitted-files warning for compute-artifact media previews — mirrors
           ComputeJobsPanel's wording and amber styling. Visible when any files
-          were dropped from the preview set (capped at 25 / 8 MiB each). */}
+          were dropped from the preview set (capped at 25 files; 8 MiB/image,
+          512 MiB/video). */}
       {(descriptor.kind === 'image' || descriptor.kind === 'video' || descriptor.kind === 'pdf' || descriptor.image || descriptor.video || descriptor.pdf || (descriptor.images?.length ?? 0) > 0 || (descriptor.videos?.length ?? 0) > 0 || (descriptor.pdfs?.length ?? 0) > 0) && descriptor.viewable_files_dropped != null && descriptor.viewable_files_dropped > 0 && (
         <div
           className="mt-2 text-ui-xs text-amber-400/90 font-mono"
           data-testid="strategic-artifact-omitted-note"
         >
-          {`${descriptor.viewable_files_dropped} file${descriptor.viewable_files_dropped === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+          {`${descriptor.viewable_files_dropped} file${descriptor.viewable_files_dropped === 1 ? '' : 's'} omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)`}
         </div>
       )}
 

@@ -43,6 +43,7 @@ from app.models import (
 from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
 from app.message_audience import (
     OPERATOR_ACTION_NEEDED,
+    operator_visible_alert_filter,
     operator_visible_audience_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
@@ -1958,6 +1959,7 @@ async def get_operator_message_counts(
                     Alert.project_id == project_id,
                     Alert.dismissed_at.is_(None),
                     Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                    operator_visible_alert_filter(Alert.event_type),
                 )
             )
         ).scalar()
@@ -2327,6 +2329,7 @@ async def build_operator_attention(
                 Alert.project_id == project.id,
                 Alert.dismissed_at.is_(None),
                 Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                operator_visible_alert_filter(Alert.event_type),
             ).group_by(Alert.severity)
         )
     ).all()
@@ -2398,6 +2401,7 @@ async def build_operator_attention(
     _alert_base_filters = (
         Alert.project_id == project.id,
         Alert.dismissed_at.is_(None),
+        operator_visible_alert_filter(Alert.event_type),
     )
     combined_alerts = list(
         (

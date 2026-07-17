@@ -649,6 +649,8 @@ def test_viewable_artifacts_descriptor_sanitizes_manifest():
         "content_type": "image/png",
         "size_bytes": 128,
         "kind": "image",
+        "revision": None,
+        "live": None,
     }
     assert out[1] == {
         "filename": None,
@@ -656,6 +658,8 @@ def test_viewable_artifacts_descriptor_sanitizes_manifest():
         "content_type": None,
         "size_bytes": None,
         "kind": None,
+        "revision": None,
+        "live": None,
     }
 
 

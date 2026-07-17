@@ -545,7 +545,15 @@ async def _discover_manifest_tools(
                 "[project-tools] No read token for %s/%s — cannot fetch manifest",
                 owner, repo_name,
             )
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+            # This is not equivalent to a repository with no manifest: callers
+            # that make retention decisions must preserve existing protection
+            # until a later read can establish whether an image is declared.
+            result = {
+                "tools": [],
+                "skills": [],
+                "compute": {"image": None},
+                "error": "Repository read token unavailable; manifest could not be fetched",
+            }
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 

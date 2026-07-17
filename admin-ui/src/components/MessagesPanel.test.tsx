@@ -40,6 +40,7 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 import { apiFetch } from '../api';
+import * as apiModule from '../api';
 
 // jsdom does not implement scrollIntoView; several panel actions invoke it
 // (summary card → routine section scroll, showOnlyNew → scroll to first new
@@ -7886,6 +7887,215 @@ describe('MessagesPanel convert-to-direction modal', () => {
 
     // Modal should be closed
     expect(el.querySelector('[role="dialog"]')).toBeNull();
+  });
+});
+
+describe('MessagesPanel confirmation chip actionability', () => {
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
+  afterEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
+
+  function makeConfirmationStrategicState(confirmationId = 'confirm-1', projectId = 'proj-1'): StrategicStateResponse {
+    return makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 confirmation needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1,
+          watch: 0,
+          unread: 0,
+          questions: 0,
+          blockers: 0,
+          approvals: 1,
+          manual_directions: 0,
+          failed_tasks: 0,
+          blocked_tasks: 0,
+          parked_tasks: 0,
+        },
+        items: [
+          {
+            id: `confirmation:${confirmationId}`,
+            kind: 'confirmation',
+            severity: 'needs_operator',
+            reason: 'approval_needed',
+            label: 'Confirm deployment plan',
+            ref: { kind: 'pending_confirmation', id: confirmationId, project_id: projectId },
+          },
+        ],
+      },
+    });
+  }
+
+  function setupConvMock(): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+        }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+  }
+
+  test('confirmation chip in needs-action strip is clickable and expands accept/dismiss affordance', async () => {
+    setupConvMock();
+    vi.spyOn(apiModule, 'acceptPendingConfirmation').mockResolvedValue({ status: 'accepted', type: 'plan' });
+    vi.spyOn(apiModule, 'dismissPendingConfirmation').mockResolvedValue(undefined);
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={makeConfirmationStrategicState()}
+      />,
+    );
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[data-testid="needs-action-strip"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    // The confirmation chip button should not be disabled
+    const chip = [...strip.querySelectorAll('button')].find(b => b.textContent?.includes('Confirm deployment plan'));
+    expect(chip).toBeTruthy();
+    expect(chip!.disabled).toBe(false);
+
+    // Before clicking, the inline actions should not be visible
+    expect(container.querySelector('[data-testid="confirmation-chip-actions"]')).toBeNull();
+
+    // Click the chip to expand inline actions
+    fireEvent.click(chip!);
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="confirmation-chip-actions"]')).toBeTruthy();
+    });
+    expect(container.querySelector('[data-testid="confirmation-accept-btn"]')).toBeTruthy();
+    expect(container.querySelector('[data-testid="confirmation-dismiss-btn"]')).toBeTruthy();
+  });
+
+  test('clicking Accept calls acceptPendingConfirmation with correct project and pending id, then hides chip', async () => {
+    setupConvMock();
+    const acceptSpy = vi.spyOn(apiModule, 'acceptPendingConfirmation').mockResolvedValue({ status: 'accepted', type: 'plan' });
+    vi.spyOn(apiModule, 'dismissPendingConfirmation').mockResolvedValue(undefined);
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const onStrategicStateRefresh = vi.fn();
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={makeConfirmationStrategicState('confirm-42', 'proj-1')}
+        onStrategicStateRefresh={onStrategicStateRefresh}
+      />,
+    );
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[data-testid="needs-action-strip"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    const chip = [...strip.querySelectorAll('button')].find(b => b.textContent?.includes('Confirm deployment plan'));
+    expect(chip).toBeTruthy();
+    fireEvent.click(chip!);
+    await waitFor(() => expect(container.querySelector('[data-testid="confirmation-accept-btn"]')).toBeTruthy());
+
+    fireEvent.click(container.querySelector('[data-testid="confirmation-accept-btn"]')!);
+
+    // acceptPendingConfirmation must be called with the correct project and pending ids
+    await waitFor(() => {
+      expect(acceptSpy).toHaveBeenCalledWith('proj-1', 'confirm-42');
+    });
+
+    // The chip should be removed from the strip after acceptance
+    await waitFor(() => {
+      const chipAfter = [...(container.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])].find(b => b.textContent?.includes('Confirm deployment plan'));
+      expect(chipAfter).toBeUndefined();
+    });
+
+    expect(onStrategicStateRefresh).toHaveBeenCalled();
+  });
+
+  test('clicking Dismiss calls dismissPendingConfirmation and removes chip from strip', async () => {
+    setupConvMock();
+    vi.spyOn(apiModule, 'acceptPendingConfirmation').mockResolvedValue({ status: 'accepted', type: 'plan' });
+    const dismissSpy = vi.spyOn(apiModule, 'dismissPendingConfirmation').mockResolvedValue(undefined);
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={makeConfirmationStrategicState('confirm-99', 'proj-1')}
+      />,
+    );
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[data-testid="needs-action-strip"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    const chip = [...strip.querySelectorAll('button')].find(b => b.textContent?.includes('Confirm deployment plan'));
+    expect(chip).toBeTruthy();
+    fireEvent.click(chip!);
+    await waitFor(() => expect(container.querySelector('[data-testid="confirmation-dismiss-btn"]')).toBeTruthy());
+
+    fireEvent.click(container.querySelector('[data-testid="confirmation-dismiss-btn"]')!);
+
+    await waitFor(() => {
+      expect(dismissSpy).toHaveBeenCalledWith('proj-1', 'confirm-99');
+    });
+
+    await waitFor(() => {
+      const chipAfter = [...(container.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])].find(b => b.textContent?.includes('Confirm deployment plan'));
+      expect(chipAfter).toBeUndefined();
+    });
+  });
+
+  test('accept API failure shows error toast and keeps chip visible', async () => {
+    setupConvMock();
+    vi.spyOn(apiModule, 'acceptPendingConfirmation').mockRejectedValue(new Error('server error'));
+    vi.spyOn(apiModule, 'dismissPendingConfirmation').mockResolvedValue(undefined);
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const addToast = vi.fn();
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={addToast}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={makeConfirmationStrategicState('confirm-err', 'proj-1')}
+      />,
+    );
+    const strip = await waitFor(() => {
+      const el = container.querySelector('[data-testid="needs-action-strip"]');
+      expect(el).toBeTruthy();
+      return el as HTMLElement;
+    });
+    const chip = [...strip.querySelectorAll('button')].find(b => b.textContent?.includes('Confirm deployment plan'));
+    fireEvent.click(chip!);
+    await waitFor(() => expect(container.querySelector('[data-testid="confirmation-accept-btn"]')).toBeTruthy());
+
+    fireEvent.click(container.querySelector('[data-testid="confirmation-accept-btn"]')!);
+
+    await waitFor(() => {
+      expect(addToast).toHaveBeenCalledWith('Failed to accept — try again', 'error');
+    });
+    // Chip must still be visible — it was not removed on failure
+    const chipAfter = [...(container.querySelector('[data-testid="needs-action-strip"]')?.querySelectorAll('button') ?? [])].find(b => b.textContent?.includes('Confirm deployment plan'));
+    expect(chipAfter).toBeTruthy();
   });
 });
 

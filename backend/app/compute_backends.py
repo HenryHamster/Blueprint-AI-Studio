@@ -154,7 +154,7 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
                 member.name,
             )
             continue
-        tar.extract(member, path=dest_dir)
+        tar.extract(member, path=dest_dir, filter="data")
         extracted += 1
     return extracted
 
@@ -210,8 +210,8 @@ async def _rehydrate_input_artifact_bundle(
     handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
     os.close(handle)
     staging_dir = f"{dest_dir}.resume-staging"
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    os.makedirs(staging_dir, exist_ok=True)
+    await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+    await asyncio.to_thread(lambda: os.makedirs(staging_dir, exist_ok=True))
     try:
         try:
             downloaded = await asyncio.to_thread(
@@ -242,8 +242,8 @@ async def _rehydrate_input_artifact_bundle(
                 f"{input_artifact_job_id} contained no checkpoint files"
             )
         try:
-            shutil.rmtree(dest_dir, ignore_errors=True)
-            os.replace(staging_dir, dest_dir)
+            await asyncio.to_thread(shutil.rmtree, dest_dir, True)
+            await asyncio.to_thread(os.replace, staging_dir, dest_dir)
         except OSError as exc:
             raise RuntimeError(
                 "input_artifact_rehydration_failed: extracted checkpoint could not "
@@ -252,11 +252,11 @@ async def _rehydrate_input_artifact_bundle(
         return file_count
     finally:
         try:
-            os.unlink(tmp_path)
+            await asyncio.to_thread(os.unlink, tmp_path)
         except OSError:
             pass
-        if os.path.exists(staging_dir):
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if await asyncio.to_thread(os.path.exists, staging_dir):
+            await asyncio.to_thread(shutil.rmtree, staging_dir, True)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="

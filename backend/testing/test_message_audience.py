@@ -23,10 +23,12 @@ from app.message_audience import (
     STRATEGIST_INTERNAL,
     PIPELINE_LOG,
     get_logical_event_pairs,
+    get_non_operator_event_types,
     get_operator_visible_webhook_events,
     get_registered_event_types,
     is_external_webhook_operator_visible,
     is_operator_visible,
+    operator_visible_alert_filter,
     route_event,
     route_external_webhook_event,
     stamp_message_audience,
@@ -223,6 +225,56 @@ def test_runner_health_alert_event_constants_are_registered():
         "Runner health alert event types missing from the audience registry: "
         + ", ".join(sorted(missing))
     )
+
+
+# ── Alert read-model audience filter (operator_visible_alert_filter) ─────
+
+
+def test_non_operator_event_types_derived_from_registry():
+    """The precomputed non-operator event_type set is derived from the registry
+    and contains explicitly strategist-internal alert types but no operator-* ones."""
+    non_operator = get_non_operator_event_types()
+    # Explicitly strategist-internal alert event types are present.
+    assert "warm_pool.payoff" in non_operator
+    assert "hotfix_backmerge.size_violation" in non_operator
+    assert "migration.slot_contention" in non_operator
+    # Operator-visible alert event types are NOT filtered out.
+    assert "task.failed" not in non_operator
+    assert "approval.needed" not in non_operator
+    assert "runner.deactivated" not in non_operator
+    # Every member genuinely resolves to a non-operator audience.
+    for event_type in non_operator:
+        assert not is_operator_visible(route_event(event_type)), event_type
+
+
+def _compile_alert_filter(event_types_to_probe=("warm_pool.payoff",)):
+    """Compile operator_visible_alert_filter(Alert.event_type) to a literal SQL string."""
+    from sqlalchemy.dialects import postgresql
+
+    from app.models import Alert
+
+    clause = operator_visible_alert_filter(Alert.event_type)
+    return str(
+        clause.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+
+def test_operator_visible_alert_filter_retains_null_and_excludes_internal():
+    """The Alert filter keeps NULL/unregistered event_types and drops registered
+    strategist-internal ones — expressed as an ``IS NULL OR NOT IN (...)`` clause."""
+    sql = _compile_alert_filter()
+    # NULL rows are retained.
+    assert "event_type IS NULL" in sql
+    # Strategist-internal event types are enumerated in the NOT IN list.
+    assert "NOT IN" in sql
+    assert "warm_pool.payoff" in sql
+    assert "hotfix_backmerge.size_violation" in sql
+    # Operator-visible alert event types are NOT in the exclusion list.
+    assert "task.failed" not in sql
+    assert "approval.needed" not in sql
 
 
 # ── External-webhook audience gate ──────────────────────────────────────

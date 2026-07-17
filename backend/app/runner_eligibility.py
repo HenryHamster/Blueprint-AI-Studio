@@ -269,8 +269,23 @@ _CONTAINER_BACKEND_KEYS = {
     "docker_usable",
     "podman_usable",
     "apptainer_ok",
-    "enroot_ok",
 }
+
+
+def _selected_container_runtime_and_mode(
+    caps: dict,
+) -> tuple[str | None, str | None]:
+    """Return the runtime and GPU flag mode the runner will actually execute."""
+    backends = caps.get("isolation_backends")
+    if not isinstance(backends, dict):
+        return None, None
+    if backends.get("docker_usable"):
+        return "docker", "cdi" if backends.get("docker_cdi_gpu") else "hook"
+    if backends.get("podman_usable"):
+        return "podman", "hook"
+    if backends.get("apptainer_ok"):
+        return "apptainer", "nv"
+    return None, None
 
 
 def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
@@ -429,37 +444,49 @@ def _runner_gpu_in_container_capable(
     have a container runtime and a GPU independently (today a runner with both
     can receive such a job and fail at runtime with "no supported GPU detected").
 
-    * **Non-docker** containers (podman, apptainer, enroot) handle GPU passthrough
-      natively — they are capable whenever the backend is available.
-    * **Docker** requires either CDI GPU support (``docker_cdi_gpu``, heartbeated
-      via ``isolation_backends``) or an nvidia-runtime hook (implied by a docker
-      runner with verified GPU capability). Both paths can pass GPUs into the
-      container (CDI via ``--device nvidia.com/gpu=N``, hook via ``--gpus``).
-
-    Returns ``False`` when no container backend is available or when a docker-only
-    runner lacks both CDI and GPU capability.
+    Capability is earned only by the runner's bounded functional probe through
+    the exact selected runtime and GPU flag mode. Runtime presence, CDI config,
+    and a host GPU are inputs to a probe, never substitutes for its result. Old
+    runners omit the additive proof and therefore fail closed for image+GPU jobs
+    while remaining eligible for CPU image jobs and imageless GPU jobs.
     """
-    caps = runner.capabilities or {}
-    backends = caps.get("isolation_backends")
-    if not isinstance(backends, dict):
+    return _container_gpu_passthrough_verified(runner.capabilities or {})
+
+
+def _container_gpu_passthrough_verified(caps: dict) -> bool:
+    """Whether capabilities prove passthrough for the selected runtime/mode."""
+    proof = caps.get("container_gpu_passthrough")
+    if not isinstance(proof, dict):
         return False
+    selected, expected_mode = _selected_container_runtime_and_mode(caps)
+    report = proof.get(selected) if selected else None
+    return (
+        isinstance(report, dict)
+        and report.get("verified") is True
+        and report.get("mode") == expected_mode
+    )
 
-    # Non-docker containers handle GPU passthrough natively.
-    non_docker_keys = _CONTAINER_BACKEND_KEYS - {"docker_usable"}
-    if any(backends.get(k) for k in non_docker_keys):
-        return True
 
-    # Docker needs explicit GPU passthrough: CDI or nvidia-hook.
-    if backends.get("docker_usable"):
-        # CDI → explicit GPU-in-container support via --device nvidia.com/gpu=N.
-        if backends.get("docker_cdi_gpu"):
-            return True
-        # No CDI but the runner has verified GPU capability → nvidia-hook
-        # (--gpus device=... flag works).  Hook daemons return docker_cdi_gpu=False
-        # but are equally capable of exposing GPUs inside containers.
-        return bool(_runner_gpu_capable(runner))
-
-    return False
+def _runner_gpu_passthrough_blocker(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> str:
+    """Bounded, operator-facing blocker from runner-produced probe evidence."""
+    caps = runner.capabilities or {}
+    proof = caps.get("container_gpu_passthrough")
+    if not isinstance(proof, dict) or not proof:
+        return "runner has not reported a verified GPU passthrough probe"
+    selected, expected_mode = _selected_container_runtime_and_mode(caps)
+    report = proof.get(selected) if selected else None
+    if not isinstance(report, dict):
+        return f"selected runtime {selected or 'unknown'} has no probe report"
+    mode = report.get("mode") or "unknown mode"
+    if mode != expected_mode:
+        return (
+            f"{selected} probe mode {mode!r} does not match "
+            f"selected mode {expected_mode!r}"
+        )
+    reason = report.get("reason") or "probe failed"
+    return f"{selected} {mode} probe: {reason}"
 
 
 def _job_requires_gpu_in_container(

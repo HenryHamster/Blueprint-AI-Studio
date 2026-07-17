@@ -20404,8 +20404,8 @@ async def test_fetch_recent_handled_conversation_bounds_and_order(db_session):
 @pytest.mark.asyncio
 async def test_handoff_session_messages_write_path(db_session):
     """handoff_session_messages must resolve messages stamped with the ending
-    session_id: status='resolved', resolution='session_handoff', resolved_at set,
-    and context stamped with session_handoff_at/session_id.
+    session_id: status='resolved', handling_state='responded',
+    resolution='session_handoff', resolved_at set.
 
     Tests the core write path by seeding a message WITH resident_session_id
     matching the session being handed off.
@@ -20459,11 +20459,9 @@ async def test_handoff_session_messages_write_path(db_session):
 
     # The session-stamped message is resolved.
     assert msg_session.status == "resolved", "stamped message must be resolved"
+    assert msg_session.handling_state == "responded", "stamped message must be RESPONDED canonically"
     assert msg_session.resolution == "session_handoff"
     assert msg_session.resolved_at is not None
-    ctx = msg_session.context or {}
-    assert "session_handoff_at" in ctx, "context must contain session_handoff_at"
-    assert ctx.get("session_id") == SESSION_ID
 
     # Unscoped and other-session messages are untouched.
     assert msg_unscoped.status == "open", "NULL-session message must remain open"

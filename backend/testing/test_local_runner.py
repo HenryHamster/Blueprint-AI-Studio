@@ -478,7 +478,7 @@ async def test_multi_project_runner_claim_and_authz(client: AsyncClient, db_sess
         rm_enroll = await client.delete(
             f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects/{proj_a.id}"
         )
-        assert rm_enroll.status_code == 400
+        assert rm_enroll.status_code == 409
 
         # 8) Removing project B revokes cross-project service: after removal a
         #    project-B job is no longer claimable.
@@ -852,36 +852,38 @@ def test_select_eligible_runner_excludes_gpu_liar_prefers_honest_runner():
 def test_runner_meets_min_compute_capability_gates_on_reported_arch():
     """`_runner_meets_min_compute_capability` returns True only when a reported GPU
     meets the floor; absent/malformed telemetry and a non-positive floor never gate."""
+    from app.runner_eligibility import _runner_meets_min_compute_capability
+
     # A V100 box (sm_70) reports compute capability 7.0.
     v100 = _snapshot({"gpu_compute_capabilities": [7.0]})
     # An L40S box (sm_89) reports 8.9.
     l40s = _snapshot({"gpu_compute_capabilities": [8.9]})
 
     # Floor met by the newer arch, not by the older one.
-    assert orch._runner_meets_min_compute_capability(l40s, 8.0) is True
-    assert orch._runner_meets_min_compute_capability(v100, 8.0) is False
+    assert _runner_meets_min_compute_capability(l40s, 8.0) is True
+    assert _runner_meets_min_compute_capability(v100, 8.0) is False
     # Exactly-at-floor counts (>= semantics).
-    assert orch._runner_meets_min_compute_capability(v100, 7.0) is True
+    assert _runner_meets_min_compute_capability(v100, 7.0) is True
     # Any ONE GPU meeting the floor is enough (mixed fleet on one box).
     mixed = _snapshot({"gpu_compute_capabilities": [7.0, 8.9]})
-    assert orch._runner_meets_min_compute_capability(mixed, 8.0) is True
+    assert _runner_meets_min_compute_capability(mixed, 8.0) is True
 
     # A non-positive floor is no floor at all.
-    assert orch._runner_meets_min_compute_capability(v100, 0.0) is True
-    assert orch._runner_meets_min_compute_capability(v100, -1.0) is True
+    assert _runner_meets_min_compute_capability(v100, 0.0) is True
+    assert _runner_meets_min_compute_capability(v100, -1.0) is True
 
     # Absence of telemetry is NOT a disqualification (backward compatible — the
     # reactive in-sandbox probe remains the safety net for such runners).
-    assert orch._runner_meets_min_compute_capability(_snapshot({}), 8.0) is True
+    assert _runner_meets_min_compute_capability(_snapshot({}), 8.0) is True
     assert (
-        orch._runner_meets_min_compute_capability(
+        _runner_meets_min_compute_capability(
             _snapshot({"gpu_compute_capabilities": []}), 8.0
         )
         is True
     )
     # Malformed telemetry is not trusted to gate.
     assert (
-        orch._runner_meets_min_compute_capability(
+        _runner_meets_min_compute_capability(
             _snapshot({"gpu_compute_capabilities": ["oops"]}), 8.0
         )
         is True
@@ -891,32 +893,34 @@ def test_runner_meets_min_compute_capability_gates_on_reported_arch():
 def test_coerce_min_compute_capability_defensive():
     """`_coerce_min_compute_capability` accepts numbers/numeric strings, rejects
     junk with an honest error, and treats unset/non-positive as no floor."""
-    assert orch._coerce_min_compute_capability({}) == (None, None)
-    assert orch._coerce_min_compute_capability({"min_compute_capability": 8.0}) == (
+    from app.orchestrator_runner_dispatch import _coerce_min_compute_capability
+
+    assert _coerce_min_compute_capability({}) == (None, None)
+    assert _coerce_min_compute_capability({"min_compute_capability": 8.0}) == (
         8.0,
         None,
     )
-    assert orch._coerce_min_compute_capability({"min_compute_capability": "7.0"}) == (
+    assert _coerce_min_compute_capability({"min_compute_capability": "7.0"}) == (
         7.0,
         None,
     )
     # Nested compute_experiment form is read too.
-    assert orch._coerce_min_compute_capability(
+    assert _coerce_min_compute_capability(
         {"compute_experiment": {"min_compute_capability": 8.9}}
     ) == (8.9, None)
     # Non-positive floor == no floor (not an error).
-    assert orch._coerce_min_compute_capability({"min_compute_capability": 0}) == (
+    assert _coerce_min_compute_capability({"min_compute_capability": 0}) == (
         None,
         None,
     )
     # Junk fails THIS task with a naming error, never raises.
-    val, err = orch._coerce_min_compute_capability({"min_compute_capability": "8.0sm"})
+    val, err = _coerce_min_compute_capability({"min_compute_capability": "8.0sm"})
     assert val is None and err is not None and "8.0sm" in err
     # bool is rejected explicitly (int subclass would otherwise mean a 1.0 floor).
-    val, err = orch._coerce_min_compute_capability({"min_compute_capability": True})
+    val, err = _coerce_min_compute_capability({"min_compute_capability": True})
     assert val is None and err is not None
     # inf is rejected (finite guard).
-    val, err = orch._coerce_min_compute_capability(
+    val, err = _coerce_min_compute_capability(
         {"min_compute_capability": float("inf")}
     )
     assert val is None and err is not None
@@ -1789,8 +1793,7 @@ class TestRunnerAllowedProjectsEndpoints:
     async def test_add_project_extends_allow_list_and_get_reflects_it(
         self, client: AsyncClient, db_session
     ):
-        """Adding a project the caller owns extends the allow-list; GET and the
-        binding table both reflect the change."""
+        """Adding a project the caller owns extends the persisted allow-list."""
         managing = await _make_project(db_session, name="Managing")
         target = await _make_project(db_session, name="Target")  # owned by TEST_USER
         runner_id = await self._register_runner(client, managing)
@@ -1810,16 +1813,6 @@ class TestRunnerAllowedProjectsEndpoints:
         assert got.status_code == 200
         got_ids = {p["project_id"] for p in got.json()["projects"]}
         assert got_ids == {str(managing.id), str(target.id)}
-
-        # Binding rows: home was materialized + the new target row.
-        bindings = (
-            await db_session.execute(
-                select(RunnerProjectBinding.project_id).where(
-                    RunnerProjectBinding.runner_id == runner_id
-                )
-            )
-        ).scalars().all()
-        assert set(bindings) == {managing.id, target.id}
 
         # Idempotent: re-adding the same project is a no-op, not a duplicate.
         again = await client.post(
@@ -1861,8 +1854,8 @@ class TestRunnerAllowedProjectsEndpoints:
         )
         assert rejected_member.status_code == 403
 
-        # (b) Caller is NOT a member at all on the target → also 403 (not 404),
-        # so the message is unambiguous about the missing owner role.
+        # (b) Caller is NOT a member at all on the target → 404, preserving the
+        # project-membership non-disclosure boundary.
         nonmember_target = await _make_project(
             db_session, owner_id="other-owner", name="Nonmember Target"
         )
@@ -1870,7 +1863,7 @@ class TestRunnerAllowedProjectsEndpoints:
             f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
             json={"project_id": str(nonmember_target.id)},
         )
-        assert rejected_nonmember.status_code == 403
+        assert rejected_nonmember.status_code == 404
 
         # No binding to either target project was created.
         bindings = (
@@ -1957,7 +1950,7 @@ class TestRunnerAllowedProjectsEndpoints:
         assert str(managing.id) in project_ids
 
     @pytest.mark.asyncio
-    async def test_remove_project_not_on_allow_list_404(
+    async def test_remove_project_not_on_allow_list_is_idempotent(
         self, client: AsyncClient, db_session
     ):
         managing = await _make_project(db_session, name="Managing NF")
@@ -1973,7 +1966,10 @@ class TestRunnerAllowedProjectsEndpoints:
             f"/api/admin/projects/{managing.id}/runners/{runner_id}"
             f"/projects/{never_bound}"
         )
-        assert resp.status_code == 404
+        assert resp.status_code == 200
+        assert {
+            item["project_id"] for item in resp.json()["projects"]
+        } == {str(managing.id), str(target.id)}
 
     @pytest.mark.asyncio
     async def test_allowed_projects_cross_project_runner_404(
@@ -2502,6 +2498,35 @@ class TestRunnerEndpoints:
             assert resp2.status_code == 204
         finally:
             _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_draining_runner_does_not_pull_new_task(
+        self, client: AsyncClient, db_session
+    ):
+        """Drain prevents a race from handing new agent work to the host."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, status="draining"
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "must stay unpulled"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 204
+        await db_session.refresh(task)
+        assert task.started_at is None
+        assert task.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
     async def test_next_task_returns_credentials_when_pool_account_resolved(
@@ -4469,11 +4494,15 @@ class TestRunnerEndpoints:
             "enroot_ok": False,
             "systemd_run_ok": True,
         }
+        passthrough = {
+            "apptainer": {"verified": True, "mode": "nv", "reason": "verified"}
+        }
         resp = await client.post(
             "/api/runner/heartbeat",
             json={
                 "version": "v22-15-gabc1234-dirty",
                 "isolation_backends": inventory,
+                "container_gpu_passthrough": passthrough,
                 "agent_backend": "bwrap",
                 "compute_backend": "bwrap",
             },
@@ -4483,6 +4512,7 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.version == "v22-15-gabc1234-dirty"
         assert runner.capabilities["isolation_backends"] == inventory
+        assert runner.capabilities["container_gpu_passthrough"] == passthrough
         assert runner.capabilities["agent_backend"] == "bwrap"
         assert runner.capabilities["compute_backend"] == "bwrap"
 
@@ -4502,6 +4532,7 @@ class TestRunnerEndpoints:
         assert resp.status_code == 200
         await db_session.refresh(runner)
         assert "isolation_backends" not in runner.capabilities
+        assert "container_gpu_passthrough" not in runner.capabilities
         assert "agent_backend" not in runner.capabilities
         assert "compute_backend" not in runner.capabilities
 
@@ -10196,12 +10227,10 @@ class TestDirectComputeExperimentDispatch:
         assert await _compute_job_for_task(db_session, task.id) is None
 
     @pytest.mark.asyncio
-    async def test_strict_runner_pin_holds_when_gpu_in_container_unavailable(
+    async def test_strict_runner_pin_accepts_nvidia_hook_without_cdi(
         self, db_session
     ):
-        """A strict pin to a docker runner with GPU but no CDI/hook for a job
-        declaring BOTH container_image and accelerator holds with the combined
-        missing_gpu_in_container_capability reason, not the individual gates."""
+        """A Docker GPU runner may use the NVIDIA runtime hook when CDI is absent."""
         project = await _make_project(db_session)
         docker_runner, _ = await _make_runner(
             db_session,
@@ -10232,24 +10261,16 @@ class TestDirectComputeExperimentDispatch:
             db_session, task, {project.id: [docker_runner]}, {}
         )
 
-        assert outcome == "held"
+        assert outcome == "launched"
         await db_session.refresh(task)
-        hold = (task.context or {}).get("runner_pin_hold")
-        assert hold is not None
-        assert hold["reason_code"] == "missing_gpu_in_container_capability", (
-            f"expected 'missing_gpu_in_container_capability', got {hold['reason_code']}"
-        )
-        assert await _compute_job_for_task(db_session, task.id) is None
+        assert "runner_pin_hold" not in (task.context or {})
+        assert await _compute_job_for_task(db_session, task.id) is not None
 
     @pytest.mark.asyncio
-    async def test_strict_runner_pin_holds_when_gpu_in_container_unavailable_vram_only(
+    async def test_strict_runner_pin_accepts_nvidia_hook_for_vram_only_job(
         self, db_session
     ):
-        """A job that declares container_image + vram_gb but NO accelerator string
-        is still a GPU job (VRAM lives on a GPU). A strict pin to a docker runner
-        with a GPU but no CDI/hook must hold with the combined
-        missing_gpu_in_container_capability reason — the gate must not be bypassed
-        just because the accelerator key is absent."""
+        """The NVIDIA runtime hook also satisfies a VRAM-only container request."""
         project = await _make_project(db_session)
         docker_runner, _ = await _make_runner(
             db_session,
@@ -10281,19 +10302,10 @@ class TestDirectComputeExperimentDispatch:
             db_session, task, {project.id: [docker_runner]}, {}
         )
 
-        assert outcome == "held"
+        assert outcome == "launched"
         await db_session.refresh(task)
-        hold = (task.context or {}).get("runner_pin_hold")
-        assert hold is not None
-        assert hold["reason_code"] == "missing_gpu_in_container_capability", (
-            f"expected 'missing_gpu_in_container_capability', got {hold['reason_code']}"
-        )
-        # The honest detail must name the vram_gb GPU requirement, not a bogus
-        # accelerator string it never had.
-        assert "vram_gb" in hold["detail"], (
-            f"detail must name the vram_gb GPU requirement: {hold['detail']!r}"
-        )
-        assert await _compute_job_for_task(db_session, task.id) is None
+        assert "runner_pin_hold" not in (task.context or {})
+        assert await _compute_job_for_task(db_session, task.id) is not None
 
     @pytest.mark.asyncio
     async def test_launch_holds_when_no_gpu_arch_compatible_runner(self, db_session):
@@ -10412,7 +10424,7 @@ class TestDirectComputeExperimentDispatch:
         )
         task = Task(
             project_id=project.id,
-            payloads=[_ce_payload(accelerator="gpu", min_compute_capability=8.0)],
+            payloads=[_ce_payload(accelerator="L4", min_compute_capability=8.0)],
             status=TaskStatus.QUEUED,
         )
         db_session.add(task)
@@ -11558,8 +11570,8 @@ class TestMidRunViewableUpload:
         ]
         with patch.object(
             compute_jobs_mod,
-            "persist_viewable_artifacts",
-            new=AsyncMock(return_value=(terminal_manifest, 0)),
+            "persist_viewable_artifacts_with_completeness",
+            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
         ):
             final_manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
@@ -11670,8 +11682,8 @@ class TestMidRunViewableUpload:
 
         with patch.object(
             compute_jobs_mod,
-            "persist_viewable_artifacts",
-            new=AsyncMock(return_value=(terminal_manifest, 0)),
+            "persist_viewable_artifacts_with_completeness",
+            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
         ):
             manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(

@@ -25,6 +25,7 @@ from app.project_message_projection import (
     message_event_payload,
     message_preview_dict,
 )
+from app.project_message_creation import reserve_project_message_sequences
 from testing.factories import make_task
 
 TEST_USER_ID = "test-user-123"
@@ -506,16 +507,21 @@ async def test_activity_endpoint_excludes_conversation_projection(
     db_session,
 ):
     project = await _make_project(db_session)
+    activity_sequence, conversation_sequence = (
+        await reserve_project_message_sequences(
+            db_session, project.id, count=2
+        )
+    )
     db_session.add_all([
         ProjectMessage(
             project_id=project.id,
-            sequence=1,
+            sequence=activity_sequence,
             surface=MessageSurface.ACTIVITY,
             content="activity only",
         ),
         ProjectMessage(
             project_id=project.id,
-            sequence=2,
+            sequence=conversation_sequence,
             surface=MessageSurface.CONVERSATION,
             from_type="user",
             content="conversation only",

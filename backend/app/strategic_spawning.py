@@ -4100,6 +4100,7 @@ async def _spawn_design_doc_update(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(

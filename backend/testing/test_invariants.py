@@ -822,8 +822,8 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
                 node.func, ast.Attribute
             ):
                 continue
-            attr = node.func.attr
             pos = (node.lineno, node.col_offset)
+            attr = node.func.attr
 
             if attr == "execute" and node.args:
                 text = _ast_literal_text(node.args[0])
@@ -1603,6 +1603,7 @@ class TestSchemaRevisionSync:
                 migration_columns.add((m.group(1), m.group(3)))
 
             # create_table('table', sa.Column('name', ...), ...)
+            # group 1 = string literal, group 2 = bare constant (_TABLE_CONST)
             for ct in create_table_re.finditer(content):
                 table = ct.group(1) or consts.get(ct.group(2) or "", "")
                 if not table:
@@ -2233,7 +2234,8 @@ class TestSchemaRevisionSync:
             + "\n  ".join(sorted(violations))
             + "\n\nInside the `if bind.dialect.name == \"postgresql\":` branch, "
             'emit `op.execute("COMMIT")` BEFORE the first CREATE/DROP INDEX '
-            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern)."
+            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern), "
+            "or wrap the CONCURRENTLY DDL in `with op.get_context().autocommit_block():`."
         )
 
 # ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
@@ -2470,6 +2472,18 @@ class TestChainInvariantSeedFixtures:
         )
         assert not _concurrently_txn_escape_violations(docstring_only, "9006"), (
             "detector wrongly flagged a docstring/comment-only CONCURRENTLY mention"
+        )
+
+        # GOOD 3: autocommit_block() context manager precedes the CONCURRENTLY DDL.
+        good_autocommit = (
+            "from alembic import op\n"
+            "def downgrade():\n"
+            "    if op.get_bind().dialect.name == 'postgresql':\n"
+            "        with op.get_context().autocommit_block():\n"
+            "            op.execute('DROP INDEX CONCURRENTLY IF EXISTS ix_z')\n"
+        )
+        assert not _concurrently_txn_escape_violations(good_autocommit, "9006"), (
+            "detector false-positived on autocommit_block()-escaped CONCURRENTLY DDL"
         )
 
         # BAD 4: a sibling autocommit block does not bless DDL outside its body.
@@ -10695,6 +10709,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
+        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",
