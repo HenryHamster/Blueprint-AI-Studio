@@ -579,6 +579,103 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
     load.assert_not_awaited()
 
 
+def test_inspection_receipt_maps_kind_and_is_trusted():
+    """An inspection receipt makes its evidence citable via the trusted index."""
+    from app.strategic_resident_evidence_validation import (
+        _canonical_hash,
+        build_trusted_evidence_index,
+    )
+    from app.strategic_resident_inspection_receipt import (
+        build_inspection_receipt,
+        citable_inspection_evidence,
+    )
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    source_id = str(uuid.uuid4())
+    evidence_json = {
+        "kind": "logs",
+        "project_id": str(project_id),
+        "source_id": source_id,
+        "revision": "task:v1",
+        "checksum": "e" * 64,
+        "observed_at": "2026-07-17T00:00:00+00:00",
+        "data": {"task_id": source_id},
+    }
+    # A logs inspection maps into the task_log trust kind.
+    assert citable_inspection_evidence(evidence_json)["kind"] == "task_log"
+
+    turn_task = SimpleNamespace(
+        id=turn_id,
+        project_id=project_id,
+        first_payload={"authority_generation": 3},
+        context={},
+    )
+    receipt = build_inspection_receipt(
+        capability_id="task.logs.inspect",
+        turn_task=turn_task,
+        context_hash="ctx-123",
+        request_hash="f" * 64,
+        evidence_json=evidence_json,
+    )
+    assert receipt is not None
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.status == "applied"
+    assert receipt.risk_level == "low"
+    assert receipt.expected_revisions == {"context_hash": "ctx-123"}
+
+    provider_input = {
+        "lineage": {"context_hash": "ctx-123", "evidence_hash": _canonical_hash([])},
+        "evidence": [],
+    }
+    index = build_trusted_evidence_index(
+        provider_input, [receipt], expected_context_hash="ctx-123"
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) in index.entries
+
+    # The context_hash binding is meaningful: the SAME receipt is NOT trusted in a
+    # turn with a different context_hash (its evidence is dropped from the index).
+    other = build_trusted_evidence_index(
+        {
+            "lineage": {"context_hash": "ctx-other", "evidence_hash": _canonical_hash([])},
+            "evidence": [],
+        },
+        [receipt],
+        expected_context_hash="ctx-other",
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) not in other.entries
+
+
+def test_inspection_receipt_requires_context_hash_and_mapped_capability():
+    from app.strategic_resident_inspection_receipt import build_inspection_receipt
+
+    turn_task = SimpleNamespace(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), first_payload={}, context={}
+    )
+    # No persisted context_hash -> no receipt (inspection still returns evidence).
+    assert (
+        build_inspection_receipt(
+            capability_id="task.inspect",
+            turn_task=turn_task,
+            context_hash="",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+    # A capability with no inspection-kind mapping is not receipted.
+    assert (
+        build_inspection_receipt(
+            capability_id="pr.merge",
+            turn_task=turn_task,
+            context_hash="ctx",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+
+
 def test_all_resident_capability_routes_are_token_allowlisted():
     """Every capability route must be in the resident-token allowlist.
 

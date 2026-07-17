@@ -1296,3 +1296,61 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
     assert len(all_receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypatch):
+    """A /capability inspection persists a context-bound, idempotent receipt."""
+    from unittest.mock import AsyncMock
+
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Simulate the frozen context_hash persisted at context-serve time.
+    turn_task.context = {**turn_task.context, TURN_CONTEXT_HASH_KEY: "ctx-hash-1"}
+    target = Task(project_id=project.id, title="target", payloads=[{"type": "plan"}])
+    authority_db.add_all([turn_task, target])
+    await authority_db.commit()
+
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        AsyncMock(return_value=turn_task),
+    )
+    token = {
+        "sub": str(turn_task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+    body = ResidentCapabilityRequest(
+        capability_id="task.logs.inspect",
+        parameters={"task_id": str(target.id)},
+    )
+
+    result = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    # Response evidence kind is mapped into the trust taxonomy (logs -> task_log).
+    assert result["evidence"]["kind"] == "task_log"
+
+    receipt = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalar_one()
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.capability == "task.logs.inspect"
+    assert receipt.status == "applied"
+    assert receipt.expected_revisions == {"context_hash": "ctx-hash-1"}
+    assert receipt.receipt["structured_result"]["evidence"][0]["kind"] == "task_log"
+
+    # Idempotent: the per-turn ledger dedups the same inspection -> one receipt.
+    await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    receipts = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalars().all()
+    assert len(receipts) == 1

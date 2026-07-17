@@ -45,6 +45,11 @@ from app.strategic_resident_capability_invocation import (
     ResidentCapabilityInvocation,
     validated_capability_parameters,
 )
+from app.strategic_resident_inspection_receipt import (
+    TURN_CONTEXT_HASH_KEY,
+    build_inspection_receipt,
+    citable_inspection_evidence,
+)
 from app.strategic_resident_project_field_mutation import (
     PROJECT_FIELD_MUTATION_SERVICE,
     project_field_mutation_callback,
@@ -208,6 +213,21 @@ async def invoke_resident_capability(
                 task_id=target_task_id,
                 kind=_TASK_INSPECTION_KINDS[body.capability_id],
             )
+        evidence_json = evidence.model_dump(mode="json")
+        # First time this inspection is registered this turn, persist a
+        # server-authored receipt so the Resident may cite the evidence. The
+        # ledger's one-write-per-fingerprint guarantee keeps operation_id unique;
+        # the receipt row does not advance the turn task's updated_at.
+        if request_registered:
+            receipt = build_inspection_receipt(
+                capability_id=body.capability_id,
+                turn_task=task,
+                context_hash=str((task.context or {}).get(TURN_CONTEXT_HASH_KEY) or ""),
+                request_hash=fingerprint,
+                evidence_json=evidence_json,
+            )
+            if receipt is not None:
+                session.add(receipt)
         await session.commit()
     except ResidentTaskNotFound as exc:
         await session.rollback()
@@ -220,7 +240,7 @@ async def invoke_resident_capability(
         raise
     return {
         "capability_id": body.capability_id,
-        "evidence": evidence.model_dump(mode="json"),
+        "evidence": citable_inspection_evidence(evidence_json),
     }
 
 
