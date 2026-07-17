@@ -56,6 +56,7 @@ describePosix('writePrHelper', () => {
     script: string,
     args: string[],
     setup: (dir: string, realFs: typeof import('node:fs')) => void,
+    envOverrides: NodeJS.ProcessEnv = {},
   ): Promise<{ status: number; stdout: string; stderr: string; checkArgs?: string }> => {
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
@@ -76,6 +77,7 @@ describePosix('writePrHelper', () => {
             PATH: `${realPath.join(dir, 'bin')}:${process.env.PATH ?? ''}`,
             ORCHESTRATOR_URL: 'https://orchestrator.example',
             AGENT_API_TOKEN: 'token-123',
+            ...envOverrides,
           },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -581,7 +583,8 @@ esac
     expect(parsed.title).toBe(specialTitle);
     expect(parsed.head).toBe('blueprint/task-nojq-1');
     expect(parsed.base).toBe('main');
-    expect(parsed.body).toBe(specialBody);
+    expect(parsed.body).toContain(specialBody);
+    expect(parsed.body).toContain('- Status: passed');
 
     // (b) Assert the html_url was extracted (via _json_field) and PR_URL persisted.
     const prUrl = realFs.readFileSync('/tmp/pr_url_task-nojq-1', 'utf8').trim();
@@ -718,10 +721,191 @@ esac
     expect(realFs.existsSync('/tmp/pr_url_task-shallow-1')).toBe(true);
     realFs.rmSync('/tmp/pr_url_task-shallow-1', { force: true });
   });
-});
 
 // Static content checks (no bash execution — these run on every platform,
 // including Windows where the POSIX integration suite above is skipped).
+  it('publishes after a bounded local-gate timeout with an explicit CI receipt', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-timeout.json';
+    const argsPath = '/tmp/pr_gate_timeout_args_task-gate-timeout.txt';
+    const prPath = '/tmp/pr_url_task-gate-timeout';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(argsPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-timeout',
+      workBranch: 'blueprint/task-gate-timeout',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nprintf "check must not run\\n" >&2\nexit 99\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/timeout`, `#!/bin/sh
+printf '%s\\n' "$*" > ${argsPath}
+exit 124
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-gate-timeout"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-gate-timeout"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/9"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/9"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/9\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('check must not run');
+    expect(realFs.readFileSync(argsPath, 'utf8')).toContain('--kill-after=10s 600s ./check');
+    expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
+      status: 'timed_out',
+      command: './check',
+      timeout_seconds: 600,
+      exit_code: 124,
+      authoritative_ci_required: true,
+    });
+    expect(realFs.readFileSync(prPath, 'utf8').trim()).toBe('https://github.com/acme/repo/pull/9');
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(argsPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+  });
+
+  it('keeps a deterministic local-gate failure fail-closed', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-failed.json';
+    const prPath = '/tmp/pr_url_task-gate-failed';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-failed',
+      workBranch: 'blueprint/task-gate-failed',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 23\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/timeout`, `#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --signal=*|--kill-after=*) shift ;;
+    *s) shift; break ;;
+    *) break ;;
+  esac
+done
+exec "$@"
+`, { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('./check failed');
+    expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
+      status: 'failed',
+      command: './check',
+      exit_code: 23,
+      authoritative_ci_required: false,
+    });
+    expect(realFs.existsSync(prPath)).toBe(false);
+    realFs.rmSync(receiptPath, { force: true });
+  });
+  it('publishes with authoritative CI required when the local gate is unavailable', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const receiptPath = '/tmp/pr_gate_receipt_task-gate-unavailable.json';
+    const prPath = '/tmp/pr_url_task-gate-unavailable';
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+
+    const script = writeScript({
+      taskId: 'task-gate-unavailable',
+      workBranch: 'blueprint/task-gate-unavailable',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nprintf "check must not run\\n" >&2\nexit 99\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/timeout`, '#!/bin/sh\nexit 127\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) printf '%s\n' 'src/app.ts'; exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\n'; exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-gate-unavailable"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-gate-unavailable"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*) [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/10"}}' > "$OUT"; printf '201'; exit 0 ;;
+  *"/pulls/10"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/10\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain('check must not run');
+    expect(JSON.parse(realFs.readFileSync(receiptPath, 'utf8'))).toMatchObject({
+      status: 'unavailable',
+      command: './check',
+      exit_code: 127,
+      authoritative_ci_required: true,
+    });
+    expect(realFs.readFileSync(prPath, 'utf8').trim()).toBe('https://github.com/acme/repo/pull/10');
+    realFs.rmSync(receiptPath, { force: true });
+    realFs.rmSync(prPath, { force: true });
+  });
+});
+
 describe('writePrHelper — generated script content', () => {
   let capturedScripts: Record<string, string> = {};
 
@@ -744,10 +928,15 @@ describe('writePrHelper — generated script content', () => {
     });
     const script = capturedScripts['/tmp/workspace/pr'];
     expect(script).toBeDefined();
-    // The marker is read AFTER the gate passes, inside the WITH_TESTS branch —
-    // a red gate still blocks; the note only annotates a green one.
-    expect(script).toMatch(/if ! \.\/check test; then[\s\S]*exit 1[\s\S]*\n {2}fi\n[\s\S]*check_gate_env_task-static-1\.txt/);
-    expect(script).toContain('if [ -s /tmp/check_gate_env_task-static-1.txt ]; then');
+    // A deterministic red gate still blocks, while timeout/tool unavailability
+    // returns through run_pr_gate with a durable authoritative-CI receipt.
+    expect(script).toContain('if ! run_pr_gate test; then');
+    expect(script).toContain('timeout --signal=TERM --kill-after=10s "${GATE_TIMEOUT_SECONDS}s" ./check "$@"');
+    expect(script).toContain('PR_GATE_TIMEOUT_SECONDS:-600');
+    expect(script).toContain('authoritative_ci_required');
+    expect(script).toContain('write_gate_receipt failed "$GATE_STATUS" false');
+    expect(script).toContain('<!-- blueprint:local-gate -->');
+    expect(script).toContain('if [ "$GATE_STATUS" = "0" ] && [ -s /tmp/check_gate_env_task-static-1.txt ]; then');
     expect(script).toContain('[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:');
     expect(script).toContain("sed 's/^/[pr]   /' /tmp/check_gate_env_task-static-1.txt");
     expect(script).toContain('Record your faithful test evidence');
