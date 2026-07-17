@@ -362,6 +362,58 @@ describe('testFixLoop — noTestsExecuted aggregation (maxFixAttempts: 0)', () =
   });
 });
 
+describe('captureTestBaseline dependency materialization', () => {
+  const adminBuildConfig = {
+    directories: [{ path: 'admin-ui', type: 'node', test_cmd: 'npm test' }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(apiPost).mockResolvedValue({ persisted: true });
+    vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => {
+      const s = String(p);
+      return s.endsWith('/admin-ui/package.json') || s.endsWith('/admin-ui/package-lock.json');
+    });
+  });
+
+  it('runs locked install before npm test in a fresh checkout', async () => {
+    execFileAsync.mockResolvedValue('ok');
+
+    const result = await captureTestBaseline(null, { value: '' }, adminBuildConfig);
+
+    expect(result).toBeInstanceOf(Set);
+    expect(execFileAsync).toHaveBeenCalledTimes(2);
+    const installCall = execFileAsync.mock.calls[0];
+    expect(installCall[0]).toBe('npm');
+    expect(installCall[1]).toEqual(['ci']);
+    expect(String((installCall[2] as { cwd?: string }).cwd).replace(/\\/g, '/'))
+      .toMatch(/\/admin-ui$/);
+    expect(execFileAsync.mock.calls[1][0]).toBe('npm');
+    expect(execFileAsync.mock.calls[1][1][0]).toBe('test');
+    expect(String((execFileAsync.mock.calls[1][2] as { cwd?: string }).cwd).replace(/\\/g, '/'))
+      .toMatch(/\/admin-ui$/);
+  });
+
+  it('never reaches npm test when locked dependency setup fails', async () => {
+    execFileAsync.mockRejectedValueOnce(
+      new Error('npm ci failed: registry unavailable'),
+    );
+
+    const result = await captureTestBaseline(null, { value: '' }, adminBuildConfig);
+
+    expect(result).toBeNull();
+    expect(execFileAsync).toHaveBeenCalledTimes(1);
+    const installCall = execFileAsync.mock.calls[0];
+    expect(installCall[0]).toBe('npm');
+    expect(installCall[1]).toEqual(['ci']);
+    expect(String((installCall[2] as { cwd?: string }).cwd).replace(/\\/g, '/'))
+      .toMatch(/\/admin-ui$/);
+    expect(execFileAsync.mock.calls.some(([cmd, args]) =>
+      cmd === 'npm' && args[0] === 'test',
+    )).toBe(false);
+  });
+});
+
 describe('captureTestBaseline build-config discovery reporting', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -402,6 +454,7 @@ describe('captureTestBaseline build-config discovery reporting', () => {
     vi.mocked(fs.existsSync).mockImplementation((p: fs.PathLike) => {
       const s = String(p);
       return (
+        s.endsWith('/node_modules') ||
         s.endsWith('/packages') ||
         s.endsWith('/packages/a/package.json') ||
         s.endsWith('/packages/b/package.json')
