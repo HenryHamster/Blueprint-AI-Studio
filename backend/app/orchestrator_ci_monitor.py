@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 import app.shared_state as _shared_state
+from app.closed_pr_reconciliation import reconcile_closed_pr_replacement
 from app.database import resolve_dialect_name
 from app.dep_lifecycle import _mark_unblocked_dependents
 from app.models import Project, Task, TaskStatus
@@ -824,6 +825,26 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                                 "status": ci_task.status,
                             },
                         )
+                    continue
+
+                # A deliberately closed/recreated PR keeps its task by rebinding
+                # to the unique open same-head/base replacement. On lookup
+                # uncertainty the helper persists retry state rather than
+                # terminalizing potentially live work.
+                if (
+                    pr_state == "closed"
+                    and not pr_data.get("merged")
+                    and await reconcile_closed_pr_replacement(
+                        task=ci_task,
+                        session=session,
+                        review_loop=ci_loop,
+                        pr_number=ci_pr_number,
+                        pr_data=pr_data,
+                        github_token=ci_gh_token,
+                        github_owner=ci_owner,
+                        github_repo=ci_repo,
+                    )
+                ):
                     continue
                 if pr_data.get("merged"):
                     _orch_ci_project = _get_project(ci_task.project_id)

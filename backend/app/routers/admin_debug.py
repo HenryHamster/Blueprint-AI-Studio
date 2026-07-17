@@ -315,6 +315,34 @@ async def _build_stuck_tasks(
     stuck_deps_secs = 10 * 60
     evaluating_timeout_secs = 2 * 3600  # 2 hours
 
+    # Parent age alone is not a liveness signal. Research/rollup parents stay
+    # EVALUATING while their pipeline children run, and some of those children
+    # can legitimately be BLOCKED waiting for an external prerequisite. The
+    # scheduler uses this same status set to decide that a stale-looking parent
+    # is still progressing; diagnostics must not contradict it.
+    evaluating_parent_ids = {
+        task.id for task in tasks if task.status == TaskStatus.EVALUATING
+    }
+    parents_with_active_children: set[uuid.UUID] = set()
+    if evaluating_parent_ids:
+        active_child_rows = await session.execute(
+            select(Task.parent_task_id).where(
+                Task.parent_task_id.in_(evaluating_parent_ids),
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                        TaskStatus.BLOCKED,
+                    ]
+                ),
+            )
+        )
+        parents_with_active_children = {
+            parent_id for parent_id in active_child_rows.scalars().all() if parent_id
+        }
+
     # Pre-fetch all dependency statuses and titles in a single batch query to avoid N+1
     from app.time_utils import _to_naive_utc
 
@@ -441,6 +469,8 @@ async def _build_stuck_tasks(
                     remediation_hint = f"No available slots — {running_count} running, {queued_count}Q waiting"
 
         elif task.status == TaskStatus.EVALUATING:
+            if task.id in parents_with_active_children:
+                continue
             # Skip CI-waiting tasks — they have their own timeout
             ctx = task.context or {}
             if not ctx.get("ci_waiting") and not ctx.get("review_loop", {}).get(
