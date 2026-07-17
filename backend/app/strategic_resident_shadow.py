@@ -643,12 +643,100 @@ async def _complete_shadow_turn(
             "shadow_last_manifest_hash": manifest_hash,
             "shadow_last_projection_latency_ms": latency_ms,
             "shadow_last_comparison": comparison,
+            "shadow_projection_state": "healthy",
             "shadow_active_task_id": str(promoted.id) if promoted else None,
         }
     )
     resident.scheduling_state = scheduling
     resident.next_wakeup_at = now if promoted is not None else None
     session.add(resident)
+    await session.commit()
+    return True
+
+
+async def _quarantine_failed_shadow_turn(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    task_id: uuid.UUID,
+    now: datetime,
+    error: Exception,
+) -> bool:
+    """Make a failed projection durable so one bad turn cannot wedge a project."""
+
+    project = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update(skip_locked=True, read=True, key_share=True)
+        )
+    ).scalar_one_or_none()
+    if project is None:
+        await session.rollback()
+        return False
+    resident = (
+        await session.execute(
+            select(StrategicResident)
+            .where(StrategicResident.project_id == project_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if (
+        resident is None
+        or resident.engine_owner != "legacy"
+        or resident.active_turn_task_id != task_id
+    ):
+        await session.rollback()
+        return False
+    tasks = await _load_pointer_tasks_locked(session, resident)
+    task = tasks.get(task_id)
+    if (
+        task is None
+        or not _is_live_pointer_task(task, project_id=project_id)
+        or not bool((task.context or {}).get(SHADOW_CONTEXT_KEY))
+    ):
+        await session.rollback()
+        return False
+
+    # Keep the durable, operator-visible state useful without persisting arbitrary
+    # exception text, which can contain user content or credentials.
+    reason = f"Resident shadow projection raised {type(error).__name__}"
+    context = dict(task.context or {})
+    context["resident_shadow_projection_failure"] = {
+        "reason": reason,
+        "exception_type": type(error).__name__,
+        "failed_at": now.isoformat(),
+    }
+    task.context = context
+    task.status = TaskStatus.FAILED
+    task.completed_at = now
+    task.updated_at = now
+    task.latest_status_message = f"Resident shadow projection failed: {reason[:400]}"
+    resident.active_turn_task_id = None
+    resident.active_turn_lane = None
+    _suppress_paused_background_successor(resident, tasks, now=now)
+    promoted = _promote_successor(resident, tasks)
+    scheduling = dict(resident.scheduling_state or {})
+    scheduling.update(
+        {
+            "shadow_projection_state": "degraded",
+            "shadow_last_failure_at": now.isoformat(),
+            "shadow_last_failure_task_id": str(task.id),
+            "shadow_last_failure_reason": reason,
+            "shadow_active_task_id": str(promoted.id) if promoted else None,
+        }
+    )
+    resident.scheduling_state = scheduling
+    resident.next_wakeup_at = now if promoted is not None else None
+    session.add(task)
+    session.add(resident)
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SHADOW_PROJECTION_FAILED",
+            details={"reason": reason},
+        )
+    )
     await session.commit()
     return True
 
@@ -689,12 +777,33 @@ async def sweep_shadow_resident_turns(
                 )
             if did_complete:
                 completed += 1
-        except Exception:
+        except Exception as error:
             logger.exception(
                 "[RESIDENT_SHADOW] Failed to project turn %s for project %s",
                 task_id,
                 project_id,
             )
+            try:
+                async with session_factory() as recovery_session:
+                    quarantined = await _quarantine_failed_shadow_turn(
+                        recovery_session,
+                        project_id=project_id,
+                        task_id=task_id,
+                        now=effective_now,
+                        error=error,
+                    )
+                if quarantined:
+                    logger.warning(
+                        "[RESIDENT_SHADOW] Quarantined failed turn %s for project %s",
+                        task_id,
+                        project_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "[RESIDENT_SHADOW] Failed to quarantine turn %s for project %s",
+                    task_id,
+                    project_id,
+                )
     if completed:
         logger.info(
             "[RESIDENT_SHADOW] Completed %d backend-only turn projection(s)",

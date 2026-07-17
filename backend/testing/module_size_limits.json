@@ -175,7 +175,7 @@
     "strategic_resident_saturated_dispatch.py": 120,
     "strategic_resident_wakeups.py": 150,
     "strategic_resident_context.py": 700,
-    "strategic_resident_shadow.py": 720,
+    "strategic_resident_shadow.py": 1050,
     "routers/agent_resident_turn.py": 220,
     "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,

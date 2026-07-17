@@ -14,6 +14,7 @@ from app.models import (
     ProjectMessage,
     StrategicResident,
     Task,
+    TaskHistory,
     TaskStatus,
 )
 from app.strategic_resident_shadow import (
@@ -440,6 +441,12 @@ async def test_sweep_failure_for_one_project_does_not_poison_another(
         lane="background",
         trigger_kind="project_change",
     )
+    recovery_wake = await coalesce_shadow_resident_turn(
+        db_session,
+        project_id=first.id,
+        lane="background",
+        trigger_kind="project_change",
+    )
     second_wake = await coalesce_shadow_resident_turn(
         db_session,
         project_id=second.id,
@@ -462,8 +469,32 @@ async def test_sweep_failure_for_one_project_does_not_poison_another(
     succeeded = await db_session.get(Task, second_wake.task_id)
     await db_session.refresh(failed)
     await db_session.refresh(succeeded)
-    assert failed.status == TaskStatus.QUEUED
+    assert failed.status == TaskStatus.FAILED
+    assert failed.context["resident_shadow_projection_failure"]["reason"] == (
+        "Resident shadow projection raised RuntimeError"
+    )
+    assert failed.context["resident_shadow_projection_failure"]["exception_type"] == "RuntimeError"
     assert succeeded.status == TaskStatus.COMPLETED
+    failed_resident = await db_session.get(StrategicResident, first.id)
+    assert failed_resident.scheduling_state["shadow_projection_state"] == "degraded"
+    assert failed_resident.active_turn_task_id == recovery_wake.task_id
+    failure_history = (
+        await db_session.execute(
+            select(TaskHistory).where(
+                TaskHistory.task_id == first_wake.task_id,
+                TaskHistory.action == "SHADOW_PROJECTION_FAILED",
+            )
+        )
+    ).scalar_one()
+    assert failure_history.details["reason"] == "Resident shadow projection raised RuntimeError"
+
+    monkeypatch.setattr(shadow, "_complete_shadow_turn", real_complete)
+    assert await sweep_shadow_resident_turns(session_factory=AsyncSessionLocal) == 1
+    recovered = await db_session.get(Task, recovery_wake.task_id)
+    await db_session.refresh(recovered)
+    await db_session.refresh(failed_resident)
+    assert recovered.status == TaskStatus.COMPLETED
+    assert failed_resident.scheduling_state["shadow_projection_state"] == "healthy"
 
 
 @pytest.mark.asyncio
