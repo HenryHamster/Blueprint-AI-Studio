@@ -31,6 +31,7 @@ malformed artifact can never smuggle a value onto ``last_qualification``.
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 from typing import Any
@@ -142,8 +143,8 @@ def build_env_preflight_from_source(
     importable (no local checkout, no ``sys.path`` manipulation).  The caller
     provides the text of the candidate's ``backend/app/required_runtime_env.py``
     (and optionally ``backend/testing/smoketest.yaml``), which this function
-    introspects using a controlled Python ``exec()`` in a sandboxed namespace
-    (safe: the source is from a known git SHA in the project's own repository).
+    introspects using Python's ``ast`` module — statically, without executing
+    the source.
 
     The artifact shape, presence-only hard rule, and ``manifest_source`` pointer
     are identical to :func:`build_env_preflight_evidence`.
@@ -166,46 +167,87 @@ def build_env_preflight_from_source(
     }
 
 
+def _resolve_str_node(node: Any, constants: dict[str, str]) -> str | None:
+    """Resolve an AST node to a string value using collected constants."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    return None
+
+
 def _extract_required_env_from_source(source: str) -> list[dict[str, str]]:
     """Extract ``REQUIRED_RUNTIME_ENV`` entries from module source code.
 
-    Uses a sandboxed ``exec()`` to resolve the module-level constant without
-    importing the candidate's package tree.  The only external import in
-    ``required_runtime_env.py`` (``ENCRYPTION_KEY_ENV`` from
-    ``app.field_encryption``) is replaced with its resolved value so the
-    source is self-contained.
+    Uses Python's ``ast`` module to statically parse the source without
+    executing it.  The only external import in ``required_runtime_env.py``
+    (``ENCRYPTION_KEY_ENV`` from ``app.field_encryption``) is substituted
+    with its known literal value so the name resolves during AST walking.
     """
-    # Resolve the sole external import to its known value so exec is
-    # self-contained.
+    # Substitute the sole external import with its known literal so that
+    # ENCRYPTION_KEY_ENV references in the list body resolve during walking.
     processed = source.replace(
         "from app.field_encryption import ENCRYPTION_KEY_ENV",
         'ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"',
     )
-    ns: dict[str, Any] = {}
     try:
-        exec(processed, ns)
-    except (SyntaxError, NameError, TypeError):
-        # SyntaxError: the source was not valid Python (candidate has a broken file).
-        # NameError/TypeError: the module imports something we didn't resolve.
-        # Both degrade gracefully to empty list — evidence is best-effort.
+        tree = ast.parse(processed)
+    except SyntaxError:
         return []
-    required = ns.get("REQUIRED_RUNTIME_ENV")
-    if not isinstance(required, (list, tuple)):
+
+    # Collect module-level simple string constant assignments for name resolution
+    # (e.g. ENCRYPTION_KEY_ENV = "..." or _VAR = "...").
+    str_constants: dict[str, str] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Name)
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                ):
+                    str_constants[target.id] = node.value.value
+        elif isinstance(node, ast.AnnAssign) and (
+            isinstance(node.target, ast.Name)
+            and node.value is not None
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        ):
+            str_constants[node.target.id] = node.value.value
+
+    # Find the REQUIRED_RUNTIME_ENV assignment (plain or type-annotated).
+    list_node: Any = None
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "REQUIRED_RUNTIME_ENV":
+                    list_node = node.value
+                    break
+        elif isinstance(node, ast.AnnAssign) and (
+            isinstance(node.target, ast.Name)
+            and node.target.id == "REQUIRED_RUNTIME_ENV"
+            and node.value is not None
+        ):
+            list_node = node.value
+        if list_node is not None:
+            break
+
+    if not isinstance(list_node, (ast.List, ast.Tuple)):
         return []
+
     result: list[dict[str, str]] = []
-    for entry in required:
-        name = (
-            str(entry.name)
-            if isinstance(getattr(entry, "name", None), str)
-            else None
-        )
-        scope = (
-            str(entry.scope)
-            if isinstance(getattr(entry, "scope", None), str)
-            else None
-        )
-        if isinstance(name, str) and isinstance(scope, str):
-            result.append({"name": name, "scope": scope})
+    for elt in list_node.elts:
+        if not isinstance(elt, ast.Call):
+            continue
+        name_val: str | None = None
+        scope_val: str | None = None
+        for kw in elt.keywords:
+            if kw.arg == "name":
+                name_val = _resolve_str_node(kw.value, str_constants)
+            elif kw.arg == "scope":
+                scope_val = _resolve_str_node(kw.value, str_constants)
+        if isinstance(name_val, str) and isinstance(scope_val, str):
+            result.append({"name": name_val, "scope": scope_val})
     return result
 
 

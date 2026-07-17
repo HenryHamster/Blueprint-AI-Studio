@@ -25,6 +25,7 @@ from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
+from app.field_encryption import encrypt_field
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
@@ -853,7 +854,7 @@ async def create_compute_job(
                     registry_meta["server"] = str(container_registry_auth["server"])
                 if container_registry_auth.get("username"):
                     registry_meta["username"] = str(container_registry_auth["username"])
-                registry_meta["password"] = str(container_registry_auth["password"])
+                registry_meta["password"] = encrypt_field(str(container_registry_auth["password"]))
                 polling_metadata["container_registry_auth"] = registry_meta
             else:
                 # No password: persist only server + username — password is never
@@ -4563,17 +4564,28 @@ async def _record_viewable_job_files(
     if not manifest:
         return 0
     written = 0
-    for entry in manifest:
-        if not isinstance(entry, dict):
-            continue
+    # Pre-filter to valid entries so we can batch-fetch existing rows in one
+    # query instead of N individual SELECTs (N ≤ 25 due to per-job cap).
+    valid_entries = [
+        e for e in manifest
+        if isinstance(e, dict)
+        and isinstance(e.get("storage_uri"), str) and e.get("storage_uri")
+        and isinstance(e.get("filename"), str) and e.get("filename")
+    ]
+    if not valid_entries:
+        return 0
+    all_uris = [e["storage_uri"] for e in valid_entries]
+    existing_rows_result = await session.execute(
+        select(ComputeJobFile).where(ComputeJobFile.storage_uri.in_(all_uris))
+    )
+    existing_by_uri: dict[str, ComputeJobFile] = {
+        row.storage_uri: row for row in existing_rows_result.scalars().all()
+    }
+    for entry in valid_entries:
         storage_uri = entry.get("storage_uri")
         filename = entry.get("filename")
         content_type = entry.get("content_type")
         size_bytes = entry.get("size_bytes")
-        if not isinstance(storage_uri, str) or not storage_uri:
-            continue
-        if not isinstance(filename, str) or not filename:
-            continue
         # ``kind`` comes straight from the shared extension classifier
         # ("image"/"video"); fall back to the MIME mapping only if it is absent.
         media_type = entry.get("kind")
@@ -4584,13 +4596,7 @@ async def _record_viewable_job_files(
                 else "unknown"
             )
         try:
-            existing_row = (
-                await session.execute(
-                    select(ComputeJobFile).where(
-                        ComputeJobFile.storage_uri == storage_uri
-                    )
-                )
-            ).scalars().first()
+            existing_row = existing_by_uri.get(storage_uri)
             if existing_row is not None:
                 # Mid-run registration already created the signing row.
                 # Reconcile its mutable metadata to the authoritative terminal

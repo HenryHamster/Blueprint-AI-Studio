@@ -287,7 +287,7 @@ async def _rehydrate_input_artifact_bundle(
             await asyncio.to_thread(shutil.rmtree, dest_dir, True)
             await asyncio.to_thread(os.replace, staging_dir, dest_dir)
         except OSError as exc:
-            shutil.rmtree(dest_dir, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, dest_dir, True)
             raise RuntimeError(
                 "input_artifact_rehydration_failed: extracted checkpoint could not "
                 f"be published: {exc}"

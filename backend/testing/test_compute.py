@@ -1951,7 +1951,11 @@ async def test_runner_subprocess_poll_status_exit_125_classifies_no_progress():
         },
     )
     result = await backend.poll_status(job)
-    assert result.status == ComputeJobStatus.FAILED
+    # Exit 125 is the reserved no-progress watchdog code: poll_status terminalizes
+    # it as TIMED_OUT (matching the end-to-end monitor finalize path asserted in
+    # test_runner_report_exit_125_finalizes_no_progress_through_monitor), not a
+    # generic FAILED — otherwise the platform kill misattributes to the command.
+    assert result.status == ComputeJobStatus.TIMED_OUT
     assert result.exit_code == 125
     assert "no_progress_timeout" in result.message
     assert (
@@ -16435,11 +16439,114 @@ async def test_create_compute_job_registry_auth_password_accepted_for_runner_sub
     )
 
     assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import decrypt_field
+
     persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
     assert persisted_auth is not None
     assert persisted_auth["server"] == "nvcr.io"
     assert persisted_auth["username"] == "$oauthtoken"
-    assert persisted_auth["password"] == "s3cr3t-ngc-api-key"
+    # Password is stored encrypted; decrypt to verify the round-trip.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_encrypted_at_rest(
+    db_session, monkeypatch
+):
+    """Registry password must be stored as Fernet ciphertext when a real key is configured."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import FERNET_CIPHERTEXT_PREFIX, decrypt_field
+    from app.models import LocalRunner
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    # Use a real Fernet key so encrypt_field produces actual ciphertext.
+    real_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", real_key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    project = Project(name="Registry Auth Encrypt Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "s3cr3t-ngc-api-key",
+        },
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth is not None
+    assert persisted_auth["server"] == "nvcr.io"
+    assert persisted_auth["username"] == "$oauthtoken"
+    # Password must be stored as Fernet ciphertext, not plaintext.
+    assert persisted_auth["password"] != "s3cr3t-ngc-api-key"
+    assert persisted_auth["password"].startswith(FERNET_CIPHERTEXT_PREFIX)
+    # Decryption must recover the original value.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+def test_decrypt_registry_auth_decrypts_password(monkeypatch):
+    """_decrypt_registry_auth must decrypt a Fernet-encrypted password field."""
+    from app.routers.runner import _decrypt_registry_auth
+    from app.field_encryption import encrypt_field, FERNET_CIPHERTEXT_PREFIX
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    encrypted = encrypt_field("secret-pw")
+    assert encrypted is not None and encrypted.startswith(FERNET_CIPHERTEXT_PREFIX)
+    auth = {"server": "nvcr.io", "username": "$oauthtoken", "password": encrypted}
+    result = _decrypt_registry_auth(auth)
+    assert result is not None
+    assert result["password"] == "secret-pw"
+    assert result["server"] == "nvcr.io"
+    assert result["username"] == "$oauthtoken"
+
+
+def test_decrypt_registry_auth_handles_no_password():
+    """_decrypt_registry_auth must pass through auth dicts without a password field."""
+    from app.routers.runner import _decrypt_registry_auth
+
+    auth_no_pw = {"server": "nvcr.io", "username": "$oauthtoken"}
+    result = _decrypt_registry_auth(auth_no_pw)
+    assert result == auth_no_pw
+
+    assert _decrypt_registry_auth(None) is None
 
 
 # ── Runner-subprocess backend tests ──────────────────────────────────────────

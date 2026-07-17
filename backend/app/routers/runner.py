@@ -43,6 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.auth import create_agent_token, get_current_runner
+from app.field_encryption import decrypt_field
 from app.broadcast import broadcast_to_project
 from app import storage as app_storage
 from app.runner_project_binding import allowed_project_ids
@@ -1903,6 +1904,14 @@ class ComputeJobReportRequest(BaseModel):
     viewable_omissions: Any = None
 
 
+def _decrypt_registry_auth(auth: dict | None) -> dict | None:
+    if not auth or "password" not in auth:
+        return auth
+    decrypted = dict(auth)
+    decrypted["password"] = decrypt_field(auth["password"])
+    return decrypted
+
+
 @router.post("/next-compute-job")
 async def next_compute_job(
     response: Response,
@@ -2049,7 +2058,9 @@ async def next_compute_job(
         "cwd": refreshed_meta.get("cwd"),
         "setup_step": refreshed_meta.get("setup_step"),
         "container_image": refreshed_meta.get("container_image"),
-        "container_registry_auth": refreshed_meta.get("container_registry_auth"),
+        "container_registry_auth": _decrypt_registry_auth(
+            refreshed_meta.get("container_registry_auth")
+        ),
         "runtime_deadline_seconds": refreshed_meta.get("runtime_deadline_seconds"),
         "cancel_requested": False,
         "repo_clone": repo_clone,

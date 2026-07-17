@@ -262,11 +262,6 @@ from app.release_qualifier_sweep import (
     _reconcile_hotfix_audit_trail,  # noqa: F401
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
-from app.release_hotfix_promotion import (
-    check_hotfix_scope_preview as check_hotfix_scope_preview,
-    hotfix_promote_current_version as hotfix_promote_current_version,
-)
-
 from app.migration_apply_gate import (
     MIGRATION_APPLY_SCRATCH_ENV,
     preflight_migration_apply_scratch,
@@ -8951,3 +8946,19 @@ async def maybe_finalize_qualification(
         session_factory=session_factory,
         expected_attempt_id=context.get("qualification_attempt_id"),
     )
+
+
+# ── Deferred re-export: break the release_qualifier ⟷ release_hotfix_promotion
+# circular import ─────────────────────────────────────────────────────────────
+# release_hotfix_promotion imports many symbols from THIS module at its own top
+# level (_FORCE_PROMOTE_NOOP_STATUSES, promote, compute_audited_surface_hash,
+# …). If we imported it at the top of release_qualifier, rhp would run while
+# this module was only partially initialized and fail to find those names. By
+# importing it at the very bottom — after every symbol rhp needs is defined —
+# rhp sees a fully-initialized release_qualifier. The two names remain
+# module-level attributes so `release_qualifier.hotfix_promote_current_version`
+# / `.check_hotfix_scope_preview` keep working for admin_hotfix_promote.
+from app.release_hotfix_promotion import (  # noqa: E402
+    check_hotfix_scope_preview as check_hotfix_scope_preview,
+    hotfix_promote_current_version as hotfix_promote_current_version,
+)

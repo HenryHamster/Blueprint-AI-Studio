@@ -236,7 +236,7 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host.querySelector('img')).not.toBeNull();
   });
 
-  test('an image load error surfaces a retry that re-mints the signed URL', async () => {
+  test('an image load error auto-re-resolves once before surfacing the manual retry', async () => {
     const { resolveArtifactDownloadUrl } = await import('../api');
     const pkg = makePackage({ descriptors: [imageDescriptor()] });
     await render(pkg, 'proj-1');
@@ -244,18 +244,26 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
 
     const img = host!.querySelector('img');
     expect(img).not.toBeNull();
-    // Simulate the signed URL going dead — the <img> fails to load.
-    await act(async () => { img!.dispatchEvent(new Event('error')); });
 
-    // The image is replaced by a retry affordance.
+    // First error — should trigger an automatic re-resolve (no retry button yet).
+    await act(async () => { img!.dispatchEvent(new Event('error')); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+    // Auto-resolved: image is restored, no retry button.
+    expect(host!.querySelector('img')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+
+    // Second error (auto-retry already consumed) — now shows the manual retry button.
+    const img2 = host!.querySelector('img');
+    await act(async () => { img2!.dispatchEvent(new Event('error')); });
     const retry = host!.querySelector<HTMLButtonElement>('[data-testid="strategic-artifact-retry"]');
     expect(retry).not.toBeNull();
     expect(host!.querySelector('img')).toBeNull();
 
-    // Clicking retry re-mints the URL and restores the preview.
+    // Clicking manual retry re-mints once more and restores the preview.
     await act(async () => { retry!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
-    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(3);
     expect(host!.querySelector('img')).not.toBeNull();
   });
 
@@ -287,7 +295,7 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelector('[data-testid="strategic-artifact-lightbox"]')).toBeNull();
   });
 
-  test('a video load error surfaces a retry that re-mints the signed URL', async () => {
+  test('a video load error auto-re-resolves once before surfacing the manual retry', async () => {
     const { resolveArtifactDownloadUrl } = await import('../api');
     const pkg = makePackage({
       descriptors: [
@@ -309,13 +317,22 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
 
     const video = host!.querySelector('[data-testid="strategic-artifact-video"]');
     expect(video).not.toBeNull();
-    await act(async () => { video!.dispatchEvent(new Event('error')); });
 
+    // First error — auto-re-resolves without showing a retry button.
+    await act(async () => { video!.dispatchEvent(new Event('error')); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+    expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).not.toBeNull();
+    expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
+
+    // Second error — auto-retry consumed, shows manual retry.
+    const video2 = host!.querySelector('[data-testid="strategic-artifact-video"]');
+    await act(async () => { video2!.dispatchEvent(new Event('error')); });
     const retry = host!.querySelector<HTMLButtonElement>('[data-testid="strategic-artifact-retry"]');
     expect(retry).not.toBeNull();
     await act(async () => { retry!.click(); });
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 10)); });
-    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(resolveArtifactDownloadUrl)).toHaveBeenCalledTimes(3);
     expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).not.toBeNull();
   });
 

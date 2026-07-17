@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { AlertTriangle, ArrowUpRight, BarChart3, FileImage, FileText, FileVideo, Gauge, Maximize2, Network, RefreshCw, Table2, X } from 'lucide-react';
 import type {
   StrategicContextArtifactViewablePreview,
@@ -132,6 +132,13 @@ function useFreshMediaUrl(
   const [loadError, setLoadError] = useState(false);
   // Bumped by retry() to force the resolver effect to re-run for the same ref.
   const [attempt, setAttempt] = useState(0);
+  // Ref holding the generation value for which an automatic error-retry has
+  // already been consumed. Compared against the current generation in
+  // onMediaError so each distinct media item (new storage_uri or revision) gets
+  // exactly one automatic re-resolve before the manual retry button appears.
+  // Written only inside a callback — never during render — to satisfy the
+  // react-hooks/refs lint rule.
+  const autoRetriedForGenerationRef = useRef<string | null>(null);
 
   const canResolve = Boolean(projectId && storageUri);
 
@@ -183,7 +190,17 @@ function useFreshMediaUrl(
     }
   }, [canResolve]);
 
-  const onMediaError = useCallback(() => { setLoadError(true); }, []);
+  const onMediaError = useCallback(() => {
+    // When the media element's URL fails (e.g. expired signed URL) and we have
+    // a stable storage_uri to re-resolve from, attempt one automatic re-resolve
+    // before surfacing the manual retry button — mirroring KnowledgeBrowser.
+    if (canResolve && autoRetriedForGenerationRef.current !== generation) {
+      autoRetriedForGenerationRef.current = generation;
+      setAttempt(a => a + 1);
+    } else {
+      setLoadError(true);
+    }
+  }, [canResolve, generation]);
 
   return { url, status, retry, onMediaError };
 }

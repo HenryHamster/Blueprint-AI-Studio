@@ -43,7 +43,11 @@ main = _vw.main
 
 
 def test_viewable_files_yields_matching_extensions(tmp_path):
-    """png/jpg/jpeg/webp/gif/mp4/webm are included; txt/pdf/svg are not."""
+    """png/jpg/jpeg/webp/gif/mp4/webm are included; txt and svg are not.
+
+    pdf is excluded from the VM watcher (mid-run live previews only) but IS
+    accepted by the endpoint for bundle-completion uploads.
+    """
     (tmp_path / "plot.png").write_bytes(b"x")
     (tmp_path / "clip.mp4").write_bytes(b"x")
     (tmp_path / "frame.webp").write_bytes(b"x")
