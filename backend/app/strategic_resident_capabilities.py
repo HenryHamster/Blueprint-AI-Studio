@@ -139,6 +139,12 @@ _PARAMETER_SPECS: dict[str, CapabilityParameterSpec] = {
     "reason": CapabilityParameterSpec(
         name="reason", kind=CapabilityParameterKind.string, min_length=1, max_length=2_000
     ),
+    "running_update": CapabilityParameterSpec(
+        name="running_update",
+        kind=CapabilityParameterKind.string,
+        min_length=1,
+        max_length=8_000,
+    ),
     "title": CapabilityParameterSpec(
         name="title", kind=CapabilityParameterKind.string, min_length=1, max_length=500
     ),
@@ -237,6 +243,15 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _inspect("ci.run.inspect", "github_checks", "run_id"),
     _inspect("ci.logs.inspect", "github_checks", "run_id"),
     _inspect("deployment.inspect", "deploy_health"),
+    # DB-only strategic-memory mutation: the first capability wired to the fenced
+    # receipt executor (FencedMutationWriter.set_running_update). Low-risk,
+    # contained side effect (one Project field), no external effect. Declares a
+    # ("task",) evidence precondition (an evidence item of that KIND must be
+    # supplied); note the envelope only checks kind-presence today, not that the
+    # ref is a real trusted inspection — lost-update safety comes from the field
+    # CAS (running_update_revision). Do NOT treat this as a trust boundary when
+    # wiring higher-risk capabilities. See routers/agent_resident_capabilities.py.
+    _mutate("strategy.running_update.set", "resident_strategy_memory", CapabilityRisk.low, ("running_update",), ("task",)),
     _mutate("task.dispatch", "orchestrator_runner_dispatch", CapabilityRisk.medium, ("task_id",), ("task", "runner_capacity")),
     _mutate("task.redirect", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id", "runner_id"), ("task", "runner")),
     _mutate("task.reprioritize", "task_lifecycle", CapabilityRisk.low, ("task_id", "priority"), ("task",)),

@@ -579,6 +579,167 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
     load.assert_not_awaited()
 
 
+def test_all_resident_capability_routes_are_token_allowlisted():
+    """Every capability route must be in the resident-token allowlist.
+
+    ``verify_agent_token`` 403s any resident-turn token hitting a path outside
+    ``_RESIDENT_AGENT_ALLOWED_PATHS`` before the endpoint runs, so a new endpoint
+    that isn't allowlisted is dead-on-arrival for the only tokens that call it.
+    """
+    from app.routers.agent import _RESIDENT_AGENT_ALLOWED_PATHS
+
+    paths = {route.path for route in capability_router.router.routes}
+    # Sanity-check the extraction against a known-allowlisted route, then assert
+    # every route (including /mutate) is covered.
+    assert "/api/agent/resident-turn/capability" in paths
+    missing = paths - _RESIDENT_AGENT_ALLOWED_PATHS
+    assert not missing, f"resident capability routes not token-allowlisted: {sorted(missing)}"
+
+
+def _mutation_invocation(project_id, turn_task_id, **overrides):
+    from app.strategic_resident_capability_invocation import CapabilityEvidenceRef
+
+    payload = {
+        "capability_id": "strategy.running_update.set",
+        "project_id": project_id,
+        "turn_task_id": turn_task_id,
+        "authority_generation": 3,
+        "parameters": {"running_update": "grounded working update"},
+        "operation_id": "op-strategy-1",
+        "expected_revisions": {
+            "authority_generation": 3,
+            "active_turn_task_version": 1,
+            "current_checkpoint_id": str(uuid.uuid4()),
+            "resident_checkpoint_version": 1,
+            "resident_checkpoint_hash": "a" * 64,
+            "running_update_revision": "b" * 64,
+        },
+        "evidence": (
+            CapabilityEvidenceRef(
+                kind="task",
+                project_id=project_id,
+                source_id=str(uuid.uuid4()),
+                revision="task:v1",
+                checksum="c" * 64,
+                inspected_at=datetime.now(timezone.utc),
+            ),
+        ),
+    }
+    payload.update(overrides)
+    return ResidentCapabilityInvocation.model_validate(payload)
+
+
+def _mutation_token(project_id, turn_task_id):
+    return {
+        "sub": str(turn_task_id),
+        "project_id": str(project_id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-strategy-1", status="applied", id=uuid.uuid4()
+    )
+    executor = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _mutation_invocation(project_id, turn_id),
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "applied"
+    assert result["capability_id"] == "strategy.running_update.set"
+    assert result["operation_id"] == "op-strategy-1"
+    # The fenced request is built from the token authority + declared operation_kind.
+    fenced_request = executor.await_args.args[1]
+    assert fenced_request.project_id == project_id
+    assert fenced_request.turn_task_id == turn_id
+    assert fenced_request.operation_kind == "set_running_update"
+    assert fenced_request.capability == "strategy.running_update.set"
+    assert fenced_request.risk == "low"
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    # Body targets a different turn task than the signed token authorizes.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, uuid.uuid4()),
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 403
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_501_for_capability_without_fenced_adapter(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    # task.reprioritize is a real mutate capability but has no project-field adapter.
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="task.reprioritize",
+        parameters={"task_id": str(uuid.uuid4()), "priority": 5},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_name", "expected_status"),
+    [
+        ("OperationIdentityCollision", 409),
+        ("InactiveTurnAuthority", 409),
+        ("ExpectedRevisionMismatch", 409),
+        ("AuthorityGenerationMismatch", 409),
+        ("FencedOperationUsageError", 400),
+    ],
+)
+async def test_mutation_route_maps_authority_errors(
+    monkeypatch, error_name, expected_status
+):
+    from app import strategic_operation_authority_validation as authority
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    error_cls = getattr(authority, error_name)
+    executor = AsyncMock(side_effect=error_cls("fenced rejection"))
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, turn_id),
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == expected_status
+
+
 @pytest.mark.asyncio
 async def test_lineage_inspection_stays_in_project_and_is_stable(db_session):
     project = Project(name="lineage", user_id="u")
