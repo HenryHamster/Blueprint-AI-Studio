@@ -122,10 +122,10 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # not ORM-mapped attributes; scanner cannot distinguish list reads from
     # ORM lazy-load reads that would trigger a detached-instance error.
     "metrics_integrity_sweep.py::check_capability_proof_gate_gap",
-    # session.rollback() at L4312 is inside `except ShadowResidentOwnershipError:`
-    # which immediately returns False (L4319) — no ORM read follows. The scanner
-    # conflates this with the separate `except Exception:` block that references
-    # new_task.id, but the rollback path never reaches it.
+    # project.id at the logger.warning() after ShadowResidentOwnershipError rollback
+    # is the loaded PK UUID (always in-memory as the object's identity key, not
+    # a lazy-load attribute); cycle_id is a local Python UUID, not an ORM column;
+    # return False immediately follows so no further ORM access occurs.
     "strategic_spawning.py::_spawn_design_doc_update",
 })
 

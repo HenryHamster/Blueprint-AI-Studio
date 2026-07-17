@@ -4,10 +4,24 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy.dialects import postgresql
 
-from app.models import Task, TaskStatus
-from app.operator_attention import _local_runner_hold_preview_statement
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Project,
+    ProjectMember,
+    Task,
+    TaskStatus,
+)
+from app.operator_attention import (
+    _local_runner_hold_preview_statement,
+    build_operator_attention,
+    get_operator_message_counts,
+)
+
+TEST_USER_ID = "test-user-attn-alert"
 
 
 def test_local_runner_hold_union_keeps_narrow_task_projection():
@@ -36,3 +50,93 @@ def test_local_runner_hold_union_keeps_narrow_task_projection():
     assert "payloads" not in sql
     assert "api_call_summary" not in sql
     assert "fix_loop_history" not in sql
+
+
+async def _seed_alert_project(db_session) -> Project:
+    """Create a project (owner member) for alert-audience assertions."""
+    project = Project(name="Alert audience", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+    return project
+
+
+def _add_alert(db_session, project_id, *, severity, event_type, title):
+    db_session.add(
+        Alert(
+            project_id=project_id,
+            severity=severity,
+            title=title,
+            message=f"{title} body",
+            event_type=event_type,
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategist_internal_alerts_excluded_from_operator_attention(db_session):
+    """Alert rows whose event_type is registered strategist-internal must not
+    reach the operator badge count, severity aggregate, or ERROR/WARNING preview.
+
+    Untagged (NULL event_type) legacy alerts and operator-visible alerts are
+    retained. Exercises all three Alert query paths in operator_attention.py that
+    now apply operator_visible_alert_filter(Alert.event_type).
+    """
+    project = await _seed_alert_project(db_session)
+
+    # Operator-visible + legacy-NULL alerts are retained.
+    _add_alert(
+        db_session,
+        project.id,
+        severity=AlertSeverity.ERROR,
+        event_type="task.failed",
+        title="Operator-visible error",
+    )
+    _add_alert(
+        db_session,
+        project.id,
+        severity=AlertSeverity.WARNING,
+        event_type=None,
+        title="Legacy untagged warning",
+    )
+    # Strategist-internal alerts must be filtered out of every operator surface.
+    _add_alert(
+        db_session,
+        project.id,
+        severity=AlertSeverity.ERROR,
+        event_type="warm_pool.payoff",
+        title="Internal payoff error",
+    )
+    _add_alert(
+        db_session,
+        project.id,
+        severity=AlertSeverity.WARNING,
+        event_type="hotfix_backmerge.size_violation",
+        title="Internal size-violation warning",
+    )
+    await db_session.commit()
+
+    # (b)+(c) severity aggregate + preview via build_operator_attention.
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+    counts = attention["counts"]
+    assert counts["error_alerts"] == 1, "only the operator-visible ERROR alert counts"
+    assert counts["warning_alerts"] == 1, "only the legacy-NULL WARNING alert counts"
+    assert counts["alerts"] == 2
+
+    alert_titles = {
+        item["label"] for item in attention["items"] if item["kind"] == "alert"
+    }
+    assert "Operator-visible error" in alert_titles
+    assert "Legacy untagged warning" in alert_titles
+    assert "Internal payoff error" not in alert_titles
+    assert "Internal size-violation warning" not in alert_titles
+
+    # (a) cross-tab badge count via get_operator_message_counts.
+    message_counts = await get_operator_message_counts(db_session, project.id)
+    assert message_counts["active_alerts"] == 2, (
+        "badge count excludes both strategist-internal alerts"
+    )

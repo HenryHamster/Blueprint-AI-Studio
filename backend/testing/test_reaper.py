@@ -13792,6 +13792,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
     STALE_OPEN_DECAY_DAYS,
+    STALE_QUESTION_DECAY_DAYS,
 )
 
 
@@ -13917,8 +13918,9 @@ async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
-    """Recent NOTEs and BLOCKER are never decayed; stale QUESTIONs are."""
+    """Recent NOTEs, BLOCKER, and QUESTIONs under 30d are never decayed."""
     project = await _make_project(reaper_db)
+    # 19 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
     old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
     recent_note = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.NOTE
@@ -13926,20 +13928,24 @@ async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
     live_blocker = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
     )
+    # QUESTION at 19 days: below STALE_QUESTION_DECAY_DAYS (30d), must survive
+    young_question = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
 
     acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
 
     assert acted == 0
-    for m in (recent_note, live_blocker):
+    for m in (recent_note, live_blocker, young_question):
         await reaper_db.refresh(m)
         assert m.status == "open"
 
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
-    """An OPEN QUESTION with no activity past the decay window is auto-decayed."""
+    """An OPEN QUESTION past the 30-day question window is auto-decayed as 'stale_unanswered'."""
     project = await _make_project(reaper_db)
-    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    old = _utcnow() - timedelta(days=STALE_QUESTION_DECAY_DAYS + 1)
     msg = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
     )
@@ -13949,7 +13955,48 @@ async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
     assert acted == 1
     await reaper_db.refresh(msg)
     assert msg.status == "resolved"
-    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolution == "stale_unanswered"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_survives_short_window(reaper_db):
+    """An OPEN QUESTION older than NOTE decay window (14d) but younger than the
+    question window (30d) must NOT be decayed — questions get more patience."""
+    project = await _make_project(reaper_db)
+    # 15 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
+    mildly_old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=mildly_old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_respects_runtime_config(reaper_db, monkeypatch):
+    """'stale_question_decay_days' runtime config overrides the default 30-day window."""
+    import app.shared_state as _ss
+
+    project = await _make_project(reaper_db)
+    # 5 days old — within default window (30d) but past the custom window (3d)
+    slightly_old = _utcnow() - timedelta(days=5)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=slightly_old
+    )
+
+    original = dict(_ss.runtime_config)
+    monkeypatch.setattr(_ss, "runtime_config", {**original, "stale_question_decay_days": 3})
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+    monkeypatch.setattr(_ss, "runtime_config", original)
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
 
 
 @pytest.mark.asyncio

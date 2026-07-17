@@ -10886,6 +10886,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "repo_bootstrap": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
+        "strategic_resident_turn": "none",
     }
     assert EVALUATION_STRATEGY_BY_TASK_TYPE == expected_registry, (
         "TaskType evaluation registry has drifted from the locked spec. "

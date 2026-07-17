@@ -189,7 +189,7 @@ async def _seed_for_finalize(
         mg_task = Task(
             project_id=project.id,
             title="merge-grade",
-            payloads=[{"type": "release_merge_grade", "base_branch": "main"}],
+            payloads=[{"type": "release_merge_grade", "base_branch": "main", "categories": []}],
             vm_instance_id="vm-merge-grade",
             status=TaskStatus.COMPLETED,
             context={"candidate_sha": _candidate_sha},

@@ -2500,6 +2500,35 @@ class TestRunnerEndpoints:
             _clear_pool()
 
     @pytest.mark.asyncio
+    async def test_draining_runner_does_not_pull_new_task(
+        self, client: AsyncClient, db_session
+    ):
+        """Drain prevents a race from handing new agent work to the host."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, status="draining"
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "must stay unpulled"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 204
+        await db_session.refresh(task)
+        assert task.started_at is None
+        assert task.status == TaskStatus.PROVISIONING
+
+    @pytest.mark.asyncio
     async def test_next_task_returns_credentials_when_pool_account_resolved(
         self, client: AsyncClient, db_session
     ):
@@ -4465,11 +4494,15 @@ class TestRunnerEndpoints:
             "enroot_ok": False,
             "systemd_run_ok": True,
         }
+        passthrough = {
+            "apptainer": {"verified": True, "mode": "nv", "reason": "verified"}
+        }
         resp = await client.post(
             "/api/runner/heartbeat",
             json={
                 "version": "v22-15-gabc1234-dirty",
                 "isolation_backends": inventory,
+                "container_gpu_passthrough": passthrough,
                 "agent_backend": "bwrap",
                 "compute_backend": "bwrap",
             },
@@ -4479,6 +4512,7 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.version == "v22-15-gabc1234-dirty"
         assert runner.capabilities["isolation_backends"] == inventory
+        assert runner.capabilities["container_gpu_passthrough"] == passthrough
         assert runner.capabilities["agent_backend"] == "bwrap"
         assert runner.capabilities["compute_backend"] == "bwrap"
 
@@ -4498,6 +4532,7 @@ class TestRunnerEndpoints:
         assert resp.status_code == 200
         await db_session.refresh(runner)
         assert "isolation_backends" not in runner.capabilities
+        assert "container_gpu_passthrough" not in runner.capabilities
         assert "agent_backend" not in runner.capabilities
         assert "compute_backend" not in runner.capabilities
 

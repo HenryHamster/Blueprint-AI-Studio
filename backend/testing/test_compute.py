@@ -1984,6 +1984,73 @@ async def test_stranded_runner_subprocess_sweep_protects_paused_draining_runners
 
 
 @pytest.mark.asyncio
+async def test_draining_runner_finishes_in_flight_job_without_new_dispatch(
+    client, db_session
+):
+    """Drain is a quiesce contract: preserve active work and refuse new claims.
+
+    The runner-side worker interprets ``cancel_requested: false`` on its normal
+    running report as permission to keep the healthy subprocess alive.  This
+    exercises that report path through normal completion, while separately
+    proving the next-compute-job pull cannot claim work after the runner drains.
+    """
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Runner drain contract")
+    runner, token = await _register_runner(db_session, project)
+    in_flight = await _make_runner_subprocess_job(db_session, project, runner)
+    queued = await _make_runner_subprocess_job(
+        db_session, project, runner, status=ComputeJobStatus.STARTING
+    )
+
+    # This mirrors the admin drain transition after the in-flight subprocess has
+    # already been claimed.  The recent heartbeat must continue to prove liveness.
+    runner.status = "draining"
+    runner.last_seen_at = now
+    await db_session.commit()
+
+    running = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "running"},
+    )
+    assert running.status_code == 200, running.text
+    assert running.json()["cancel_requested"] is False
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession
+    )
+    assert await sweep_stranded_runner_subprocess_compute_jobs(
+        db_session,
+        now,
+        session_factory=session_factory,
+    ) == 0
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.RUNNING
+    assert in_flight.terminal_reason is None
+
+    no_dispatch = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert no_dispatch.status_code == 204
+    await db_session.refresh(queued)
+    assert queued.status == ComputeJobStatus.STARTING
+
+    completed = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "succeeded", "exit_code": 0},
+    )
+    assert completed.status_code == 200, completed.text
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.SUCCEEDED
+    assert in_flight.terminal_reason != "runner_subprocess_runner_dead"
+
+
+@pytest.mark.asyncio
 async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_monitor(
     client, db_session
 ):

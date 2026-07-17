@@ -127,6 +127,9 @@ def test_build_runner_device_full_caps():
                 "gpu_names": ["Tesla V100-SXM2-16GB"] * 8,
                 "gpu_memory_total_mib": [16384] * 8,
                 "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+                "container_gpu_passthrough": {
+                    "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+                },
                 "active_task_ids": ["a", "b"],
                 "active_compute_job_ids": ["c"],
             },
@@ -153,6 +156,36 @@ def test_build_runner_device_skips_absent_vram_and_bounds_models():
     assert "gpu_vram_mib" not in device  # older runner: key omitted, never 0
     assert len(device["gpu_models"]) == DEVICES_MAX_GPU_MODELS
     assert device["container_ok"] is False
+    assert device["gpu_in_container_ok"] is False
+
+
+def test_build_runner_device_uses_selected_runtime_and_mode_proof():
+    """A lower-priority runtime's proof cannot authorize selected Docker."""
+    device = build_runner_device(
+        _runner(
+            {
+                "gpu_count": 1,
+                "isolation_backends": {
+                    "docker_usable": True,
+                    "docker_cdi_gpu": True,
+                    "podman_usable": True,
+                },
+                "container_gpu_passthrough": {
+                    "docker": {
+                        "verified": True,
+                        "mode": "hook",
+                        "reason": "verified",
+                    },
+                    "podman": {
+                        "verified": True,
+                        "mode": "hook",
+                        "reason": "verified",
+                    },
+                },
+            }
+        )
+    )
+    assert device["container_ok"] is True
     assert device["gpu_in_container_ok"] is False
 
 

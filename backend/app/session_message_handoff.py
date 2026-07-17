@@ -27,10 +27,9 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import ProjectMessage
+from app.models import MessageHandlingState, ProjectMessage
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +47,8 @@ async def handoff_session_messages(
 
     Queries ``ProjectMessage`` rows where ``status='open'`` and
     ``resident_session_id`` matches the ending session, then marks each one
-    ``status='resolved'``, ``resolution='session_handoff'``, ``resolved_at=now``,
-    appending checkpoint metadata to ``context``.
+    ``status='resolved'``, ``handling_state='responded'``,
+    ``resolution='session_handoff'``, ``resolved_at=now``.
 
     Returns the number of messages resolved (0 when the column is absent or no
     messages match). Does NOT commit — callers commit after verifying the count
@@ -80,16 +79,11 @@ async def handoff_session_messages(
         return 0
 
     now = _utcnow_naive()
-    now_iso = now.isoformat()
     for msg in messages:
         msg.status = "resolved"
+        msg.handling_state = MessageHandlingState.RESPONDED
         msg.resolution = "session_handoff"
         msg.resolved_at = now
-        ctx = dict(msg.context or {})
-        ctx["session_handoff_at"] = now_iso
-        ctx["session_id"] = resident_session_id
-        msg.context = ctx
-        flag_modified(msg, "context")
         session.add(msg)
 
     logger.info(
