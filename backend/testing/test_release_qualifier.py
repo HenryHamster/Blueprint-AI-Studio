@@ -19459,14 +19459,17 @@ class TestFinalizeInfraFailure:
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_classification(self, db_session):
-        """3 consecutive gate errors stay identical despite child diagnostics."""
+        """Volatile per-attempt details do not hide a persistent gate failure."""
         from app import release_qualifier_audit as rqa
 
         project, version = await _make_project_and_version(db_session)
         sig = "migration_apply:unknown:migration_apply_check_unavailable"
         same_entry = {
             "finalized_at": "2026-07-10T00:00:00",
-            "error": "migration_apply_check_unavailable",
+            "error": (
+                "migration_apply_check_unavailable: scratch database "
+                "blueprint_migration_attempt_a unavailable"
+            ),
             "signature": sig,
             "candidate_sha": "dead" * 10,
             "failing_leg": "migration_apply",
@@ -19483,7 +19486,11 @@ class TestFinalizeInfraFailure:
             "prior_infra_streak": 2,
             "infra_attempt_history": [
                 dict(same_entry, finalized_at="2026-07-10T00:00:00"),
-                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+                dict(
+                    same_entry,
+                    finalized_at="2026-07-10T00:01:00",
+                    error="migration_apply_check_unavailable: connection id 8472",
+                ),
             ],
         }
         db_session.add(version)
@@ -19494,7 +19501,7 @@ class TestFinalizeInfraFailure:
             db_session,
             version,
             dict(version.last_qualification),
-            "migration_apply_check_unavailable",
+            "migration_apply_check_unavailable: scratch database attempt_c timed out",
         )
         await db_session.commit()
 
@@ -19523,6 +19530,8 @@ class TestFinalizeInfraFailure:
         assert "whole-tree force-promotion" in latest.message
         assert "agent VM" not in latest.message
         assert "clone pipeline" not in latest.message
+        assert latest.message.count("Sanctioned remediation:") == 1
+        assert "Sanctioned Sanctioned" not in latest.message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_different_signature(
@@ -19560,13 +19569,13 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
         await db_session.refresh(version)
 
-        # The current call has a DIFFERENT error (carries a detail suffix) than the prior
-        # two entries, so the per-signature streak should reset to 1.
+        # A genuinely different stable gate code resets the per-signature streak.
+        # Merely changing the diagnostic suffix is covered by the test above.
         result = await rqa._handle_infra_failure(
             db_session,
             version,
             dict(version.last_qualification),
-            "migration_apply_check_unavailable:unreachable",
+            "migration_apply_scratch_provision_failed: unreachable",
         )
         await db_session.commit()
 

@@ -192,10 +192,14 @@ def _infra_failure_signature(
 
     Child task failures are useful evidence, but are unrelated to a deterministic
     gate error (and can vary between attempts).  Including them made a stable
-    migration gate look transient and prevented incapacity escalation.
+    migration gate look transient and prevented incapacity escalation.  The
+    suffix after the first colon is diagnostic detail too (scratch database names,
+    exception text, and other per-attempt values), so only the stable error code
+    participates in the signature.
     """
     del child_failures
-    return f"{_infer_infra_leg(infra_error)}:unknown:{infra_error}"
+    stable_error_code = infra_error.partition(":")[0].strip()
+    return f"{_infer_infra_leg(infra_error)}:unknown:{stable_error_code}"
 
 
 async def _collect_terminal_infra_child_events(
@@ -1064,7 +1068,7 @@ async def _handle_infra_failure(
                 f"The migration-apply gate for v{version.version_number} is "
                 f"persistently incapable across {same_signature_streak} "
                 f"same-signature attempts ({infra_error!r}) — the underlying "
-                f"condition will not self-resolve by retry. Sanctioned "
+                f"condition will not self-resolve by retry. "
                 f"{preview_text}Sanctioned remediation: use the hotfix scope "
                 f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
                 f"not whole-tree force-promotion. "
