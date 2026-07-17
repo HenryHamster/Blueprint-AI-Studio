@@ -10883,6 +10883,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "web_research": "forward-quality",
         "design": "forward-quality",
         "repo_bootstrap": "none",
+        "strategic_resident_turn": "none",
         "salvage_bundle": "code-ci-review",
         "capability_proof_trial": "none",
     }

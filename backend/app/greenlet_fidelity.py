@@ -122,11 +122,16 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # not ORM-mapped attributes; scanner cannot distinguish list reads from
     # ORM lazy-load reads that would trigger a detached-instance error.
     "metrics_integrity_sweep.py::check_capability_proof_gate_gap",
+    # session.rollback() at L4312 is inside `except ShadowResidentOwnershipError:`
+    # which immediately returns False (L4319) — no ORM read follows. The scanner
+    # conflates this with the separate `except Exception:` block that references
+    # new_task.id, but the rollback path never reaches it.
+    "strategic_spawning.py::_spawn_design_doc_update",
 })
 
 # Monotonic ceiling for the rollback-flow allowlist: can only shrink as entries
 # are fixed at the production code level. Bump when adding a new entry.
-ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 8
+ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 9
 
 
 def rollback_flow_allowlist_within_ceiling() -> bool:

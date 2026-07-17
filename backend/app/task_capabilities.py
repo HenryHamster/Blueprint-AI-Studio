@@ -1015,6 +1015,7 @@ AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.investigate.value,
         TaskType.memo.value,
         TaskType.repo_bootstrap.value,
+        TaskType.strategic_resident_turn.value,
         *STRATEGIC_TASK_TYPES,
     }
 )
