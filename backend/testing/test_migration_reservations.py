@@ -210,6 +210,66 @@ async def test_no_github_config_uses_local_head(db_session):
 
 
 @pytest.mark.asyncio
+async def test_empty_github_listing_falls_back_to_local_head(db_session, monkeypatch):
+    """Empty GitHub listing (404/greenfield) must fall back to local head, not "0000".
+
+    list_versions_at_ref returns [] on HTTP 404 (no migrations directory).
+    Prior to the fix, _head_from_migration_filenames([]) returned the truthy
+    "0000" string, bypassing the local-head fallback and letting allocations
+    collide with the existing chain.
+    """
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+
+    async def token(*_args):
+        return "read-token"
+
+    async def empty_listing(*_args, **_kwargs):
+        # Simulates HTTP 404: list_versions_at_ref contract returns [] on 404.
+        return []
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", empty_listing)
+
+    reservation = await allocate_migration_reservation(db_session, task)
+
+    # Must allocate above the LOCAL head (0151), not above "0000".
+    assert reservation.provisional_down_revision == "0151"
+    assert reservation.provisional_revision == "0152"
+
+
+@pytest.mark.asyncio
+async def test_github_listing_with_no_numeric_filenames_falls_back_to_local_head(
+    db_session, monkeypatch
+):
+    """A listing with no parseable numeric revisions is treated as empty → local fallback."""
+    project = await _make_project(db_session)
+    project.github_owner = "acme"
+    project.github_repo = "widget"
+    db_session.add(project)
+    await db_session.commit()
+    task = await _make_task(db_session, project.id)
+
+    async def token(*_args):
+        return "read-token"
+
+    async def non_numeric_listing(*_args, **_kwargs):
+        return ["env.py", "README.md"]
+
+    monkeypatch.setattr("app.github_auth.get_repo_installation_read_token", token)
+    monkeypatch.setattr("app.github.list_versions_at_ref", non_numeric_listing)
+
+    reservation = await allocate_migration_reservation(db_session, task)
+
+    assert reservation.provisional_down_revision == "0151"
+    assert reservation.provisional_revision == "0152"
+
+
+@pytest.mark.asyncio
 async def test_considers_active_reservations_for_monotonic_numbering(db_session):
     project = await _make_project(db_session)
     task_a = await _make_task(db_session, project.id)

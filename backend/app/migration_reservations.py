@@ -187,23 +187,32 @@ def _effective_task_base_branch(task: Task, project: Project) -> str:
     )
 
 
-def _head_from_migration_filenames(filenames: list[str]) -> str:
-    """Return the numeric migration-id floor advertised by a repository listing."""
+def _head_from_migration_filenames(filenames: list[str]) -> str | None:
+    """Return the numeric migration-id floor advertised by a repository listing.
+
+    Returns ``None`` when no parseable numeric revision ids are found, signalling
+    the caller to fall back to the local merged-chain head.
+    """
     revisions = [
         name.split("_", 1)[0]
         for name in filenames
         if name.split("_", 1)[0].isdigit()
     ]
-    return max(revisions, key=int) if revisions else "0000"
+    return max(revisions, key=int) if revisions else None
 
 
 async def _task_base_migration_head(session, task: Task) -> str | None:
     """Remote migration head for the task's effective base branch.
 
     Returns ``None`` when no GitHub repository is configured (caller falls back
-    to the local merged head).  When a repository IS configured, any failure
-    (missing token, network error, API error) propagates — a stale-local-head
-    fallback in that case would recreate the pre-#15085 stale-chain reservation.
+    to the local merged head), or when the remote versions directory is absent
+    (HTTP 404) or contains no parseable migration filenames (greenfield branch).
+    In both cases the local merged-chain head is the safe floor to allocate from.
+
+    When a repository IS configured and the directory exists, any non-404 failure
+    (missing token, network error, non-200 API error) propagates — a
+    stale-local-head fallback in that case would recreate the pre-#15085
+    stale-chain reservation.
     """
     project = await session.get(Project, task.project_id)
     if project is None or not project.github_owner or not project.github_repo:
@@ -236,7 +245,14 @@ async def _task_base_migration_head(session, task: Task) -> str | None:
             f"cannot safely determine task-base migration head for "
             f"{project.github_owner}/{project.github_repo}: {exc}"
         ) from exc
-    return _head_from_migration_filenames(filenames)
+    # list_versions_at_ref returns [] on HTTP 404 (no migrations directory —
+    # greenfield repo or branch without migrations yet). An empty listing, or
+    # one with no parseable numeric revision ids, is indistinguishable from
+    # "listing unavailable" at this layer. Return None so the allocator falls
+    # back to the local merged-chain head rather than silently resolving to
+    # the fake "0000" floor, which bypasses all existing chain history and
+    # enables migration revision collisions.
+    return _head_from_migration_filenames(filenames)  # None on empty/non-numeric
 
 
 async def allocate_migration_reservation(
@@ -389,9 +405,9 @@ async def _lock_task(session, task_id: uuid.UUID) -> Task | None:
 
 
 __all__ = [
-    "allocate_migration_reservation",
-    "finalize_migration_reservation",
-    "expire_migration_reservation",
-    "get_migration_reservation_for_task",
     "MigrationHeadUnavailableError",
+    "allocate_migration_reservation",
+    "expire_migration_reservation",
+    "finalize_migration_reservation",
+    "get_migration_reservation_for_task",
 ]
