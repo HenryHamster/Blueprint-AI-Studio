@@ -93,6 +93,7 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
+from app.acceptance_gate import check_required_diff_paths
 from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.acceptance_gate import stamp_changed_files_signal
 from app.time_utils import _utcnow, exponential_backoff, set_retry_after
@@ -1715,6 +1716,24 @@ async def update_agent_status(
             task, session, payload.consumed_artifact_ids, modern_agent=True
         )
     session.add(task)
+
+    # Enforce required_diff_paths contract — fail-closed when declared, for ALL
+    # COMPLETED submissions regardless of artifact_type (PR, commit, or none).
+    if payload.status == TaskStatus.COMPLETED:
+        _missing_paths = check_required_diff_paths(
+            task, payload.changed_files or []
+        )
+        if _missing_paths:
+            _missing_list = ", ".join(repr(p) for p in _missing_paths)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PR diff is missing required path(s): {_missing_list}. "
+                    "The task payload declared required_diff_paths that must "
+                    "all appear in the PR diff. Ensure the PR touches every "
+                    "declared path before marking the task complete."
+                ),
+            )
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).
     # Audit 2026-04-25 A14: pre-check is non-locking — two concurrent status POSTs
