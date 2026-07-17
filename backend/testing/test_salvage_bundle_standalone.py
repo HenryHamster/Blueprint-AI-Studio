@@ -22,6 +22,26 @@ Findings covered here (prior 16-finding bundle):
   #14       — acceptance-evidence minting runs deployed-side (release_qualifier_sweep.py)
   #15 / #16 — operator hotfix-deploy channel exists (admin_hotfix_promote.py, release_hotfix_promotion.py)
 
+Findings covered here (18-finding keyless-encryption / release-recovery salvage bundle, 2026-07-17):
+  e1  — decrypt_field returns value unchanged when Fernet token cannot be decrypted (wrong key)
+  e2  — probe_key_continuity fails closed when configured key cannot decrypt reference ciphertext
+  e3  — assert_plaintext_or_raise raises RuntimeError for wrong-key ciphertext (not passed as plaintext)
+  e4  — MultiFernet contract: encrypt with first key, decrypt with any configured key
+  e5  — _get_fernet returns None for malformed GITHUB_PAT_ENCRYPTION_KEY (not crash)
+  e6  — (scratch-DB degraded, not boot-fatal) → already pinned by existing test_scratch_db_url_* tests
+  e7  — (gate-defer signature isolated) → already pinned by existing test_infra_failure_signature_* tests
+  e8  — (timed-out children contained) → already pinned by existing test_cancel_qualifier_children_* tests
+  e9  — (deterministic defects block) → already pinned by existing test_deterministic_migration_defect_* tests
+  e10 — (env-preflight independent blocker) → already pinned by existing test_env_preflight_* tests
+  e11 — auto_qualification_triggers knob controls only the generic trigger sweep, not bespoke re-drivers
+  e12 — (orphan promotion containment) → already pinned by existing test_bare_claim_promotion_* test
+  e13 — (data-migration proof gate) → already pinned by existing test_data_migration_proof_gate_* tests
+  e14 — (UI hotfix remediation) → already pinned by existing test_version_lifecycle_panel_* test
+  e15 — (scratch prereq, not boot req) → already pinned by existing test_scratch_db_url_* tests
+  e16 — _MIN_INFRA_ERROR_STREAK == 3 (permanent gate incapacity streak threshold)
+  e17 — hotfix endpoint validates non-empty reason and ack_inert_until_deploy before promoting
+  e18 — (acceptance evidence deployed-side, hotfix channel) → pinned by existing tests above
+
 Findings covered here (7-finding compute-images bundle):
   cb-1 — dispatch reads ProjectComputeImage to resolve default container image
   cb-2 — GPU-in-container capability is required for jobs declaring both container_image and GPU
@@ -2313,4 +2333,256 @@ def test_stale_question_decay_days_constant_is_correct():
     assert STALE_QUESTION_DECAY_DAYS > STALE_OPEN_DECAY_DAYS, (
         "QUESTION decay window must exceed the NOTE/FEEDBACK window "
         f"({STALE_OPEN_DECAY_DAYS}d) — questions deserve more patience"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 18-finding keyless-encryption / release-recovery salvage bundle (2026-07-17)
+# --------------------------------------------------------------------------- #
+
+
+# e1 — decrypt_field returns value unchanged when Fernet token cannot be decrypted
+# --------------------------------------------------------------------------- #
+
+
+def test_decrypt_field_returns_value_unchanged_for_undecryptable_ciphertext(monkeypatch):
+    """decrypt_field must return the raw value when the configured key cannot decrypt it.
+
+    Finding e1 claim: decrypt_field returns its input unchanged when a valid Fernet
+    token cannot be decrypted with the configured key.  This is the backward-compat
+    path that keeps a rolling deploy from breaking existing unencrypted rows — but it
+    also fires on a wrong-key rotation, which probe_key_continuity guards against.
+    """
+    from cryptography.fernet import Fernet
+    from app import field_encryption
+
+    key_a = Fernet.generate_key()
+    key_b = Fernet.generate_key()
+
+    token = Fernet(key_a).encrypt(b"sensitive-value").decode()
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key_b.decode())
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    result = field_encryption.decrypt_field(token)
+    assert result == token, (
+        "decrypt_field must return the undecryptable ciphertext unchanged (not raise) "
+        "when the configured key differs from the encryption key — this is the rolling-deploy "
+        "backward-compat path; probe_key_continuity is the guard that prevents silent data loss"
+    )
+
+
+# e2 — probe_key_continuity fails closed when configured key cannot decrypt reference ciphertext
+# --------------------------------------------------------------------------- #
+
+
+def test_probe_key_continuity_fails_closed_for_incompatible_key(monkeypatch):
+    """probe_key_continuity must raise RuntimeError when the configured key is wrong.
+
+    Finding e2 claim: the boot-time continuity probe (probe_key_continuity) decrypts
+    a canonical reference ciphertext with the CURRENT key; if the key has been rotated
+    without re-encrypting at-rest data, InvalidToken fires and a RuntimeError is raised
+    so the service fails closed rather than silently serving the wrong plaintexts.
+    """
+    from cryptography.fernet import Fernet
+    import pytest
+    from app import field_encryption
+
+    wrong_key = Fernet.generate_key()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", wrong_key.decode())
+
+    with pytest.raises(RuntimeError, match="continuity"):
+        field_encryption.probe_key_continuity("test-context")
+
+
+# e3 — assert_plaintext_or_raise raises for wrong-key ciphertext
+# --------------------------------------------------------------------------- #
+
+
+def test_assert_plaintext_or_raise_raises_for_wrong_key_ciphertext(monkeypatch):
+    """assert_plaintext_or_raise must raise when a Fernet ciphertext can't be decrypted.
+
+    Finding e3 / Finding 1 claim: Migration 0531 uses decrypt_field(value)==value as
+    evidence that the value is plaintext.  assert_plaintext_or_raise is the guard that
+    prevents a backfill migration from re-encrypting a ciphertext that happens to be
+    undecryptable with the current key (wrong-key rotation scenario).
+    """
+    from cryptography.fernet import Fernet
+    import pytest
+    from app import field_encryption
+
+    key_a = Fernet.generate_key()
+    key_b = Fernet.generate_key()
+
+    token = Fernet(key_a).encrypt(b"secret").decode()
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key_b.decode())
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    with pytest.raises(RuntimeError, match="Wrong-key ciphertext"):
+        field_encryption.assert_plaintext_or_raise(token)
+
+
+# e4 — MultiFernet encrypts with first key, decrypts with any configured key
+# --------------------------------------------------------------------------- #
+
+
+def test_multifernet_encrypts_with_first_key_decrypts_with_all():
+    """The cryptography library's MultiFernet must encrypt with the first key and
+    decrypt with any configured key.
+
+    Finding e4 / Finding 2 claim: the official MultiFernet contract encrypts with the
+    first key, decrypts with every configured key, and supports explicit token rotation.
+    Blueprint's key-rotation design relies on this contract.
+    """
+    from cryptography.fernet import Fernet, MultiFernet
+
+    key_primary = Fernet.generate_key()
+    key_fallback = Fernet.generate_key()
+
+    f_primary = Fernet(key_primary)
+    f_fallback = Fernet(key_fallback)
+
+    mf = MultiFernet([f_primary, f_fallback])
+    token = mf.encrypt(b"rotate-me")
+
+    assert f_primary.decrypt(token) == b"rotate-me", (
+        "MultiFernet must encrypt with the first (primary) key — "
+        "the primary Fernet instance must be able to decrypt the token directly"
+    )
+    assert mf.decrypt(token) == b"rotate-me", (
+        "MultiFernet must decrypt with any of its configured keys"
+    )
+
+    mf_fallback_only = MultiFernet([f_fallback, f_primary])
+    rotated = mf_fallback_only.rotate(token)
+    assert f_fallback.decrypt(rotated) == b"rotate-me", (
+        "MultiFernet.rotate must re-encrypt with the new primary key "
+        "(fallback-only federation re-encrypts under the fallback key)"
+    )
+
+
+# e5 — _get_fernet returns None for malformed GITHUB_PAT_ENCRYPTION_KEY
+# --------------------------------------------------------------------------- #
+
+
+def test_get_fernet_returns_none_for_malformed_key(monkeypatch):
+    """_get_fernet must return None (not raise) when the env var contains an invalid key.
+
+    Finding e5 / Finding 3 claim: field_encryption._get_fernet catches an invalid
+    GITHUB_PAT_ENCRYPTION_KEY and returns None, so is_encryption_active() returns
+    False identically for a missing key and a malformed key.  require_encryption_active()
+    is the stricter call that distinguishes the two cases.
+    """
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "not-a-valid-fernet-key")
+    monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+    from app import field_encryption
+
+    result = field_encryption._get_fernet()
+    assert result is None, (
+        "_get_fernet must return None for an invalid GITHUB_PAT_ENCRYPTION_KEY "
+        "rather than raising — is_encryption_active() depends on this None-return "
+        "to distinguish 'key absent' from 'key malformed'; require_encryption_active() "
+        "is the discriminating guard for backfill migrations"
+    )
+
+    assert not field_encryption.is_encryption_active(), (
+        "is_encryption_active() must return False when the key is malformed — "
+        "this conflation is intentional: callers that need to distinguish missing vs "
+        "malformed MUST use require_encryption_active()"
+    )
+
+
+# e11 — auto_qualification_triggers knob controls only the generic trigger sweep
+# --------------------------------------------------------------------------- #
+
+
+def test_infra_failure_redrive_is_independent_of_auto_qualification_triggers_knob():
+    """Bespoke infra_failure and deferred_unsynced re-drivers must NOT check the
+    auto_qualification_triggers runtime-config knob.
+
+    Finding e11 / Finding 9 claim: the auto_qualification_triggers knob controls
+    only the generic trigger sweep (sweep_auto_qualification_triggers), not the
+    bespoke loops (_redrive_infra_failure_qualification and
+    _redrive_deferred_unsynced_qualification).  If the bespoke re-drivers checked
+    the knob they could stall forever when the knob is 'observe' or 'off'.
+    """
+    import inspect
+    from app.release_qualifier_redrive import (
+        _redrive_infra_failure_qualification,
+        _redrive_deferred_unsynced_qualification,
+    )
+
+    for fn in (_redrive_infra_failure_qualification, _redrive_deferred_unsynced_qualification):
+        source = inspect.getsource(fn)
+        assert "auto_qualification_triggers" not in source, (
+            f"{fn.__name__} must NOT check auto_qualification_triggers — "
+            "the bespoke re-drivers run unconditionally; only the generic "
+            "sweep_auto_qualification_triggers function respects the knob"
+        )
+        assert "get_auto_qualification_triggers_mode" not in source, (
+            f"{fn.__name__} must NOT call get_auto_qualification_triggers_mode() — "
+            "bespoke re-drivers are not gated by the observe/on/off policy"
+        )
+
+
+# e16 — _MIN_INFRA_ERROR_STREAK == 3
+# --------------------------------------------------------------------------- #
+
+
+def test_permanent_gate_incapacity_min_infra_error_streak_is_three():
+    """_MIN_INFRA_ERROR_STREAK must equal 3 (the design-specified streak threshold).
+
+    Finding e16 / Finding 14 claim: is_permanent_gate_incapacity requires a
+    same_signature_streak >= _MIN_INFRA_ERROR_STREAK (3) consecutive identical
+    signatures for the escalation to fire.  This prevents a single fluke from
+    triggering a permanent-incapacity escalation while still catching a
+    consistently broken gate after 3 consecutive same-signature attempts.
+    """
+    from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK
+
+    assert _MIN_INFRA_ERROR_STREAK == 3, (
+        f"_MIN_INFRA_ERROR_STREAK must be 3; got {_MIN_INFRA_ERROR_STREAK} — "
+        "is_permanent_gate_incapacity fires after this many consecutive "
+        "same-signature infra failures"
+    )
+
+
+# e17 — hotfix endpoint validates reason and ack_inert_until_deploy
+# --------------------------------------------------------------------------- #
+
+
+def test_hotfix_endpoint_validates_reason_and_ack_inert_until_deploy():
+    """The /promote/hotfix endpoint must reject requests with empty reason or
+    missing ack_inert_until_deploy acknowledgment.
+
+    Finding e17 / Finding 12 claim: the backend exposes a hotfix promote endpoint
+    with owner, reason, and acknowledgment requirements.  The endpoint must not
+    proceed unless (a) reason is non-empty, and (b) ack_inert_until_deploy=true,
+    so the operator explicitly acknowledges the inert-until-deploy semantics.
+    """
+    import pathlib
+
+    router_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app" / "routers" / "admin_hotfix_promote.py"
+    )
+    source = router_path.read_text()
+
+    assert "ack_inert_until_deploy" in source, (
+        "admin_hotfix_promote.py must require ack_inert_until_deploy — "
+        "the operator must explicitly acknowledge that hotfix changes are "
+        "inert until the next full deploy"
+    )
+    assert "reason" in source, (
+        "admin_hotfix_promote.py must require a non-empty reason field — "
+        "it is the audit justification for the hotfix"
+    )
+    assert "not body.reason" in source or "min_length=1" in source, (
+        "admin_hotfix_promote.py must validate that reason is non-empty "
+        "(either via Pydantic min_length=1 or an explicit check)"
+    )
+    assert "not body.ack_inert_until_deploy" in source or "ack_inert_until_deploy must be true" in source, (
+        "admin_hotfix_promote.py must reject requests where ack_inert_until_deploy is false"
     )
