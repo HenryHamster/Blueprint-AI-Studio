@@ -230,8 +230,7 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
     assert await _alerts_for(db_session, project.id) == []
 
     # --- first-time breach: empty history → WARNING ---
-    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
-         patch("app.hotfix_backmerge.parse_bump_history", return_value=[]):
+    with patch("app.hotfix_backmerge.parse_bump_history", return_value=[]):
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
@@ -265,8 +264,7 @@ async def test_chronic_alert_deduplicates(db_session, mocker):
         {"section": "backend", "rel": "big_module.py", "count": 1700, "cap": 1600}
     ]
 
-    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
-         patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
+    with patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
         await hb._emit_size_violation_alerts(
             db_session, project.id, violations=violation, pr_number=10, trigger_desc=""
         )
@@ -283,14 +281,13 @@ async def test_chronic_alert_deduplicates(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker):
-    """Suppression returns before history lookup, so history failures are irrelevant."""
+    """If parse_bump_history raises, the audience gate already suppressed the alert."""
     project = await _make_project(db_session)
 
-    with patch("app.hotfix_backmerge.is_operator_visible", return_value=True), \
-         patch(
-             "app.hotfix_backmerge.parse_bump_history",
-             side_effect=RuntimeError("git not available"),
-         ):
+    with patch(
+        "app.hotfix_backmerge.parse_bump_history",
+        side_effect=RuntimeError("git not available"),
+    ):
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
