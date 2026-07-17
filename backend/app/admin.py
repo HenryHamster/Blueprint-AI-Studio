@@ -276,10 +276,13 @@ def _artifact_is_current_attempt(
 
 # Columns loaded for the task list endpoint. Excludes the three JSONB blobs that
 # are only accessed in the detail endpoint: attempt_history_db, api_call_summary,
-# format_compliance_summary.
+# format_compliance_summary. Also excludes Task.payloads — the full payloads blob
+# carries agent prompt text and research_findings (up to ~100KB per task) that list
+# views never render. Instead, a slim batch query extracts only the display fields
+# (type, pr_number, spend_cap_usd) from payloads[0] after the main task fetch.
 _TASK_LIST_COLS = [
     Task.id, Task.project_id, Task.title, Task.description, Task.status,
-    Task.payloads, Task.vm_instance_id, Task.latest_status_message,
+    Task.vm_instance_id, Task.latest_status_message,
     Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
     Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
     Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
@@ -289,6 +292,9 @@ _TASK_LIST_COLS = [
     Task.post_commit_pending, Task.updated_at,
     Task.vm_machine_type, Task.vm_spot, Task.prompt_fingerprint,
 ]
+
+# Fields extracted from payloads[0] for the list endpoint (no large blobs).
+_TASK_LIST_PAYLOAD_DISPLAY_FIELDS = ("type", "pr_number", "spend_cap_usd")
 
 
 @router.get("/tasks")
@@ -423,6 +429,28 @@ async def get_all_tasks(
 
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
+
+    # Fetch slim payload display fields (type, pr_number, spend_cap_usd) without
+    # loading the full payloads blob (which carries large agent prompt text and
+    # research_findings). Uses the same JSONB subscript notation as the direction
+    # filter above — SQLAlchemy maps this to json_extract on SQLite automatically.
+    slim_payload_map: Dict[str, Dict[str, Any]] = {}
+    if task_ids:
+        slim_stmt = select(
+            Task.id,
+            Task.payloads[0]["type"].as_string().label("payload_type"),
+            Task.payloads[0]["pr_number"].as_integer().label("payload_pr_number"),
+            Task.payloads[0]["spend_cap_usd"].as_float().label("payload_spend_cap_usd"),
+        ).where(Task.id.in_(task_ids))
+        for _row in (await session.execute(slim_stmt)).all():
+            _slim: Dict[str, Any] = {}
+            if _row.payload_type is not None:
+                _slim["type"] = _row.payload_type
+            if _row.payload_pr_number is not None:
+                _slim["pr_number"] = _row.payload_pr_number
+            if _row.payload_spend_cap_usd is not None:
+                _slim["spend_cap_usd"] = _row.payload_spend_cap_usd
+            slim_payload_map[str(_row.id)] = _slim
     artifacts_map: Dict[str, List[Dict[str, Any]]] = {}
     pr_map: Dict[str, str] = {}
     logs_map: Dict[str, str] = {}
@@ -576,7 +604,11 @@ async def get_all_tasks(
 
     result_list = []
     for t in tasks:
-        task_type = _task_payload_dict(t).get("type", "create")
+        _slim_payload = slim_payload_map.get(str(t.id), {})
+        # Stash slim payload so task.first_payload returns it without accessing
+        # the deferred Task.payloads column (which is not in _TASK_LIST_COLS).
+        object.__setattr__(t, "_projected_first_payload", _slim_payload)
+        task_type = _slim_payload.get("type") or "create"
         task_dict = {
             "id": str(t.id),
             "project_id": str(t.project_id),
@@ -613,7 +645,7 @@ async def get_all_tasks(
             # non-PARKED or pre-migration task; the admin UI guards on presence.
             "parked_at": t.parked_at.isoformat() if t.parked_at else None,
             "park_reason": t.park_reason,
-            "payloads": redact_task_payloads(t.payloads),
+            "payloads": [_slim_payload] if _slim_payload else [],
             "context": {
                 k: v
                 for k, v in (t.context or {}).items()

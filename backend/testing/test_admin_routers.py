@@ -30695,6 +30695,62 @@ class TestTaskListPlanSubtasksContract:
         t = resp.json()["tasks"][0]
         assert t["fix_loop_summary"] is None
 
+    @pytest.mark.asyncio
+    async def test_list_payloads_strips_large_fields(self, client: AsyncClient, db_session):
+        """payloads in the list response contains only slim display fields — no prompt/research_findings."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{
+                "type": "review",
+                "pr_number": 42,
+                "prompt": "A" * 10000,
+                "research_findings": [{"title": "Finding"}] * 50,
+                "status_log": [{"msg": "step"}] * 200,
+            }],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        t = resp.json()["tasks"][0]
+
+        # task_type is still derived from payloads[0].type
+        assert t["task_type"] == "review"
+
+        # payloads in the list response must be slim — no large fields
+        assert isinstance(t["payloads"], list)
+        payload = t["payloads"][0] if t["payloads"] else {}
+        assert payload.get("type") == "review"
+        assert payload.get("pr_number") == 42
+        assert "prompt" not in payload, "prompt must not appear in list payloads"
+        assert "research_findings" not in payload, "research_findings must not appear in list payloads"
+        assert "status_log" not in payload, "status_log must not appear in list payloads"
+
+    @pytest.mark.asyncio
+    async def test_list_task_type_from_slim_payload_query(self, client: AsyncClient, db_session):
+        """task_type is correctly derived from the slim payload batch query."""
+        project = await _make_project(db_session)
+        for task_type in ("create", "research", "fix", "review"):
+            db_session.add(Task(
+                project_id=project.id,
+                payloads=[{"type": task_type, "prompt": "large prompt " * 100}],
+                title=f"task-{task_type}",
+                status=TaskStatus.QUEUED,
+            ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        by_title = {t["title"]: t for t in resp.json()["tasks"]}
+        for task_type in ("create", "research", "fix", "review"):
+            assert by_title[f"task-{task_type}"]["task_type"] == task_type, (
+                f"task_type mismatch for {task_type}"
+            )
+
 
 class TestStrategistCancelTask:
     """Strategic cancel_task op: the strategist can retract its own dispatched work."""
