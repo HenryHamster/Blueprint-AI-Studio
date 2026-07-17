@@ -7222,11 +7222,13 @@ describe('MessagesPanel composer draft persistence', () => {
         }}
       />,
     );
-    await waitFor(() => {
-      const element = container.querySelector('textarea') as HTMLTextAreaElement | null;
-      expect(element).not.toBeNull();
-      expect(element?.value).toBe('use the clean chat path');
-    });
+    // strategicState is supplied as a prop, so usesStrategicReadModel=true and
+    // the component skips the strategic-conversation GET (piggybacking on the
+    // poll epoch instead). Wait for the textarea to confirm the component mounted.
+    await waitFor(() => expect(container.querySelector('textarea')).toBeTruthy());
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('use the clean chat path');
     const sendButton = getAllByRole('button', { name: 'Send message' })
       .find((button): button is HTMLButtonElement => button instanceof HTMLButtonElement && !button.disabled);
     if (!sendButton) throw new Error('Expected enabled Strategic send button');
