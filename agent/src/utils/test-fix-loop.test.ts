@@ -395,6 +395,36 @@ describe('testFixLoop — wall-clock timeout is a fall-open, not a retried setup
     expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
   });
 
+  it('a signal-KILL that is NOT a wall-clock timeout (OOM/EOOM, killed=true but errno≠ETIMEDOUT) → setupFailed (fail-closed), NOT timedOut/fall-open', async () => {
+    // execFileAsync sets err.killed=true for ANY signal-terminated process, not
+    // just a wall-clock timeout: an OOM kill surfaces as code:'EOOM' + SIGKILL,
+    // a native crash as SIGSEGV/SIGABRT, an external kill as SIGTERM. NONE of
+    // these carry errno==='ETIMEDOUT' (only a real termTimer wall-clock kill does).
+    // Such a signal kill must fail CLOSED on the retryable setupErrors lane — NOT
+    // fall open as a bounded "gate could not run" timedOut, which would merge
+    // unverified/broken code. Mutation guard: against the pre-hardening
+    // `killed===true || errno==='ETIMEDOUT'` predicate this OOM error matched the
+    // timeout lane and returned timedOut:true, so this assertion would fail.
+    execFileAsync.mockRejectedValueOnce(
+      Object.assign(new Error('Command failed: python3 -m pytest\nSignal: SIGKILL'), {
+        killed: true, code: 'EOOM',
+      }),
+    );
+
+    const result = await testFixLoop(
+      null, statusRef, undefined, undefined, undefined,
+      undefined, undefined, undefined,
+      { maxFixAttempts: 0, runnersOverride: [REAL_RUNNER] },
+    );
+
+    expect(result.setupFailed).toBe(true);
+    expect(result.timedOut).toBeFalsy();
+    expect(result.partialSetupFailed).toBeFalsy();
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+  });
+
   it('a GENUINE setup error alongside a timeout stays setupFailed (still retryable)', async () => {
     // When at least one runner failed for a real environment reason (missing
     // runtime), the all-failed case is NOT a pure wall-clock kill — keep the

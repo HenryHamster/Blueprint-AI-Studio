@@ -844,14 +844,17 @@ export async function testFixLoop(
         const errno = testErr instanceof Error
           ? (testErr as NodeJS.ErrnoException).code
           : undefined;
-        // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
-        // chain in execFileAsync) treat as a setup error — a Docker build
-        // timeout is not a fixable code failure, but we also can't claim tests
-        // passed.
-        const isRunnerTimeout = testErr instanceof Error && (
-          (testErr as Error & { killed?: boolean }).killed === true ||
-          errno === 'ETIMEDOUT'
-        );
+        // Route a TRUE wall-clock kill to the bounded fall-open (timedOut) lane.
+        // Narrow to errno==='ETIMEDOUT' ONLY — execFileAsync sets that code
+        // whenever its wall-clock termTimer fired (even when it escalates
+        // SIGTERM→SIGKILL: the `timedOut` branch wins over the SIGKILL/EOOM one),
+        // so a genuine timeout ALWAYS carries ETIMEDOUT. `killed` alone is too
+        // broad: execFileAsync sets killed=true for ANY signal-terminated process
+        // — an OOM kill (code 'EOOM'/SIGKILL), a native SIGSEGV/SIGABRT crash, or
+        // an external SIGTERM. Those are NOT wall-clock timeouts and must stay on
+        // the fail-closed setupErrors lane (retryable) rather than falling open as
+        // timedOut and merging unverified/broken code.
+        const isRunnerTimeout = errno === 'ETIMEDOUT';
         if (isRunnerTimeout) {
           const msg = testErr instanceof Error ? testErr.message : String(testErr);
           sendLog(ws, `WARNING: Test runner [${runner.label}] hit the wall clock — the suite is unbounded/oversized; recording a timeout (not a transient setup failure to retry).\n`);
