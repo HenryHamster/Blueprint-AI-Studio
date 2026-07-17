@@ -4673,6 +4673,12 @@ async def check_capability_proof_gate_auto_graduation(
             advance_to,
             exc_info=True,
         )
+        # A notification flush/commit failure leaves AsyncSession in a failed
+        # transaction until it is rolled back.  Keep this best-effort side
+        # effect from poisoning completion-debt resolution or the next sweep
+        # check; the gate advancement above is already durably committed.
+        with contextlib.suppress(Exception):
+            await ctx.session.rollback()
 
     # Resolve the dormant-knob debt for capability_proof_gate_mode when advancing
     # to enforce (the knob's "off" / "observe" value meant an open obligation).

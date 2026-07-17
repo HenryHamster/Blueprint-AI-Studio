@@ -3208,6 +3208,62 @@ async def test_auto_graduation_emits_operator_message_on_advance(_grad_db):
     assert len(await _messages()) == total_before
 
 
+@pytest.mark.asyncio
+async def test_auto_graduation_notification_commit_failure_cleans_session(_grad_db):
+    """A notification flush failure must not poison later sweep checks."""
+    from unittest.mock import patch
+
+    from sqlmodel import select
+
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.models import DeploymentState, Project
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap A",
+                "status": "working",
+                "evidence_refs": [_proven_ref()],
+            }
+        ],
+    )
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+    ctx = _make_sweep_ctx(_grad_db)
+
+    async def _enqueue_invalid_notification(session, project_id, **kwargs):
+        # The duplicate singleton fails during the caller's notification commit,
+        # reproducing a real failed-flush session rather than a pre-commit mock.
+        existing = await session.get(DeploymentState, 1)
+        session.expunge(existing)
+        session.add(DeploymentState(id=1))
+
+    with patch(
+        "app.notification_dispatch.post_capability_proof_gate_graduated_message",
+        new=_enqueue_invalid_notification,
+    ):
+        results = await check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.FLAGGED
+    assert _rc["capability_proof_gate_mode"] == "observe"
+    state = await _grad_db.get(DeploymentState, 1)
+    assert state is not None
+    assert state.runtime_config_json["capability_proof_gate_mode"] == "observe"
+    # Raises PendingRollbackError when notification cleanup is absent, which
+    # would make the next check in the shared-session sweep fail spuriously.
+    assert (
+        (await _grad_db.execute(select(Project))).scalars().first()
+        is not None
+    )
+
 # ── Disabled flag ──────────────────────────────────────────────────────────
 
 
