@@ -2303,6 +2303,36 @@ def test_looks_like_keyless_encryption_artifact():
     )
 
 
+def test_looks_like_keyless_encryption_artifact_rejects_accumulated_chain_stderr():
+    """Accumulated chain stderr from earlier no-op migrations emits the env-var
+    name to stderr, so a real RuntimeError from an *unrelated* broken migration
+    that follows a 0531-style warning must NOT be classified as the 0609
+    keyless fail-closed artifact.
+
+    This test catches the regression where the predicate matched on the
+    env-var name + RuntimeError alone (too broad) instead of requiring the
+    0609-specific error message marker.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    # Simulates accumulated chain stderr: the 0531 no-op migration emits the
+    # env-var name as a warning, and then an *unrelated* migration fails with
+    # a RuntimeError that has nothing to do with the keyless fail-closed.
+    accumulated_chain_stderr = (
+        "INFO:root:GITHUB_PAT_ENCRYPTION_KEY not set — "
+        "migration 0531 is a no-op and will stamp without encrypting.\n"
+        "Traceback (most recent call last):\n"
+        "  File \"/app/alembic/versions/0612_add_widget_table.py\", line 42, in upgrade\n"
+        "    op.add_column('widget', sa.Column('size', sa.Integer, nullable=False))\n"
+        "RuntimeError: Column 'size' violates a domain constraint unrelated to encryption"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(accumulated_chain_stderr), (
+        "must NOT classify accumulated chain stderr (0531 warning + unrelated RuntimeError) "
+        "as the 0609 keyless fail-closed artifact — env-var name appears only in a "
+        "prior no-op warning, not in the RuntimeError that follows"
+    )
+
+
 @pytest.mark.asyncio
 async def test_keyless_encryption_migration_replay_degrades_not_defers(monkeypatch):
     """The keyless-encryption fail-closed artifact in the scratch subprocess

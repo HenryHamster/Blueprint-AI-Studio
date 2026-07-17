@@ -522,15 +522,17 @@ def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
     """Return True when *detail* describes the deliberate keyless fail-closed
     of an encryption migration in the secret-free scratch subprocess.
 
-    Matches on the env var the gate deliberately withholds AND a RuntimeError
-    (the fail-closed pattern used by the encryption-reconciliation migration).
-    Both signals together ensure a genuinely broken migration (e.g. a real
-    SQL/DDL defect) is NOT swallowed — only the deliberate keyless fail-closed
-    is degraded.
+    Requires all three signals to avoid false-positives from accumulated chain
+    stderr: earlier no-op migrations (0531 etc.) always emit the env-var name
+    to stderr, so matching on the env var + RuntimeError alone would swallow
+    any unrelated RuntimeError that happens to follow a no-op warning line.
+    Requiring 'Migration 0609' anchors the match to the specific fail-closed
+    error raised by migration 0609 itself.
     """
     return (
-        _ENCRYPTION_KEY_ENV_VAR in detail
-        and "RuntimeError" in detail
+        "RuntimeError" in detail
+        and _ENCRYPTION_KEY_ENV_VAR in detail
+        and "Migration 0609" in detail
     )
 
 
