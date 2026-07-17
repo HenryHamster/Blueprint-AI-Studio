@@ -1869,7 +1869,7 @@ async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs
     now = _utcnow()
     project = await _make_project_owner(db_session, name="Stranded runner sweep")
     stale_runner = LocalRunner(project_id=project.id, token_hash="stale", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
-    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now)
+    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
     boundary_runner = LocalRunner(project_id=project.id, token_hash="boundary", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS))
     task = Task(project_id=project.id, status=TaskStatus.PARKED)
     db_session.add_all([stale_runner, inactive_runner, boundary_runner, task])
@@ -1923,6 +1923,131 @@ async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs
         )
         == 0
     )
+
+
+@pytest.mark.asyncio
+async def test_stranded_runner_subprocess_sweep_protects_paused_draining_runners(db_session):
+    """Paused/draining runners with recent heartbeats keep in-flight jobs; stale ones get finalized."""
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+    from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Paused/Draining runner sweep")
+    # Paused/draining runners with RECENT heartbeats — still alive, should NOT lose jobs.
+    paused_alive = LocalRunner(project_id=project.id, token_hash="paused-alive", status="paused", last_seen_at=now)
+    draining_alive = LocalRunner(project_id=project.id, token_hash="draining-alive", status="draining", last_seen_at=now)
+    # Paused/draining runners with STALE heartbeats — truly dead, jobs SHOULD be finalized.
+    paused_dead = LocalRunner(project_id=project.id, token_hash="paused-dead", status="paused", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    draining_dead = LocalRunner(project_id=project.id, token_hash="draining-dead", status="draining", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add_all([paused_alive, draining_alive, paused_dead, draining_dead, task])
+    await db_session.commit()
+
+    def job(status=ComputeJobStatus.RUNNING, **kwargs):
+        return ComputeJob(project_id=project.id, backend=RUNNER_SUBPROCESS_BACKEND_NAME, status=status, **kwargs)
+
+    paused_alive_job = job(ran_on_runner_id=paused_alive.id)
+    draining_alive_job = job(ran_on_runner_id=draining_alive.id)
+    paused_dead_job = job(ran_on_runner_id=paused_dead.id)
+    draining_dead_job = job(ran_on_runner_id=draining_dead.id)
+    db_session.add_all([paused_alive_job, draining_alive_job, paused_dead_job, draining_dead_job])
+    await db_session.flush()
+    wake = TaskWakeRegistration(
+        task_id=task.id, project_id=project.id,
+        wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(paused_dead_job.id), wake_action=WakeAction.FINALIZE,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession)
+    # Expected: 2 dead-runner jobs finalized, 2 alive-runner jobs survive.
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 2
+    )
+
+    await db_session.refresh(paused_alive_job)
+    await db_session.refresh(draining_alive_job)
+    await db_session.refresh(paused_dead_job)
+    await db_session.refresh(draining_dead_job)
+    # Alive paused/draining: their jobs MUST survive (runner still heartbeating).
+    assert paused_alive_job.status == ComputeJobStatus.RUNNING
+    assert draining_alive_job.status == ComputeJobStatus.RUNNING
+    # Dead paused/draining: their jobs ARE finalized (runner truly gone).
+    assert paused_dead_job.status == ComputeJobStatus.FAILED
+    assert paused_dead_job.terminal_reason == "runner_subprocess_runner_dead"
+    assert draining_dead_job.status == ComputeJobStatus.FAILED
+    assert draining_dead_job.terminal_reason == "runner_subprocess_runner_dead"
+
+
+@pytest.mark.asyncio
+async def test_draining_runner_finishes_in_flight_job_without_new_dispatch(
+    client, db_session
+):
+    """Drain is a quiesce contract: preserve active work and refuse new claims.
+
+    The runner-side worker interprets ``cancel_requested: false`` on its normal
+    running report as permission to keep the healthy subprocess alive.  This
+    exercises that report path through normal completion, while separately
+    proving the next-compute-job pull cannot claim work after the runner drains.
+    """
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Runner drain contract")
+    runner, token = await _register_runner(db_session, project)
+    in_flight = await _make_runner_subprocess_job(db_session, project, runner)
+    queued = await _make_runner_subprocess_job(
+        db_session, project, runner, status=ComputeJobStatus.STARTING
+    )
+
+    # This mirrors the admin drain transition after the in-flight subprocess has
+    # already been claimed.  The recent heartbeat must continue to prove liveness.
+    runner.status = "draining"
+    runner.last_seen_at = now
+    await db_session.commit()
+
+    running = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "running"},
+    )
+    assert running.status_code == 200, running.text
+    assert running.json()["cancel_requested"] is False
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession
+    )
+    assert await sweep_stranded_runner_subprocess_compute_jobs(
+        db_session,
+        now,
+        session_factory=session_factory,
+    ) == 0
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.RUNNING
+    assert in_flight.terminal_reason is None
+
+    no_dispatch = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert no_dispatch.status_code == 204
+    await db_session.refresh(queued)
+    assert queued.status == ComputeJobStatus.STARTING
+
+    completed = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "succeeded", "exit_code": 0},
+    )
+    assert completed.status_code == 200, completed.text
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.SUCCEEDED
+    assert in_flight.terminal_reason != "runner_subprocess_runner_dead"
 
 
 @pytest.mark.asyncio
@@ -5506,7 +5631,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         project_id=project.id,
         title="compute parent",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment"}],
+        payloads=[{"type": "compute_experiment", "declared_metric": "score"}],
     )
     db_session.add(task)
     await db_session.commit()
@@ -5518,6 +5643,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         command=(
             'printf "stdout-line\\n"; '
             'printf "stderr-line\\n" >&2; '
+            'printf \'{"score":1.0}\' > "$BLUEPRINT_COMPUTE_RESULT_PATH"; '
             'printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"'
         ),
         machine_type="e2-standard-2",
@@ -8052,7 +8178,13 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
         project_id=project.id,
         title="compute_experiment: parked job",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -8111,6 +8243,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -8210,7 +8343,13 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
         project_id=project.id,
         title="compute_experiment: terminal before park",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -8254,6 +8393,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -10666,7 +10806,13 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project2.id,
         title="compute_experiment: terminal wake",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task2)
@@ -10708,6 +10854,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -17097,16 +17244,22 @@ def test_append_progress_sample_non_finite_value():
 
 
 def test_append_progress_sample_ring_buffer_cap():
-    """After 55 samples only the last 50 are retained (drop-oldest)."""
+    """The per-metric history retains the last 1,500 minute buckets."""
     from app.compute_jobs import append_progress_sample
 
     meta: dict = {}
-    for i in range(55):
-        meta = append_progress_sample(meta, metric="step", value=float(i), t=f"t{i}")
+    start = datetime(2026, 1, 1)
+    for i in range(1505):
+        meta = append_progress_sample(
+            meta,
+            metric="step",
+            value=float(i),
+            t=(start + timedelta(minutes=i)).isoformat(),
+        )
     series = meta["progress_series"]
-    assert len(series) == 50
+    assert len(series) == 1500
     assert series[0]["value"] == 5.0, "oldest 5 samples should have been dropped"
-    assert series[-1]["value"] == 54.0
+    assert series[-1]["value"] == 1504.0
 
 
 def test_append_progress_sample_does_not_mutate_input():
@@ -17134,7 +17287,7 @@ def test_merge_progress_report_bridges_new_records_to_progress_series():
     raw = {
         "records": [
             {"metric": "reward", "value": 1.0, "ts": "2026-01-01T00:00:00"},
-            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:00:01"},
+            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:01:01"},
         ],
         "count": 2,
     }
@@ -21637,16 +21790,17 @@ def test_no_progress_stalled_requires_window_of_history():
     assert compute_jobs._no_progress_stalled(job, now=now) is False
 
 
-def test_no_progress_stalled_ignores_stale_buffer():
+def test_no_progress_stalled_treats_stale_buffer_as_missing_progress():
     metric = "val/loss"
     # A flat buffer whose newest sample predates the trailing window entirely
-    # (the job stopped reporting long ago). The window slice is empty → no fire;
-    # a genuinely dead VM is handled by the poll-failure kills, not the watchdog.
+    # means a declared watchdog has received no current progress for a full
+    # window. That is an enforcement failure and must fire, while backend poll
+    # failures remain a separate safety-kill path.
     samples = [(3600 - i * 300, metric, 1.0) for i in range(6)]  # ages 3600..2100
     job, now = _progress_job(
         metric=metric, samples=samples, started_offset_seconds=7200
     )
-    assert compute_jobs._no_progress_stalled(job, now=now) is False
+    assert compute_jobs._no_progress_stalled(job, now=now) is True
 
 
 def test_no_progress_stalled_respects_grace_period():
@@ -22310,9 +22464,16 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
     script = provision_calls[0]
     # Downloads the predecessor bundle and extracts it into the artifact dir.
     assert "https://storage.example.com/predecessor-bundle" in script
+    resume_stage = shlex.quote(
+        f"{compute_backends_module._GCP_ARTIFACT_DIR_PATH}.resume-staging"
+    )
     assert (
-        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)} "
+        f"tar -C {resume_stage} "
         f"--no-same-owner -xzf" in script
+    )
+    assert (
+        f"mv {resume_stage} "
+        f"{shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)}" in script
     )
     assert "resume_hydration.ok" in script
     assert "resume_hydration.failed" in script

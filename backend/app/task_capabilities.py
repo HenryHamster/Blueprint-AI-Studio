@@ -21,6 +21,7 @@ class TaskType(str, Enum):
     plan = "plan"
     research = "research"
     strategic_review = "strategic_review"
+    strategic_resident_turn = "strategic_resident_turn"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
     qa = "qa"
@@ -47,6 +48,7 @@ class TaskType(str, Enum):
 
 
 AgentMode = Literal["write", "read_only"]
+ExecutionOwner = Literal["agent", "backend"]
 
 # Closed set of forward evaluation-gate strategy keys. Each TaskType DECLARES
 # which one applies via ``TaskCapability.evaluation``; the pluggable evaluator
@@ -129,6 +131,11 @@ class TaskCapability:
     id: TaskType
     label: str
     agent_mode: AgentMode
+    # Which runtime owns execution. ``agent`` is the normal provision/claim
+    # path; ``backend`` is reserved for bounded control-plane tasks that must
+    # never be handed to an agent process (for example migration-shadow
+    # Resident turns completed by a zero-model backend sweep).
+    execution_owner: ExecutionOwner = "agent"
     default_category: str | None = None
     user_launchable: bool = False
     operator_contract_launchable: bool = False
@@ -344,6 +351,25 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.strategic_resident_turn,
+        "Resident Turn",
+        "read_only",
+        execution_owner="backend",
+        default_category="strategic",
+        provider_configurable=False,
+        filter_visible=False,
+        description=(
+            "Run one bounded, checkpoint-derived Resident turn. Hidden while the "
+            "new Resident engine is shadowing the legacy strategist."
+        ),
+        run_shape="single_agent",
+        output_kind="knowledge",
+        requires_code=False,
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=0.0,
+        evaluation="none",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -763,6 +789,16 @@ TASK_CAPABILITY_BY_VALUE: dict[str, TaskCapability] = {
 ALL_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value for capability in TASK_CAPABILITIES
 )
+AGENT_EXECUTED_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.execution_owner == "agent"
+)
+BACKEND_MANAGED_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.execution_owner == "backend"
+)
 READ_ONLY_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
     for capability in TASK_CAPABILITIES
@@ -1003,6 +1039,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
+        TaskType.strategic_resident_turn.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
@@ -1036,7 +1073,9 @@ COMPUTE_SUBSTRATE_TASK_TYPES: frozenset[str] = frozenset(
 # candidates — they never push a branch/PR, never need persistent disk, and
 # are the dominant idle-cost component. The intersection happens in
 # orchestrator.py; this set never imports runtime_config_state.
-CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
+CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = (
+    READ_ONLY_TASK_TYPES & AGENT_EXECUTED_TASK_TYPES
+)
 
 
 def runs_on_compute_substrate(task_type: str | TaskType | None) -> bool:
@@ -1089,6 +1128,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         # compact tag without each surface re-deriving the default.
         "badge": capability.badge or capability.label,
         "agent_mode": capability.agent_mode,
+        "execution_owner": capability.execution_owner,
         "default_category": capability.default_category,
         "description": capability.description,
         "user_launchable": capability.user_launchable,
@@ -1144,6 +1184,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "label": capability.label,
         "description": capability.description,
         "agent_mode": capability.agent_mode,
+        "execution_owner": capability.execution_owner,
         "default_category": capability.default_category,
         "user_launchable": capability.user_launchable,
         "operator_contract_launchable": capability.operator_contract_launchable,

@@ -885,10 +885,21 @@ export interface ComputeJob {
    *  or jobs without viewable output. */
   viewable_artifacts?: ViewableArtifact[] | null;
   /** Job-level aggregate: number of viewable files omitted from
-   *  `viewable_artifacts` for exceeding the 25-file count cap or the 8 MiB
-   *  per-file size cap. Additive/backward-compatible — absent or 0 on legacy
-   *  rows and jobs where nothing was omitted. */
+   *  `viewable_artifacts` for exceeding the 25-file count cap or the per-file
+   *  size cap (8 MiB/image, 512 MiB/video). Additive/backward-compatible —
+   *  absent or 0 on legacy rows and jobs where nothing was omitted.
+   *  Only populated at terminal time; use viewable_artifacts_live_omissions
+   *  for running jobs. */
   viewable_artifacts_dropped_count?: number | null;
+  /** Live omission telemetry for RUNNING jobs. Contains the count of unique
+   *  artifact files the runner skipped due to the per-kind size cap
+   *  ("size_cap": images ≤ 8 MiB, videos ≤ 512 MiB) or the 25-file count
+   *  cap ("count_cap"). Absent or null on terminal jobs — use
+   *  viewable_artifacts_dropped_count instead once the job finishes. */
+  viewable_artifacts_live_omissions?: {
+    size_cap?: number | null;
+    count_cap?: number | null;
+  } | null;
   /** Bounded time-series of intermediate progress samples emitted during the
    *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
    *  Absent on legacy rows or jobs that did not emit progress. */

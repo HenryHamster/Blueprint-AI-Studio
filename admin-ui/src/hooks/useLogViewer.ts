@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
@@ -844,7 +844,10 @@ export function useLogViewer({
     }
   }, [hasForegroundLogTask, restoreSelectedProjectStream]);
 
-  const gatedTaskTypes = [...gatedTypesMap.values()].sort((a, b) => a.task_type.localeCompare(b.task_type));
+  const gatedTaskTypes = useMemo(
+    () => [...gatedTypesMap.values()].sort((a, b) => a.task_type.localeCompare(b.task_type)),
+    [gatedTypesMap]
+  );
 
   return {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,

@@ -1,4 +1,4 @@
-import { useEffect, useState, memo, lazy, Suspense, type ComponentProps, type ReactNode } from 'react';
+import { useEffect, useState, useMemo, memo, lazy, Suspense, type ComponentProps, type ReactNode } from 'react';
 import { ChevronDown, ChevronRight, Star } from 'lucide-react';
 import { ErrorBoundary } from './ErrorBoundary';
 import type { KanbanColumn, SortBy } from './KanbanBoard';
@@ -514,9 +514,11 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
 }
 
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
-  const parkedTasks = flow.tasks.filter(task => task.status === 'PARKED');
-  const waitingTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) > 0);
-  const queuedReadyTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) === 0);
+  const { parkedTasks, waitingTasks, queuedReadyTasks } = useMemo(() => ({
+    parkedTasks: flow.tasks.filter(task => task.status === 'PARKED'),
+    waitingTasks: metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) > 0),
+    queuedReadyTasks: metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) === 0),
+  }), [flow.tasks, metrics.queuedTasks]);
   const attentionTaskIds = new Set<string>();
   rail.attentionTasks.forEach(entry => attentionTaskIds.add(taskFromAttentionInput(entry).id));
   metrics.blockedTasks.forEach(task => attentionTaskIds.add(task.id));

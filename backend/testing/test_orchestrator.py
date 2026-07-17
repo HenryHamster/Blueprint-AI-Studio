@@ -1301,15 +1301,15 @@ def test_diagnose_strict_pin_hold_reports_insufficient_disk():
 
 
 @pytest.mark.parametrize("docker_cdi_gpu,has_gpu,gpu_count,expected", [
-    (True,  True,  1, True),    # CDI docker → capable
-    (False, True,  1, True),    # Hook docker (has_gpu + corroborated) → capable
+    (True,  True,  1, False),   # Config/host GPU without functional proof
+    (False, True,  1, False),   # Hook inference is not functional proof
     (False, True,  0, False),   # Docker + has_gpu but telemetry contradicts → not capable
     (False, False, 0, False),   # Docker, no GPU → not capable
 ])
 def test_runner_gpu_in_container_capable_docker(
     docker_cdi_gpu, has_gpu, gpu_count, expected
 ):
-    """Docker GPU-in-container capability: CDI and nvidia-hook are both capable."""
+    """Docker config and host GPU alone never substitute for a runtime probe."""
     from app.orchestrator_runner_dispatch import (
         _runner_gpu_in_container_capable,
         RunnerDispatchSnapshot,
@@ -1334,7 +1334,7 @@ def test_runner_gpu_in_container_capable_docker(
 
 
 def test_runner_gpu_in_container_capable_podman():
-    """Podman is natively GPU-capable in containers."""
+    """Podman presence alone is not functional passthrough proof."""
     from app.orchestrator_runner_dispatch import (
         _runner_gpu_in_container_capable,
         RunnerDispatchSnapshot,
@@ -1347,11 +1347,11 @@ def test_runner_gpu_in_container_capable_podman():
             "isolation_backends": {"podman_usable": True},
         },
     )
-    assert _runner_gpu_in_container_capable(runner) is True
+    assert _runner_gpu_in_container_capable(runner) is False
 
 
 def test_runner_gpu_in_container_capable_apptainer():
-    """Apptainer is natively GPU-capable in containers."""
+    """Apptainer presence alone is not functional passthrough proof."""
     from app.orchestrator_runner_dispatch import (
         _runner_gpu_in_container_capable,
         RunnerDispatchSnapshot,
@@ -1364,11 +1364,11 @@ def test_runner_gpu_in_container_capable_apptainer():
             "isolation_backends": {"apptainer_ok": True},
         },
     )
-    assert _runner_gpu_in_container_capable(runner) is True
+    assert _runner_gpu_in_container_capable(runner) is False
 
 
 def test_runner_gpu_in_container_capable_enroot():
-    """Enroot is natively GPU-capable in containers."""
+    """Enroot presence alone is neither execution nor passthrough proof."""
     from app.orchestrator_runner_dispatch import (
         _runner_gpu_in_container_capable,
         RunnerDispatchSnapshot,
@@ -1381,7 +1381,50 @@ def test_runner_gpu_in_container_capable_enroot():
             "isolation_backends": {"enroot_ok": True},
         },
     )
-    assert _runner_gpu_in_container_capable(runner) is True
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_image_gpu_dispatch_requires_verified_runtime_passthrough():
+    """Image+GPU dispatch selects only the exact runtime with positive proof."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    legacy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+        },
+    )
+    failed = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"podman_usable": True},
+            "container_gpu_passthrough": {
+                "podman": {"verified": False, "mode": "hook", "reason": "probe_exit_125"}
+            },
+        },
+    )
+    verified = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    selected = _select_eligible_runner(
+        {project_id: [legacy, failed, verified]}, project_id,
+        "compute_experiment", "gpu", {}, container_image="repo/image@sha256:abc",
+    )
+    assert selected is not None
+    assert selected.id == verified.id
 
 
 def test_runner_gpu_in_container_capable_false_no_container_backend():
@@ -1396,6 +1439,41 @@ def test_runner_gpu_in_container_capable_false_no_container_backend():
         capabilities={
             "task_types": "all",
             "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+@pytest.mark.parametrize(
+    ("backends", "runtime", "reported_mode"),
+    [
+        ({"docker_usable": True, "docker_cdi_gpu": True}, "docker", "hook"),
+        ({"docker_usable": True, "docker_cdi_gpu": False}, "docker", "cdi"),
+        ({"podman_usable": True}, "podman", "cdi"),
+        ({"apptainer_ok": True}, "apptainer", "hook"),
+    ],
+)
+def test_runner_gpu_in_container_rejects_verified_wrong_mode(
+    backends, runtime, reported_mode
+):
+    """Verified proof is invalid when it did not exercise the selected flag path."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _runner_gpu_in_container_capable,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={
+            "isolation_backends": backends,
+            "container_gpu_passthrough": {
+                runtime: {
+                    "verified": True,
+                    "mode": reported_mode,
+                    "reason": "verified",
+                }
+            },
         },
     )
     assert _runner_gpu_in_container_capable(runner) is False
@@ -1440,6 +1518,9 @@ def test_select_eligible_runner_image_plus_gpu_excludes_no_gpu_docker():
             "has_gpu": True,
             "gpu_count": 1,
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
         },
     )
     cache = {project_id: [no_gpu_docker, cdi_docker]}
@@ -1510,6 +1591,9 @@ def test_select_eligible_runner_image_plus_vram_only_excludes_no_cdi_docker():
             "gpu_count": 1,
             "gpu_free_vram_mib": [40960],
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
         },
     )
     cache = {project_id: [no_gpu_in_container, cdi_docker]}
@@ -1529,8 +1613,8 @@ def test_select_eligible_runner_image_plus_vram_only_excludes_no_cdi_docker():
     )
 
 
-def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
-    """Both CDI and hook docker runners are eligible for image+GPU jobs."""
+def test_select_eligible_runner_image_plus_gpu_selects_verified_hook_or_cdi():
+    """Both hook and CDI modes are eligible after their functional probe passes."""
     from app.orchestrator_runner_dispatch import (
         _select_eligible_runner,
         RunnerDispatchSnapshot,
@@ -1545,6 +1629,9 @@ def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
             "has_gpu": True,
             "gpu_count": 1,
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
         },
     )
     cdi_docker = RunnerDispatchSnapshot(
@@ -1555,6 +1642,9 @@ def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
             "has_gpu": True,
             "gpu_count": 1,
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
         },
     )
     cache = {project_id: [hook_docker, cdi_docker]}
@@ -1572,8 +1662,8 @@ def test_select_eligible_runner_image_plus_gpu_selects_hook_or_cdi():
     )
 
 
-def test_select_eligible_runner_image_plus_gpu_hook_docker_eligible():
-    """A hook-only docker runner (has_gpu, no CDI) passes the combined gate."""
+def test_select_eligible_runner_image_plus_gpu_verified_hook_docker_eligible():
+    """A hook-mode Docker runner passes only after a functional probe."""
     from app.orchestrator_runner_dispatch import (
         _select_eligible_runner,
         RunnerDispatchSnapshot,
@@ -1588,6 +1678,9 @@ def test_select_eligible_runner_image_plus_gpu_hook_docker_eligible():
             "has_gpu": True,
             "gpu_count": 1,
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
         },
     )
     cache = {project_id: [hook_docker]}
@@ -13165,7 +13258,13 @@ async def test_gpu_in_container_ineligible_holds_with_honest_reason(
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
 
-    project = make_project(name="GpuInContainerHoldProject", user_id=_TEST_USER)
+    project = make_project(
+        name="GpuInContainerHoldProject",
+        user_id=_TEST_USER,
+        # Regression: require-local used to return before the proof-specific
+        # hold, leaving this task with no actionable status message.
+        build_config={"resource_envelope": {"require_local_runner": True}},
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -13196,6 +13295,8 @@ async def test_gpu_in_container_ineligible_holds_with_honest_reason(
         project_id=project.id,
         capabilities={
             "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
             "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
         },
     )
@@ -13221,14 +13322,71 @@ async def test_gpu_in_container_ineligible_holds_with_honest_reason(
     assert "GPU inside the container" in msg or "GPU-in-container" in msg, (
         f"status message must name the GPU-in-container passthrough blocker: {msg!r}"
     )
-    assert "CDI" in msg, (
-        f"status message should point the operator at CDI / nvidia runtime: {msg!r}"
+    assert "verified GPU passthrough probe" in msg, (
+        f"status message should identify the missing runtime proof: {msg!r}"
     )
     # The FALSE generic docker-missing wording must NOT be used for this fleet.
     assert "no live runner has docker_usable capability" not in msg, (
         "must not claim docker is missing when it is present — that is the bug "
         f"this hold fixes: {msg!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_forced_runner_gpu_in_container_hold_names_probe_blocker(
+    db_session, mocker
+):
+    """A hard pin preserves the functional-proof diagnosis, not a generic hold."""
+    from app.orchestrator_runner_dispatch import (
+        FORCED_RUNNER_TARGET_CONTEXT_KEY,
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="ForcedGpuProofHold", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        context={FORCED_RUNNER_TARGET_CONTEXT_KEY: str(runner.id)},
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    assert (task.context or {}).get("awaiting_forced_runner_since")
+    message = task.latest_status_message or ""
+    assert "GPU inside the container" in message
+    assert "verified GPU passthrough probe" in message
 
 
 @pytest.mark.asyncio
@@ -13309,6 +13467,157 @@ async def test_gpu_in_container_hold_fires_for_vram_only_no_accelerator(
     assert "no live runner has docker_usable capability" not in msg, (
         "must not claim docker is missing when it is present"
     )
+
+
+@pytest.mark.asyncio
+async def test_gpu_proof_hold_does_not_mask_mixed_fleet_capacity(
+    db_session, mocker
+):
+    """Fleet proof exists: do not claim no selected runtime has proof."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="MixedGpuProofFleet", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    verified_but_busy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "max_concurrent_compute": 1,
+            "active_compute_job_ids": ["busy"],
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {
+                    "verified": True,
+                    "mode": "hook",
+                    "reason": "verified",
+                }
+            },
+        },
+    )
+    unverified_idle = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session,
+        task,
+        {project.id: [verified_but_busy, unverified_idle]},
+        runner_pins_this_cycle={},
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert "no selected runtime has functional passthrough proof" not in msg
+    assert "at capacity or fails another job requirement" in msg
+    assert "no live runner has docker_usable capability" not in msg
+
+
+@pytest.mark.asyncio
+async def test_gpu_proof_hold_ignores_proof_on_wrong_task_type_runner(
+    db_session, mocker
+):
+    """Proof on a runner that cannot take compute work must not mask the
+    passthrough hold for an otherwise eligible runner that lacks that proof.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="WrongTypeGpuProofFleet", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    verified_but_wrong_type = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": ["research"],
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    unverified_compute_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session,
+        task,
+        {project.id: [verified_but_wrong_type, unverified_compute_runner]},
+        runner_pins_this_cycle={},
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert "no selected runtime has functional passthrough proof" in msg
+    assert "at capacity or fails another job requirement" not in msg
 
 
 @pytest.mark.asyncio

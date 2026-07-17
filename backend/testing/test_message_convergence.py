@@ -251,7 +251,7 @@ def test_needs_action_message_types_are_question_and_blocker():
         {MessageType.QUESTION.value, MessageType.BLOCKER.value}
     )
     assert CONVERSATIONAL_DECAY_MESSAGE_TYPES == frozenset(
-        {MessageType.NOTE.value, MessageType.FEEDBACK.value}
+        {MessageType.NOTE.value, MessageType.FEEDBACK.value, MessageType.QUESTION.value}
     )
 
 

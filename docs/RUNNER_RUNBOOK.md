@@ -57,6 +57,22 @@ only when required:
 See `scripts/runner_isolation.py` for the full decision tables
 (`decide_agent_backend`, `decide_compute_backend`).
 
+### GPU probe image on restricted networks
+
+Before dispatching an image-backed GPU job, the runner proves that its selected
+container runtime can expose a GPU by running `nvidia-smi -L`. By default this
+uses a public CUDA image. If the runner is allowed to pull project/private
+registry images but Docker Hub is blocked, configure a pullable image that
+includes `nvidia-smi` before starting the runner:
+
+```bash
+export BLUEPRINT_RUNNER_GPU_PROBE_IMAGE='registry.example/project/cuda:stable'
+blueprint-runner start --token <token>
+```
+
+The runner uses this image on startup and on its bounded retry cadence; ensure
+the runner's container runtime is authenticated to that registry.
+
 ---
 
 ## 1. WSL PC (developer laptop, WSL2)

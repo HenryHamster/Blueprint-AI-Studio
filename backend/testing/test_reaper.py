@@ -3333,6 +3333,55 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_step6_ignores_backend_managed_resident_turns(reaper_db):
+    project = await _make_project(reaper_db)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            title="Resident shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            status=TaskStatus.QUEUED,
+            created_at=_utcnow() - timedelta(hours=24),
+            archived=True,
+        )
+    )
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db,
+        _utcnow(),
+        runtime_config={"queued_age_alert_hours": 2},
+    )
+    assert alerted == 0
+
+
+@pytest.mark.asyncio
+async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    import app.reaper as _reaper_mod
+
+    shadow = mocker.patch(
+        "app.reaper.sweep_shadow_resident_turns",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("shadow projection failed"),
+    )
+    later = mocker.patch(
+        "app.reaper.sweep_regression_scan",
+        new_callable=AsyncMock,
+    )
+
+    await _run_reaper_once()
+
+    shadow.assert_awaited_once()
+    assert (
+        shadow.await_args.kwargs["session_factory"]
+        is _reaper_mod.AsyncSessionLocal
+    )
+    later.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_step6_alert_does_not_broadcast_on_commit_failure(reaper_db, mocker):
     """If the batch commit fails, queued-age alerts must not be broadcast."""
     project = await _make_project(reaper_db)
@@ -9433,6 +9482,237 @@ async def test_unblock_sweep_requeues_conflict_blocker(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_unblock_sweep_revalidates_repo_gate_only_after_head_advances(
+    reaper_db, mocker
+):
+    """A green integration HEAD requeues an inherited-gate task on a fresh base."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": True,
+            "checked_at_utc": _utcnow().isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./pr open failed on pre-existing repo-wide standalone "
+            "smoke failures in untouched tests"
+        ),
+        context={
+            "generated_head_sha": "a" * 40,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+    assert "integration head" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_prioritizes_gate_blocker_before_backoff_is_due(
+    reaper_db, mocker
+):
+    """A HEAD advance bypasses stale backoff without bypassing SHA/CI guards."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": True,
+            "checked_at_utc": _utcnow().isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./pr open failed on pre-existing repo-wide standalone "
+            "smoke failures in untouched tests"
+        ),
+        recheck_after=now + timedelta(hours=1),
+        context={
+            "generated_head_sha": "a" * 40,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retries_tests_gated_legacy_task_after_new_commit(
+    reaper_db, mocker
+):
+    """No-checks integration branches recover legacy rows without spawn SHAs."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    now = _utcnow()
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": False,
+            "no_checks_allowed": True,
+            "revalidation_ready": True,
+            "head_committed_at": now + timedelta(minutes=1),
+            "checked_at_utc": now.isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./pr open is blocked by standalone smoke failures in "
+            "untouched backend/testing/test_invariants.py"
+        ),
+        recheck_after=now + timedelta(hours=1),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+    task.blocked_at = now
+    reaper_db.add(task)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+    assert "rerun the repository gate" in (task.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_does_not_revalidate_same_green_head(
+    reaper_db, mocker
+):
+    """The same green HEAD cannot repeatedly unblock a task that blocks again."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": True,
+            "checked_at_utc": _utcnow().isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: ./check test has pre-existing repo-wide failures "
+            "outside this diff"
+        ),
+        context={
+            "generated_head_sha": "a" * 40,
+            "_gate_revalidated_head": "b" * 40,
+            "_blocked_optimistic_retries": _BLOCKED_OPTIMISTIC_RETRY_CAP,
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 0
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    assert task.context["_gate_revalidated_head"] == "b" * 40
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_ignores_unrelated_active_sibling_for_gate_recovery(
+    reaper_db, mocker
+):
+    """Independent decomposed siblings do not masquerade as a live respawn."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.gate_revalidation.resolve_gate_state",
+        new_callable=AsyncMock,
+        return_value={
+            "head_sha": "b" * 40,
+            "green_at_head": True,
+            "checked_at_utc": _utcnow().isoformat(),
+        },
+    )
+    project = await _make_project(reaper_db)
+    parent_id = _uuid_mod.uuid4()
+    task = await _blocked_task(
+        reaper_db,
+        project,
+        parent_task_id=parent_id,
+        blocker_kind="precondition",
+        blocked_reason=(
+            "BLOCKER: mandatory impacted backend gate fails outside this diff"
+        ),
+        context={
+            "generated_head_sha": "a" * 40,
+            "finding_hash": "blocked-finding",
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+            },
+        },
+    )
+    sibling = Task(
+        project_id=project.id,
+        parent_task_id=parent_id,
+        title="independent sibling",
+        status=TaskStatus.IN_PROGRESS,
+        created_by="test-user",
+        payloads=[{"type": "create"}],
+        context={"finding_hash": "other-finding"},
+        status_log=[],
+    )
+    reaper_db.add(sibling)
+    await reaper_db.commit()
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, _utcnow())
+
+    assert requeued == 1
+    await reaper_db.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+
+
+@pytest.mark.asyncio
 async def test_unblock_sweep_broadcasts_after_commit(reaper_db, mocker):
     """The unblock-to-QUEUED task_updated broadcast must fire only after the
     batch commit succeeds, so the UI never refetches a still-BLOCKED row."""
@@ -13512,6 +13792,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
     STALE_OPEN_DECAY_DAYS,
+    STALE_QUESTION_DECAY_DAYS,
 )
 
 
@@ -13637,25 +13918,85 @@ async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
-    """Recent NOTEs and any QUESTION/BLOCKER are never decayed."""
+    """Recent NOTEs, BLOCKER, and QUESTIONs under 30d are never decayed."""
     project = await _make_project(reaper_db)
+    # 19 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
     old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
     recent_note = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.NOTE
     )  # created now
-    live_question = await _make_conversational_message(
-        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
-    )
     live_blocker = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
+    )
+    # QUESTION at 19 days: below STALE_QUESTION_DECAY_DAYS (30d), must survive
+    young_question = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
     )
 
     acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
 
     assert acted == 0
-    for m in (recent_note, live_question, live_blocker):
+    for m in (recent_note, live_blocker, young_question):
         await reaper_db.refresh(m)
         assert m.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
+    """An OPEN QUESTION past the 30-day question window is auto-decayed as 'stale_unanswered'."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_QUESTION_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_survives_short_window(reaper_db):
+    """An OPEN QUESTION older than NOTE decay window (14d) but younger than the
+    question window (30d) must NOT be decayed — questions get more patience."""
+    project = await _make_project(reaper_db)
+    # 15 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
+    mildly_old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=mildly_old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_respects_runtime_config(reaper_db, monkeypatch):
+    """'stale_question_decay_days' runtime config overrides the default 30-day window."""
+    import app.shared_state as _ss
+
+    project = await _make_project(reaper_db)
+    # 5 days old — within default window (30d) but past the custom window (3d)
+    slightly_old = _utcnow() - timedelta(days=5)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=slightly_old
+    )
+
+    original = dict(_ss.runtime_config)
+    monkeypatch.setattr(_ss, "runtime_config", {**original, "stale_question_decay_days": 3})
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+    monkeypatch.setattr(_ss, "runtime_config", original)
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
 
 
 @pytest.mark.asyncio

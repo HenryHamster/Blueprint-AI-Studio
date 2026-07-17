@@ -54,6 +54,7 @@ class TestViewableSelectionPolicy:
             "shot.jpeg",
             "rollout.mp4",
             "clip.webm",
+            "report.pdf",
             "chart.svg",  # EXCLUDED by design: script execution via signed URL
             "index.html",
             "results.json",
@@ -71,6 +72,7 @@ class TestViewableSelectionPolicy:
             "shot.jpeg": "image",
             "rollout.mp4": "video",
             "clip.webm": "video",
+            "report.pdf": "pdf",
         }
         assert "chart.svg" not in by_name
 
@@ -348,6 +350,7 @@ class TestRunnerViewableScan:
             "shot.jpeg",
             "rollout.mp4",
             "clip.webm",
+            "report.pdf",
             "chart.svg",  # EXCLUDED by design (script-bearing SVG is an XSS vector)
             "index.html",
             "results.json",
@@ -363,6 +366,7 @@ class TestRunnerViewableScan:
             "shot.jpeg": "image",
             "rollout.mp4": "video",
             "clip.webm": "video",
+            "report.pdf": "pdf",
         }
         assert "chart.svg" not in by_name
 
@@ -566,6 +570,51 @@ class TestRunnerViewableStreaming:
             local_runner._stream_viewable_files(
                 "http://orch", "tok", "job-1", str(tmp_path), state
             )
+
+    def test_oversize_file_tracked_in_oversize_relpaths(self, tmp_path, monkeypatch):
+        """Oversize skips accumulate in oversize_relpaths without duplicates."""
+        monkeypatch.setattr(local_runner, "_MAX_VIEWABLE_IMAGE_BYTES", 64)
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "huge.png").write_bytes(b"x" * 128)
+        (art / "small.png").write_bytes(b"x" * 16)
+        state = local_runner._ViewableStreamState()
+        # Two scans of the same oversize file must not inflate the count.
+        _run_stream(art, state)
+        _run_stream(art, state)
+        assert state.oversize_relpaths == {"huge.png"}
+        assert state.count_cap_relpaths == set()
+
+    def test_count_cap_files_tracked_in_count_cap_relpaths(self, tmp_path):
+        """Files beyond the 25-file budget accumulate in count_cap_relpaths."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        # Create exactly cap + 2 files so 2 are skipped.
+        for i in range(local_runner._MAX_VIEWABLE_FILE_COUNT + 2):
+            (art / f"plot_{i:03d}.png").write_bytes(b"x" * 16)
+        state = local_runner._ViewableStreamState()
+        # Run enough iterations to fill the budget, then one more to trigger the
+        # count-cap path for the remaining files (the cap check fires on the scan
+        # that follows all 25 successful uploads).
+        for _ in range(local_runner._MAX_VIEWABLE_FILE_COUNT + 1):
+            _run_stream(art, state)
+        # Two unique relpaths should be in count_cap_relpaths.
+        assert len(state.count_cap_relpaths) == 2
+        assert state.oversize_relpaths == set()
+        # A second pass over the same over-budget files must not inflate the count.
+        _run_stream(art, state)
+        assert len(state.count_cap_relpaths) == 2
+
+    def test_pdf_file_uploaded(self, tmp_path):
+        """PDF files are streamed live (added to runner _VIEWABLE_CONTENT_TYPES)."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "report.pdf").write_bytes(b"%PDF-1.4 small content")
+        state = local_runner._ViewableStreamState()
+        calls = _run_stream(art, state)
+        assert len(calls) == 1
+        assert calls[0]["relpath"] == "report.pdf"
+        assert calls[0]["content_type"] == "application/pdf"
 
 
 class TestRunnerViewableUpload:
@@ -781,7 +830,8 @@ class TestRunnerViewableUpload:
             with mock.patch.object(local_runner.iso, "decide_compute_backend", return_value="test"), \
                  mock.patch.object(local_runner.iso, "plan_compute_execution", side_effect=fake_plan), \
                  mock.patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
-                 mock.patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.1):
+                 mock.patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.1), \
+                 mock.patch.object(local_runner, "_FINAL_VIEWABLE_DRAIN_SECONDS", 0.05):
                 local_runner._run_compute_job(
                     {"job_id": "slow-upload", "command": "unused", "env": {}},
                     f"http://127.0.0.1:{server.server_port}", "tok", set(), threading.Lock(),

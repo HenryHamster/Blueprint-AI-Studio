@@ -2,7 +2,7 @@
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
 import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
-import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
+import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker, acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
@@ -467,10 +467,23 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     () => strategicAttention?.items.filter(item => item.severity === 'needs_operator') ?? [],
     [strategicAttention?.items],
   );
+  // Set of message IDs that the server marks needs_operator. Used to converge
+  // the list high-signal split onto the same canonical source as the badge and
+  // toast surfaces so all four surfaces agree without client-side re-derivation.
+  const needsOperatorMessageIds = useMemo(
+    () => new Set(
+      attentionNeedsActionItems
+        .filter(item => item.kind === 'message')
+        .map(item => item.ref.id),
+    ),
+    [attentionNeedsActionItems],
+  );
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const messagesRef = useRef<ProjectMessage[]>([]);
   messagesRef.current = messages;
   const [loading, setLoading] = useState(true);
+  const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
+  const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
@@ -893,6 +906,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     showResolved,
     showOnlyNew,
     dividerTime,
+    needsOperatorIds: needsOperatorMessageIds,
   });
   // Legacy fallback when the canonical strategic attention read model is unavailable.
   const highSignalCount = useMemo(
@@ -1234,12 +1248,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       const data = await res.json();
       if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
-      // Detect new high-signal messages for toast alerts
+      // Detect new needs-action messages for toast alerts. The canonical
+      // attention model (not local mute prefs) is the exclusive gate: if the
+      // server marks a message needs_operator it must trigger a toast regardless
+      // of any locally-muted event_type so all four notification surfaces agree.
       if (hasInitiallyLoadedRef.current) {
         const newNeedsOperator = msgs.filter(m =>
           m.status === 'open' &&
           isMessageNeedingOperatorAttention(m, strategicAttentionRef.current) &&
-          effectiveSignal(m, eventPrefsRef.current, tempMutesRef.current) !== 'mute' &&
           !seenMessageIdsRef.current.has(m.id)
         );
         if (newNeedsOperator.length > 0) {
@@ -1248,8 +1264,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             : `${newNeedsOperator.length} new needs-action messages`;
           const toastSeverity = newNeedsOperator.some(m => getToastSeverity(m) === 'error') ? 'error' : 'info';
           addToastRef.current(summary, toastSeverity);
-          // Local settings may suppress or present canonical attention; they do
-          // not decide which server-routed messages are intrusive.
           if (notifyOnHighSignalMessageRef.current && 'Notification' in window && Notification.permission === 'granted') {
             for (const msg of newNeedsOperator) {
               new Notification(msg.message_type, { body: msg.content.slice(0, 100) });
@@ -2608,38 +2622,92 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               <span className="shrink-0 rounded-full bg-amber-800/60 px-1.5 text-ui-sm font-semibold text-amber-200">{attentionNeedsActionItems.length}</span>
             </div>
             <div className="flex flex-wrap gap-1.5">
-              {attentionNeedsActionItems.slice(0, 6).map(item => {
+              {attentionNeedsActionItems.slice(0, 6).filter(item => !resolvedConfirmationIds.has(item.id)).map(item => {
                 const isMessage = item.kind === 'message';
                 const isConfirmation = item.kind === 'confirmation';
                 const messageId = isMessage ? item.ref?.id : null;
+                const isExpanded = isConfirmation && expandedConfirmationItemId === item.id;
                 const handleClick = () => {
                   if (isMessage && messageId && conversationMode) {
                     void scrollConversationMessageIntoView(messageId).then(revealed => {
                       if (revealed) setHighlightedMessageId(messageId);
                     });
+                  } else if (isConfirmation) {
+                    setExpandedConfirmationItemId(prev => prev === item.id ? null : item.id);
+                  }
+                };
+                const handleAccept = async () => {
+                  const projectId = item.ref?.project_id ?? selectedProjectId;
+                  const pendingId = item.ref?.id ?? item.id;
+                  if (!projectId) return;
+                  try {
+                    await acceptPendingConfirmation(projectId, pendingId);
+                    setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
+                    setExpandedConfirmationItemId(null);
+                    refreshStrategicState?.();
+                  } catch {
+                    addToast?.('Failed to accept — try again', 'error');
+                  }
+                };
+                const handleDismiss = async () => {
+                  const projectId = item.ref?.project_id ?? selectedProjectId;
+                  const pendingId = item.ref?.id ?? item.id;
+                  if (!projectId) return;
+                  try {
+                    await dismissPendingConfirmation(projectId, pendingId);
+                    setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
+                    setExpandedConfirmationItemId(null);
+                    refreshStrategicState?.();
+                  } catch {
+                    addToast?.('Failed to dismiss — try again', 'error');
                   }
                 };
                 return (
-                  <button
-                    key={item.id}
-                    type="button"
-                    onClick={handleClick}
-                    disabled={!isMessage && !isConfirmation}
-                    title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
-                    className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
-                      isMessage
-                        ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                        : 'border-neutral-800 bg-neutral-950/50 cursor-default'
-                    }`}
-                  >
-                    <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
-                    <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
-                    {item.lifecycle?.clears_when && (
-                      <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
-                        auto-clears
-                      </span>
+                  <div key={item.id} className="flex flex-col gap-1">
+                    <button
+                      type="button"
+                      onClick={handleClick}
+                      disabled={!isMessage && !isConfirmation}
+                      title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
+                      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
+                        isMessage
+                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                          : isConfirmation
+                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                          : 'border-neutral-800 bg-neutral-950/50 cursor-default'
+                      }`}
+                    >
+                      <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
+                      <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
+                      {item.lifecycle?.clears_when && (
+                        <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
+                          auto-clears
+                        </span>
+                      )}
+                    </button>
+                    {isExpanded && (
+                      <div className="flex gap-1.5 pl-1" data-testid="confirmation-chip-actions">
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          type="button"
+                          onClick={() => { void handleAccept(); }}
+                          className="rounded border border-green-700/60 bg-green-900/40 px-2 py-0.5 text-xs font-medium text-green-200 hover:bg-green-800/50 transition-colors"
+                          data-testid="confirmation-accept-btn"
+                        >
+                          Accept
+                        </button>
+                        {/* eslint-disable-next-line viewport/min-touch-target */}
+                        <button
+                          type="button"
+                          onClick={() => { void handleDismiss(); }}
+                          className="rounded border border-neutral-700/60 bg-neutral-900/40 px-2 py-0.5 text-xs font-medium text-neutral-300 hover:bg-neutral-800/50 transition-colors"
+                          data-testid="confirmation-dismiss-btn"
+                        >
+                          Dismiss
+                        </button>
+                      </div>
                     )}
-                  </button>
+                  </div>
                 );
               })}
             </div>

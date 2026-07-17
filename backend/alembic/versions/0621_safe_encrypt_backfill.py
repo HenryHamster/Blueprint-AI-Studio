@@ -43,7 +43,7 @@ import sqlalchemy as sa
 logger = logging.getLogger(__name__)
 
 revision = "0621"
-down_revision = "0609"
+down_revision = "0612"
 branch_labels = None
 depends_on = None
 

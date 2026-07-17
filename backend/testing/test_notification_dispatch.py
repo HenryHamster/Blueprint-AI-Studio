@@ -81,6 +81,17 @@ def _reset_stats():
     nd._per_project_stats.clear()
 
 
+async def _persist_test_project(session) -> uuid.UUID:
+    """Create the parent row required by canonical message sequencing."""
+    project = Project(
+        name=f"Notification test {uuid.uuid4()}",
+        user_id="notification-dispatch-test",
+    )
+    session.add(project)
+    await session.flush()
+    return project.id
+
+
 # ---------------------------------------------------------------------------
 # dispatch_external_notification — delivery stats
 # ---------------------------------------------------------------------------
@@ -676,6 +687,8 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     in-memory queue must leave a durable, re-drivable NotificationDeadLetter
     row instead of silently vanishing."""
 
+    from app.field_encryption import decrypt_field
+
     _reset_stats()
     pid = uuid.uuid4()
 
@@ -714,7 +727,8 @@ async def test_exhausted_or_evicted_notification_writes_dead_letter(db_session):
     assert row.last_status == 503
     assert row.attempts == len(_RETRY_DELAYS)  # attempts+1, all attempts used
     assert row.payload == {"k": "v"}
-    assert row.webhook_url == "https://dest.example.com/hook"
+    assert row.webhook_url != "https://dest.example.com/hook"
+    assert decrypt_field(row.webhook_url) == "https://dest.example.com/hook"
     assert len(nd._retry_queue) == 0  # exhausted entry not re-queued
 
     # --- Evicted path: overflowing the bounded queue drops the oldest entry ---
@@ -779,7 +793,7 @@ def test_get_notification_stats_initial():
 
 @pytest.mark.asyncio
 async def test_post_event_message_basic(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     # "failure_alert" is a registered operator-visible (operator-fyi) event
     # type, so post_event_message creates the operator-facing NOTE and stamps
     # the resolved audience onto the row.
@@ -804,7 +818,7 @@ async def test_post_event_message_unregistered_event_is_tagged_strategist_intern
     may want) but is stamped ``audience="strategist-internal"`` so operator
     surfaces can exclude it — it is never operator-visible.
     """
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_event_message(db_session, project_id, "test_event", "Test summary")
     assert msg is not None
     assert msg.context["event_type"] == "test_event"
@@ -815,7 +829,7 @@ async def test_post_event_message_unregistered_event_is_tagged_strategist_intern
 @pytest.mark.asyncio
 async def test_post_event_message_registered_internal_event_is_tagged(db_session):
     """A registered strategist-internal event type is created but tagged non-operator."""
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     # "pr_merged" is registered as strategist-internal bookkeeping.
     msg = await post_event_message(db_session, project_id, "pr_merged", "Merged")
     assert msg is not None
@@ -824,7 +838,7 @@ async def test_post_event_message_registered_internal_event_is_tagged(db_session
 
 @pytest.mark.asyncio
 async def test_post_event_message_with_context_and_task_id(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     task_id = uuid.uuid4()
     extra_ctx = {"key": "value", "num": 42}
     # "question_answer" is a registered operator-visible (operator-fyi) event type.
@@ -846,7 +860,7 @@ async def test_post_event_message_with_context_and_task_id(db_session):
 
 @pytest.mark.asyncio
 async def test_post_criterion_retracted_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     version_id = uuid.uuid4()
     msg = await nd.post_criterion_retracted_message(
         db_session,
@@ -871,7 +885,7 @@ async def test_post_criterion_retracted_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_criterion_retracted_message_truncates_reason_and_text(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await nd.post_criterion_retracted_message(
         db_session,
         project_id,
@@ -887,7 +901,7 @@ async def test_post_criterion_retracted_message_truncates_reason_and_text(db_ses
 
 @pytest.mark.asyncio
 async def test_post_criterion_superseded_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     version_id = uuid.uuid4()
     msg = await nd.post_criterion_superseded_message(
         db_session,
@@ -923,7 +937,7 @@ def test_criterion_events_are_high_signal_note_types():
 
 @pytest.mark.asyncio
 async def test_post_pr_merged_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_pr_merged_message(
         db_session,
         project_id,
@@ -944,7 +958,7 @@ async def test_post_pr_merged_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_pr_merged_message_truncates_direction_text(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     long_text = "x" * 200
     msg = await post_pr_merged_message(
         db_session, project_id, pr_number=1, direction_text=long_text, task_count=1
@@ -954,7 +968,7 @@ async def test_post_pr_merged_message_truncates_direction_text(db_session):
 
 @pytest.mark.asyncio
 async def test_post_direction_milestone_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_direction_milestone_message(
         db_session,
         project_id,
@@ -974,7 +988,7 @@ async def test_post_direction_milestone_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_direction_milestone_message_truncates_text(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     long_text = "y" * 200
     msg = await post_direction_milestone_message(
         db_session,
@@ -989,7 +1003,7 @@ async def test_post_direction_milestone_message_truncates_text(db_session):
 @pytest.mark.asyncio
 async def test_post_direction_milestone_message_fires_webhook(db_session):
     """Creating the milestone message also fires DIRECTION_MILESTONE via the external webhook."""
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     with patch(
         "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
@@ -1019,7 +1033,7 @@ async def test_post_direction_milestone_message_fires_webhook(db_session):
 async def test_post_direction_milestone_message_adds_reason_code_and_evidence(
     db_session,
 ):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     evidence = {"cost_per_merge": 12.5, "merge_count": 1}
     with patch(
@@ -1050,7 +1064,7 @@ async def test_post_direction_milestone_message_adds_reason_code_and_evidence(
 async def test_post_direction_milestone_message_no_reason_code_for_non_paused(
     db_session,
 ):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     with patch(
         "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
@@ -1075,7 +1089,7 @@ async def test_post_direction_milestone_message_no_reason_code_for_non_paused(
 
 @pytest.mark.asyncio
 async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     with patch(
         "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
@@ -1099,7 +1113,7 @@ async def test_post_direction_milestone_message_reason_code_budget_exceeded(db_s
 
 @pytest.mark.asyncio
 async def test_post_direction_milestone_message_reason_code_low_yield(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     with patch(
         "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
@@ -1123,7 +1137,7 @@ async def test_post_direction_milestone_message_reason_code_low_yield(db_session
 
 @pytest.mark.asyncio
 async def test_post_cycle_summary_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_cycle_summary_message(
         db_session,
         project_id,
@@ -1148,7 +1162,7 @@ async def test_post_cycle_summary_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_failure_alert_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_failure_alert_message(
         db_session, project_id, description="Circuit breaker opened"
     )
@@ -1161,7 +1175,7 @@ async def test_post_failure_alert_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_account_model_regression_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_account_model_regression_message(
         db_session,
         project_id,
@@ -1194,7 +1208,7 @@ async def test_post_account_model_regression_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_account_model_regression_recovered_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_account_model_regression_recovered_message(
         db_session,
         project_id,
@@ -1223,7 +1237,7 @@ async def test_post_account_model_regression_recovered_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_account_model_regression_recovered_message_no_stats(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_account_model_regression_recovered_message(
         db_session,
         project_id,
@@ -1242,7 +1256,7 @@ async def test_post_account_model_regression_recovered_message_no_stats(db_sessi
 
 @pytest.mark.asyncio
 async def test_post_auto_fix_spawned_message_few_checks(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_auto_fix_spawned_message(
         db_session,
         project_id,
@@ -1261,7 +1275,7 @@ async def test_post_auto_fix_spawned_message_few_checks(db_session):
 
 @pytest.mark.asyncio
 async def test_post_auto_fix_spawned_message_many_checks(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     checks = ["check1", "check2", "check3", "check4", "check5"]
     msg = await post_auto_fix_spawned_message(
         db_session, project_id, branch="feature", failed_checks=checks
@@ -1290,7 +1304,7 @@ async def test_post_auto_fix_result_merged(db_session):
 
 @pytest.mark.asyncio
 async def test_post_auto_fix_result_failed(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_auto_fix_result_message(
         db_session, project_id, branch="main", result="failed"
     )
@@ -1301,7 +1315,7 @@ async def test_post_auto_fix_result_failed(db_session):
 
 @pytest.mark.asyncio
 async def test_post_auto_fix_result_review_needed(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_auto_fix_result_message(
         db_session, project_id, branch="feat", result="review_needed", pr_number=55
     )
@@ -1312,7 +1326,7 @@ async def test_post_auto_fix_result_review_needed(db_session):
 
 @pytest.mark.asyncio
 async def test_post_remediation_escalation_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_remediation_escalation_message(
         db_session,
         project_id,
@@ -1334,7 +1348,7 @@ async def test_post_remediation_escalation_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_remediation_escalation_message_truncates(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     long_dir = "d" * 200
     long_pattern = "p" * 500
     long_summary = "s" * 500
@@ -1354,7 +1368,7 @@ async def test_post_remediation_escalation_message_truncates(db_session):
 @pytest.mark.asyncio
 async def test_post_remediation_escalation_message_fires_webhook(db_session):
     """Creating the escalation message also fires REMEDIATION_ESCALATED via the external webhook."""
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     dispatch_mock = AsyncMock()
     with patch(
         "app.notification_dispatch.dispatch_external_notification", new=dispatch_mock
@@ -1386,7 +1400,7 @@ async def test_post_remediation_escalation_message_fires_webhook(db_session):
 
 @pytest.mark.asyncio
 async def test_post_issue_implementation_spawned_message(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     task_id = uuid.uuid4()
     msg = await post_issue_implementation_spawned_message(
         db_session,
@@ -1407,7 +1421,7 @@ async def test_post_issue_implementation_spawned_message(db_session):
 
 @pytest.mark.asyncio
 async def test_post_issue_implementation_spawned_message_no_task_id(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_issue_implementation_spawned_message(
         db_session, project_id, issue_number=5, issue_title="Bug"
     )
@@ -1416,7 +1430,7 @@ async def test_post_issue_implementation_spawned_message_no_task_id(db_session):
 
 @pytest.mark.asyncio
 async def test_post_review_feedback_dismissed(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_review_feedback_message(
         db_session,
         project_id,
@@ -1436,7 +1450,7 @@ async def test_post_review_feedback_dismissed(db_session):
 
 @pytest.mark.asyncio
 async def test_post_review_feedback_user_overrode(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_review_feedback_message(
         db_session, project_id, pr_number=20, signal="user_overrode_review"
     )
@@ -1447,7 +1461,7 @@ async def test_post_review_feedback_user_overrode(db_session):
 
 @pytest.mark.asyncio
 async def test_post_review_feedback_user_caught_issues(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_review_feedback_message(
         db_session, project_id, pr_number=30, signal="user_caught_issues"
     )
@@ -1458,7 +1472,7 @@ async def test_post_review_feedback_user_caught_issues(db_session):
 
 @pytest.mark.asyncio
 async def test_post_review_feedback_unknown_signal(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_review_feedback_message(
         db_session, project_id, pr_number=40, signal="some_unknown_signal"
     )
@@ -1468,7 +1482,7 @@ async def test_post_review_feedback_unknown_signal(db_session):
 
 @pytest.mark.asyncio
 async def test_post_feedback_acknowledgment(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     original_msg_id = uuid.uuid4()
     msg = await post_feedback_acknowledgment(
         db_session,
@@ -1490,7 +1504,7 @@ async def test_post_feedback_acknowledgment(db_session):
 
 @pytest.mark.asyncio
 async def test_post_feedback_acknowledgment_with_task_id(db_session):
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     original_msg_id = uuid.uuid4()
     task_id = uuid.uuid4()
     msg = await post_feedback_acknowledgment(
@@ -1856,7 +1870,7 @@ async def test_post_residual_fix_result_review_needed_preserves_state(db_session
 async def test_post_residual_fix_escalation_message(db_session):
     """Escalation helper emits a BLOCKER ProjectMessage with the
     residual_fix_escalated event_type so external subscribers can filter."""
-    project_id = uuid.uuid4()
+    project_id = await _persist_test_project(db_session)
     msg = await post_residual_fix_escalation_message(
         db_session,
         project_id,

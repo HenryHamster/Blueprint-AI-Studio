@@ -917,22 +917,20 @@ async def load_strategic_context_evidence(
 ) -> Dict[str, Any]:
     """Return bounded durable context descriptors without heavy bodies/logs."""
 
-    knowledge_total = (
+    # Real aggregate count of all knowledge documents for the project, plus the
+    # pending (unaddressed) subset — merged into one indexed round trip.
+    _knowledge_count_row = (
         await session.execute(
-            select(func.count()).where(KnowledgeDocument.project_id == project_id)
+            select(
+                func.count().label("total"),
+                func.count().filter(
+                    KnowledgeDocument.lifecycle_status == "pending"
+                ).label("pending"),
+            ).where(KnowledgeDocument.project_id == project_id)
         )
-    ).scalar()
-
-    # Real aggregate count of pending (unaddressed) knowledge documents — not a
-    # slice of the top-N sample, so the dashboard reflects the full backlog.
-    pending_count = (
-        await session.execute(
-            select(func.count()).where(
-                KnowledgeDocument.project_id == project_id,
-                KnowledgeDocument.lifecycle_status == "pending",
-            )
-        )
-    ).scalar()
+    ).one()
+    knowledge_total = int(_knowledge_count_row.total or 0)
+    pending_count = int(_knowledge_count_row.pending or 0)
 
     # Age of the oldest unaddressed pending document so backlog health is
     # observable over time (no signal was tracked before).

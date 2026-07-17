@@ -2239,20 +2239,15 @@ _DETAIL_NAME_MAX = 200
 def _extract_test_erosion_detail(
     report: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Pull a compact test-erosion detail from a RELEASE_AUDIT_REPORT.
+    """Pull a test-erosion detail from a RELEASE_AUDIT_REPORT.
 
-    ``_score_audit`` knows which test files were deleted and the net test /
-    assertion deltas while scoring, but discards them after deriving the number.
-    When test-erosion is the binding constraint the strategic agent then sees
-    only ``test_erosion=0.42`` with no indication of WHAT eroded.  This carries
-    the actionable detail (deleted files, negative deltas) into
-    ``last_qualification`` so the agent can scope a targeted remediation
-    (restore file X, recover the N removed assertions).
+    Stores ALL non-zero numerical deltas (positive and negative) so the detail
+    is lossless for cumulative reconstruction in scoped audit merging.  Also
+    captures ``deleted_test_files`` when present.
 
-    Mirrors the ``computed_test_erosion``-over-``test_erosion`` preference in
-    ``_score_audit``.  Returns ``None`` when there is no actionable erosion (no
-    deleted files and no negative delta) so a clean dimension adds nothing to
-    the payload.  ``deleted_test_files`` is capped at ``_MAX_DELETED_TEST_FILES``.
+    ``deleted_test_files`` is capped at ``_MAX_DELETED_TEST_FILES``.
+    Returns ``None`` when nothing is present (no deletions and all deltas
+    are zero).
     """
     if not isinstance(report, dict):
         return None
@@ -2284,7 +2279,7 @@ def _extract_test_erosion_detail(
     if (
         isinstance(test_delta, (int, float))
         and not isinstance(test_delta, bool)
-        and test_delta < 0
+        and test_delta != 0
     ):
         detail["test_count_delta"] = (
             int(test_delta) if float(test_delta).is_integer() else test_delta
@@ -2294,7 +2289,7 @@ def _extract_test_erosion_detail(
     if (
         isinstance(assertion_delta, (int, float))
         and not isinstance(assertion_delta, bool)
-        and assertion_delta < 0
+        and assertion_delta != 0
     ):
         detail["assertion_delta"] = (
             int(assertion_delta)

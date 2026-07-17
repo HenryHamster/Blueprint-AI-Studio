@@ -6,6 +6,7 @@
     "ColumnsPicker": "Utility component: renders chip columns in KanbanBoard's table; layout controlled entirely by parent, not rendering standalone in operator pages.",
     "Toasts": "Toast notifications: positioned fixed/absolutely, exempt from viewport flow overflow checks; positioned via Tailwind fixed positioning.",
     "MessageBubble": "Message-row sub-component rendered exclusively inside MessagesPanel; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises the bubble inline (overflow, text-truncation, touch-target).",
+    "MessageAttachments": "Attachment-chip row rendered exclusively inside MessageBubble; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises the bubble (and its attachments) inline.",
     "MessagesPanelHeader": "Header (title badges, webhook popover, toolbar, search, saved-views strip) rendered exclusively inside MessagesPanel; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises it inline.",
     "MessagesComposer": "Bottom compose area (reply bar, type dropdown, textarea, send) rendered exclusively inside MessagesPanel; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises it inline.",
     "MessagesBatchActionBar": "Batch-action bar rendered exclusively inside MessagesPanel when select-mode is active; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises it inline.",

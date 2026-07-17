@@ -58,6 +58,11 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
+from app.strategic_resident_models import (  # noqa: F401
+    StrategicOperationReceipt,
+    StrategicResident,
+    StrategicResidentCheckpoint,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -2305,6 +2310,7 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
+        Index("ix_computejob_updated_at", "updated_at"),
         Index(
             "ix_computejob_polling_metadata_runner_target_id",
             "polling_metadata",
@@ -3402,7 +3408,7 @@ class ProjectMessage(SQLModel, table=True):
     # Allowed values: 'user' | 'agent' | 'strategic' | 'system'. Enforced
     # server-side by ``chk_projectmessage_from_type`` (alembic 0065 /
     # audit L-S1, Postgres-only).
-    from_type: str = Field(default="user")
+    from_type: str = Field(default="user", index=True)
     from_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
     content: str = Field(default="")
     context: Dict[str, Any] = Field(
@@ -3503,6 +3509,7 @@ class ProjectMessage(SQLModel, table=True):
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
+        Index("ix_projectmessage_status_from_type", "status", "from_type"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(
@@ -4936,6 +4943,13 @@ class ImprovementLane(SQLModel, table=True):
         Index("ix_improvementlane_project_status", "project_id", "status"),
         # Direction scope: find lanes for a given direction.
         Index("ix_improvementlane_direction_status", "direction_id", "status"),
+        # Stale-parked-lane sweep: expired PARKED lanes.
+        Index(
+            "ix_improvementlane_status_parked_at",
+            "status",
+            "parked_at",
+            postgresql_where=text("status = 'PARKED'"),
+        ),
     )
 
 

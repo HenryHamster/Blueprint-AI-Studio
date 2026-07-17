@@ -568,6 +568,10 @@ class HeartbeatRequest(BaseModel):
     # systemd_run_ok); agent_backend/compute_backend name the backend the runner
     # would use for each class. All ride in capabilities JSONB for the fleet panel.
     isolation_backends: dict | None = None
+    # Additive functional evidence keyed by the runtime jobs will execute, e.g.
+    # {"docker": {"verified": true, "mode": "cdi", "reason": "verified"}}.
+    # Old runners omit it and remain heartbeat-compatible.
+    container_gpu_passthrough: dict | None = None
     agent_backend: str | None = None
     compute_backend: str | None = None
     # Versioned functional evidence for project-authoring verification. Kept raw
@@ -1025,6 +1029,12 @@ async def next_task(
     allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_task")
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    # A draining runner may finish work it has already pulled, but it must not
+    # receive another agent task while the operator is quiescing the host.
+    if runner.status != "active":
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
 
     pinned_vm_id = f"runner:{runner.id}"
     # Skip markers are scoped to the runner that wrote them: routability depends on
@@ -1526,6 +1536,14 @@ async def heartbeat(
     # All optional and tolerated as missing so older runners keep heartbeating.
     if payload.isolation_backends is not None:
         caps["isolation_backends"] = payload.isolation_backends
+    if payload.container_gpu_passthrough is not None:
+        caps["container_gpu_passthrough"] = payload.container_gpu_passthrough
+    elif payload.active_work_report:
+        # A daemon heartbeat from an older/replaced runner is current negative
+        # evidence: retaining proof from a previous process would authorize GPU
+        # image work that this daemon cannot prove it can execute. Non-report
+        # preflights leave the last genuine daemon inventory untouched.
+        caps.pop("container_gpu_passthrough", None)
     if payload.llm_clis is not None:
         caps["llm_clis"] = payload.llm_clis
     if payload.agent_backend is not None:
@@ -1877,6 +1895,12 @@ class ComputeJobReportRequest(BaseModel):
     # exit outcome remains in runner_exec_status; this marker independently says
     # whether its checkpoint bundle reached verified storage.
     artifact_delivery: Dict[str, Any] | None = None
+    # Live omission telemetry from the runner's mid-run viewable scan. Typed
+    # ``Any`` on purpose: tolerance contract validated inline (garbage is dropped).
+    # Shape: {"size_cap": int, "count_cap": int} — counts of unique relpaths skipped
+    # due to per-kind size cap or 25-file count cap. Only meaningful on "running"
+    # reports; ignored on terminal ones.
+    viewable_omissions: Any = None
 
 
 @router.post("/next-compute-job")
@@ -1895,6 +1919,14 @@ async def next_compute_job(
     allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_compute_job")
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    # Draining is a quiesce state, not a runner failure: already-claimed jobs
+    # keep reporting and finish normally, but no new subprocess may be handed to
+    # this runner.  Return the ordinary empty-poll response so older runners
+    # simply back off while an operator drains the host.
+    if runner.status != "active":
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
 
     now = _utcnow()
     # Serve compute jobs for ANY project on this runner's allow-list, not only its
@@ -2198,6 +2230,14 @@ async def report_compute_job(
                         # or backdate its own protection window.
                         t=now.isoformat(),
                     )
+        if payload.exec_status == "running" and isinstance(payload.viewable_omissions, dict):
+            omissions: Dict[str, Any] = {}
+            for key in ("size_cap", "count_cap"):
+                val = payload.viewable_omissions.get(key)
+                if isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 10000:
+                    omissions[key] = val
+            if omissions:
+                meta["viewable_live_omissions"] = omissions
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
         if isinstance(payload.resume_hydration, dict):
@@ -3101,7 +3141,7 @@ async def upload_compute_job_viewable(
             raise HTTPException(
                 status_code=422,
                 detail=f"file type not viewable: {raw_filename!r} — "
-                f"supported: png/jpg/jpeg/webp/gif/mp4/webm",
+                f"supported: png/jpg/jpeg/webp/gif/mp4/webm/pdf",
             )
         content_type, kind = type_info
 

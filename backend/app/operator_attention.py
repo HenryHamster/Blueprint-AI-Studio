@@ -13,7 +13,7 @@ from typing import Any
 
 from sqlalchemy import and_, case, func, not_, or_, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import load_only
+from sqlalchemy.orm import aliased, load_only
 from sqlmodel import select
 
 from app.message_convergence import OPEN_STATUS
@@ -43,6 +43,7 @@ from app.models import (
 from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
 from app.message_audience import (
     OPERATOR_ACTION_NEEDED,
+    operator_visible_alert_filter,
     operator_visible_audience_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
@@ -124,6 +125,42 @@ _TASK_ATTENTION_COLS = (
     Task.created_at,
     Task.updated_at,
 )
+
+
+def _local_runner_hold_preview_statement(
+    local_runner_hold_filters: tuple[Any, ...],
+    strategic_local_runner_hold_filters: tuple[Any, ...],
+):
+    """Load both hold previews in one round trip without widening the row.
+
+    ``select(Task).from_statement(union_all(select(Task), ...))`` selects every
+    Task column even when loader options are attached to the UNION branches.
+    That silently reintroduced large JSON payload/status columns that the
+    attention read model intentionally excludes. Project the exact consumed
+    columns into a subquery, then map the narrow rows back to Task instances.
+    """
+
+    projection = (
+        *_TASK_ATTENTION_COLS,
+        Task.vm_instance_id,
+        Task.context,
+    )
+    combined = union_all(
+        select(*projection)
+        .where(*local_runner_hold_filters)
+        .order_by(Task.priority.asc(), Task.created_at.asc())
+        .limit(4),
+        select(*projection)
+        .where(*strategic_local_runner_hold_filters)
+        .order_by(Task.priority.asc(), Task.created_at.asc())
+        .limit(4),
+    ).subquery()
+    held_task = aliased(Task, combined, adapt_on_names=True)
+    loaded_attributes = [getattr(held_task, column.key) for column in projection]
+    return select(held_task).options(
+        load_only(*loaded_attributes, raiseload=True)
+    )
+
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
@@ -1037,6 +1074,22 @@ def _handmerge_preserved_task_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
     )
 
 
+async def _load_handmerge_preserved_tasks(
+    session: AsyncSession, project_id: uuid.UUID
+) -> tuple[int, list[Task]]:
+    """Return the exact count plus the bounded operator-attention preview."""
+    result = await session.execute(
+        select(Task, func.count().over().label("_total_count"))
+        .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
+        .where(*_handmerge_preserved_task_filter(project_id))
+        .order_by(Task.updated_at.desc())
+        .limit(_STALE_TASK_PREVIEW_LIMIT)
+    )
+    rows = result.all()
+    count = int(rows[0][1] or 0) if rows else 0
+    return count, [row[0] for row in rows]
+
+
 async def _load_stale_runner_pins(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1114,6 +1167,7 @@ def _runner_is_dead(runner: LocalRunner) -> bool:
 async def _load_dead_runners(
     session: AsyncSession,
     project_id: uuid.UUID,
+    runner_rows: list[LocalRunner] | None = None,
 ) -> tuple[int, int, list[LocalRunner]]:
     """Registered runners that have died/stalled, independent of any pinned task.
 
@@ -1134,19 +1188,20 @@ async def _load_dead_runners(
     may be interrupted), an idle one is a ``watch`` item — mirroring the
     ERROR/WARNING split of the runner-deactivated alert.
     """
-    runners = list(
-        (
-            await session.execute(
-                select(LocalRunner).where(
-                    runner_allowed_for_project(project_id),
-                    LocalRunner.status != "deleted",
+    if runner_rows is None:
+        runner_rows = list(
+            (
+                await session.execute(
+                    select(LocalRunner).where(
+                        runner_allowed_for_project(project_id),
+                        LocalRunner.status != "deleted",
+                    )
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    dead = [runner for runner in runners if _runner_is_dead(runner)]
+    dead = [runner for runner in runner_rows if _runner_is_dead(runner)]
     if not dead:
         return 0, 0, []
     # Exclude runners already surfaced by an unpulled-pin (stale_runner_pin) item.
@@ -1904,6 +1959,7 @@ async def get_operator_message_counts(
                     Alert.project_id == project_id,
                     Alert.dismissed_at.is_(None),
                     Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                    operator_visible_alert_filter(Alert.event_type),
                 )
             )
         ).scalar()
@@ -1925,6 +1981,8 @@ async def build_operator_attention(
     session: AsyncSession,
     project: Project,
     user_id: str,
+    *,
+    runner_rows: list[LocalRunner] | None = None,
 ) -> dict[str, Any]:
     """Build the operator attention block for a project.
 
@@ -2131,21 +2189,13 @@ async def build_operator_attention(
     blocked_count = int(task_count_result.blocked or 0)
     parked_count = int(task_count_result.parked or 0)
 
-    handmerge_preserved_filters = _handmerge_preserved_task_filter(project.id)
-    _handmerge_all = list(
-        (
-            await session.execute(
-                select(Task)
-                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
-                .where(*handmerge_preserved_filters)
-                .order_by(Task.updated_at.desc())
-            )
-        )
-        .scalars()
-        .all()
+    (
+        handmerge_preserved_count,
+        handmerge_preserved_tasks,
+    ) = await _load_handmerge_preserved_tasks(
+        session,
+        project.id,
     )
-    handmerge_preserved_count = len(_handmerge_all)
-    handmerge_preserved_tasks = _handmerge_all[:_STALE_TASK_PREVIEW_LIMIT]
     # Keep preserved hand-merge PRs visible as their own operator item rather
     # than letting the generic FAILED-task watch preview consume the signal.
     generic_failed_count = max(failed_count - handmerge_preserved_count, 0)
@@ -2171,54 +2221,25 @@ async def build_operator_attention(
     ).one()
     local_runner_hold_count = int(_hold_counts.local or 0)
     strategic_local_runner_hold_count = int(_hold_counts.strategic or 0)
-    compute_local_runner_hold_tasks = list(
+    hold_task_rows = list(
         (
             await session.execute(
-                select(Task)
-                .options(
-                    load_only(
-                        *_TASK_ATTENTION_COLS,
-                        Task.vm_instance_id,
-                        Task.context,
-                        raiseload=True,
-                    )
+                _local_runner_hold_preview_statement(
+                    local_runner_hold_filters,
+                    strategic_local_runner_hold_filters,
                 )
-                .where(*local_runner_hold_filters)
-                .order_by(Task.priority.asc(), Task.created_at.asc())
-                .limit(4)
             )
         )
         .scalars()
         .all()
     )
-    strategic_local_runner_hold_tasks = list(
-        (
-            await session.execute(
-                select(Task)
-                .options(
-                    load_only(
-                        *_TASK_ATTENTION_COLS,
-                        Task.vm_instance_id,
-                        Task.context,
-                        raiseload=True,
-                    )
-                )
-                .where(*strategic_local_runner_hold_filters)
-                .order_by(Task.priority.asc(), Task.created_at.asc())
-                .limit(4)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    local_runner_hold_tasks = [
-        *compute_local_runner_hold_tasks,
-        *[
-            task
-            for task in strategic_local_runner_hold_tasks
-            if all(task.id != existing.id for existing in compute_local_runner_hold_tasks)
-        ],
-    ]
+    # Deduplicate (a task could theoretically match both filters).
+    seen_ids: set = set()
+    local_runner_hold_tasks = []
+    for task in hold_task_rows:
+        if task.id not in seen_ids:
+            seen_ids.add(task.id)
+            local_runner_hold_tasks.append(task)
     local_runner_hold_tasks.sort(
         key=lambda task: (task.priority, task.created_at or _utcnow())
     )
@@ -2235,7 +2256,7 @@ async def build_operator_attention(
         dead_runner_needs_operator_count,
         dead_runner_watch_count,
         dead_runners,
-    ) = await _load_dead_runners(session, project.id)
+    ) = await _load_dead_runners(session, project.id, runner_rows=runner_rows)
     (
         stale_provisioning_count,
         stale_provisioning_tasks,
@@ -2308,6 +2329,7 @@ async def build_operator_attention(
                 Alert.project_id == project.id,
                 Alert.dismissed_at.is_(None),
                 Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                operator_visible_alert_filter(Alert.event_type),
             ).group_by(Alert.severity)
         )
     ).all()
@@ -2376,38 +2398,33 @@ async def build_operator_attention(
         .scalars()
         .all()
     )
-    error_alerts = list(
+    _alert_base_filters = (
+        Alert.project_id == project.id,
+        Alert.dismissed_at.is_(None),
+        operator_visible_alert_filter(Alert.event_type),
+    )
+    combined_alerts = list(
         (
             await session.execute(
-                select(Alert)
-                .where(
-                    Alert.project_id == project.id,
-                    Alert.dismissed_at.is_(None),
-                    Alert.severity == AlertSeverity.ERROR,
+                select(Alert).from_statement(
+                    union_all(
+                        select(Alert)
+                        .where(*_alert_base_filters, Alert.severity == AlertSeverity.ERROR)
+                        .order_by(Alert.created_at.desc())
+                        .limit(_ALERT_ERROR_PREVIEW_LIMIT),
+                        select(Alert)
+                        .where(*_alert_base_filters, Alert.severity == AlertSeverity.WARNING)
+                        .order_by(Alert.created_at.desc())
+                        .limit(_ALERT_WARNING_PREVIEW_LIMIT),
+                    )
                 )
-                .order_by(Alert.created_at.desc())
-                .limit(_ALERT_ERROR_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
-    warning_alerts = list(
-        (
-            await session.execute(
-                select(Alert)
-                .where(
-                    Alert.project_id == project.id,
-                    Alert.dismissed_at.is_(None),
-                    Alert.severity == AlertSeverity.WARNING,
-                )
-                .order_by(Alert.created_at.desc())
-                .limit(_ALERT_WARNING_PREVIEW_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
+    error_alerts = [a for a in combined_alerts if a.severity == AlertSeverity.ERROR]
+    warning_alerts = [a for a in combined_alerts if a.severity == AlertSeverity.WARNING]
     alerts = [*error_alerts, *warning_alerts]
 
     # Stuck acceptance criteria: uncovered active criteria with no active direction.

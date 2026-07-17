@@ -14,6 +14,7 @@ vi.mock('../api/projectTools', async () => {
     fetchToolKinds: vi.fn(),
     createProjectTool: vi.fn(),
     updateProjectTool: vi.fn(),
+    deleteProjectTool: vi.fn(),
     seedProjectTools: vi.fn(),
     fetchAssetToken: vi.fn(),
     fetchComputeImageStatus: vi.fn(),
@@ -26,6 +27,7 @@ import {
   fetchToolKinds,
   createProjectTool,
   updateProjectTool,
+  deleteProjectTool,
   fetchAssetToken,
   fetchComputeImageStatus,
   type FetchProjectToolsResult,
@@ -538,6 +540,82 @@ describe('ProjectToolHost — owner walkthrough (end-to-end chained flow)', () =
     await act(async () => { showHiddenBtn.click(); });
     expect(findButton('Hide')).toBeTruthy();
     expect(loadHiddenManifestSlugs('proj-walkthrough').size).toBe(0);
+  });
+});
+
+describe('ProjectToolHost — delete confirmation gate', () => {
+  beforeEach(() => {
+    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
+    vi.mocked(fetchToolKinds).mockResolvedValue(KINDS);
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
+    vi.mocked(deleteProjectTool).mockImplementation(() => Promise.resolve());
+  });
+
+  afterEach(() => {
+    if (root) act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  test('clicking Remove shows confirmation prompt without immediately deleting', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    expect(findButton('Remove')).toBeTruthy();
+    expect(findButton('Permanently remove')).toBeUndefined();
+
+    await act(async () => { requireButton('Remove').click(); });
+
+    expect(findButton('Remove')).toBeUndefined();
+    expect(findButton('Permanently remove')).toBeTruthy();
+    expect(h().textContent).toContain('Remove permanently?');
+    expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
+  });
+
+  test('clicking Cancel on confirmation dismisses it without calling deleteProjectTool', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => { requireButton('Remove').click(); });
+    expect(findButton('Cancel')).toBeTruthy();
+
+    await act(async () => { requireButton('Cancel').click(); });
+
+    expect(findButton('Remove')).toBeTruthy();
+    expect(findButton('Permanently remove')).toBeUndefined();
+    expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
+  });
+
+  test('clicking Permanently remove calls deleteProjectTool and refreshes the list', async () => {
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+    await act(async () => { requireButton('Remove').click(); });
+    await act(async () => { requireButton('Permanently remove').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+
+    expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-1');
+    expect(vi.mocked(fetchProjectTools)).toHaveBeenCalledTimes(2);
+  });
+
+  test('disabled-section Remove also requires confirmation before deleting', async () => {
+    const disabledTool: ProjectTool = { ...TOOL, id: 'tool-disabled', title: 'Off Widget', enabled: false };
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [disabledTool],
+      total_count: 1,
+      next_offset: null,
+    });
+
+    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
+
+    // The Disabled section has a Remove button
+    expect(findButton('Remove')).toBeTruthy();
+    expect(findButton('Permanently remove')).toBeUndefined();
+
+    await act(async () => { requireButton('Remove').click(); });
+    expect(findButton('Permanently remove')).toBeTruthy();
+    expect(vi.mocked(deleteProjectTool)).not.toHaveBeenCalled();
+
+    await act(async () => { requireButton('Permanently remove').click(); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
+    expect(vi.mocked(deleteProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-disabled');
   });
 });
 

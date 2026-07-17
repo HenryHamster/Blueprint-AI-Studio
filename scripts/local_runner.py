@@ -50,6 +50,10 @@ Optional environment variables:
                                       (int 0–100, default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
+    BLUEPRINT_RUNNER_GPU_PROBE_IMAGE  Image used to prove container GPU passthrough.
+                                      Set this to a pullable project/private image with
+                                      nvidia-smi when Docker Hub is unavailable; default
+                                      is nvidia/cuda:12.6.3-base-ubuntu24.04.
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
     BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
     BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
@@ -2169,6 +2173,7 @@ _VIEWABLE_CONTENT_TYPES = {
     "gif": ("image/gif", "image"),
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
+    "pdf": ("application/pdf", "pdf"),
 }
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
@@ -2847,63 +2852,125 @@ class _LiveRunnerConfig:
                 "config_rejected_generation": self._rejected_generation,
             }
 
-    def apply(self, config) -> bool:
-        """Reconcile a server config block onto the live process.
+    @staticmethod
+    def _parses_to_int(value) -> bool:
+        """True when ``int(value)`` would succeed (well-typed for a clamp field).
 
-        Returns True when every delivered field was applied and the generation
-        advanced; False when an unrecognized field forced the generation to stay
-        pending. Never raises — a malformed/absent block leaves live config
-        untouched and reports False.
+        A well-typed-but-out-of-range int is still valid here — the field-level
+        clamp is the server-bound defense for those. Only values ``int()``
+        cannot parse (wrong type, unparseable string) are malformed.
+        """
+        try:
+            int(value)
+        except (TypeError, ValueError):
+            return False
+        return True
+
+    def _classify_fields(self, config) -> tuple[list[str], list[str]]:
+        """Validation pass (no lock, no mutation): classify each delivered field.
+
+        Returns ``(unrecognized, malformed)`` — non-null keys the daemon does
+        not know, and recognized keys whose value has the wrong type/shape to be
+        applied (would otherwise be silently clamped-to-default or ignored while
+        the generation was still claimed applied). ``None`` values are always
+        well-formed no-ops. A generation is fully applicable only when BOTH
+        lists are empty.
+        """
+        unrecognized: list[str] = []
+        malformed: list[str] = []
+        for key, value in config.items():
+            if key == "config_generation":
+                continue
+            if key not in self._KNOWN_KEYS:
+                if value is not None:
+                    unrecognized.append(str(key))
+                continue
+            # Recognized key. A null value is a no-op (never malformed).
+            if value is None:
+                continue
+            if key in ("max_concurrent", "max_concurrent_compute", "gpus_per_job"):
+                if not self._parses_to_int(value):
+                    malformed.append(key)
+            elif key in ("task_types", "gpu_indices_allowed"):
+                # Accepted shapes: the "all" sentinel or a list. Anything else
+                # (a bare int/string/dict) would be silently dropped today.
+                if value != "all" and not isinstance(value, list):
+                    malformed.append(key)
+        return unrecognized, malformed
+
+    def apply(self, config) -> bool:
+        """Reconcile a server config block onto the live process, atomically.
+
+        Returns True when every delivered field is recognized AND well-formed:
+        the whole block applies and the generation advances. Returns False when
+        ANY field is unrecognized or malformed — in that case NOTHING is
+        mutated (the generation is rejected as a unit, not partially applied),
+        the older applied generation keeps being reported, and a structured
+        rejection reason naming the offending field(s) is recorded. Never
+        raises — a malformed/absent block leaves live config untouched and
+        reports False.
+
+        A well-typed-but-out-of-range clamp field (e.g. ``max_concurrent: 999``)
+        is NOT malformed: it is a valid value the daemon clamps into range as a
+        server-bound defense, and the block still applies fully.
         """
         if not isinstance(config, dict):
             return False
         generation = config.get("config_generation")
-        # Forward-compat guard: an unknown non-null field is NOT known-live-safe,
-        # so we refuse to claim the generation as applied and keep reporting the
-        # older one (the server renders it as still-pending).
-        fully_applicable = True
-        unrecognized: list[str] = []
-        for key, value in config.items():
-            if key == "config_generation":
-                continue
-            if key not in self._KNOWN_KEYS and value is not None:
-                fully_applicable = False
-                unrecognized.append(str(key))
+        # Validate BEFORE taking the lock or mutating anything, so a rejected
+        # generation is a true no-op rather than a half-applied block whose
+        # "rejected" verdict misdescribes the runner's real live state.
+        unrecognized, malformed = self._classify_fields(config)
+        fully_applicable = not unrecognized and not malformed
 
         with self._lock:
-            mc = config.get("max_concurrent")
-            if mc is not None:
-                self._max_concurrent = self._clamp(mc)
-            mcc = config.get("max_concurrent_compute")
-            if mcc is not None:
-                self._max_concurrent_compute = self._clamp(mcc)
-            if "task_types" in config:
-                tt = config.get("task_types")
-                if tt == "all" or tt is None:
-                    self._task_types = "all"
-                elif isinstance(tt, list):
-                    self._task_types = [str(x) for x in tt if isinstance(x, str) and x]
-            if "gpu_indices_allowed" in config:
-                self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
-            if "gpus_per_job" in config:
-                self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
-            if fully_applicable and isinstance(generation, str) and generation:
-                self._applied_generation = generation
             if fully_applicable:
+                mc = config.get("max_concurrent")
+                if mc is not None:
+                    self._max_concurrent = self._clamp(mc)
+                mcc = config.get("max_concurrent_compute")
+                if mcc is not None:
+                    self._max_concurrent_compute = self._clamp(mcc)
+                if "task_types" in config:
+                    tt = config.get("task_types")
+                    if tt == "all" or tt is None:
+                        self._task_types = "all"
+                    elif isinstance(tt, list):
+                        self._task_types = [
+                            str(x) for x in tt if isinstance(x, str) and x
+                        ]
+                if "gpu_indices_allowed" in config:
+                    self._apply_gpu_allowlist_locked(config.get("gpu_indices_allowed"))
+                if "gpus_per_job" in config:
+                    self._apply_gpus_per_job_locked(config.get("gpus_per_job"))
+                if isinstance(generation, str) and generation:
+                    self._applied_generation = generation
                 # A clean apply clears any prior rejection state (never let a
                 # resolved reason linger after convergence).
                 self._rejection_reason = None
                 self._rejected_fields = None
                 self._rejected_generation = None
             else:
-                # Refused this generation for an unrecognized field. Record the
-                # offending field name(s) + a stable human reason + the refused
-                # generation so the operator sees WHICH field broke, not 'stuck'.
-                sorted_fields = sorted(unrecognized)
-                self._rejection_reason = "unrecognized config field(s): " + ", ".join(
-                    sorted_fields
+                # Refused this generation. Mutate NOTHING. Record the offending
+                # field name(s) + a stable human reason + the refused generation
+                # so the operator sees WHICH field broke and that the runner's
+                # live state is still the previous generation, not 'stuck'.
+                sorted_unrecognized = sorted(unrecognized)
+                sorted_malformed = sorted(malformed)
+                reasons: list[str] = []
+                if sorted_unrecognized:
+                    reasons.append(
+                        "unrecognized config field(s): "
+                        + ", ".join(sorted_unrecognized)
+                    )
+                if sorted_malformed:
+                    reasons.append(
+                        "malformed config field(s): " + ", ".join(sorted_malformed)
+                    )
+                self._rejection_reason = "; ".join(reasons)
+                self._rejected_fields = sorted(
+                    set(sorted_unrecognized) | set(sorted_malformed)
                 )
-                self._rejected_fields = sorted_fields
                 self._rejected_generation = (
                     generation if isinstance(generation, str) and generation else None
                 )
@@ -3209,8 +3276,15 @@ def _heartbeat_loop(
     ever_authenticated = False
     _llm_cli_last_healthy: dict[tuple[str, str], dict] = {}
     _llm_cli_transient_failures: dict[tuple[str, str], int] = {}
+    # Startup detection already made the first proof. Delay a retry until the
+    # bounded cadence elapses, then refresh only recoverable failures so a cold
+    # image pull or temporary registry/runtime outage does not require restart.
+    _gpu_passthrough_last_retry_at = time.monotonic()
     while not _shutdown_event.is_set():
         try:
+            caps, _gpu_passthrough_last_retry_at = _retry_transient_gpu_passthrough(
+                caps, _gpu_passthrough_last_retry_at
+            )
             with lock:
                 task_ids = list(active_tasks.keys())
             if active_compute_jobs is not None and compute_lock is not None:
@@ -3407,6 +3481,9 @@ def _heartbeat_loop(
                 "hostname": hostname,
                 "version": version,
                 "isolation_backends": isolation_backends,
+                "container_gpu_passthrough": (
+                    caps.container_gpu_passthrough if caps is not None else None
+                ),
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 "llm_clis": llm_clis,
@@ -3702,6 +3779,7 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
 # ── Isolation capability cache + GPU scheduling ───────────────────────────────
 
 _CAPS_CACHE: "iso.Capabilities | None" = None
+_GPU_PASSTHROUGH_RETRY_SECONDS = 300.0
 
 
 def _get_capabilities() -> "iso.Capabilities":
@@ -3710,6 +3788,18 @@ def _get_capabilities() -> "iso.Capabilities":
     if _CAPS_CACHE is None:
         _CAPS_CACHE = iso.detect_capabilities()
     return _CAPS_CACHE
+
+
+def _retry_transient_gpu_passthrough(
+    caps: "iso.Capabilities | None", last_retry_at: float, *, now: float | None = None
+) -> tuple["iso.Capabilities | None", float]:
+    """Refresh a recoverable container GPU proof at a bounded heartbeat cadence."""
+    if caps is None or not iso.container_gpu_passthrough_needs_retry(caps):
+        return caps, last_retry_at
+    current = time.monotonic() if now is None else now
+    if current - last_retry_at < _GPU_PASSTHROUGH_RETRY_SECONDS:
+        return caps, last_retry_at
+    return iso.refresh_container_gpu_passthrough(caps), current
 
 
 def _make_gpu_state(caps: "iso.Capabilities") -> dict:
@@ -3850,6 +3940,7 @@ def _report_compute_job(
     progress: dict | None = None,
     resume_hydration: dict | None = None,
     artifact_delivery: dict | None = None,
+    viewable_omissions: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -3878,6 +3969,8 @@ def _report_compute_job(
         body["resume_hydration"] = resume_hydration
     if artifact_delivery is not None:
         body["artifact_delivery"] = artifact_delivery
+    if viewable_omissions is not None:
+        body["viewable_omissions"] = viewable_omissions
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -3923,16 +4016,23 @@ class _ComputeJobReportHeartbeat:
         self._token = token
         self._job_id = job_id
         self._stop = threading.Event()
+        self._cancel_requested = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _send(self) -> None:
         try:
-            _report_compute_job(
+            if _report_compute_job(
                 self._orchestrator_url, self._token, self._job_id,
                 exec_status="running",
-            )
+            ):
+                self._cancel_requested.set()
         except Exception:  # noqa: BLE001 -- liveness is best-effort
             pass
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether any liveness report observed an orchestrator cancellation."""
+        return self._cancel_requested.is_set()
 
     def _run(self) -> None:
         while not self._stop.wait(_RUNNER_HEARTBEAT_INTERVAL):
@@ -4184,6 +4284,8 @@ class _ViewableStreamState:
         "revisions",
         "oversize_logged",
         "budget_logged",
+        "oversize_relpaths",
+        "count_cap_relpaths",
         "inflight",
         "completed",
         "lock",
@@ -4197,6 +4299,12 @@ class _ViewableStreamState:
         self.revisions: dict = {}
         self.oversize_logged: set = set()
         self.budget_logged = False
+        # Deduplicated sets of relpaths skipped due to per-kind size cap or the
+        # 25-file count cap. Set membership prevents repeated scans from inflating
+        # counts. Reported to the backend on each running heartbeat so the operator
+        # can see live omissions before the job reaches a terminal state.
+        self.oversize_relpaths: set = set()
+        self.count_cap_relpaths: set = set()
         self.inflight: tuple | None = None
         self.completed: tuple | None = None
         self.lock = threading.Lock()
@@ -4385,6 +4493,7 @@ def _stream_viewable_files(
                     f"{cap}-byte {kind} cap for job {job_id}; skipping live preview",
                     flush=True,
                 )
+            state.oversize_relpaths.add(relpath)
             continue
 
         # Nanosecond mtime + ctime detects same-size overwrites while remaining
@@ -4405,6 +4514,7 @@ def _stream_viewable_files(
                     f"for job {job_id}; further new live previews skipped",
                     flush=True,
                 )
+            state.count_cap_relpaths.add(relpath)
             continue
 
         # Slow preview uploads run outside the report/cancellation loop.  A single
@@ -5741,11 +5851,17 @@ def _run_compute_job(
                 )
                 return
 
+            _omissions: dict = {}
+            if viewable_state.oversize_relpaths:
+                _omissions["size_cap"] = len(viewable_state.oversize_relpaths)
+            if viewable_state.count_cap_relpaths:
+                _omissions["count_cap"] = len(viewable_state.count_cap_relpaths)
             cancel = _report_compute_job(
                 orchestrator_url, token, job_id,
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
+                viewable_omissions=_omissions or None,
             )
             if cancel:
                 _teardown()
@@ -5780,9 +5896,28 @@ def _run_compute_job(
         # terminal jobs, and the durable artifact bundle may be skipped when it
         # exceeds its much smaller upload cap. Reuse the live state so already
         # uploaded files are not sent again.
-        _stream_viewable_files(
-            orchestrator_url, token, job_id, artifact_dir, viewable_state, drain=True
-        )
+        with _ComputeJobReportHeartbeat(
+            orchestrator_url, token, job_id
+        ) as final_viewable_heartbeat:
+            _stream_viewable_files(
+                orchestrator_url,
+                token,
+                job_id,
+                artifact_dir,
+                viewable_state,
+                drain=True,
+            )
+        if final_viewable_heartbeat.cancel_requested:
+            outcome = None
+            _report_terminal(
+                exec_status="failed",
+                exit_code=1,
+                command_log=_terminal_command_log(
+                    "cancel requested by orchestrator during final viewable upload"
+                ),
+                progress=progress_tail.poll(),
+            )
+            return
 
         result_metrics = _parse_result_metrics(result_file)
 
@@ -6416,6 +6551,7 @@ def _preflight(
             # Isolation-backend inventory + selected backends so `--check`
             # populates the fleet view the same way the running heartbeat does.
             "isolation_backends": iso.capabilities_inventory(caps),
+            "container_gpu_passthrough": caps.container_gpu_passthrough,
             "agent_backend": iso.decide_agent_backend(
                 caps, agent_binary_present=agent_binary is not None,
                 agent_image=agent_image,

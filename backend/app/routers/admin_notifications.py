@@ -955,19 +955,20 @@ async def resolve_message(
     )
     reply_sequence: int | None = None
     if wants_reply:
-        # Canonical mutation order: sequence counter -> Project -> reply target.
+        # Canonical mutation order: Project -> sequence counter -> reply target.
         # A sequence gap is safe when a concurrent resolver already created the
-        # reply; allocating before either shared row lock prevents send/resolve
-        # deadlocks.
+        # reply. Take FOR UPDATE up front because reply arming updates Project
+        # vision later in this transaction; upgrading after taking the counter
+        # would recreate a lock inversion with generic KEY SHARE writers.
+        await session.execute(
+            select(Project.id)
+            .where(Project.id == message_project_uuid)
+            .with_for_update()
+        )
         reply_sequence = await lock_project_and_next_message_sequence(
             session,
             message_project_uuid,
             lock_timeout_ms=1_500,
-        )
-        await session.execute(
-            select(Project.id)
-            .where(Project.id == message_project_uuid)
-            .with_for_update(key_share=True)
         )
         locked_message = (
             await session.execute(

@@ -355,6 +355,51 @@ async def test_heartbeat_without_report_does_not_refresh_stamp(db_session):
 
 
 @pytest.mark.asyncio
+async def test_daemon_heartbeat_omission_invalidates_stale_gpu_proof(db_session):
+    """An old replacement daemon cannot inherit a prior process's proof."""
+    stale_proof = {
+        "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+    }
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "container_gpu_passthrough": stale_proof,
+        },
+    )
+
+    await heartbeat(
+        payload=HeartbeatRequest(active_work_report=True),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert "container_gpu_passthrough" not in runner.capabilities
+
+
+@pytest.mark.asyncio
+async def test_preflight_omission_preserves_last_gpu_proof(db_session):
+    """A non-daemon --check probe does not erase genuine daemon inventory."""
+    stale_proof = {
+        "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+    }
+    _project, runner = await _make_runner(
+        db_session,
+        capabilities={
+            "task_types": "all",
+            "container_gpu_passthrough": stale_proof,
+        },
+    )
+
+    await heartbeat(
+        payload=HeartbeatRequest(active_work_report=False),
+        runner=runner,
+        session=db_session,
+    )
+    await db_session.refresh(runner)
+    assert runner.capabilities["container_gpu_passthrough"] == stale_proof
+
+@pytest.mark.asyncio
 async def test_check_preflight_does_not_zero_live_task_claim(db_session):
     """A --check preflight (active_task_ids=[], active_work_report=False) must not
     let the reaper conclude a live task is unclaimed and reap it.

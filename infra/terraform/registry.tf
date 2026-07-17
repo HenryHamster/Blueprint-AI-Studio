@@ -48,7 +48,7 @@ resource "google_artifact_registry_repository" "orchestrator_repo" {
 # The ONLY thing standing between the DELETE policies below and a live digest is
 # the orchestrator's DB-aware guard sweep
 # (reaper_sweeps.sweep_protect_referenced_compute_image_digests), which stamps an
-# `inuse-<shorthash>` tag on referenced digests for the `keep-inuse-tagged` KEEP
+# `inuse-<shorthash>` tag on current/default and job-referenced digests for the `keep-inuse-tagged` KEEP
 # policy to shield. That guard is BEST-EFFORT by construction: hourly cadence, all
 # registry helpers fail open, and it is brand-new code that has never run against a
 # populated prod registry. Retention here is therefore configured to survive the
@@ -66,8 +66,8 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
   #
   # OPERATOR: arm this (flip to `false`) only after confirming, from the Artifact
   # Registry cleanup dry-run logs, that (a) the guard is actually stamping
-  # `inuse-` tags on the digests `project_compute_image` / live ComputeJob rows
-  # reference, and (b) nothing on the would-delete list is a digest the DB still
+  # `inuse-` tags on current project defaults and live/recent ComputeJob digests,
+  # and (b) nothing on the would-delete list is a digest the DB still
   # pins. Until then the cost of over-retention is a few $/month; the cost of a
   # wrong delete is an unrunnable dep_hash and destroyed result provenance.
   cleanup_policy_dry_run = true
@@ -81,7 +81,8 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
   }
   # DB-aware GC guard: the orchestrator reaper
   # (sweep_protect_referenced_compute_image_digests) stamps an `inuse-<shorthash>`
-  # tag on any digest a live/recent compute job still depends on. This KEEP
+  # tag on a current project default or any digest a live/recent compute job still
+  # depends on. This KEEP
   # policy runs before the DELETE policies below and shields anything so tagged,
   # so a running experiment's (or a recent result's provenance) image is never
   # reclaimed out from under it. The reaper prunes `inuse-` tags once the digest
@@ -118,14 +119,11 @@ resource "google_artifact_registry_repository" "compute_images_repo" {
     condition {
       tag_state = "TAGGED"
       # 90 days. KEEP keep-recent-tagged + keep-inuse-tagged run first. The guard
-      # (sweep_protect_referenced_compute_image_digests) now stamps an `inuse-`
-      # tag on EVERY `ProjectComputeImage.digest` — a row is a standing pin with
-      # no expiry — not only rows rebuilt inside the last 30 days, so a stable
-      # project image that nobody has rebaked is protected regardless of age. The
-      # window was previously doubled to 180 days ONLY to bound the exposure while
-      # that follow-up landed; with the gap closed it returns to the 90-day
-      # sibling default. (Job-provenance-only digests — no ProjectComputeImage row
-      # — remain protected for the 30-day completed-job window, then age out here.)
+      # (sweep_protect_referenced_compute_image_digests) stamps an `inuse-` tag
+      # on the newest usable row for each project/image/registry identity, even
+      # before its first job. Superseded rows stay protected only while a live or
+      # recent (30-day provenance window) job references their digest, then their
+      # inuse tag is pruned so this policy can reclaim them.
       older_than = "7776000s" # 90 days
     }
   }

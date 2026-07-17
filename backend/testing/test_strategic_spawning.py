@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 import pytest
 from sqlalchemy.exc import MissingGreenlet
 from unittest.mock import AsyncMock, call, patch
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
@@ -72,6 +72,20 @@ from app.task_evaluators import (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
+
+
+def _select_agent_tasks(project_id):
+    """Select project Tasks while excluding hidden backend control work."""
+
+    task_type = Task.payloads[0]["type"].as_string()
+    return select(Task).where(
+        Task.project_id == project_id,
+        or_(
+            task_type.is_(None),
+            task_type.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+        )
+    )
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -298,11 +312,29 @@ async def test_architecture_cycle_spawns_design_doc_update(db_session):
     finally:
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
     assert tasks[0].payloads[0]["type"] == "design_doc_update", (
         f"Expected design_doc_update on architecture cycle, got {tasks[0].payloads[0]['type']}"
+    )
+    all_tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    shadow = [
+        task
+        for task in all_tasks
+        if task.first_payload.get("type") == "strategic_resident_turn"
+    ]
+    assert len(shadow) == 1
+    assert shadow[0].archived is True
+    assert shadow[0].first_payload["lane"] == "background"
+    assert shadow[0].first_payload["project_change_cursor"]["phase1_task_id"] == str(
+        tasks[0].id
+    )
+    assert (
+        shadow[0].first_payload["project_change_cursor"]["strategic_cycle_id"]
+        == tasks[0].strategic_cycle_id
     )
 
 
@@ -327,12 +359,109 @@ async def test_strategy_only_cycle_spawns_strategic_review(db_session):
     finally:
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
     assert tasks[0].payloads[0]["type"] == "strategic_review", (
         f"Expected strategic_review on strategy-only cycle, got {tasks[0].payloads[0]['type']}"
     )
+    all_tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    shadow = [
+        task
+        for task in all_tasks
+        if task.first_payload.get("type") == "strategic_resident_turn"
+    ]
+    assert len(shadow) == 1
+    assert shadow[0].archived is True
+    assert shadow[0].first_payload["lane"] == "background"
+    assert shadow[0].first_payload["project_change_cursor"]["phase2_task_id"] == str(
+        tasks[0].id
+    )
+    assert (
+        shadow[0].first_payload["project_change_cursor"]["strategic_cycle_id"]
+        == tasks[0].strategic_cycle_id
+    )
+
+
+@pytest.mark.parametrize("cycle_count", [1, 2])
+@pytest.mark.asyncio
+async def test_paused_resident_keeps_legacy_cycle_but_creates_no_shadow(
+    db_session, cycle_count
+):
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    project = _make_project(
+        vision={
+            "_strategic_cycle_count": cycle_count,
+            "_research_spawn_count": 5,
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    resident = await initialize_strategic_resident(db_session, project.id)
+    resident.background_policy = "paused"
+    db_session.add(resident)
+    await db_session.commit()
+
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        await _spawn_research_task(project, db_session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+
+    all_tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(
+        [task for task in all_tasks if task.first_payload.get("type") != "strategic_resident_turn"]
+    ) == 1
+    assert not [
+        task for task in all_tasks if task.first_payload.get("type") == "strategic_resident_turn"
+    ]
+
+
+@pytest.mark.parametrize("cycle_count", [1, 2])
+@pytest.mark.asyncio
+async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
+    db_session, cycle_count
+):
+    from app.models import StrategicCycle
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    project = _make_project(
+        vision={
+            "_strategic_cycle_count": cycle_count,
+            "_research_spawn_count": 5,
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    resident = await initialize_strategic_resident(db_session, project.id)
+    resident.engine_owner = "strategic_resident"
+    resident.authority_generation += 1
+    db_session.add(resident)
+    await db_session.commit()
+
+    old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
+    _shared_state.runtime_config["architecture_review_frequency"] = 3
+    try:
+        await _spawn_research_task(project, db_session)
+    finally:
+        _shared_state.runtime_config["architecture_review_frequency"] = old
+
+    all_tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert all_tasks == []
+    cycles = (
+        await db_session.execute(
+            select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+        )
+    ).scalars().all()
+    assert cycles == []
 
 
 @pytest.mark.asyncio
@@ -369,7 +498,7 @@ async def test_strategy_only_cycle_records_strategic_cycle_row(db_session):
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
     tasks = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()
     )
@@ -416,7 +545,7 @@ async def test_arch_frequency_zero_always_spawns_strategic_review(db_session):
     finally:
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
     assert tasks[0].payloads[0]["type"] == "strategic_review", (
@@ -551,7 +680,7 @@ async def test_strategic_failures_below_three_allows_force_strategic(db_session)
 
     await _spawn_research_task(project, db_session)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, f"Expected one strategic task, got {len(tasks)}"
     assert tasks[0].payloads[0]["type"] in ("design_doc_update", "strategic_review")
@@ -1282,7 +1411,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = next(
         t.payloads[0]
         for t in result.scalars().all()
@@ -1308,11 +1437,17 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "unavailable_cause",
         "criterion_met",
         "criterion",
+        "criterion_unmeasured_reason",
+        "evidence_tier",
         "per_arm_verdicts",
         "origin_provenance",
+        "run_provenance",
         "sweep_id",
         "arm_label",
         "lifecycle_status",
+        "evidence_tier",
+        "run_provenance",
+        "criterion_unmeasured_reason",
     }
 
 
@@ -1597,7 +1732,7 @@ async def test_operator_rejection_rate_computed_correctly(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
@@ -2898,7 +3033,7 @@ async def test_spawn_design_doc_update_proceeds_when_no_active_strategic(db_sess
     spawned = await _spawn_design_doc_update(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     assert tasks[0].payloads[0]["type"] == "design_doc_update"
@@ -2927,7 +3062,7 @@ async def test_spawn_strategic_review_proceeds_when_no_active_strategic(db_sessi
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     assert tasks[0].payloads[0]["type"] == "strategic_review"
@@ -3119,7 +3254,7 @@ async def test_spawn_design_doc_update_proceeds_when_bootstrap_completed(db_sess
     spawned = await _spawn_design_doc_update(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     assert tasks[0].payloads[0]["type"] == "design_doc_update"
@@ -3149,7 +3284,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
     spawned = await _spawn_strategic_review(project_self_no_flag, db_session)
     assert spawned is True
     result = await db_session.execute(
-        select(Task).where(Task.project_id == project_self_no_flag.id)
+        _select_agent_tasks(project_self_no_flag.id)
     )
     task_self = result.scalars().one()
     assert task_self.payloads[0]["is_self_repo"] is True
@@ -3169,7 +3304,7 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
     spawned2 = await _spawn_strategic_review(project_flag, db_session)
     assert spawned2 is True
     result2 = await db_session.execute(
-        select(Task).where(Task.project_id == project_flag.id)
+        _select_agent_tasks(project_flag.id)
     )
     task_flag = result2.scalars().one()
     assert task_flag.payloads[0]["is_self_repo"] is False
@@ -3209,7 +3344,7 @@ async def test_spawn_strategic_review_is_self_repo_follows_deploy_identity(
     task_match = (
         (
             await db_session.execute(
-                select(Task).where(Task.project_id == project_match.id)
+                _select_agent_tasks(project_match.id)
             )
         )
         .scalars()
@@ -3235,7 +3370,7 @@ async def test_spawn_strategic_review_is_self_repo_follows_deploy_identity(
     task_mismatch = (
         (
             await db_session.execute(
-                select(Task).where(Task.project_id == project_mismatch.id)
+                _select_agent_tasks(project_mismatch.id)
             )
         )
         .scalars()
@@ -3937,7 +4072,7 @@ async def test_spawn_strategic_review_records_preferred_runner_without_pin(
         preferred_runner_target_id=preferred_runner_id,
     )
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.context.get("strategic_cycle_id") == cycle_id
     assert task.context.get("preferred_runner_target_id") == preferred_runner_id
@@ -3978,7 +4113,7 @@ async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
     spawned = await _spawn_design_doc_update(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "design_doc_update"
     assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
@@ -4035,7 +4170,7 @@ async def test_strategic_review_uses_live_local_continuation_runner_affinity(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
     assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
@@ -4090,7 +4225,7 @@ async def test_local_continuation_affinity_omitted_when_stale_or_incapable(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
     assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
@@ -4135,7 +4270,7 @@ async def test_local_continuation_requires_local_even_without_live_runner(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
     assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
@@ -4187,7 +4322,7 @@ async def test_local_continuation_ttl_bounded_to_lease_window(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
     assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
@@ -4227,7 +4362,7 @@ async def test_local_continuation_requires_local_for_fresh_foreign_owner_marker(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
     assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
@@ -4280,7 +4415,7 @@ async def test_local_continuation_affinity_reads_current_db_marker(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().one()
     assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
     assert "preferred_runner_target_id" not in task.context
@@ -5771,7 +5906,7 @@ async def test_design_doc_update_payload_omits_playbook_archive(db_session):
     await db_session.refresh(project)
 
     await _spawn_design_doc_update(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
@@ -5846,7 +5981,7 @@ async def test_spawn_design_doc_update_payload_uses_reconciled_design_doc(
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
@@ -5932,7 +6067,7 @@ async def test_spawn_design_doc_update_payload_downgrades_symbol_absent_entry(
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
@@ -6004,7 +6139,7 @@ async def test_spawn_design_doc_update_symbol_indeterminate_leaves_entry(
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     by_key = {e["key"]: e for e in tasks[0].payloads[0]["design_doc"]["sections"]}
@@ -16040,7 +16175,7 @@ async def _spawn_strategic_review_payload(project, session) -> dict:
         await _spawn_research_task(project, session)
     finally:
         _shared_state.runtime_config["architecture_review_frequency"] = old
-    result = await session.execute(select(Task).where(Task.project_id == project.id))
+    result = await session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1, f"Expected one task, got {len(tasks)}"
     payload = tasks[0].payloads[0]
@@ -17234,7 +17369,7 @@ async def test_open_bug_report_older_than_thread_cap_appears_in_open_messages(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert len(tasks) == 1
     payload = tasks[0].payloads[0]
@@ -20269,8 +20404,8 @@ async def test_fetch_recent_handled_conversation_bounds_and_order(db_session):
 @pytest.mark.asyncio
 async def test_handoff_session_messages_write_path(db_session):
     """handoff_session_messages must resolve messages stamped with the ending
-    session_id: status='resolved', resolution='session_handoff', resolved_at set,
-    and context stamped with session_handoff_at/session_id.
+    session_id: status='resolved', handling_state='responded',
+    resolution='session_handoff', resolved_at set.
 
     Tests the core write path by seeding a message WITH resident_session_id
     matching the session being handed off.
@@ -20324,11 +20459,9 @@ async def test_handoff_session_messages_write_path(db_session):
 
     # The session-stamped message is resolved.
     assert msg_session.status == "resolved", "stamped message must be resolved"
+    assert msg_session.handling_state == "responded", "stamped message must be RESPONDED canonically"
     assert msg_session.resolution == "session_handoff"
     assert msg_session.resolved_at is not None
-    ctx = msg_session.context or {}
-    assert "session_handoff_at" in ctx, "context must contain session_handoff_at"
-    assert ctx.get("session_id") == SESSION_ID
 
     # Unscoped and other-session messages are untouched.
     assert msg_unscoped.status == "open", "NULL-session message must remain open"

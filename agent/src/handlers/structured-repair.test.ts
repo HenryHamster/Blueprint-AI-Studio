@@ -10,6 +10,7 @@ vi.mock('../telemetry.js', () => ({
   buildPromptSizeTelemetry: vi.fn(),
   getLlmTelemetry: vi.fn(),
   recordFormatRepairTokens: vi.fn(),
+  restoreOperatorDecisionCaptureTelemetry: vi.fn(),
 }));
 
 vi.mock('../prompt.js', () => ({

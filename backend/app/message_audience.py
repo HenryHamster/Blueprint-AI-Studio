@@ -179,6 +179,18 @@ _NON_OPERATOR_AUDIENCES: frozenset[str] = frozenset(
     {STRATEGIST_INTERNAL, PIPELINE_LOG}
 )
 
+# Registry event_types that resolve to a non-operator audience.  Precomputed
+# from the single-source-of-truth registry so the Alert read-model filter never
+# duplicates an event-type list.  A row whose ``event_type`` is one of these is
+# strategist-internal / pipeline-log and must never reach an operator badge,
+# count, or preview.  Untagged (NULL) or unregistered ``event_type`` rows are
+# retained by the filter — the conservative, legacy-preserving choice.
+_NON_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
+    event_type
+    for event_type, audience in _EVENT_AUDIENCE_REGISTRY.items()
+    if audience in _NON_OPERATOR_AUDIENCES
+)
+
 
 # ── Public API ──────────────────────────────────────────────────────────
 
@@ -213,6 +225,29 @@ def operator_visible_audience_filter(context: Any) -> Any:
     """
     audience = context["audience"].as_string()
     return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
+
+
+def operator_visible_alert_filter(event_type_column: Any) -> Any:
+    """Return the shared SQL filter for operator-visible ``Alert`` rows.
+
+    ``Alert`` carries no ``context``/``audience`` column — its audience is keyed
+    on ``event_type`` through the same registry that :func:`route_event`
+    consults at creation.  This is the alert analogue of
+    :func:`operator_visible_audience_filter`: it retains untagged (``NULL``) and
+    unregistered ``event_type`` rows (conservative, legacy-preserving) while
+    dropping rows whose ``event_type`` is explicitly registered
+    strategist-internal or pipeline-log so they never contribute to an
+    operator-facing badge count, severity aggregate, or preview.
+    """
+    return or_(
+        event_type_column.is_(None),
+        event_type_column.notin_(_NON_OPERATOR_EVENT_TYPES),
+    )
+
+
+def get_non_operator_event_types() -> frozenset[str]:
+    """Return every event_type that resolves to a non-operator audience (testing hook)."""
+    return _NON_OPERATOR_EVENT_TYPES
 
 
 def stamp_message_audience(

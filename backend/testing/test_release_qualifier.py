@@ -5952,7 +5952,7 @@ class TestExtractTestErosionDetail:
         assert detail == {"deleted_test_files": ["testing/test_foo.py"]}
 
     def test_negative_deltas_carried(self):
-        """Net-negative test/assertion deltas are carried; zero/positive ignored."""
+        """Net-negative test/assertion deltas are carried (as before)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
@@ -5963,13 +5963,25 @@ class TestExtractTestErosionDetail:
         detail = rq._extract_test_erosion_detail(report)
         assert detail == {"test_count_delta": -2, "assertion_delta": -5}
 
-    def test_clean_erosion_returns_none(self):
-        """No deletions and no negative delta yields None (nothing to carry)."""
+    def test_positive_deltas_preserved_for_cumulative(self):
+        """Positive deltas are now carried (lossless for cumulative reconstruction)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
                 "test_count_delta": 3,
                 "assertion_delta": 10,
+            }
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"test_count_delta": 3, "assertion_delta": 10}
+
+    def test_zero_deltas_omitted(self):
+        """Zero deltas (no noise) are omitted; no other signal → None."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": [],
+                "test_count_delta": 0,
+                "assertion_delta": 0,
             }
         }
         assert rq._extract_test_erosion_detail(report) is None
@@ -8720,6 +8732,669 @@ class TestIncrementalAuditBaseline:
         assert rq._incremental_audit_base_sha(
             self.clean(sub_scores={}), self.NEW
         ) is None
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
+    db_session,
+    mocker,
+):
+    """Cross-SHA audit facts reuse identical trees and scope changed trees.
+
+    An excluded-only advance copies the prior fact without an audit spawn; a
+    one-file change uses the prior candidate as its incremental base and carries
+    only findings from unchanged paths.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    same_surface_sha = "sameonly" * 5
+    changed_sha = "changed1" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+    old_surface_hash = rq._audited_surface_hash_from_map(old_surface)
+    unchanged_finding = {
+        "severity": "low",
+        "summary": "Unchanged path still leaks internal timing detail",
+        "file": "backend/app/unchanged.py",
+        "key": rq._audit_finding_key(
+            "Unchanged path still leaks internal timing detail",
+            "backend/app/unchanged.py",
+        ),
+    }
+    superseded_finding = {
+        "severity": "low",
+        "summary": "Old changed-path finding",
+        "file": "backend/app/changed.py",
+        "key": rq._audit_finding_key(
+            "Old changed-path finding", "backend/app/changed.py"
+        ),
+    }
+    audit_detail = rq._audit_dimension_detail(
+        surface_paths=old_surface,
+        audit_findings=[unchanged_finding, superseded_finding],
+        excluded_audit_findings=[],
+        findings_meta={
+            "audit_findings_total": 2,
+            "audit_findings_truncated": False,
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        },
+        audit_missing_reason=None,
+        audit_scope={"mode": "full"},
+    )
+    audit_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="audit",
+        status="failed",
+        sub_score=0.96,
+        audited_surface_hash=old_surface_hash,
+        detail=audit_detail,
+        origin_attempt_id=origin_attempt,
+    )
+    erosion_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="test_erosion",
+        status="passed",
+        sub_score=1.0,
+        detail={},
+        origin_attempt_id=origin_attempt,
+    )
+    challenge_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="challenge",
+        status="passed",
+        detail={"verdicts": [{"verdict": "confirmed"}]},
+        origin_attempt_id=origin_attempt,
+    )
+    db_session.add_all([audit_row, erosion_row, challenge_row])
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": old_sha,
+        "qualification_attempt_id": str(origin_attempt),
+        "error": "merge_grade_report_unparseable",
+    }
+    version.active_qualification_attempt_id = origin_attempt
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=same_surface_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            side_effect=[
+                [
+                    {"path": path, "sha": blob_sha, "size": 1}
+                    for path, blob_sha in old_surface.items()
+                ],
+                [
+                    {
+                        "path": "backend/app/unchanged.py",
+                        "sha": "blob-unchanged",
+                        "size": 1,
+                    },
+                    {
+                        "path": "backend/app/changed.py",
+                        "sha": "blob-new",
+                        "size": 1,
+                    },
+                ],
+            ]
+        ),
+    )
+    spawned_task = MagicMock(id=uuid.uuid4())
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=spawned_task),
+    )
+
+    unchanged_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert unchanged_result["status"] == "spawned"
+    audit_spawn.assert_not_called()
+    active_attempt = uuid.UUID(unchanged_result["qualification_attempt_id"])
+    reused_row = await rq._load_dimension_result(
+        db_session, version, same_surface_sha, "audit"
+    )
+    assert reused_row is not None
+    assert reused_row.origin_attempt_id == origin_attempt
+    assert str(active_attempt) in (reused_row.reused_by_attempt_ids or [])
+    from app.qualification_state_resolver import (
+        resolve_dimension_states_from_ledger,
+    )
+
+    states = await resolve_dimension_states_from_ledger(db_session, version)
+    audit_state = next(state for state in states if state["key"] == "audit")
+    assert audit_state["provenance"]["currency"] == "reused"
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": same_surface_sha,
+        "qualification_attempt_id": str(active_attempt),
+        "error": "migration_apply_check_unavailable",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=changed_sha),
+    )
+
+    changed_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert changed_result["status"] == "spawned"
+    audit_spawn.assert_awaited_once()
+    assert audit_spawn.await_args.kwargs["audit_base_sha"] == same_surface_sha
+    assert version.last_qualification["changed_audited_paths"] == [
+        "backend/app/changed.py"
+    ]
+
+    fresh_report = {
+        "audit_score": 0.98,
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+            }
+        ],
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": same_surface_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "test_erosion": {},
+    }
+    merged_report, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fresh_report,
+        fresh_report,
+        reused_row.detail,
+        expected_base_sha=same_surface_sha,
+    )
+    merged_findings = rq._extract_audit_findings(merged_report)
+    assert {finding["summary"] for finding in merged_findings} == {
+        "Unchanged path still leaks internal timing detail",
+        "Fresh changed-path finding",
+    }
+    assert rq._score_audit(merged_report)[0] == pytest.approx(0.96)
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
+    db_session,
+    mocker,
+):
+    """Finalization with scoped audit merging persists the correct merged facts.
+
+    Prior ledger rows exist for an old SHA (audit + test_erosion).  A new
+    candidate triggers an incremental audit that finds one fresh issue on a
+    changed path and zero test erosion.  After ``_finalize_qualification``:
+    - The audit ledger row for the new SHA carries both the prior unchanged-path
+      finding and the fresh changed-path finding.
+    - The test_erosion ledger row carries cumulative deltas (prior -3 + current +1 = -2).
+    - ``last_qualification`` reflects the merged facts.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    new_sha = "newaudit" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+
+    # --- Prior ledger rows ----------------------------------------------------
+    prior_audit_detail = {
+        "audited_surface_paths": old_surface,
+        "audit_findings": [
+            {
+                "severity": "low",
+                "summary": "Unchanged path still leaks internal timing detail",
+                "file": "backend/app/unchanged.py",
+                "key": rq._audit_finding_key(
+                    "Unchanged path still leaks internal timing detail",
+                    "backend/app/unchanged.py",
+                ),
+            },
+            {
+                "severity": "low",
+                "summary": "Old changed-path finding (superseded)",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Old changed-path finding (superseded)",
+                    "backend/app/changed.py",
+                ),
+            },
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_total": 2,
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_total": 0,
+        "excluded_audit_findings_truncated": False,
+        "audit_scope": {"mode": "full"},
+    }
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+        "assertion_delta": 0,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            detail=prior_audit_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Spawn a completed audit task with scoped artifact --------------------
+    audit_task = Task(
+        project_id=project.id,
+        title="scoped-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": new_sha},
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # Scoped audit report: one fresh finding on changed.py, no test deletions
+    audit_report = {
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Fresh changed-path finding", "backend/app/changed.py"
+                ),
+            },
+        ],
+        "computed_test_erosion": {
+            "test_count_delta": 1,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    # --- Stamp last_qualification for finalization ---------------------------
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Finalize ------------------------------------------------------------
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Not promoted due to merged finding penalties (prior + fresh = 2 low findings).
+    assert result["status"] == "not_promoted"
+
+    # --- Assert audit ledger row ---------------------------------------------
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    merged_findings = audit_row.detail.get("audit_findings") or []
+    merged_summaries = {f["summary"] for f in merged_findings}
+    assert "Unchanged path still leaks internal timing detail" in merged_summaries, (
+        "prior unchanged-path finding must be carried forward"
+    )
+    assert "Fresh changed-path finding" in merged_summaries, (
+        "current scoped finding must be present"
+    )
+    assert "Old changed-path finding (superseded)" not in merged_summaries, (
+        "superseded path finding must NOT be carried"
+    )
+
+    # --- Assert test_erosion ledger row --------------------------------------
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    ed = erosion_row.detail or {}
+    assert ed.get("test_count_delta") == -2, (
+        f"expected cumulative -3 + 1 = -2, got {ed.get('test_count_delta')}"
+    )
+    assert ed.get("assertion_delta") == 0
+    # Prior deleted file not in current changed_paths → carried forward.
+    assert "testing/test_removed.py" in (ed.get("deleted_test_files") or [])
+    # Prior was blocked and blocking file still present → still blocked.
+    assert erosion_row.status == "blocked"
+    assert erosion_row.sub_score is None
+
+    # --- Assert last_qualification ------------------------------------------
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    lq_summaries = {f["summary"] for f in (lq.get("audit_findings") or [])}
+    assert "Unchanged path still leaks internal timing detail" in lq_summaries
+    assert "Fresh changed-path finding" in lq_summaries
+    assert "Old changed-path finding (superseded)" not in lq_summaries
+
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_restoration_clears_blocker(
+    db_session,
+    mocker,
+):
+    """When a prior blocking file is restored in the current scope, the
+    test_erosion blocker clears and the cumulative delta is computed correctly."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "erosion0" * 5
+    new_sha = "restored" * 5
+    origin_attempt = uuid.uuid4()
+
+    # --- Prior ledger: blocked test_erosion due to deleted test file ----------
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -5,
+        "assertion_delta": -3,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="passed",
+            sub_score=1.0,
+            detail={"audited_surface_paths": {}, "audit_findings": [],
+                    "excluded_audit_findings": [], "audit_scope": {"mode": "full"}},
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Completed audit task: file restored in current scope -----------------
+    audit_task = Task(
+        project_id=project.id,
+        title="restoration-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # testing/test_removed.py is in changed_paths but NOT in deleted_test_files
+    # → the scoped computation determined it was restored.
+    audit_report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 3,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Test erosion should no longer be blocked.
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    # File was in changed_paths but NOT in deleted_test_files → restored.
+    assert "testing/test_removed.py" not in (erosion_row.detail or {}).get(
+        "deleted_test_files", []
+    ), "restored file must not appear in deleted_test_files"
+    assert erosion_row.status == "passed", (
+        f"expected passed after restoration, got {erosion_row.status}"
+    )
+    assert erosion_row.sub_score is not None, (
+        "blocker must be cleared; sub_score should not be None"
+    )
+    # Cumulative delta: -5 + 3 = -2 → still has some erosion but not blocked.
+    assert (erosion_row.detail or {}).get("test_count_delta") == -2
+
+    # Audit ledger row: no findings.
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    assert len((audit_row.detail or {}).get("audit_findings") or []) == 0
+
+    # last_qualification reflects the merged state.
+    lq = version.last_qualification
+    assert lq.get("sub_scores", {}).get("test_erosion") is not None, (
+        "test_erosion sub_score should not be None after restoration"
+    )
+
+
+def test_scoped_audit_merge_requires_bound_path_complete_unique_facts():
+    base_sha = "a" * 40
+    prior = {
+        "audited_surface_paths": {"backend/app/a.py": "blob"},
+        "audit_findings": [
+            {"file": "backend/app/a.py", "severity": "low", "summary": "one", "surface_key": "same"},
+            {"file": "backend/app/a.py", "severity": "low", "summary": "two", "surface_key": "same"},
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_truncated": False,
+    }
+    report = {
+        "findings": [],
+        "reviewed_paths": {"backend/app/b.py": "clean"},
+        "audit_scope": {"mode": "incremental", "effective_base_sha": base_sha, "changed_paths": ["backend/app/b.py"]},
+    }
+    merged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        report, report, prior, expected_base_sha=base_sha
+    )
+    assert [finding["summary"] for finding in merged["findings"]] == ["one", "two"]
+    fallback = {**report, "audit_scope": {"mode": "full", "effective_base_sha": None}}
+    unmerged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fallback, fallback, prior, expected_base_sha=base_sha
+    )
+    assert unmerged["findings"] == []
+    pathless = {**prior, "audit_findings": [{"severity": "low", "summary": "global"}]}
+    assert rq._audit_detail_is_delta_reusable(pathless) is False
+
+
+def test_scoped_test_erosion_preserves_prior_blocker_and_cumulative_deltas():
+    """Prior blocked + file outside current scope carries forward unchanged."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": -2}},
+        {"deleted_test_files": ["testing/test_removed.py"], "test_count_delta": -3},
+        prior_blocked=True,
+    )
+    assert score is None
+    assert detail == {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -2,
+        "assertion_delta": -2,
+    }
+
+
+def test_scoped_test_erosion_restoration_clears_blocker():
+    """Prior-deleted file restored in current scope: blocker clears."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": 0},
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    # File was in changed_paths but NOT in current deleted_test_files → restored.
+    assert score is not None, "blocker should clear after restoration"
+    assert "deleted_test_files" not in (detail or {})
+    assert detail.get("test_count_delta") == -2  # -3 + 1
+
+
+def test_scoped_test_erosion_restoration_preserves_other_deletions():
+    """Only the restored file drops; other prior deletions remain."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 0, "assertion_delta": 0,
+            "deleted_test_files": ["testing/still_gone.py"],
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py", "testing/still_gone.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": [
+            "testing/test_removed.py", "testing/still_gone.py",
+        ],
+        "test_count_delta": -5,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    assert "testing/still_gone.py" in (detail or {}).get("deleted_test_files", [])
+    assert "testing/test_removed.py" not in (detail or {}).get("deleted_test_files", [])
+
+
+def test_scoped_test_erosion_positive_delta_preservation():
+    """Prior positive delta (stripped by old _extract_test_erosion_detail) is
+    now losslessly preserved so cumulative sum is correct."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": -5, "assertion_delta": 0}},
+        {"test_count_delta": 10, "assertion_delta": 0},
+        prior_blocked=False,
+    )
+    # Old behavior: prior's +10 stripped → merged = 0 + (-5) = -5 (incorrect penalty)
+    # New behavior: prior's +10 preserved → merged = 10 + (-5) = 5 (no penalty)
+    assert score == 1.0, f"expected no erosion penalty for cumulative +5, got {score}"
+    assert detail["test_count_delta"] == 5
 
 
 @pytest.mark.asyncio
@@ -11482,6 +12157,75 @@ async def test_promotion_dimension_ledger_incomplete_when_dimension_missing(
 
 
 @pytest.mark.asyncio
+async def test_promotion_dimension_ledger_incomplete_when_required_fact_unavailable(
+    db_session,
+):
+    """A transient unavailable fact is not durable terminal proof for a required
+    dimension, even though the ledger row exists at the correct candidate SHA."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "merge_grade",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "migration_apply",
+        status="unavailable",
+        detail={
+            "infra_error": "migration_apply_check_unavailable",
+            "verdict": "defer",
+        },
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is False
+    assert missing == ["migration_apply"]
+
+
+@pytest.mark.asyncio
+async def test_promotion_dimension_ledger_accepts_explicit_non_applicable_fact(
+    db_session,
+):
+    """An explicitly non-applicable merge-grade fact remains valid terminal
+    evidence when there is no gradeable release goal."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "migration_apply",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "merge_grade",
+        status="unavailable",
+        detail={"status": "not_applicable"},
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is True
+    assert missing == []
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mocker):
     """Integration: a clean candidate that would promote is HELD as an infra
     failure — promote() is NOT called — when the per-dimension ledger is
@@ -11512,36 +12256,25 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
         },
     )
 
-    # Simulate a ledger that lost a required gating dimension: the dual-write
-    # writes every dimension EXCEPT migration_apply for this candidate tree.
-    # Also intercept _upsert_dimension_result to skip migration_apply: Phase 1b
-    # added an eager-write for migration_apply inside _finalize_qualification
-    # (before _dual_write_dimension_results), so we must suppress it here too to
-    # faithfully reproduce a scenario where that eager-write's savepoint rolled back.
-    _orig_upsert = rq._upsert_dimension_result
+    # Simulate a ledger that loses one required gate across both the eager and
+    # final writers.  Patching only the final dual-write is insufficient now that
+    # migration gates are durably recorded as soon as they resolve.
+    real_upsert = rq._upsert_dimension_result
 
-    async def _skip_migration_apply_upsert(session, ver, sha, dim, **kw):
-        if dim == "migration_apply":
+    async def _drop_migration_apply(
+        session,
+        ver,
+        sha,
+        dimension,
+        **kwargs,
+    ):
+        if dimension == "migration_apply":
             return
-        return await _orig_upsert(session, ver, sha, dim, **kw)
+        await real_upsert(session, ver, sha, dimension, **kwargs)
 
     mocker.patch(
         "app.release_qualifier._upsert_dimension_result",
-        side_effect=_skip_migration_apply_upsert,
-    )
-
-    async def _incomplete_dual_write(session, ver, base_record, composite):
-        sha = base_record.get("candidate_sha")
-        # Flush the caller's staged mutations first so each upsert's savepoint
-        # isolates only the ledger write (mirrors the real dual-write).
-        await session.flush()
-        for dim in ("ci", "audit", "test_erosion", "migration_identity",
-                    "smoketest", "merge_grade"):
-            await _orig_upsert(session, ver, sha, dim, status="passed")
-
-    mocker.patch(
-        "app.release_qualifier._dual_write_dimension_results",
-        new=_incomplete_dual_write,
+        new=_drop_migration_apply,
     )
     promote_spy = mocker.patch(
         "app.release_qualifier.promote",
@@ -11820,11 +12553,11 @@ async def test_finalize_holds_when_ledger_empty_on_redrive(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, mocker):
+async def test_finalize_holds_on_empty_ledger_first_attempt(db_session, mocker):
     """When the per-dimension ledger is completely empty at the promotion gate
-    on the FIRST qualification (qualification_attempts == 1), the promotion
-    still fail-opens on the live composite -- a transient ledger-write failure
-    on the first qualification must not block an otherwise-qualified promotion."""
+    on the FIRST qualification (qualification_attempts == 1), promotion fails
+    closed.  A candidate with no durable same-tree facts must never promote from
+    only the mutable live composite."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -11866,9 +12599,10 @@ async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, moc
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Fail-open: promoted despite empty ledger (first qualification).
-    assert result["status"] == "promoted"
-    promote_spy.assert_called_once()
+    # Held, not promoted -- empty ledger fails closed on the first attempt too.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "qualification_dimension_ledger_empty"
+    promote_spy.assert_not_called()
 
 
 # Fully-controlled gate inputs for finalize reuse-path tests: CI green, both
@@ -16664,10 +17398,12 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
     # Pre-cap completeness meta agrees with the carried (capped) list.
     assert version.last_qualification["audit_findings_total"] == len(findings)
     assert version.last_qualification["audit_findings_truncated"] is False
-    # Test-erosion detail is carried too: this fixture has positive deltas and
-    # no deleted files, so the clean dimension carries None (nothing to fix).
+    # Test-erosion detail carries the lossless deltas (positive included) so
+    # a later scoped-audit merge can reconstruct cumulative erosion correctly.
     assert "test_erosion_detail" in version.last_qualification
-    assert version.last_qualification["test_erosion_detail"] is None
+    assert version.last_qualification["test_erosion_detail"] == {
+        "test_count_delta": 373, "assertion_delta": 840,
+    }
     # Smoketest detail names the specific failing test so the agent can target it.
     smoketest_detail = version.last_qualification["smoketest_detail"]
     assert smoketest_detail["failed_tests"] == ["b"]
