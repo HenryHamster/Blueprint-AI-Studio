@@ -6,27 +6,20 @@ The stable public names are re-exported by :mod:`app.release_qualifier`.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+import app.release_qualifier as _rq  # module-level ref — breaks circular import
 from app import github, hotfix_policy, release_version
 from app.database import AsyncSessionLocal
 from app.models import Project
-from app.release_qualifier import (
-    _FORCE_PROMOTE_NOOP_STATUSES,
-    _lts_branch_names,
-    _maybe_reconcile_after_promotion_conflict,
-    _maybe_trigger_strategic_after_qualification,
-    _promotion_in_flight_result,
-    _resolve_github_with_session,
-    compute_audited_surface_hash,
-    logger,
-    promote,
-)
 from app.time_utils import _utcnow
+
+logger = logging.getLogger(__name__)
 
 # ── Operator hotfix-deploy channel (design d-ae60ffe3, knowledge f69ffbff) ────
 # A NARROW, OWNER-approved, fail-closed sibling of force-promote: it fast-tracks
@@ -90,7 +83,7 @@ async def _hotfix_promote_locked(
     from app.qualification_state_resolver import resolve_newest_qualification_verdict
 
     _latest_verdict = await resolve_newest_qualification_verdict(session, version)
-    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict)
+    _promo = _rq._promotion_in_flight_result(version, latest_verdict=_latest_verdict)
     if _promo is not None:
         return _promo
     now = _utcnow()
@@ -120,7 +113,7 @@ async def _hotfix_promote_locked(
         reason,
         _scope_modules,
     )
-    result = await promote(
+    result = await _rq.promote(
         session,
         version,
         candidate_sha,
@@ -171,11 +164,11 @@ async def _hotfix_promote_in_dedicated_session(
                 )
             raise
 
-    if result.get("status") not in _FORCE_PROMOTE_NOOP_STATUSES:
-        await _maybe_reconcile_after_promotion_conflict(
+    if result.get("status") not in _rq._FORCE_PROMOTE_NOOP_STATUSES:
+        await _rq._maybe_reconcile_after_promotion_conflict(
             version_id, result, session_factory=session_factory
         )
-        await _maybe_trigger_strategic_after_qualification(
+        await _rq._maybe_trigger_strategic_after_qualification(
             version_id, result, session_factory=session_factory
         )
     return result
@@ -297,11 +290,11 @@ async def hotfix_promote_current_version(
     project = await session.get(Project, project_id)
     if project is None:
         return {"status": "project_not_found"}
-    resolved = await _resolve_github_with_session(session, project)
+    resolved = await _rq._resolve_github_with_session(session, project)
     if resolved is None:
         return {"status": "no_credentials"}
     token, owner, repo = resolved
-    integration_branch, promotion_target = _lts_branch_names(project)
+    integration_branch, promotion_target = _rq._lts_branch_names(project)
     if not candidate_sha:
         try:
             candidate_sha = await github.get_branch_sha(
@@ -363,7 +356,7 @@ async def hotfix_promote_current_version(
             "reason": verdict.reason,
         }
 
-    candidate_diff_hash = compute_audited_surface_hash(
+    candidate_diff_hash = _rq.compute_audited_surface_hash(
         await github.list_repo_tree_paths_at_ref(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
@@ -432,11 +425,11 @@ async def check_hotfix_scope_preview(
     project = await session.get(Project, project_id)
     if project is None:
         return {"status": "no_open_version"}
-    resolved = await _resolve_github_with_session(session, project)
+    resolved = await _rq._resolve_github_with_session(session, project)
     if resolved is None:
         return {"status": "no_credentials"}
     token, owner, repo = resolved
-    integration_branch, promotion_target = _lts_branch_names(project)
+    integration_branch, promotion_target = _rq._lts_branch_names(project)
     if not candidate_sha:
         try:
             candidate_sha = await github.get_branch_sha(
