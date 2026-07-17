@@ -27,6 +27,10 @@ export interface UseMessageListInput {
   showResolved: boolean;
   showOnlyNew: boolean;
   dividerTime: number | null;
+  /** Server-side needs_operator message IDs from the canonical attention model.
+   *  These are promoted to highSignalOpen regardless of local mute prefs,
+   *  keeping the list split consistent with the badge and toast surfaces. */
+  needsOperatorIds?: ReadonlySet<string>;
 }
 
 const RECENT_RESOLVED = 5;
@@ -48,6 +52,7 @@ export function useMessageList({
   showResolved,
   showOnlyNew,
   dividerTime,
+  needsOperatorIds,
 }: UseMessageListInput) {
   const byTime = (a: ProjectMessage, b: ProjectMessage) => {
     const ta = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
@@ -165,13 +170,22 @@ export function useMessageList({
       return byTimeDescInner(a, b);
     };
     return {
-      highSignalOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'high' && matchesSearch(m) && isNew(m))]
-        .sort(sortMode === 'importance' ? bySeverityInner : byTimeDescInner),
-      // Always compute routine messages; mute only filters them from the non-promoted routine section
-      routineOpen: [...openMessages.filter(m => effectiveSignal(m, eventPrefs, tempMutes) === 'routine' && matchesSearch(m) && isNew(m))].sort(byTimeDescInner),
+      // Attention-model items (needs_operator) are always high-signal regardless
+      // of local mute prefs — they must appear here even when the event_type is
+      // muted, so the list stays consistent with the badge and toast surfaces.
+      highSignalOpen: [...openMessages.filter(m =>
+        (effectiveSignal(m, eventPrefs, tempMutes) === 'high' || (needsOperatorIds?.has(m.id) ?? false))
+        && matchesSearch(m) && isNew(m)
+      )].sort(sortMode === 'importance' ? bySeverityInner : byTimeDescInner),
+      // Exclude needs_operator items from routine — they are promoted to high-signal above.
+      routineOpen: [...openMessages.filter(m =>
+        effectiveSignal(m, eventPrefs, tempMutes) === 'routine'
+        && !(needsOperatorIds?.has(m.id) ?? false)
+        && matchesSearch(m) && isNew(m)
+      )].sort(byTimeDescInner),
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openMessages, eventPrefs, tempMutes, searchQuery, sortMode, showOnlyNew, dividerTime]);
+  }, [openMessages, eventPrefs, tempMutes, needsOperatorIds, searchQuery, sortMode, showOnlyNew, dividerTime]);
 
   // In importance mode, pin BLOCKERs and unanswered QUESTIONs at the top with visual dividers
   const pinnedBlockers = sortMode === 'importance' ? highSignalOpen.filter(m => m.message_type === 'BLOCKER') : [];

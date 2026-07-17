@@ -795,7 +795,7 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1);
     expect(_messagesGetCalls()).toHaveLength(0);
-    expect(el.textContent).toContain('Session-backed Strategic reply');
+    await waitFor(() => expect(el.textContent).toContain('Session-backed Strategic reply'));
   });
 
   test('full message chrome still loads from the generic messages endpoint', async () => {
@@ -2320,7 +2320,7 @@ describe('MessagesPanel toast notifications', () => {
     }
   });
 
-  test('does not fire toast for muted high-signal NOTE event_type', async () => {
+  test('fires toast for needs_operator message even when event_type is muted', async () => {
     vi.useFakeTimers();
     try {
       const mockAddToast = vi.fn();
@@ -2338,13 +2338,12 @@ describe('MessagesPanel toast notifications', () => {
         created_at: '2026-05-06T10:00:00Z',
       };
 
-      // Set event pref to mute failure_alert via the project-scoped key the
-      // panel actually reads on mount (loadEventPrefs(email, projectId)). Seeding
-      // the legacy flat key would only exercise the migration fallback, never the
-      // real scoped read path.
+      // Mute the event_type locally — the attention model must override this
+      // for needs_operator items so all four notification surfaces stay consistent.
       saveEventPrefs('test-user@example.com', 'proj-1', { failure_alert: 'mute' });
 
-      // Initial load empty, then poll returns the muted failure_alert — no toast should fire
+      // Initial load empty, then poll returns the failure_alert which is in
+      // the attention model as needs_operator.
       _mockMessagesFetchSequence([[], [failureAlert]]);
 
       render(
@@ -2369,8 +2368,12 @@ describe('MessagesPanel toast notifications', () => {
         expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(2);
       });
 
-      // Even though failure_alert is high-signal, the mute pref prevents the toast
-      expect(mockAddToast).not.toHaveBeenCalled();
+      // Attention model (needs_operator) overrides local mute prefs for toasts —
+      // the four notification surfaces must agree on the canonical server signal.
+      await vi.waitFor(() => {
+        expect(mockAddToast).toHaveBeenCalledTimes(1);
+      });
+      expect(mockAddToast.mock.calls[0][0]).toContain('needs-action message');
     } finally {
       vi.useRealTimers();
       localStorage.removeItem(eventPrefsKey('test-user@example.com', 'proj-1'));

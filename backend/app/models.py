@@ -58,6 +58,11 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
+from app.strategic_resident_models import (  # noqa: F401
+    StrategicOperationReceipt,
+    StrategicResident,
+    StrategicResidentCheckpoint,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,

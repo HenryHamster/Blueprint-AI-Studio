@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy import func, or_
 from sqlmodel import select
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
@@ -269,6 +270,12 @@ async def sweep_queued_age_alerts(
                 .where(
                     Task.status == TaskStatus.QUEUED,
                     Task.created_at <= _queued_cutoff,
+                    or_(
+                        Task.payloads[0]["type"].as_string().is_(None),
+                        Task.payloads[0]["type"].as_string().not_in(
+                            sorted(BACKEND_MANAGED_TASK_TYPES)
+                        ),
+                    ),
                 )
                 .limit(batch_size)
             )
@@ -1798,9 +1805,9 @@ async def sweep_orphaned_cross_base_children(session, *, batch_size: int = 500) 
 #      resurfaces on failure; the two are disjoint by message_type and together
 #      cover every 'linked' message.
 #   2. sweep_decay_stale_open_messages — auto-resolves an OPEN conversational
-#      (NOTE/FEEDBACK) item with no activity for STALE_OPEN_DECAY_DAYS and no live
-#      linked condition, stamping resolution 'auto-decayed (stale)'. Genuinely-live
-#      QUESTION/BLOCKER items are never decayed.
+#      (NOTE/FEEDBACK/QUESTION) item with no activity for STALE_OPEN_DECAY_DAYS and
+#      no live linked condition, stamping resolution 'auto-decayed (stale)'.
+#      Genuinely-live BLOCKER items are never decayed.
 
 # Decay window (days) after which a stale open conversational message is
 # auto-resolved. Exposed as a module constant so the one-time backlog migration
@@ -1919,12 +1926,12 @@ async def sweep_decay_stale_open_messages(
 ) -> int:
     """Auto-resolve dead conversational (NOTE/FEEDBACK) open threads.
 
-    Ages out any OPEN NOTE/FEEDBACK item with no activity for the decay window
-    (``STALE_OPEN_DECAY_DAYS``, overridable via
+    Ages out any OPEN NOTE/FEEDBACK/QUESTION item with no activity for the decay
+    window (``STALE_OPEN_DECAY_DAYS``, overridable via
     ``runtime_config['stale_open_message_decay_days']``) and no live linked
     condition, stamping ``resolution='auto-decayed (stale)'``. Genuinely-live
-    QUESTION/BLOCKER items and any message carrying a live ``_convergence_link``
-    are left untouched.
+    BLOCKER items and any message carrying a live ``_convergence_link`` are left
+    untouched.
 
     Fail-safe per message, idempotent (resolution moves status off 'open'), and
     broadcasts a ``message_updated`` envelope per resolved row.

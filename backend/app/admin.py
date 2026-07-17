@@ -65,7 +65,10 @@ from app.payload_schemas import (
     TaskType,
     validate_task_payload,
 )
-from app.task_capabilities import USER_LAUNCHABLE_TASK_TYPES
+from app.task_capabilities import (
+    BACKEND_MANAGED_TASK_TYPES,
+    USER_LAUNCHABLE_TASK_TYPES,
+)
 from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
@@ -306,6 +309,7 @@ async def get_all_tasks(
     project_id: uuid.UUID | None = Query(None),
     spawned_by: str | None = Query(None, max_length=100),
     approval_needed: bool | None = Query(None),
+    include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -315,6 +319,14 @@ async def get_all_tasks(
 
     # Build shared filter conditions
     filters = [Task.project_id.in_(_user_project_ids(current_user["user_id"]))]
+    if not include_backend_managed:
+        task_type_expr = Task.payloads[0]["type"].as_string()
+        filters.append(
+            or_(
+                task_type_expr.is_(None),
+                task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+            )
+        )
     if project_id is not None:
         filters.append(Task.project_id == project_id)
     if status:
@@ -884,9 +896,14 @@ async def purge_archive_tasks(
     """
     user_project_ids = _member_project_ids(current_user["user_id"])
 
+    task_type_expr = Task.payloads[0]["type"].as_string()
     where_clauses = [
         Task.archived.is_(True),
         Task.project_id.in_(user_project_ids),
+        or_(
+            task_type_expr.is_(None),
+            task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+        ),
     ]
     if request.older_than_days is not None:
         if request.older_than_days < 1:
@@ -2475,6 +2492,14 @@ async def create_task_manually(
             github_repo=github_repo,
         )
         session.add(project)
+        await session.flush()
+        from app.strategic_resident_checkpointing import (
+            initialize_strategic_resident,
+        )
+
+        await initialize_strategic_resident(
+            session, project.id, locked_project=project
+        )
         await session.commit()
         await session.refresh(project)
         # Auto-add owner membership
@@ -3253,6 +3278,14 @@ async def create_compute_experiment_task(
             build_config={"bootstrap_completed_at": _now_iso},
         )
         session.add(project)
+        await session.flush()
+        from app.strategic_resident_checkpointing import (
+            initialize_strategic_resident,
+        )
+
+        await initialize_strategic_resident(
+            session, project.id, locked_project=project
+        )
         await session.commit()
         await session.refresh(project)
         session.add(

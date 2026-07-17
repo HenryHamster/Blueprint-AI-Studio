@@ -2822,6 +2822,158 @@ async def test_manifest_compute_no_connected_repo_has_compute_key(
     assert body["compute"]["image"] is None
 
 
+# ---------------------------------------------------------------------------
+# Local-source fallback tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_manifest_local_fallback_loads_tools(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is set and project has no GitHub connection,
+    manifest loads from the local filesystem."""
+    from app.routers.admin_project_tools import _manifest_cache
+
+    # Set up a minimal tools.json under the local root.
+    blueprint_dir = tmp_path / ".blueprint"
+    blueprint_dir.mkdir()
+    manifest = {"tools": [{"slug": "canvas", "title": "Canvas", "entry": "index.html"}]}
+    (blueprint_dir / "tools.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    # No github_owner/github_repo — local fallback must fire.
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+    assert resp.status_code == 200
+    body = resp.json()
+    tools = body.get("tools", [])
+    assert any(t["slug"] == "canvas" for t in tools), f"Expected 'canvas' in tools: {tools}"
+    assert body.get("error") is None
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_manifest_local_fallback_absent_returns_empty(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT points to a dir with no tools.json,
+    the response is empty lists with no error."""
+    from app.routers.admin_project_tools import _manifest_cache
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("tools") == []
+    assert body.get("error") is None
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_manifest_github_primary_takes_precedence(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When a project has a GitHub connection, GitHub is the primary source even
+    if BLUEPRINT_LOCAL_TOOLS_ROOT is also set."""
+    from unittest.mock import AsyncMock, patch
+    from app.routers.admin_project_tools import _manifest_cache
+
+    # Write a local manifest with a 'local-only-tool' slug.
+    blueprint_dir = tmp_path / ".blueprint"
+    blueprint_dir.mkdir()
+    local_manifest = {"tools": [{"slug": "local-only-tool", "title": "Local Only", "entry": "index.html"}]}
+    (blueprint_dir / "tools.json").write_text(json.dumps(local_manifest), encoding="utf-8")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    github_manifest = json.dumps({"tools": [{"slug": "github-tool", "title": "GitHub Tool", "entry": "app.html"}]})
+
+    with (
+        patch("app.github_auth.get_repo_installation_read_token", AsyncMock(return_value="ghs_tok")),
+        patch("app.github_refs.get_repo_default_branch", AsyncMock(return_value="main")),
+        patch("app.github.get_file_text_at_ref", AsyncMock(return_value=github_manifest)),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    slugs = [t["slug"] for t in body.get("tools", [])]
+    assert "github-tool" in slugs, f"Expected GitHub tool in response: {slugs}"
+    assert "local-only-tool" not in slugs, f"Local tool should not appear: {slugs}"
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_local_fallback_serves_file(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is set and project has no GitHub connection,
+    asset files are served from the local filesystem."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    # Write a JS asset under the tool slug.
+    asset_dir = tmp_path / ".blueprint" / "tools" / "canvas"
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "app.js").write_bytes(b"console.log('local');")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+
+    project = await _make_project_member(db_session)
+    # No GitHub connection.
+
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/app.js"
+    )
+    assert resp.status_code == 200
+    assert b"local" in resp.content
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_local_fallback_missing_file_returns_404(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When no local asset exists and project has no GitHub connection, serve 404."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+
+    project = await _make_project_member(db_session)
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/missing.js"
+    )
+    assert resp.status_code == 404
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_no_local_root_no_github_returns_404(client: AsyncClient, db_session, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is not set and project has no GitHub connection,
+    serve 404."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+    project = await _make_project_member(db_session)
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/app.js"
+    )
+    assert resp.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_research_claim_includes_project_skills(client, db_session):
     """Research and plan task types receive project skills just like create/fix tasks."""

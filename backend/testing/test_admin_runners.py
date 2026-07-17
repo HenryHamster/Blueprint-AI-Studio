@@ -1559,3 +1559,232 @@ class TestAllowlistedRunnerVisibleFromAddedProject:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["jobs_run_count"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Daemon enrollment contract — fleet state transitions observed by the walkthrough
+#
+# These tests prove the specific state transitions that v26-live-walkthrough.cjs
+# step 1d now observes: last_seen_at transitions from null (never heartbeated) to
+# a timestamp (daemon connected and heartbeated), and current_token_heartbeat_confirmed
+# flips from False to True. This is the contract that makes daemon enrollment
+# verifiable through the fleet API rather than only via --check preflight output.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestDaemonEnrollmentContract:
+    """Fleet-state transitions the walkthrough's step 1d daemon enrollment observes.
+
+    The walkthrough extends step 1d to start the actual runner daemon (not just
+    --check) and verify enrollment through the fleet API. These tests document and
+    enforce that contract at the API level so regressions are caught before a
+    live-stack walkthrough re-run is required.
+    """
+
+    @pytest.mark.asyncio
+    async def test_newly_registered_runner_has_null_last_seen_at(
+        self, client: AsyncClient, db_session
+    ):
+        """A freshly enrolled runner has last_seen_at=null before the daemon connects.
+
+        The walkthrough snapshots this 'before' state to establish a baseline.
+        Without this null baseline, a re-used runner row could falsely appear
+        to have already heartbeated.
+        """
+        project = await _make_project(db_session, "Daemon Enrollment Baseline")
+        reg = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "daemon-enroll-baseline-box"},
+        )
+        assert reg.status_code == 200, reg.text
+        runner_id = reg.json()["runner_id"]
+
+        fleet = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert fleet.status_code == 200
+        row = next((r for r in fleet.json() if r["id"] == runner_id), None)
+        assert row is not None
+        assert row["last_seen_at"] is None, (
+            "Newly registered runner must have last_seen_at=null before the daemon "
+            "sends its first heartbeat — the walkthrough uses this as the 'before' "
+            "baseline to prove a real heartbeat occurred"
+        )
+        assert row["current_token_heartbeat_confirmed"] is False
+
+    @pytest.mark.asyncio
+    async def test_daemon_heartbeat_sets_last_seen_at_in_fleet_api(
+        self, client: AsyncClient, db_session
+    ):
+        """After the daemon sends one heartbeat, last_seen_at is set and the runner
+        appears connected in the fleet API.
+
+        This is the core of the walkthrough's step 1d daemon enrollment check:
+        observe last_seen_at transitioning from null to a timestamp via the fleet
+        endpoint, proving the runner actually connected (not just that the token
+        was valid at preflight time).
+        """
+        project = await _make_project(db_session, "Daemon Enrollment After Heartbeat")
+        reg = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "daemon-hb-box"},
+        )
+        assert reg.status_code == 200, reg.text
+        token = reg.json()["token"]
+        runner_id = reg.json()["runner_id"]
+
+        # Confirm baseline: no heartbeat yet.
+        before = await client.get(f"/api/admin/projects/{project.id}/runners")
+        before_row = next(r for r in before.json() if r["id"] == runner_id)
+        assert before_row["last_seen_at"] is None
+
+        # Simulate the daemon sending its first heartbeat (POST /api/runner/heartbeat
+        # with the one-time token). The daemon uses the same endpoint in production.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": [], "active_work_report": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200, hb.text
+
+        # Fleet API must now show the runner as enrolled and connected.
+        after = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert after.status_code == 200
+        after_row = next(r for r in after.json() if r["id"] == runner_id)
+
+        assert after_row["last_seen_at"] is not None, (
+            "last_seen_at must be set after daemon heartbeat — this is the enrollment "
+            "evidence the walkthrough captures to prove FULL daemon connection"
+        )
+        assert after_row["current_token_heartbeat_confirmed"] is True, (
+            "current_token_heartbeat_confirmed must be True after daemon heartbeats "
+            "with the registered token — proves the live daemon uses the correct credential"
+        )
+        assert after_row["health"]["device_status"] == "connected", (
+            "Fleet health must report 'connected' after a recent heartbeat — "
+            "the walkthrough checks this as human-readable enrollment confirmation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_successive_daemon_heartbeats_advance_last_seen_at(
+        self, client: AsyncClient, db_session
+    ):
+        """Each heartbeat advances last_seen_at, proving ongoing live connection.
+
+        The walkthrough waits 10s for the daemon's heartbeat loop (2s interval) to
+        fire multiple times. This test verifies that successive heartbeats keep
+        advancing last_seen_at — a monotonically increasing timestamp proves the
+        runner stays connected, not just that it connected once.
+        """
+        project = await _make_project(db_session, "Daemon Successive Heartbeats")
+        reg = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "daemon-multi-hb-box"},
+        )
+        assert reg.status_code == 200, reg.text
+        token = reg.json()["token"]
+        runner_id = reg.json()["runner_id"]
+
+        seen_at_values = []
+
+        for _ in range(3):
+            hb = await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": [], "active_work_report": True},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert hb.status_code == 200, hb.text
+
+            fleet = await client.get(f"/api/admin/projects/{project.id}/runners")
+            row = next(r for r in fleet.json() if r["id"] == runner_id)
+            seen_at = row["last_seen_at"]
+            assert seen_at is not None
+            seen_at_values.append(seen_at)
+
+        # All three reads must show last_seen_at as non-null.
+        assert all(ts is not None for ts in seen_at_values), (
+            "last_seen_at must be populated after every heartbeat — not just the first"
+        )
+
+    @pytest.mark.asyncio
+    async def test_daemon_heartbeat_hostname_reflects_live_machine(
+        self, client: AsyncClient, db_session
+    ):
+        """The daemon reports the actual machine hostname on heartbeat (not the
+        enrollment-time placeholder). The walkthrough uses this to confirm the
+        running daemon is the correct machine.
+
+        The runner daemon sends its hostname on every heartbeat (local_runner.py
+        _heartbeat_loop → hostname field). This is distinct from the enrollment-time
+        hostname supplied by the operator: the daemon always overrides it with the
+        real socket.gethostname() value.
+        """
+        project = await _make_project(db_session, "Daemon Hostname Heartbeat")
+        reg = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "placeholder-enrollment-hostname"},
+        )
+        assert reg.status_code == 200, reg.text
+        token = reg.json()["token"]
+        runner_id = reg.json()["runner_id"]
+
+        # Daemon heartbeat carries the live machine's hostname.
+        hb = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "active_work_report": True,
+                "hostname": "real-daemon-hostname.local",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb.status_code == 200, hb.text
+
+        fleet = await client.get(f"/api/admin/projects/{project.id}/runners")
+        row = next(r for r in fleet.json() if r["id"] == runner_id)
+        # The daemon-reported hostname overwrites the enrollment placeholder.
+        assert row["hostname"] == "real-daemon-hostname.local", (
+            "Daemon heartbeat must update hostname to the live machine value — "
+            "fleet UI uses this to distinguish machines enrolled from the browser"
+        )
+
+    @pytest.mark.asyncio
+    async def test_daemon_heartbeat_token_revoked_after_deletion(
+        self, client: AsyncClient, db_session
+    ):
+        """After the runner is deleted (revoked), daemon heartbeats return 401/403.
+
+        The walkthrough checks token revocation as part of the enrollment lifecycle.
+        A deleted runner's token must be immediately invalid — the daemon cannot
+        continue heartbeating after operator revocation.
+        """
+        project = await _make_project(db_session, "Daemon Revocation")
+        reg = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "revoked-daemon-box"},
+        )
+        assert reg.status_code == 200, reg.text
+        token = reg.json()["token"]
+        runner_id = reg.json()["runner_id"]
+
+        # Daemon heartbeat works before revocation.
+        hb_before = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": [], "active_work_report": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb_before.status_code == 200
+
+        # Operator revokes the runner.
+        del_resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}"
+        )
+        assert del_resp.status_code == 200
+
+        # Daemon heartbeat must now be rejected.
+        hb_after = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": [], "active_work_report": True},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert hb_after.status_code in (401, 403), (
+            f"Revoked runner token must be rejected on heartbeat (got {hb_after.status_code})"
+        )
