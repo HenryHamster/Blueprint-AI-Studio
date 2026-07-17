@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 vi.mock('child_process', () => ({
   execFileSync: vi.fn().mockReturnValue(''),
@@ -264,7 +265,7 @@ describe('verifyCloneDelivered', () => {
     let caughtCategory: string | undefined;
     try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caughtCategory = (e as Error & { failureCategory?: string }).failureCategory; }
     expect(caughtCategory).toBe('clone_failed');
-    expect(vi.mocked(apiPost)).toHaveBeenCalledWith(
+    expectCalledWith(apiPost,
       '/api/agent/build-config-discovery',
       { observed_repo_is_empty: true },
     );

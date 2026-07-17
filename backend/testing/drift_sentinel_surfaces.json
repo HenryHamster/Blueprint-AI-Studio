@@ -18,6 +18,11 @@
       "glob": "backend/app/capability_trial_verdict.py",
       "sentinels": ["backend/testing/test_event_type_invariants.py"],
       "why": "Second source file in test_event_type_invariants.py's fixed source_paths set (event_type literals for capability trial verdicts). Same rationale as backend/app/notification_dispatch.py."
+    },
+    {
+      "glob": "backend/alembic/versions/**/*.py",
+      "sentinels": ["backend/testing/test_migration_chain.py"],
+      "why": "test_migration_chain.py::test_migration_files_do_not_import_app_modules AST-scans every migration file in alembic/versions/ for app.* imports — a class of defect (#15100, 0621/0626) that causes ImportError in the promotion apply gate when migration files are executed in the serving process. Migration files never import backend/testing helpers and are not in backend/app/, so the dotted-import reverse-dep scan never selects this guard. Register here so any change to a migration file runs the guard at merge time."
     }
   ]
 }

@@ -29,6 +29,17 @@ Identical to 0531 / 0472: ``decrypt_field(value) != value`` means the value is
 ALREADY ciphertext and is skipped.  The plain ``encrypt_field(value) == value``
 short-circuit avoids a no-key no-op turning into a double-encrypt attempt.
 
+WHY NO app.* IMPORTS
+--------------------
+The promotion apply gate (backend/app/migration_apply_gate.py,
+``_apply_candidate_migrations``) executes candidate migration FILES in-process
+on the DEPLOYED engine.  Any ``from app.*`` import resolves against the SERVING
+tree rather than the candidate, so missing symbols (e.g. ``require_encryption_active``
+added after the serving SHA was deployed) cause ImportError and infra-fail every
+qualification attempt.  Precedent: migration 0561 was fixed by PR #15100
+(commit 1e51b910b) for the same class.  All encryption helpers are inlined here
+as module-local frozen copies — no runtime dependency on ``app.field_encryption``.
+
 Revision ID: 0621
 Revises: 0609
 Create Date: 2026-07-16 00:00:00.000000
@@ -36,11 +47,99 @@ Create Date: 2026-07-16 00:00:00.000000
 """
 
 import logging
+import os
 
 from alembic import op
 import sqlalchemy as sa
+from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger(__name__)
+
+# ── Module-local frozen encryption helpers ────────────────────────────────────
+# Inlined from app.field_encryption to avoid app.* imports at migration load
+# time (see module docstring for why this matters).
+
+_ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
+_ALLOW_PLAINTEXT_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
+
+
+def _get_fernet():
+    key = os.getenv(_ENCRYPTION_KEY_ENV)
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode())
+    except Exception:
+        return None
+
+
+def _is_encryption_active():
+    return _get_fernet() is not None
+
+
+def _require_encryption_available():
+    if _is_encryption_active():
+        return
+    if not os.getenv(_ALLOW_PLAINTEXT_ENV):
+        raise RuntimeError(
+            f"{_ENCRYPTION_KEY_ENV} is not available and "
+            f"{_ALLOW_PLAINTEXT_ENV} is not set. "
+            f"Set {_ALLOW_PLAINTEXT_ENV}=true for development "
+            "environments without encryption, or configure a valid "
+            f"{_ENCRYPTION_KEY_ENV} for production use."
+        )
+
+
+def _require_encryption_active(context):
+    key = os.getenv(_ENCRYPTION_KEY_ENV)
+    if key:
+        try:
+            Fernet(key.encode())
+        except Exception as exc:
+            raise RuntimeError(
+                f"{context}: {_ENCRYPTION_KEY_ENV} is set but contains an invalid "
+                f"Fernet key — encryption cannot proceed. "
+                f"Supply a valid key generated with Fernet.generate_key(). "
+                f"(Error: {exc})"
+            ) from exc
+        return
+    if not os.getenv(_ALLOW_PLAINTEXT_ENV):
+        raise RuntimeError(
+            f"{context}: {_ENCRYPTION_KEY_ENV} is not set and "
+            f"{_ALLOW_PLAINTEXT_ENV} is not set — "
+            f"refusing to proceed without confirmed encryption or explicit "
+            f"plaintext development opt-in. "
+            f"Set {_ALLOW_PLAINTEXT_ENV}=true for keyless dev environments."
+        )
+
+
+def _encrypt_field(value):
+    if value is None:
+        return None
+    f = _get_fernet()
+    if f is None:
+        _require_encryption_available()
+        return value
+    return f.encrypt(value.encode()).decode()
+
+
+def _decrypt_field(value):
+    if value is None:
+        return None
+    f = _get_fernet()
+    if f is None:
+        _require_encryption_available()
+        return value
+    try:
+        return f.decrypt(value.encode()).decode()
+    except (InvalidToken, ValueError, TypeError) as e:
+        logger.warning(
+            "Decryption fallback for %s (%s): %s — value returned as-is",
+            type(e).__name__,
+            _ENCRYPTION_KEY_ENV,
+            e,
+        )
+        return value
 
 revision = "0621"
 down_revision = "0613"
@@ -115,19 +214,12 @@ def backfill_encrypted_columns(bind, decrypt_field, encrypt_field) -> dict[str, 
 
 
 def upgrade() -> None:
-    from app.field_encryption import (
-        decrypt_field,
-        encrypt_field,
-        is_encryption_active,
-        require_encryption_active,
-    )
-
     # Fail closed before reading any row: absent key raises RuntimeError unless
     # ALLOW_PLAINTEXT_CREDENTIALS is explicitly set (development environments).
     # A malformed key always raises regardless of that flag.
-    require_encryption_active("Migration 0621")
+    _require_encryption_active("Migration 0621")
 
-    if not is_encryption_active():
+    if not _is_encryption_active():
         # ALLOW_PLAINTEXT_CREDENTIALS is set — genuine no-op for keyless dev.
         logger.warning(
             "0621: ALLOW_PLAINTEXT_CREDENTIALS is set without an encryption key "
@@ -136,16 +228,14 @@ def upgrade() -> None:
         return
 
     bind = op.get_bind()
-    updated_by_column = backfill_encrypted_columns(bind, decrypt_field, encrypt_field)
+    updated_by_column = backfill_encrypted_columns(bind, _decrypt_field, _encrypt_field)
     logger.info("Migration 0621 backfilled encrypted columns: %s", updated_by_column)
 
 
 def downgrade() -> None:
     bind = op.get_bind()
 
-    from app.field_encryption import decrypt_field, is_encryption_active
-
-    if not is_encryption_active():
+    if not _is_encryption_active():
         logger.warning(
             "0621 (downgrade): field encryption not configured — leaving "
             "encrypted-at-rest columns unchanged"
@@ -165,7 +255,7 @@ def downgrade() -> None:
         rows = bind.execute(sa.select(tbl.c.id, col).where(where_clause)).fetchall()
         updated = 0
         for row_id, value in rows:
-            plaintext = decrypt_field(value)
+            plaintext = _decrypt_field(value)
             if plaintext == value:
                 # Not ciphertext for this key — leave as-is.
                 continue
