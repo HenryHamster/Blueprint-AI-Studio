@@ -82,7 +82,8 @@ async def seed():
         print(f"✓ ProjectMember: {MEMBER_ID} (user_id={USER_ID!r}, role=owner)")
         print(f"✓ AllowedUser: {ALLOWED_USER_ID} (email=admin@walkthrough.local)")
 
-        # 4. Create a test ProjectMessage for the Messages flow test (upsert to reset status)
+        # 4. Create a test ProjectMessage (system/NOTE) for the Messages flow test.
+        # This is the message that 3c resolves — upsert to reset status on re-run.
         message_id = uuid.UUID("00000000-0000-4000-8000-000000000010")
         await conn.execute(
             """
@@ -96,7 +97,48 @@ async def seed():
             now,
             "Walkthrough test message: v26 qualification run 2026-07-16",
         )
-        print(f"✓ ProjectMessage: {message_id}")
+        print(f"✓ ProjectMessage (system/NOTE, resolved by flow 3c): {message_id}")
+
+        # 5. Create a second open operator-audience message (user/QUESTION) so
+        # that flow 3e can assert visible message bubbles/composer after 3c resolves
+        # the first message.  from_type='user' passes the isConversationMessage()
+        # check and renders via MessageBubble with data-message-id.
+        # created_at is 1 second later so this sorts after message_id in the list.
+        import datetime as _dt
+        later = now + _dt.timedelta(seconds=1)
+        operator_msg_id = uuid.UUID("00000000-0000-4000-8000-000000000011")
+        await conn.execute(
+            """
+            INSERT INTO projectmessage (id, project_id, created_at, content,
+                message_type, from_type, status, resolved_at)
+            VALUES ($1, $2, $3, $4, 'QUESTION', 'user', 'open', NULL)
+            ON CONFLICT (id) DO UPDATE SET status = 'open', resolved_at = NULL, resolution = NULL
+            """,
+            operator_msg_id,
+            PROJECT_ID,
+            later,
+            "Walkthrough seed: operator question — verifies MessagesPanel renders message bubbles (flow 3e).",
+        )
+        print(f"✓ ProjectMessage (user/QUESTION, stays open for flow 3e UI): {operator_msg_id}")
+
+        # 6. Create an active (undismissed) ERROR alert so that flow 3f can assert
+        # the bg-red-500 cross-tab alert indicator.  event_type=NULL passes the
+        # operator_visible_alert_filter() (null is treated as operator-visible legacy).
+        alert_id = uuid.UUID("00000000-0000-4000-8000-000000000020")
+        await conn.execute(
+            """
+            INSERT INTO alert (id, project_id, created_at, title, message, severity,
+                domain, event_type, dismissed_at)
+            VALUES ($1, $2, $3, $4, $5, 'ERROR', 'core', NULL, NULL)
+            ON CONFLICT (id) DO UPDATE SET dismissed_at = NULL
+            """,
+            alert_id,
+            PROJECT_ID,
+            now,
+            "Walkthrough seed: active alert",
+            "Seeded for flow 3f — verifies cross-tab alert indicator (bg-red-500 dot).",
+        )
+        print(f"✓ Alert (ERROR, undismissed, event_type=NULL, for flow 3f): {alert_id}")
 
     finally:
         await conn.close()
