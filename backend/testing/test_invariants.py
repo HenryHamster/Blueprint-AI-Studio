@@ -2238,6 +2238,71 @@ class TestSchemaRevisionSync:
             "or wrap the CONCURRENTLY DDL in `with op.get_context().autocommit_block():`."
         )
 
+    def test_migrations_do_not_import_candidate_side_app_symbols(self):
+        """Every migration file must be self-contained — no ``from app.* import``
+        or ``import app.*`` at any scope (top-level or inside functions).
+
+        Candidate migrations are replayed by the OLDER serving engine during
+        release qualification.  Any ``app.*`` symbol absent from that engine
+        causes an ``ImportError`` that surfaces as an infra hold, blocking
+        qualification indefinitely.  Migration 0609's docstring codifies this
+        contract; migrations 0621 and 0626 violated it by importing
+        ``require_encryption_active`` / ``assert_plaintext_or_raise`` from
+        ``app.field_encryption``, wedging v26 qualification for 31+ attempts.
+
+        This test machine-enforces the contract so the failure class cannot recur.
+        """
+        import glob as globmod
+
+        migrations_dir = os.path.join(
+            os.path.dirname(__file__), "..", "alembic", "versions"
+        )
+        files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
+        assert files, "No migration files found"
+
+        # The self-containment contract was documented in 0609.  Migrations
+        # before that revision predate the rule and cannot be modified
+        # (applied history is immutable — see CLAUDE.md).
+        _MIN_SELF_CONTAINED_REVISION = 609
+
+        violations: list[str] = []
+        for path in files:
+            filename = os.path.basename(path)
+            try:
+                revision_num = int(filename.split("_")[0])
+            except ValueError:
+                continue
+            if revision_num < _MIN_SELF_CONTAINED_REVISION:
+                continue
+            with open(path) as fh:
+                source = fh.read()
+            try:
+                tree = ast.parse(source, filename=filename)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    module = node.module or ""
+                    if module == "app" or module.startswith("app."):
+                        names = ", ".join(alias.name for alias in node.names)
+                        violations.append(
+                            f"{filename}: from {module} import {names}"
+                        )
+                elif isinstance(node, ast.Import):
+                    violations.extend(
+                        f"{filename}: import {alias.name}"
+                        for alias in node.names
+                        if alias.name == "app" or alias.name.startswith("app.")
+                    )
+
+        assert not violations, (
+            "Migration file(s) import from app.* — candidate migrations are "
+            "replayed by the serving engine during qualification, which may not "
+            "have candidate-side app symbols.  Make these migrations self-contained "
+            "(inline the needed logic, as 0609 demonstrates):\n  "
+            + "\n  ".join(violations)
+        )
+
 # ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
 
 class TestChainInvariantSeedFixtures:
