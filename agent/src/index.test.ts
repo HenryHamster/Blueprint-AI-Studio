@@ -2345,14 +2345,18 @@ describe('captureTestBaseline timeout selection', () => {
     expect((defined(dockerCall)[2] as { timeout: number }).timeout).toBe(600_000);
   });
 
-  it('uses the passed timeoutMs (60s default) for non-Docker runners', async () => {
+  it('uses setup timeout for npm ci and the passed baseline timeout for the suite', async () => {
     const buildConfig = {
       directories: [{ path: '', type: 'node', test_cmd: 'npm test' }],
     };
     await captureTestBaseline(null, { value: '' }, buildConfig);
-    const npmCall = vi.mocked(spawn).mock.calls.find(c => c[0] === 'npm');
-    expect(npmCall).toBeDefined();
-    expect((defined(npmCall)[2] as { timeout: number }).timeout).toBe(60_000);
+    const npmCalls = vi.mocked(spawn).mock.calls.filter(c => c[0] === 'npm');
+    const setupCall = npmCalls.find(c => (c[1] as string[])[0] === 'ci');
+    const testCall = npmCalls.find(c => (c[1] as string[])[0] === 'test');
+    expect(setupCall).toBeDefined();
+    expect(testCall).toBeDefined();
+    expect((defined(setupCall)[2] as { timeout: number }).timeout).toBe(180_000);
+    expect((defined(testCall)[2] as { timeout: number }).timeout).toBe(60_000);
   });
 });
 

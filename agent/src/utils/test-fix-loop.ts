@@ -342,6 +342,31 @@ export async function captureTestBaseline(
   const successfulRunners: TestRunner[] = [];
 
   for (const runner of runners) {
+    // A baseline is only meaningful after the runner's locked dependencies
+    // exist. Fresh task clones intentionally omit node_modules; invoking npm
+    // test first turns a missing Vitest binary into a false repository failure.
+    // Use the same package-manager-aware setup contract as the post-change
+    // test loop, and never invoke the suite when setup fails.
+    const setupCommand = describeRunnerSetupCommand(runner);
+    if (setupCommand) {
+      sendHeartbeatSync(taskId, `Baseline setup [${runner.label}]...`);
+      sendLog(ws, `Preparing baseline runner [${runner.label}]: ${setupCommand.label}\n`);
+      try {
+        await execFileAsync(setupCommand.cmd, setupCommand.args, {
+          cwd: runner.cwd,
+          timeoutMs: TEST_RUNNER_TIMEOUT,
+        });
+      } catch (setupErr) {
+        const msg = setupErr instanceof Error ? setupErr.message : String(setupErr);
+        sendLog(
+          ws,
+          `Test baseline setup failed for [${runner.label}] — suite was not executed.\n` +
+          `${msg.slice(0, 500)}\n`,
+        );
+        await postBuildDiscoveryReport(ws, buildConfig, successfulRunners);
+        return null;
+      }
+    }
     // For vitest, request the JSON reporter so we can extract failing
     // test names authoritatively — the stdout parser historically missed
     // vitest's " FAIL" format, producing a "0 pre-existing failures"
