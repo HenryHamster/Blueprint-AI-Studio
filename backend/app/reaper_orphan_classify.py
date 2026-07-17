@@ -24,6 +24,32 @@ _ORPHAN_PRIORITY_SPOT = 1  # spot VM — likelier to be preempted again
 _ORPHAN_PRIORITY_PROVISION = 2  # stuck PROVISIONING — never got a heartbeat
 _ORPHAN_PRIORITY_DEFAULT = 3  # everything else
 
+# Bespoke handlers that do not invoke an LLM and therefore cannot emit the
+# tool-use events consumed by the progress-stale watchdog. Their direct work is
+# observable through the ordinary agent heartbeat only:
+#
+# * verify_tests runs detected build/test subprocesses directly; a healthy suite
+#   can exceed the small-scope 480s progress cutoff.
+# * compute_experiment launches a backend-managed job and parks on its durable
+#   terminal wake; it likewise has no LLM/tool-event stream while launch is in
+#   flight.
+#
+# This is deliberately a progress-only exemption. Heartbeat-stale, missing-
+# heartbeat, provisioning, and absolute-ceiling branches run before the guarded
+# progress checks below and remain fully effective.
+_HEARTBEAT_ONLY_PROGRESS_TASK_TYPES = frozenset(
+    {
+        "verify_tests",
+        "compute_experiment",
+    }
+)
+
+
+def _uses_heartbeat_only_progress(task) -> bool:
+    """True for direct handlers that cannot produce LLM tool-use events."""
+    payload = task.first_payload or {}
+    return payload.get("type") in _HEARTBEAT_ONLY_PROGRESS_TASK_TYPES
+
 
 def _orphan_priority_key(task) -> int:
     """Cheap priority bucket for one orphan, computed ONLY from already-loaded
@@ -545,6 +571,7 @@ def _classify_orphan(
         if (
             task.last_heartbeat
             and task.last_heartbeat >= hb_cutoff
+            and not _uses_heartbeat_only_progress(task)
             and task.last_tool_use_at is not None
             and task.last_tool_use_at < _progress_stale_cutoff(task, now)
             and (
@@ -591,6 +618,7 @@ def _classify_orphan(
         if (
             task.last_heartbeat
             and task.last_heartbeat >= hb_cutoff
+            and not _uses_heartbeat_only_progress(task)
             and task.last_tool_use_at is None
             and task.started_at
             and task.started_at < _progress_stale_cutoff(task, now)
