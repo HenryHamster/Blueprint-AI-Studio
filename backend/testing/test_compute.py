@@ -1521,6 +1521,20 @@ def test_gcp_resume_rejects_empty_accepted_archive(monkeypatch, tmp_path):
     assert "resume_hydration_failed" in proc.stdout
 
 
+def test_gcp_resume_rejects_archive_with_only_unsafe_member(monkeypatch, tmp_path):
+    """Skipped traversal members cannot count as a hydrated checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"../outside/checkpoint.pt": b"weights"},
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
 def test_gcp_resume_scrubs_failed_publication(monkeypatch, tmp_path):
     """A failed staged copy is checked and no partial checkpoint survives."""
     proc, artifact_dir, _source_id = _run_gcp_resume_block(

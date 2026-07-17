@@ -121,12 +121,13 @@ _RESUME_EXTRACTOR_PY = (
     "os.makedirs(d,exist_ok=True);"
     'tf=tarfile.open(b,"r:gz");'
     "ms=tf.getmembers();"
-    "[tf.extract(m,d) for m in ms if not m.issym() and not m.islnk()"
+    "safe=[m for m in ms if not m.issym() and not m.islnk()"
     ' and (m.isreg() or m.isdir())'
     ' and ".." not in m.name.split("/")'
     ' and not m.name.startswith("/")'
     ' and not(m.isreg() and m.name.split("/")[-1] in STALE)];'
-    'fc=sum(1 for m in ms if m.isreg() and m.name.split("/")[-1] not in STALE);'
+    "[tf.extract(m,d) for m in safe];"
+    "fc=sum(1 for m in safe if m.isreg());"
     "tf.close();"
     "sys.exit(0 if fc>0 else 1)"
 )
@@ -3349,7 +3350,8 @@ def _build_gcp_startup_script(
             f"python3 -c '{_RESUME_EXTRACTOR_PY}' "
             f"{_resume_bundle_q} {_resume_stage_path} >/dev/null 2>&1; then\n"
             f"  _BP_RESUME_FC=$(find {_resume_stage_path} -type f 2>/dev/null | wc -l)\n"
-            f"  if rm -rf {artifact_dir} && cp -a {_resume_stage_path} {artifact_dir} >/dev/null 2>&1; then\n"
+            f'  if [ "$_BP_RESUME_FC" -gt 0 ] && rm -rf {artifact_dir} '
+            f"&& cp -a {_resume_stage_path} {artifact_dir} >/dev/null 2>&1; then\n"
             f"    __BP_RESUME_D=$(python3 -c 'import json,base64,sys,datetime; print("
             f"base64.b64encode(json.dumps({{"
             f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)},'
