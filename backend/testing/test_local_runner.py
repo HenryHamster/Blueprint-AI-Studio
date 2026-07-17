@@ -56,7 +56,7 @@ from app.routers.runner import (
     _parse_multipart_form_stream,
 )
 from app.runner_config import config_generation, live_safe_config
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
@@ -1151,7 +1151,7 @@ class TestAdminRunnerEndpoints:
         assert row is not None
         assert row.capabilities["runner_preset"] == "strategic_local"
         assert row.capabilities["workload"] == "strategic"
-        assert row.capabilities["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert row.capabilities["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         assert row.capabilities["max_concurrent"] == 1
 
     @pytest.mark.asyncio
@@ -2286,7 +2286,7 @@ class TestRunnerConfigChannel:
         caps = patch.json()["capabilities"]
         assert caps["gpu_indices_allowed"] == [0]
         assert caps["max_concurrent"] == 1
-        assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert caps["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         # The config block reflects the clamped values, not the requested ones.
         assert patch.json()["config"]["desired"]["max_concurrent"] == 1
 
@@ -8514,6 +8514,7 @@ class TestLocalRunnerStatusForStrategist:
                     "enroot_ok": False,
                     "systemd_run_ok": False,
                 },
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "cdi"}},
                 "active_task_ids": ["t-1"],
                 "active_compute_job_ids": [],
             },
@@ -10300,6 +10301,7 @@ class TestDirectComputeExperimentDispatch:
                 "gpu_count": 1,
                 "max_concurrent": 2,
                 "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
             },
         )
         task = Task(
@@ -10341,6 +10343,7 @@ class TestDirectComputeExperimentDispatch:
                 "gpu_free_vram_mib": [40960],  # plenty of free VRAM
                 "max_concurrent": 2,
                 "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
             },
         )
         task = Task(
@@ -11791,6 +11794,113 @@ class TestMidRunViewableUpload:
             f"viewable_file_count must be stamped by the terminal pass, got "
             f"{meta.get('viewable_file_count')!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_pdf_viewable_upload_accepted(self, client, db_session):
+        """PDF files are a supported viewable kind and must be accepted by the endpoint.
+
+        Finding 12: PDF artifacts should be uploadable via the live viewable
+        pipeline (storage.py classifies .pdf as kind='pdf') and the endpoint
+        must store the entry with the correct content_type/kind.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "report.pdf"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (safe_name, b"%PDF-1.4 tiny", "application/pdf")
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"PDF viewable upload should be accepted, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "pdf"
+        assert body["entry"]["content_type"] == "application/pdf"
+        assert body["entry"]["storage_uri"] == fake_uri
+
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1
+        assert vf[0]["kind"] == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_bound_secondary_project_viewable_upload_allowed(
+        self, client, db_session
+    ):
+        """A runner bound to a secondary project can upload viewable files for jobs in that project.
+
+        Finding 5: the live-viewable endpoint must authorize against
+        allowed_project_ids (the runner's enrollment project UNION its explicit
+        bindings), not just runner.project_id. A runner enrolled in project A but
+        explicitly bound to project B must be able to push previews for a job in B.
+        """
+        from app import runner_project_binding as rpb
+
+        # Runner is enrolled in project A.
+        _project_a, runner, token, _job_a = await self._make_running_job(db_session)
+
+        # Create project B and a job in it, pinned to this runner.
+        project_b = await _make_project(db_session, name="ProjectB")
+        job_b = ComputeJob(
+            project_id=project_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job_b)
+        await db_session.commit()
+        await db_session.refresh(job_b)
+
+        # Upload to job_b BEFORE binding — must be rejected (runner not on allow-list).
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job_b.id, safe_name)
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_before = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_before.status_code == 404, (
+            f"Upload to unbound project should be 404, got {resp_before.status_code}"
+        )
+
+        # Bind the runner to project B.
+        await rpb.add_binding(db_session, runner.id, project_b.id)
+        await db_session.commit()
+
+        # Now upload must succeed.
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_after = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_after.status_code == 200, (
+            f"Upload to bound project should succeed, got "
+            f"{resp_after.status_code}: {resp_after.text}"
+        )
+        body = resp_after.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "image"
 
 
 # ── Capability proof trial: runner job + result ingestion (design 84021e2d §2) ─

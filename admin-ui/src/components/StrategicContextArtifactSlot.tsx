@@ -452,9 +452,10 @@ export function ArtifactViewablePreviews({
 
   // A preview is renderable from EITHER a baked url or a re-resolvable
   // storage_uri — never filter on url alone, or an expired baked url would drop
-  // a still-resolvable preview.
+  // a still-resolvable preview. PDF previews are included alongside images and
+  // videos so mixed-media artifacts surface all supported kinds in the strip.
   const items = (previews ?? []).filter(
-    preview => (preview.kind === 'image' || preview.kind === 'video') && (preview.url || preview.storage_uri),
+    preview => (preview.kind === 'image' || preview.kind === 'video' || preview.kind === 'pdf') && (preview.url || preview.storage_uri),
   );
   if (items.length === 0) return null;
 
@@ -475,6 +476,20 @@ export function ArtifactViewablePreviews({
               bakedUrl={preview.url}
               ariaLabel={alt}
               className="h-20 w-auto flex-shrink-0"
+              live={preview.live}
+            />
+          );
+        }
+        if (preview.kind === 'pdf') {
+          return (
+            <ResolvedPdf
+              key={preview.revision ? `${preview.storage_uri || preview.url}@${preview.revision}` : preview.storage_uri || preview.url || i}
+              projectId={projectId}
+              storageUri={preview.storage_uri}
+              revision={preview.revision}
+              bakedUrl={preview.url}
+              label={alt}
+              className="flex h-20 w-32 flex-shrink-0 flex-col items-center justify-center gap-1 rounded border border-neutral-700 bg-neutral-900 p-1 text-xs text-neutral-300 hover:text-sky-300"
               live={preview.live}
             />
           );

@@ -437,3 +437,298 @@ def test_compute_job_runner_calls_prune_docker_images_after_job():
         "local_runner._prune_docker_images must be both defined AND called in the "
         "compute-job lifecycle; found fewer than 2 occurrences of '_prune_docker_images('"
     )
+
+
+# =========================================================================== #
+# 12-finding compute-viewable salvage bundle (2026-07-17)
+#
+# Findings: live-preview starvation, canvas dedup, honest media limits,
+# artifact sampling disclosure, bound-project uploads, atomic terminal handoff
+# design, refresh overwritten previews, mixed-media preservation, atomic
+# terminal handoff impl, reserve slots for viewable runs, omission telemetry,
+# PDF support.
+# =========================================================================== #
+
+
+def _runner_router_source() -> str:
+    """Return the source of backend/app/routers/runner.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "runner.py",
+        Path("/repo/backend/app/routers/runner.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "runner.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("runner.py not found in expected locations")
+
+
+def _strategic_pkg_source() -> str:
+    """Return the source of backend/app/strategic_context_package.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "strategic_context_package.py",
+        Path("/repo/backend/app/strategic_context_package.py"),
+        Path(__file__).resolve().parent.parent / "app" / "strategic_context_package.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("strategic_context_package.py not found")
+
+
+def _admin_compute_jobs_source() -> str:
+    """Return the source of backend/app/routers/admin_compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "admin_compute_jobs.py",
+        Path("/repo/backend/app/routers/admin_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "admin_compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("admin_compute_jobs.py not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding 1: live-preview fairness — scanner rotates past last-uploaded path
+# --------------------------------------------------------------------------- #
+
+
+def test_stream_viewable_files_returns_after_one_upload_decision():
+    """Non-drain _stream_viewable_files returns after at most one upload per call.
+
+    Finding 1 claim: 'The non-drain scheduler returns after one upload decision
+    per heartbeat.' A frequently-rewritten file must not monopolize every heartbeat.
+    """
+    source = _local_runner_source()
+
+    # The non-drain path must have an explicit return after start_upload().
+    assert "if not drain:" in source or "return" in source, (
+        "_stream_viewable_files must return after one upload decision outside drain"
+    )
+    # scan_start cursor must be advanced after each upload decision.
+    assert "state.scan_start = relpath" in source, (
+        "_stream_viewable_files must set state.scan_start to advance the fairness cursor"
+    )
+
+
+def test_stream_viewable_files_rotates_candidate_list():
+    """The candidate list is rotated to start just past scan_start.
+
+    Finding 1 claim: 'The scanner returns candidates in deterministic path order.'
+    The fairness rotation must find the index strictly greater than scan_start.
+    """
+    source = _local_runner_source()
+
+    assert "scan_start" in source, "scan_start attribute must exist in _ViewableStreamState"
+    # The rotation uses a comparison to find the first relpath > scan_start.
+    assert "relpath > state.scan_start" in source or "c[\"relpath\"] > state.scan_start" in source, (
+        "_stream_viewable_files must rotate candidates so scanning resumes after scan_start"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 5: live-viewable endpoint authorizes against allowed_project_ids
+# --------------------------------------------------------------------------- #
+
+
+def test_viewable_endpoint_uses_allowed_project_ids():
+    """The /compute-job/{job_id}/viewable endpoint must use allowed_project_ids.
+
+    Finding 5 claim: 'The live-viewable endpoint filters ComputeJob.project_id
+    against runner.project_id rather than the runner's allowed_project_ids set.'
+    The current code must use the broader allowed_project_ids so bound secondary
+    projects can stream their plots.
+    """
+    source = _runner_router_source()
+
+    # The endpoint function (upload_compute_job_viewable) must call allowed_project_ids.
+    # Locate the viewable endpoint section.
+    idx = source.find('"/compute-job/{job_id}/viewable"')
+    assert idx >= 0, "viewable endpoint definition not found in runner.py"
+    # Scan forward into the function body. The body is long (multipart parsing
+    # precedes the DB query), so use a generous window.
+    body_slice = source[idx : idx + 12000]
+    assert "allowed_project_ids" in body_slice, (
+        "upload_compute_job_viewable must call allowed_project_ids (not use "
+        "runner.project_id directly) so a runner bound to a secondary project "
+        "can upload previews for jobs in that project"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 7: cache key includes revision so overwritten files refresh
+# --------------------------------------------------------------------------- #
+
+
+def test_pdf_in_viewable_content_types():
+    """PDF must be in the storage viewable content-type registry.
+
+    Finding 12 claim: 'compute_backends._VIEWABLE_CONTENT_TYPES has no pdf entry.'
+    """
+    from app import storage
+
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES, (
+        "storage._VIEWABLE_CONTENT_TYPES must include 'pdf' so PDF viewable files "
+        "can be classified and uploaded via the live-viewable pipeline"
+    )
+    content_type, kind = storage._VIEWABLE_CONTENT_TYPES["pdf"]
+    assert content_type == "application/pdf"
+    assert kind == "pdf"
+
+
+def test_local_runner_pdf_in_viewable_content_types():
+    """PDF must also be in the runner's local copy of _VIEWABLE_CONTENT_TYPES.
+
+    Finding 12 claim: the runner must mirror the server's allowlist so it does
+    not skip PDF files before attempting upload.
+    """
+    source = _local_runner_source()
+
+    assert '"pdf": ("application/pdf", "pdf")' in source or (
+        '"pdf"' in source and "application/pdf" in source
+    ), (
+        "local_runner.py _VIEWABLE_CONTENT_TYPES must include a 'pdf' entry "
+        "matching ('application/pdf', 'pdf')"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 8/12: mixed-media descriptor retains all preview kinds
+# --------------------------------------------------------------------------- #
+
+
+def test_artifact_descriptor_retains_mixed_media_kinds():
+    """_artifact_descriptor emits image, video, AND pdf groups from a mixed manifest.
+
+    Finding 8 claim: 'After choosing a kind, the descriptor emits only that
+    kind's list for the main tile.' The fix must call add_preview_group for every
+    present kind regardless of the primary kind selection.
+    """
+    from app.strategic_context_package import _artifact_descriptor
+
+    previews = [
+        {"kind": "image", "url": "http://s/plot.png", "storage_uri": "gs://b/plot.png", "filename": "plot.png"},
+        {"kind": "video", "url": "http://s/rollout.mp4", "storage_uri": "gs://b/rollout.mp4", "filename": "rollout.mp4"},
+        {"kind": "pdf", "url": "http://s/report.pdf", "storage_uri": "gs://b/report.pdf", "filename": "report.pdf"},
+    ]
+    artifact = {
+        "id": "art-001",
+        "viewable_previews": previews,
+        "kind": "storage",
+        "label": "Mixed experiment",
+        "artifact_type": "compute_result",
+        "task_title": "Exp 1",
+        "task_status": "completed",
+        "created_at": None,
+    }
+    descriptor = _artifact_descriptor(artifact)
+    assert descriptor is not None
+
+    # Primary kind is image (first match wins), but video and pdf must also be present.
+    assert descriptor.get("kind") == "image"
+    assert descriptor.get("image") is not None, "image group missing from mixed descriptor"
+    assert isinstance(descriptor.get("images"), list) and len(descriptor["images"]) >= 1
+    assert descriptor.get("video") is not None, "video group missing from mixed descriptor"
+    assert isinstance(descriptor.get("videos"), list) and len(descriptor["videos"]) >= 1
+    assert descriptor.get("pdf") is not None, "pdf group missing from mixed descriptor"
+    assert isinstance(descriptor.get("pdfs"), list) and len(descriptor["pdfs"]) >= 1
+
+
+# --------------------------------------------------------------------------- #
+# Finding 9: late bundle arrival backfills artifact_id / result_reference
+# --------------------------------------------------------------------------- #
+
+
+def test_late_bundle_upload_triggers_artifact_linkage():
+    """runner.py backfills artifact_id when a bundle arrives after terminalization.
+
+    Finding 9 claim: 'A terminal runner job can currently retain a stored bundle
+    pointer without artifact_id or result_reference being backfilled.' The fix
+    calls _link_terminal_artifact for the first late upload on a terminal job.
+    """
+    source = _runner_router_source()
+
+    # The bundle-upload handler must call _link_terminal_artifact for terminal jobs.
+    assert "_link_terminal_artifact" in source, (
+        "runner.py must import and call _link_terminal_artifact to backfill "
+        "artifact_id / result_reference when a bundle arrives after terminalization"
+    )
+    # Must be conditional on the job being terminal AND not yet having an artifact.
+    assert "existing_artifact is None" in source or "runner_artifact is None" in source, (
+        "late bundle backfill must guard on the job not already having an artifact "
+        "(idempotent: only backfill the FIRST late upload)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 10: viewable-bearing artifacts sort first in evidence slice
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_loader_sorts_viewable_artifacts_first():
+    """Terminal artifact evidence sorts viewable-bearing rows before non-viewable.
+
+    Finding 10 claim: 'Terminal evidence queries the four newest meaningful
+    artifacts before resolving viewable previews.' The sort must put viewable
+    items first so the _ARTIFACT_EVIDENCE_LIMIT cap retains media-bearing rows.
+    """
+    source = _strategic_pkg_source()
+
+    # The sort key must place viewable_previews before non-viewable.
+    assert 'viewable_previews' in source, "strategic_context_package must reference viewable_previews"
+    # Look for the explicit sort that prioritises viewable items.
+    assert "artifact_items.sort(" in source, (
+        "load_strategic_context_evidence must call artifact_items.sort() to "
+        "prioritize viewable-bearing rows before the evidence-limit slice"
+    )
+    # Confirm the sort key checks for viewable_previews.
+    assert "i.get(\"viewable_previews\")" in source or "i.get('viewable_previews')" in source, (
+        "the evidence sort key must check for viewable_previews to prioritize media rows"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 11: live omission telemetry surfaced via polling_metadata
+# --------------------------------------------------------------------------- #
+
+
+def test_live_omissions_stamped_in_polling_metadata():
+    """The runner stamps viewable_live_omissions into polling_metadata on running reports.
+
+    Finding 11 claim: 'The runner logs local oversize/count-budget skips but does
+    not report them to the backend.' The fix stamps both counts via viewable_omissions
+    in the running heartbeat, which the server converts to viewable_live_omissions.
+    """
+    source = _local_runner_source()
+
+    assert "viewable_omissions" in source, (
+        "local_runner.py must include a viewable_omissions payload in the running "
+        "heartbeat so the server can stamp viewable_live_omissions"
+    )
+    assert "oversize_relpaths" in source, (
+        "local_runner.py must track oversize_relpaths and report them as omissions"
+    )
+    assert "count_cap_relpaths" in source, (
+        "local_runner.py must track count_cap_relpaths and report them as omissions"
+    )
+
+
+def test_admin_api_exposes_viewable_live_omissions():
+    """The admin compute-jobs API exposes viewable_live_omissions to the frontend.
+
+    Finding 11 claim: omission telemetry must flow from runner heartbeat through
+    polling_metadata to the API response so the UI can display it.
+    """
+    source = _admin_compute_jobs_source()
+
+    assert "viewable_live_omissions" in source or "viewable_artifacts_live_omissions" in source, (
+        "admin_compute_jobs.py must expose the runner's live omission counts "
+        "as viewable_artifacts_live_omissions in the compute-job polling response"
+    )

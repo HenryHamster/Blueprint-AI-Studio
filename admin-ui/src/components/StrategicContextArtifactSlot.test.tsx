@@ -626,16 +626,36 @@ describe('ArtifactViewablePreviews — inline artifact-evidence thumbnails', () 
     expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
   });
 
-  test('ignores non-image/video kinds and previews with neither url nor storage_uri', async () => {
+  test('ignores previews with neither url nor storage_uri; unsupported kinds self-hide the strip', async () => {
     await render(
       [
         { url: '', kind: 'image', filename: 'empty.png', storage_uri: null },
-        { url: 'https://storage.example.com/doc.pdf?sig=baked', kind: 'pdf', filename: 'doc.pdf', storage_uri: null },
+        { url: '', kind: 'pdf', filename: 'no-url.pdf', storage_uri: null },
       ],
       'proj-1',
     );
-    // Neither entry is renderable → the strip self-hides entirely.
+    // Both entries lack a usable URL and storage_uri → strip self-hides.
     expect(host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
+
+  test('renders a PDF preview as an open-in-new-tab button', async () => {
+    await render(
+      [
+        {
+          url: 'https://storage.example.com/report.pdf?sig=baked',
+          kind: 'pdf',
+          filename: 'report.pdf',
+          storage_uri: 'gs://bucket/proj/report.pdf',
+        },
+      ],
+      'proj-1',
+    );
+    const strip = host!.querySelector('[data-testid="strategic-artifact-viewable-previews"]');
+    expect(strip).not.toBeNull();
+    // PDF renders as a link/button, not as <img> or <video>.
+    expect(strip!.querySelector('[data-testid="strategic-context-pdf-open"]')).not.toBeNull();
+    expect(strip!.querySelector('img')).toBeNull();
+    expect(strip!.querySelector('video')).toBeNull();
   });
 
   test('falls back to the baked URL when no projectId is available', async () => {
