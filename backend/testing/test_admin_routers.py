@@ -20642,6 +20642,148 @@ class TestRequeueClearsBlockerMetadata:
         assert task.attempt_count == 0
 
 
+class TestManualRequeueGuidance:
+    @pytest.mark.asyncio
+    async def test_stale_fix_prompt_gets_agent_facing_operator_guidance(
+        self, db_session
+    ):
+        """Manual guidance lands in payload.prompt_suffix, not internal context."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        stale_prompt = "Renumber the migration to 0626."
+        task = Task(
+            project_id=project.id,
+            title="Fix stale migration advice",
+            payloads=[
+                {
+                    "pr_number": 15420,
+                    "branch": "fix/stale-migration",
+                    "type": "fix",
+                    "prompt": stale_prompt,
+                    "prompt_suffix": "Preserve the original review constraints.",
+                }
+            ],
+            status=TaskStatus.FAILED,
+            vm_instance_id="agent-vm-old",
+            context={
+                "_original_prompt_suffix": "This internal snapshot is not guidance."
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "requeue_prompt_suffix": (
+                    "Do not create 0626. Remove the duplicate migration instead."
+                ),
+            },
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.first_payload["prompt"] == stale_prompt
+        suffix = task.first_payload["prompt_suffix"]
+        assert suffix.startswith("Preserve the original review constraints.")
+        assert suffix.endswith(
+            "Do not create 0626. Remove the duplicate migration instead."
+        )
+        assert "## Operator retry guidance" in suffix
+        assert (
+            task.first_payload["operator_retry_guidance"]
+            == "Do not create 0626. Remove the duplicate migration instead."
+        )
+
+        # A later operator correction replaces the earlier block instead of
+        # stacking contradictory retry instructions.
+        await modify_task_apply(
+            task,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "requeue_prompt_suffix": "Delete only the semantic duplicate.",
+            },
+            BackgroundTasks(),
+            db_session,
+        )
+        await db_session.refresh(task)
+        suffix = task.first_payload["prompt_suffix"]
+        assert "Do not create 0626" not in suffix
+        assert suffix.count("## Operator retry guidance") == 1
+        assert suffix.endswith("Delete only the semantic duplicate.")
+
+    @pytest.mark.asyncio
+    async def test_internal_suffix_context_write_is_rejected_on_requeue(
+        self, db_session
+    ):
+        """The old silent no-op operator pattern fails with an actionable 400."""
+        from fastapi import BackgroundTasks, HTTPException
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Reject internal suffix mutation",
+            payloads=[{"type": "fix", "prompt": "stale"}],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await modify_task_apply(
+                task,
+                {
+                    "status": TaskStatus.QUEUED.value,
+                    "context": {"_original_prompt_suffix": "operator advice"},
+                },
+                BackgroundTasks(),
+                db_session,
+            )
+        assert exc_info.value.status_code == 400
+        assert "use requeue_prompt_suffix instead" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_guidance_without_queued_status_is_rejected(self, db_session):
+        """Guidance-only PATCHes cannot succeed while delivering nothing."""
+        from fastapi import BackgroundTasks, HTTPException
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Reject detached guidance",
+            payloads=[
+                {
+                    "type": "fix",
+                    "prompt": "stale",
+                    "pr_number": 15420,
+                    "branch": "fix/stale",
+                }
+            ],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await modify_task_apply(
+                task,
+                {"requeue_prompt_suffix": "new guidance"},
+                BackgroundTasks(),
+                db_session,
+            )
+        assert exc_info.value.status_code == 400
+
+
 class TestRequeueClearsStaleFailureVerdict:
     @pytest.mark.asyncio
     async def test_manual_requeue_pops_failure_class_and_category(self, db_session):

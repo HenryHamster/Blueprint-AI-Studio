@@ -36,6 +36,7 @@ from app.models import (
     _utcnow,
 )
 from app.payload_schemas import validate_internal_payload
+from app.retry_prompt import materialize_operator_retry_guidance
 from app.shared_state import (
     get_project_integration_branch,
     get_project_task_branch_namespace,
@@ -234,6 +235,11 @@ async def _apply_status_mutation(
 ) -> None:
     """Handle status-field mutations including cascade cancellation and requeue."""
     if "status" not in payload:
+        if "requeue_prompt_suffix" in payload:
+            raise HTTPException(
+                status_code=400,
+                detail="requeue_prompt_suffix is only valid with status=QUEUED",
+            )
         return
 
     try:
@@ -242,6 +248,49 @@ async def _apply_status_mutation(
         raise HTTPException(status_code=400, detail="Invalid status") from None
 
     admin_allowed = {TaskStatus.QUEUED, TaskStatus.CANCELLED}
+    raw_requeue_guidance = payload.get("requeue_prompt_suffix")
+    if (
+        new_status == TaskStatus.QUEUED
+        and isinstance(payload.get("context"), dict)
+        and "_original_prompt_suffix" in payload["context"]
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "_original_prompt_suffix is internal retry-dedup metadata and is not "
+                "delivered to agents; use requeue_prompt_suffix instead"
+            ),
+        )
+
+    requeue_guidance: str | None = None
+    if "requeue_prompt_suffix" in payload:
+        if new_status != TaskStatus.QUEUED:
+            raise HTTPException(
+                status_code=400,
+                detail="requeue_prompt_suffix is only valid with status=QUEUED",
+            )
+        if (
+            not isinstance(raw_requeue_guidance, str)
+            or not raw_requeue_guidance.strip()
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="requeue_prompt_suffix must be a non-empty string",
+            )
+        if not task.payloads or not isinstance(task.payloads[0], dict):
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot attach retry guidance: task has no agent payload",
+            )
+        requeue_guidance = raw_requeue_guidance.strip()
+        updated_payloads = [dict(item) for item in task.payloads]
+        materialize_operator_retry_guidance(updated_payloads[0], requeue_guidance)
+        task.payloads = [
+            validate_internal_payload(item, "admin:manual_requeue_guidance")
+            for item in updated_payloads
+        ]
+        changes["requeue_prompt_suffix"] = "materialized"
+
     if new_status not in admin_allowed and task.status in _TERMINAL_STATUSES:
         raise HTTPException(
             status_code=400,
@@ -354,7 +403,11 @@ async def _apply_status_mutation(
                 .all()
             )
         if children:
-            retried = await _requeue_parent_task(task, session)
+            retried = await _requeue_parent_task(
+                task,
+                session,
+                operator_retry_guidance=requeue_guidance,
+            )
             changes["status"] = TaskStatus.EVALUATING
             changes["retried_children"] = retried
         else:

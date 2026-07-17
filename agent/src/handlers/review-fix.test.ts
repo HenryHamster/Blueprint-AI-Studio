@@ -256,7 +256,38 @@ describe('review history feedback truncation — reviewer sees at least as much 
   });
 });
 
-// ── handleFix: operator steering reaches the fix prompt ─────────────────────
+// -- handleFix: operator retry guidance ---------------------------------------
+describe('handleFix - operator retry guidance', () => {
+  it('renders prompt_suffix after a stale fix prompt', async () => {
+    const stalePrompt = 'Renumber the migration to 0626.';
+    const guidance = 'Do not create 0626. Remove the duplicate migration instead.';
+    await handleFix(
+      'task-requeued-fix',
+      {
+        branch: 'feat/migration-fix',
+        base_branch: 'automain',
+        pr_number: 15420,
+        prompt: stalePrompt,
+        prompt_suffix: `## Operator retry guidance\n${guidance}`,
+      },
+      {
+        context: {
+          scope: 'small',
+          review_loop: { iteration: 1, review_history: [] },
+        },
+      },
+      'gh-token', 'owner', 'repo', null, statusRef(),
+    );
+
+    const prompt = capturedFixPrompt();
+    expect(prompt).toContain(stalePrompt);
+    expect(prompt).toContain('Additional instructions:');
+    expect(prompt).toContain(guidance);
+    expect(prompt.lastIndexOf(guidance)).toBeGreaterThan(prompt.lastIndexOf(stalePrompt));
+  });
+});
+// -- handleFix: operator steering reaches the fix prompt ----------------------
+
 describe('handleFix — operator steering (strategic_intent)', () => {
   const histWithStructured = [{
     iteration: 1,
