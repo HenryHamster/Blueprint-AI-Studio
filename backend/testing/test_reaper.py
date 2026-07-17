@@ -1095,15 +1095,16 @@ async def test_in_progress_stale_tool_use_but_fresh_attempt_not_reaped(
 
 
 @pytest.mark.asyncio
-async def test_in_progress_no_tool_use_codex_provider_not_reaped(
+async def test_in_progress_no_tool_use_non_anthropic_provider_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Codex (openai) tasks with last_tool_use_at NULL must NOT be reaped.
+    """Zero-progress non-Anthropic tasks must be reaped on the progress-stale clock.
 
-    The wrapper's outputMode='text' for Codex never invokes recordToolUse,
-    so last_tool_use_at IS NULL for every Codex task by design — even when
-    Codex is calling apply_patch happily. Pre-fix this watchdog reaped all
-    healthy Codex work after the progress-stale cutoff. Pin the gate.
+    The agent wrapper now calls recordToolUse('model_output', ...) on every
+    non-empty stdout chunk in text-mode (Gemini/Codex), so last_tool_use_at IS
+    populated for any genuinely-progressing task.  A task that has last_tool_use_at
+    NULL after the progress-stale cutoff has truly produced zero output and must be
+    reaped just like a stalled Anthropic task.
     """
     project = await _make_project(reaper_db)
     t = Task(
@@ -1123,7 +1124,7 @@ async def test_in_progress_no_tool_use_codex_provider_not_reaped(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert t.status == TaskStatus.IN_PROGRESS
+    assert t.status == TaskStatus.TIMED_OUT
 
 
 @pytest.mark.asyncio
@@ -7373,21 +7374,22 @@ def test_classify_orphan_open_pr_uses_90s_cutoff():
     assert _classify_orphan(t, now, has_open_pr=True) is True
 
 
-def test_classify_orphan_stalled_but_heartbeating_anthropic_no_tool_use():
+def test_classify_orphan_stalled_but_heartbeating_no_tool_use_all_providers():
     now = _utcnow()
     # Fresh heartbeat, zero tool calls ever, started 10min ago (past 8min small
-    # progress cutoff), anthropic provider → agent_stalled orphan.
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(seconds=30),
-        last_tool_use_at=None,
-        started_at=now - timedelta(minutes=10),
-        context={"llm_provider": "anthropic"},
-    )
-    assert _classify_orphan(t, now, has_open_pr=False) is True
-    # Same task on a non-anthropic provider is NOT reaped (Codex text-mode gate).
-    t.context = {"llm_provider": "codex"}
-    assert _classify_orphan(t, now, has_open_pr=False) is False
+    # progress cutoff). All providers now emit recordToolUse on progress, so
+    # last_tool_use_at=None means genuinely zero-progress for all → reap.
+    for provider in ("anthropic", "openai", "gemini", "zai", "deepseek", None):
+        t = _FakeClassifyTask(
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=now - timedelta(seconds=30),
+            last_tool_use_at=None,
+            started_at=now - timedelta(minutes=10),
+            context={"llm_provider": provider} if provider else {},
+        )
+        assert _classify_orphan(t, now, has_open_pr=False) is True, (
+            f"Expected zero-progress reap for provider={provider!r}"
+        )
 
 
 def test_classify_orphan_cross_attempt_stale_tool_guard():
@@ -8193,17 +8195,17 @@ def test_classify_orphan_stale_offrow_tool_use_still_reaps_genuine_stall():
 
 
 def test_classify_orphan_fresh_offrow_tool_use_suppresses_zero_toolcall_stall():
-    """Fix 3b also covers the zero-tool-calls-ever branch (anthropic gate): on-row
-    last_tool_use_at is None and started_at is past the progress cutoff, but a
-    fresh OFF-ROW tool use means the agent DID record a tool call the lock-starved
-    heartbeat failed to land on the task row — it is progressing, don't reap."""
+    """Fix 3b: on-row last_tool_use_at is None and started_at is past the
+    progress cutoff, but a fresh OFF-ROW tool use means the agent DID record a
+    tool call the lock-starved heartbeat failed to land on the task row — it is
+    progressing, don't reap. Applies to all providers."""
     now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),
         last_tool_use_at=None,  # on-row: zero tool calls ever
         started_at=now - timedelta(minutes=10),  # past 8min small progress cutoff
-        context={"llm_provider": "anthropic"},
+        context={"llm_provider": "gemini"},
         vm_instance_id="vm-zero-tool",
     )
     # Without the off-row signal → reap (existing zero-tool anthropic stall).
@@ -8495,10 +8497,10 @@ def test_task_scoped_row_present_with_null_tool_stamp_does_not_fall_back():
     )
 
 
-def test_zero_tool_anthropic_stall_branch_is_also_task_scoped():
-    """The second stall branch (fresh heartbeat, NO tool use ever, anthropic) must
+def test_zero_tool_stall_branch_is_also_task_scoped():
+    """The zero-tool-use stall branch (fresh heartbeat, NO tool use ever) must
     consult the task-scoped row too — otherwise a sibling's tool calls still mask a
-    never-progressed hung anthropic agent."""
+    never-progressed hung agent on a shared runner."""
     now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,

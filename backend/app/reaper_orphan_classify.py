@@ -594,19 +594,14 @@ def _classify_orphan(
             and task.last_tool_use_at is None
             and task.started_at
             and task.started_at < _progress_stale_cutoff(task, now)
-            and (task.context or {}).get("llm_provider") == "anthropic"
         ):
             # Stalled-but-heartbeating with zero tool calls ever.
-            # Provider-gated to anthropic only because the agent
-            # wrapper's outputMode='text' path (Codex/Gemini at
-            # agent/src/index.ts:3061,3119) never calls
-            # recordToolUse — only the claude-stream-json parser
-            # does. So last_tool_use_at IS NULL for every
-            # Codex/Gemini task by design, regardless of whether
-            # tools were called. Without this gate the watchdog
-            # reaps healthy non-anthropic work after 8 min.
-            # TODO: parse Codex --json events / Gemini events
-            # to populate tool_trace, then drop the gate.
+            # All providers now populate tool_trace via recordToolUse:
+            # claude-stream-json fires on tool_use blocks; codex-jsonl
+            # fires on item events; text-mode (Gemini) fires on every
+            # non-empty stdout chunk as 'model_output'. So
+            # last_tool_use_at is NULL only for genuinely zero-progress
+            # agents, regardless of provider.
             #
             # Fix 3b: even with on-row last_tool_use_at NULL, an off-row
             # ``vmcontact.last_tool_use_at`` within the progress cutoff means
