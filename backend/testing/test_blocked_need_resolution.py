@@ -11,7 +11,7 @@ an in-memory SQLite DB to exercise the sweep's project-scanning logic.
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2929,7 +2929,7 @@ def _make_sweep_ctx(db: AsyncSession):
 
     return SweepContext(
         session=db,
-        now=datetime.utcnow(),
+        now=datetime.now(timezone.utc),
         mode="observe",
         max_projects=10,
         sample_limit=200,

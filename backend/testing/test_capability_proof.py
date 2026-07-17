@@ -1705,7 +1705,15 @@ class TestCommissionProofEarnLoop:
     async def test_already_proven_cap_excluded(self):
         """A demanded capability that is already proven is excluded from earning."""
         project = MagicMock()
-        project.capability_proof_records = {}
+        project.capability_proof_records = {
+            "proven-cap": [
+                {
+                    "task_id": "platform:test:proven-cap",
+                    "proof_kind": "named_test",
+                    "proof_ref": "t1",
+                }
+            ]
+        }
         project.problem_model = {"capabilities": [
             {"name": "proven-cap", "status": "working",
              "evidence_refs": [{"proven": True, "ref": "t1", "source_id": "s1"}]},
@@ -2078,7 +2086,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "source": _exemption_source()},
         ]
     }
-    project.capability_proof_records = {}
+    project.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     async def _verify(p: str) -> bool:
         return True
@@ -2119,7 +2127,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "backing_paths": ["backend/app/main.py"]},
         ]
     }
-    project2.capability_proof_records = {}
+    project2.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     with patch("app.capability_proof.flag_modified"):
         result2 = asyncio.get_event_loop().run_until_complete(
@@ -2467,7 +2475,15 @@ async def test_earn_loop_demand_driven_intersection_and_proof():
     - the return summary reports earned, no_backing_paths, still_unproven correctly
     """
     project = MagicMock()
-    project.capability_proof_records = {}
+    project.capability_proof_records = {
+        "demanded-proven": [
+            {
+                "task_id": "platform:test:demanded-proven",
+                "proof_kind": "named_test",
+                "proof_ref": "test_demanded_proven",
+            }
+        ]
+    }
     problem_model = {
         "capabilities": [
             # demanded + unproven working + has backing_paths → WILL be earned
@@ -4740,13 +4756,13 @@ class TestReleaseQualifierAliases:
         assert "forged-cap" in detail["uncorroborated"], (
             "a forged name outside the alias map must not be corroborated"
         )
-        # real-cap and old-y are unproven in the base map (no evidence_refs) and
-        # NOT proven in the release gate (which does NOT fold ledger upgrades like
-        # consumer_gate_proof_status does), so they are in the unproven set only —
-        # they never reach the corroborated/uncorroborated distinction.
-        assert "real-cap" in detail["unproven"]
-        assert "old-y" in detail["unproven"]
-
+        # The release seam now folds platform-ledger upgrades just like the
+        # consumer seams. The genuine consolidation therefore proves real-cap and
+        # its forwarded alias, while the unrelated forged name remains blocked.
+        assert "real-cap" in detail["corroborated"]
+        assert "old-y" in detail["corroborated"]
+        assert "real-cap" not in detail["unproven"]
+        assert "old-y" not in detail["unproven"]
 
 class TestAuthorizedExemptionLedgerCarveOut:
     """Findings #2 + #9: WHO may authorize the one bypass of the machine-proof

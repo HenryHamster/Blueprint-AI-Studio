@@ -997,7 +997,7 @@ def _ledger_proof_status_for_names(
         {
             "kind": entry.get("proof_kind"),
             "proven": True,
-            "recorded_at": entry.get("proved_at"),
+            "recorded_at": entry.get("proved_at") or entry.get("recorded_at"),
         }
         for name in names
         for entry in _ledger_machine_proof_entries(proof_records, name)
@@ -1042,7 +1042,7 @@ def _ledger_proof_status(
         {
             "kind": e.get("proof_kind"),
             "proven": True,
-            "recorded_at": e.get("proved_at"),
+            "recorded_at": e.get("proved_at") or e.get("recorded_at"),
         }
         for e in _ledger_machine_proof_entries(proof_records, cap_name)
     ]
@@ -1215,7 +1215,7 @@ def fold_ledger_proof_upgrades(
             {
                 "kind": e.get("proof_kind"),
                 "proven": True,
-                "recorded_at": e.get("proved_at"),
+                "recorded_at": e.get("proved_at") or e.get("recorded_at"),
             }
             for e in _ledger_machine_proof_entries(proof_records, ledger_key)
         ]

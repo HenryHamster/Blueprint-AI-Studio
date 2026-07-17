@@ -27,6 +27,7 @@ from app.capability_registry import (
     compose_capability_markers,
     exempt_capability_names,
     normalize_capability_name,
+    working_capability_proof_status,
 )
 from app.evidence_primitive import (
     KNOWN_PROOF_KINDS,
@@ -2135,6 +2136,69 @@ async def commission_proof_earn_loop(
         getattr(project, "capability_proof_records", None),
         now=now,
     )
+    # A still-fresh executed proof can clear the ordinary proof gate while being
+    # bound to an older revision. Keep such demanded capabilities in the earn
+    # loop when execution trials are enabled so the cadence guard below can
+    # re-enroll them after HEAD moves (or the proof ages out). Without this
+    # revision-aware supplement, the initial gate-status intersection filters
+    # them out before _maybe_enroll_proof_trial can compare commit_sha to HEAD.
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _trials_enabled = bool(
+            session is not None
+            and (_rc or {}).get("capability_proof_execution_trials_enabled", False)
+        )
+    except Exception:  # noqa: BLE001 - optional trial path must degrade safely
+        _trials_enabled = False
+
+    if _trials_enabled:
+        _resolve_sha = read_head_sha or _default_read_head_sha
+        try:
+            _current_head_sha = await _resolve_sha()
+        except Exception:  # noqa: BLE001 - indeterminate HEAD permits re-verification
+            _current_head_sha = None
+
+        _records = getattr(project, "capability_proof_records", None)
+        _already = {
+            normalize_capability_name(entry.get("ref"))
+            for entry in demanded_unproven
+            if isinstance(entry, dict)
+        }
+        _working_names = set(
+            working_capability_proof_status(
+                problem_model, now=now, proof_records=_records
+            )
+        )
+        for _demand in (demand_result.get("demands") or []):
+            if not isinstance(_demand, dict) or _demand.get("kind") != "capability":
+                continue
+            _cap = normalize_capability_name(_demand.get("ref"))
+            if not _cap or _cap in _already or _cap not in _working_names:
+                continue
+            _entries = _records.get(_cap) if isinstance(_records, dict) else None
+            _has_revision_bound_proof = any(
+                isinstance(_entry, dict)
+                and (
+                    _entry.get("task_id") == f"named_test_exec:{_cap}"
+                    or (
+                        _entry.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+                        and isinstance(_entry.get("commit_sha"), str)
+                        and bool(_entry.get("commit_sha"))
+                    )
+                )
+                for _entry in (_entries or [])
+            )
+            if (
+                _has_revision_bound_proof
+                and not _fresh_executed_proof_covers_head(
+                    project, _cap, _current_head_sha, now=now
+                )
+            ):
+                _candidate = dict(_demand)
+                _candidate["proof_status"] = "revision_stale"
+                demanded_unproven.append(_candidate)
+                _already.add(_cap)
     if not demanded_unproven:
         return {
             "total_demanded_unproven": 0,
