@@ -14556,6 +14556,44 @@ async def test_migration_apply_gate_retries_on_defer_and_succeeds(db_session, mo
 
 
 @pytest.mark.asyncio
+async def test_migration_apply_timeout_defer_is_not_blindly_retried(
+    db_session, mocker
+):
+    """Fresh credentials cannot repair a timed-out local gate stage."""
+
+    _project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+    gate = mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        return_value=(
+            "defer",
+            "migration_apply_replay_apply_timeout: exceeded 180s wall-clock budget",
+        ),
+    )
+    resolve = mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("token", "acme", "widget"),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_async_engine",
+        return_value=object(),
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "defer"
+    assert detail.startswith("migration_apply_replay_apply_timeout:")
+    assert gate.await_count == 1
+    assert resolve.await_count == 1
+    assert rq._migration_apply_infra_error(detail).startswith(
+        "migration_apply_replay_apply_timeout:"
+    )
+
+@pytest.mark.asyncio
 async def test_migration_apply_gate_retries_on_defer_both_fail(db_session, mocker):
     """When both the first and the retry call to run_migration_apply_gate return
     defer, the final verdict is defer — fails closed, no infinite retry."""

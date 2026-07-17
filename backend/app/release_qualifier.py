@@ -2806,6 +2806,7 @@ async def _resolve_migration_identity_at_finalize(
         )
         if verdict != "defer":
             return verdict, detail
+
         # First attempt deferred — retry once with freshly-resolved credentials.
         # _resolve_github_with_session returns a fresh token if the cache was
         # invalidated by a 401 during the first attempt.
@@ -2844,6 +2845,27 @@ async def _resolve_migration_identity_at_finalize(
             exc,
         )
         return ("defer", f"migration-identity gate error: {exc}")
+
+
+def _migration_apply_timeout_detail(detail: str | None) -> bool:
+    """Return whether detail starts with one stable migration watchdog code."""
+
+    if not detail:
+        return False
+    code = detail.partition(":")[0].strip()
+    return code.startswith("migration_apply_") and code.endswith("_timeout")
+
+
+def _migration_apply_infra_error(detail: str | None) -> str:
+    """Preserve stable timeout codes; retain the legacy code for other defers."""
+
+    if _migration_apply_timeout_detail(detail):
+        return str(detail)
+    return (
+        f"migration_apply_check_unavailable: {detail}"
+        if detail
+        else "migration_apply_check_unavailable"
+    )
 
 
 async def _resolve_migration_apply_at_finalize(
@@ -2921,6 +2943,11 @@ async def _resolve_migration_apply_at_finalize(
             detail or "applies cleanly",
         )
         if verdict != "defer":
+            return verdict, detail
+        if _migration_apply_timeout_detail(detail):
+            # Fresh credentials cannot repair a wedged import, lock, or database
+            # stage. The next qualification cycle may retry; this finalize must
+            # not blindly double the watchdog budget.
             return verdict, detail
         # First attempt deferred — retry once with freshly-resolved credentials.
         logger.info(
@@ -5119,9 +5146,7 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            f"migration_apply_check_unavailable: {apply_detail}"
-            if apply_detail
-            else "migration_apply_check_unavailable",
+            _migration_apply_infra_error(apply_detail),
         )
     migration_apply_blocked = apply_verdict == "block"
 

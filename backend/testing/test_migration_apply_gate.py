@@ -467,52 +467,361 @@ async def test_candidate_sources_read_from_tarball_no_contents_calls(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_concurrent_applies_are_serialized():
-    """Alembic's runtime is PROCESS-GLOBAL — the ``op``/``context`` proxies are
-    module-level singletons rebound on every ``EnvironmentContext`` enter — so two
-    in-process migration applies running concurrently corrupt each other. That is
-    the flaky ``KeyError: 'config'`` that false-failed a release qualification to
-    ``infra_failure`` on 2026-06-16: the qualifier runs this gate PRE-LOCK, so two
-    overlapping finalize attempts genuinely invoke it at the same time.
+async def test_concurrent_applies_are_serialized(monkeypatch):
+    """The retained capacity lock admits only one migration subprocess at a time."""
 
-    ``_apply_candidate_migrations`` must therefore serialize the apply so no two
-    are ever live at once. The fake connection models the real apply, whose
-    greenlet-bridged DDL yields to the event loop at each statement — the exact
-    window a concurrent apply would interleave into and clobber the global proxy.
-    Without the lock, ``active`` would exceed 1."""
     import app.migration_apply_gate as gate_mod
 
     state = {"active": 0, "max": 0}
+    first_entered = asyncio.Event()
+    release = asyncio.Event()
 
-    class _FakeConn:
-        async def run_sync(self, _fn):
-            state["active"] += 1
-            state["max"] = max(state["max"], state["active"])
-            await asyncio.sleep(0.02)  # yield: a concurrent apply could interleave
-            state["active"] -= 1
+    async def _fake_runner(_engine, _script_location, *, timeout_code):
+        del timeout_code
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        first_entered.set()
+        await release.wait()
+        state["active"] -= 1
 
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _fake_runner
+    )
 
     class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
+        pass
 
-    sources = {"0001_init.py": "revision = '0001'\ndown_revision = None\n"}
-    await asyncio.gather(
-        *(
+    sources = {
+        "0001_init.py": """revision = '0001'
+down_revision = None
+"""
+    }
+    tasks = [
+        asyncio.create_task(
             gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
-            for _ in range(3)
+        )
+        for _ in range(3)
+    ]
+    await first_entered.wait()
+    await asyncio.sleep(0)
+    assert state["max"] == 1
+    release.set()
+    await asyncio.gather(*tasks)
+    assert state["max"] == 1
+
+
+class _HangingProcess:
+    def __init__(self):
+        self.pid = 424242
+        self.returncode = None
+        self.entered = asyncio.Event()
+        self.communicate_calls = 0
+        self.killed = False
+
+    async def communicate(self, input=None):
+        del input
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.entered.set()
+            await asyncio.Event().wait()
+        return b"", b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_timeout_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(gate_mod, "_CANDIDATE_METADATA_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=b"archive"),
+    )
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+
+    with pytest.raises(
+        gate_mod._MigrationApplyTimeout,
+        match="migration_apply_candidate_metadata_timeout",
+    ):
+        await gate_mod._build_candidate_required_metadata_from_snapshot(
+            "token", "owner", "repo", "sha", None
+        )
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+    assert proc.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_subprocess_happy_path(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    archive = _make_tar_bytes(
+        [
+            ("repo/backend/app/__init__.py", b""),
+            (
+                "repo/backend/app/models.py",
+                b"""from sqlmodel import Field, SQLModel
+class Widget(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+""",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=archive),
+    )
+
+    metadata = await gate_mod._build_candidate_required_metadata_from_snapshot(
+        "token", "owner", "repo", "sha", None
+    )
+
+    assert "widget" in metadata.tables
+    assert list(metadata.tables["widget"].columns.keys()) == ["id"]
+
+@pytest.mark.asyncio
+async def test_subprocess_cancellation_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+    task = asyncio.create_task(
+        gate_mod._communicate_bounded(
+            proc,
+            timeout_seconds=60,
+            timeout_code="migration_apply_test_timeout",
         )
     )
+    await proc.entered.wait()
+    task.cancel()
 
-    assert state["max"] == 1, (
-        f"concurrent in-process Alembic applies observed (max={state['max']}); the "
-        "apply must be serialized to protect Alembic's process-global op/context "
-        "proxies"
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_create_timeout_still_attempts_drop(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    timeout = gate_mod._MigrationApplyTimeout(
+        "migration_apply_scratch_provision_timeout", 0.01
+    )
+    monkeypatch.setattr(
+        gate_mod, "_create_database", AsyncMock(side_effect=timeout)
+    )
+    drop = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_drop_database", drop)
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            raise AssertionError("unreachable")
+
+    drop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_cleanup_finishes_before_cancellation_propagates(
+    monkeypatch,
+):
+    import app.migration_apply_gate as gate_mod
+
+    body_entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    monkeypatch.setattr(gate_mod, "_create_database", AsyncMock())
+    monkeypatch.setattr(
+        gate_mod, "create_async_engine", lambda *_args, **_kwargs: object()
     )
 
+    async def _cleanup(_engine, _base_url, _name):
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(gate_mod, "_cleanup_ephemeral_database", _cleanup)
+
+    async def _use_database():
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            body_entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(_use_database())
+    await body_entered.wait()
+    task.cancel()
+    await cleanup_started.wait()
+    assert not task.done()
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanup_finished.is_set()
+
+@pytest.mark.asyncio
+async def test_timeout_is_not_retried_internally():
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _timeout():
+        nonlocal calls
+        calls += 1
+        raise gate_mod._MigrationApplyTimeout(
+            "migration_apply_replay_apply_timeout", 0.01
+        )
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._with_transient_retry(_timeout, label="test timeout")
+
+    assert calls == 1
+
+@pytest.mark.asyncio
+async def test_apply_timeout_releases_capacity_lock(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _runner(_engine, _script_location, *, timeout_code):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise gate_mod._MigrationApplyTimeout(timeout_code, 0.01)
+
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _runner
+    )
+
+    class _FakeEngine:
+        pass
+
+    sources = {"0001_init.py": "revision = '0001'"}
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+
+    # A timeout must release the capacity lock before temp-file cleanup. If it
+    # did not, this second call would wait for the 240-second lock watchdog.
+    await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_receives_only_scratch_database_url(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setenv("BLUEPRINT_TEST_SECRET", "must-not-leak")
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "must-not-leak-either")
+    observed = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 123
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://scratch_user:scratch_secret@"
+            "scratch-host:5432/mig_apply_gate_test"
+        )
+
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeEngine(),
+        "candidate-versions",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+    env = observed["kwargs"]["env"]
+    expected = _FakeEngine.url.render_as_string(hide_password=False)
+    assert env["DATABASE_URL"] == expected
+    assert env["MIGRATION_APPLY_DATABASE_URL"] == expected
+    assert "prod" not in env["DATABASE_URL"]
+    assert "BLUEPRINT_TEST_SECRET" not in env
+    assert "GITHUB_PAT_ENCRYPTION_KEY" not in env
+    assert observed["kwargs"]["start_new_session"] == (os.name == "posix")
+
+
+def test_subprocess_diagnostic_is_bounded_and_redacted():
+    import app.migration_apply_gate as gate_mod
+
+    password = "super-secret-password"
+    token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    stderr = (
+        b"x" * (gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100)
+        + f" postgresql+asyncpg://user:{password}@host/db bearer {token}".encode()
+    )
+
+    detail = gate_mod._bounded_subprocess_detail(
+        stderr, b"", 1, sensitive_values=(password,)
+    )
+
+    assert password not in detail
+    assert token not in detail
+    assert "<redacted>" in detail
+    assert "<redacted-token>" in detail
+    assert detail.startswith("[truncated to last ")
+    assert len(detail.encode()) < gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100
+
+
+@pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_legacy_tar_fallback_rejects_link_escape(
+    monkeypatch, member_type
+):
+    import app.migration_apply_gate as gate_mod
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        link = tarfile.TarInfo("repo/link")
+        link.type = member_type
+        link.linkname = "../../outside"
+        tar.addfile(link)
+
+    monkeypatch.setattr(gate_mod.sys, "version_info", (3, 11, 3))
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:") as tar:
+            with pytest.raises(ValueError, match="link member"):
+                gate_mod._safe_tar_extractall(tar, tmp)
 
 # --- Fail-safe cases that need no scratch DB (run everywhere) ---------------
 
