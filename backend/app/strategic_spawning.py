@@ -4100,7 +4100,6 @@ async def _spawn_design_doc_update(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
-    project_id = project.id
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -4298,16 +4297,19 @@ async def _spawn_design_doc_update(
         coalesce_shadow_resident_turn,
     )
 
+    # Snapshot IDs before the try block so they remain accessible after rollback.
+    _project_id = project.id
+    _new_task_id = new_task.id
     try:
         async with session.begin_nested():
             await coalesce_shadow_resident_turn(
                 session,
-                project_id=project.id,
+                project_id=_project_id,
                 lane="background",
                 trigger_kind="project_change",
                 project_change_cursor={
                     "strategic_cycle_id": str(cycle_id),
-                    "phase1_task_id": str(new_task.id),
+                    "phase1_task_id": str(_new_task_id),
                 },
             )
     except ShadowResidentOwnershipError:
@@ -4315,7 +4317,7 @@ async def _spawn_design_doc_update(
         logger.warning(
             "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
             "(project=%s cycle=%s)",
-            project_id,
+            _project_id,
             cycle_id,
         )
         return False
@@ -4323,9 +4325,9 @@ async def _spawn_design_doc_update(
         logger.exception(
             "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
             "(cycle=%s task=%s)",
-            project.id,
+            _project_id,
             cycle_id,
-            new_task.id,
+            _new_task_id,
         )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.

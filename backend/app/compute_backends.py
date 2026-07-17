@@ -100,6 +100,9 @@ _ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
 _HEARTBEAT_BODY_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "heartbeat_body.py").read_bytes()
 ).decode("ascii")
+_VIEWABLE_WATCH_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "viewable_watch.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +154,7 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
                 member.name,
             )
             continue
-        tar.extract(member, path=dest_dir)
+        tar.extract(member, path=dest_dir, filter="data")
         extracted += 1
     return extracted
 
@@ -3092,7 +3095,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -3133,7 +3136,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 setup_step_failed "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi"
@@ -3272,7 +3275,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 resume_hydration_failed "
             f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -3352,6 +3355,7 @@ TTL_PID=$!
 # `set -u` script can reference "$_NP_WATCHDOG_PID" in the setup-failure kill
 # paths (clone/setup/pull) that run before the watchdog is armed.
 _NP_WATCHDOG_PID=
+_VIEWABLE_PID=
 echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
@@ -3376,6 +3380,14 @@ _compute_heartbeat
   done
 ) &
 _HEARTBEAT_PID=$!
+echo '{_VIEWABLE_WATCH_B64}' | base64 -d > /tmp/blueprint_viewable_watch.py
+python3 /tmp/blueprint_viewable_watch.py \
+  {artifact_dir} \
+  "$_COMPUTE_ORCHESTRATOR_URL" \
+  "$_COMPUTE_JOB_ID" \
+  "$_COMPUTE_HB_TOKEN" \
+  >/dev/null 2>&1 &
+_VIEWABLE_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
@@ -3460,7 +3472,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """

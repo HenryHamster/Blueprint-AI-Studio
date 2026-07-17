@@ -3145,6 +3145,68 @@ def test_gcp_startup_script_emits_valid_env_keys():
     assert "export SEED2=42" in script
 
 
+def test_gcp_startup_script_decodes_viewable_watch_script():
+    """The GCP startup script decodes the viewable_watch.py base64 blob into /tmp."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The base64-encoded viewable_watch.py is decoded to /tmp/blueprint_viewable_watch.py
+    assert "blueprint_viewable_watch.py" in script
+    assert "base64 -d > /tmp/blueprint_viewable_watch.py" in script
+
+
+def test_gcp_startup_script_launches_viewable_watcher_background():
+    """The viewable watcher runs as a background process with the expected args."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The watcher is launched as a background process (trailing &).
+    assert "blueprint_viewable_watch.py" in script
+    assert "&" in script[script.index("blueprint_viewable_watch.py"):]
+
+
+def test_gcp_startup_script_kills_viewable_watcher_on_cleanup():
+    """The viewable watcher PID is included in the main cleanup kill command."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The final kill command must include _VIEWABLE_PID alongside the others.
+    assert '$_VIEWABLE_PID' in script
+    # The PID must be pre-declared before the setup-failure branches.
+    assert '_VIEWABLE_PID=' in script
+
+
 @pytest.mark.parametrize(
     "bad_key",
     [
@@ -10771,7 +10833,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project.id,
         title="compute_experiment: lock release",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -21190,6 +21252,641 @@ async def _job_files(db_session, job_id) -> list[ComputeJobFile]:
     )
 
 
+# ── GCP VM viewable upload endpoint ──────────────────────────────────────
+
+
+def _build_viewable_multipart_body(
+    file_data: bytes, filename: str
+) -> tuple[bytes, str]:
+    """Build a ``multipart/form-data`` body matching viewable_watch.py's format."""
+    boundary = b"----TestBoundaryViewable"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="file"; filename="'
+        + filename.encode("utf-8")
+        + b'"',
+        b"Content-Type: application/octet-stream",
+        b"",
+        file_data,
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="filename"',
+        b"",
+        filename.encode("utf-8"),
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    return body, ct
+
+
+async def _fake_viewable_upload(job_id, basename, data, content_type, *, calls):
+    """Async fake for ``storage.upload_compute_job_viewable_file``."""
+    calls.append({"basename": basename, "size": len(data)})
+    return (
+        f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_heartbeat_stamps_live_viewable_file(
+    client, db_session, monkeypatch
+):
+    """Acceptance test: a GCP VM uploads a viewable file mid-run and it is
+    persisted in polling_metadata with ``live=True``, reachable before the
+    job reaches a terminal state.
+
+    This is the named acceptance evidence for the 'push mid-run viewables
+    from GCP-VM jobs' task.  It exercises the full endpoint seam: auth via
+    per-job HMAC secret, multipart body parsing, kind classification,
+    per-kind byte caps, GCS upload integration, polling_metadata manifest
+    update, and ``ComputeJobFile`` row creation — all without requiring a
+    real GCS bucket.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    upload_calls: list = []
+    monkeypatch.setattr(
+        storage,
+        "upload_compute_job_viewable_file",
+        lambda j, b, d, ct: _fake_viewable_upload(j, b, d, ct, calls=upload_calls),
+    )
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev-001")
+
+    project = Project(name="GCP VM Viewable Acc", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    body, content_type = _build_viewable_multipart_body(png_data, "reward.png")
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+        },
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200, got {resp.status_code}: {resp.text}"
+    )
+
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["total_viewable_files"] == 1
+    entry = data["entry"]
+    assert entry["filename"] == "reward.png"
+    assert entry["kind"] == "image"
+    assert entry["content_type"] == "image/png"
+    assert entry["live"] is True
+    assert entry["size_bytes"] == len(png_data)
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    viewable_files = meta.get("viewable_files") or []
+    assert len(viewable_files) == 1
+    assert viewable_files[0]["filename"] == "reward.png"
+    assert viewable_files[0]["live"] is True
+    assert viewable_files[0]["kind"] == "image"
+
+    assert len(upload_calls) == 1
+    assert upload_calls[0]["basename"] == "reward.png"
+
+    # A ComputeJobFile row was created
+    rows = await _job_files(db_session, job.id)
+    assert len(rows) == 1
+    assert rows[0].safe_relpath == "reward.png"
+    assert rows[0].media_type == "image"
+    assert rows[0].content_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_bad_auth(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with a wrong bearer token returns 403."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable Auth", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={"Authorization": "Bearer wrong-token", "Content-Type": ct},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_terminal_job(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable for a terminal job returns 409."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Terminal", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_unsupported_type(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with an unsupported extension (.svg) returns 422."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Type", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"<svg></svg>", "diagram.svg")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_oversized(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with a file over the per-kind byte cap returns 413."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Oversized", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    oversized = b"\x89PNG\r\n\x1a\n" + b"\x00" * (9 * 1024 * 1024)
+    body, ct = _build_viewable_multipart_body(oversized, "huge.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_cap_enforced(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable when the 25-file cap is reached returns 429."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    upload_count = 0
+    async def _fake_up(job_id, basename, data, ct):
+        nonlocal upload_count
+        upload_count += 1
+        return f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_up)
+
+    project = Project(name="GCP Viewable Cap", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    preload = []
+    for i in range(25):
+        preload.append({
+            "filename": f"file{i:02d}.png",
+            "storage_uri": (
+                f"gs://test-bucket/compute-jobs/{job.id}"
+                f"/artifacts/viewable/file{i:02d}.png"
+            ),
+            "content_type": "image/png",
+            "size_bytes": 100,
+            "kind": "image",
+            "revision": f"r{i}",
+            "live": True,
+        })
+    job.polling_metadata = {"viewable_files": preload}
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "new_file.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_refreshes_existing(
+    client, db_session, monkeypatch
+):
+    """Re-uploading the same relpath updates the existing entry (no cap error)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    upload_count = 0
+    async def _fake_up(job_id, basename, data, ct):
+        nonlocal upload_count
+        upload_count += 1
+        return f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_up)
+
+    project = Project(name="GCP Viewable Refresh", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    body, ct = _build_viewable_multipart_body(png_data, "reward.png")
+    resp1 = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["total_viewable_files"] == 1
+
+    newer_data = b"\x89PNG\r\n\x1a\n" + b"\xff" * 200
+    body2, ct2 = _build_viewable_multipart_body(newer_data, "reward.png")
+    resp2 = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body2,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct2,
+        },
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["total_viewable_files"] == 1
+    assert data2["entry"]["size_bytes"] == len(newer_data)
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    files = meta.get("viewable_files") or []
+    assert len(files) == 1
+    assert files[0]["size_bytes"] == len(newer_data)
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_with_subdir_relpath(
+    client, db_session, monkeypatch
+):
+    """A file from a subdirectory (arm1/reward.png) is stored with flattened name."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    upload_calls: list = []
+    monkeypatch.setattr(
+        storage,
+        "upload_compute_job_viewable_file",
+        lambda j, b, d, ct: _fake_viewable_upload(j, b, d, ct, calls=upload_calls),
+    )
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    project = Project(name="GCP Viewable Subdir", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    body, ct = _build_viewable_multipart_body(png_data, "arm1/reward.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["entry"]["filename"] == "arm1__reward.png"
+    assert data["total_viewable_files"] == 1
+    assert len(upload_calls) == 1
+    assert upload_calls[0]["basename"] == "arm1__reward.png"
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_missing_filename_field(
+    client, db_session, monkeypatch
+):
+    """A multipart body without a 'filename' field returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable NoFn", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+
+    boundary = b"----TestBoundaryNoFn"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="file"; filename="x.png"',
+        b"Content-Type: application/octet-stream",
+        b"",
+        b"PNGDATA",
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_missing_file_field(
+    client, db_session, monkeypatch
+):
+    """A multipart body without a 'file' field returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable NoFile", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+
+    boundary = b"----TestBoundaryNoFile"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="filename"',
+        b"",
+        b"test.png",
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_empty_file(
+    client, db_session, monkeypatch
+):
+    """An empty file body returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable Empty", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"", "empty.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_nonexistent_job(client, monkeypatch):
+    """POST .../viewable for a non-existent job returns 404."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    fake_id = uuid.uuid4()
+    token = compute_backends_module.compute_job_heartbeat_secret(fake_id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{fake_id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 404
+
+
+# ── Terminal viewable-pipeline tests ──────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkeypatch):
     """A bundle mixing viewable and non-viewable files — only images and videos are
@@ -22666,8 +23363,8 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
 
     assert download_calls == [str(predecessor_id)]
     script = provision_calls[0]
-    # Downloads the predecessor bundle and extracts it into the staging dir,
-    # which is then moved to the artifact dir.
+    # Downloads the predecessor bundle and extracts it into the staging dir first,
+    # then moves it into the artifact dir (so partial extracts never corrupt it).
     assert "https://storage.example.com/predecessor-bundle" in script
     resume_stage = shlex.quote(
         f"{compute_backends_module._GCP_ARTIFACT_DIR_PATH}.resume-staging"

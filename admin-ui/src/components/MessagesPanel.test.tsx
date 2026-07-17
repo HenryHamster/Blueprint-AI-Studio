@@ -796,7 +796,7 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1);
     expect(_messagesGetCalls()).toHaveLength(0);
-    expect(el.textContent).toContain('Session-backed Strategic reply');
+    await waitFor(() => expect(el.textContent).toContain('Session-backed Strategic reply'));
   });
 
   test('full message chrome still loads from the generic messages endpoint', async () => {
