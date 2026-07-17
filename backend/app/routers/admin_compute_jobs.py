@@ -49,6 +49,7 @@ from app.task_evaluators import (
     _declared_success_criterion,
     evaluate_compute_success_criterion,
 )
+from app.storage import artifact_expires_at
 
 logger = logging.getLogger(__name__)
 
@@ -404,6 +405,16 @@ async def _build_compute_job_payload(
                     validated_om[_key] = _val
             live_om = validated_om or None
         data["viewable_artifacts_live_omissions"] = live_om
+        # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+        # lifecycle DELETE.  Once the retention window passes, the underlying
+        # storage object is permanently gone and re-minting a signed URL will
+        # still 404.  Stamp the expected expiry so the frontend can distinguish
+        # a transient preview failure from permanent expiry.  Uses completed_at
+        # (object creation time for viewable files) with a fallback to
+        # created_at for in-flight jobs.
+        data["artifact_expires_at"] = artifact_expires_at(
+            job.completed_at or job.created_at
+        )
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
         data["runner_target_id"] = runner_target_id_str
