@@ -845,6 +845,21 @@ async def next_role(
 
     # Liveness signal: receiving the request itself proves the VM is alive.
     _shared_state.record_vm_heartbeat(req.vm_instance_id)
+    # Enrolled local runners must reacquire work through the capability-aware
+    # runner dispatcher. Warm chain/backlog handoff intentionally bypasses runner
+    # selection and therefore cannot prove browser, project-verification, GPU, or
+    # task-type eligibility. Letting a ``runner:*`` agent claim here caused visual
+    # tasks to reach Chromium-less sandboxes and backend authoring to reach a host
+    # without Docker/Postgres. Exit this role immediately so the local-runner
+    # daemon releases its slot; the normal dispatcher can then pin only compatible
+    # work or fall through to cloud without the 180-second warm-poll delay.
+    if req.vm_instance_id.startswith("runner:"):
+        logger.info(
+            "[NEXT-ROLE] Local runner %s returning to capability-aware dispatch",
+            req.vm_instance_id,
+        )
+        return {"action": "exit", "reason": "local_runner_capability_recheck"}
+
 
     from app.warm_backlog_reuse import record_chain_poll as _record_chain_poll
 

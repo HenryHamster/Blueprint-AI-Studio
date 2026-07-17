@@ -1773,3 +1773,21 @@ def test_salvage_bundle_payload_contract():
     assert f1["title"] == "A minimal finding with no prompt"[:80]
     assert f1["discard_reason"] == "unknown"
     assert f1["prompt"] is None  # absent in input → None in output (TS falls back gracefully)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "expected"),
+    [
+        ({"related_files": ["admin-ui/src/Foo.viewport.test.tsx"]}, True),
+        ({"acceptance_evidence": {"kind": "playwright"}}, True),
+        ({"related_files": ["backend/testing/test_foo.py"]}, False),
+    ],
+)
+def test_salvage_bundle_surfaces_browser_routing_requirement(candidate, expected):
+    """Viewport proof must become a dispatcher-readable payload capability."""
+
+    from app.research_completion import _build_salvage_payload
+
+    payload = _build_salvage_payload([candidate], "source-task")
+
+    assert payload["requires_browser"] is expected
