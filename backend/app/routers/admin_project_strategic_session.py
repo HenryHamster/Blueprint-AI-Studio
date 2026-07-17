@@ -139,6 +139,7 @@ from app.storage import (
     generate_download_signed_url,
     storage as gcs_storage,
 )
+from app.message_audience import stamp_message_audience
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
     build_resident_runner_options,
@@ -3091,15 +3092,18 @@ async def create_project_strategic_session_check_in(
             project_id,
             workbench_context_for_snapshot,
         )
-        message_context: Dict[str, Any] = {
-            "event_type": _CHECK_IN_EVENT_TYPE,
-            "check_in": {
-                "version": 1,
-                "kind": kind,
-                "operator_user_id": current_user["user_id"],
-                "captured_at": now.isoformat(),
+        message_context: Dict[str, Any] = stamp_message_audience(
+            {
+                "event_type": _CHECK_IN_EVENT_TYPE,
+                "check_in": {
+                    "version": 1,
+                    "kind": kind,
+                    "operator_user_id": current_user["user_id"],
+                    "captured_at": now.isoformat(),
+                },
             },
-        }
+            _CHECK_IN_EVENT_TYPE,
+        )
         if strategic_session:
             message_context["strategic_session"] = strategic_session
         next_sequence = await lock_project_and_next_message_sequence(

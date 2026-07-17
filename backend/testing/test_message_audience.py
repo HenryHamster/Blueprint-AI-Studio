@@ -1021,6 +1021,13 @@ _MODULES_WITH_OPERATOR_MESSAGES = [
     "review_loop_convergence.py",
     "branch_resolution.py",
     "review_fix_lane_pilot.py",
+    "review_pipeline.py",
+    "research_direction_state.py",
+    "capability_trial_verdict.py",
+    "strategic_completion.py",
+    "work_session_command_execution.py",
+    "routers/admin_project_strategic_session.py",
+    "routers/admin_agent_ops.py",
 ]
 
 

@@ -48,6 +48,7 @@ from app.models import (
     TaskStatus,
 )
 from app.broadcast import broadcast_to_project
+from app.message_audience import stamp_message_audience
 from app.project_message_creation import build_project_message
 from app.project_message_projection import message_event_payload
 from app.shared_state import runtime_config as _runtime_config
@@ -6383,6 +6384,7 @@ async def _handle_strategic_completion(
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         _event_type = _msg_ctx.get("event_type")
+        _msg_ctx = stamp_message_audience(_msg_ctx, _event_type or "strategic_message")
         _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
         _reply_to_id: uuid.UUID | None = None
         _raw_reply_to = _msg_ctx.get("reply_to")

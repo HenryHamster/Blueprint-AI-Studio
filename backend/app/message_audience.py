@@ -104,6 +104,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # review_fix_lane_pilot.raise_gate_integrity_alert: a non-negotiable
     # gate-integrity violation BLOCKER.
     "review_fix_lane_gate_integrity_violation": OPERATOR_ACTION_NEEDED,
+    # review_pipeline._post_repeat_fingerprint_blocker_message: a repeat-fingerprint
+    # halt BLOCKER — the operator must decide whether to spawn a precondition-fix
+    # direction or cancel the chain.
+    "repeat_fingerprint_halt": OPERATOR_ACTION_NEEDED,
     # review_fix_lane_pilot.emit_lane_event_message: per-lane terminal/degraded
     # WARNING notices the operator currently sees.  Kept operator-fyi to preserve
     # their current visibility while closing the structural NULL hole; a later
@@ -177,6 +181,13 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "research.escalation_delivery_failed": OPERATOR_ACTION_NEEDED,
     "research.diagnosis_stalled": OPERATOR_ACTION_NEEDED,
     "research.strategic_issue": OPERATOR_FYI,
+    # Dedup / already-fixed deadlock diagnostics: internal pipeline health
+    # signals handled by the strategic agent — not surfaced to the operator.
+    "research.dedup_deadlock": STRATEGIST_INTERNAL,
+    "research.already_fixed_deadlock": STRATEGIST_INTERNAL,
+    # Zero-children NOTE: strategic bookkeeping when a research pass creates no
+    # child tasks (all findings deduped or no actionable scope).
+    "research.zero_children": STRATEGIST_INTERNAL,
     # Branch lifecycle bookkeeping
     "branch.cleanup_summary": STRATEGIST_INTERNAL,
     # Rollup / LTS
@@ -193,6 +204,24 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "efficiency.provider_routing_verdict": STRATEGIST_INTERNAL,
     # === Back-merge / hotfix alerts (no existing policy entry) ============
     "hotfix_backmerge.size_violation": STRATEGIST_INTERNAL,
+    # work_session_command_execution: operator command receipts (confirmed/failed).
+    # These are resolved NOTEs that record an operator-initiated command result —
+    # visible in the conversation panel but not an escalation requiring attention.
+    "operator_command": OPERATOR_FYI,
+    # admin_project_strategic_session: operator check-in notes. A check-in is a
+    # short user-initiated note to the strategic agent; it is already resolved on
+    # creation and visible in the conversation surface.
+    "strategic_check_in": OPERATOR_FYI,
+    # admin_agent_ops.agent_annotate: agent-authored annotations (comment, issue,
+    # vision, size_breach). Annotations are agent outputs that belong in the
+    # strategic context; they are operator-visible by default so the operator can
+    # see the agent's findings without needing a separate escalation channel.
+    "agent_annotation": OPERATOR_FYI,
+    # admin_agent_ops.strategic_operation / strategic_completion: catch-all for
+    # strategic messages whose event_type is unknown or missing. Unregistered types
+    # already fail-closed to STRATEGIST_INTERNAL via route_event; this entry makes
+    # the fallback explicit so it is self-documenting and test-stable.
+    "strategic_message": STRATEGIST_INTERNAL,
     # Resident strategist self-observability. A chronically-low operator-decision
     # capture rate means operator corrections are silently failing to reach the
     # durable decisions register. This is internal strategist bookkeeping — the
