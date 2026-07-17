@@ -142,7 +142,7 @@ async def spawn_migration_guard_fix_task(
             MIGRATION_GUARD_STATE_FIX_SUPPRESSED, requires_approval=True
         )
         task.latest_status_message = (
-            f"Merge blocked — Alembic guard needs migration renumber/rechain on "
+            f"Merge blocked — Alembic guard needs migration chain repair on "
             f"PR #{pr_number}, but branch/base metadata is missing; manual "
             "intervention required"
         )[:500]
