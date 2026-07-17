@@ -11633,7 +11633,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             final_manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
@@ -11745,7 +11745,7 @@ class TestMidRunViewableUpload:
         with patch.object(
             compute_jobs_mod,
             "persist_viewable_artifacts_with_completeness",
-            new=AsyncMock(return_value=(terminal_manifest, 0, True)),
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
         ):
             manifest, dropped = (
                 await compute_jobs_mod.persist_viewable_files_for_job(
@@ -12379,6 +12379,60 @@ async def test_capability_proof_trial_missing_head_sha_is_rejected(db_session):
 
 
 @pytest.mark.asyncio
+async def test_capability_proof_trial_incomplete_receipt_records_nothing(db_session):
+    """A trial result with an empty test_refs or a proper subset of enrolled refs
+    must NOT mint proof — the agent must report the complete executed suite."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-refs-cap"
+    enrolled_refs = [
+        "backend/testing/test_prompt.py::test_map",
+        "backend/testing/test_prompt.py::test_search",
+    ]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, enrolled_refs, head_sha="deadbeef")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    base_result = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+
+    # Case 1: empty test_refs — bypasses validation entirely without this fix.
+    empty_refs_result = dict(base_result, test_refs=[])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(empty_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "empty test_refs must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+    # Case 2: proper subset — only one of two enrolled refs reported.
+    partial_refs_result = dict(base_result, test_refs=[enrolled_refs[0]])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(partial_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "partial test_refs subset must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
 async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
     """A trial result whose head_sha differs from the enrollment must NOT mint
     proof — the runner must execute the enrolled revision."""
@@ -12411,6 +12465,89 @@ async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
     await db_session.refresh(project)
     assert cap not in (project.capability_proof_records or {})
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_sha_records_nothing(db_session):
+    """A trial result that omits head_sha must NOT mint proof when the enrollment
+    specified a head_sha — missing executed SHA is a receipt defect."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-receipt-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a head_sha so the check is active.
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a result WITHOUT head_sha (None / missing).
+    incomplete = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        # head_sha intentionally absent
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(incomplete), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_records_reported_sha_not_enrolled_sha(db_session):
+    """When the enrollment has no head_sha but the agent reports one, the ledger
+    records the agent-reported SHA (the actual executed revision), not an empty
+    string or None."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-fallback-cap"
+    test_refs = ["backend/testing/test_prompt.py::test_map"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll WITHOUT a head_sha (head_sha_enrolled = None).
+    task = Task(
+        project_id=project.id,
+        title=f"Capability proof trial: {cap}",
+        payloads=[{
+            "type": "capability_proof_trial",
+            "cap": cap,
+            "test_refs": test_refs,
+            # deliberately omit head_sha
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "reported-sha-abc",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+        "skipped_summary": {"total": 3, "skipped": 0},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+    entries = project.capability_proof_records.get(cap, [])
+    assert len(entries) == 1
+    # The recorded SHA is the agent-reported revision, not None or empty.
+    assert entries[0]["commit_sha"] == "reported-sha-abc"
 
 
 @pytest.mark.asyncio

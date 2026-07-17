@@ -47,10 +47,19 @@ import {
 } from '../strategicStateApi';
 import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 import { messageHasClientIdentity, mergeCanonicalConversationMessage } from '../utils/conversationMessageIdentity';
-import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
+import { clearComposerDraftIfCurrent, loadComposerDraft, saveComposerDraft } from '../utils/conversationDraftState';
 import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateConversationComposerIntent } from '../utils/conversationAttachmentDraftFinalization';
 import { ComposerRequestOwnershipGuard } from '../utils/composerRequestOwnership';
 import { ConversationAttachmentUploadError, uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
+import {
+  acknowledgeQueuedResidentToolHandoffs,
+  enqueueResidentToolHandoff,
+  isResidentToolHandoffEvent,
+  isResidentToolHandoffQueueStorageKey,
+  loadQueuedResidentToolHandoffEntries,
+  RESIDENT_TOOL_HANDOFF_EVENT,
+  type ResidentToolHandoffQueueEntry,
+} from '../utils/residentToolHandoff';
 import {
   clearPendingAttachments as clearStoredPendingAttachments,
   deletePendingAttachment as deleteStoredPendingAttachment,
@@ -68,6 +77,21 @@ const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
 const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
+
+function artifactRefIdentity(ref: Record<string, unknown>): string {
+  return String(ref.artifact_ref_id || ref.id || '');
+}
+
+function mergeArtifactRefs(
+  ...groups: Array<Array<Record<string, unknown>>>
+): Array<Record<string, unknown>> {
+  const merged = new Map<string, Record<string, unknown>>();
+  for (const ref of groups.flat()) {
+    const identity = artifactRefIdentity(ref);
+    if (identity) merged.set(identity, ref);
+  }
+  return [...merged.values()];
+}
 function getCompletionReceiptTone(status?: string | null): {
   banner: string;
   dot: string;
@@ -138,6 +162,47 @@ function attentionTextTone(level?: string | null): string {
   if (level === 'needs_operator') return 'text-amber-300';
   if (level === 'watch') return 'text-neutral-300';
   return 'text-emerald-300';
+}
+/** Human-readable short label for an attention item's lifecycle.operator_action. */
+function lifecycleOperatorActionLabel(operatorAction?: string | null): string {
+  if (!operatorAction) return '';
+  const labels: Record<string, string> = {
+    reply_or_resolve_message: 'Reply or resolve',
+    inspect_or_resolve_message: 'Inspect or resolve',
+    approve_or_reject_task: 'Approve or reject',
+    hand_merge_or_archive_task: 'Hand-merge or archive',
+    connect_or_select_local_runner: 'Connect or select runner',
+    recover_runner_or_retarget_task: 'Recover runner or retarget',
+    recover_or_remove_runner: 'Recover or remove runner',
+    inspect_runtime_or_requeue_task: 'Inspect runtime or requeue',
+    inspect_dependency_or_requeue_task: 'Inspect dependency or requeue',
+    remap_or_attest_criterion: 'Remap or attest',
+    update_direction: 'Update direction',
+    provide_credentials_or_dismiss: 'Provide credentials',
+    grant_access_or_dismiss: 'Grant access',
+    confirm_intent_change_or_dismiss: 'Confirm intent',
+    answer_decision_or_dismiss: 'Answer decision',
+    remap_direction_or_attest_criterion: 'Remap or attest',
+    monitor_active_direction_progress: 'Monitor progress',
+    register_criteria_or_correct_referenced_keys: 'Register criteria',
+    re_attest_or_provide_evidence: 'Re-attest or provide evidence',
+    re_attest_or_provide_machine_evidence: 'Re-attest or provide evidence',
+    re_attest_or_provide_evidence_or_retry: 'Re-attest or retry',
+    link_task_or_resolve_debt: 'Link or resolve debt',
+    dismiss_or_fix_alert_source: 'Dismiss or fix',
+    inspect_blocked_task: 'Inspect blocked task',
+    inspect_parked_task: 'Inspect parked task',
+    inspect_failed_task: 'Inspect failed task',
+    inspect_experiment_result: 'Inspect result',
+    inspect_source: 'Inspect source',
+  };
+  return labels[operatorAction] ?? operatorAction.replace(/_/g, ' ');
+}
+/** Human-readable label for an attention item's lifecycle.acknowledge_effect. */
+function lifecycleAcknowledgeEffectLabel(effect?: string | null): string {
+  if (!effect || effect === 'none') return 'Acknowledge';
+  if (effect === 'clears_unread_only') return 'Mark as seen — removes from needs-action strip until next update';
+  return `Acknowledge (${effect.replace(/_/g, ' ')})`;
 }
 /** Human-readable label for an attention item's lifecycle.clears_when. */
 function lifecycleClearsLabel(clearsWhen?: string | null): string {
@@ -493,6 +558,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
   const [draftSourceRefs, setDraftSourceRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.source_refs ?? []);
   const [draftArtifactRefs, setDraftArtifactRefs] = useState<Array<Record<string, unknown>>>(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.artifact_refs ?? []);
+  const composerDraftWriteIdRef = useRef(loadComposerDraft(currentActorUserId, selectedProjectId)?.write_id ?? null);
   const [submitting, setSubmitting] = useState(false);
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
@@ -558,8 +624,40 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const effectiveNewType = conversationMode ? 'FEEDBACK' : newType;
   const composerIntentRef = useRef<ConversationComposerIntent>({ type: effectiveNewType, content: newContent, reply_to: replyTo, source_refs: draftSourceRefs, artifact_refs: draftArtifactRefs, attachment_send_key: conversationSend.identity });
   const updateComposerIntent = useCallback((patch: Partial<ConversationComposerIntent>) => (composerIntentRef.current = updateConversationComposerIntent(composerIntentRef.current, patch)), []);
+  const saveComposerDraftSnapshot = useCallback((
+    actorUserId: string,
+    projectId: string,
+    intent: ConversationComposerIntent,
+  ) => {
+    const previousWriteId = currentActorUserIdRef.current === actorUserId
+      && selectedProjectIdRef.current === projectId
+      ? composerDraftWriteIdRef.current
+      : null;
+    const result = saveComposerDraft(actorUserId, projectId, intent, undefined, previousWriteId);
+    if (
+      result !== false
+      && currentActorUserIdRef.current === actorUserId
+      && selectedProjectIdRef.current === projectId
+    ) composerDraftWriteIdRef.current = result;
+    return result !== false;
+  }, []);
+  const clearSubmittedComposerDraft = useCallback((
+    actorUserId: string | null,
+    projectId: string,
+    writeId: string | null | undefined,
+  ) => {
+    if (!actorUserId) return false;
+    const cleared = clearComposerDraftIfCurrent(actorUserId, projectId, writeId);
+    if (
+      cleared
+      && currentActorUserIdRef.current === actorUserId
+      && selectedProjectIdRef.current === projectId
+      && composerDraftWriteIdRef.current === writeId
+    ) composerDraftWriteIdRef.current = null;
+    return cleared;
+  }, []);
   const resetComposerIntent = useCallback(() => {
-    updateComposerIntent({ content: '', reply_to: null, source_refs: [], artifact_refs: [], attachment_send_key: null });
+    updateComposerIntent({ content: '', reply_to: null, source_refs: [], artifact_refs: [], operator_intent: undefined, attachment_send_key: null });
     setNewContent(''); setDraftSourceRefs([]); setDraftArtifactRefs([]); setReplyTo(null);
   }, [updateComposerIntent]);
   const captureCurrentDraftRefs = useCallback(() => {
@@ -567,9 +665,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const sourceRefs = Array.isArray(workbenchContext?.selected_refs)
       ? workbenchContext.selected_refs as Array<Record<string, unknown>>
       : [];
+    const explicitToolRefs = composerIntentRef.current.artifact_refs.filter(
+      ref => typeof ref.artifact_ref_id === 'string',
+    );
     return {
       sourceRefs,
-      artifactRefs: sourceRefs.filter(ref => ref.kind === 'artifact'),
+      artifactRefs: mergeArtifactRefs(
+        sourceRefs.filter(ref => ref.kind === 'artifact'),
+        explicitToolRefs,
+      ),
     };
   }, [currentStrategicState, strategicWorkbenchState]);
   const persistComposerEnvelope = useCallback((overrides: {
@@ -586,10 +690,113 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       type: overrides.type ?? current.type, content: overrides.content ?? current.content,
       reply_to: overrides.replyTo === undefined ? current.reply_to : overrides.replyTo,
       source_refs: overrides.sourceRefs ?? current.source_refs, artifact_refs: overrides.artifactRefs ?? current.artifact_refs,
+      operator_intent: current.operator_intent,
       attachment_send_key: overrides.attachmentSendKey === undefined ? current.attachment_send_key : overrides.attachmentSendKey,
     });
-    saveComposerDraft(currentActorUserId, selectedProjectId, next);
-  }, [currentActorUserId, selectedProjectId, updateComposerIntent]);
+    saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
+  }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
+  const applyToolHandoffs = useCallback((entries: ResidentToolHandoffQueueEntry[]) => {
+    if (!conversationMode || !currentActorUserId || !selectedProjectId || entries.length === 0) return false;
+    // A composer envelope has one operator intent. Consume one immutable queue
+    // entry at a time so refs from other handoffs cannot be acknowledged under
+    // the wrong prompt, revision, lane owner, or intent.
+    const entry = entries[0];
+    const handoff = entry.detail;
+    const current = composerIntentRef.current;
+    if (current.operator_intent && current.artifact_refs.length > 0) return false;
+    const artifactRefs = mergeArtifactRefs(
+      current.artifact_refs,
+      [handoff.artifactRef as unknown as Record<string, unknown>],
+    );
+    const content = current.content.trim() ? current.content : handoff.prompt;
+    const operatorIntent: Record<string, unknown> = {
+      kind: handoff.intent,
+      expected_revision: handoff.artifactRef.revision,
+      ...(handoff.laneOwner ? { lane_owner: handoff.laneOwner } : {}),
+    };
+    const next = updateComposerIntent({
+      content,
+      artifact_refs: artifactRefs,
+      operator_intent: operatorIntent,
+    });
+    setNewContent(content);
+    setDraftArtifactRefs(artifactRefs);
+    const persisted = saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
+    if (persisted) {
+      acknowledgeQueuedResidentToolHandoffs(currentActorUserId, selectedProjectId, [entry]);
+    }
+    focusComposerTextarea();
+    return persisted;
+  }, [conversationMode, currentActorUserId, focusComposerTextarea, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
+
+  useEffect(() => {
+    const blocked = () => submitting || sendState === 'sending' || sendState === 'needs_retry';
+    const applyQueued = () => {
+      if (!currentActorUserId || !selectedProjectId || blocked()) return false;
+      return applyToolHandoffs(
+        loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId),
+      );
+    };
+    const onToolHandoff = (event: Event) => {
+      if (!conversationMode) return;
+      if (!isResidentToolHandoffEvent(event) || event.detail.projectId !== selectedProjectId) return;
+      if (!currentActorUserId || event.detail.artifactRef.author !== currentActorUserId) return;
+      // Direct test/integration callers may emit without using the durable
+      // dispatch helper. Replacing the same per-ref entry remains idempotent.
+      const queued = enqueueResidentToolHandoff(currentActorUserId, selectedProjectId, event.detail);
+      if (!queued) {
+        addToastRef.current('Could not queue the tool revision locally. Retry Share with Resident.', 'error');
+        return;
+      }
+      if (composerIntentRef.current.operator_intent && composerIntentRef.current.artifact_refs.length > 0) {
+        addToastRef.current('Exact tool revision queued for your next Resident message', 'info');
+        return;
+      }
+      if (blocked()) {
+        addToastRef.current(
+          'Exact tool revision queued for your next Resident message',
+          'info',
+        );
+        return;
+      }
+      if (applyQueued()) {
+        addToastRef.current('Exact tool revision attached to Resident conversation', 'success');
+      } else {
+        addToastRef.current('Could not preserve the tool revision draft locally. Retry Share with Resident.', 'error');
+      }
+    };
+    const onStorage = (event: StorageEvent) => {
+      if (
+        currentActorUserId
+        && selectedProjectId
+        && isResidentToolHandoffQueueStorageKey(event.key, currentActorUserId, selectedProjectId)
+        && applyQueued()
+      ) {
+        addToastRef.current('Tool revision from another tab is ready in your next Resident message', 'success');
+      }
+    };
+    window.addEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
+      window.removeEventListener('storage', onStorage);
+    };
+  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
+
+  useEffect(() => {
+    if (
+      !currentActorUserId
+      || !selectedProjectId
+      || !conversationMode
+      || submitting
+      || sendState === 'sending'
+      || sendState === 'needs_retry'
+    ) return;
+    const queued = loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId);
+    if (queued.length > 0 && applyToolHandoffs(queued)) {
+      addToastRef.current('Queued tool revision is ready in your next Resident message', 'success');
+    }
+  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -849,14 +1056,26 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // Reload composer draft for the new project — drafts are scoped per-project
     // so switching projects shows that project's in-progress draft, not another's.
     const draft = loadComposerDraft(currentActorUserId, selectedProjectId);
-    const restoredReply = optimisticSend?.reply_to ?? draft?.reply_to ?? null;
-    updateComposerIntent({ type: draft?.type ?? 'FEEDBACK', content: draft?.content ?? '', reply_to: restoredReply, source_refs: draft?.source_refs ?? [], artifact_refs: draft?.artifact_refs ?? [], attachment_send_key: draft?.attachment_send_key ?? null });
-    setNewContent(draft?.content ?? '');
-    setNewType(draft?.type ?? 'FEEDBACK');
-    setDraftSourceRefs(draft?.source_refs ?? []);
-    setDraftArtifactRefs(draft?.artifact_refs ?? []);
+    const unresolvedSend = optimisticSend
+      && (optimisticSend.state === 'sending' || optimisticSend.state === 'needs_retry')
+      ? optimisticSend
+      : null;
+    const immutablePayload = unresolvedSend?.payload;
+    const restoredContent = immutablePayload?.content ?? unresolvedSend?.content ?? draft?.content ?? '';
+    const restoredType = immutablePayload?.message_type ?? unresolvedSend?.message_type ?? draft?.type ?? 'FEEDBACK';
+    const restoredSourceRefs = immutablePayload?.source_refs ?? draft?.source_refs ?? [];
+    const restoredArtifactRefs = immutablePayload?.artifact_refs ?? draft?.artifact_refs ?? [];
+    const restoredOperatorIntent = immutablePayload?.operator_intent ?? draft?.operator_intent;
+    const restoredReply = unresolvedSend?.reply_to ?? draft?.reply_to ?? null;
+    const restoredAttachmentKey = unresolvedSend?.key ?? draft?.attachment_send_key ?? null;
+    composerDraftWriteIdRef.current = unresolvedSend?.draft_write_id ?? draft?.write_id ?? null;
+    updateComposerIntent({ type: restoredType, content: restoredContent, reply_to: restoredReply, source_refs: restoredSourceRefs, artifact_refs: restoredArtifactRefs, operator_intent: restoredOperatorIntent, attachment_send_key: restoredAttachmentKey });
+    setNewContent(restoredContent);
+    setNewType(restoredType);
+    setDraftSourceRefs(restoredSourceRefs);
+    setDraftArtifactRefs(restoredArtifactRefs);
     setReplyTo(restoredReply);
-    conversationSend.adoptIdentity(draft?.attachment_send_key);
+    conversationSend.adoptIdentity(restoredAttachmentKey);
     setMessages([]);
     messagesRef.current = [];
     setPendingAttachments(prev => {
@@ -993,7 +1212,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     if (workingSince == null) return;
     if (countStrategicReplies(conversationMessages) > strategicReplyBaselineRef.current) {
       setWorkingSince(null);
-      conversationSend.clear();
+      conversationSend.clearPending();
     }
   }, [workingSince, conversationMessages, conversationSend]);
   // A `done` lifecycle frame ends the turn — clear the working state / strip even
@@ -1068,7 +1287,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     const landed = conversationMessages.find(m => messageHasClientIdentity(m, optimisticSend.key));
     // eslint-disable-next-line react-hooks/set-state-in-effect
     if (landed && ['claimed', 'responded', 'superseded'].includes(landed.handling_state ?? '')) {
-      conversationSend.clear();
+      conversationSend.clearPending();
       if (currentActorUserId && selectedProjectId) {
         void clearStoredPendingAttachments(currentActorUserId, selectedProjectId, optimisticSend.key);
       }
@@ -1101,7 +1320,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         );
         setWorkingSince(claimed || wakeupState === 'queued' || wakeupState === 'coalesced' ? Date.now() : null);
         resetComposerIntent();
-        clearComposerDraft(currentActorUserId, selectedProjectId);
+        clearSubmittedComposerDraft(currentActorUserId, selectedProjectId, optimisticSend.draft_write_id);
         clearPendingAttachments(optimisticSend.key);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         void refreshStrategicState?.();
@@ -1111,7 +1330,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (!cancelled && selectedProjectIdRef.current === selectedProjectId && currentActorUserIdRef.current === currentActorUserId && optimisticSend.state === 'sending') conversationSend.transition('needs_retry');
       });
     return () => { cancelled = true; if (!settled) recoveryKeys.delete(recoveryKey); };
-  }, [conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
+  }, [clearSubmittedComposerDraft, conversationMode, currentActorUserId, optimisticSend, resetComposerIntent, selectedProjectId]);
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -1520,7 +1739,16 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         pendingAttachmentsRef.current = next;
         return next;
       });
-      if (next.length === 0 && mutation.actorUserId) finalizeLastAttachmentRemoval(mutation.actorUserId, mutation.projectId, updateComposerIntent({ attachment_send_key: null }), conversationSend.clearIdentity);
+      if (next.length === 0 && mutation.actorUserId) {
+        const result = finalizeLastAttachmentRemoval(
+          mutation.actorUserId,
+          mutation.projectId,
+          updateComposerIntent({ attachment_send_key: null }),
+          conversationSend.clearIdentity,
+          composerDraftWriteIdRef.current,
+        );
+        if (result !== false) composerDraftWriteIdRef.current = result;
+      }
     } catch {
       if (currentActorUserIdRef.current === mutation.actorUserId && selectedProjectIdRef.current === mutation.projectId) {
         addToast('Could not remove the persisted attachment', 'error');
@@ -1599,6 +1827,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       && currentActorUserIdRef.current === submitActorUserId
     );
     const submittedContent = newContent.trim();
+    const submittedDraftWriteId = composerDraftWriteIdRef.current;
+    const submittedOperatorIntent = composerIntentRef.current.operator_intent;
     const attachmentsForSubmit = pendingAttachmentsRef.current;
     const retainedPayloadAttachments = optimisticSend?.payload?.attachments ?? [];
     let attachmentUploadFailed = false;
@@ -1635,7 +1865,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         if (!submitStillCurrent()) return;
         idempotencyKeyRef.current = null;
         resetComposerIntent();
-        clearComposerDraft(submitActorUserId, submitProjectId);
+        clearSubmittedComposerDraft(submitActorUserId, submitProjectId, submittedDraftWriteId);
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
@@ -1680,6 +1910,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           wakeup_state: null,
           reply_to_message_id: submitReplyTo?.id ?? null,
           reply_to: submitReplyTo,
+          draft_write_id: submittedDraftWriteId,
           context: {
             ...(visibleAttachmentDescriptors.length ? { attachments: visibleAttachmentDescriptors } : {}),
             ...(submitReplyTo ? {
@@ -1697,6 +1928,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             reply_to_message_id: submitReplyTo?.id ?? null,
             source_refs: initialSourceRefs,
             artifact_refs: initialArtifactRefs,
+            ...(submittedOperatorIntent ? { operator_intent: submittedOperatorIntent } : {}),
             attachments: [],
             ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
           },
@@ -1721,7 +1953,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             );
           }
           resetComposerIntent();
-          clearComposerDraft(submitActorUserId, submitProjectId);
+          clearSubmittedComposerDraft(submitActorUserId, submitProjectId, optimisticSend.draft_write_id);
           clearPendingAttachments(sendIdentity);
           if (textareaRef.current) textareaRef.current.style.height = 'auto';
           addToast('Message accepted', 'success');
@@ -1774,6 +2006,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               reply_to_message_id: submitReplyTo?.id ?? null,
               source_refs: sourceRefs,
               artifact_refs: artifactRefs,
+              ...(submittedOperatorIntent ? { operator_intent: submittedOperatorIntent } : {}),
               attachments: uploadedAttachments,
               ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
             };
@@ -1788,6 +2021,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               wakeup_state: null,
               reply_to_message_id: submitReplyTo?.id ?? null,
               reply_to: submitReplyTo,
+              draft_write_id: submittedDraftWriteId,
               context: {
                 ...context,
                 source_refs: sourceRefs,
@@ -1875,7 +2109,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         // Clear only after durable acceptance. A lost/failed response preserves
         // text, reply, attachments, and source context for identity recovery.
         resetComposerIntent();
-        clearComposerDraft(submitActorUserId, submitProjectId);
+        clearSubmittedComposerDraft(submitActorUserId, submitProjectId, pendingSend.draft_write_id);
         setLastArming(arming);
         clearPendingAttachments(sendIdentity);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
@@ -1931,7 +2165,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       // Sent cleanly — the next distinct message gets a fresh key.
       idempotencyKeyRef.current = null;
       resetComposerIntent();
-      clearComposerDraft(submitActorUserId, submitProjectId);
+      clearSubmittedComposerDraft(submitActorUserId, submitProjectId, submittedDraftWriteId);
       setLastArming(arming);
       clearPendingAttachments();
       if (textareaRef.current) textareaRef.current.style.height = 'auto';
@@ -2354,6 +2588,23 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }, [persistComposerEnvelope, sendState]);
 
+  const handleRemoveArtifactRef = useCallback((identity: string) => {
+    if (sendState === 'sending' || sendState === 'needs_retry') return;
+    const current = composerIntentRef.current;
+    const artifactRefs = current.artifact_refs.filter(ref => artifactRefIdentity(ref) !== identity);
+    const sourceRefs = current.source_refs.filter(ref => artifactRefIdentity(ref) !== identity);
+    const next = updateComposerIntent({
+      artifact_refs: artifactRefs,
+      source_refs: sourceRefs,
+      operator_intent: undefined,
+    });
+    setDraftArtifactRefs(artifactRefs);
+    setDraftSourceRefs(sourceRefs);
+    if (currentActorUserId && selectedProjectId) {
+      saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
+    }
+  }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, sendState, updateComposerIntent]);
+
   async function handleAbandonPendingSend() {
     if (!optimisticSend || optimisticSend.state !== 'needs_retry' || !selectedProjectId || !currentActorUserId || submittingGuardRef.current.active) return;
     const projectId = selectedProjectId;
@@ -2376,7 +2627,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         }
         clearPendingAttachments(identity);
         resetComposerIntent();
-        clearComposerDraft(actorUserId, projectId);
+        clearSubmittedComposerDraft(actorUserId, projectId, optimisticSend.draft_write_id);
         addToast('Message was already accepted; recovered its canonical receipt.', 'success');
         return;
       }
@@ -2398,7 +2649,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       });
       conversationSend.clear();
       resetComposerIntent();
-      clearComposerDraft(actorUserId, projectId);
+      clearSubmittedComposerDraft(actorUserId, projectId, optimisticSend.draft_write_id);
       addToast('Pending message abandoned after confirming it was not accepted.', 'info');
     } catch {
       if (selectedProjectIdRef.current === projectId && currentActorUserIdRef.current === actorUserId) {
@@ -2674,29 +2925,58 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
                     addToast?.('Failed to dismiss — try again', 'error');
                   }
                 };
+                const handleAck = () => {
+                  // Client-side dismiss: removes the item from the strip for this session.
+                  // No server-side effect — the item reappears if still needs_operator after
+                  // the next attention poll. Driven by lifecycle.acknowledgeable=true.
+                  setResolvedConfirmationIds(prev => new Set(prev).add(item.id));
+                };
+                const isAcknowledgeable = isMessage && (item.lifecycle?.acknowledgeable ?? false);
+                const operatorActionHint = item.lifecycle?.operator_action
+                  ? lifecycleOperatorActionLabel(item.lifecycle.operator_action)
+                  : null;
                 return (
                   <div key={item.id} className="flex flex-col gap-1">
-                    <button
-                      type="button"
-                      onClick={handleClick}
-                      disabled={!isMessage && !isConfirmation}
-                      title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
-                      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
-                        isMessage
-                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                          : isConfirmation
-                          ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
-                          : 'border-neutral-800 bg-neutral-950/50 cursor-default'
-                      }`}
-                    >
-                      <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
-                      <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
-                      {item.lifecycle?.clears_when && (
-                        <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
-                          auto-clears
-                        </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleClick}
+                        disabled={!isMessage && !isConfirmation}
+                        title={item.lifecycle?.clears_when ? lifecycleClearsLabel(item.lifecycle.clears_when) : undefined}
+                        className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border px-2 py-1 text-left text-xs transition-colors ${
+                          isMessage
+                            ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                            : isConfirmation
+                            ? 'border-amber-700/50 bg-amber-950/50 hover:border-amber-600 hover:bg-amber-900/50 cursor-pointer'
+                            : 'border-neutral-800 bg-neutral-950/50 cursor-default'
+                        }`}
+                      >
+                        <span className="shrink-0 text-sm leading-none" aria-hidden="true">{attentionItemIcon(item.kind)}</span>
+                        <span className="truncate max-w-[220px] font-medium text-amber-100">{item.label}</span>
+                        {operatorActionHint && (
+                          <span className="shrink-0 hidden sm:inline text-neutral-400 text-ui-sm" data-testid="operator-action-hint">
+                            {operatorActionHint}
+                          </span>
+                        )}
+                        {item.lifecycle?.clears_when && (
+                          <span className="shrink-0 hidden sm:inline text-neutral-500" title={lifecycleClearsLabel(item.lifecycle.clears_when)}>
+                            auto-clears
+                          </span>
+                        )}
+                      </button>
+                      {isAcknowledgeable && (
+                        /* eslint-disable-next-line viewport/min-touch-target */
+                        <button
+                          type="button"
+                          onClick={handleAck}
+                          title={lifecycleAcknowledgeEffectLabel(item.lifecycle?.acknowledge_effect)}
+                          className="shrink-0 rounded border border-neutral-700/60 bg-neutral-900/40 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200 transition-colors"
+                          data-testid="attention-ack-btn"
+                        >
+                          Ack
+                        </button>
                       )}
-                    </button>
+                    </div>
                     {isExpanded && (
                       <div className="flex gap-1.5 pl-1" data-testid="confirmation-chip-actions">
                         {/* eslint-disable-next-line viewport/min-touch-target */}
@@ -2874,9 +3154,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               Array.isArray(optimisticSend?.context?.attachments) ? optimisticSend.context.attachments.length : 0,
             )
           : 0}
+        artifactRefs={draftArtifactRefs}
         uploading={uploading}
         onAddAttachment={handleAddAttachment}
         onRemoveAttachment={handleRemoveAttachment}
+        onRemoveArtifactRef={handleRemoveArtifactRef}
         onReplaceAttachmentFile={handleReplaceAttachmentFile}
         onChangeType={handleChangeType}
         onChangeContent={handleChangeContent}

@@ -489,22 +489,124 @@ def test_media_kind_for_mime_maps_pdf():
     assert storage._media_kind_for_mime("application/octet-stream") == "unknown"
 
 
-def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
-    """Finding 63ee179fc66a7b97: the per-file viewable substrate and the
-    bundle-extraction surface MUST agree on SVG, and the agreed policy is
-    fail-closed exclusion (an SVG served from a signed URL can execute script
-    in the viewer's browsing context)."""
+def test_svg_viewable_on_both_surfaces_after_sanitization():
+    """SVG is accepted on both viewable surfaces now that sanitize_svg_bytes
+    strips <script> elements and on* event attributes before upload.  The two
+    allowlist surfaces must agree (svg_is_viewable returns True)."""
     # Surface 1: the individually-addressable viewable substrate.
-    assert storage.viewable_content_type_for_filename("chart.svg") is None
-    assert "svg" not in storage._VIEWABLE_CONTENT_TYPES
+    assert storage.viewable_content_type_for_filename("chart.svg") == (
+        "image/svg+xml",
+        "image",
+    )
+    assert "svg" in storage._VIEWABLE_CONTENT_TYPES
     # Surface 2: the durable-bundle extraction allowlist.
-    assert ".svg" not in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
-    # Both surfaces agree, and they agree on exclusion.
-    assert storage.svg_is_viewable() is False
-    # PDF, by contrast, is present on BOTH surfaces (added alongside the SVG
-    # exclusion, not replacing it) — the two allowlists stay in agreement.
+    assert ".svg" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    # Both surfaces agree, and they agree on inclusion.
+    assert storage.svg_is_viewable() is True
+    # PDF is still present on both surfaces.
     assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
     assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+
+
+def test_sanitize_svg_bytes_strips_script_and_events():
+    """sanitize_svg_bytes removes <script> elements, on* event attributes, and
+    javascript: hrefs, but preserves valid SVG geometry."""
+    # Script element (namespaced and bare) are removed.
+    svg_with_script = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<script>alert(1)</script>"
+        b"<rect width='10' height='10'/>"
+        b"</svg>"
+    )
+    result = storage.sanitize_svg_bytes(svg_with_script)
+    assert b"<script" not in result
+    assert b"alert" not in result
+    assert b"rect" in result  # geometry preserved
+
+    # on* event attributes are stripped.
+    svg_with_event = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<circle onclick='evil()' r='5'/>"
+        b"</svg>"
+    )
+    result2 = storage.sanitize_svg_bytes(svg_with_event)
+    assert b"onclick" not in result2
+    assert b"circle" in result2
+
+    # javascript: href is stripped.
+    svg_with_href = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<a href='javascript:alert(1)'><text>click</text></a>"
+        b"</svg>"
+    )
+    result3 = storage.sanitize_svg_bytes(svg_with_href)
+    assert b"javascript:" not in result3
+    assert b"text" in result3
+
+    # Malformed XML returns the original bytes unchanged (not an error).
+    bad = b"not xml at all <<< >>>"
+    assert storage.sanitize_svg_bytes(bad) == bad
+
+
+def test_sanitize_svg_bytes_strips_xhtml_namespaced_script():
+    """<script> inside <foreignObject> with XHTML namespace must be removed.
+
+    A bare _SVG_SCRIPT_TAGS set-lookup misses {xhtml}script — this test pins
+    the local-name matching fix so the bypass class stays closed.
+    """
+    xhtml_ns = "http://www.w3.org/1999/xhtml"
+    svg_ns = "http://www.w3.org/2000/svg"
+    # foreignObject with an XHTML-namespaced script inside.
+    payload = (
+        f'<svg xmlns="{svg_ns}" xmlns:xhtml="{xhtml_ns}">'
+        f"<foreignObject>"
+        f'<xhtml:script>alert(1)</xhtml:script>'
+        f"</foreignObject>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"script" not in result.lower()
+    assert b"alert" not in result
+    assert b"foreignObject" not in result  # entire foreignObject subtree dropped
+
+
+def test_sanitize_svg_bytes_strips_smil_href_animation():
+    """SMIL <animate> that rewrites href to javascript: must be removed.
+
+    Static-attribute checks miss runtime rewriting — this test pins the
+    animation-element fix so the vector stays closed.
+    """
+    svg_ns = "http://www.w3.org/2000/svg"
+    payload = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe"><text>click</text>'
+        f'<animate attributeName="href" to="javascript:alert(1)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"animate" not in result
+    assert b"javascript:" not in result
+    assert b"text" in result  # safe geometry preserved
+
+    # <set> variant
+    payload2 = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe">'
+        f'<set attributeName="href" to="javascript:alert(2)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result2 = storage.sanitize_svg_bytes(payload2)
+    assert b"set" not in result2 or b"javascript:" not in result2
+    assert b"javascript:" not in result2
+
+    # Clean SVG is returned as valid XML bytes.
+    clean = b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>"
+    sanitized = storage.sanitize_svg_bytes(clean)
+    assert b"rect" in sanitized
+    # Idempotent: sanitizing twice does not change the result further.
+    assert storage.sanitize_svg_bytes(sanitized) == sanitized
 
 
 def test_sanitize_viewable_basename_strips_traversal():
@@ -1202,3 +1304,55 @@ async def test_signable_viewable_set_matches_listed_set(
     assert resp2.status_code == 404, (
         "non-viewable-extension ComputeJobFile row must not be signable"
     )
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_manifest_uri_non_viewable_extension_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A URI in the viewable_files manifest whose filename has a non-viewable
+    extension (e.g. '.csv') is rejected 404 — the extension guard is symmetric
+    across both the manifest branch and the ComputeJobFile branch."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    # Inject a non-viewable URI directly into the manifest (bypassing
+    # write-time enforcement to simulate a bypass attempt or legacy data).
+    non_viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/metrics.csv"
+    )
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "metrics.csv",
+                "storage_uri": non_viewable_uri,
+                "content_type": "text/csv",
+                "size_bytes": 256,
+                "kind": "unknown",
+            }
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": non_viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404, (
+        "manifest URI with non-viewable extension must not be signable"
+    )
+    sign.assert_not_called()

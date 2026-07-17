@@ -313,6 +313,31 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
 
+# Explicit enumeration of every dimension written by _dual_write_dimension_results.
+# This constant is asserted == LEDGER_DIMENSION_KEYS at module load so any drift
+# between the spec list and the registry is caught at import time (no DB needed),
+# rather than only when _dual_write_dimension_results executes against a real session.
+_DUAL_WRITE_SPEC_DIMENSIONS: frozenset[str] = frozenset({
+    "ci",
+    "audit",
+    "test_erosion",
+    "smoketest",
+    "challenge",
+    "migration_identity",
+    "migration_apply",
+    "merge_grade",
+    "acceptance_window",
+    "debt_pressure",
+    "capability_proof",
+    "env_preflight",
+})
+assert _DUAL_WRITE_SPEC_DIMENSIONS == LEDGER_DIMENSION_KEYS, (
+    f"_DUAL_WRITE_SPEC_DIMENSIONS ({_DUAL_WRITE_SPEC_DIMENSIONS}) != "
+    f"LEDGER_DIMENSION_KEYS ({LEDGER_DIMENSION_KEYS}); "
+    f"extra: {_DUAL_WRITE_SPEC_DIMENSIONS - LEDGER_DIMENSION_KEYS}, "
+    f"missing: {LEDGER_DIMENSION_KEYS - _DUAL_WRITE_SPEC_DIMENSIONS}"
+)
+
 _NEVER_GRADED_GAP = (
     "No merge-grade verdict exists for this candidate — the acceptance contract "
     "was never graded (a merge-grade runs only for a version with a usable, "
@@ -4830,6 +4855,25 @@ async def _dual_write_dimension_results(
     else:  # enforce
         _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
 
+    # env_preflight ledger status (Slice 3, design 245212a4): mirror the deployed-
+    # side judge semantics used by the state resolver.  DARK by default → the judge
+    # is inert, so no manifest is scored and the row is ``unavailable``.  When the
+    # judge is enabled: a live boot-prereq block (boot_prereq_missing /
+    # boot_prereq_evidence_missing) surfaces via the composite blocker as
+    # ``blocked``; a recorded positive sub_score is ``passed``; a None score (no
+    # candidate manifest seen) is ``unavailable``.  env_preflight is MUTABLE — it is
+    # re-measured live every drive and its reused ledger row is never composed, so
+    # this spec always upserts the freshly-measured fact.
+    _epf_enabled = bool(base_record.get("env_preflight_enabled"))
+    _epf_blocker = _own_blocker({"boot_prereq_missing", "boot_prereq_evidence_missing"})
+    _epf_score = _score("env_preflight")
+    if _epf_blocker is not None:
+        _epf_status = "blocked"
+    elif _epf_enabled and _epf_score is not None and _epf_score > 0.0:
+        _epf_status = "passed"
+    else:
+        _epf_status = "unavailable"
+
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
@@ -4951,6 +4995,19 @@ async def _dual_write_dimension_results(
             "sub_score": None,
             "blocker": _own_blocker({"capability_proof_gate_blocked"}),
             "detail": _cp_detail,
+            "producing_task_id": None,
+        },
+        {
+            "dimension": "env_preflight",
+            "status": _epf_status,
+            # Presence-only sub_score, recorded only when the judge is enabled so a
+            # dark run carries no score into the ledger.
+            "sub_score": _epf_score if _epf_enabled else None,
+            "blocker": _epf_blocker,
+            # Slice 3 verdict blob: {required:[{name,scope}], missing:[names],
+            # deploy_target_scope} — presence-only, None when the judge was disabled
+            # or no candidate manifest was seen.
+            "detail": base_record.get("env_preflight_verdict"),
             "producing_task_id": None,
         },
     ]
@@ -8401,6 +8458,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
         "ci_not_green",
     }
 )
+
 
 async def _force_promote_locked(
     session: AsyncSession,

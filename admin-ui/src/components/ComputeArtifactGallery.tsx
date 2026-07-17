@@ -118,8 +118,9 @@ export function ComputeArtifactGallery({
   const liveOmTotal = (liveOm?.size_cap ?? 0) + (liveOm?.count_cap ?? 0);
   const terminalDropped = job.viewable_artifacts_dropped_count ?? 0;
   const omissionCount = isRunning ? liveOmTotal : terminalDropped;
+  const svgOmitted = job.viewable_artifacts_svg_omitted_count ?? 0;
 
-  if (artifacts.length === 0 && omissionCount <= 0) return null;
+  if (artifacts.length === 0 && omissionCount <= 0 && svgOmitted <= 0) return null;
 
   function omissionDetail(): string {
     if (liveOm) {
@@ -143,12 +144,23 @@ export function ComputeArtifactGallery({
       </div>
     ) : null;
 
-  // Every viewable file was dropped by the preview cap — surface the omitted
-  // note alone (no toggle, nothing to preview) rather than rendering nothing.
+  const svgOmittedNote =
+    svgOmitted > 0 ? (
+      <div
+        className="text-ui-xs text-amber-400/90 font-mono"
+        data-testid={`${testIdPrefix}-artifact-svg-omitted-note`}
+      >
+        {`${svgOmitted} SVG file${svgOmitted === 1 ? '' : 's'} not shown (SVG excluded for security — can execute script when served inline)`}
+      </div>
+    ) : null;
+
+  // Every viewable file was dropped by the preview cap or SVG exclusion —
+  // surface the note(s) alone rather than rendering nothing.
   if (artifacts.length === 0) {
     return (
       <div className="mt-1.5" data-testid={`${testIdPrefix}-artifact-gallery`}>
         {omittedNote}
+        {svgOmittedNote}
       </div>
     );
   }
@@ -167,6 +179,7 @@ export function ComputeArtifactGallery({
         </button>
       </div>
       {omittedNote}
+      {svgOmittedNote}
       {expanded && (
         <div className="flex flex-wrap gap-2">
           {artifacts.map((art) => {

@@ -521,4 +521,39 @@ describe('ComputeArtifactGallery', () => {
     expect(badges.length).toBe(1);
     expect(badges[0].textContent).toContain('LIVE');
   });
+
+  test('renders SVG-omitted notice when job has only SVG outputs', () => {
+    const { getByTestId, queryByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [], viewable_artifacts_svg_omitted_count: 2 })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-gallery')).toBeTruthy();
+    expect(getByTestId('drawer-artifact-svg-omitted-note').textContent).toContain('2 SVG files');
+    expect(getByTestId('drawer-artifact-svg-omitted-note').textContent).toContain('security');
+    // No previews to toggle.
+    expect(queryByTestId('drawer-artifact-gallery-toggle')).toBeNull();
+  });
+
+  test('renders SVG-omitted notice with singular copy for one SVG file', () => {
+    const { getByTestId } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [], viewable_artifacts_svg_omitted_count: 1 })}
+      />,
+    );
+    expect(getByTestId('drawer-artifact-svg-omitted-note').textContent).toContain('1 SVG file');
+    expect(getByTestId('drawer-artifact-svg-omitted-note').textContent).not.toContain('SVG files');
+  });
+
+  test('renders nothing when svg_omitted_count is 0 and no other artifacts', () => {
+    const { container } = render(
+      <ComputeArtifactGallery
+        projectId="proj-1"
+        job={makeJob({ viewable_artifacts: [], viewable_artifacts_svg_omitted_count: 0 })}
+      />,
+    );
+    expect(container.querySelector('[data-testid="drawer-artifact-gallery"]')).toBeNull();
+  });
 });

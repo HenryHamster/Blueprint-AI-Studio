@@ -93,6 +93,8 @@ from app.routers.admin_orchestrator_errors import (
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
 from app.routers.agent_resident_turn import router as agent_resident_turn_router
+from app.routers.agent_resident_artifacts import router as agent_resident_artifacts_router
+from app.routers.agent_resident_capabilities import router as agent_resident_capabilities_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_auth import router as admin_auth_router
@@ -113,7 +115,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0628"
+EXPECTED_SCHEMA_REVISION = "0631"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -955,6 +957,8 @@ app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
 app.include_router(agent_resident_turn_router)
+app.include_router(agent_resident_artifacts_router)
+app.include_router(agent_resident_capabilities_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)
@@ -1578,6 +1582,7 @@ async def resolve_artifact_download_url(
         allowed_uris: set[str] = set()
         if job and job.result_reference:
             allowed_uris.add(job.result_reference)
+        artifact = None
         if job and job.artifact_id is not None:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None and artifact.storage_uri:
@@ -1616,6 +1621,19 @@ async def resolve_artifact_download_url(
                 viewable_content_type_for_filename as _vctype,
             )
             if _vctype(cjf.safe_relpath) is None:
+                raise HTTPException(status_code=404, detail="Artifact not found")
+        elif storage_uri != (job.result_reference or "") and (
+            artifact is None or storage_uri != artifact.storage_uri
+        ):
+            # This URI came from the viewable_files manifest — apply the same
+            # extension guard that the manifest build path enforces at write time,
+            # making the check symmetric across both signing branches.
+            from app.storage import (
+                viewable_content_type_for_filename as _vctype2,
+            )
+
+            uri_basename = storage_uri.rsplit("/", 1)[-1]
+            if _vctype2(uri_basename) is None:
                 raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage

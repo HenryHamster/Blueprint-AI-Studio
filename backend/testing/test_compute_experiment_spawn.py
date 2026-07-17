@@ -4019,3 +4019,174 @@ async def test_resolve_project_default_container_image_none_project():
     from app.compute_backends import resolve_project_default_container_image
 
     assert await resolve_project_default_container_image(None, None) is None
+
+
+# ---------------------------------------------------------------------------
+# resolve_project_baked_image_strict — fail-CLOSED resolver used at dispatch
+# time. Unlike the fail-open helper, it returns an honest error when the
+# project declares a baked image name but no built, digest-pinned record
+# exists, so the dispatch path can terminal-fail the task instead of silently
+# running image-less on the host toolchain.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_no_image_declared(
+    db_session, mocker
+):
+    """A manifest with no compute.image.name returns (None, None) — no-op."""
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    project = Project(name="StrictNoImageManifest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {}},
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref is None
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_manifest_error_is_no_op(
+    db_session, mocker
+):
+    """A manifest-fetch exception (project has no manifest) returns (None, None).
+
+    We cannot distinguish 'declares no image' from 'manifest unreadable', so
+    we treat both as 'no image declared' — preserving image-less behavior for
+    projects without a .blueprint/tools.json.
+    """
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    project = Project(name="StrictManifestError", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("registry unreachable"),
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref is None
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_returns_pinned_ref_on_success(
+    db_session, mocker
+):
+    """Image declared + built ProjectComputeImage row → (pinned_ref, None)."""
+    from app.compute_backends import resolve_project_baked_image_strict
+    from app.models import ProjectComputeImage
+
+    project = Project(name="StrictSuccessProject", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    pinned_ref = "reg.example.com/org/repo/strict-proj@sha256:aabbccdd"
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="strict-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-strict",
+            tag="latest",
+            pinned_ref=pinned_ref,
+            digest="sha256:aabbccdd",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/strict-proj:latest"}
+            }
+        },
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref == pinned_ref, f"expected pinned_ref, got {ref!r}"
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_errors_when_no_build_record(
+    db_session, mocker
+):
+    """Image declared in manifest but no built ProjectComputeImage row → (None, reason).
+
+    This is the fail-CLOSED contract: a project that declares a baked image
+    must have it built before dispatch; running image-less is refused.
+    """
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    project = Project(name="StrictNoRecordProject", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/not-built-yet:latest"}
+            }
+        },
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref is None
+    assert error is not None
+    assert "not-built-yet" in error or "baked compute image" in error, (
+        f"error message should mention the image or the concept; got: {error!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_already_digest_pinned(
+    db_session, mocker
+):
+    """A manifest that already names a digest-pinned ref is accepted directly."""
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    project = Project(name="StrictAlreadyPinnedProject", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    already_pinned = "reg.example.com/org/repo/my-proj@sha256:deadbeef"
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={"compute": {"image": {"name": already_pinned}}},
+    )
+
+    ref, error = await resolve_project_baked_image_strict(db_session, project)
+    assert ref == already_pinned
+    assert error is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_project_baked_image_strict_none_project():
+    """A None project returns (None, None) — no-op, no raise."""
+    from app.compute_backends import resolve_project_baked_image_strict
+
+    ref, error = await resolve_project_baked_image_strict(None, None)
+    assert ref is None
+    assert error is None

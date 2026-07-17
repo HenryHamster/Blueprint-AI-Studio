@@ -17,6 +17,7 @@ from app.capability_registry import (
     off_registry_capability_refs,
     registry_capability_names,
 )
+from app.capability_execution_fence import stamp_capability_requirements
 from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_ADVISORY,
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
@@ -1409,6 +1410,15 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 _active_need = build_need(
                     _prereq.get("kind"), _prereq.get("ref"), label=_prereq.get("label")
                 )
+                # Durably record the capability prerequisite REGARDLESS of gate
+                # disposition (block or wire-edge) so the shared execution-authority
+                # fence re-grades this task-backed foundation at cold dispatch / warm
+                # claim even after the gate graduates off/observe -> enforce. No-op
+                # for a non-capability (task-kind) prereq. Survives generic retry
+                # (key excluded from FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+                if _active_need:
+                    stamp_capability_requirements(ct, [_active_need])
+                    session.add(ct)
                 if _active_need and task_backed_capability_need_blocked_by_proof_gate(
                     _active_need,
                     getattr(project, "capability_proof_records", None),
@@ -1475,12 +1485,24 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                 {"kind": need["kind"], "ref": need["ref"]},
             ]
             ct.context = context
+            # Durably stamp a task-backed capability prerequisite even when it
+            # resolved to an already-completed foundation, so the fence re-grades
+            # it at cold dispatch / warm claim if the gate later enforces and the
+            # foundation's platform proof is missing/revoked. No-op for task-kind.
+            stamp_capability_requirements(ct, [need])
             session.add(ct)
             continue
         if registry_satisfies_capability_need(need, _working_registry_caps):
             _disposition, _proof_status = spawn_capability_gate_disposition(
                 need, _working_registry_proof, mode=_proof_gate_mode
             )
+            # Durably record this capability prerequisite REGARDLESS of
+            # disposition so the shared execution-authority fence can re-grade it
+            # at cold dispatch / warm claim (proof current at admission may expire
+            # or be revoked before the subtask gains authority). Survives generic
+            # retry (key excluded from FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+            stamp_capability_requirements(ct, [need])
+            session.add(ct)
             if _disposition == "surface":
                 context = dict(ct.context or {})
                 context[SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY] = [

@@ -12,6 +12,10 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.artifact_refs import (
+    RESIDENT_ARTIFACT_REF_GRANTS_KEY,
+    RESIDENT_ARTIFACT_REF_GRANTS_MAX,
+)
 from app.models import (
     MessageSurface,
     Project,
@@ -25,6 +29,7 @@ from app.strategic_operation_authority_validation import (
     InactiveTurnAuthority,
     _validate_frozen_turn_lineage,
 )
+from app.strategic_resident_capabilities import compact_capability_catalog
 from app.strategic_resident_reference_validation import (
     validate_durable_ref_ownership,
 )
@@ -52,7 +57,7 @@ _REF_FIELDS = (
     "source_id",
     "label",
     "title",
-    "artifact_id",
+    "artifact_id", "artifact_ref_id",
     "tool_id",
     "message_id",
     "task_id",
@@ -64,7 +69,7 @@ _REF_FIELDS = (
     "created_at",
     "updated_at",
     "excerpt",
-    "retrieval_capability",
+    "retrieval",
     "attachment_id",
     "name",
     "mime_type",
@@ -80,7 +85,7 @@ _EVIDENCE_IDENTITY_FIELDS = frozenset(
         "id",
         "kind",
         "source_id",
-        "artifact_id",
+        "artifact_id", "artifact_ref_id",
         "tool_id",
         "message_id",
         "task_id",
@@ -200,6 +205,9 @@ def _project_revisioned_refs(
         identity_truncated = False
         for key in _REF_FIELDS:
             if item.get(key) is None:
+                continue
+            if key == "retrieval" and isinstance(item[key], Mapping):
+                projected[key] = {str(k)[:80]: _utf8_prefix(v, 512)[0] for k, v in list(item[key].items())[:8] if v is not None}
                 continue
             max_bytes = (
                 2_000
@@ -475,13 +483,50 @@ def _fit_provider_input(value: dict[str, Any]) -> dict[str, Any]:
     fit_limit = HARD_INPUT_BYTES - 1_024
     lane_context = value["lane_context"]
     messages = lane_context.get("recent_conversation") or []
+    window = lane_context["conversation_window"]
     evidence = value.get("evidence") or []
+
+    def _drop_message_evidence(sequence: Any) -> None:
+        if not isinstance(sequence, int):
+            return
+        evidence[:] = [
+            item
+            for item in evidence
+            if not (
+                isinstance(item, Mapping)
+                and item.get("source_message_sequence") == sequence
+            )
+        ]
+
+    # Historical context is expendable; frozen unhandled messages are not. Drop
+    # prior rows first and remove their duplicated evidence projections with them.
+    while (
+        len(_canonical_json(value)) > fit_limit
+        and messages
+        and not messages[0].get("is_unhandled")
+    ):
+        removed = messages.pop(0)
+        _drop_message_evidence(removed.get("sequence"))
+
+    # If the frozen unhandled range itself exceeds the provider budget, retain a
+    # contiguous prefix. Reconciliation advances only through represented_end and
+    # schedules the omitted tail as a successor, so never remove the oldest row.
     while len(_canonical_json(value)) > fit_limit and len(messages) > 1:
-        messages.pop(0)
-        lane_context["conversation_window"]["omitted_messages"] += 1
+        removed = messages.pop()
+        _drop_message_evidence(removed.get("sequence"))
+        if removed.get("is_unhandled"):
+            window["omitted_messages"] += 1
+        retained_unhandled = [
+            item for item in messages if item.get("is_unhandled")
+        ]
+        window["represented_end"] = (
+            int(retained_unhandled[-1]["sequence"])
+            if retained_unhandled
+            else None
+        )
     while len(_canonical_json(value)) > fit_limit and evidence:
         evidence.pop()
-        lane_context["conversation_window"]["omitted_unrevisioned_refs"] += 1
+        window["omitted_unrevisioned_refs"] += 1
     if len(_canonical_json(value)) > fit_limit:
         value["memory"]["working_strategy"] = {
             "content_hash": _sha256(value["memory"]["working_strategy"]),
@@ -499,6 +544,74 @@ def _fit_provider_input(value: dict[str, Any]) -> dict[str, Any]:
             size_bytes=len(encoded),
         )
     return value
+
+
+def _finalized_artifact_ref_grants(
+    provider_input: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Project exact ArtifactRef authority from the fitted provider context."""
+
+    raw_refs: list[Any] = []
+    lane_context = provider_input.get("lane_context")
+    lane_context = lane_context if isinstance(lane_context, Mapping) else {}
+    messages = lane_context.get("recent_conversation")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, Mapping):
+                continue
+            references = message.get("references")
+            if not isinstance(references, Mapping):
+                continue
+            for values in references.values():
+                if isinstance(values, list):
+                    raw_refs.extend(values)
+    evidence = provider_input.get("evidence")
+    if isinstance(evidence, list):
+        raw_refs.extend(evidence)
+
+    identities: set[uuid.UUID] = set()
+    for ref in raw_refs:
+        if not isinstance(ref, Mapping) or ref.get("artifact_ref_id") is None:
+            continue
+        try:
+            identities.add(uuid.UUID(str(ref["artifact_ref_id"])))
+        except (TypeError, ValueError):
+            raise InactiveTurnAuthority(
+                "Resident provider context contains an invalid ArtifactRef grant",
+                artifact_ref_id=str(ref.get("artifact_ref_id")),
+            ) from None
+    if len(identities) > RESIDENT_ARTIFACT_REF_GRANTS_MAX:
+        raise InactiveTurnAuthority(
+            "Resident provider context exceeds the ArtifactRef grant limit",
+            grant_count=len(identities),
+        )
+    return tuple(sorted(str(identity) for identity in identities))
+
+
+async def _replace_finalized_artifact_ref_grants(
+    session: AsyncSession,
+    *,
+    task: Task,
+    project_id: uuid.UUID,
+    provider_input: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Replace active-turn grants with the exact stable post-fit projection."""
+
+    grants = _finalized_artifact_ref_grants(provider_input)
+    await validate_durable_ref_ownership(
+        session,
+        [{"artifact_ref_id": identity} for identity in grants],
+        project_id=project_id,
+    )
+    context = dict(task.context or {})
+    if grants:
+        context[RESIDENT_ARTIFACT_REF_GRANTS_KEY] = list(grants)
+    else:
+        context.pop(RESIDENT_ARTIFACT_REF_GRANTS_KEY, None)
+    if context != (task.context or {}):
+        task.context = context
+        session.add(task)
+    return grants
 
 
 async def reconstruct_authoritative_turn_input(
@@ -630,14 +743,7 @@ async def reconstruct_authoritative_turn_input(
         ),
         "capabilities": {
             "mode": "typed_project_scoped_only",
-            "allowed": [
-                "project_inspect",
-                "task_inspect",
-                "pr_inspect",
-                "ci_inspect",
-                "deployment_inspect",
-                "resident_operation",
-            ],
+            "catalog": compact_capability_catalog(),
             "ambient_shell": False,
             "ambient_credentials": False,
             "repository_write": False,
@@ -652,7 +758,17 @@ async def reconstruct_authoritative_turn_input(
         },
     }
     result = _fit_provider_input(result)
+    result["lineage"]["conversation_hash"] = _sha256(
+        result["lane_context"]["recent_conversation"]
+    )
     result["lineage"]["evidence_hash"] = _sha256(result["evidence"])
+    finalized_grants = await _replace_finalized_artifact_ref_grants(
+        session,
+        task=task,
+        project_id=project_id,
+        provider_input=result,
+    )
+    result["lineage"]["artifact_ref_grants_hash"] = _sha256(finalized_grants)
     hash_projection = {
         **result,
         "lineage": {

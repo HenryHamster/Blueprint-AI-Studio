@@ -37,6 +37,7 @@ from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
+from app.deployed_sha import get_serving_sha
 
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
@@ -924,12 +925,14 @@ async def _handle_infra_failure(
         and qual.get("candidate_sha")
         and previous_candidate_sha != qual.get("candidate_sha")
     )
+    engine_sha = get_serving_sha()
     prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
     attempt_entry = {
         "finalized_at": finalized_at,
         "error": infra_error,
         "signature": signature,
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "failing_leg": _infer_infra_leg(infra_error),
         "child_failures": child_failures,
     }
@@ -966,9 +969,6 @@ async def _handle_infra_failure(
         "attempt": attempt_entry,
         "attempt_history": attempt_history,
     }
-    hotfix_preview: dict[str, Any] | None = None
-    if hotfix_preview is not None:
-        infra_evidence["hotfix_preview"] = hotfix_preview
 
     # Per-dimension failure isolation (Phase 1): infer WHICH dimension the infra
     # failure belongs to so only that (candidate_sha, dimension) ledger fact is
@@ -981,6 +981,7 @@ async def _handle_infra_failure(
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
@@ -1004,8 +1005,6 @@ async def _handle_infra_failure(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
     }
-    if hotfix_preview is not None:
-        record["hotfix_preview"] = hotfix_preview
     version.last_qualification = record
     flag_modified(version, "last_qualification")
     release_version.set_version_phase(
@@ -1041,12 +1040,13 @@ async def _handle_infra_failure(
         else None
     )
 
+    hotfix_preview: dict[str, Any] | None = None
     if is_permanent_gate_incapacity:
         # Make the sanctioned remediation concrete at the point incapacity is
         # declared.  This is read-only and deliberately best-effort: inability
         # to preview must not turn a held release into a promotion.
         try:
-            hotfix_preview = await _release_qualifier_module().check_hotfix_preview(
+            hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
             )
         except Exception:  # noqa: BLE001 — remediation guidance is best-effort
@@ -1055,6 +1055,12 @@ async def _handle_infra_failure(
                 version.version_number,
                 exc_info=True,
             )
+        # Persist the hotfix eligibility preview into the qualification record so
+        # post-mortem analysis can see the eligible changes without re-computing.
+        if hotfix_preview and hotfix_preview.get("eligible"):
+            infra_evidence["hotfix_preview"] = hotfix_preview
+            record["hotfix_preview"] = hotfix_preview
+            flag_modified(version, "last_qualification")
 
     # Phase 1b read: compose already-resolved dimension facts from the per-dimension
     # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
@@ -1102,7 +1108,7 @@ async def _handle_infra_failure(
                 f"{preview_text}Sanctioned remediation: use the hotfix scope "
                 f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
                 f"not whole-tree force-promotion. "
-                f"Signature: {signature}."
+                f"Signature: {signature}. Engine: {engine_sha or 'unknown'}."
             )
         else:
             alert_message = (
@@ -1150,7 +1156,7 @@ async def _handle_infra_failure(
             f"will not self-resolve by retry. "
             f"Use the sanctioned hotfix scope preview and endpoint "
             f"(POST /projects/{{id}}/promote/hotfix), not whole-tree force-promotion."
-            f"{preview_text}"
+            f"{preview_text} Engine: {engine_sha or 'unknown'}."
         )
     else:
         notify_message = (
@@ -1222,12 +1228,17 @@ async def _handle_infra_failure(
     return {
         "status": "infra_failure",
         "error": infra_error,
+        "engine_sha": engine_sha,
         "infra_failure_signature": signature,
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
         "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
         "same_signature_streak": same_signature_streak,
+
+        # Hotfix scope preview (present only when is_permanent_gate_incapacity
+        # and the preview computation succeeded with an eligible result).
+        "hotfix_preview": hotfix_preview,
 
         # Per-dimension isolation (Phase 1): which single dimension was marked
         # unavailable, and that dimension's own infra-error streak (distinct from

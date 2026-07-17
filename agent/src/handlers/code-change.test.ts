@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
@@ -48,7 +49,6 @@ import {
   prepareTaskWorkBranch,
 } from '../task-checkpoint.js';
 import { writePrHelper } from '../prompts/pr-helper.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {

@@ -36,9 +36,9 @@ class QualificationDimension:
         key: The stable dimension identifier written to the ledger / read model.
         label: Human-facing label surfaced by the read model.
         ledger_backed: Whether the dimension is dual-written as its own
-            ``QualificationDimensionResult`` ledger row.  The three blob-only
-            dimensions (``criterion_coverage``, ``goal_alignment``,
-            ``env_preflight``) are derived live from ``last_qualification``.
+            ``QualificationDimensionResult`` ledger row.  The two blob-only
+            dimensions (``criterion_coverage``, ``goal_alignment``) are derived
+            live from ``last_qualification``.
         promotion_required: Whether a terminal same-``candidate_sha`` fact for
             this dimension is required before a promotion may compose from the
             ledger.  (``smoketest`` is required only when the run had it enabled
@@ -120,9 +120,16 @@ QUALIFICATION_DIMENSIONS: tuple[QualificationDimension, ...] = (
         ledger_backed=True,
         blocker_codes=("capability_proof_gate_blocked",),
     ),
+    # env_preflight is environment-dependent, not candidate-stable: an operator
+    # repairing the deploy environment (or arming the supported one-shot
+    # boot-prereq acknowledgement) must take effect on a same-candidate re-drive.
+    # It is therefore ``mutable`` — re-measured live each drive, its reused ledger
+    # row never composed or overlaid — so a prior boot_prereq failure cannot be
+    # reused/overlaid after the environment is fixed.
     QualificationDimension(
         "env_preflight", "Env Preflight",
-        blocker_codes=("boot_prereq_missing",),
+        ledger_backed=True, mutable=True,
+        blocker_codes=("boot_prereq_missing", "boot_prereq_evidence_missing"),
     ),
 )
 

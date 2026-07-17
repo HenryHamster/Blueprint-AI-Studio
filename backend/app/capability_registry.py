@@ -257,8 +257,16 @@ def working_capability_names(problem_model: object) -> set[str]:
     spawn-time resolver (``research_completion``) and the blocked-resume matcher
     (``reaper_sweeps``) consume this set via
     :func:`registry_satisfies_capability_need`, so neither needs its own edit.
+
+    Platform-owned capabilities (``PLATFORM_WORKING_CAPABILITIES``) are always
+    included regardless of the project model, mirroring the demand filter in
+    :mod:`app.capability_demand`. Without this, a prerequisite naming a platform
+    capability is blocked at both spawn and blocked-resume while the demand
+    surface suppresses it — a permanent, invisible block with no repair path.
     """
-    working: set[str] = set()
+    # Platform capabilities are always working — include them first so the
+    # project model can only add to this set, never subtract.
+    working: set[str] = set(PLATFORM_WORKING_CAPABILITIES)
     for raw_name, status, absorbs in _iter_capability_entries(problem_model):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue

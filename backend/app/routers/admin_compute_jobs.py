@@ -387,6 +387,9 @@ async def _build_compute_job_payload(
         data["viewable_artifacts_dropped_count"] = int(
             pm.get("viewable_files_dropped") or 0
         )
+        svg_excl = pm.get("viewable_files_svg_excluded")
+        if isinstance(svg_excl, int) and svg_excl > 0:
+            data["viewable_artifacts_svg_omitted_count"] = svg_excl
         # Live omissions reported by the runner while the job is still RUNNING.
         # Contains the count of unique relpaths skipped due to per-kind size cap
         # ("size_cap") or 25-file count cap ("count_cap"). Absent or null for
@@ -674,21 +677,29 @@ async def get_project_awaiting_local_runner_holds(
     return [_awaiting_local_runner_entry(task, runner_map) for task in rows]
 
 
+_SUMMARY_WINDOW_DAYS = 90
+
+
 @router.get("/projects/{project_id}/compute-jobs/summary")
 async def get_project_compute_jobs_aggregate_summary(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return aggregate summary over ALL compute jobs for a project (viewer+).
+    """Return aggregate summary over recent compute jobs for a project (viewer+).
 
-    Unlike the list endpoint, this endpoint is not capped by include_finished_minutes
-    and covers the project's full history — suitable for cumulative experiment totals.
+    Stats are bounded to the last 90 days to avoid full-history table scans on
+    large projects.  The response also includes ``total_jobs_all_time`` — a
+    lightweight COUNT(*) over the project's full history — so callers retain
+    access to the cumulative figure without paying for a full aggregate scan.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    return await aggregate_all_compute_jobs_summary(session, project_id=project_id)
+    since = datetime.now(tz=timezone.utc) - timedelta(days=_SUMMARY_WINDOW_DAYS)
+    return await aggregate_all_compute_jobs_summary(
+        session, project_id=project_id, since=since
+    )
 
 
 # ── GPU contamination audit ───────────────────────────────────────────────────

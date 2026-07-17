@@ -830,6 +830,9 @@ async def create_operator_project_message(
                 from app.strategic_resident_runtime import (
                     coalesce_resident_turn,
                 )
+                from app.artifact_refs import (
+                    artifact_ref_grants_from_message_context,
+                )
 
                 resident_wake = await coalesce_resident_turn(
                     session,
@@ -839,6 +842,9 @@ async def create_operator_project_message(
                     message_sequence=next_sequence,
                     locked_resident=locked_resident,
                     prelocked_tasks=locked_turn_tasks,
+                    artifact_ref_grants=artifact_ref_grants_from_message_context(
+                        message_context
+                    ),
                 )
         except Exception as exc:
             # The outer Resident lock survives SAVEPOINT rollback, so ownership

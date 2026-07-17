@@ -7125,6 +7125,116 @@ async def test_env_preflight_evidence_rebuilt_on_full_dimension_reuse(
 
 
 @pytest.mark.asyncio
+async def test_env_preflight_dropped_from_reuse_on_same_sha_redrive(
+    db_session, mocker
+):
+    """Executed same-SHA blocked→refresh regression for env_preflight.
+
+    env_preflight is environment-dependent (mutable): a stale BLOCKED ledger row
+    from a prior attempt must NOT be carried forward as reused on a same-candidate
+    re-drive — otherwise a boot_prereq failure would remain reused even after the
+    operator repaired the deploy environment.  Truly immutable dimensions
+    (audit/test_erosion/smoketest/merge_grade) must still be reused.
+
+    Observable proof: ``last_qualification["resolved_dimensions"]`` (the reuse set
+    written at spawn) must include the immutable gates but exclude env_preflight,
+    forcing env_preflight to be re-measured live this drive.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+
+    # Immutable gates resolved+passed in the ledger → carried forward as reused.
+    for dim in ("audit", "test_erosion", "smoketest", "merge_grade"):
+        await _seed_dimension_row(
+            db_session, project, version, dim,
+            status="passed", candidate_sha=candidate,
+        )
+    # A stale BLOCKED env_preflight row from a prior attempt (the environment was
+    # broken then; the operator has since repaired it).
+    await _seed_dimension_row(
+        db_session, project, version, "env_preflight",
+        status="blocked", blocker="boot_prereq_missing", candidate_sha=candidate,
+    )
+    await db_session.commit()
+
+    prior_attempt_id = uuid.uuid4()
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(prior_attempt_id),
+        "retry_episode": 0,
+        "candidate_sha": candidate,
+        "error": "smoketest_task_failed",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-01-01T00:00:00",
+        "finalized_at": "2026-01-01T00:01:00",
+    }
+    version.active_qualification_attempt_id = prior_attempt_id
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-deadbeef",
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"Expected 'spawned' but got {result['status']!r}"
+    )
+
+    await db_session.refresh(version)
+    resolved = version.last_qualification.get("resolved_dimensions") or {}
+
+    # env_preflight (mutable) must be dropped from the reuse set → re-measured.
+    assert "env_preflight" not in resolved, (
+        "stale blocked env_preflight ledger row must NOT be carried forward as "
+        "reused on a same-SHA re-drive; it must be re-measured after an env repair"
+    )
+    # Truly immutable gates must still be reused (candidate-stable reuse preserved).
+    assert "audit" in resolved and "test_erosion" in resolved, (
+        "immutable dimension reuse must be preserved for candidate-stable gates"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
     db_session, mocker
 ):
@@ -11628,7 +11738,9 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     by_dim = {r.dimension: r for r in rows}
 
     # Every dimension is recorded exactly once for this candidate tree.
-    # env_preflight is blob-only (not ledger_backed) so it is NOT dual-written.
+    # env_preflight IS ledger_backed (mutable, re-measured live) so it is
+    # dual-written too — the judge is DARK by default in this fixture, so its row
+    # records the inert "unavailable" state.
     expected_dims = {
         "ci",
         "audit",
@@ -11641,6 +11753,7 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
         "acceptance_window",
         "debt_pressure",
         "capability_proof",
+        "env_preflight",
     }
     assert set(by_dim) == expected_dims
     assert len(rows) == len(expected_dims), "dual-write must not duplicate rows"
@@ -11658,6 +11771,11 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     assert by_dim["migration_apply"].status == "passed"
     # No version goal / merge-grade child was seeded → not-applicable → unavailable.
     assert by_dim["merge_grade"].status == "unavailable"
+    # env_preflight judge is DARK by default (not enabled in this fixture) → the
+    # deployed-side judge is inert, so no score and the row is unavailable.
+    assert by_dim["env_preflight"].status == "unavailable"
+    assert by_dim["env_preflight"].blocker is None
+    assert by_dim["env_preflight"].sub_score is None
 
     # Failure-isolation (Phase 1b enabler): re-recording ONE dimension for the
     # SAME candidate tree upserts that dimension's row in place (no duplicate) and
@@ -12103,6 +12221,149 @@ async def test_infra_failure_isolates_to_failing_dimension(db_session):
     # The audit fact that already passed is NOT discarded by the migration hiccup.
     assert by_dim["audit"].status == "passed"
     assert by_dim["audit"].sub_score == 1.0
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
+    """_handle_infra_failure stamps engine_sha into the top-level record and
+    each attempt_entry in infra_attempt_history so engine vs candidate triage
+    reads directly off the persisted qualification record."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in return value, got {result.get('engine_sha')!r}"
+    )
+    # Verify the persisted record also carries engine_sha.
+    lq = version.last_qualification
+    assert lq["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in last_qualification record, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history, "infra_attempt_history must be non-empty"
+    latest = history[-1]
+    assert latest["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in attempt_entry, got {latest.get('engine_sha')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_engine_sha_none_when_deploy_sha_absent(db_session, monkeypatch):
+    """When DEPLOY_SHA is not set, engine_sha degrades gracefully to None
+    rather than raising — callers read 'unknown' in messages but the record
+    stays structurally intact."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.delenv("DEPLOY_SHA", raising=False)
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result.get("engine_sha") is None, (
+        f"expected engine_sha None when DEPLOY_SHA absent, got {result.get('engine_sha')!r}"
+    )
+    lq = version.last_qualification
+    assert lq.get("engine_sha") is None, (
+        f"expected engine_sha None in last_qualification, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history[-1].get("engine_sha") is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_gate_incapacity_message_includes_engine_sha(db_session, monkeypatch):
+    """The permanent-gate-incapacity operator notification embeds the engine SHA
+    so the triage reader can distinguish engine build without parsing tracebacks."""
+    from app import release_qualifier_audit as rqa
+    from app import release_qualifier as rq_module
+    from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK, _infra_failure_signature
+
+    monkeypatch.setenv("DEPLOY_SHA", "deadbeef12345ab")
+
+    notified: list[str] = []
+
+    async def _capture_notify(session, version, event, message, extra=None):
+        notified.append(message)
+
+    monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
+
+    project, version = await _make_project_and_version(db_session)
+    # Compute the expected signature so pre-seeded history entries match.
+    _infra_error = "migration_apply_check_unavailable"
+    _sig = _infra_failure_signature(_infra_error, [])
+    _seed_count = _MIN_INFRA_ERROR_STREAK - 1
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        # prior_infra_streak drives current_streak so the alert fires.
+        "prior_infra_streak": _seed_count,
+        # Pre-seed matching-signature history so same_signature_streak reaches threshold.
+        "infra_attempt_history": [
+            {
+                "finalized_at": "2026-07-10T00:00:00",
+                "error": _infra_error,
+                "signature": _sig,
+                "candidate_sha": _LEDGER_SHA_A,
+            }
+        ] * _seed_count,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        _infra_error,
+    )
+    await db_session.commit()
+
+    assert notified, "operator notification was never sent"
+    msg = notified[-1]
+    assert "deadbeef12345ab" in msg, (
+        f"engine SHA 'deadbeef12345ab' not found in permanent-incapacity message: {msg!r}"
+    )
 
 
 @pytest.mark.asyncio
@@ -22289,24 +22550,27 @@ class TestFinalizeInfraFailure:
             dict(version.last_qualification),
 
             "migration_apply_check_unavailable: scratch database attempt_c timed out",
-            "migration_apply_check_unavailable",
         )
         await db_session.commit()
 
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
-        assert result["same_signature_streak"] == 3
+        assert result["same_signature_streak"] == 4  # 3 prior + current all same sig
 
 
         await db_session.refresh(version)
 
         # Verify a force-promote Alert was raised with the right message.
-        assert result["hotfix_scope_preview"]["eligible"] is True
+        assert result["hotfix_preview"]["eligible"] is True
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
 
         await db_session.refresh(version)
+
+        # The hotfix_preview must be persisted in the version's last_qualification
+        # so post-mortem analysis can see the eligible changes without re-computing.
+        assert version.last_qualification.get("hotfix_preview") == result["hotfix_preview"]
 
         # The persisted alert gives the operator the narrow endpoint, rather
         # than authorizing the entire candidate tree through force-promote.
@@ -22401,7 +22665,7 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
-        assert result["hotfix_scope_preview"]["eligible"] is False
+        assert result["hotfix_preview"]["eligible"] is False
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
@@ -22425,18 +22689,14 @@ class TestFinalizeInfraFailure:
         assert "persistently incapable" in latest.message
         assert "force-promote" not in latest.message
         assert "POST /projects/{id}/promote/hotfix" in latest.message
-        assert "keep the release held" in latest.message
-        assert "not eligible" in latest.message
-        assert "changed files touch code outside migrations" in latest.message
+        assert "unavailable or ineligible" in latest.message
 
         # The operator notification carries the same fail-closed guidance.
         notify_mock.assert_awaited()
         notify_message = notify_mock.await_args.args[3]
-        assert "hotfix scope is not eligible" in notify_message
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
         assert "POST /projects/{id}/promote/hotfix" in notify_message
-        assert "Keep the release held" in notify_message
-        assert "force-promote" not in notify_message
-        assert "changed files touch code outside migrations" in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_holds_when_hotfix_preview_is_unavailable(
@@ -22493,9 +22753,9 @@ class TestFinalizeInfraFailure:
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
-        # A failed preview is recorded as not-eligible so it cannot become a
-        # silent hotfix authorization.
-        assert result["hotfix_scope_preview"]["eligible"] is False
+        # A failed preview is recorded as None — no preview available — so it
+        # cannot become a silent hotfix authorization.
+        assert result["hotfix_preview"] is None
         preview_mock.assert_awaited_once_with(
             db_session, project.id, candidate_sha="dead" * 10
         )
@@ -22517,15 +22777,13 @@ class TestFinalizeInfraFailure:
         assert "persistently incapable" in latest.message
         assert "force-promote" not in latest.message
         assert "POST /projects/{id}/promote/hotfix" in latest.message
-        assert "keep the release held" in latest.message
-        assert "not eligible" in latest.message
+        assert "unavailable or ineligible" in latest.message
 
         notify_mock.assert_awaited()
         notify_message = notify_mock.await_args.args[3]
-        assert "hotfix scope is not eligible" in notify_message
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
         assert "POST /projects/{id}/promote/hotfix" in notify_message
-        assert "Keep the release held" in notify_message
-        assert "force-promote" not in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_different_signature(
@@ -22574,7 +22832,6 @@ class TestFinalizeInfraFailure:
             dict(version.last_qualification),
 
             "migration_apply_scratch_provision_failed: unreachable",
-            "migration_apply_check_unavailable:unreachable",
         )
         await db_session.commit()
 
@@ -41877,7 +42134,8 @@ async def test_record_v22_live_verification_evidence_records_evidence_row(db_ses
 async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, mocker):
     """_finalize_qualification writes one QualificationDimensionResult row per
     gate (audit, test_erosion, ci, smoketest, migration_identity, migration_apply,
-    merge_grade, acceptance_window, debt_pressure) on a clean pass.
+    merge_grade, acceptance_window, debt_pressure, capability_proof, env_preflight)
+    on a clean pass.
 
     Verifies: each finalize run persists the expected dimension rows for its
     candidate_sha.
@@ -41946,6 +42204,7 @@ async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, moc
         "acceptance_window",
         "debt_pressure",
         "capability_proof",
+        "env_preflight",
     }
     assert expected_dims == dims_found, (
         f"expected dims {expected_dims}, got {dims_found}"

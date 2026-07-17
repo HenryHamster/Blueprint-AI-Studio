@@ -324,7 +324,7 @@ def test_registry_capability_names_canonicalize_problem_model_names():
 
 
 def test_working_capability_names_only_working_status():
-    from app.capability_registry import working_capability_names
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES, working_capability_names
 
     model = ProblemModel(
         capabilities=[
@@ -334,8 +334,35 @@ def test_working_capability_names_only_working_status():
         ]
     )
 
-    assert working_capability_names(model) == {"seeded-evaluation-harness"}
-    assert working_capability_names(None) == set()
+    # Platform capabilities are always included regardless of the project model.
+    assert working_capability_names(model) == {"seeded-evaluation-harness"} | PLATFORM_WORKING_CAPABILITIES
+    assert working_capability_names(None) == PLATFORM_WORKING_CAPABILITIES
+
+
+def test_working_capability_names_includes_platform_capabilities():
+    """Platform capabilities resolve at spawn/resume so they can never produce
+    a permanently-blocked-but-demand-suppressed prerequisite."""
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES, working_capability_names
+
+    # Even with no project model, every platform capability is returned.
+    result = working_capability_names(None)
+    assert PLATFORM_WORKING_CAPABILITIES.issubset(result), (
+        f"Platform capabilities missing from working set: "
+        f"{PLATFORM_WORKING_CAPABILITIES - result}"
+    )
+
+    # A model with no capabilities still returns the full platform set.
+    empty_model = ProblemModel(capabilities=[])
+    assert PLATFORM_WORKING_CAPABILITIES.issubset(working_capability_names(empty_model))
+
+    # A capability need naming a platform capability resolves as satisfied.
+    from app.capability_registry import registry_satisfies_capability_need
+
+    for cap in PLATFORM_WORKING_CAPABILITIES:
+        need = {"kind": "capability", "ref": cap}
+        assert registry_satisfies_capability_need(need, working_capability_names(None)), (
+            f"Platform capability '{cap}' not resolved by registry_satisfies_capability_need"
+        )
 
 
 def test_registry_satisfies_capability_need_matches_working_only():
@@ -466,9 +493,14 @@ def test_proof_aware_resolver_returns_unproven_for_unproven_capability():
     assert registry_satisfies_capability_need(
         need, working_capability_names(model)
     )
-    # The map keys are exactly the working-capability name set the boolean check
-    # consumes — the invariant the sweep relies on to fetch once and serve both.
-    assert set(proof) == working_capability_names(model)
+    # The proof map covers the project-model working set; working_capability_names
+    # additionally includes PLATFORM_WORKING_CAPABILITIES (always resolved, no
+    # per-project evidence needed), so platform caps are a subset of the name set
+    # but not necessarily in the proof map.
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES
+
+    assert set(proof).issubset(working_capability_names(model))
+    assert working_capability_names(model) - set(proof) == PLATFORM_WORKING_CAPABILITIES
 
 
 def test_proof_aware_resolver_no_match_cases_return_none():

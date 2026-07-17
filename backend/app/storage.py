@@ -16,6 +16,9 @@ import logging
 import asyncio
 import json
 import threading
+import time
+import xml.etree.ElementTree as _ET
+from dataclasses import dataclass
 import google.auth
 from google.auth.transport.requests import Request as _GoogleAuthRequest
 from google.cloud import storage
@@ -24,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
+ARTIFACT_REF_OBJECT_ROOT = "artifact-refs"
+ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS = 30
+ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS = 60
+ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS = 2
+ARTIFACT_REF_CLEANUP_RETRY_DEADLINE_SECONDS = 3
+ARTIFACT_REF_CLEANUP_BATCH_SIZE = 8
+ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS = 2
+ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS = 3
 
 # Merged helpers from both sides:
 # A gs:// URI is gs://<bucket>/<object>. Buckets allow lowercase letters,
@@ -270,6 +281,7 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
 
     def _delete() -> None:
         from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
 
         blob = (
             storage.Client(project=GCP_PROJECT_ID)
@@ -277,7 +289,12 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
             .blob(object_name)
         )
         try:
-            blob.delete()
+            blob.delete(
+                timeout=ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS,
+                retry=DEFAULT_RETRY.with_deadline(
+                    ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS
+                ),
+            )
         except _gexc.NotFound:
             pass
 
@@ -287,6 +304,286 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
         logger.warning("Failed to delete storage object %s", object_name, exc_info=True)
         return False
     return True
+
+
+def artifact_ref_render_object_name(
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+) -> str:
+    """Return the immutable, project-cleanable object name for a board render."""
+
+    return (
+        f"{ARTIFACT_REF_OBJECT_ROOT}/{project_id}/{tool_id}/"
+        f"{int(revision)}/{attachment_id}.png"
+    )
+
+
+def artifact_ref_render_uri(
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+) -> str:
+    return (
+        f"gs://{ARTIFACT_BUCKET_NAME}/"
+        f"{artifact_ref_render_object_name(project_id, tool_id, revision, attachment_id)}"
+    )
+
+
+@dataclass(frozen=True)
+class ArtifactRefRenderPromotion:
+    storage_uri: str
+    created: bool
+    generation: int
+
+
+async def promote_artifact_ref_render(
+    source_storage_uri: str,
+    *,
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> ArtifactRefRenderPromotion:
+    """Idempotently copy and verify a rendered board outside database locks.
+
+    The destination identity includes the upload receipt. Retries reconcile an
+    uncertain copy by exact-verifying an existing object; they never overwrite
+    or delete it. The source must be the exact project-scoped receipt prefix;
+    callers still revalidate the receipt row under lock before committing.
+    """
+
+    bucket_name, source_name = parse_artifact_uri(source_storage_uri)
+    source_prefix = f"message-attachments/{project_id}/{attachment_id}/"
+    if not source_name.startswith(source_prefix) or "/" in source_name[
+        len(source_prefix) :
+    ]:
+        raise StorageUriError("render source does not match its project upload receipt")
+    if expected_size_bytes < 1:
+        raise StorageUriError("render source has invalid expected size")
+    checksum = str(expected_sha256 or "").strip().lower()
+    if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise StorageUriError("render source has invalid SHA-256")
+    destination_name = artifact_ref_render_object_name(
+        project_id, tool_id, revision, attachment_id
+    )
+
+    def _promote_and_verify() -> tuple[bool, int]:
+        import hashlib
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(bucket_name)
+
+        def _verify(blob) -> int | None:
+            blob.reload(timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry)
+            if int(blob.size or -1) != int(expected_size_bytes):
+                raise StorageUriError("rendered image size does not match its receipt")
+            digest = hashlib.sha256()
+            with blob.open(
+                "rb",
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            ) as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() != checksum:
+                raise StorageUriError(
+                    "rendered image checksum does not match its receipt"
+                )
+            if blob.generation is None:
+                raise StorageUriError("rendered image generation is unavailable")
+            return int(blob.generation)
+
+        destination = bucket.blob(destination_name)
+        try:
+            return False, int(_verify(destination))
+        except _gexc.NotFound:
+            pass
+
+        source = bucket.blob(source_name)
+        source_generation = _verify(source)
+        try:
+            copied = bucket.copy_blob(
+                source,
+                bucket,
+                destination_name,
+                if_source_generation_match=source_generation,
+                if_generation_match=0,
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+            generation = copied.generation
+            if generation is None:
+                generation = _verify(destination)
+            return True, int(generation)
+        except (_gexc.Conflict, _gexc.PreconditionFailed) as exc:
+            # A same-identity retry may find the exact durable object already
+            # present. Verify and reuse it; never overwrite or delete it.
+            try:
+                generation = _verify(destination)
+            except _gexc.NotFound:
+                raise StorageUriError(
+                    "render source changed during durable promotion"
+                ) from exc
+            return False, int(generation)
+
+    created, generation = await asyncio.to_thread(_promote_and_verify)
+    return ArtifactRefRenderPromotion(
+        storage_uri=f"gs://{bucket_name}/{destination_name}",
+        created=created,
+        generation=generation,
+    )
+
+
+async def inspect_artifact_ref_render_candidate(
+    storage_uri: str,
+    *,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> int | None:
+    """Return the exact candidate generation, or ``None`` when absent."""
+
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+    checksum = str(expected_sha256 or "").strip().lower()
+    if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise StorageUriError("render candidate has invalid SHA-256")
+
+    def _inspect() -> int | None:
+        import hashlib
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        try:
+            blob.reload(timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry)
+        except _gexc.NotFound:
+            return None
+        if int(blob.size or -1) != int(expected_size_bytes):
+            raise StorageUriError("render candidate size mismatch")
+        digest = hashlib.sha256()
+        with blob.open(
+            "rb", timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry
+        ) as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != checksum:
+            raise StorageUriError("render candidate checksum mismatch")
+        if blob.generation is None:
+            raise StorageUriError("render candidate generation is unavailable")
+        return int(blob.generation)
+
+    return await asyncio.to_thread(_inspect)
+
+
+async def delete_artifact_ref_render_candidate(
+    storage_uri: str,
+    *,
+    generation: int,
+) -> bool:
+    """Delete only the exact observed candidate generation."""
+
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+
+    def _delete() -> bool:
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        try:
+            blob.delete(
+                if_generation_match=int(generation),
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+        except _gexc.NotFound:
+            return False
+        return True
+
+    return await asyncio.to_thread(_delete)
+
+
+async def delete_artifact_ref_project_prefix_best_effort(
+    project_id: uuid.UUID,
+    *,
+    max_objects: int = ARTIFACT_REF_CLEANUP_BATCH_SIZE,
+    max_seconds: float = 30.0,
+) -> dict[str, object]:
+    """Drain one deleted project's retained renders under hard safety bounds."""
+
+    prefix = f"{ARTIFACT_REF_OBJECT_ROOT}/{project_id}/"
+
+    def _delete_prefix() -> tuple[int, bool]:
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_CLEANUP_RETRY_DEADLINE_SECONDS)
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        deadline = time.monotonic() + max(0.1, float(max_seconds))
+        batch_size = max(1, min(ARTIFACT_REF_CLEANUP_BATCH_SIZE, int(max_objects)))
+        blobs = list(
+            storage_client.list_blobs(
+                bucket,
+                prefix=prefix,
+                max_results=batch_size + 1,
+                timeout=ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+        )
+        if not blobs:
+            return 0, True
+        deleted = 0
+        for blob in blobs[:batch_size]:
+            if time.monotonic() >= deadline:
+                return deleted, False
+            blob.delete(
+                timeout=ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+            deleted += 1
+        return deleted, len(blobs) <= batch_size
+
+    try:
+        deleted, complete = await asyncio.to_thread(_delete_prefix)
+    except Exception:
+        logger.warning(
+            "ArtifactRef project cleanup is unknown; reconciliation required",
+            extra={
+                "event": "artifact_ref_cleanup_unknown",
+                "project_id": str(project_id),
+                "object_prefix": prefix,
+            },
+            exc_info=True,
+        )
+        return {
+            "deleted": 0,
+            "complete": False,
+            "reconciliation_required": True,
+        }
+    if not complete:
+        logger.warning(
+            "ArtifactRef project cleanup reached its bound; reconciliation required",
+            extra={
+                "event": "artifact_ref_cleanup_reconciliation_required",
+                "project_id": str(project_id),
+                "object_prefix": prefix,
+                "deleted": deleted,
+            },
+        )
+    return {
+        "deleted": deleted,
+        "complete": complete,
+        "reconciliation_required": not complete,
+    }
 
 
 # Object-name root under the shared artifact bucket where each compute job's
@@ -426,10 +723,11 @@ _VIEWABLE_ARTIFACT_SUBDIR = "viewable"
 # Viewable file extension (lowercase, no dot) -> (content_type, kind). Only these
 # extensions are ever persisted as individual objects; everything else stays
 # inside the opaque bundle. Deliberately conservative: raster images, the two
-# browser-native video containers, and pdf. NO svg — an SVG served from a signed
-# URL can execute script in the viewer's browsing context. PDF is safe because it
-# is opened as a top-level new-tab navigation and renders in the browser's
-# sandboxed PDF viewer on the storage origin, not the app origin.
+# browser-native video containers, pdf, and SVG (sanitized before upload — see
+# sanitize_svg_bytes). PDF is safe because it is opened as a top-level new-tab
+# navigation and renders in the browser's sandboxed PDF viewer on the storage
+# origin, not the app origin. SVG is safe because script tags and event
+# attributes are stripped before upload, and <img src> sandboxes inline SVG.
 _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
@@ -439,6 +737,7 @@ _VIEWABLE_CONTENT_TYPES: dict[str, tuple[str, str]] = {
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
     "pdf": ("application/pdf", "pdf"),
+    "svg": ("image/svg+xml", "image"),
 }
 
 # Any char outside the safe object-name subset (mirrors the object class in
@@ -474,6 +773,84 @@ def normalize_viewable_revision(value: object) -> str | None:
         return None
     value = value.strip()
     return value if _VIEWABLE_REVISION_RE.fullmatch(value) else None
+
+
+_SVG_NAMESPACE = "http://www.w3.org/2000/svg"
+_XLINK_NAMESPACE = "http://www.w3.org/1999/xlink"
+# Local names of elements to remove entirely, regardless of namespace.
+# foreignObject can embed arbitrary HTML and is a known XSS vector.
+_SVG_DANGEROUS_LOCAL_NAMES = {"script", "foreignobject"}
+# SMIL animation elements that can rewrite href to javascript: at runtime.
+_SVG_ANIMATION_LOCAL_NAMES = {"animate", "animatetransform", "set"}
+# attributeName values that animation elements could use to redirect navigation.
+_HREF_ATTR_NAMES = {"href", "xlink:href"}
+
+
+def _svg_local_name(tag: str) -> str:
+    """Return the local name of an ElementTree tag, lowercased."""
+    return tag.split("}")[-1].lower() if "}" in tag else tag.lower()
+
+
+def sanitize_svg_bytes(data: bytes) -> bytes:
+    """Strip executable content from SVG bytes before serving.
+
+    Removes ``<script>`` elements in ALL namespaces (matched by local name),
+    ``<foreignObject>`` subtrees (which can embed arbitrary HTML), SMIL
+    animation elements that rewrite href to a javascript: URL, all ``on*``
+    event attributes, and ``href`` / ``xlink:href`` attributes whose value
+    starts with ``javascript:``.  Returns the sanitized XML bytes, or the
+    original ``data`` unchanged when parsing fails — malformed SVG will not
+    execute anything in the browser anyway.
+
+    This is defence-in-depth: ``<img src>`` already sandboxes SVG in all
+    modern browsers (no script execution, no cookies, no same-origin network
+    access), but stripping known attack vectors reduces the blast radius for
+    any future browser regression.
+    """
+    try:
+        root = _ET.fromstring(data)
+    except _ET.ParseError:
+        return data
+
+    # Collect elements to remove (mutating during iteration is unsafe).
+    to_remove: list[tuple[_ET.Element, _ET.Element]] = []
+    for parent in root.iter():
+        for child in list(parent):
+            local = _svg_local_name(child.tag)
+            if local in _SVG_DANGEROUS_LOCAL_NAMES:
+                to_remove.append((parent, child))
+                continue
+            # Strip SMIL animation elements that can rewrite href to javascript:
+            if local in _SVG_ANIMATION_LOCAL_NAMES:
+                attr_name = child.attrib.get("attributeName", "").strip().lower()
+                if attr_name in _HREF_ATTR_NAMES:
+                    to_remove.append((parent, child))
+                    continue
+                for val_key in ("to", "from", "values"):
+                    if child.attrib.get(val_key, "").lstrip().lower().startswith("javascript:"):
+                        to_remove.append((parent, child))
+                        break
+    for parent, child in to_remove:
+        parent.remove(child)
+
+    # Strip dangerous attributes from every surviving element.
+    for element in root.iter():
+        bad_attrs = [
+            attr
+            for attr in list(element.attrib)
+            if attr.lower().startswith("on")
+            or (
+                attr in ("href", f"{{{_XLINK_NAMESPACE}}}href")
+                and element.attrib[attr].lstrip().lower().startswith("javascript:")
+            )
+        ]
+        for attr in bad_attrs:
+            del element.attrib[attr]
+
+    try:
+        return _ET.tostring(root, encoding="unicode").encode("utf-8")
+    except Exception:
+        return data
 
 
 def viewable_content_type_for_filename(filename: str) -> tuple[str, str] | None:
@@ -579,12 +956,16 @@ async def upload_compute_job_viewable_file(
     if not basename or not data:
         return None
     object_name = compute_job_viewable_object_name(job_id, basename)
+    # Strip executable content from SVG before it reaches storage. Defence-in-
+    # depth: <img src> already sandboxes SVG, but we sanitize at upload time so
+    # any "open in new tab" lightbox path on the storage origin is also safe.
+    upload_data = sanitize_svg_bytes(data) if content_type == "image/svg+xml" else data
 
     def _upload() -> None:
         storage_client = storage.Client(project=GCP_PROJECT_ID)
         bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
         blob = bucket.blob(object_name)
-        blob.upload_from_string(data, content_type=content_type)
+        blob.upload_from_string(upload_data, content_type=content_type)
 
     try:
         await asyncio.to_thread(_upload)
@@ -1030,11 +1411,11 @@ async def download_compute_job_artifact_bundle(job_id) -> bytes | None:
 # viewable compute-job artifacts extracted from the durable bundle. Raster
 # images, the two browser-native video containers, and pdf.
 #
-# Deliberately NO ``.svg``: an SVG served from a signed URL / the viewable
-# canvas can execute script in the viewer's browsing context, so SVG is
-# excluded fail-closed. This MUST stay in agreement with
-# ``_VIEWABLE_CONTENT_TYPES`` above — both surfaces exclude SVG so no path
-# ever renders untrusted SVG executably (see :func:`svg_is_viewable`).
+# ``.svg`` IS now included — SVG is sanitized via :func:`sanitize_svg_bytes`
+# before upload so ``<script>`` elements and ``on*`` event attributes are
+# stripped server-side. ``<img src>`` also sandboxes SVG natively (no script
+# execution, no same-origin access), so a signed URL to a sanitized SVG is
+# safe. Both surfaces must stay in agreement (see :func:`svg_is_viewable`).
 # ``.pdf`` IS included: it renders in the browser's sandboxed PDF viewer as a
 # top-level new-tab navigation on the storage origin, carrying no same-origin
 # script-execution risk.
@@ -1047,18 +1428,20 @@ VIEWABLE_COMPUTE_JOB_EXTENSIONS: dict[str, str] = {
     ".mp4": "video/mp4",
     ".webm": "video/webm",
     ".pdf": "application/pdf",
+    ".svg": "image/svg+xml",
 }
 
 
 def svg_is_viewable() -> bool:
     """Whether SVG is treated as a signable/viewable artifact.
 
-    SVG is excluded fail-closed from BOTH viewable-artifact surfaces
+    SVG is accepted on BOTH viewable-artifact surfaces
     (``_VIEWABLE_CONTENT_TYPES`` and ``VIEWABLE_COMPUTE_JOB_EXTENSIONS``)
-    because an SVG served from a signed URL can execute script in the
-    viewer's browsing context. This helper exists so the two surfaces can be
-    asserted to agree on SVG handling; it returns ``True`` only if BOTH
-    surfaces would accept an ``.svg`` file.
+    because SVG bytes are sanitized via :func:`sanitize_svg_bytes` before
+    upload (removing ``<script>`` elements and ``on*`` event attributes), and
+    ``<img src>`` rendering sandboxes SVG in all modern browsers. This helper
+    exists so the two surfaces can be asserted to agree on SVG handling; it
+    returns ``True`` only if BOTH surfaces would accept an ``.svg`` file.
     """
     substrate_accepts_svg = "svg" in _VIEWABLE_CONTENT_TYPES
     bundle_accepts_svg = ".svg" in VIEWABLE_COMPUTE_JOB_EXTENSIONS

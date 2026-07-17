@@ -10,6 +10,7 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.artifact_refs import merge_resident_artifact_ref_grants
 from app.broadcast import _sanitize_log
 from app.models import (
     Project,
@@ -75,6 +76,7 @@ def _merge_interactive_range(successor: Task, failed: Task) -> None:
         10_000, int(payload.get("trigger_count") or 1) + 1
     )
     successor.payloads = [payload]
+    merge_resident_artifact_ref_grants(successor, failed)
     successor.updated_at = _utcnow()
 
 

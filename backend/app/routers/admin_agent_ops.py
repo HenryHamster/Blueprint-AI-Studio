@@ -54,6 +54,7 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.message_audience import stamp_message_audience
 from app.project_message_creation import (
     build_project_message,
     lock_project_and_next_message_sequence,
@@ -901,6 +902,7 @@ async def agent_annotate(
             if warning:
                 ctx = {**ctx, "_provenance_warnings": warning}
 
+    ctx = stamp_message_audience(ctx, "agent_annotation")
     msg = await build_project_message(
         session,
         project_id=task.project_id,
@@ -2919,6 +2921,7 @@ async def strategic_operation(
         from app.routers.admin_notifications import ROUTINE_EVENT_TYPES
 
         event_type = str(msg_ctx.get("event_type") or "").strip() or None
+        msg_ctx = stamp_message_audience(msg_ctx, event_type or "strategic_message")
         is_routine = event_type in ROUTINE_EVENT_TYPES
         reply_to_message_id: uuid.UUID | None = None
         raw_reply_to = msg_ctx.get("reply_to")

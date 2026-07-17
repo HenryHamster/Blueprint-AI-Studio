@@ -55,14 +55,15 @@ class TestViewableSelectionPolicy:
             "rollout.mp4",
             "clip.webm",
             "report.pdf",
-            "chart.svg",  # EXCLUDED by design: script execution via signed URL
+            "chart.svg",  # SVG is now viewable (sanitized before upload)
             "index.html",
             "results.json",
             "noext",
         ):
             (art / name).write_bytes(b"x" * 16)
-        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
         assert size_dropped == 0
+        assert svg_count == 1  # chart.svg is excluded for security
         by_name = {c.filename: c.kind for c in selected}
         assert by_name == {
             "plot.png": "image",
@@ -73,21 +74,24 @@ class TestViewableSelectionPolicy:
             "rollout.mp4": "video",
             "clip.webm": "video",
             "report.pdf": "pdf",
+            "chart.svg": "image",
         }
-        assert "chart.svg" not in by_name
+        assert "index.html" not in by_name
+        assert "results.json" not in by_name
+        assert "noext" not in by_name
 
     def test_empty_zero_byte_and_missing_dir(self, tmp_path):
-        assert _collect_viewable_candidates_from_dir("") == ([], 0)
+        assert _collect_viewable_candidates_from_dir("") == ([], 0, 0)
         assert (
             _collect_viewable_candidates_from_dir(str(tmp_path / "missing"))
-            == ([], 0)
+            == ([], 0, 0)
         )
         art = tmp_path / "artifacts"
         art.mkdir()
         (art / "empty.png").write_bytes(b"")
         # A zero-byte viewable file is skipped but NOT counted as a size-cap
         # omission (it was not omitted for being too large).
-        assert _collect_viewable_candidates_from_dir(str(art)) == ([], 0)
+        assert _collect_viewable_candidates_from_dir(str(art)) == ([], 0, 0)
 
     def test_oversize_viewable_file_counted_as_dropped(self, tmp_path):
         """A viewable file over the 8 MiB per-file cap is excluded from the
@@ -100,9 +104,10 @@ class TestViewableSelectionPolicy:
         (art / "small.png").write_bytes(b"\x89PNG" + b"x" * 32)
         (art / "huge.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
         (art / "notes.txt").write_bytes(b"z" * (_MAX_VIEWABLE_FILE_BYTES + 1))
-        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
         assert [c.filename for c in selected] == ["small.png"]
         assert size_dropped == 1
+        assert svg_count == 0
 
     def test_count_and_size_cap_both_reflected(self, tmp_path):
         """When files exceed BOTH the 25-file count cap and the size cap, the
@@ -121,10 +126,24 @@ class TestViewableSelectionPolicy:
         # size-cap omissions: 2 oversize viewable files
         (art / "big_a.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
         (art / "big_b.png").write_bytes(b"\x89PNG" + b"y" * (_MAX_VIEWABLE_FILE_BYTES + 1))
-        selected, size_dropped = _collect_viewable_candidates_from_dir(str(art))
+        selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
         # oversize files never appear in candidates
         assert len(selected) == _MAX_VIEWABLE_FILE_COUNT + 3
         assert size_dropped == 2
+        assert svg_count == 0
+
+    def test_svg_files_counted_separately_not_as_dropped(self, tmp_path):
+        """SVG files are excluded for XSS security; they contribute to svg_count,
+        not size_dropped, so the omission signal is distinct and informative."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "plot.png").write_bytes(b"\x89PNG" + b"x" * 16)
+        (art / "chart.svg").write_bytes(b"<svg></svg>")
+        (art / "diagram.SVG").write_bytes(b"<svg></svg>")
+        selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
+        assert [c.filename for c in selected] == ["plot.png"]
+        assert size_dropped == 0
+        assert svg_count == 2  # both .svg and .SVG extensions counted
 
 
 class TestSymlinkExclusion:
@@ -140,7 +159,7 @@ class TestSymlinkExclusion:
         (art / "real.png").write_bytes(b"\x89PNG real")
         _make_symlink_or_skip(str(secret), str(art / "loss_curve.png"))
 
-        selected, _ = _collect_viewable_candidates_from_dir(str(art))
+        selected, _, _svg = _collect_viewable_candidates_from_dir(str(art))
         assert [c.filename for c in selected] == ["real.png"], (
             "symlinked file must not be collected"
         )
@@ -154,7 +173,7 @@ class TestSymlinkExclusion:
         (art / "ok.png").write_bytes(b"y" * 10)
         _make_symlink_or_skip(str(outside), str(art / "plots"))
 
-        selected, _ = _collect_viewable_candidates_from_dir(str(art))
+        selected, _, _svg = _collect_viewable_candidates_from_dir(str(art))
         assert [c.filename for c in selected] == ["ok.png"], (
             "walk must not descend through a symlinked dir"
         )
@@ -165,7 +184,7 @@ class TestSymlinkExclusion:
         (outside / "leak.png").write_bytes(b"x" * 10)
         link = tmp_path / "artifacts"
         _make_symlink_or_skip(str(outside), str(link))
-        assert _collect_viewable_candidates_from_dir(str(link)) == ([], 0)
+        assert _collect_viewable_candidates_from_dir(str(link)) == ([], 0, 0)
 
     def test_read_nofollow_refuses_symlink_planted_after_scan(self, tmp_path):
         # TOCTOU: the entry could be a regular file at scan time and a symlink
@@ -339,7 +358,8 @@ def _run_stream(artifact_dir, state, *, upload_return=200):
 class TestRunnerViewableScan:
     """The runner's inlined scan mirrors the server allowlist/kinds/symlink policy."""
 
-    def test_scan_classifies_allowlist_and_excludes_svg(self, tmp_path):
+    def test_scan_classifies_allowlist_including_svg(self, tmp_path):
+        """SVG is now included in the viewable allowlist (sanitized server-side)."""
         art = tmp_path / "artifacts"
         art.mkdir()
         for name in (
@@ -351,7 +371,7 @@ class TestRunnerViewableScan:
             "rollout.mp4",
             "clip.webm",
             "report.pdf",
-            "chart.svg",  # EXCLUDED by design (script-bearing SVG is an XSS vector)
+            "chart.svg",
             "index.html",
             "results.json",
             "noext",
@@ -367,8 +387,11 @@ class TestRunnerViewableScan:
             "rollout.mp4": "video",
             "clip.webm": "video",
             "report.pdf": "pdf",
+            "chart.svg": "image",
         }
-        assert "chart.svg" not in by_name
+        assert "index.html" not in by_name
+        assert "results.json" not in by_name
+        assert "noext" not in by_name
 
     def test_scan_content_types(self, tmp_path):
         art = tmp_path / "artifacts"

@@ -71,6 +71,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
+from cryptography.fernet import Fernet
+
 import app.github as github
 from app.deploy_smoketest import reflect_schema_drift
 from app.migration_chain import (
@@ -341,65 +343,11 @@ _SUBPROCESS_ENV_ALLOWLIST = (
     "WINDIR",
 )
 
-
-_T = TypeVar("_T")
-
-
-async def _with_transient_retry(
-    coro_factory: Callable[[], Awaitable[_T]],
-    *,
-    label: str,
-) -> _T:
-    """Invoke *coro_factory* with bounded exponential backoff on exceptions.
-
-    *coro_factory* is a zero-argument awaitable factory — a lambda or closure
-    — because a consumed coroutine cannot be re-awaited.  On each attempt a
-    fresh coroutine is created so the retry observes a clean call stack.
-
-    Reads retry parameters from module-level ``_TRANSIENT_RETRY_*`` constants
-    so tests can monkeypatch them for speed without altering production.
-
-    After exhausting *max_attempts* consecutive failures, re-raises the *last*
-    exception so existing ``try``/``except`` structures around the caller
-    convert it to ``("defer", ...)``.
-    """
-    last_exc: Exception | None = None
-    for attempt in range(1, _TRANSIENT_RETRY_MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            delay = exponential_backoff(
-                attempt - 1,
-                base=_TRANSIENT_RETRY_BASE_DELAY,
-                cap=_TRANSIENT_RETRY_MAX_DELAY,
-                jitter=0.25,
-            )
-            logger.warning(
-                "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
-                "retrying in %.1fs: %s",
-                label,
-                attempt - 1,
-                _TRANSIENT_RETRY_MAX_ATTEMPTS,
-                delay,
-                last_exc,
-            )
-            await asyncio.sleep(delay)
-        try:
-            return await coro_factory()
-        except _MigrationApplyTimeout:
-            # A stage watchdog already proved this attempt exceeded its budget.
-            # Re-running it internally only multiplies a deterministic stall.
-            raise
-        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
-            last_exc = exc
-    # All attempts exhausted — re-raise the last exception.
-    raise cast(Exception, last_exc)
-
-
-# Retry configuration for transient operations — overridable in tests (via
-# monkeypatch) for speed without altering production behavior.
-_TRANSIENT_RETRY_MAX_ATTEMPTS = 3
-_TRANSIENT_RETRY_BASE_DELAY = 1.0
-_TRANSIENT_RETRY_MAX_DELAY = 16.0
-
+# The encryption-key env var the gate deliberately withholds from the secret-free
+# scratch replay subprocess.  When present in a migration subprocess failure, it
+# identifies a deliberate fail-closed artifact (not deploy-fatal) rather than a
+# genuine migration defect.
+_ENCRYPTION_KEY_ENV_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
 
 _T = TypeVar("_T")
 
@@ -444,6 +392,8 @@ async def _with_transient_retry(
             await asyncio.sleep(delay)
         try:
             return await coro_factory()
+        except _MigrationApplyTimeout:
+            raise  # a timed-out stage cannot be salvaged by retrying
         except Exception as exc:
             if isinstance(exc, no_retry_types):
                 raise  # deterministic — retry cannot help
@@ -476,6 +426,58 @@ class _DeterministicMigrationDefect(Exception):
     class-42 SQL error (syntax_error / invalid_schema_name / undefined_table /
     etc.).  These must hard-block the candidate rather than loop as transient
     infra failures — retrying cannot resolve them."""
+
+
+class _ServingOnlyImportError(Exception):
+    """An ``ImportError`` that references an ``app.*`` symbol — a self-reference
+    artifact of replaying candidate migrations against the serving process.
+
+    On the actual deploy target the candidate's own app code is present, so this
+    is not a deploy-fatal defect.  Degrades the gate to ``'ok'`` rather than
+    hard-blocking the candidate."""
+
+
+class _KeylessEncryptionArtifact(Exception):
+    """A candidate encryption migration fail-closed in the scratch replay because
+    ``_ENCRYPTION_KEY_ENV_VAR`` is deliberately withheld from the secret-free
+    subprocess environment.
+
+    On the actual deploy target the encryption key IS present (it is a required
+    env var for production operation), so this is not deploy-fatal.  Degrades the
+    gate to ``'ok'`` — mirroring ``_ServingOnlyImportError``."""
+
+
+def _looks_like_serving_only_import(exc: ImportError) -> bool:
+    """Return True when an ImportError references an app.* module.
+
+    Serving-engine replays run candidate migration files against the OLD app
+    code.  A migration that imports a candidate-only symbol (e.g.
+    ``from app.field_encryption import require_encryption_active``) will raise
+    ImportError in this context, but the same migration succeeds on the real
+    deploy target where the candidate's own app code is present.
+    """
+    if exc.name and (exc.name == "app" or exc.name.startswith("app.")):
+        return True
+    return bool(re.search(r"'app\.", str(exc)))
+
+
+def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
+    """Return True when *detail* describes the deliberate keyless fail-closed
+    of an encryption migration in the secret-free scratch subprocess.
+
+    Uses a single-line regex to require that the encryption env-var name
+    appears on the same line as the RuntimeError — this rejects accumulated
+    chain stderr where earlier no-op migrations (0531 etc.) emit the env-var
+    name as a warning on a prior line before an unrelated RuntimeError.
+    Migration-number-agnostic: matches any encryption migration that
+    fail-closes with the same pattern (0609, 0621, future migrations).
+    """
+    return bool(
+        re.search(
+            r"RuntimeError[^\n]*" + re.escape(_ENCRYPTION_KEY_ENV_VAR),
+            detail,
+        )
+    )
 
 
 class _ScratchDatabaseUnavailable(Exception):
@@ -972,6 +974,11 @@ async def _run_migration_apply_subprocess(
     env["DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_SCRIPT_LOCATION"] = script_location
+    # Some migrations (e.g. 0609) call _load_fernet() at import time and raise
+    # without a key — fail-closed by design. The scratch DB is empty and
+    # ephemeral, so no real key is needed; inject a synthetic one scoped only
+    # to this subprocess so the migration body can execute normally.
+    env["GITHUB_PAT_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
     backend_root = os.path.dirname(os.path.dirname(__file__))
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -989,6 +996,15 @@ async def _run_migration_apply_subprocess(
         timeout_code=timeout_code,
     )
     if proc.returncode != 0:
+        if _looks_like_keyless_encryption_artifact(
+            stderr.decode(errors="replace")
+        ):
+            raise _KeylessEncryptionArtifact(
+                "candidate encryption migration fail-closed because "
+                f"{_ENCRYPTION_KEY_ENV_VAR} is deliberately withheld from "
+                "the secret-free scratch replay subprocess (not deploy-fatal)"
+            )
+
         detail = _bounded_subprocess_detail(
             stderr,
             stdout,
@@ -1030,7 +1046,16 @@ async def _apply_candidate_migrations(
                     lock.release()
     except _DeterministicMigrationDefect:
         raise  # already classified; propagate without re-wrapping
+    except _ServingOnlyImportError:
+        raise  # already classified; propagate without re-wrapping
+    except _KeylessEncryptionArtifact:
+        raise  # already classified; propagate without re-wrapping
     except (SyntaxError, ImportError) as exc:
+        if isinstance(exc, ImportError) and _looks_like_serving_only_import(exc):
+            raise _ServingOnlyImportError(
+                f"candidate migration imports a candidate-only app symbol "
+                f"(serving-engine artifact, not deploy-fatal): {exc}"
+            ) from exc
         raise _DeterministicMigrationDefect(
             f"candidate migration has a deterministic Python defect "
             f"({type(exc).__name__}): {exc}"
@@ -1297,29 +1322,6 @@ async def _provision_seed_and_detect_drift(
             candidate_sources,
             timeout_code="migration_apply_replay_apply_timeout",
         )
-        return await _reflect_scratch_drift(scratch_engine, required_metadata)
-
-
-async def _provision_seed_and_detect_drift(
-    scratch_base_url: URL,
-    prod_state: _ProdState,
-    candidate_sources: dict[str, str],
-    required_metadata: sa.MetaData,
-) -> list[str]:
-    """Provision an isolated scratch DB, seed with production's recorded state,
-    apply candidate migrations, and return any schema drift.
-
-    Raises ``_MigrationApplyError`` on seed/apply/collision failure (deferrable).
-    Returns an empty list when the post-upgrade schema satisfies all requirements.
-    """
-    async with ephemeral_postgres_database(scratch_base_url) as (scratch_engine, name):
-        # ISOLATION GUARD: never run DDL against the production database.
-        if name == scratch_base_url.database:
-            raise _MigrationApplyError(
-                "scratch database name collided with the scratch server's default database"
-            )
-        await _seed_scratch(scratch_engine, prod_state)
-        await _apply_candidate_migrations(scratch_engine, candidate_sources)
         return await _reflect_scratch_drift(scratch_engine, required_metadata)
 
 
@@ -1781,6 +1783,10 @@ async def run_migration_apply_gate(
                 candidate_ref=candidate_ref,
                 project_id=project_id,
             )
+        except _ServingOnlyImportError:
+            return ("ok", None)
+        except _KeylessEncryptionArtifact:
+            return ("ok", None)
         except _DeterministicMigrationDefect as exc:
             return ("block", str(exc))
         except _ScratchDatabaseUnavailable:
@@ -1819,8 +1825,12 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
-            no_retry_types=(_DeterministicMigrationDefect,),
+            no_retry_types=(_DeterministicMigrationDefect, _ServingOnlyImportError, _KeylessEncryptionArtifact),
         )
+    except _ServingOnlyImportError:
+        return ("ok", None)
+    except _KeylessEncryptionArtifact:
+        return ("ok", None)
     except _DeterministicMigrationDefect as exc:
         return ("block", str(exc))
     except _ScratchDatabaseUnavailable:

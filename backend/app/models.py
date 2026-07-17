@@ -1039,6 +1039,171 @@ class ProjectTool(SQLModel, table=True):
     )
 
 
+class ArtifactRef(SQLModel, table=True):
+    """Immutable, project-scoped snapshot of a human-authored tool revision."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    tool_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), nullable=False)
+    )
+    kind: str = Field(sa_column=Column(String(32), nullable=False))
+    revision: int = Field(sa_column=Column(Integer, nullable=False))
+    checksum: str = Field(sa_column=Column(String(64), nullable=False))
+    author_user_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    content_snapshot: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    retrieval_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('notes','whiteboard')", name="chk_artifactref_kind"),
+        CheckConstraint("revision >= 0", name="chk_artifactref_revision_nonnegative"),
+        CheckConstraint("length(checksum) = 64", name="chk_artifactref_checksum_length"),
+        UniqueConstraint(
+            "project_id", "tool_id", "revision", name="uq_artifactref_project_tool_revision"
+        ),
+        Index("ix_artifactref_project_created", "project_id", "created_at"),
+        Index("ix_artifactref_tool_revision", "tool_id", "revision"),
+    )
+
+
+class ArtifactRefCleanupIntent(SQLModel, table=True):
+    """Durable, retryable cleanup for retained project-scoped render objects."""
+
+    project_id: uuid.UUID = Field(primary_key=True)
+    object_prefix: str = Field(sa_column=Column(Text, nullable=False))
+    state: str = Field(
+        default="pending",
+        sa_column=Column(String(24), nullable=False, server_default="pending"),
+    )
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    next_attempt_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    claim_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+    last_error: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    completed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending','processing','complete')",
+            name="chk_artifactrefcleanupintent_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="chk_artifactrefcleanupintent_attempt_nonnegative",
+        ),
+        Index(
+            "ix_artifactrefcleanupintent_due",
+            "state",
+            "next_attempt_at",
+        ),
+    )
+
+
+class ArtifactRefPromotionIntent(SQLModel, table=True):
+    """No-FK write-ahead record for one rendered ArtifactRef copy effect."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(index=False)
+    tool_id: uuid.UUID = Field(index=False)
+    revision: int = Field(sa_column=Column(Integer, nullable=False))
+    receipt_id: uuid.UUID = Field(index=False)
+    actor_user_id: str = Field(sa_column=Column(String(255), nullable=False))
+    source_storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    candidate_storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    expected_size_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    expected_sha256: str = Field(sa_column=Column(String(64), nullable=False))
+    render_width: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    render_height: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    state: str = Field(default="pending", sa_column=Column(String(24), nullable=False, server_default="pending"))
+    attempt_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    claim_id: uuid.UUID | None = Field(default=None, sa_column=Column(GUID(), nullable=True))
+    lease_expires_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    effect_deadline_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    settle_until: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    next_attempt_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    destination_generation: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    settlement_absent_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    artifact_ref_id: uuid.UUID | None = Field(default=None, sa_column=Column(GUID(), nullable=True))
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    completed_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+
+    __table_args__ = (
+        CheckConstraint("state IN ('pending','copying','promoted','owned','cleanup','cleanup_claimed','settled')", name="chk_artifactrefpromotionintent_state"),
+        CheckConstraint("revision >= 0", name="chk_artifactrefpromotionintent_revision"),
+        CheckConstraint("expected_size_bytes > 0", name="chk_artifactrefpromotionintent_size"),
+        CheckConstraint("length(expected_sha256) = 64", name="chk_artifactrefpromotionintent_checksum"),
+        CheckConstraint("attempt_count >= 0 AND settlement_absent_count >= 0", name="chk_artifactrefpromotionintent_counts"),
+        CheckConstraint(
+            "state != 'owned' OR (artifact_ref_id IS NOT NULL AND completed_at IS NOT NULL AND destination_generation IS NOT NULL)",
+            name="chk_artifactrefpromotionintent_owned",
+        ),
+        CheckConstraint(
+            "state NOT IN ('promoted','owned') OR destination_generation IS NOT NULL",
+            name="chk_artifactrefpromotionintent_generation",
+        ),
+        CheckConstraint(
+            "state NOT IN ('copying','promoted','cleanup_claimed') OR (claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="chk_artifactrefpromotionintent_claim",
+        ),
+        CheckConstraint(
+            "state != 'copying' OR (effect_deadline_at IS NOT NULL AND settle_until IS NOT NULL AND settle_until >= effect_deadline_at)",
+            name="chk_artifactrefpromotionintent_effect_window",
+        ),
+        CheckConstraint(
+            "state != 'settled' OR completed_at IS NOT NULL",
+            name="chk_artifactrefpromotionintent_settled",
+        ),
+        UniqueConstraint("receipt_id", name="uq_artifactrefpromotionintent_receipt"),
+        Index("ix_artifactrefpromotionintent_due", "state", "next_attempt_at"),
+        Index("ix_artifactrefpromotionintent_project", "project_id", "state"),
+        Index("ix_artifactrefpromotionintent_logical_ref", "project_id", "tool_id", "revision"),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -2382,6 +2547,7 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
         Index("ix_computejob_updated_at", "updated_at"),
+        Index("ix_computejob_completed_at", "completed_at"),
         Index(
             "ix_computejob_polling_metadata_runner_target_id",
             "polling_metadata",
@@ -3672,6 +3838,14 @@ class ProjectMessageAttachmentUpload(SQLModel, table=True):
             nullable=True,
         ),
     )
+    artifact_ref_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifactref.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(
@@ -3700,6 +3874,10 @@ class ProjectMessageAttachmentUpload(SQLModel, table=True):
             "project_id",
             "actor_user_id",
             "created_at",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_artifact_ref_id",
+            "artifact_ref_id",
         ),
         Index(
             "ix_projectmessageattachmentupload_message_id",

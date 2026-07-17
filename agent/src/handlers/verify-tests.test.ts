@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // Mock ../index.js so module-level imports resolve and main() never runs.
 // Keep strVal/sanitize/resolveBaseBranch real (pure helpers the handler relies
@@ -62,8 +63,6 @@ import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
-
 // Must match process.env.AGENT_WORKSPACE so describeRunnerDirectory (which reads
 // that env var at module load time in test-runners.ts) strips the right prefix.
 const WORKSPACE = process.env.AGENT_WORKSPACE || '/tmp/workspace';

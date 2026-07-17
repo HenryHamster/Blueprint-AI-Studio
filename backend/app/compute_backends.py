@@ -32,6 +32,7 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -2417,7 +2418,7 @@ def _select_viewable_candidates_from_bundle_path(
     path: str,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
 
     Two passes over the (seekable) archive file:
@@ -2446,6 +2447,7 @@ def _select_viewable_candidates_from_bundle_path(
         refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
         seen: set[str] = set()
         size_dropped = 0
+        svg_count = 0
         with tarfile.open(path, mode="r:gz") as tar:
             for member in tar:
                 if not member.isfile():
@@ -2461,6 +2463,8 @@ def _select_viewable_candidates_from_bundle_path(
                         and member.size > _MAX_VIEWABLE_FILE_BYTES
                     ):
                         size_dropped += 1
+                    elif member.name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 relname, content_type, kind = classified
                 if relname in seen:
@@ -2472,7 +2476,7 @@ def _select_viewable_candidates_from_bundle_path(
         selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
         dropped = (len(refs) - len(selected_refs)) + size_dropped
         if not selected_refs:
-            return [], dropped
+            return [], dropped, svg_count
 
         wanted = {ref[1]: ref for ref in selected_refs}
         out: dict[str, ViewableArtifactCandidate] = {}
@@ -2519,7 +2523,7 @@ def _select_viewable_candidates_from_bundle_path(
         _unlink_temp_sources(tmp_video_paths)
         if not fail_soft:
             raise RuntimeError("viewable bundle enumeration failed") from exc
-        return [], 0
+        return [], 0, 0
     if len(out) != len(selected_refs) and not fail_soft:
         _unlink_temp_sources(tmp_video_paths)
         raise RuntimeError("viewable bundle enumeration was incomplete")
@@ -2528,21 +2532,21 @@ def _select_viewable_candidates_from_bundle_path(
     # persist_viewable_artifacts after upload.
     kept = {c.source_path for c in out.values() if c.source_path is not None}
     _unlink_temp_sources([p for p in tmp_video_paths if p not in kept])
-    return sorted(out.values(), key=lambda c: c.filename), dropped
+    return sorted(out.values(), key=lambda c: c.filename), dropped, svg_count
 
 
 async def _stream_viewable_candidates_from_bundle(
     job_id,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Fetch + select a bundle-backed job's viewable files without ever holding
     the bundle in memory.
 
     The bundle is streamed to a temp file, selected from on disk (two-pass,
     count-capped BEFORE any member bytes are read), and the temp file is always
     removed. Fail-soft: a missing bundle or ANY download/parse error degrades to
-    ``([], 0)``.
+    ``([], 0, 0)``.
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-", suffix=".tar.gz")
     os.close(handle)
@@ -2553,7 +2557,7 @@ async def _stream_viewable_candidates_from_bundle(
         if not downloaded:
             if not fail_soft:
                 raise RuntimeError("durable viewable bundle is unavailable")
-            return [], 0
+            return [], 0, 0
         return await asyncio.to_thread(
             _select_viewable_candidates_from_bundle_path,
             tmp_path,
@@ -2568,7 +2572,7 @@ async def _stream_viewable_candidates_from_bundle(
         )
         if not fail_soft:
             raise
-        return [], 0
+        return [], 0, 0
     finally:
         try:
             os.unlink(tmp_path)
@@ -2668,7 +2672,7 @@ def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
 
 def _collect_viewable_candidates_from_dir(
     artifact_dir: str,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select viewable files by walking a local job's on-disk artifact dir.
 
     The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
@@ -2699,10 +2703,11 @@ def _collect_viewable_candidates_from_dir(
         or not os.path.isdir(artifact_dir)
         or os.path.islink(artifact_dir)
     ):
-        return [], 0
+        return [], 0, 0
     artifact_root = os.path.realpath(artifact_dir)
     out: list[ViewableArtifactCandidate] = []
     size_dropped = 0
+    svg_count = 0
     seen: set[str] = set()
     try:
         for root, dirs, files in os.walk(artifact_dir, followlinks=False):
@@ -2712,6 +2717,8 @@ def _collect_viewable_candidates_from_dir(
             for name in sorted(files):
                 classified = storage.viewable_content_type_for_filename(name)
                 if classified is None:
+                    if name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 path = os.path.join(root, name)
                 if os.path.islink(path) or not os.path.isfile(path):
@@ -2769,59 +2776,60 @@ def _collect_viewable_candidates_from_dir(
                     )
                 )
     except OSError:
-        return out, size_dropped
-    return out, size_dropped
+        return out, size_dropped, svg_count
+    return out, size_dropped, svg_count
 
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
     *,
     fail_soft: bool = True,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Backend-aware selection of a terminal job's viewable files.
 
     Local/local-gpu jobs are read from the on-disk artifact dir that survives the
     subprocess; gcp and runner-subprocess jobs are read from the durable
     ``bundle.tar.gz`` — STREAMED to a temp file and selected from disk, never
     materialized in the orchestrator's heap (a results bundle has no size bound;
-    pulling one into the API process is an OOM). Returns ``([], 0)`` for an
+    pulling one into the API process is an OOM). Returns ``([], 0, 0)`` for an
     unrecognised backend or a missing bundle.
 
     Candidates are sorted by sanitized filename for deterministic selection when
-    the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
-    ``dropped`` is the total count of viewable files omitted from the manifest —
-    both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
-    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap).
+    the archive/walk order is arbitrary. Returns ``(selected, dropped, svg_count)``
+    where ``dropped`` is the total count of viewable files omitted from the manifest
+    — both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
+    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap) — and
+    ``svg_count`` is the number of ``.svg`` files encountered (excluded for XSS).
     """
     if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
         meta = job.polling_metadata or {}
         artifact_dir = str(meta.get("artifact_dir") or "").strip()
         if not artifact_dir:
             artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
-        all_candidates, size_dropped = await asyncio.to_thread(
+        all_candidates, size_dropped, svg_count = await asyncio.to_thread(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
     elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
         # Already sorted + capped on disk (count cap applied BEFORE any member
         # bytes are read; size-cap omissions folded into the returned count), so
-        # it returns the final (selected, dropped) directly.
+        # it returns the final (selected, dropped, svg_count) directly.
         return await _stream_viewable_candidates_from_bundle(
             job.id,
             fail_soft=fail_soft,
         )
     else:
-        return [], 0
+        return [], 0, 0
     all_candidates.sort(key=lambda c: c.filename)
     selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
     count_dropped = len(all_candidates) - len(selected)
-    return selected, count_dropped + size_dropped
+    return selected, count_dropped + size_dropped, svg_count
 
 
 async def persist_viewable_artifacts(
     job: ComputeJob,
 ) -> tuple[list[dict[str, Any]], int]:
     """Compatibility wrapper returning the historical ``(manifest, dropped)``."""
-    manifest, dropped, _complete = (
+    manifest, dropped, _complete, _svg = (
         await persist_viewable_artifacts_with_completeness(job)
     )
     return manifest, dropped
@@ -2829,11 +2837,11 @@ async def persist_viewable_artifacts(
 
 async def persist_viewable_artifacts_with_completeness(
     job: ComputeJob,
-) -> tuple[list[dict[str, Any]], int, bool]:
+) -> tuple[list[dict[str, Any]], int, bool, int]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
-    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
-    can execute script when served from a signed URL) from the
+    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm/svg — SVG is
+    sanitized before upload; see storage.sanitize_svg_bytes) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
     returns ``(manifest, dropped, complete)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
@@ -2848,7 +2856,7 @@ async def persist_viewable_artifacts_with_completeness(
     appear in the returned manifest.
     """
     try:
-        candidates, dropped = await _collect_viewable_artifact_candidates(
+        candidates, dropped, svg_count = await _collect_viewable_artifact_candidates(
             job,
             fail_soft=False,
         )
@@ -2858,9 +2866,9 @@ async def persist_viewable_artifacts_with_completeness(
             getattr(job, "id", None),
             exc_info=True,
         )
-        return [], 0, False
+        return [], 0, False, 0
     if not candidates:
-        return [], dropped, True
+        return [], dropped, True, svg_count
     manifest: list[dict[str, Any]] = []
     complete = True
     for candidate in candidates:
@@ -2896,7 +2904,7 @@ async def persist_viewable_artifacts_with_completeness(
                 "live": False,
             }
         )
-    return manifest, dropped, complete
+    return manifest, dropped, complete, svg_count
 
 
 def _open_viewable_source_nofollow(path: str, artifact_root: str | None):
@@ -3988,6 +3996,7 @@ def _launch_spawn_subprocess(
 # out the repo, and drives the hash-gated build.
 
 from app import compute_image_build  # noqa: E402
+from app import compute_image_remote_build  # noqa: E402
 
 # Files, in priority order, that count as dependency inputs when the manifest
 # does not enumerate them. Any that exist in the checkout are hashed.
@@ -4014,9 +4023,13 @@ def resolve_project_compute_image_build(
     *manifest_compute* is the ``compute`` dict returned by
     ``admin_project_tools._discover_manifest_tools`` (shape
     ``{"image": {"name": ..., "build": {...} | None}}``). Returns a dict
-    ``{"name", "dockerfile", "parent", "build_args"}`` when the project declares
-    a ``build`` section, or ``None`` when it only points at a prebuilt image
-    (or declares no compute image at all).
+    ``{"name", "dockerfile", "parent", "build_args", "deps"}`` when the project
+    declares a ``build`` section, or ``None`` when it only points at a prebuilt
+    image (or declares no compute image at all).
+
+    ``deps`` is either an explicit list of repo-relative dependency file paths
+    (when the manifest's ``build.deps`` field is set) or an empty list (meaning
+    the build system will auto-discover dependency files).
     """
     if not isinstance(manifest_compute, dict):
         return None
@@ -4029,19 +4042,33 @@ def resolve_project_compute_image_build(
     name = image.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
+    raw_deps = build.get("deps")
+    deps: list[str] = list(raw_deps) if isinstance(raw_deps, list) else []
     return {
         "name": name.strip(),
         "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
         "parent": build.get("parent"),
         "build_args": dict(build.get("build_args") or {}),
+        "deps": deps,
     }
 
 
 def _discover_dep_files(repo_dir: str) -> list[str]:
-    """Return the default dependency files that actually exist in *repo_dir*."""
+    """Return dependency files that exist in *repo_dir*, including lockfile-less fallbacks.
+
+    Checks all :data:`_DEFAULT_DEP_FILES` first, then adds bare ecosystem
+    manifests (``package.json``, ``Pipfile``, ``setup.cfg``) for any ecosystem
+    where no lockfile was found, so a project with only a bare manifest still
+    changes its image hash when that manifest changes.
+    """
+    present_set: set[str] = set()
     present: list[str] = []
     for rel in _DEFAULT_DEP_FILES:
         if os.path.isfile(os.path.join(repo_dir, rel)):
+            present.append(rel)
+            present_set.add(rel)
+    for rel in compute_image_build.bare_manifest_fallback_files(frozenset(present_set)):
+        if rel not in present_set and os.path.isfile(os.path.join(repo_dir, rel)):
             present.append(rel)
     return present
 
@@ -4109,6 +4136,7 @@ async def build_project_compute_image(
     ref: str | None = None,
     dep_files: Sequence[str] | None = None,
     dry_run: bool = False,
+    cancel_event: "threading.Event | None" = None,
     _token_fn=None,
     _clone_fn=None,
     _build_fn=None,
@@ -4144,11 +4172,30 @@ async def build_project_compute_image(
     """
     import tempfile as _tempfile
 
-    build_fn = _build_fn or compute_image_build.build_and_push
     # The async lane only makes sense for a REAL build — a dry_run is a pure
     # daemon-free hash/scan and must stay inline (it is what the drift check and
     # presence probe rely on).
     async_dispatch = image_builder_backend_enabled() and not dry_run
+    build_fn = _build_fn
+    if build_fn is None:
+        if async_dispatch:
+            # The async lane calls build_fn ONLY as a daemon-free dry_run probe
+            # (content hash + source-credential scan + registry presence/digest
+            # check, never a docker build); the real build is handed to the
+            # builder VM. The local hash implementation is the probe.
+            build_fn = compute_image_build.build_and_push
+        else:
+            # Inline server-side builds must always use the isolated remote
+            # builder. The local docker implementation is reserved for its
+            # standalone CLI; a partial or mistyped production configuration
+            # must fail closed.
+            if not compute_image_remote_build._remote_build_configured():
+                raise RuntimeError(
+                    "Remote compute-image build is not configured: set "
+                    "COMPUTE_IMAGE_BUILDER_SA, COMPUTE_IMAGE_BUILD_LOCATION, and "
+                    "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
+                )
+            build_fn = compute_image_remote_build.remote_build_and_push
 
     owner = (getattr(project, "github_owner", None) or "").strip()
     repo = (getattr(project, "github_repo", None) or "").strip()
@@ -4194,7 +4241,11 @@ async def build_project_compute_image(
             clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
             await asyncio.to_thread(_git_clone_ref, clone_url, resolved_ref, repo_dir)
 
-        resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
+        explicit_deps = list(build_config.get("deps") or [])
+        resolved_dep_files = (
+            list(dep_files) if dep_files is not None
+            else (explicit_deps if explicit_deps else _discover_dep_files(repo_dir))
+        )
 
         if async_dispatch:
             # Daemon-free probe: content-hash + source credential scan + registry
@@ -4241,6 +4292,7 @@ async def build_project_compute_image(
             parent=parent,
             build_args=dict(build_args),
             dry_run=dry_run,
+            cancel_event=cancel_event,
         )
     return result
 
@@ -4687,8 +4739,23 @@ async def refresh_project_compute_image(
         fetch_bytes_fn = get_file_bytes_at_ref
     else:
         fetch_bytes_fn = _fetch_bytes_fn
-    tag_exists_fn = _tag_exists_fn or compute_image_build.registry_tag_exists
-    resolve_digest_fn = _resolve_digest_fn or compute_image_build._resolve_digest
+    # Use Docker-free tag / digest checks when the remote builder is configured
+    # so the fast-path no-op (unchanged manifest) never needs a local docker daemon.
+    _remote_ok = compute_image_remote_build._remote_build_configured()
+    if _tag_exists_fn is not None:
+        tag_exists_fn = _tag_exists_fn
+    elif _remote_ok:
+        tag_exists_fn = compute_image_remote_build.remote_registry_tag_exists
+    else:
+        tag_exists_fn = compute_image_build.registry_tag_exists
+
+    if _resolve_digest_fn is not None:
+        resolve_digest_fn = _resolve_digest_fn
+    elif _remote_ok:
+        resolve_digest_fn = compute_image_remote_build._resolve_registry_digest_from_api
+    else:
+        resolve_digest_fn = compute_image_build._resolve_digest
+
     build_fn = _build_fn or build_project_compute_image
     record_fn = _record_fn or record_project_compute_image_build
 
@@ -4709,6 +4776,24 @@ async def refresh_project_compute_image(
         token = await token_fn(owner, repo)
         if not token:
             return {"status": "no_config", "reason": "no installation read token"}
+
+        # Fail closed on a genuinely buildable project (repo + build section +
+        # token) when no build backend is available: neither the isolated remote
+        # builder nor the off-orchestrator VM builder is configured and no test
+        # hook supplied a build/registry function. Placed AFTER the no_config
+        # short-circuits so a project with nothing to build still resolves to
+        # no_config rather than a misleading error.
+        if (
+            not _remote_ok
+            and not image_builder_backend_enabled()
+            and _tag_exists_fn is None
+            and _resolve_digest_fn is None
+            and _build_fn is None
+        ):
+            return {
+                "status": "error",
+                "error": "Remote compute-image build is not configured",
+            }
 
         default_branch = await default_branch_fn(token, owner, repo)
         project_id_str = str(project_id or "")
@@ -4733,23 +4818,70 @@ async def refresh_project_compute_image(
                 "reason": f"no Dockerfile at {dockerfile_rel}",
             }
 
-        # Key inputs EXACTLY as build_and_push does: Dockerfile under
-        # "Dockerfile", each present dep file under its relative path — so the
-        # hash matches what a real build produces (an unchanged manifest =>
-        # identical dep_hash => registry-tag-exists fast path).
-        inputs: Dict[str, bytes] = {"Dockerfile": dockerfile_bytes}
-        for rel in _DEFAULT_DEP_FILES:
-            data = await fetch_bytes_fn(
-                rel,
-                token=token,
-                owner=owner,
-                repo=repo,
-                ref=default_branch,
-                project_id=project_id_str,
-            )
-            if data is not None:
-                inputs[rel] = data
+        # Fetch dep file bytes using assemble_fingerprint_inputs (same logic as
+        # build_and_push) so the cheap hash is guaranteed to match the real build.
+        # When the manifest declares explicit deps, fetch only those; otherwise
+        # fetch the defaults and bare-manifest fallbacks.
+        explicit_deps = list(build_config.get("deps") or [])
+        dep_file_bytes: Dict[str, bytes] = {}
+        if explicit_deps:
+            for rel in explicit_deps:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is None:
+                    # Explicit declarations are mandatory, just as they are in
+                    # build_and_push.  Never hash a partial input set and reuse
+                    # a registry tag that the real build could not produce.
+                    return {
+                        "status": "no_config",
+                        "reason": f"declared dependency file not found: {rel}",
+                    }
+                dep_file_bytes[rel] = data
+        else:
+            # Fetch all defaults, then bare-manifest fallbacks for any ecosystem
+            # that has no lockfile present.
+            fetched_names: set[str] = set()
+            for rel in _DEFAULT_DEP_FILES:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is not None:
+                    dep_file_bytes[rel] = data
+                    fetched_names.add(rel)
+            for rel in compute_image_build.bare_manifest_fallback_files(
+                frozenset(fetched_names)
+            ):
+                if rel not in dep_file_bytes:
+                    data = await fetch_bytes_fn(
+                        rel,
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        ref=default_branch,
+                        project_id=project_id_str,
+                    )
+                    if data is not None:
+                        dep_file_bytes[rel] = data
 
+        parent = build_config.get("parent")
+        build_args = dict(build_config.get("build_args") or {})
+        inputs = compute_image_build.assemble_fingerprint_inputs(
+            dockerfile_bytes,
+            dep_file_bytes,
+            parent=parent,
+            build_args=build_args,
+        )
         dep_hash = compute_image_build.compute_dependency_hash(inputs)
 
         registry_repo = resolve_compute_image_registry_repo()
@@ -4805,6 +4937,10 @@ async def refresh_project_compute_image(
                     "dep_hash": dep_hash,
                 }
 
+        # A threading.Event lets the remote-build worker detect outer cancellation
+        # and issue a Cloud Build cancel before cleanup.
+        _cancel_event = threading.Event()
+        _build_task = None
         try:
             if progress_cb is not None:
                 # Run the build as a background task with periodic progress
@@ -4816,22 +4952,66 @@ async def refresh_project_compute_image(
                     registry_repo=registry_repo,
                     build_config=build_config,
                     ref=default_branch,
+                    cancel_event=_cancel_event,
                 ))
-                while True:
-                    _done, _pending = await asyncio.wait(
-                        [_build_task], timeout=_HEARTBEAT_INTERVAL
-                    )
-                    if _done:
-                        result = _build_task.result()
-                        break
-                    progress_cb()
+                try:
+                    while True:
+                        _done, _pending = await asyncio.wait(
+                            [_build_task], timeout=_HEARTBEAT_INTERVAL
+                        )
+                        if _done:
+                            result = _build_task.result()
+                            break
+                        progress_cb()
+                except BaseException:
+                    # Signal the remote-build thread so it cancels the Cloud Build
+                    # before cleanup.  Transfer semaphore ownership to a drain task
+                    # so the slot is not released while _build_task is still running.
+                    #
+                    # Do NOT call _build_task.cancel() here.  build_fn wraps
+                    # asyncio.to_thread; cancelling the asyncio Future marks it done
+                    # immediately while the OS thread continues running (Python cannot
+                    # stop threads).  Without cancellation, _drain_and_release's
+                    # ``await _t`` blocks until the thread truly finishes cleanup,
+                    # ensuring the semaphore slot is not released prematurely.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_and_release(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_and_release())
+                        acquired = False
+                    raise
             else:
-                result = await build_fn(
+                # Direct-await path (no heartbeat).  Use ensure_future + shield so
+                # outer cancellation does not detach the thread-backed coroutine from
+                # the drain task that owns the semaphore slot.
+                _build_task = asyncio.ensure_future(build_fn(
                     project,
                     registry_repo=registry_repo,
                     build_config=build_config,
                     ref=default_branch,
-                )
+                    cancel_event=_cancel_event,
+                ))
+                try:
+                    result = await asyncio.shield(_build_task)
+                except BaseException:
+                    # Signal the thread so the remote Cloud Build is cancelled.
+                    # Transfer semaphore ownership to a drain task for the same
+                    # reason as the progress path: the thread may still be running
+                    # cleanup even after the shield raised CancelledError.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_direct(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_direct())
+                        acquired = False
+                    raise
         finally:
             if acquired:
                 build_semaphore.release()
@@ -5075,6 +5255,107 @@ async def resolve_project_default_container_image(
             getattr(project, "id", None),
         )
         return None
+
+
+async def resolve_project_baked_image_strict(
+    session: Any,
+    project: Any,
+) -> tuple[str | None, str | None]:
+    """Resolve a project's declared baked compute image — fail CLOSED on unresolvable.
+
+    Returns ``(pinned_ref, None)`` when the project's manifest declares
+    ``compute.image.name`` AND a ``ProjectComputeImage`` row exists with
+    ``built=True`` and a non-null ``digest``.
+
+    Returns ``(None, None)`` when the project declares NO baked image (no
+    manifest, manifest error, or no ``compute.image.name`` key) — the caller
+    must preserve image-less behavior, identical to today.
+
+    Returns ``(None, reason)`` when the project declares a baked image name but
+    no resolved, digest-pinned build record can be found — the caller MUST
+    terminal-fail the dispatch with the returned reason rather than silently
+    running image-less on the host toolchain.
+
+    Unlike :func:`resolve_project_default_container_image` (which is
+    fail-OPEN and used at authoring time), this function is used at dispatch
+    time where the baked-image isolation contract must be enforced: running a
+    declared-but-unbuilt image on the host toolchain is a reproducibility and
+    isolation failure that must surface to the operator.
+    """
+    if project is None:
+        return None, None
+    try:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        manifest = await _discover_manifest_tools(project)
+        compute_image = (manifest.get("compute") or {}).get("image") or {}
+        name = compute_image.get("name") if isinstance(compute_image, dict) else None
+        if not name:
+            return None, None
+    except Exception:  # noqa: BLE001 — no manifest means no image declared
+        logger.debug(
+            "[COMPUTE] manifest fetch failed for project=%s; treating as no baked image",
+            getattr(project, "id", None),
+        )
+        return None, None
+
+    # Image is declared — resolve to a built, digest-pinned record or fail closed.
+    if "@sha256:" in name:
+        # Already content-addressed; accept as-is (no build record needed).
+        return name, None
+
+    registry_repo, image_name, ref_tag = _split_image_ref(name)
+
+    try:
+        from sqlalchemy import select
+
+        conditions = [
+            ProjectComputeImage.project_id == project.id,
+            ProjectComputeImage.image_name == image_name,
+            ProjectComputeImage.built.is_(True),
+            ProjectComputeImage.digest.is_not(None),
+        ]
+        if registry_repo:
+            conditions.append(ProjectComputeImage.registry_repo == registry_repo)
+
+        row = None
+        if ref_tag:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions, ProjectComputeImage.tag == ref_tag)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+        if row is None:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001
+        reason = (
+            f"Project declares baked compute image '{name}' but the build-record "
+            f"lookup failed: {exc} — refusing to run image-less on host toolchain"
+        )
+        logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+        return None, reason
+
+    if row is not None and row.pinned_ref:
+        return row.pinned_ref, None
+
+    reason = (
+        f"Project declares baked compute image '{name}' but no built, "
+        "digest-pinned build record exists — image has not been built yet or the "
+        "build failed; refusing to run image-less on host toolchain"
+    )
+    logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+    return None, reason
 
 
 def resolve_compute_image_registry_repo() -> str:

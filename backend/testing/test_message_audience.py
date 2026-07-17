@@ -469,6 +469,34 @@ def _get_all_webhook_event_keys() -> set[str]:
     return set(getattr(_ma, "_WEBHOOK_EVENT_AUDIENCE", {}).keys())
 
 
+def test_valid_notification_events_all_present_in_webhook_registry():
+    """Every operator-selectable notification event must have a webhook registry entry.
+
+    ``_VALID_NOTIFICATION_EVENTS`` in ``admin_settings`` is the universe the
+    operator can enable; ``_WEBHOOK_EVENT_AUDIENCE`` in ``message_audience`` is the
+    routing table that decides whether ``route_external_webhook_event`` delivers or
+    silently drops the notification.  If an event is selectable but absent from the
+    webhook registry, ``route_external_webhook_event`` fails closed to
+    ``STRATEGIST_INTERNAL`` and the operator enables the event but never receives it.
+
+    This guard fails CI the moment an event is added to one list but not the other.
+    """
+    from app.routers.admin_settings import _VALID_NOTIFICATION_EVENTS
+
+    webhook_keys = _get_all_webhook_event_keys()
+    missing = sorted(_VALID_NOTIFICATION_EVENTS - webhook_keys)
+    assert not missing, (
+        "Operator-selectable notification events are missing from the webhook "
+        "audience registry (_WEBHOOK_EVENT_AUDIENCE in message_audience.py).\n"
+        "Missing events: " + ", ".join(missing) + "\n\n"
+        "A missing entry means route_external_webhook_event() will fail closed to "
+        "STRATEGIST_INTERNAL and the notification is silently dropped even when the "
+        "operator has enabled it.\n\n"
+        "Fix: add each missing event to _WEBHOOK_EVENT_AUDIENCE in "
+        "backend/app/message_audience.py with its intended audience classification."
+    )
+
+
 # ── post_event_message audience gating (via notification_dispatch) ──────
 
 
@@ -1021,6 +1049,13 @@ _MODULES_WITH_OPERATOR_MESSAGES = [
     "review_loop_convergence.py",
     "branch_resolution.py",
     "review_fix_lane_pilot.py",
+    "review_pipeline.py",
+    "research_direction_state.py",
+    "capability_trial_verdict.py",
+    "strategic_completion.py",
+    "work_session_command_execution.py",
+    "routers/admin_project_strategic_session.py",
+    "routers/admin_agent_ops.py",
 ]
 
 

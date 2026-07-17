@@ -24,12 +24,15 @@ import uuid
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import AsyncSessionLocal, get_session
+from app.artifact_refs import artifact_ref_projection
 from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
     Alert,
     Artifact,
+    ArtifactRef,
+    ArtifactRefPromotionIntent,
     CompletionDebtEntry,
     ComputeJob,
     ComputeJobStatus,
@@ -54,6 +57,7 @@ from app.models import (
     _utcnow,
 )
 from app.auth import get_current_user
+from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
@@ -139,6 +143,7 @@ from app.storage import (
     generate_download_signed_url,
     storage as gcs_storage,
 )
+from app.message_audience import stamp_message_audience
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
     build_resident_runner_options,
@@ -631,13 +636,14 @@ def _message_ref_uuid(value: Any, *, prefix: str | None = None) -> uuid.UUID | N
 
 _VISIBLE_MESSAGE_RECORD_KEYS = {
     "source_refs": frozenset({
-        "id", "message_id", "task_id", "artifact_id", "tool_id", "project_id",
+        "id", "message_id", "task_id", "artifact_id", "artifact_ref_id", "tool_id", "project_id",
         "kind", "label", "title", "excerpt", "revision", "checksum", "author",
-        "timestamp", "created_at", "updated_at",
+        "timestamp", "created_at", "updated_at", "retrieval",
     }),
     "artifact_refs": frozenset({
-        "id", "artifact_id", "tool_id", "project_id", "kind", "label", "title",
+        "id", "artifact_id", "artifact_ref_id", "tool_id", "project_id", "kind", "label", "title",
         "revision", "checksum", "author", "timestamp", "created_at", "updated_at",
+        "excerpt", "retrieval",
     }),
     "attachments": frozenset({
         "attachment_id", "storage_uri", "kind", "type", "mime_type", "media_type",
@@ -660,7 +666,7 @@ def _bounded_visible_message_record(kind: str, item: Dict[str, Any]) -> Dict[str
             result[key] = value[:2_000]
         elif value is None or isinstance(value, (bool, int, float)):
             result[key] = value
-        elif key == "target" and isinstance(value, dict):
+        elif key in {"target", "retrieval"} and isinstance(value, dict):
             result[key] = {
                 str(target_key)[:80]: (
                     target_value[:500]
@@ -798,6 +804,13 @@ async def _cleanup_expired_message_attachment_uploads(
                         ProjectMessageAttachmentUpload.consumed_at.is_(None),
                         ProjectMessageAttachmentUpload.message_id.is_(None),
                         ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+                        ~select(ArtifactRefPromotionIntent.id)
+                        .where(
+                            ArtifactRefPromotionIntent.receipt_id
+                            == ProjectMessageAttachmentUpload.attachment_id,
+                            ArtifactRefPromotionIntent.state != "settled",
+                        )
+                        .exists(),
                     )
                     .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
                     .limit(_MESSAGE_ATTACHMENT_CLEANUP_BATCH)
@@ -891,6 +904,7 @@ async def _validated_message_scoped_context(
     message_ids: set[uuid.UUID] = set()
     task_ids: set[uuid.UUID] = set()
     artifact_ids: set[uuid.UUID] = set()
+    artifact_ref_ids: set[uuid.UUID] = set()
     direction_ids: set[str] = set()
     runner_ids: set[uuid.UUID] = set()
     knowledge_ids: set[uuid.UUID] = set()
@@ -967,12 +981,20 @@ async def _validated_message_scoped_context(
             raise HTTPException(status_code=400, detail="Unsupported source reference kind")
 
     for ref in context.get("artifact_refs") or []:
-        artifact_id = ref.get("artifact_id") or ref.get("id")
-        parsed = _message_ref_uuid(artifact_id, prefix="artifact")
-        if parsed is None:
-            raise HTTPException(status_code=400, detail="Invalid artifact reference")
-        artifact_ids.add(parsed)
-        _record_reference_claim("artifact", parsed, ref)
+        if ref.get("artifact_ref_id") is not None:
+            ref_id = ref.get("artifact_ref_id")
+            parsed = _message_ref_uuid(ref_id, prefix="artifact-ref")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid tool ArtifactRef")
+            artifact_ref_ids.add(parsed)
+            _record_reference_claim("artifact_ref", parsed, ref)
+        else:
+            artifact_id = ref.get("artifact_id") or ref.get("id")
+            parsed = _message_ref_uuid(artifact_id, prefix="artifact")
+            if parsed is None:
+                raise HTTPException(status_code=400, detail="Invalid artifact reference")
+            artifact_ids.add(parsed)
+            _record_reference_claim("artifact", parsed, ref)
 
     if message_ids:
         stmt = select(ProjectMessage).where(
@@ -1027,6 +1049,34 @@ async def _validated_message_scoped_context(
                 checksum_value=row.commit_hash,
                 detail="Artifact",
             )
+    if artifact_ref_ids:
+        stmt = select(ArtifactRef).where(
+            ArtifactRef.id.in_(artifact_ref_ids),
+            ArtifactRef.project_id == project_id,
+        )
+        if lock_references:
+            stmt = stmt.with_for_update()
+        rows = (await session.execute(stmt)).scalars().all()
+        valid_ids = {row.id for row in rows}
+        if valid_ids != artifact_ref_ids:
+            raise HTTPException(status_code=400, detail="Invalid tool ArtifactRef")
+        canonical_refs = {row.id: artifact_ref_projection(row) for row in rows}
+        for row in rows:
+            claim = reference_claims.get(("artifact_ref", str(row.id)))
+            if claim and str(claim.get("kind") or "").lower() != row.kind:
+                raise HTTPException(status_code=400, detail="ArtifactRef kind mismatch")
+            _assert_reference_revision(
+                claim,
+                revision_values=(row.revision,),
+                checksum_value=row.checksum,
+                detail="Tool ArtifactRef",
+            )
+        context["artifact_refs"] = [
+            canonical_refs[_message_ref_uuid(ref.get("artifact_ref_id"))]
+            if ref.get("artifact_ref_id") is not None
+            else ref
+            for ref in context.get("artifact_refs") or []
+        ]
     for ids, model, detail in (
         (runner_ids, LocalRunner, "Invalid runner source reference"),
         (knowledge_ids, KnowledgeDocument, "Invalid knowledge source reference"),
@@ -3091,15 +3141,18 @@ async def create_project_strategic_session_check_in(
             project_id,
             workbench_context_for_snapshot,
         )
-        message_context: Dict[str, Any] = {
-            "event_type": _CHECK_IN_EVENT_TYPE,
-            "check_in": {
-                "version": 1,
-                "kind": kind,
-                "operator_user_id": current_user["user_id"],
-                "captured_at": now.isoformat(),
+        message_context: Dict[str, Any] = stamp_message_audience(
+            {
+                "event_type": _CHECK_IN_EVENT_TYPE,
+                "check_in": {
+                    "version": 1,
+                    "kind": kind,
+                    "operator_user_id": current_user["user_id"],
+                    "captured_at": now.isoformat(),
+                },
             },
-        }
+            _CHECK_IN_EVENT_TYPE,
+        )
         if strategic_session:
             message_context["strategic_session"] = strategic_session
         next_sequence = await lock_project_and_next_message_sequence(
@@ -3474,6 +3527,7 @@ async def delete_message_attachment_upload(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    await lock_project_or_429(session, project_id)
     receipt = (
         await session.execute(
             select(ProjectMessageAttachmentUpload)
@@ -3488,19 +3542,43 @@ async def delete_message_attachment_upload(
     ).scalar_one_or_none()
     if receipt is None:
         return {"status": "not_found", "deleted": False}
-    if receipt.consumed_at is not None or receipt.message_id is not None:
+    promotion = (
+        await session.execute(
+            select(ArtifactRefPromotionIntent)
+            .where(ArtifactRefPromotionIntent.receipt_id == attachment_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if promotion is not None and promotion.state not in {"settled"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Attachment is owned by an ArtifactRef promotion",
+        )
+    if (
+        receipt.consumed_at is not None
+        or receipt.message_id is not None
+        or receipt.artifact_ref_id is not None
+    ):
         raise HTTPException(status_code=409, detail="Consumed attachment cannot be deleted")
+    storage_uri = receipt.storage_uri
+    # Fence new consumers durably, but retain the receipt as cleanup evidence
+    # until the storage effect is confirmed.
+    receipt.expires_at = min(receipt.expires_at, _utcnow())
+    session.add(receipt)
+    await session.commit()
     try:
         deleted = await asyncio.wait_for(
-            delete_storage_uri_best_effort(receipt.storage_uri),
+            delete_storage_uri_best_effort(storage_uri),
             timeout=_MESSAGE_ATTACHMENT_CLEANUP_TIMEOUT_SECONDS,
         )
     except TimeoutError:
         deleted = False
     if not deleted:
-        raise HTTPException(status_code=503, detail="Storage cleanup unavailable")
-    await session.delete(receipt)
-    await session.commit()
+        return {"status": "cleanup_pending", "deleted": False}
+    current = await session.get(ProjectMessageAttachmentUpload, attachment_id)
+    if current is not None:
+        await session.delete(current)
+        await session.commit()
     return {"status": "deleted", "deleted": True}
 
 

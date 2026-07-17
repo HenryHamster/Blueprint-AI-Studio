@@ -114,6 +114,105 @@ def compute_dependency_hash(inputs: Dict[str, bytes], *, length: int = DEP_HASH_
     return hasher.hexdigest()[:length]
 
 
+# ── Canonical fingerprint-input assembly ─────────────────────────────────────
+#
+# A compute image's content hash covers ALL inputs that affect the image:
+# Dockerfile, declared dependency files, the parent image, and build-args.
+# Both build_and_push (local build) and remote_build_and_push (Cloud Build) and
+# the cheap-hash reuse check in refresh_project_compute_image must use the same
+# assembly so they cannot produce diverging hashes for identical configs.
+#
+# Fingerprint keys are typed rather than ordinary filenames.  A NUL cannot occur
+# in a repository path, so this namespace prevents dependency filenames such as
+# ``Dockerfile`` or ``__parent_image__`` from overwriting a control input.
+_FINGERPRINT_DOCKERFILE_KEY = "\x00dockerfile"
+_FINGERPRINT_DEP_PREFIX = "\x00dep:"
+_FINGERPRINT_PARENT_KEY = "\x00parent_image"
+_FINGERPRINT_BUILD_ARGS_KEY = "\x00build_args"
+
+# Bare ecosystem manifest files: included in the fingerprint ONLY when no
+# corresponding lockfile is present.  Each entry:
+#   (lockfile_names, bare_manifest_names)
+# If NONE of the lockfile_names appear in the resolved file set, any present
+# bare_manifest_names are added to the hash.  This closes the lockfile-less gap:
+# a project with only package.json or only Pipfile still changes its image hash
+# when those manifests change.
+_BARE_MANIFEST_FALLBACKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    # npm/node: hash package.json when no node lockfile present
+    (
+        ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"),
+        ("package.json",),
+    ),
+    # pipenv: hash Pipfile when Pipfile.lock absent
+    (
+        ("Pipfile.lock",),
+        ("Pipfile",),
+    ),
+    # traditional Python: hash setup.cfg when no pip/pyproject-style file present
+    # (pyproject.toml is in _DEFAULT_DEP_FILES and always wins if present)
+    (
+        (
+            "requirements.txt",
+            "requirements.lock",
+            "uv.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "pyproject.toml",
+        ),
+        ("setup.cfg",),
+    ),
+)
+
+
+def bare_manifest_fallback_files(present_lockfiles: frozenset[str]) -> list[str]:
+    """Bare ecosystem manifest candidate filenames when no lockfile is present.
+
+    *present_lockfiles* should contain the resolved set of dependency/lockfiles
+    that exist (i.e. the subset of :data:`_DEFAULT_DEP_FILES` that were found).
+    For each ecosystem group in :data:`_BARE_MANIFEST_FALLBACKS`: if NONE of
+    the group's lockfiles appear in *present_lockfiles*, the group's bare
+    manifest names are returned as candidates.  The caller is responsible for
+    checking whether each candidate actually exists (e.g. via ``os.path.isfile``
+    or by checking that a fetch returned non-None).
+    """
+    result: list[str] = []
+    for lockfiles, bare_manifests in _BARE_MANIFEST_FALLBACKS:
+        if not any(lf in present_lockfiles for lf in lockfiles):
+            result.extend(bare_manifests)
+    return result
+
+
+def assemble_fingerprint_inputs(
+    dockerfile_bytes: bytes,
+    dep_file_bytes: Dict[str, bytes],
+    *,
+    parent: str | None = None,
+    build_args: Dict[str, str] | None = None,
+) -> Dict[str, bytes]:
+    """Canonical fingerprint-input dict for a compute image.
+
+    Produces the ``inputs`` dict that :func:`compute_dependency_hash` should
+    receive.  Both build paths (:func:`build_and_push`,
+    ``remote_build_and_push``) and the cheap-hash check in
+    ``refresh_project_compute_image`` must call this function so the hashes
+    cannot drift from one another.
+
+    *dep_file_bytes* maps each dep file's relative path to its raw bytes.
+    Every category is stored in a NUL-prefixed typed namespace, so metadata and
+    valid reserved-looking dependency filenames cannot overwrite one another.
+    """
+    inputs: Dict[str, bytes] = {_FINGERPRINT_DOCKERFILE_KEY: bytes(dockerfile_bytes)}
+    for key, value in dep_file_bytes.items():
+        inputs[f"{_FINGERPRINT_DEP_PREFIX}{key}"] = bytes(value)
+    if parent:
+        inputs[_FINGERPRINT_PARENT_KEY] = str(parent).encode("utf-8")
+    if build_args:
+        inputs[_FINGERPRINT_BUILD_ARGS_KEY] = json.dumps(
+            dict(sorted(build_args.items())), sort_keys=True
+        ).encode("utf-8")
+    return inputs
+
+
 # ── Credential scanner (no-platform-creds-in-layers security constraint) ─────
 
 # Substring / regex patterns for platform credentials that must NEVER be baked
@@ -1313,17 +1412,25 @@ def build_and_push(
     if not os.path.isfile(dockerfile_path):
         raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")
 
-    # Collect hash inputs: the Dockerfile plus each declared dep file.
-    inputs: Dict[str, bytes] = {}
+    # Collect hash inputs: Dockerfile + each declared dep file + parent + build_args.
+    # assemble_fingerprint_inputs is the single source of truth shared with
+    # remote_build_and_push and refresh_project_compute_image.
     with open(dockerfile_path, "rb") as fh:
-        inputs["Dockerfile"] = fh.read()
+        dockerfile_bytes = fh.read()
+    dep_file_bytes: Dict[str, bytes] = {}
     for rel in dep_files:
         dep_path = os.path.join(repo_dir, rel)
         if not os.path.isfile(dep_path):
             raise FileNotFoundError(f"declared dependency file not found: {dep_path}")
         with open(dep_path, "rb") as fh:
-            inputs[rel] = fh.read()
+            dep_file_bytes[rel] = fh.read()
 
+    inputs = assemble_fingerprint_inputs(
+        dockerfile_bytes,
+        dep_file_bytes,
+        parent=parent,
+        build_args=build_args,
+    )
     dep_hash = compute_dependency_hash(inputs)
     full_repo = f"{registry_repo}/{image_name}"
 

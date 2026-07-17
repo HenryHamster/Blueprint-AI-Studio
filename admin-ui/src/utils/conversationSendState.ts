@@ -16,6 +16,8 @@ export interface PendingConversationSend {
   wakeup_state?: StrategicMessageWakeupState | null;
   reply_to_message_id?: string | null;
   reply_to?: { id: string; content: string; from: string; message_type: string; status: string } | null;
+  /** Draft snapshot submitted into this immutable send envelope. */
+  draft_write_id?: string | null;
   context?: Record<string, unknown>;
   /** Immutable create envelope. Retries must replay this exact payload. */
   payload?: StrategicSessionMessageCreate;

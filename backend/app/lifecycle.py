@@ -665,6 +665,41 @@ def _log_startup_deploy_identity() -> None:
         )
 
 
+async def _shutdown_background_task_registry(
+    registry: dict[str, asyncio.Task],
+    *,
+    monitor_task: asyncio.Task,
+    leader_keepalive_task: asyncio.Task | None,
+    timeout_seconds: float = 10.0,
+) -> None:
+    """Cancel the current monitored task identities and clear the registry."""
+
+    monitor_task.cancel()
+    # Snapshot without yielding: on this event loop the cancelled monitor
+    # cannot install another replacement before the authoritative identities
+    # are captured.
+    tasks = [monitor_task, *registry.values()]
+    if leader_keepalive_task is not None:
+        tasks.append(leader_keepalive_task)
+    tasks = list(dict.fromkeys(tasks))
+    for task in tasks:
+        task.cancel()
+    try:
+        completion = asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.wait_for(
+            asyncio.shield(completion),
+            timeout=max(0.01, float(timeout_seconds)),
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[SHUTDOWN] Background tasks didn't finish within %.1fs grace period",
+            timeout_seconds,
+        )
+        completion.add_done_callback(lambda done: done.exception())
+    finally:
+        registry.clear()
+
+
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan context manager — startup and shutdown hooks."""
@@ -703,15 +738,26 @@ async def lifespan(app):
     logger.info("[STARTUP] Logging configured — app logs now visible in Cloud Logging")
 
     # Late imports to avoid circular dependency with app.main
-    from app.main import (
-        _verify_encryption_config,
-        _verify_schema_version,
-        _verify_schema_drift,
-        _init_deployment_state,
+    from app.artifact_ref_cleanup import (
+        artifact_ref_lifecycle_service,
+        shutdown_artifact_ref_lifecycle,
     )
-    from app.required_runtime_env import _verify_required_env
+    from app.artifact_ref_promotion import (
+        shutdown_tracked_artifact_ref_promotions,
+    )
+    from app.compute_jobs import compute_job_monitor_service
+    from app.github import close_github_client
+    from app.main import (
+        _init_deployment_state,
+        _verify_encryption_config,
+        _verify_schema_drift,
+        _verify_schema_version,
+    )
+    from app.max_plan_pool import load_max_plan_pool
     from app.notification import _send_webhook_notification
+    from app.orchestrator import orchestrator_worker
     from app.reaper import reaper_service
+    from app.required_runtime_env import _verify_required_env
     from app.services import (
         account_availability_refresh_service,
         auto_archive_service,
@@ -720,11 +766,7 @@ async def lifespan(app):
         secret_reconciliation_service,
         stale_branch_cleanup_service,
     )
-    from app.max_plan_pool import load_max_plan_pool
-    from app.compute_jobs import compute_job_monitor_service
-    from app.orchestrator import orchestrator_worker
     from app.shared_state import runtime_config_sync_service
-    from app.github import close_github_client
 
     # Startup: Initialize DB tables
     await init_db()
@@ -1041,29 +1083,13 @@ async def lifespan(app):
 
         yield
 
-        nl_monitor_task.cancel()
-        config_sync_task.cancel()
-        jwt_revocation_task_nl.cancel()
-        event_fanout_task_nl.cancel()
-        agent_log_relay_task_nl.cancel()
-        publish_task_nl.cancel()
-        notification_retry_task_nl.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    nl_monitor_task,
-                    config_sync_task,
-                    jwt_revocation_task_nl,
-                    event_fanout_task_nl,
-                    agent_log_relay_task_nl,
-                    publish_task_nl,
-                    notification_retry_task_nl,
-                    return_exceptions=True,
-                ),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[SHUTDOWN] Non-leader tasks didn't finish within 10s")
+        await _shutdown_background_task_registry(
+            _bg_tasks_nl,
+            monitor_task=nl_monitor_task,
+            leader_keepalive_task=None,
+        )
+        await shutdown_tracked_artifact_ref_promotions()
+        await shutdown_artifact_ref_lifecycle()
         await close_github_client()
         from app.redis_client import close_redis
 
@@ -1140,6 +1166,11 @@ async def lifespan(app):
 
     # Start the GCP Cleanup Service background task
     gcp_cleanup_task = asyncio.create_task(gcp_cleanup_service())
+
+    # Reconcile durable rendered-ArtifactRef effects independently from VM cleanup.
+    artifact_ref_lifecycle_task = asyncio.create_task(
+        artifact_ref_lifecycle_service()
+    )
 
     # Start the GCP Image Pruner (keeps agent image family under the per-project quota)
     gcp_image_cleanup_task = asyncio.create_task(gcp_image_cleanup_service())
@@ -1511,6 +1542,7 @@ async def lifespan(app):
     _bg_tasks["credential_sweep"] = credential_sweep_task
     _bg_tasks["reaper"] = reaper_task
     _bg_tasks["gcp_cleanup"] = gcp_cleanup_task
+    _bg_tasks["artifact_ref_lifecycle"] = artifact_ref_lifecycle_task
     _bg_tasks["gcp_image_cleanup"] = gcp_image_cleanup_task
     _bg_tasks["secret_reconciliation"] = secret_recon_task
     _bg_tasks["stale_branch_cleanup"] = stale_branch_task
@@ -1545,6 +1577,7 @@ async def lifespan(app):
             "orchestrator": orchestrator_worker,
             "reaper": reaper_service,
             "gcp_cleanup": gcp_cleanup_service,
+            "artifact_ref_lifecycle": artifact_ref_lifecycle_service,
             "gcp_image_cleanup": gcp_image_cleanup_service,
             "secret_reconciliation": secret_reconciliation_service,
             "stale_branch_cleanup": stale_branch_cleanup_service,
@@ -1804,40 +1837,16 @@ async def lifespan(app):
     start_orchestrator_hard_watchdog(is_guarded=lambda: _shared_state.is_leader)
 
     yield
-    # Shutdown: graceful cleanup with timeout to let in-flight operations finish
-    tasks_to_cancel = [
-        reaper_task,
-        gcp_cleanup_task,
-        gcp_image_cleanup_task,
-        secret_recon_task,
-        stale_branch_task,
-        auto_archive_task,
-        pipeline_alert_scan_task,
-        digest_precompute_task,
-        pool_maintainer_task,
-        compute_job_monitor_task,
-        branch_reconciliation_task,
-        orchestrator_task,
-        config_sync_task,
-        jwt_revocation_task,
-        event_fanout_task,
-        agent_log_relay_task,
-        publish_task,
-        notification_retry_task,
-        monitor_task,
-    ]
-    if leader_keepalive_task is not None:
-        tasks_to_cancel.append(leader_keepalive_task)
-    for t in tasks_to_cancel:
-        t.cancel()
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*tasks_to_cancel, return_exceptions=True), timeout=10.0
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "[SHUTDOWN] Background tasks didn't finish within 10s grace period"
-        )
+    # Stop the monitor before snapshotting the registry so it cannot install a
+    # replacement between snapshot and cancellation. After automatic restarts,
+    # the shared registry is authoritative; startup-local handles may be stale.
+    await _shutdown_background_task_registry(
+        _bg_tasks,
+        monitor_task=monitor_task,
+        leader_keepalive_task=leader_keepalive_task,
+    )
+    await shutdown_tracked_artifact_ref_promotions()
+    await shutdown_artifact_ref_lifecycle()
     await close_github_client()
     from app.redis_client import close_redis
 

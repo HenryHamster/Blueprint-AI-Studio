@@ -28,12 +28,12 @@ import time
 import urllib.request
 
 # Viewable extensions this watcher considers for upload, matching
-# ``storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS`` minus SVG (excluded fail-closed
-# for XSS via signed URL) and PDF (excluded mid-run because it is a terminal
-# output, not a live preview).
+# ``storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS`` minus PDF (excluded mid-run
+# because it is a terminal output, not a live preview). SVG is included —
+# the server sanitizes it (strips <script>/on* attrs) before storing.
 _VIEWABLE_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".webp", ".gif",
-    ".mp4", ".webm",
+    ".mp4", ".webm", ".svg",
 })
 
 # Maximum bytes this watcher will read into memory for an image file.  Files

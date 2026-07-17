@@ -2163,8 +2163,8 @@ _RUNNER_LIVE_TAIL_CHARS = 4096
 # per-kind byte caps, and 25-file budget MIRROR the server's (app.storage
 # ._VIEWABLE_CONTENT_TYPES + the /viewable endpoint) so the runner does not waste
 # an upload the server would reject: png/jpg/jpeg/webp/gif images ≤ 8 MiB, mp4/webm
-# videos ≤ 512 MiB, at most 25 distinct viewable objects per job. SVG is excluded
-# by design (a script-bearing SVG served from a signed URL is an XSS vector).
+# videos ≤ 512 MiB, at most 25 distinct viewable objects per job. SVG is sanitized
+# server-side (script tags stripped) before being stored and served.
 _VIEWABLE_CONTENT_TYPES = {
     "png": ("image/png", "image"),
     "jpg": ("image/jpeg", "image"),
@@ -2174,9 +2174,12 @@ _VIEWABLE_CONTENT_TYPES = {
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
     "pdf": ("application/pdf", "pdf"),
+    "svg": ("image/svg+xml", "image"),
 }
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
-_MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
+_MAX_VIEWABLE_VIDEO_BYTES = int(
+    os.environ.get("BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES", str(512 * 1024 * 1024))
+)  # mirrors backend/app/compute_backends.py BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
 _FINAL_VIEWABLE_DRAIN_SECONDS = 10.0
 # Maximum total directory entries (files + dirs) inspected per scan cycle.
@@ -4104,9 +4107,8 @@ def _classify_viewable(filename: str) -> "tuple[str, str] | None":
     """Return ``(content_type, kind)`` for a viewable filename, else ``None``.
 
     Mirrors ``app.storage.viewable_content_type_for_filename``: classification is
-    by the lowercased extension only (png/jpg/jpeg/webp/gif → image, mp4/webm →
-    video; svg deliberately excluded). A name with no recognised viewable
-    extension yields ``None`` so the caller skips it.
+    by the lowercased extension only (png/jpg/jpeg/webp/gif/svg → image, mp4/webm →
+    video). A name with no recognised viewable extension yields ``None``.
     """
     if not isinstance(filename, str) or "." not in filename:
         return None
@@ -4123,7 +4125,7 @@ def _scan_viewable_files(artifact_dir: str) -> list:
     ``sanitize_viewable_relpath``). Mirrors the HOST-side scan policy in
     ``app.compute_backends._collect_viewable_candidates_from_dir``:
 
-      * extension allowlist only (png/jpg/jpeg/webp/gif/mp4/webm; svg excluded);
+      * extension allowlist only (png/jpg/jpeg/webp/gif/mp4/webm/svg/pdf);
       * symlinked files skipped and symlinked dirs never descended
         (``os.walk(followlinks=False)`` + ``os.path.islink``) — a planted symlink
         must never exfiltrate an operator secret via a viewer-accessible object;

@@ -81,6 +81,7 @@ from app.finding_deduplication import (
     resolve_prerequisite_task,
 )
 from app.task_blocked import NEED_REF_MAX_LEN
+from app.capability_execution_fence import stamp_capability_requirements
 from app.task_evaluators import (
     ADVERSARIAL_PARSE_CHALLENGER_FAILED,
     ADVERSARIAL_PARSE_NO_HASH_MATCHES,
@@ -6293,6 +6294,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
                 prereq_need = build_need(prereq.get("kind"), prereq.get("ref"), label=prereq.get("label"))
+                # Durably record the capability prerequisite REGARDLESS of gate
+                # disposition (block or wire-edge) so the shared execution-authority
+                # fence can re-grade this task-backed foundation at cold dispatch /
+                # warm claim even after the gate graduates off/observe -> enforce.
+                # No-op for a non-capability (task-kind) prereq. Survives generic
+                # retry (key excluded from FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+                if prereq_need:
+                    stamp_capability_requirements(ct, [prereq_need])
                 if prereq_need and task_backed_capability_need_blocked_by_proof_gate(
                     prereq_need, getattr(project_obj, "capability_proof_records", None),
                     getattr(project_obj, "problem_model", None),
@@ -6300,6 +6309,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 ):
                     needs.append(prereq_need)
                     unresolved_entries.append(prereq)
+                    session.add(ct)
                 else:
                     _wired = _wire_prerequisite_edge(
                         ct, foundation, finding_title=finding_title,
@@ -6307,6 +6317,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     )
                     if _wired:
                         _maybe_inherit_base(ct, foundation, finding_title=finding_title)
+                    # Persist the durable requirement stamped above even when
+                    # _wire_prerequisite_edge added no new edge (idempotent re-spawn).
+                    if prereq_need:
+                        session.add(ct)
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or
@@ -6327,6 +6341,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         _working_registry_proof,
                         mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
                     )
+                    # Durably record this capability prerequisite on the child
+                    # REGARDLESS of disposition (block/surface/ok) so the shared
+                    # execution-authority fence can re-grade it at cold dispatch
+                    # and warm claim — even a proof that is current now may expire
+                    # or be revoked before the child gains authority. The record
+                    # survives generic retry (not in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+                    stamp_capability_requirements(ct, [prereq_need])
+                    session.add(ct)
                     if _disposition == "block":
                         # ENFORCE mode: an unproven/partial 'working' capability
                         # does NOT satisfy the prerequisite. Gate the dependent —
