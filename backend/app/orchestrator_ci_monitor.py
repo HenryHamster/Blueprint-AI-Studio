@@ -825,6 +825,109 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                             },
                         )
                     continue
+
+                # A PR can be deliberately superseded while its branch remains
+                # the canonical work branch (for example, a duplicate/wrong-base
+                # PR is closed and recreated against the integration branch).
+                # Reconcile to the unique open same-head/base replacement before
+                # terminalizing the task against the stale number.
+                if pr_state == "closed" and not pr_data.get("merged"):
+                    from app.github import get_open_pull_request_for_head_branch
+                    from sqlalchemy.orm.attributes import flag_modified
+
+                    _closed_head = ((pr_data.get("head") or {}).get("ref") or "")
+                    _closed_base = (
+                        ((pr_data.get("base") or {}).get("ref") or "")
+                        or ci_loop.get("base_branch", "")
+                    )
+                    if _closed_head and _closed_base:
+                        try:
+                            _replacement_pr = await get_open_pull_request_for_head_branch(
+                                ci_gh_token,
+                                ci_owner,
+                                ci_repo,
+                                _closed_head,
+                                _closed_base,
+                                project_id=str(ci_task.project_id),
+                            )
+                        except HTTPException as _replacement_exc:
+                            # Fail open on lookup uncertainty. The old PR is
+                            # closed, but we cannot assert there is no live
+                            # replacement until GitHub confirms it.
+                            ci_loop["polls_since_pr_fetch"] = 999
+                            ci_task.latest_status_message = (
+                                f"PR #{ci_pr_number} closed; replacement lookup "
+                                "unavailable — retrying before terminalizing"
+                            )
+                            ci_task.context = {
+                                **(ci_task.context or {}),
+                                "review_loop": ci_loop,
+                            }
+                            flag_modified(ci_task, "context")
+                            session.add(ci_task)
+                            await session.commit()
+                            logger.warning(
+                                "[CI] replacement lookup for closed PR #%s failed: %s",
+                                ci_pr_number,
+                                _replacement_exc,
+                            )
+                            continue
+
+                        _replacement_number = (
+                            (_replacement_pr or {}).get("number")
+                            if isinstance(_replacement_pr, dict)
+                            else None
+                        )
+                        if (
+                            _replacement_number
+                            and _replacement_number != ci_pr_number
+                        ):
+                            _replacement_head = (
+                                (_replacement_pr.get("head") or {}).get("sha") or ""
+                            )
+                            ci_loop["pr_number"] = _replacement_number
+                            ci_loop["branch"] = (
+                                ((_replacement_pr.get("head") or {}).get("ref") or "")
+                                or _closed_head
+                            )
+                            ci_loop["base_branch"] = (
+                                ((_replacement_pr.get("base") or {}).get("ref") or "")
+                                or _closed_base
+                            )
+                            ci_loop["ci_waiting"] = True
+                            ci_loop["polls_since_pr_fetch"] = 999
+                            if _replacement_head:
+                                ci_loop["head_sha"] = _replacement_head
+
+                            _rebound_ctx = {
+                                **(ci_task.context or {}),
+                                "review_loop": ci_loop,
+                            }
+                            if (
+                                _rebound_ctx.get("rollup_pr_number")
+                                == ci_pr_number
+                            ):
+                                _rebound_ctx["rollup_pr_number"] = (
+                                    _replacement_number
+                                )
+                            ci_task.context = _rebound_ctx
+                            ci_task.latest_status_message = (
+                                f"PR #{ci_pr_number} was superseded by open PR "
+                                f"#{_replacement_number}; resumed CI monitoring"
+                            )
+                            flag_modified(ci_task, "context")
+                            session.add(ci_task)
+                            await session.commit()
+                            logger.info(
+                                "[CI] rebound task %s from closed PR #%s to open "
+                                "replacement PR #%s (%s -> %s)",
+                                ci_task.id,
+                                ci_pr_number,
+                                _replacement_number,
+                                _closed_head,
+                                _closed_base,
+                            )
+                            continue
                 if pr_data.get("merged"):
                     _orch_ci_project = _get_project(ci_task.project_id)
                     _ci_base = (
