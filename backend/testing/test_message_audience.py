@@ -111,6 +111,65 @@ def test_route_event_hotfix_backmerge_size_violation_is_strategist_internal():
     assert route_event("hotfix_backmerge.size_violation") == STRATEGIST_INTERNAL
 
 
+def test_route_event_pipeline_internal_bookkeeping_is_strategist_internal():
+    """Pipeline-internal bookkeeping event types that must NOT reach the operator badge."""
+    # Stale-branch cleanup summary (branch_cleanup.py)
+    assert route_event("branch.cleanup_summary") == STRATEGIST_INTERNAL
+    # Anomaly auto-adjust / restore (autonomous_research.py)
+    assert route_event("research.anomaly_auto_adjusted") == STRATEGIST_INTERNAL
+    # Churn-retirement recommended — kept paused, strategist decides (direction_lifecycle.py)
+    assert route_event("research.churn_retirement_recommended") == STRATEGIST_INTERNAL
+    # These pipeline-bookkeeping types appear in get_non_operator_event_types() and
+    # are therefore excluded by operator_visible_alert_filter.
+    non_operator = get_non_operator_event_types()
+    assert "branch.cleanup_summary" in non_operator
+    assert "research.anomaly_auto_adjusted" in non_operator
+    assert "research.churn_retirement_recommended" in non_operator
+
+
+def test_route_event_operator_facing_direction_incidents():
+    """Direction incidents that need operator attention are classified accordingly."""
+    # Escalation notification delivery failed — ERROR alert, operator must act
+    assert route_event("research.escalation_delivery_failed") == OPERATOR_ACTION_NEEDED
+    # Direction diagnosis stalled — WARNING alert, manual investigation required
+    assert route_event("research.diagnosis_stalled") == OPERATOR_ACTION_NEEDED
+    # These must NOT appear in the non-operator exclusion set (they reach the badge)
+    non_operator = get_non_operator_event_types()
+    assert "research.escalation_delivery_failed" not in non_operator
+    assert "research.diagnosis_stalled" not in non_operator
+
+
+def test_route_event_already_registered_reused_types_retain_audience():
+    """Reused existing event types (stamped on new call sites) keep their registered audience."""
+    # warm_pool.cost_guard and self_improvement.payload_too_large are already registered;
+    # their audience must not have changed.
+    assert route_event("warm_pool.cost_guard") == STRATEGIST_INTERNAL
+    assert route_event("self_improvement.payload_too_large") == STRATEGIST_INTERNAL
+    # cost.ceiling_reached is operator-facing (reused on cost_ceiling.py)
+    assert route_event("cost.ceiling_reached") == OPERATOR_ACTION_NEEDED
+    # research.direction_auto_completed is internal (reused on direction_lifecycle.py)
+    assert route_event("research.direction_auto_completed") == STRATEGIST_INTERNAL
+
+
+def test_new_internal_event_types_appear_in_non_operator_filter():
+    """All new strategist-internal alert event types are in the Alert read-side exclusion set.
+
+    This is the end-to-end proof that operator_visible_alert_filter() will drop
+    Alert rows tagged with these event_types from badge counts and previews.
+    """
+    non_operator = get_non_operator_event_types()
+    internal_types = {
+        "branch.cleanup_summary",
+        "research.anomaly_auto_adjusted",
+        "research.churn_retirement_recommended",
+    }
+    for et in internal_types:
+        assert et in non_operator, (
+            f"{et!r} is registered STRATEGIST_INTERNAL but absent from "
+            "get_non_operator_event_types() — operator_visible_alert_filter will NOT exclude it"
+        )
+
+
 # ── route_event – fail-closed ───────────────────────────────────────────
 
 
@@ -1042,3 +1101,237 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
     assert msg.handling_state == "responded"
     assert msg.reply_to_message_id == orig_id
     mock_session.add.assert_called_once()
+
+
+# ── Structural AST scan: Alert(...) constructors must carry event_type ───
+#
+# operator_visible_alert_filter(Alert.event_type) in operator_attention.py
+# FAILS OPEN on NULL event_type, so a directly-constructed Alert(...) without
+# an event_type= keyword silently inflates the operator badge/preview.
+# The correct pattern is either:
+#   (a) Alert(..., event_type="registered.event") in the constructor call, OR
+#   (b) routing through create_project_alert_if_allowed (which stamps it).
+# This ratchet prevents either pattern from silently regressing.
+
+_ALERT_GATE_CALL = "create_project_alert_if_allowed"
+
+
+def _collect_ungated_alert_constructors(
+    source: str, *, filename: str, rel: str
+) -> list[str]:
+    """Return offender strings for Alert(...) constructor calls whose enclosing
+    function neither supplies an event_type= keyword nor calls
+    create_project_alert_if_allowed."""
+
+    tree = ast.parse(source, filename=filename)
+    funcs = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+
+    def _enclosing_func(lineno: int):
+        best = None
+        for fn in funcs:
+            if fn.lineno <= lineno <= (fn.end_lineno or fn.lineno):
+                if best is None or fn.lineno > best.lineno:
+                    best = fn
+        return best
+
+    def _has_event_type_keyword(call: ast.Call) -> bool:
+        return any(kw.arg == "event_type" for kw in call.keywords)
+
+    def _calls_gate(func_node) -> bool:
+        return any(
+            isinstance(n, ast.Call) and _ast_called_name(n) == _ALERT_GATE_CALL
+            for n in ast.walk(func_node)
+        )
+
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _ast_called_name(node) != "Alert":
+            continue
+        if _has_event_type_keyword(node):
+            continue
+        enclosing = _enclosing_func(node.lineno)
+        if enclosing is not None and _calls_gate(enclosing):
+            continue
+        func_name = enclosing.name if enclosing is not None else "<module>"
+        offenders.append(
+            f"  {rel}:{node.lineno} in {func_name}() — Alert() constructed without "
+            "event_type= keyword and not routed through create_project_alert_if_allowed"
+        )
+    return offenders
+
+
+# ── Unit tests for the Alert scanner ────────────────────────────────────
+
+
+def test_alert_scan_flags_constructor_without_event_type():
+    """An Alert(...) call with no event_type= keyword is flagged."""
+    source = dedent(
+        """
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                level="WARNING",
+                message="something happened",
+            )
+            session.add(alert)
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "emit_alert()" in offenders[0]
+    assert "event_type=" in offenders[0]
+
+
+def test_alert_scan_accepts_constructor_with_event_type():
+    """An Alert(...) call that includes event_type= is accepted."""
+    source = dedent(
+        """
+        def emit_alert(session, project_id):
+            alert = Alert(
+                project_id=project_id,
+                level="WARNING",
+                message="something happened",
+                event_type="branch.cleanup_summary",
+            )
+            session.add(alert)
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_alert_scan_accepts_function_routing_through_gate():
+    """An Alert(...) call without event_type= is accepted when the function also
+    calls create_project_alert_if_allowed (it delegates to the gated path)."""
+    source = dedent(
+        """
+        async def emit_alert(session, project_id, condition):
+            if condition:
+                await create_project_alert_if_allowed(
+                    session,
+                    project_id=project_id,
+                    event_type="task.failed",
+                    message="task failed",
+                )
+            else:
+                alert = Alert(
+                    project_id=project_id,
+                    level="INFO",
+                    message="fallback",
+                )
+                session.add(alert)
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_alert_scan_flags_multiple_ungated_constructors():
+    """Multiple Alert(...) calls without event_type= in the same file are all flagged."""
+    source = dedent(
+        """
+        def emit_a(session, project_id):
+            alert = Alert(project_id=project_id, message="a")
+            session.add(alert)
+
+        def emit_b(session, project_id):
+            alert = Alert(project_id=project_id, message="b")
+            session.add(alert)
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 2
+    assert any("emit_a()" in o for o in offenders)
+    assert any("emit_b()" in o for o in offenders)
+
+
+def test_alert_scan_skips_non_alert_calls():
+    """Calls to other functions (AlertPolicy, AlertEvent, etc.) are not flagged."""
+    source = dedent(
+        """
+        def configure_policy():
+            policy = AlertPolicy(level="WARNING")
+            return policy
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_alert_scan_mixed_gated_and_ungated():
+    """Only the ungated Alert(...) call is flagged when another in the file has event_type=."""
+    source = dedent(
+        """
+        def emit_gated(session, project_id):
+            alert = Alert(project_id=project_id, message="ok", event_type="task.failed")
+            session.add(alert)
+
+        def emit_ungated(session, project_id):
+            alert = Alert(project_id=project_id, message="bad")
+            session.add(alert)
+        """
+    )
+    offenders = _collect_ungated_alert_constructors(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert len(offenders) == 1
+    assert "emit_ungated()" in offenders[0]
+
+
+# ── Whole-file invariant: zero ungated Alert constructors in domain modules ──
+
+_DOMAIN_MODULES_WITH_ALERTS = [
+    "autonomous_research.py",
+    "cost_ceiling.py",
+    "branch_cleanup.py",
+    "direction_lifecycle.py",
+    "warm_pool_maintainer.py",
+]
+
+
+def test_no_alert_constructor_bypasses_event_type_gate():
+    """Whole-file invariant: every Alert(...) constructed in the pipeline-internal
+    domain modules carries an event_type= keyword (or is in a function that routes
+    through create_project_alert_if_allowed).
+
+    This is the structural ratchet that prevents the operator-badge leak from
+    silently reoccurring: operator_visible_alert_filter(Alert.event_type) fails
+    OPEN on NULL, so any ungated Alert(...) inflates the operator badge/preview.
+    A new direct constructor without a registered event_type= fails CI here.
+    """
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    all_offenders: list[str] = []
+    for module_name in _DOMAIN_MODULES_WITH_ALERTS:
+        fpath = os.path.join(app_dir, module_name)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        offenders = _collect_ungated_alert_constructors(
+            source, filename=fpath, rel=module_name
+        )
+        all_offenders.extend(offenders)
+
+    assert not all_offenders, (
+        "Found Alert() constructor(s) in pipeline-internal domain modules that "
+        "do NOT supply an event_type= keyword or route through "
+        "create_project_alert_if_allowed. A NULL event_type causes "
+        "operator_visible_alert_filter to FAIL OPEN, leaking the alert into "
+        "the operator badge/preview. Fix by adding event_type=<registered_key> "
+        "to the Alert(...) call (register the key in message_audience.py if needed):\n"
+        + "\n".join(all_offenders)
+    )
