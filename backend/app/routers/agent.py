@@ -342,6 +342,8 @@ _RESIDENT_AGENT_ALLOWED_PATHS = frozenset(
         "/api/agent/refresh-token",
         "/api/agent/resident-turn/complete",
         "/api/agent/resident-turn/context",
+        "/api/agent/resident-turn/artifact",
+        "/api/agent/resident-turn/capability",
         "/api/agent/resident-turn/fail",
         "/api/agent/task-capabilities",
     }

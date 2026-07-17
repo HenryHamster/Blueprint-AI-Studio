@@ -1311,6 +1311,13 @@ async def delete_project_admin(
     # qualificationverdict, auditfindingresolution, improvementlane,
     # evergreenbacklogitem) were correct from the start. With all FKs
     # cascading at the DB level, the project delete below is sufficient.
+    from app.artifact_ref_cleanup import ensure_artifact_ref_cleanup_intent
+    from app.artifact_ref_promotion import mark_project_artifact_ref_promotions_cleanup
+
+    # No FK by design: the outbox row commits atomically with project deletion
+    # and survives the cascade, including orphan-only / unknown-copy objects.
+    await mark_project_artifact_ref_promotions_cleanup(session, project_id)
+    await ensure_artifact_ref_cleanup_intent(session, project_id)
     await session.delete(project)
     await session.commit()
 

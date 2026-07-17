@@ -16,7 +16,9 @@ import logging
 import asyncio
 import json
 import threading
+import time
 import xml.etree.ElementTree as _ET
+from dataclasses import dataclass
 import google.auth
 from google.auth.transport.requests import Request as _GoogleAuthRequest
 from google.cloud import storage
@@ -25,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "your-gcp-project-id")
 ARTIFACT_BUCKET_NAME = os.getenv("ARTIFACT_BUCKET_NAME", "blueprint-agent-artifacts")
+ARTIFACT_REF_OBJECT_ROOT = "artifact-refs"
+ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS = 30
+ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS = 60
+ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS = 2
+ARTIFACT_REF_CLEANUP_RETRY_DEADLINE_SECONDS = 3
+ARTIFACT_REF_CLEANUP_BATCH_SIZE = 8
+ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS = 2
+ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS = 3
 
 # Merged helpers from both sides:
 # A gs:// URI is gs://<bucket>/<object>. Buckets allow lowercase letters,
@@ -271,6 +281,7 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
 
     def _delete() -> None:
         from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
 
         blob = (
             storage.Client(project=GCP_PROJECT_ID)
@@ -278,7 +289,12 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
             .blob(object_name)
         )
         try:
-            blob.delete()
+            blob.delete(
+                timeout=ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS,
+                retry=DEFAULT_RETRY.with_deadline(
+                    ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS
+                ),
+            )
         except _gexc.NotFound:
             pass
 
@@ -288,6 +304,286 @@ async def delete_storage_uri_best_effort(storage_uri: str) -> bool:
         logger.warning("Failed to delete storage object %s", object_name, exc_info=True)
         return False
     return True
+
+
+def artifact_ref_render_object_name(
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+) -> str:
+    """Return the immutable, project-cleanable object name for a board render."""
+
+    return (
+        f"{ARTIFACT_REF_OBJECT_ROOT}/{project_id}/{tool_id}/"
+        f"{int(revision)}/{attachment_id}.png"
+    )
+
+
+def artifact_ref_render_uri(
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+) -> str:
+    return (
+        f"gs://{ARTIFACT_BUCKET_NAME}/"
+        f"{artifact_ref_render_object_name(project_id, tool_id, revision, attachment_id)}"
+    )
+
+
+@dataclass(frozen=True)
+class ArtifactRefRenderPromotion:
+    storage_uri: str
+    created: bool
+    generation: int
+
+
+async def promote_artifact_ref_render(
+    source_storage_uri: str,
+    *,
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    revision: int,
+    attachment_id: uuid.UUID,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> ArtifactRefRenderPromotion:
+    """Idempotently copy and verify a rendered board outside database locks.
+
+    The destination identity includes the upload receipt. Retries reconcile an
+    uncertain copy by exact-verifying an existing object; they never overwrite
+    or delete it. The source must be the exact project-scoped receipt prefix;
+    callers still revalidate the receipt row under lock before committing.
+    """
+
+    bucket_name, source_name = parse_artifact_uri(source_storage_uri)
+    source_prefix = f"message-attachments/{project_id}/{attachment_id}/"
+    if not source_name.startswith(source_prefix) or "/" in source_name[
+        len(source_prefix) :
+    ]:
+        raise StorageUriError("render source does not match its project upload receipt")
+    if expected_size_bytes < 1:
+        raise StorageUriError("render source has invalid expected size")
+    checksum = str(expected_sha256 or "").strip().lower()
+    if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise StorageUriError("render source has invalid SHA-256")
+    destination_name = artifact_ref_render_object_name(
+        project_id, tool_id, revision, attachment_id
+    )
+
+    def _promote_and_verify() -> tuple[bool, int]:
+        import hashlib
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(bucket_name)
+
+        def _verify(blob) -> int | None:
+            blob.reload(timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry)
+            if int(blob.size or -1) != int(expected_size_bytes):
+                raise StorageUriError("rendered image size does not match its receipt")
+            digest = hashlib.sha256()
+            with blob.open(
+                "rb",
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            ) as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() != checksum:
+                raise StorageUriError(
+                    "rendered image checksum does not match its receipt"
+                )
+            if blob.generation is None:
+                raise StorageUriError("rendered image generation is unavailable")
+            return int(blob.generation)
+
+        destination = bucket.blob(destination_name)
+        try:
+            return False, int(_verify(destination))
+        except _gexc.NotFound:
+            pass
+
+        source = bucket.blob(source_name)
+        source_generation = _verify(source)
+        try:
+            copied = bucket.copy_blob(
+                source,
+                bucket,
+                destination_name,
+                if_source_generation_match=source_generation,
+                if_generation_match=0,
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+            generation = copied.generation
+            if generation is None:
+                generation = _verify(destination)
+            return True, int(generation)
+        except (_gexc.Conflict, _gexc.PreconditionFailed) as exc:
+            # A same-identity retry may find the exact durable object already
+            # present. Verify and reuse it; never overwrite or delete it.
+            try:
+                generation = _verify(destination)
+            except _gexc.NotFound:
+                raise StorageUriError(
+                    "render source changed during durable promotion"
+                ) from exc
+            return False, int(generation)
+
+    created, generation = await asyncio.to_thread(_promote_and_verify)
+    return ArtifactRefRenderPromotion(
+        storage_uri=f"gs://{bucket_name}/{destination_name}",
+        created=created,
+        generation=generation,
+    )
+
+
+async def inspect_artifact_ref_render_candidate(
+    storage_uri: str,
+    *,
+    expected_size_bytes: int,
+    expected_sha256: str,
+) -> int | None:
+    """Return the exact candidate generation, or ``None`` when absent."""
+
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+    checksum = str(expected_sha256 or "").strip().lower()
+    if len(checksum) != 64 or any(char not in "0123456789abcdef" for char in checksum):
+        raise StorageUriError("render candidate has invalid SHA-256")
+
+    def _inspect() -> int | None:
+        import hashlib
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        try:
+            blob.reload(timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry)
+        except _gexc.NotFound:
+            return None
+        if int(blob.size or -1) != int(expected_size_bytes):
+            raise StorageUriError("render candidate size mismatch")
+        digest = hashlib.sha256()
+        with blob.open(
+            "rb", timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS, retry=retry
+        ) as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+        if digest.hexdigest() != checksum:
+            raise StorageUriError("render candidate checksum mismatch")
+        if blob.generation is None:
+            raise StorageUriError("render candidate generation is unavailable")
+        return int(blob.generation)
+
+    return await asyncio.to_thread(_inspect)
+
+
+async def delete_artifact_ref_render_candidate(
+    storage_uri: str,
+    *,
+    generation: int,
+) -> bool:
+    """Delete only the exact observed candidate generation."""
+
+    bucket_name, object_name = parse_artifact_uri(storage_uri)
+
+    def _delete() -> bool:
+        from google.api_core import exceptions as _gexc
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_GCS_RETRY_DEADLINE_SECONDS)
+        blob = storage.Client(project=GCP_PROJECT_ID).bucket(bucket_name).blob(object_name)
+        try:
+            blob.delete(
+                if_generation_match=int(generation),
+                timeout=ARTIFACT_REF_GCS_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+        except _gexc.NotFound:
+            return False
+        return True
+
+    return await asyncio.to_thread(_delete)
+
+
+async def delete_artifact_ref_project_prefix_best_effort(
+    project_id: uuid.UUID,
+    *,
+    max_objects: int = ARTIFACT_REF_CLEANUP_BATCH_SIZE,
+    max_seconds: float = 30.0,
+) -> dict[str, object]:
+    """Drain one deleted project's retained renders under hard safety bounds."""
+
+    prefix = f"{ARTIFACT_REF_OBJECT_ROOT}/{project_id}/"
+
+    def _delete_prefix() -> tuple[int, bool]:
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
+        retry = DEFAULT_RETRY.with_deadline(ARTIFACT_REF_CLEANUP_RETRY_DEADLINE_SECONDS)
+        storage_client = storage.Client(project=GCP_PROJECT_ID)
+        bucket = storage_client.bucket(ARTIFACT_BUCKET_NAME)
+        deadline = time.monotonic() + max(0.1, float(max_seconds))
+        batch_size = max(1, min(ARTIFACT_REF_CLEANUP_BATCH_SIZE, int(max_objects)))
+        blobs = list(
+            storage_client.list_blobs(
+                bucket,
+                prefix=prefix,
+                max_results=batch_size + 1,
+                timeout=ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+        )
+        if not blobs:
+            return 0, True
+        deleted = 0
+        for blob in blobs[:batch_size]:
+            if time.monotonic() >= deadline:
+                return deleted, False
+            blob.delete(
+                timeout=ARTIFACT_REF_CLEANUP_RPC_TIMEOUT_SECONDS,
+                retry=retry,
+            )
+            deleted += 1
+        return deleted, len(blobs) <= batch_size
+
+    try:
+        deleted, complete = await asyncio.to_thread(_delete_prefix)
+    except Exception:
+        logger.warning(
+            "ArtifactRef project cleanup is unknown; reconciliation required",
+            extra={
+                "event": "artifact_ref_cleanup_unknown",
+                "project_id": str(project_id),
+                "object_prefix": prefix,
+            },
+            exc_info=True,
+        )
+        return {
+            "deleted": 0,
+            "complete": False,
+            "reconciliation_required": True,
+        }
+    if not complete:
+        logger.warning(
+            "ArtifactRef project cleanup reached its bound; reconciliation required",
+            extra={
+                "event": "artifact_ref_cleanup_reconciliation_required",
+                "project_id": str(project_id),
+                "object_prefix": prefix,
+                "deleted": deleted,
+            },
+        )
+    return {
+        "deleted": deleted,
+        "complete": complete,
+        "reconciliation_required": not complete,
+    }
 
 
 # Object-name root under the shared artifact bucket where each compute job's

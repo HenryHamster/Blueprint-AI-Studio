@@ -46,6 +46,21 @@ function renderComposer(props: Partial<React.ComponentProps<typeof MessagesCompo
 }
 
 describe('MessagesComposer — clickable pending image preview', () => {
+  test('renders an exact-revision source chip and exposes explicit removal', () => {
+    const onRemoveArtifactRef = vi.fn();
+    renderComposer({
+      artifactRefs: [{
+        id: 'tool-ref-7', artifact_ref_id: 'tool-ref-7', kind: 'notes', revision: 7,
+      }],
+      onRemoveArtifactRef,
+    });
+
+    expect(screen.getByLabelText('Attached Resident sources')).toBeTruthy();
+    expect(screen.getByText('Notes revision 7')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Remove Notes revision 7'));
+    expect(onRemoveArtifactRef).toHaveBeenCalledWith('tool-ref-7');
+  });
+
   test('renders an open-preview button for a pending image with a preview url', () => {
     renderComposer({ pendingAttachments: [imageAttachment()] });
     expect(screen.getByLabelText('Open shot.png preview')).toBeTruthy();

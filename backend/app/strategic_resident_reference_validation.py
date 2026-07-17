@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import Artifact, ProjectMessage, Task
+from app.models import Artifact, ArtifactRef, ProjectMessage, Task
 from app.strategic_operation_authority_validation import InactiveTurnAuthority
 
 
@@ -22,6 +22,7 @@ async def validate_durable_ref_ownership(
 
     targets = (
         ("artifact_id", Artifact),
+        ("artifact_ref_id", ArtifactRef),
         ("task_id", Task),
         ("message_id", ProjectMessage),
     )

@@ -1,0 +1,213 @@
+"""Task-bound typed capability invocations for authoritative Resident turns."""
+
+import hashlib
+import json
+import uuid
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import get_session
+from app.models import TaskStatus
+from app.routers.agent import verify_agent_token
+from app.shared_state import limiter
+from app.resident_agent_rate_limits import (
+    resident_remote_rate_key,
+    resident_task_token_rate_key,
+)
+from app.strategic_operation_authority_validation import (
+    OperationPayloadTooLarge,
+    StrategicAuthorityError,
+)
+from app.strategic_resident_agent_binding import (
+    ResidentAgentAuthorityError,
+    ResidentAgentBinding,
+    ResidentAgentBindingError,
+    ResidentAgentTaskNotFound,
+    load_live_resident_agent_task_locked,
+)
+from app.strategic_resident_capabilities import CapabilityMode, capability_for
+from app.strategic_resident_capability_invocation import (
+    validated_capability_parameters,
+)
+from app.strategic_resident_task_inspection import (
+    ResidentTaskNotFound,
+    inspect_project_task,
+    inspect_project_task_lineage,
+)
+
+
+router = APIRouter(prefix="/api/agent/resident-turn", tags=["agent"])
+
+MAX_CAPABILITY_REQUESTS_PER_TURN = 8
+_CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY = "_strategic_resident_capability_requests"
+
+_TASK_INSPECTION_KINDS = {
+    "task.inspect": "task",
+    "task.logs.inspect": "logs",
+    "task.failure.inspect": "failure",
+    "task.provider.inspect": "provider",
+}
+
+
+class ResidentCapabilityRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability_id: str = Field(min_length=3, max_length=120)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+
+
+def _binding(token: dict[str, Any]) -> ResidentAgentBinding:
+    try:
+        return ResidentAgentBinding(
+            task_id=uuid.UUID(str(token.get("sub"))),
+            project_id=uuid.UUID(str(token.get("project_id"))),
+            vm_instance_id=str(token.get("vm_instance_id") or ""),
+            task_type=str(token.get("task_type") or ""),
+            claim_nonce=str(token.get("claim_nonce") or ""),
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=403, detail="complete Resident task token required"
+        ) from None
+
+
+def _request_fingerprint(
+    capability_id: str,
+    parameters: dict[str, Any],
+) -> str:
+    encoded = json.dumps(
+        {"capability_id": capability_id, "parameters": parameters},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _register_capability_request(
+    task: Any,
+    *,
+    fingerprint: str,
+) -> bool:
+    """Consume one durable unique-call slot under the locked turn Task."""
+
+    context = task.context if isinstance(task.context, dict) else {}
+    raw_ledger = context.get(_CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY, [])
+    if not isinstance(raw_ledger, list) or any(
+        not isinstance(item, str)
+        or len(item) != 64
+        or any(character not in "0123456789abcdef" for character in item)
+        for item in raw_ledger
+    ):
+        raise HTTPException(status_code=409, detail="capability request ledger is invalid")
+    ledger = list(dict.fromkeys(raw_ledger))
+    if len(ledger) > MAX_CAPABILITY_REQUESTS_PER_TURN:
+        raise HTTPException(status_code=409, detail="capability request ledger is invalid")
+    if fingerprint in ledger:
+        return False
+    if len(ledger) >= MAX_CAPABILITY_REQUESTS_PER_TURN:
+        raise HTTPException(status_code=429, detail="Resident capability budget exhausted")
+    task.context = {
+        **context,
+        _CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY: [*ledger, fingerprint],
+    }
+    return True
+
+
+_capability_rate_key = resident_task_token_rate_key
+
+
+@router.post("/capability")
+@limiter.limit("600/minute", key_func=resident_remote_rate_key)
+@limiter.limit("60/minute", key_func=_capability_rate_key)
+async def invoke_resident_capability(
+    request: Request,
+    body: ResidentCapabilityRequest,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+) -> dict[str, Any]:
+    """Invoke one implemented read-only capability under the live turn token."""
+
+    binding = _binding(token)
+    try:
+        spec = capability_for(body.capability_id)
+        parameters = validated_capability_parameters(spec, body.parameters)
+    except OperationPayloadTooLarge as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except (StrategicAuthorityError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if spec.mode is not CapabilityMode.inspect:
+        raise HTTPException(
+            status_code=501,
+            detail="mutation capability is proposal-only until a fenced adapter exists",
+        )
+    if spec.service != "resident_task_inspection":
+        raise HTTPException(
+            status_code=501,
+            detail="capability is declared but has no task-bound adapter",
+        )
+
+    try:
+        task = await load_live_resident_agent_task_locked(
+            session,
+            binding,
+            allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
+        )
+    except ResidentAgentTaskNotFound as exc:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ResidentAgentAuthorityError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ResidentAgentBindingError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    target_task_id = uuid.UUID(parameters["task_id"])
+    fingerprint = _request_fingerprint(body.capability_id, parameters)
+    try:
+        request_registered = _register_capability_request(
+            task,
+            fingerprint=fingerprint,
+        )
+        if request_registered:
+            # Make the ledger write (and its updated_at onupdate) visible before
+            # inspecting the turn Task itself, so returned revision evidence is
+            # not stale immediately after commit.
+            await session.flush()
+        if body.capability_id == "task.lineage.inspect":
+            evidence = await inspect_project_task_lineage(
+                session,
+                project_id=task.project_id,
+                task_id=target_task_id,
+            )
+        else:
+            evidence = await inspect_project_task(
+                session,
+                project_id=task.project_id,
+                task_id=target_task_id,
+                kind=_TASK_INSPECTION_KINDS[body.capability_id],
+            )
+        await session.commit()
+    except ResidentTaskNotFound as exc:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        await session.rollback()
+        raise
+    except Exception:
+        await session.rollback()
+        raise
+    return {
+        "capability_id": body.capability_id,
+        "evidence": evidence.model_dump(mode="json"),
+    }
+
+
+__all__ = [
+    "MAX_CAPABILITY_REQUESTS_PER_TURN",
+    "ResidentCapabilityRequest",
+    "router",
+]

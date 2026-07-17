@@ -2,13 +2,12 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1 and 2a merged; Milestone 2b post-rebase review converged,
-publication pending.
+**Status:** Milestones 1, 2a, and 2b merged; Milestone 3 in progress.
 
 **Last refreshed:** 2026-07-16. M2a merged through PR `#15292` at merge commit
-`7b9b8c80b`. M2b is rebased onto `origin/automain` at `ef2d993a8`; migration,
-locking, latency, provider-boundary, and affected-suite review/fix loops have
-converged. The milestone is ready for publication.
+`7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
+migration, locking, latency, provider-boundary, and affected-suite review/fix
+loops converged. M3 now adds typed operations and revision-safe human-tool handoff.
 
 This plan tracks the migration from disposable Resident sessions to one durable,
 project-owned Strategic Resident. It is intentionally separate from the historical
@@ -140,7 +139,7 @@ Current convergence checklist:
 
 Merged by PR `#15292`, commit `7b9b8c80b`.
 
-### M2b — Mutation-authorized bounded Resident turns — in progress
+### M2b — Mutation-authorized bounded Resident turns — merged
 
 - Reconstruct turns from stable instructions, charter, working strategy, active
   mission, recent conversation, and explicitly retrieved evidence.
@@ -174,7 +173,7 @@ Current implementation checklist:
   iterative post-rebase review/fix convergence.
 - [x] Refresh latest `origin/automain` through `ef2d993a8`; the four late commits
   are non-overlapping and the migration/size/diff smoke gates remain green.
-- [ ] Publish and merge M2b.
+- [x] Publish and merge M2b through PR `#15486`, commit `3d3689e65`.
 
 Pre-rebase evidence:
 
@@ -219,7 +218,7 @@ Post-rebase evidence:
   upstream handler preservation, provider isolation, lock/FK compatibility,
   stale identity/session routing, workbench autoflush, and SAVEPOINT recovery.
 
-### M3 — Typed operations and human-tool compatibility
+### M3 — Typed operations and human-tool compatibility — in progress
 
 - Project-scoped inspection and mutation capabilities with declared scope, risk,
   evidence, approval, idempotency, reconciliation, and receipt shapes.
@@ -227,18 +226,77 @@ Post-rebase evidence:
 - Share/Ask Resident after autosave flush, source-linked derived work, explicit lane
   ownership, revision-safe writes, and recursive-wakeup prevention.
 
-### M4 — Complete user experience, migration, and rollback
+Current implementation checklist:
 
-- Finish the split Resident conversation/composer/operation renderer/activity inbox
-  architecture and retire Chat/Workday/session assumptions.
-- Shadow comparison and rollout health surfaces.
-- Atomic per-project engine ownership flip at a checkpoint boundary.
-- Rollback by fencing the new generation, reconciling unknown operations, projecting
-  the latest checkpoint into legacy inputs, and restoring legacy ownership.
-- Retire legacy session blobs and handlers only after the soak.
+- [x] Declare 38 immutable project-scoped inspection/mutation contracts and expose
+  a compact 4.1 KB provider catalog without service internals, credentials, shell,
+  or verbose receipt metadata.
+- [x] Add fail-closed invocation validation plus bounded, tenant-isolated exact
+  Task, lineage, log, failure, and provider inspection.
+- [x] Add migration `0628` for immutable Notes/Whiteboard `ArtifactRef` snapshots,
+  rendered-image receipt ownership, and a durable project-cleanup outbox with
+  lease-generation fencing and bounded retry reconciliation.
+- [x] Validate revision/checksum/project ownership when a displayed tool chip is
+  sent, and preserve that exact chip through bounded Resident reconstruction.
+- [x] Give only the live task/VM/project/authority-bound Resident token access to
+  bounded Notes text or a short-lived raster Whiteboard URL.
+- [x] Union canonical ArtifactRef grants into new, successor, and recovery turns;
+  retrieve only exact task-granted revisions and release authority locks before
+  signed-URL generation.
+- [x] Flush Notes/Whiteboard autosave before reference creation; preserve explicit
+  Share/Ask intent and optional lane ownership through draft, remount, retry, and
+  canonical conversation send paths.
+- [x] Make composer drafts and tool handoffs immutable per write/event across tabs,
+  consume one handoff intent per message, and bound Whiteboard points, nodes,
+  embedded bytes, text, image concurrency, browser yields, and total render time.
+- [x] Fail closed on human-tool writes and output-link mutations until they can run
+  inside the canonical authority/receipt executor; no context-flag-only bypass
+  ships in M3.
+- [x] Keep the typed catalog latency-bounded and verify full provider input remains
+  within its hard byte budget.
+- [x] Complete independent backend/UI review-fix iterations until convergence.
+- [ ] Refresh from current `origin/automain`, repeat affected gates, publish, and
+  merge the M3 milestone.
 
-### M5 — Release audit
+Pre-rebase evidence:
 
+- ArtifactRef promotion, crash reconciliation, cleanup, message-grant, and
+  shutdown coverage passes (`33 passed`, one PostgreSQL-only concurrency skip);
+  schema head/linear/monotonic gates pass (`4 passed`).
+- Typed capability invocation and task inspection pass (`14 passed`); Agent
+  capability-loop tests and typecheck remain green.
+- Strategic runtime/context reconstruction passes (`12 passed`), including a
+  24-message oversized unhandled range that preserves a contiguous cursor prefix
+  and grants only the omitted tail's exact ArtifactRefs to its successor.
+- Durable pending Whiteboard handoff, immutable composer/handoff storage, retry,
+  remount, and rendering bounds pass (`41` focused pending-operation tests,
+  `348` full MessagesPanel tests, and `38` related Resident-tool UI tests).
+- Independent backend, UI, latency, migration, lifecycle, retention/IAM, and
+  maintainability review/fix iterations converged with no actionable findings;
+  scoped Ruff, TypeScript, ESLint, Terraform formatting, and diff checks are clean.
+
+### M4 — Fenced operations, strategic memory, and cadence
+
+- Route authorized mutations through operation IDs, expected revisions, authority
+  generations, evidence preconditions, approvals, durable receipts, and explicit
+  unknown-effect reconciliation.
+- Add direct bounded adapters for safe operations and managed-Task escalation for
+  code editing, large review, open-ended debugging, and repeated CI repair.
+- Reconstruct interactive/background turns independently from charter, working
+  strategy, active mission, conversation cursors, and retrieved evidence.
+- Admit worker memory proposals only through Resident reconciliation; preserve
+  charter, decisions, rationales, commitments, and open loops across rotations.
+- Coalesce meaningful wakeups, make unchanged checks zero-model-call, preempt
+  background work safely, and reconcile revision-linked StrategicCycle proposals.
+
+### M5 — Rollout, legacy retirement, and release audit
+
+- Complete shadow comparisons and rollout health surfaces, then atomically flip
+  per-project engine ownership at a checkpoint boundary.
+- Rehearse rollback by fencing the new generation, reconciling unknown operations,
+  projecting the latest checkpoint into legacy inputs, and restoring ownership.
+- Retire session blobs, continuation markers, Chat/Workday state, and legacy
+  handlers only after the soak and rollback evidence converge.
 - Message-quality and adversarial authority suites.
 - PR-to-deployment operational scenario while conversation and human tools continue.
 - Failover, context rotation, 10,000-event noise, crash-boundary, prompt-injection,

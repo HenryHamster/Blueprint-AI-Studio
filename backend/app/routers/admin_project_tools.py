@@ -42,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,7 +50,16 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Project, ProjectComputeImage, ProjectTool, _utcnow
+from app.shared_state import limiter
+from app.models import (
+    ArtifactRef,
+    ArtifactRefPromotionIntent,
+    Project,
+    ProjectComputeImage,
+    ProjectMessageAttachmentUpload,
+    ProjectTool,
+    _utcnow,
+)
 from app.auth import (
     get_current_user,
     AGENT_JWT_SECRET,
@@ -726,6 +735,11 @@ class _ToolContentSave(BaseModel):
     base_revision: int
 
 
+class _ToolArtifactRefCreate(BaseModel):
+    expected_revision: int = Field(ge=0)
+    rendered_image: Dict[str, Any] | None = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -1072,6 +1086,371 @@ async def save_project_tool_content(
     await session.commit()
     await session.refresh(tool)
     return {"content_revision": tool.content_revision}
+
+
+async def _await_tracked_artifact_ref_promotion(task):
+    """Bound the request wait without transferring cancellation to the WAL task."""
+
+    return await asyncio.wait_for(asyncio.shield(task), timeout=25)
+
+
+def _artifact_ref_pending_response(
+    intent_id: uuid.UUID,
+    receipt_id: uuid.UUID,
+) -> JSONResponse:
+    """Return the canonical durable-acceptance response for a pending copy."""
+
+    return JSONResponse(
+        status_code=202,
+        headers={"Retry-After": "5"},
+        content={
+            "state": "pending",
+            "promotion_intent_id": str(intent_id),
+            "receipt_id": str(receipt_id),
+            "retry_after_ms": 5_000,
+        },
+    )
+
+
+@router.post(
+    "/projects/{project_id}/tools/{tool_id}/artifact-refs",
+    status_code=201,
+)
+@limiter.limit("30/minute")
+async def create_project_tool_artifact_ref(
+    request: Request,
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    payload: _ToolArtifactRefCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Freeze an exact Notes/Whiteboard revision for a Resident handoff."""
+
+    del request
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.artifact_refs import (
+        ArtifactRefConflict,
+        artifact_ref_projection,
+        create_tool_artifact_ref,
+    )
+    from app.storage import (
+        StorageUriError,
+        artifact_ref_render_uri,
+    )
+    from app.artifact_ref_promotion import (
+        ArtifactRefPromotionBusy,
+        expire_artifact_ref_promotion_claim,
+        prepare_artifact_ref_promotion_intent,
+        reconcile_one_artifact_ref_promotion,
+        start_tracked_artifact_ref_promotion,
+    )
+
+    rendered_image = dict(payload.rendered_image or {}) or None
+    promoted_uri: str | None = None
+    candidate_promoted_uri: str | None = None
+    promotion_intent_id: uuid.UUID | None = None
+    promotion_claim_id: uuid.UUID | None = None
+    if rendered_image is not None:
+        preflight_tool = await session.get(ProjectTool, tool_id)
+        if preflight_tool is None or preflight_tool.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Tool not found")
+        if preflight_tool.kind != "whiteboard":
+            raise HTTPException(
+                status_code=400,
+                detail="rendered images are only valid for Whiteboard handoff",
+            )
+        try:
+            attachment_id = uuid.UUID(
+                str(rendered_image.get("attachment_id") or rendered_image.get("id") or "")
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="whiteboard handoff requires a rendered image upload",
+            ) from None
+        receipt = await session.get(ProjectMessageAttachmentUpload, attachment_id)
+        existing = (
+            await session.execute(
+                select(ArtifactRef).where(
+                    ArtifactRef.project_id == project_id,
+                    ArtifactRef.tool_id == tool_id,
+                    ArtifactRef.revision == payload.expected_revision,
+                )
+            )
+        ).scalar_one_or_none()
+        receipt_identity_invalid = (
+            receipt is None
+            or receipt.project_id != project_id
+            or receipt.actor_user_id != current_user["user_id"]
+            or receipt.storage_uri
+            != str(rendered_image.get("storage_uri") or "").strip()
+        )
+        receipt_already_used_elsewhere = bool(
+            receipt is not None
+            and (
+                receipt.message_id is not None
+                or (
+                    receipt.artifact_ref_id is not None
+                    and (existing is None or receipt.artifact_ref_id != existing.id)
+                )
+            )
+        )
+        receipt_unavailable_for_new_ref = bool(
+            receipt is not None
+            and existing is None
+            and (
+                receipt.consumed_at is not None
+                or receipt.artifact_ref_id is not None
+                or receipt.expires_at <= _utcnow()
+            )
+        )
+        if (
+            receipt_identity_invalid
+            or receipt_already_used_elsewhere
+            or receipt_unavailable_for_new_ref
+        ):
+            raise HTTPException(status_code=400, detail="Invalid rendered image upload receipt")
+        if existing is None:
+            source_storage_uri = receipt.storage_uri
+            expected_size_bytes = receipt.expected_size_bytes
+            candidate_promoted_uri = artifact_ref_render_uri(
+                project_id,
+                tool_id,
+                payload.expected_revision,
+                attachment_id,
+            )
+            try:
+                promotion_claim = await prepare_artifact_ref_promotion_intent(
+                    session,
+                    project_id=project_id,
+                    tool_id=tool_id,
+                    revision=payload.expected_revision,
+                    receipt_id=attachment_id,
+                    actor_user_id=current_user["user_id"],
+                    source_storage_uri=source_storage_uri,
+                    candidate_storage_uri=candidate_promoted_uri,
+                    expected_size_bytes=expected_size_bytes,
+                    expected_sha256=str(rendered_image.get("checksum") or ""),
+                    render_width=rendered_image.get("width") if isinstance(rendered_image.get("width"), int) else None,
+                    render_height=rendered_image.get("height") if isinstance(rendered_image.get("height"), int) else None,
+                )
+                promotion_intent_id = promotion_claim.intent_id
+                promotion_claim_id = promotion_claim.claim_id
+            except ArtifactRefPromotionBusy as exc:
+                await session.rollback()
+                same_intent = (
+                    await session.execute(
+                        select(ArtifactRefPromotionIntent).where(
+                            ArtifactRefPromotionIntent.project_id == project_id,
+                            ArtifactRefPromotionIntent.tool_id == tool_id,
+                            ArtifactRefPromotionIntent.revision == payload.expected_revision,
+                            ArtifactRefPromotionIntent.receipt_id == attachment_id,
+                            ArtifactRefPromotionIntent.state.notin_(["settled"]),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if same_intent is None:
+                    same_intent = (
+                        await session.execute(
+                            select(ArtifactRefPromotionIntent).where(
+                                ArtifactRefPromotionIntent.project_id == project_id,
+                                ArtifactRefPromotionIntent.tool_id == tool_id,
+                                ArtifactRefPromotionIntent.revision
+                                == payload.expected_revision,
+                                ArtifactRefPromotionIntent.state != "settled",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                if same_intent is None:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
+                # A live copy already has one tracked owner. Poll requests must
+                # remain DB-only; starting GCS inspection here would create an
+                # uncancellable worker thread on every retry. Promoted/owned
+                # states are safe to reconcile because they need only DB work.
+                if same_intent.state in {"promoted", "owned"}:
+                    try:
+                        async with asyncio.timeout(25):
+                            reconciled = await reconcile_one_artifact_ref_promotion(
+                                project_id=project_id,
+                                tool_id=tool_id,
+                                revision=payload.expected_revision,
+                                receipt_id=same_intent.receipt_id,
+                            )
+                    except TimeoutError:
+                        reconciled = None
+                    if reconciled is not None:
+                        return JSONResponse(
+                            status_code=201,
+                            content={
+                                "state": "ready",
+                                "artifact_ref": artifact_ref_projection(reconciled),
+                            },
+                        )
+                # Keep the caller's durable receipt identity. This may be a
+                # redundant upload waiting on another receipt's logical
+                # promotion; replaying the same body adopts the immutable ref.
+                return _artifact_ref_pending_response(
+                    same_intent.id, attachment_id
+                )
+            except PermissionError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=403, detail=str(exc)) from None
+            except LookupError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            try:
+                promotion_task = start_tracked_artifact_ref_promotion(
+                    intent_id=promotion_intent_id,
+                    claim_id=promotion_claim_id,
+                    project_id=project_id,
+                    tool_id=tool_id,
+                    revision=payload.expected_revision,
+                    receipt_id=attachment_id,
+                    source_storage_uri=source_storage_uri,
+                    expected_size_bytes=expected_size_bytes,
+                    expected_sha256=str(rendered_image.get("checksum") or ""),
+                )
+                reconciled = await _await_tracked_artifact_ref_promotion(
+                    promotion_task
+                )
+                if reconciled is None:
+                    raise ArtifactRefPromotionBusy(
+                        "Render promotion authority changed; reconciliation queued"
+                    )
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "state": "ready",
+                        "artifact_ref": artifact_ref_projection(reconciled),
+                    },
+                )
+            except StorageUriError:
+                logger.warning(
+                    "ArtifactRef promotion returned a storage error after WAL prepare",
+                    extra={"promotion_intent_id": str(promotion_intent_id)},
+                    exc_info=True,
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except ArtifactRefPromotionBusy:
+                await expire_artifact_ref_promotion_claim(
+                    intent_id=promotion_intent_id,
+                    claim_id=promotion_claim_id,
+                    error="tracked promotion capacity unavailable",
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except TimeoutError:
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                logger.warning(
+                    "ArtifactRef render promotion failed for project %s tool %s",
+                    project_id,
+                    tool_id,
+                    extra={
+                        "event": "artifact_ref_promotion_unknown",
+                        "project_id": str(project_id),
+                        "tool_id": str(tool_id),
+                        "storage_uri": candidate_promoted_uri,
+                    },
+                    exc_info=True,
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+
+    try:
+        artifact_ref = await create_tool_artifact_ref(
+            session,
+            project_id=project_id,
+            tool_id=tool_id,
+            actor_user_id=current_user["user_id"],
+            expected_revision=payload.expected_revision,
+            rendered_image=rendered_image,
+            promotion_intent_id=promotion_intent_id,
+            promotion_claim_id=promotion_claim_id,
+        )
+    except ArtifactRefConflict as conflict:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tool_revision_conflict",
+                "expected_revision": conflict.expected_revision,
+                "current_revision": conflict.current_revision,
+                "action": "reload_or_rebase",
+            },
+        ) from None
+    except LookupError:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="Tool not found") from None
+    except PermissionError:
+        await session.rollback()
+        raise HTTPException(status_code=403, detail="Project member access changed") from None
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except HTTPException:
+        await session.rollback()
+        raise
+    try:
+        await session.commit()
+    except Exception:
+        # Commit outcome can be uncertain. Preserve the deterministic object so
+        # a same-receipt retry can reconcile instead of deleting a durable ref.
+        logger.warning(
+            "ArtifactRef commit outcome unknown; promoted object retained for retry",
+            extra={
+                "event": "artifact_ref_commit_unknown",
+                "project_id": str(project_id),
+                "tool_id": str(tool_id),
+                "storage_uri": promoted_uri,
+            },
+            exc_info=True,
+        )
+        raise
+    await session.refresh(artifact_ref)
+    return {"state": "ready", "artifact_ref": artifact_ref_projection(artifact_ref)}
+
+
+@router.get("/projects/{project_id}/artifact-refs/{artifact_ref_id}")
+async def get_project_tool_artifact_ref(
+    project_id: uuid.UUID,
+    artifact_ref_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieve one immutable tool revision through project membership."""
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.artifact_refs import artifact_ref_projection, get_project_artifact_ref
+
+    artifact_ref = await get_project_artifact_ref(
+        session,
+        project_id=project_id,
+        artifact_ref_id=artifact_ref_id,
+    )
+    if artifact_ref is None:
+        raise HTTPException(status_code=404, detail="ArtifactRef not found")
+    return {
+        "artifact_ref": artifact_ref_projection(artifact_ref),
+        "content": artifact_ref.content_snapshot or {},
+        "retrieval": artifact_ref.retrieval_metadata or {},
+    }
 
 
 @router.post("/projects/{project_id}/tools/seed")

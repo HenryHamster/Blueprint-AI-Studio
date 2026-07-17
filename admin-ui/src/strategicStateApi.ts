@@ -771,6 +771,7 @@ export interface StrategicSessionMessageCreate {
   reply_to_message_id?: string | null;
   source_refs?: Array<Record<string, unknown>>;
   artifact_refs?: Array<Record<string, unknown>>;
+  operator_intent?: Record<string, unknown>;
   attachments?: MessageAttachment[];
 }
 
