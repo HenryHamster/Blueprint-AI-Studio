@@ -7209,6 +7209,7 @@ describe('MessagesPanel composer draft persistence', () => {
             curated_metrics: [],
           },
         })}
+        strategicPollEpoch={1}
         strategicWorkbenchState={{
           version: 1,
           interaction_mode: 'continuous',

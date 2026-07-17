@@ -4162,3 +4162,133 @@ async def test_capability_proof_gate_enforcement_full_lifecycle(_grad_db):
 
     finally:
         _rc.pop("capability_proof_gate_mode", None)
+
+
+# ---------------------------------------------------------------------------
+# Capability proof gate — merge-gate proof path unblocks dependents (DB level)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_proof_unblocks_blocked_consumer(_spawn_db, mocker):
+    """ACCEPTANCE EVIDENCE (merge-gate proof path, DB-level integration).
+
+    Exercises the full capability proof gate enforcement life cycle using the
+    regular merge-gate proof path (``record_capability_proof`` → commit →
+    ``event_driven_unblock_on_capability_proof``) rather than the trial
+    completion path.  This is the DB-level counterpart to
+    ``test_capability_proof_gate_enforcement_full_lifecycle`` (which only
+    verifies the proof map) and the merge-gate analog to
+    ``test_capability_proof_trial_green_wakes_blocked_dependents`` (which
+    covers the trial path).
+
+    Phase 1: A consumer task is BLOCKED on an unproven capability 'my-cap'
+             (gate mode = enforce).
+    Phase 2: A provider task completes with a green named_test verdict;
+             ``record_capability_proof`` stamps the proof into
+             ``capability_proof_records`` and the session is committed.
+    Phase 3: ``event_driven_unblock_on_capability_proof`` is called directly
+             (the same seam the periodic sweep invokes after a merge-gate
+             proof lands).  The consumer must transition to QUEUED without
+             any additional periodic sweep.
+    """
+    from datetime import timedelta
+
+    from app.capability_proof import record_capability_proof
+    from app.blocked_task_unblock_sweeps import event_driven_unblock_on_capability_proof
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+    from app.time_utils import _utcnow
+
+    cap = "my-cap"
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    _rc["capability_proof_gate_mode"] = "enforce"
+    try:
+        # ── Phase 1: create project + BLOCKED consumer ───────────────────────
+        project = Project(
+            name="merge-gate-proof-unblock-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap, "status": "working"}]},
+            capability_proof_records={},
+        )
+        _spawn_db.add(project)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        now = _utcnow()
+        need = {"kind": "capability", "ref": cap}
+        consumer = _T(
+            project_id=project.id,
+            title="consumer-needs-my-cap",
+            description="x",
+            status=TaskStatus.BLOCKED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            blocker_kind="precondition",
+            blocked_reason=f"BLOCKER: needs capability {cap}",
+            blocked_at=now,
+            recheck_after=now - timedelta(minutes=1),
+            context={
+                "blocker": {
+                    "source": "agent",
+                    "waiting_on": "capability",
+                    "needs": [need],
+                    "need": need,
+                }
+            },
+        )
+        _spawn_db.add(consumer)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.BLOCKED, "Phase 1: consumer must start BLOCKED"
+
+        # ── Phase 2: provider completes with green named_test verdict ─────────
+        provider = _T(
+            project_id=project.id,
+            title="feat: implement my-cap",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            context={
+                "provides_capability": cap,
+                "code_acceptance_verdict": {
+                    "proven": True,
+                    "kind": "named_test",
+                    "proof_ref": "backend/testing/test_my_cap.py::test_my_cap",
+                },
+            },
+        )
+        _spawn_db.add(provider)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(provider)
+
+        recorded = record_capability_proof(provider, project)
+        assert recorded == [cap], "record_capability_proof must stamp proof for my-cap"
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        assert cap in (project.capability_proof_records or {}), (
+            "capability_proof_records must contain my-cap after record_capability_proof"
+        )
+
+        # ── Phase 3: event-driven unblock must wake the consumer ─────────────
+        requeued = await event_driven_unblock_on_capability_proof(project.id, _spawn_db)
+        assert requeued >= 1, (
+            "event_driven_unblock_on_capability_proof must report ≥1 requeued task"
+        )
+
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.QUEUED, (
+            "merge-gate proof must immediately wake BLOCKED consumer via "
+            f"event_driven_unblock_on_capability_proof — got {consumer.status}"
+        )
+
+    finally:
+        _rc.pop("capability_proof_gate_mode", None)
