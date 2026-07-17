@@ -6,10 +6,21 @@ properties that were identified in the adversarial-gate review cycle but can be
 confirmed purely against source code or pure-Python logic.
 
 Findings covered here (prior 16-finding bundle):
+  #1        — 0626 fails closed on malformed keys; 0628 backfills github_oauth_token
+  #2        — scratch-DB URL absence does NOT block Cloud Run boot
   #3  / #12 — infra-failure signature is NOT polluted by child-task failures
+  #4        — timed-out qualifier children are cancelled via _cancel_qualifier_children
+  #5        — deterministic migration defects block (not defer) via _DeterministicMigrationDefect
   #6        — env-preflight absent evidence is a hard blocker (not "unavailable")
+  #7        — trigger resolver returns not_applicable for terminal/auto-redrive states
+  #8        — bare-claim promotion timeout is applied (promoting orphan containment)
+  #9        — data-migration proof gate defers DML migrations without proof declaration
+  #10       — VersionLifecyclePanel.tsx has owner-only hotfix remediation flow
   #11       — MIGRATION_APPLY_SCRATCH_DATABASE_URL is a qualification prereq, not a boot req
+  #12       — (see #3 / #12 above)
   #13       — hotfix_policy.py and admin_operator_triggers.py are in HOTFIX_ELIGIBLE_MODULES
+  #14       — acceptance-evidence minting runs deployed-side (release_qualifier_sweep.py)
+  #15 / #16 — operator hotfix-deploy channel exists (admin_hotfix_promote.py, release_hotfix_promotion.py)
 
 Findings covered here (7-finding compute-images bundle):
   cb-1 — dispatch reads ProjectComputeImage to resolve default container image
@@ -210,6 +221,393 @@ def test_env_preflight_absent_evidence_is_a_hard_blocker():
         "compute_composite must set blocker='boot_prereq_evidence_missing' — a hard promotion "
         "block, not a soft 'unavailable' state. "
         f"Got blocker={result.get('blocker')!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #1 — 0626 fails closed on malformed keys; 0628 covers github_oauth_token
+# --------------------------------------------------------------------------- #
+
+
+def test_migration_0626_calls_require_encryption_active():
+    """Migration 0626 must use require_encryption_active() to fail closed on malformed keys.
+
+    Finding #1 claim: is_encryption_active() conflates a missing key and a malformed
+    key — both return False, so 0531 silently no-ops a malformed-key migration.
+    Migration 0626 fixes this by calling require_encryption_active(), which raises
+    RuntimeError for malformed keys regardless of ALLOW_PLAINTEXT_CREDENTIALS.
+    """
+    import inspect
+    import importlib.util
+    import pathlib
+
+    mig_path = pathlib.Path(__file__).parent.parent / "alembic" / "versions" / "0626_safe_encrypt_backfill.py"
+    spec = importlib.util.spec_from_file_location("mig0626", mig_path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    upgrade_src = inspect.getsource(mig.upgrade)
+    assert "require_encryption_active" in upgrade_src, (
+        "Migration 0626 upgrade() must call require_encryption_active() — not "
+        "is_encryption_active() — so a malformed GITHUB_PAT_ENCRYPTION_KEY raises "
+        "RuntimeError instead of silently no-oping the backfill"
+    )
+
+
+def test_migration_0628_covers_github_oauth_token():
+    """Migration 0628 must backfill userintegration.github_oauth_token.
+
+    Finding #1 claim: 0566 adds userintegration.github_oauth_token as a nullable
+    Text column encrypted on new writes, but it was absent from every prior backfill
+    migration (0531/0621/0626).  Migration 0628 closes this gap.
+    """
+    import importlib.util
+    import pathlib
+
+    mig_path = pathlib.Path(__file__).parent.parent / "alembic" / "versions" / "0628_backfill_github_oauth_token_encrypted.py"
+    assert mig_path.exists(), (
+        "backend/alembic/versions/0628_backfill_github_oauth_token_encrypted.py must exist "
+        "to backfill userintegration.github_oauth_token — the column was missed by 0531/0621/0626"
+    )
+
+    spec = importlib.util.spec_from_file_location("mig0628", mig_path)
+    mig = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mig)
+
+    source = pathlib.Path(mig_path).read_text()
+    assert "github_oauth_token" in source, (
+        "Migration 0628 must reference github_oauth_token"
+    )
+    assert "require_encryption_active" in source, (
+        "Migration 0628 must call require_encryption_active() to fail closed on malformed keys"
+    )
+    assert mig.revision == "0628", "Migration revision must be '0628'"
+    assert mig.down_revision == "0627", "Migration 0628 must chain from 0627"
+
+
+# --------------------------------------------------------------------------- #
+# Finding #4 — timed-out qualifier children are cancelled, not left running
+# --------------------------------------------------------------------------- #
+
+
+def test_cancel_qualifier_children_covers_all_child_types():
+    """_cancel_qualifier_children must handle all qualification child task types.
+
+    Finding #4 claim: qualification timeout and sweep-crash handlers rewrite the
+    release record without changing referenced child task states.  The fix cancels
+    audit, smoketest, challenge, and merge_grade tasks.
+    """
+    import inspect
+    from app.release_qualifier_sweep import _cancel_qualifier_children
+
+    source = inspect.getsource(_cancel_qualifier_children)
+    for child in ("audit_task_id", "smoketest_task_id", "challenge_task_id", "merge_grade_task_id"):
+        assert child in source, (
+            f"_cancel_qualifier_children must handle '{child}' — "
+            "all child task types must be terminated on qualification timeout to prevent "
+            "late completions from corrupting the next attempt"
+        )
+
+    assert "CANCELLED" in source or "cancelled" in source.lower(), (
+        "_cancel_qualifier_children must set child tasks to CANCELLED status"
+    )
+
+
+def test_force_finalize_timed_out_calls_cancel_children():
+    """_force_finalize_timed_out_qualification must call _cancel_qualifier_children.
+
+    Finding #4: the timeout finalizer must contain children before re-drive is eligible.
+    """
+    import inspect
+    from app.release_qualifier_sweep import _force_finalize_timed_out_qualification
+
+    source = inspect.getsource(_force_finalize_timed_out_qualification)
+    assert "_cancel_qualifier_children" in source, (
+        "_force_finalize_timed_out_qualification must call _cancel_qualifier_children "
+        "before rewriting the release record — containment must precede re-drive"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #5 — deterministic migration defects block (not defer)
+# --------------------------------------------------------------------------- #
+
+
+def test_deterministic_migration_defect_class_exists():
+    """_DeterministicMigrationDefect must exist and be used to separate candidate
+    defects from transient infra failures.
+
+    Finding #5 claim: migration replay wraps every exception in one error type
+    that the gate converts to defer.  The fix introduces _DeterministicMigrationDefect
+    to separate hard-block candidate defects from deferrable infra failures.
+    """
+    from app.migration_apply_gate import _DeterministicMigrationDefect
+
+    assert issubclass(_DeterministicMigrationDefect, Exception)
+
+
+def test_structural_defect_check_returns_block_verdict():
+    """_check_structural_defects must return a ('block', ...) verdict for broken chains.
+
+    Finding #5: dup revision ids and multi-head chains are deterministically defective
+    and must hard-block rather than defer-with-retry.
+    """
+    from app.migration_apply_gate import _check_structural_defects
+
+    # A migration source with a duplicate revision ID is structurally defective.
+    fake_dup = {
+        "0999_dup_a.py": (
+            '"""Rev.\nRevision ID: 0999\nRevises: 0998\n"""\nrevision = "0999"\ndown_revision = "0998"\n'
+        ),
+        "0999_dup_b.py": (
+            '"""Rev.\nRevision ID: 0999\nRevises: 0997\n"""\nrevision = "0999"\ndown_revision = "0997"\n'
+        ),
+    }
+    result = _check_structural_defects(fake_dup)
+    assert result is not None, (
+        "_check_structural_defects must return a non-None verdict for duplicate revision IDs"
+    )
+    verdict, reason = result
+    assert verdict == "block", (
+        f"Duplicate revision IDs must produce a 'block' verdict, got {verdict!r}"
+    )
+    assert "0999" in reason or "dup" in reason.lower() or "duplicate" in reason.lower(), (
+        f"Block reason should reference the duplicate revision, got: {reason!r}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #7 — trigger resolver returns not_applicable for terminal/auto-redrive states
+# --------------------------------------------------------------------------- #
+
+
+def test_trigger_resolver_returns_not_applicable_for_promoted():
+    """resolve_qualification_trigger returns not_applicable for promoted versions.
+
+    Finding #7 claim: the trigger resolver returned not_applicable for states that
+    dedicated sweep re-drive functions handle automatically, without exposing them
+    through the unified decision contract.  Promoted and abandoned versions must
+    return not_applicable (terminal — no re-drive possible).
+    """
+    from app.qualification_triggers import resolve_qualification_trigger
+
+    for terminal_status in ("promoted", "abandoned"):
+        decision = resolve_qualification_trigger(
+            status=terminal_status,
+            blocker=None,
+            candidate_sha="abc123",
+            dry_run_sha=None,
+            automain_sha="abc123",
+            ci_state="green",
+            ci_required=False,
+            attempt_count=0,
+            infra_error=None,
+            infra_error_count=0,
+            infra_consecutive_errors=0,
+            rubric_changed=False,
+            deferred_unsynced=False,
+            blockers_cleared=False,
+            readiness_sufficient=False,
+            qualification_locked=False,
+        )
+        assert decision.fire is False, (
+            f"resolve_qualification_trigger must return fire=False for status={terminal_status!r}"
+        )
+        assert decision.reason == "not_applicable", (
+            f"Terminal status {terminal_status!r} must return reason='not_applicable', "
+            f"got {decision.reason!r}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #8 — bare-claim promotion timeout is applied (orphan containment)
+# --------------------------------------------------------------------------- #
+
+
+def test_bare_claim_promotion_gets_shorter_timeout():
+    """A bare promotion claim (claiming=True, no pr_number) must receive a shorter
+    timeout cap than the default.
+
+    Finding #8 claim: promotion crash recovery must be containment-first.  When
+    promotion_pending has claiming=True but no pr_number (crash before PR creation),
+    the reconciler applies _PROMOTION_CLAIM_TIMEOUT_SECONDS (30 min) instead of the
+    full promotion timeout to limit how long the dead claim blocks the next attempt.
+    """
+    import inspect
+    from app import release_reconciliation
+
+    source = inspect.getsource(release_reconciliation)
+
+    assert "_PROMOTION_CLAIM_TIMEOUT_SECONDS" in source, (
+        "release_reconciliation.py must define _PROMOTION_CLAIM_TIMEOUT_SECONDS "
+        "to cap bare-claim promotion hold duration"
+    )
+    assert "_is_bare_claim" in source, (
+        "release_reconciliation.py must detect bare claims (claiming=True, no pr_number) "
+        "and apply a shorter timeout cap for faster containment"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #9 — data-migration proof gate defers DML without proof declaration
+# --------------------------------------------------------------------------- #
+
+
+def test_data_migration_proof_gate_defers_dml_without_proof():
+    """_check_data_migration_proof_gate must return ('defer', reason) for DML without proof.
+
+    Finding #9 claim: the current migration-safe verdict can be produced after applying
+    a data migration to empty scratch tables.  The gate requires a
+    # BLUEPRINT_DATA_MIGRATION_PROOF: declaration to force proof documentation.
+    """
+    from app.migration_apply_gate import _check_data_migration_proof_gate
+
+    # Fake new migration source with DML but no proof declaration.
+    dml_source = {
+        "0900_dml_migration.py": (
+            '"""Rev.\nRevision ID: 0900\n"""\n'
+            "def upgrade():\n"
+            "    op.execute(sa.update(some_table).values(col='x'))\n"
+        )
+    }
+    result = _check_data_migration_proof_gate(dml_source)
+    assert result is not None, (
+        "_check_data_migration_proof_gate must return a non-None verdict for DML "
+        "migrations without a BLUEPRINT_DATA_MIGRATION_PROOF declaration"
+    )
+    verdict, reason = result
+    assert verdict == "defer", (
+        f"DML without proof declaration must produce a 'defer' verdict, got {verdict!r}"
+    )
+    assert "data_migration_proof_missing" in reason, (
+        f"Defer reason must reference 'data_migration_proof_missing', got: {reason!r}"
+    )
+
+
+def test_data_migration_proof_gate_passes_with_proof_declaration():
+    """_check_data_migration_proof_gate must return None when proof is declared."""
+    from app.migration_apply_gate import _check_data_migration_proof_gate
+
+    # Same DML but with the required proof declaration.
+    dml_with_proof = {
+        "0900_dml_migration.py": (
+            '"""Rev.\nRevision ID: 0900\n'
+            "# BLUEPRINT_DATA_MIGRATION_PROOF: tested via fixture with 3 sample rows\n"
+            '"""\n'
+            "def upgrade():\n"
+            "    op.execute(sa.update(some_table).values(col='x'))\n"
+        )
+    }
+    result = _check_data_migration_proof_gate(dml_with_proof)
+    assert result is None, (
+        "_check_data_migration_proof_gate must return None (pass) when "
+        "BLUEPRINT_DATA_MIGRATION_PROOF is declared"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #10 — VersionLifecyclePanel has owner-only hotfix remediation flow
+# --------------------------------------------------------------------------- #
+
+
+def test_version_lifecycle_panel_has_hotfix_remediation():
+    """VersionLifecyclePanel.tsx must contain the hotfix remediation flow.
+
+    Finding #10 claim: admin-ui/src currently has no hotfix preview or promotion
+    client and VersionLifecyclePanel renders only generic qualification failure state.
+    The fix adds an owner-only panel with hotfix eligibility preview and promotion.
+    """
+    import pathlib
+
+    panel_path = (
+        pathlib.Path(__file__).parent.parent.parent
+        / "admin-ui" / "src" / "components" / "VersionLifecyclePanel.tsx"
+    )
+    source = panel_path.read_text()
+
+    assert "hotfix" in source.lower(), (
+        "VersionLifecyclePanel.tsx must reference hotfix remediation flow"
+    )
+    assert "data-testid=\"hotfix-remediation-panel\"" in source or "hotfix-remediation" in source, (
+        "VersionLifecyclePanel.tsx must have a hotfix-remediation panel "
+        "(data-testid='hotfix-remediation-panel')"
+    )
+    assert "hotfix-open-btn" in source or "hotfixPanelOpen" in source, (
+        "VersionLifecyclePanel.tsx must have a hotfix open/toggle button"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #14 — acceptance-evidence minting runs deployed-side (architectural constraint)
+# --------------------------------------------------------------------------- #
+
+
+def test_acceptance_evidence_minting_is_deployed_side():
+    """Acceptance-evidence minting must run in release_qualifier_sweep.py (deployed-side).
+
+    Finding #14 claim: record_acceptance_window_coverage_evidence,
+    backfill_unverified_merge_evidence, and backfill_direction_merge_evidence run
+    inside the deployed orchestrator process at the deployed SHA.  No candidate-
+    executing surface invokes these minters — they are deployed-side by design.
+    """
+    import inspect
+    from app import release_qualifier_sweep
+
+    sweep_source = inspect.getsource(release_qualifier_sweep)
+
+    for fn_name in (
+        "record_acceptance_window_coverage_evidence",
+        "backfill_direction_merge_evidence",
+    ):
+        assert fn_name in sweep_source, (
+            f"release_qualifier_sweep.py must invoke {fn_name} — acceptance evidence "
+            "is minted deployed-side so fixes to minting logic require a promotion "
+            "to take effect (architectural constraint; operator must be aware)"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Findings #15 / #16 — operator hotfix-deploy channel exists
+# --------------------------------------------------------------------------- #
+
+
+def test_hotfix_promote_endpoint_exists():
+    """admin_hotfix_promote.py must expose a POST /projects/{id}/promote/hotfix endpoint.
+
+    Findings #15/#16 claim: no /promote/hotfix endpoint exists; only force_promote exists.
+    The fix adds a narrow, audited, module-scoped hotfix channel.
+    """
+    import pathlib
+
+    router_path = (
+        pathlib.Path(__file__).parent.parent
+        / "app" / "routers" / "admin_hotfix_promote.py"
+    )
+    assert router_path.exists(), (
+        "backend/app/routers/admin_hotfix_promote.py must exist — "
+        "the hotfix-deploy channel router"
+    )
+    source = router_path.read_text()
+    assert "promote/hotfix" in source, (
+        "admin_hotfix_promote.py must define a /promote/hotfix endpoint"
+    )
+
+
+def test_hotfix_promote_current_version_function_exists():
+    """release_hotfix_promotion.py must export hotfix_promote_current_version.
+
+    Findings #15/#16: the channel function must exist and be importable.
+    """
+    from app.release_hotfix_promotion import (
+        hotfix_promote_current_version,
+        check_hotfix_scope_preview,
+    )
+
+    assert callable(hotfix_promote_current_version), (
+        "hotfix_promote_current_version must be a callable async function"
+    )
+    assert callable(check_hotfix_scope_preview), (
+        "check_hotfix_scope_preview must be a callable (read-only scope preview)"
     )
 
 

@@ -62,6 +62,7 @@ import { handleVerifyTests } from './verify-tests.js';
 import { persistAndPostStatus, execFileAsync } from '../index.js';
 import { detectTestRunners, detectAutoTestRunners, detectAcceptanceProbes, discoverDocumentedCommands } from '../utils/test-runners.js';
 import { testFixLoop } from '../utils/test-fix-loop.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // Must match process.env.AGENT_WORKSPACE so describeRunnerDirectory (which reads
 // that env var at module load time in test-runners.ts) strips the right prefix.
@@ -1271,7 +1272,8 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
 
     await handleVerifyTests('df-fetch', payload, {}, 'tok', 'o', 'r', null, { value: '' });
 
-    expect(vi.mocked(execFileAsync)).toHaveBeenCalledWith(
+    expectCalledWith(
+      execFileAsync,
       'git',
       ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
       expect.objectContaining({ cwd: '/tmp/workspace' }),
