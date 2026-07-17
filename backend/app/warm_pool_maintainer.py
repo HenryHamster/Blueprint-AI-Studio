@@ -363,6 +363,7 @@ async def _maybe_emit_cost_guard_alert(
     session.add(
         Alert(
             project_id=project_id,
+            event_type="warm_pool.cost_guard",
             severity=AlertSeverity.WARNING,
             title=_COST_GUARD_ALERT_TITLE,
             message=reason,

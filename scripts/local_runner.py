@@ -50,6 +50,10 @@ Optional environment variables:
                                       (int 0–100, default: 0 = disabled)
     BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
     BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
+    BLUEPRINT_RUNNER_GPU_PROBE_IMAGE  Image used to prove container GPU passthrough.
+                                      Set this to a pullable project/private image with
+                                      nvidia-smi when Docker Hub is unavailable; default
+                                      is nvidia/cuda:12.6.3-base-ubuntu24.04.
     BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
     BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
     BLUEPRINT_RUNNER_CLI_MAINTENANCE  Host CLI self-maintenance (default: 1;
@@ -2169,6 +2173,7 @@ _VIEWABLE_CONTENT_TYPES = {
     "gif": ("image/gif", "image"),
     "mp4": ("video/mp4", "video"),
     "webm": ("video/webm", "video"),
+    "pdf": ("application/pdf", "pdf"),
 }
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
@@ -3271,8 +3276,15 @@ def _heartbeat_loop(
     ever_authenticated = False
     _llm_cli_last_healthy: dict[tuple[str, str], dict] = {}
     _llm_cli_transient_failures: dict[tuple[str, str], int] = {}
+    # Startup detection already made the first proof. Delay a retry until the
+    # bounded cadence elapses, then refresh only recoverable failures so a cold
+    # image pull or temporary registry/runtime outage does not require restart.
+    _gpu_passthrough_last_retry_at = time.monotonic()
     while not _shutdown_event.is_set():
         try:
+            caps, _gpu_passthrough_last_retry_at = _retry_transient_gpu_passthrough(
+                caps, _gpu_passthrough_last_retry_at
+            )
             with lock:
                 task_ids = list(active_tasks.keys())
             if active_compute_jobs is not None and compute_lock is not None:
@@ -3469,6 +3481,9 @@ def _heartbeat_loop(
                 "hostname": hostname,
                 "version": version,
                 "isolation_backends": isolation_backends,
+                "container_gpu_passthrough": (
+                    caps.container_gpu_passthrough if caps is not None else None
+                ),
                 "agent_backend": agent_backend,
                 "compute_backend": compute_backend,
                 "llm_clis": llm_clis,
@@ -3709,7 +3724,7 @@ def _derive_registry_host(container_image: str | None) -> str:
 
 
 def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess_run=None) -> bool:
-    """Run `docker login` using the credentials in *auth*.
+    """Run the available container runtime's login using credentials in *auth*.
 
     Returns True on success, False on any failure (non-zero exit, missing
     required fields, subprocess error).  Auth must contain at least a
@@ -3735,7 +3750,14 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
     username = auth.get("username") or ""
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
-    cmd = ["docker", "login", "--password-stdin"]
+    runtime = (
+        "docker" if shutil.which("docker") else "podman" if shutil.which("podman") else None
+    )
+    if runtime is None:
+        print("[compute] container runtime login unavailable (docker/podman not installed)", flush=True)
+        return False
+
+    cmd = [runtime, "login", "--password-stdin"]
     if username:
         cmd += ["--username", username]
     if server:
@@ -3764,6 +3786,7 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
 # ── Isolation capability cache + GPU scheduling ───────────────────────────────
 
 _CAPS_CACHE: "iso.Capabilities | None" = None
+_GPU_PASSTHROUGH_RETRY_SECONDS = 300.0
 
 
 def _get_capabilities() -> "iso.Capabilities":
@@ -3772,6 +3795,18 @@ def _get_capabilities() -> "iso.Capabilities":
     if _CAPS_CACHE is None:
         _CAPS_CACHE = iso.detect_capabilities()
     return _CAPS_CACHE
+
+
+def _retry_transient_gpu_passthrough(
+    caps: "iso.Capabilities | None", last_retry_at: float, *, now: float | None = None
+) -> tuple["iso.Capabilities | None", float]:
+    """Refresh a recoverable container GPU proof at a bounded heartbeat cadence."""
+    if caps is None or not iso.container_gpu_passthrough_needs_retry(caps):
+        return caps, last_retry_at
+    current = time.monotonic() if now is None else now
+    if current - last_retry_at < _GPU_PASSTHROUGH_RETRY_SECONDS:
+        return caps, last_retry_at
+    return iso.refresh_container_gpu_passthrough(caps), current
 
 
 def _make_gpu_state(caps: "iso.Capabilities") -> dict:
@@ -3912,6 +3947,7 @@ def _report_compute_job(
     progress: dict | None = None,
     resume_hydration: dict | None = None,
     artifact_delivery: dict | None = None,
+    viewable_omissions: dict | None = None,
 ) -> bool:
     """POST a status report for a compute job. Returns cancel_requested.
 
@@ -3940,6 +3976,8 @@ def _report_compute_job(
         body["resume_hydration"] = resume_hydration
     if artifact_delivery is not None:
         body["artifact_delivery"] = artifact_delivery
+    if viewable_omissions is not None:
+        body["viewable_omissions"] = viewable_omissions
 
     durable = exec_status in _REPORT_TERMINAL_STATUSES
     max_attempts = (_REPORT_MAX_RETRIES + 1) if durable else 1
@@ -3985,16 +4023,23 @@ class _ComputeJobReportHeartbeat:
         self._token = token
         self._job_id = job_id
         self._stop = threading.Event()
+        self._cancel_requested = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _send(self) -> None:
         try:
-            _report_compute_job(
+            if _report_compute_job(
                 self._orchestrator_url, self._token, self._job_id,
                 exec_status="running",
-            )
+            ):
+                self._cancel_requested.set()
         except Exception:  # noqa: BLE001 -- liveness is best-effort
             pass
+
+    @property
+    def cancel_requested(self) -> bool:
+        """Whether any liveness report observed an orchestrator cancellation."""
+        return self._cancel_requested.is_set()
 
     def _run(self) -> None:
         while not self._stop.wait(_RUNNER_HEARTBEAT_INTERVAL):
@@ -4246,6 +4291,8 @@ class _ViewableStreamState:
         "revisions",
         "oversize_logged",
         "budget_logged",
+        "oversize_relpaths",
+        "count_cap_relpaths",
         "inflight",
         "completed",
         "lock",
@@ -4259,6 +4306,12 @@ class _ViewableStreamState:
         self.revisions: dict = {}
         self.oversize_logged: set = set()
         self.budget_logged = False
+        # Deduplicated sets of relpaths skipped due to per-kind size cap or the
+        # 25-file count cap. Set membership prevents repeated scans from inflating
+        # counts. Reported to the backend on each running heartbeat so the operator
+        # can see live omissions before the job reaches a terminal state.
+        self.oversize_relpaths: set = set()
+        self.count_cap_relpaths: set = set()
         self.inflight: tuple | None = None
         self.completed: tuple | None = None
         self.lock = threading.Lock()
@@ -4447,6 +4500,7 @@ def _stream_viewable_files(
                     f"{cap}-byte {kind} cap for job {job_id}; skipping live preview",
                     flush=True,
                 )
+            state.oversize_relpaths.add(relpath)
             continue
 
         # Nanosecond mtime + ctime detects same-size overwrites while remaining
@@ -4467,6 +4521,7 @@ def _stream_viewable_files(
                     f"for job {job_id}; further new live previews skipped",
                     flush=True,
                 )
+            state.count_cap_relpaths.add(relpath)
             continue
 
         # Slow preview uploads run outside the report/cancellation loop.  A single
@@ -5822,12 +5877,18 @@ def _run_compute_job(
                 )
                 return
 
+            _omissions: dict = {}
+            if viewable_state.oversize_relpaths:
+                _omissions["size_cap"] = len(viewable_state.oversize_relpaths)
+            if viewable_state.count_cap_relpaths:
+                _omissions["count_cap"] = len(viewable_state.count_cap_relpaths)
             cancel = _report_compute_job(
                 orchestrator_url, token, job_id,
                 exec_status="running",
                 command_log=_interim_log_tail(),
                 progress=progress_tail.poll(),
                 resume_hydration=resume_hydration,
+                viewable_omissions=_omissions or None,
             )
             if cancel:
                 _teardown()
@@ -5863,9 +5924,28 @@ def _run_compute_job(
         # terminal jobs, and the durable artifact bundle may be skipped when it
         # exceeds its much smaller upload cap. Reuse the live state so already
         # uploaded files are not sent again.
-        _stream_viewable_files(
-            orchestrator_url, token, job_id, artifact_dir, viewable_state, drain=True
-        )
+        with _ComputeJobReportHeartbeat(
+            orchestrator_url, token, job_id
+        ) as final_viewable_heartbeat:
+            _stream_viewable_files(
+                orchestrator_url,
+                token,
+                job_id,
+                artifact_dir,
+                viewable_state,
+                drain=True,
+            )
+        if final_viewable_heartbeat.cancel_requested:
+            outcome = None
+            _report_terminal(
+                exec_status="failed",
+                exit_code=1,
+                command_log=_terminal_command_log(
+                    "cancel requested by orchestrator during final viewable upload"
+                ),
+                progress=progress_tail.poll(),
+            )
+            return
 
         result_metrics = _parse_result_metrics(result_file)
 
@@ -6500,6 +6580,7 @@ def _preflight(
             # Isolation-backend inventory + selected backends so `--check`
             # populates the fleet view the same way the running heartbeat does.
             "isolation_backends": iso.capabilities_inventory(caps),
+            "container_gpu_passthrough": caps.container_gpu_passthrough,
             "agent_backend": iso.decide_agent_backend(
                 caps, agent_binary_present=agent_binary is not None,
                 agent_image=agent_image,

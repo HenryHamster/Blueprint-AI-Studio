@@ -46,6 +46,43 @@ def _docker_caps(gpu_indices=()):
     )
 
 
+class TestGpuPassthroughRetry(unittest.TestCase):
+    def test_retries_transient_proof_after_cadence_and_preserves_no_host_gpu(self):
+        transient = iso.replace(
+            _docker_caps((0,)),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "probe_timeout"}
+            },
+        )
+        refreshed = iso.replace(
+            transient,
+            container_gpu_passthrough={
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        )
+        with patch.object(iso, "refresh_container_gpu_passthrough", return_value=refreshed) as refresh:
+            result, retry_at = local_runner._retry_transient_gpu_passthrough(
+                transient, 0.0, now=local_runner._GPU_PASSTHROUGH_RETRY_SECONDS
+            )
+        self.assertIs(result, refreshed)
+        self.assertEqual(retry_at, local_runner._GPU_PASSTHROUGH_RETRY_SECONDS)
+        refresh.assert_called_once_with(transient)
+
+        no_host_gpu = iso.replace(
+            _docker_caps(),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
+            },
+        )
+        with patch.object(iso, "refresh_container_gpu_passthrough") as refresh:
+            result, retry_at = local_runner._retry_transient_gpu_passthrough(
+                no_host_gpu, 0.0, now=999.0
+            )
+        self.assertIs(result, no_host_gpu)
+        self.assertEqual(retry_at, 0.0)
+        refresh.assert_not_called()
+
+
 def _healthy_llm_clis():
     return {
         "claude": {
@@ -1267,7 +1304,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "gen-A"}))
         self.assertEqual(holder.report()["applied_config_generation"], "gen-A")
         # A block carrying an UNRECOGNIZED non-null field is not fully applicable:
-        # the known fields still apply, but the generation stays pending (older).
+        # the whole block is rejected atomically — the known fields do NOT apply.
         applied = holder.apply({
             "max_concurrent": 7,
             "future_field": "something",
@@ -1361,7 +1398,7 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertIsNone(rep["config_apply_reason"])
         self.assertIsNone(rep["config_rejected_generation"])
 
-        # An unrecognized non-null field is rejected; known field still applied.
+        # An unrecognized non-null field causes atomic rejection — known field NOT applied.
         applied = holder.apply({
             "max_concurrent": 6,
             "zzz_field": "x",
@@ -3832,6 +3869,28 @@ class TestGpuDetection(unittest.TestCase):
 # ── Docker login helper ───────────────────────────────────────────────────────
 
 class TestDockerLogin(unittest.TestCase):
+    def test_docker_login_runtime_selection(self):
+        """Private registry auth uses podman when docker CLI is unavailable."""
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            result = MagicMock(returncode=0, stderr=b"")
+            return result
+
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None,
+        ):
+            result = local_runner._docker_login(
+                {"server": "registry.example.com", "username": "u", "password": "pw"},
+                _subprocess_run=fake_run,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(captured["cmd"][0:2], ["podman", "login"])
+
     def test_docker_login_called_when_auth_has_password(self):
         """_docker_login calls subprocess.run with docker login args when password present."""
         captured = {}
@@ -9342,6 +9401,7 @@ class TestProgressTail(unittest.TestCase):
         finally:
             os.unlink(path)
 
+
     def test_valid_record_appears_in_snapshot(self):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
@@ -9423,5 +9483,3 @@ class TestProgressTail(unittest.TestCase):
             self.assertEqual(result["count"], 1)
         finally:
             os.unlink(path)
-
-

@@ -281,7 +281,7 @@ async def test_chronic_alert_deduplicates(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker):
-    """Suppression returns before history lookup, so history failures are irrelevant."""
+    """If parse_bump_history raises, the audience gate already suppressed the alert."""
     project = await _make_project(db_session)
 
     with patch(

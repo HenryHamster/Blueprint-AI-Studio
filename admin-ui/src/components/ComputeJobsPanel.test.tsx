@@ -1493,6 +1493,34 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(form.useArmsMode).toBe(false);
   });
 
+  test('buildCloneForm preserves inputArtifactJobId, setupStep, and noProgressTimeoutSeconds from launch_params', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      launch_params: {
+        command: 'python train.py',
+        spend_cap_usd: 5.0,
+        deadline_seconds: 3600,
+        setup_step: 'pip install -r requirements.txt',
+        no_progress_timeout_seconds: 1800,
+        input_artifact_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const onCloneExperiment = vi.fn();
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onCloneExperiment={onCloneExperiment} />
+    );
+    const cloneBtn = await findByTestId('clone-to-form');
+    await act(async () => { cloneBtn.click(); });
+    expect(onCloneExperiment).toHaveBeenCalledTimes(1);
+    const form = onCloneExperiment.mock.calls[0][0];
+    expect(form.setupStep).toBe('pip install -r requirements.txt');
+    expect(form.noProgressTimeoutSeconds).toBe('1800');
+    expect(form.inputArtifactJobId).toBe('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+  });
+
   test('clone-to-form button not rendered when onCloneExperiment is not provided', async () => {
     const terminal = makeJob({
       status: 'SUCCEEDED',

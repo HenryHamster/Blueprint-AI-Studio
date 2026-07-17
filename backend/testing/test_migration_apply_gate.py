@@ -28,15 +28,23 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.migration_apply_gate import (
     MigrationApplyScratchPreflight,
+    _check_data_migration_proof_gate,
     _create_database,
     _drop_database,
+    _migration_has_data_ops,
+    _migration_has_proof_declaration,
+    _new_migration_sources,
     _safe_tar_extractall,
     _validate_db_name,
     ephemeral_postgres_database,
     preflight_migration_apply_scratch,
     run_migration_apply_gate,
 )
-from app.required_runtime_env import _verify_required_env
+from app.required_runtime_env import (
+    QUALIFICATION_ENV,
+    _verify_required_env,
+    missing_qualification_env,
+)
 
 # Same Postgres-vs-SQLite selection conftest uses. The scratch-DB cases need a
 # server we can CREATE DATABASE on (CI's `test` user is a superuser).
@@ -60,7 +68,20 @@ def test_scratch_prereq_is_typed_optional_and_boot_safe(monkeypatch):
     monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "test-presence-only")
     monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
 
+    # Boot must succeed even without the scratch URL — the gate degrades to
+    # 'defer', it does NOT prevent the app from starting.
     assert _verify_required_env() is None
+
+    # The qualification env manifest declares it as a cloud_run-scoped
+    # qualification prerequisite and surfaces it as missing when absent.
+    assert any(
+        req.name == "MIGRATION_APPLY_SCRATCH_DATABASE_URL" for req in QUALIFICATION_ENV
+    )
+    missing = missing_qualification_env()
+    assert any(
+        req.name == "MIGRATION_APPLY_SCRATCH_DATABASE_URL" for req in missing
+    ), "MIGRATION_APPLY_SCRATCH_DATABASE_URL must appear in missing_qualification_env() when absent in Cloud Run"
+
     result = preflight_migration_apply_scratch(None)
     assert isinstance(result, MigrationApplyScratchPreflight)
     assert result.status == "defer"
@@ -1412,3 +1433,299 @@ async def test_replay_seed_scratch_unavailable_returns_typed_defer(monkeypatch):
     assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
     assert "prod-secret" not in (detail or "")
     assert "scratch-secret" not in (detail or "")
+
+
+# ---- Data-migration proof gate tests -----------------------------------------
+
+_MIG_DATA_NO_PROOF = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "d01"
+down_revision = "a03"
+
+
+def upgrade():
+    # Backfill existing rows with a default value.
+    op.execute(sa.text("UPDATE widget SET colour = 'blue' WHERE colour IS NULL"))
+
+
+def downgrade():
+    pass
+"""
+
+_MIG_DATA_WITH_PROOF = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "d01"
+down_revision = "a03"
+
+# BLUEPRINT_DATA_MIGRATION_PROOF: all rows in widget.colour are either NULL
+# (backfilled to 'blue') or already non-NULL; count invariant: total unchanged.
+
+
+def upgrade():
+    op.execute(sa.text("UPDATE widget SET colour = 'blue' WHERE colour IS NULL"))
+
+
+def downgrade():
+    pass
+"""
+
+_MIG_DATA_ORM_NO_PROOF = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "d02"
+down_revision = "a03"
+
+
+def upgrade():
+    tbl = sa.table("widget", sa.column("id"), sa.column("colour"))
+    with op.batch_alter_table("widget") as batch_op:
+        pass
+    conn = op.get_bind()
+    conn.execute(sa.update(tbl).where(tbl.c.colour == None).values(colour="blue"))
+
+
+def downgrade():
+    pass
+"""
+
+_MIG_BULK_INSERT_NO_PROOF = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "d03"
+down_revision = "a03"
+
+
+def upgrade():
+    tbl = sa.table("feature_flags", sa.column("name"), sa.column("enabled"))
+    op.bulk_insert(tbl, [{"name": "new_flag", "enabled": True}])
+
+
+def downgrade():
+    pass
+"""
+
+_MIG_STRUCTURAL_ONLY = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "s01"
+down_revision = "a03"
+
+
+def upgrade():
+    op.add_column("widget", sa.Column("colour", sa.String(), nullable=True))
+    with op.get_context().autocommit_block():
+        op.create_index(
+            "ix_widget_colour", "widget", ["colour"], postgresql_concurrently=True
+        )
+
+
+def downgrade():
+    op.drop_index("ix_widget_colour", "widget")
+    op.drop_column("widget", "colour")
+"""
+
+_MIG_DDL_WITH_DML_IN_TRIGGER = """
+from alembic import op
+import sqlalchemy as sa
+
+revision = "t01"
+down_revision = "a03"
+
+
+def upgrade():
+    # DDL: trigger function body contains DML keywords but this is NOT a data migration.
+    op.execute(sa.text(
+        '''
+        CREATE OR REPLACE FUNCTION trg_widget_audit()
+        RETURNS TRIGGER AS $$
+        BEGIN
+            INSERT INTO widget_audit(widget_id, changed_at) VALUES (NEW.id, NOW());
+            UPDATE widget_audit SET last = TRUE WHERE widget_id = NEW.id;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        '''
+    ))
+    op.execute(sa.text(
+        "CREATE TRIGGER trg_widget AFTER UPDATE ON widget "
+        "FOR EACH ROW EXECUTE FUNCTION trg_widget_audit()"
+    ))
+
+
+def downgrade():
+    op.execute(sa.text("DROP TRIGGER IF EXISTS trg_widget ON widget"))
+    op.execute(sa.text("DROP FUNCTION IF EXISTS trg_widget_audit"))
+"""
+
+
+def test_migration_has_data_ops_detects_dml_in_execute():
+    assert _migration_has_data_ops(_MIG_DATA_NO_PROOF)
+    assert _migration_has_data_ops(_MIG_DATA_ORM_NO_PROOF)
+    assert _migration_has_data_ops(_MIG_BULK_INSERT_NO_PROOF)
+
+
+def test_migration_has_data_ops_skips_structural_only():
+    assert not _migration_has_data_ops(_MIG_STRUCTURAL_ONLY)
+
+
+def test_migration_has_data_ops_skips_ddl_with_embedded_dml():
+    # Trigger body starts with CREATE OR REPLACE FUNCTION, not DML — should NOT be flagged.
+    assert not _migration_has_data_ops(_MIG_DDL_WITH_DML_IN_TRIGGER)
+
+
+def test_migration_has_proof_declaration():
+    assert _migration_has_proof_declaration(_MIG_DATA_WITH_PROOF)
+    assert not _migration_has_proof_declaration(_MIG_DATA_NO_PROOF)
+    assert not _migration_has_proof_declaration(_MIG_STRUCTURAL_ONLY)
+
+
+def test_check_data_migration_proof_gate_defers_on_missing_proof():
+    sources = {"d01_backfill.py": _MIG_DATA_NO_PROOF}
+    verdict, detail = _check_data_migration_proof_gate(sources)
+    assert verdict == "defer"
+    assert "data_migration_proof_missing" in (detail or "")
+    assert "d01_backfill.py" in (detail or "")
+
+
+def test_check_data_migration_proof_gate_passes_with_proof():
+    sources = {"d01_backfill.py": _MIG_DATA_WITH_PROOF}
+    result = _check_data_migration_proof_gate(sources)
+    assert result is None
+
+
+def test_check_data_migration_proof_gate_passes_structural_only():
+    sources = {"s01_add_col.py": _MIG_STRUCTURAL_ONLY}
+    result = _check_data_migration_proof_gate(sources)
+    assert result is None
+
+
+def test_check_data_migration_proof_gate_bulk_insert_requires_proof():
+    sources = {"d03_seed.py": _MIG_BULK_INSERT_NO_PROOF}
+    verdict, detail = _check_data_migration_proof_gate(sources)
+    assert verdict == "defer"
+    assert "data_migration_proof_missing" in (detail or "")
+
+
+def test_new_migration_sources_filters_to_post_prod_revisions():
+    # a03 is prod; d01 and s01 are new.
+    sources = {
+        "a01_init.py": _MIG_A01,
+        "a02_computejob.py": _MIG_A02_COMPUTEJOB,
+        "a03_later.py": _MIG_A03,
+        "d01_backfill.py": _MIG_DATA_NO_PROOF,
+        "s01_add_col.py": _MIG_STRUCTURAL_ONLY,
+    }
+    # Patch _MIG_A03 down_revision to chain properly (it already has a03)
+    new = _new_migration_sources(sources, "a03")
+    assert "d01_backfill.py" in new
+    assert "s01_add_col.py" in new
+    assert "a01_init.py" not in new
+    assert "a02_computejob.py" not in new
+    assert "a03_later.py" not in new
+
+
+def test_new_migration_sources_returns_all_when_prod_revision_absent():
+    # If prod_revision isn't in the chain, all sources are conservatively returned.
+    sources = {
+        "a01_init.py": _MIG_A01,
+        "d01_backfill.py": _MIG_DATA_NO_PROOF,
+    }
+    new = _new_migration_sources(sources, "unknown_revision")
+    assert "a01_init.py" in new
+    assert "d01_backfill.py" in new
+
+
+@pytest.mark.asyncio
+async def test_run_migration_apply_gate_defers_on_data_migration_without_proof(
+    monkeypatch,
+):
+    """run_migration_apply_gate defers when a new migration has DML but no proof."""
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a03", metadata=metadata)),
+    )
+
+    sources = {
+        "a01_init.py": _MIG_A01,
+        "a02_computejob.py": _MIG_A02_COMPUTEJOB,
+        "a03_later.py": _MIG_A03,
+        "d01_backfill.py": _MIG_DATA_NO_PROOF,
+    }
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=sources,
+            required_metadata=metadata,
+            scratch_db_url="postgresql+asyncpg://s:s@scratch-db:5432/ctrl",
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "defer"
+    assert "data_migration_proof_missing" in (detail or "")
+    assert "d01_backfill.py" in (detail or "")
+
+
+@pytest.mark.asyncio
+async def test_run_migration_apply_gate_does_not_flag_existing_data_migrations(
+    monkeypatch,
+):
+    """The proof gate only checks NEW migrations, not those already applied to prod."""
+    import app.migration_apply_gate as gate_mod
+
+    metadata = sa.MetaData()
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0)
+    # Prod is already at d01 (the data migration is already applied).
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="d01", metadata=metadata)),
+    )
+    # Stub out the scratch provisioning step — required_metadata is provided so
+    # the reference-build path is skipped; only _provision_seed_and_detect_drift
+    # is called (via _with_transient_retry).
+    monkeypatch.setattr(
+        gate_mod,
+        "_provision_seed_and_detect_drift",
+        AsyncMock(return_value=[]),  # no drift
+    )
+
+    sources = {
+        "a01_init.py": _MIG_A01,
+        "a02_computejob.py": _MIG_A02_COMPUTEJOB,
+        "a03_later.py": _MIG_A03,
+        "d01_backfill.py": _MIG_DATA_NO_PROOF,  # already applied in prod
+    }
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources=sources,
+            required_metadata=metadata,
+            scratch_db_url="postgresql+asyncpg://s:s@scratch-db:5432/ctrl",
+        )
+    finally:
+        await engine.dispose()
+
+    # Already-applied data migration must NOT trigger the proof gate.
+    assert verdict == "ok"
+    assert detail is None

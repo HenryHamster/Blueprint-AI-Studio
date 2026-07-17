@@ -52,6 +52,7 @@ from app.task_evaluators import (
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_evaluators import QUALITY_GRADER_VERDICT_KEY
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -628,6 +629,7 @@ async def apply_post_spawn_state(
                     _dir_grade_dist = grade_dist_by_dir.get(did)
                     _dir_basis_dist = basis_dist_by_dir.get(did)
                     _dir_challenge_summary = challenge_summary_by_dir.get(did)
+                    _qg_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
@@ -665,6 +667,12 @@ async def apply_post_spawn_state(
                             {"finding_challenge_summary": _dir_challenge_summary}
                             if _dir_challenge_summary
                             and _dir_challenge_summary.get("challenged_findings")
+                            else {}
+                        ),
+                        **(
+                            {"quality_grader_verdict": _qg_verdict}
+                            if isinstance(_qg_verdict, dict)
+                            and "passed" in _qg_verdict
                             else {}
                         ),
                         "filter_breakdown": {

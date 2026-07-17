@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import ComputeJob, LocalRunner, Task, TaskStatus
+from app.runner_eligibility import _container_gpu_passthrough_verified
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +131,12 @@ def _container_flags(capabilities: dict[str, Any]) -> tuple[bool, bool]:
         return False, False
     container_ok = any(
         bool(backends.get(key))
-        for key in ("docker_usable", "podman_usable", "apptainer_ok", "enroot_ok")
+        for key in ("docker_usable", "podman_usable", "apptainer_ok")
     )
-    return container_ok, bool(backends.get("docker_cdi_gpu"))
+    # Use the same selected-runtime + exact-mode contract as dispatch. Proof for
+    # a lower-priority runtime cannot authorize the runtime jobs will execute.
+    gpu_in_container_ok = _container_gpu_passthrough_verified(capabilities)
+    return container_ok, gpu_in_container_ok
 
 
 def _dedup_bounded(values: Any, limit: int) -> list[str]:

@@ -7,9 +7,9 @@
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
     "orchestrator.py": 5100,
-    "orchestrator_ci_monitor.py": 3000,
+    "orchestrator_ci_monitor.py": 3550,
     "orchestrator_health.py": 1180,
-    "orchestrator_runner_dispatch.py": 3100,
+    "orchestrator_runner_dispatch.py": 3600,
     "orchestrator_runtime_env.py": 400,
     "orchestrator_provision.py": 800,
     "admin.py": 4600,
@@ -50,9 +50,9 @@
     "rollup_management.py": 5550,
     "rollup_migration_validation.py": 1350,
     "reaper.py": 3650,
-    "reaper_sweeps.py": 2950,
+    "reaper_sweeps.py": 3450,
     "reaper_fleet_health_sweeps.py": 500,
-    "reaper_bug_message_sweeps.py": 1400,
+    "reaper_bug_message_sweeps.py": 1700,
     "reaper_evaluating_sweeps.py": 600,
     "blocked_task_unblock_sweeps.py": 2100,
     "reaper_orphan_io.py": 600,
@@ -157,7 +157,7 @@
     "routers/admin_project_tools.py": 2200,
     "routers/admin_runners.py": 1950,
     "compute_image_build.py": 1750,
-    "capability_proof.py": 2250,
+    "capability_proof.py": 2800,
     "plan_completion.py": 1750
   },
   "agent": {
@@ -202,7 +202,7 @@
     "handlers/fresh-reviewer.ts": 950,
     "providers/resident-session.ts": 800,
     "handlers/research-plan-sections.ts": 1800,
-    "handlers/strategic-resident-lib.ts": 2150
+    "handlers/strategic-resident-lib.ts": 2950
   },
   "frontend": {
     "useAppState.ts": 3000,

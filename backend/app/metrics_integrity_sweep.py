@@ -3687,9 +3687,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         record_capability_named_test_proof,
     )
     from app.capability_registry import (
+        consumer_gate_proof_status,
         exempt_capability_names,
         normalize_capability_name,
-        working_capability_proof_status,
     )
     from app.models import Project
     from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
@@ -3715,6 +3715,11 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     for project in projects:
         pid = str(project.id)
         pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        proof_records = (
+            project.capability_proof_records
+            if isinstance(project.capability_proof_records, dict)
+            else None
+        )
         caps_list = pm.get("capabilities") if pm else None
         if not isinstance(caps_list, list) or not caps_list:
             results.append(
@@ -3727,8 +3732,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
             )
             continue
 
-        proof_by_name = working_capability_proof_status(pm)
-        exempt_set = exempt_capability_names(pm)
+        proof_by_name = consumer_gate_proof_status(pm, proof_records, now=ctx.now)
+        exempt_set = exempt_capability_names(pm, proof_records)
         if not proof_by_name:
             results.append(
                 CheckResult(
@@ -4256,7 +4261,7 @@ async def compute_fleet_proof_coverage(
     surfaced read-only to the operator (e.g. the settings endpoint) as well as
     driving :func:`check_capability_proof_gate_auto_graduation`.
 
-    Coverage = total proven working caps / total non-exempt working caps.
+    Coverage = total ledger-cleared working caps / total non-exempt working caps.
     Exempt capabilities are excluded from BOTH numerator and denominator, and a
     project with working caps that are all exempt does not contribute.
 
@@ -4274,18 +4279,15 @@ async def compute_fleet_proof_coverage(
       float, or ``None`` when the denominator is zero (ratio undefined)
     """
     from app.capability_registry import (
+        consumer_gate_proof_status,
         exempt_capability_names,
-        working_capability_proof_status,
     )
     from app.models import Project
 
     # Snapshot ``now`` ONCE for the whole fleet scan and thread it explicitly into
-    # every ``working_capability_proof_status`` call below. PROOF_FRESHNESS_TTL
-    # demotion is applied against this single instant, so a proof older than the TTL
-    # is NOT counted toward ``total_proven`` — stale proofs cannot silently inflate
-    # graduation coverage. Passing an explicit ``now`` (rather than relying on the
-    # per-call ``_utcnow()`` default) also keeps the freshness cutoff deterministic
-    # across all projects in one scan instead of drifting mid-loop.
+    # every authoritative grading call below. PROOF_FRESHNESS_TTL demotion is
+    # applied against this single instant, so a proof older than the TTL is NOT
+    # counted toward ``total_proven``.
     if now is None:
         now = _utcnow()
 
@@ -4323,8 +4325,8 @@ async def compute_fleet_proof_coverage(
     for project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
         proof_records = raw_records if isinstance(raw_records, dict) else {}
-        proof_by_name = working_capability_proof_status(
-            pm, now=now, proof_records=proof_records
+        proof_by_name = consumer_gate_proof_status(
+            pm, proof_records, now=now
         )
         if not proof_by_name:
             continue
@@ -4382,8 +4384,8 @@ async def compute_trial_eligibility_projection(
 ) -> Dict[str, Any]:
     """Count unproven working capabilities that have backing_paths (trial-eligible).
 
-    A capability is trial-eligible when it is unproven (not yet ``proven`` tier),
-    has a ``working`` status, and declares at least one ``backing_path``. Enabling
+    A capability is trial-eligible when the platform ledger has not cleared it,
+    it has a ``working`` status, and declares at least one ``backing_path``. Enabling
     ``capability_proof_execution_trials_enabled`` allows the earn loop to discover
     test coverage for these capabilities and enroll bounded execution trials that
     can mint the real ``proven`` tier — clearing the enforce gate.
@@ -4399,7 +4401,7 @@ async def compute_trial_eligibility_projection(
     * ``projects_contributing`` — projects with at least one unproven working cap
     * ``num_projects`` — projects scanned (bounded by ``max_projects``)
     """
-    from app.capability_registry import working_capability_proof_status
+    from app.capability_registry import consumer_gate_proof_status
     from app.models import Project
 
     projects = (
@@ -4407,6 +4409,7 @@ async def compute_trial_eligibility_projection(
             select(
                 Project.id,
                 Project.problem_model,
+                Project.capability_proof_records,
             ).limit(max_projects)
         )
     ).all()
@@ -4415,9 +4418,10 @@ async def compute_trial_eligibility_projection(
     total_unproven_working = 0
     projects_contributing = 0
 
-    for _project_id, raw_pm in projects:
+    for _project_id, raw_pm, raw_records in projects:
         pm = raw_pm if isinstance(raw_pm, dict) else {}
-        proof_by_name = working_capability_proof_status(pm)
+        proof_records = raw_records if isinstance(raw_records, dict) else {}
+        proof_by_name = consumer_gate_proof_status(pm, proof_records)
         if not proof_by_name:
             continue
 
@@ -4575,7 +4579,48 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    # Advance the gate mode — update in-memory config.
+    # Persist the new gate mode before changing process-local state.  A process
+    # must never enforce a mode that was not durably committed.
+    try:
+        state = await ctx.session.get(DeploymentState, 1)
+        if state is None:
+            await ctx.session.rollback()
+            return [
+                CheckResult(
+                    check="capability_proof_gate_auto_graduation",
+                    status=CheckStatus.ERROR,
+                    subject="global",
+                    detail=(
+                        f"cannot auto-graduate gate from {current_mode} to {advance_to}: "
+                        "deployment state is missing; in-memory mode unchanged"
+                    ),
+                )
+            ]
+        config_json = dict(getattr(state, "runtime_config_json", None) or {})
+        config_json["capability_proof_gate_mode"] = advance_to
+        state.runtime_config_json = config_json
+        ctx.session.add(state)
+        await ctx.session.commit()
+    except Exception as exc:
+        await ctx.session.rollback()
+        logger.warning(
+            "[METRICS-INTEGRITY] failed to persist capability proof gate "
+            "auto-graduation to DB; in-memory mode remains %s",
+            current_mode,
+            exc_info=True,
+        )
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.ERROR,
+                subject="global",
+                detail=(
+                    f"failed to persist gate auto-graduation from {current_mode} "
+                    f"to {advance_to}: {exc}; in-memory mode unchanged"
+                ),
+            )
+        ]
+
     _runtime_config["capability_proof_gate_mode"] = advance_to
     logger.info(
         "[METRICS-INTEGRITY] capability proof gate auto-graduated: "
@@ -4590,26 +4635,6 @@ async def check_capability_proof_gate_auto_graduation(
         total_non_exempt_working,
         total_proven,
     )
-
-    # Persist the new gate mode to the database so it survives restarts.
-    try:
-        state = await ctx.session.get(DeploymentState, 1)
-        if state is not None:
-            config_json = getattr(state, "runtime_config_json", None)
-            if isinstance(config_json, dict):
-                config_json["capability_proof_gate_mode"] = advance_to
-            else:
-                config_json = {"capability_proof_gate_mode": advance_to}
-            state.runtime_config_json = config_json
-            ctx.session.add(state)
-            await ctx.session.commit()
-    except Exception:
-        logger.warning(
-            "[METRICS-INTEGRITY] failed to persist capability proof gate "
-            "auto-graduation to DB; in-memory value is %s",
-            advance_to,
-            exc_info=True,
-        )
 
     # Notify the operator of this autonomous gate-mode change. The advance
     # (especially → enforce, which begins BLOCKING task spawning and release
@@ -4648,6 +4673,12 @@ async def check_capability_proof_gate_auto_graduation(
             advance_to,
             exc_info=True,
         )
+        # A notification flush/commit failure leaves AsyncSession in a failed
+        # transaction until it is rolled back.  Keep this best-effort side
+        # effect from poisoning completion-debt resolution or the next sweep
+        # check; the gate advancement above is already durably committed.
+        with contextlib.suppress(Exception):
+            await ctx.session.rollback()
 
     # Resolve the dormant-knob debt for capability_proof_gate_mode when advancing
     # to enforce (the knob's "off" / "observe" value meant an open obligation).
@@ -5017,6 +5048,221 @@ async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckRes
                 status=CheckStatus.OK,
                 subject="global",
                 detail="no stalled capability_proof_trial outcomes found in window",
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "unmapped_acceptance_criteria",
+    "Flag active criteria not linked to any direction — they can never accumulate merge evidence",
+)
+async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckResult]:
+    """Flag ACTIVE acceptance criteria that are not mapped to any Direction.
+
+    An unmapped criterion is structurally guaranteed to never receive
+    ``task_merge`` evidence via ``record_task_merge_evidence``, because that
+    function only writes evidence for criteria that are (a) carried on the task
+    as ``criterion_ids``, or (b) inherited from the spawning Direction's
+    ``criterion_keys``.  A criterion authored but never linked to a Direction
+    falls into neither bucket and silently stays uncovered indefinitely.
+
+    This check surfaces unmapped active criteria per project so operators can
+    take corrective action (link the criterion to a Direction, or retract it).
+
+    * ``self_reported`` = total active criteria on the open version.
+    * ``ground_truth``  = active criteria that ARE mapped to at least one Direction.
+    * ``delta``         = unmapped active criteria count (self_reported - ground_truth).
+
+    SKIPPED when no open version or no active criteria exist.
+    Bounded to ``ctx.max_projects`` projects.
+    """
+    from app.acceptance_criteria import get_unmapped_active_criterion_keys
+    from app.models import Project
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="unmapped_acceptance_criteria",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        from app.acceptance_criteria import get_criteria_for_version
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        active_criteria = [c for c in criteria if c.status == "active"]
+        if not active_criteria:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no active criteria on open version",
+                )
+            )
+            continue
+
+        any_checked = True
+        total_active = len(active_criteria)
+        unmapped_keys = await get_unmapped_active_criterion_keys(
+            ctx.session, project_id, open_version.id
+        )
+        unmapped_count = len(unmapped_keys)
+        mapped_count = total_active - unmapped_count
+
+        if unmapped_count == 0:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.OK,
+                    self_reported=total_active,
+                    ground_truth=mapped_count,
+                    delta=0,
+                    subject=pid,
+                    detail=f"all {total_active} active criterion/criteria mapped to a direction",
+                )
+            )
+        else:
+            preview = unmapped_keys[:5]
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_active,
+                    ground_truth=mapped_count,
+                    delta=unmapped_count,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{unmapped_count} active criterion/criteria unmapped to any direction "
+                        f"and will never receive merge evidence: {preview}"
+                        + (" (and more)" if unmapped_count > 5 else "")
+                    ),
+                )
+            )
+
+    if not any_checked:
+        results.append(
+            CheckResult(
+                check="unmapped_acceptance_criteria",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no projects with active criteria to audit",
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "research_quality_grader_pass_rate",
+    "Flag directions with a persistently low forward-quality grader pass rate",
+)
+async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[CheckResult]:
+    """Surface directions where recent research cycles consistently fail quality grading.
+
+    Reads ``quality_grader_verdict`` from the last 3 ``research_history`` entries
+    on each active Direction.  When ALL entries with a verdict show
+    ``passed=False``, the direction is flagged — it is generating findings that
+    the quality grader rejects.  Cycles without a verdict (legacy entries or
+    directions that do not use the quality grader) are skipped so this check is
+    additive and never fires on legacy data.
+
+    * ``self_reported`` = cycles with a quality grader verdict in the window.
+    * ``ground_truth``  = cycles with ``passed=True``.
+    * ``delta``         = cycles with ``passed=False``.
+
+    SKIPPED when no project has active directions with quality grader data.
+    Bounded to ``ctx.max_projects`` projects.
+    """
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="research_quality_grader_pass_rate",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_flagged = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        project = await ctx.session.get(Project, project_id)
+        if not project:
+            continue
+        directions = list(project.directions or [])
+        for d in directions:
+            if d.get("status") not in ("active", "paused"):
+                continue
+            history = d.get("research_history") or []
+            recent = history[-3:]
+            verdicts = [
+                e.get("quality_grader_verdict")
+                for e in recent
+                if isinstance(e.get("quality_grader_verdict"), dict)
+                and "passed" in e.get("quality_grader_verdict", {})
+            ]
+            if not verdicts:
+                continue
+            passed = sum(1 for v in verdicts if v.get("passed"))
+            failed = len(verdicts) - passed
+            if failed > 0 and passed == 0:
+                any_flagged = True
+                results.append(
+                    CheckResult(
+                        check="research_quality_grader_pass_rate",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=len(verdicts),
+                        ground_truth=passed,
+                        delta=failed,
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"direction {d.get('id')!r} ({d.get('text', '')[:60]!r}): "
+                            f"{failed}/{len(verdicts)} recent research cycle(s) failed "
+                            "quality grading — findings may be low-actionability"
+                        ),
+                    )
+                )
+
+    if not any_flagged:
+        results.append(
+            CheckResult(
+                check="research_quality_grader_pass_rate",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no directions with persistent quality grader failures in recent cycles",
             )
         )
 

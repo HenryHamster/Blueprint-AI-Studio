@@ -11,7 +11,7 @@ an in-memory SQLite DB to exercise the sweep's project-scanning logic.
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -499,7 +499,9 @@ def test_proof_aware_resolver_no_match_cases_return_none():
 
 
 def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
-    """An absorbed old capability name resolves to the surviving cap's proof status."""
+    """A GENUINELY-absorbed old capability name resolves to the surviving cap's proof
+    status — via the platform-recorded consolidation forwarding marker, NOT the
+    agent-writable ``absorbs`` field."""
     from app.capability_registry import (
         capability_need_proof_status,
         working_capability_proof_status,
@@ -515,7 +517,19 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
             )
         ]
     )
-    proof = working_capability_proof_status(model)
+    # The platform ledger records the genuine consolidation of the old name with a
+    # forwarding marker; only this (never raw ``absorbs``) folds the old name in.
+    proof_records = {
+        "old-harness-name": [
+            {
+                "task_id": "absorbed_into:old-harness-name",
+                "proof_kind": "absorbed_into",
+                "survivor": "unified-harness",
+                "absorbed": "old-harness-name",
+            }
+        ]
+    }
+    proof = working_capability_proof_status(model, proof_records=proof_records)
 
     # Both the survivor name and the absorbed alias carry the survivor's status.
     assert (
@@ -530,6 +544,34 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
         )
         == "proven"
     )
+
+
+def test_proof_aware_resolver_declared_absorbs_without_marker_is_not_folded():
+    """SECURITY: an agent-declared ``absorbs`` with NO platform forwarding marker
+    does NOT fold the old name into the survivor's proof map — the old name is
+    simply absent (no-match), so it cannot inherit the survivor's status."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                evidence_refs=[_proven_ref()],
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)  # no ledger, no marker
+    assert (
+        capability_need_proof_status(
+            {"kind": "capability", "ref": "old-harness-name"}, proof
+        )
+        is None
+    ), "a declared-only absorb must not fold the old name into the survivor's proof map"
 
 
 def test_working_capability_proof_status_accepts_dict_form_problem_model():
@@ -2097,18 +2139,19 @@ def test_capability_proof_gate_full_cycle():
     # regression in that shared derivation surfaces in the connected cycle.
     from app.capability_registry import capability_proof_gate_release_status
 
-    # Enforce + unproven working capability → promotion blocked, audited.
+    # A proof that survived only in the platform ledger clears release exactly as
+    # it already clears spawn and blocked-resume.
     q_blocked, q_detail = capability_proof_gate_release_status(
         unproven_model, "enforce", named_test_records
     )
-    assert q_blocked is True, (
-        "the release qualifier must block promotion under enforce mode when a "
-        "working capability is unproven"
+    assert q_blocked is False, (
+        "a ledger-only machine proof must clear release qualification"
     )
     assert q_detail["mode"] == "enforce"
-    assert q_detail["unproven"] == ["container-runtime"]
-    assert q_detail["unproven_count"] == 1
+    assert q_detail["unproven"] == []
+    assert q_detail["unproven_count"] == 0
     assert q_detail["total_working"] == 1
+    assert q_detail["corroborated"] == ["container-runtime"]
 
     # Enforce + proven working capability, CORROBORATED by the platform ledger →
     # promotion NOT blocked. The ledger is what clears it: the same problem_model
@@ -2803,6 +2846,10 @@ async def _grad_db():
         expire_on_commit=False,
     )
     async with Session() as s:
+        from app.models import DeploymentState
+
+        s.add(DeploymentState())
+        await s.commit()
         yield s
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
@@ -2845,13 +2892,34 @@ async def _create_project_with_caps(
     ``proof_records`` seeds the platform-only ``capability_proof_records`` ledger —
     the operator-recorded carve-out set the graduation sweep must honor.
     """
+    from app.capability_registry import normalize_capability_name
     from app.models import Project
+
+    records = dict(proof_records or {})
+    for cap in caps:
+        name = normalize_capability_name(cap.get("name"))
+        refs = cap.get("evidence_refs")
+        if (
+            name
+            and name not in records
+            and isinstance(refs, list)
+            and any(isinstance(ref, dict) and ref.get("proven") is True for ref in refs)
+        ):
+            records[name] = [
+                {
+                    "task_id": f"proof:{name}",
+                    "proof_kind": "named_test",
+                    "proof_ref": f"testing/test_{name}.py::test_{name}",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                    "commit_sha": "a" * 40,
+                }
+            ]
 
     p = Project(
         name="grad-test",
         user_id="u1",
         problem_model={"capabilities": caps},
-        capability_proof_records=proof_records or {},
+        capability_proof_records=records,
     )
     db.add(p)
     await db.commit()
@@ -2865,7 +2933,7 @@ def _make_sweep_ctx(db: AsyncSession):
 
     return SweepContext(
         session=db,
-        now=datetime.utcnow(),
+        now=datetime.now(timezone.utc),
         mode="observe",
         max_projects=10,
         sample_limit=200,
@@ -3140,6 +3208,62 @@ async def test_auto_graduation_emits_operator_message_on_advance(_grad_db):
     assert len(await _messages()) == total_before
 
 
+@pytest.mark.asyncio
+async def test_auto_graduation_notification_commit_failure_cleans_session(_grad_db):
+    """A notification flush failure must not poison later sweep checks."""
+    from unittest.mock import patch
+
+    from sqlmodel import select
+
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.models import DeploymentState, Project
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap A",
+                "status": "working",
+                "evidence_refs": [_proven_ref()],
+            }
+        ],
+    )
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+    ctx = _make_sweep_ctx(_grad_db)
+
+    async def _enqueue_invalid_notification(session, project_id, **kwargs):
+        # The duplicate singleton fails during the caller's notification commit,
+        # reproducing a real failed-flush session rather than a pre-commit mock.
+        existing = await session.get(DeploymentState, 1)
+        session.expunge(existing)
+        session.add(DeploymentState(id=1))
+
+    with patch(
+        "app.notification_dispatch.post_capability_proof_gate_graduated_message",
+        new=_enqueue_invalid_notification,
+    ):
+        results = await check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.FLAGGED
+    assert _rc["capability_proof_gate_mode"] == "observe"
+    state = await _grad_db.get(DeploymentState, 1)
+    assert state is not None
+    assert state.runtime_config_json["capability_proof_gate_mode"] == "observe"
+    # Raises PendingRollbackError when notification cleanup is absent, which
+    # would make the next check in the shared-session sweep fail spuriously.
+    assert (
+        (await _grad_db.execute(select(Project))).scalars().first()
+        is not None
+    )
+
 # ── Disabled flag ──────────────────────────────────────────────────────────
 
 
@@ -3339,18 +3463,11 @@ async def test_auto_graduation_skips_when_no_working_caps(_grad_db):
 @pytest.mark.asyncio
 async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_db):
     """A DECLARED ``proof_exempt`` no longer excludes a capability from the coverage
-    aggregate (finding #9).
+    aggregate or advance the global mode (finding #9).
 
-    The graduation sweep reads the problem_model tier-1 map, where an attributed
-    ``proof_exempt`` declaration still grades ``proven`` (that is what keeps the earn
-    loop from chasing a capability the strategist says cannot be machine-proven). It
-    is NOT, however, an exemption: ``exempt_capability_names`` now requires an
-    operator record in the platform-only ledger, so the capability is no longer
-    excluded from the denominator — it is simply counted, and the fleet advances
-    toward ENFORCE, which is the safe direction. At the gate itself the very same
-    capability is refused (see
-    ``test_agent_fabricated_exemption_provenance_blocks_blocked_resume``), so a
-    self-declared exemption buys an agent nothing anywhere.
+    The graduation sweep consumes the same ledger-backed grade as enforce
+    consumers. With no platform exemption or proof record, the declaration is
+    ``unverified`` and coverage is zero.
     """
     from app.metrics_integrity_sweep import (
         CheckStatus,
@@ -3377,9 +3494,9 @@ async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_
     ctx = _make_sweep_ctx(_grad_db)
     results = await check_capability_proof_gate_auto_graduation(ctx)
     assert len(results) == 1
-    assert results[0].status == CheckStatus.FLAGGED
-    assert "off → observe" in results[0].detail
-    assert _rc["capability_proof_gate_mode"] == "observe"
+    assert results[0].status == CheckStatus.OK
+    assert "below threshold" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "off"
 
 
 @pytest.mark.asyncio
@@ -3939,8 +4056,6 @@ async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, 
     finally:
         _rc.pop("capability_proof_gate_mode", None)
         _rc.pop("capability_proof_execution_trials_enabled", None)
-
-
 # ---------------------------------------------------------------------------
 # Capability proof gate enforcement cycle — end-to-end integration test
 # ---------------------------------------------------------------------------
@@ -4047,4 +4162,3 @@ async def test_capability_proof_gate_enforcement_full_lifecycle(_grad_db):
 
     finally:
         _rc.pop("capability_proof_gate_mode", None)
-

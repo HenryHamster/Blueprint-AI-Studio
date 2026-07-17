@@ -859,6 +859,17 @@ def compute_composite(
         gate is not masked, and before the quality dimensions so a candidate
         whose capability claims are unproven is rejected regardless of audit
         quality.
+      * ``env_preflight_enabled`` is True AND ``env_preflight_score`` is None —
+        the candidate produced no boot/env-prerequisite evidence at all (the
+        evidence producer never ran, or ran but produced no usable manifest).
+        Without evidence the boot gate cannot be certified
+        (``"boot_prereq_evidence_missing"``).  This is a DETERMINISTIC quality
+        verdict, never an infra-failure retry loop — the fix is producing evidence
+        on the candidate tree (EXECUTION_SITE_CANDIDATE).  Checked BEFORE
+        ``boot_prereq_missing`` because individual prerequisite presence is moot
+        when no evidence exists.  The ``env_preflight_ack_override`` escape valve
+        does NOT suppress this block — an ack presupposes evidence exists and
+        only suppresses ``boot_prereq_missing``.
       * ``env_preflight_enabled`` is True AND ``env_preflight_missing`` is a
         non-empty list — the DEPLOYED-side env-preflight judge (Slice 3, design
         245212a4) found at least one candidate-declared, in-scope boot
@@ -970,6 +981,16 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
+    elif env_preflight_enabled and env_preflight_score is None:
+        # No boot/env-prerequisite evidence was produced by the candidate — the
+        # evidence producer never ran, or ran but produced no usable manifest.
+        # This is a DETERMINISTIC quality verdict (never an infra-failure retry
+        # loop — the v22 migration-gate lesson).  The fix is producing evidence
+        # on the candidate tree (EXECUTION_SITE_CANDIDATE).  Checked AFTER the
+        # migration gates so a candidate failing both reports migrations first,
+        # and BEFORE ``boot_prereq_missing`` because with no evidence we cannot
+        # certify the boot gate at all — individual prerequisite presence is moot.
+        blocker = "boot_prereq_evidence_missing"
     elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
         # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
         # default (env_preflight_enabled defaults False).  A candidate-declared,
@@ -1178,6 +1199,10 @@ BLOCKER_EXECUTION_SITE: dict[str, str] = {
     # An OWNER may pre-acknowledge that binding via ``ack_env_will_be_bound`` when
     # it lands in the same deploy (see compute_composite's env_preflight_ack_override).
     "boot_prereq_missing": EXECUTION_SITE_OPERATOR_ENV,
+    # Candidate-side: the evidence producer must run on the candidate tree.
+    # A fix on automain that causes the producer to run clears this on the
+    # next qualification — no deploy or operator action required.
+    "boot_prereq_evidence_missing": EXECUTION_SITE_CANDIDATE,
     # Candidate-side: resolvable by an automain fix that lands in the next
     # candidate tree — CI, the merged diff, or a smoketest running candidate code.
     "ci_not_green": EXECUTION_SITE_CANDIDATE,
@@ -2214,20 +2239,15 @@ _DETAIL_NAME_MAX = 200
 def _extract_test_erosion_detail(
     report: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Pull a compact test-erosion detail from a RELEASE_AUDIT_REPORT.
+    """Pull a test-erosion detail from a RELEASE_AUDIT_REPORT.
 
-    ``_score_audit`` knows which test files were deleted and the net test /
-    assertion deltas while scoring, but discards them after deriving the number.
-    When test-erosion is the binding constraint the strategic agent then sees
-    only ``test_erosion=0.42`` with no indication of WHAT eroded.  This carries
-    the actionable detail (deleted files, negative deltas) into
-    ``last_qualification`` so the agent can scope a targeted remediation
-    (restore file X, recover the N removed assertions).
+    Stores ALL non-zero numerical deltas (positive and negative) so the detail
+    is lossless for cumulative reconstruction in scoped audit merging.  Also
+    captures ``deleted_test_files`` when present.
 
-    Mirrors the ``computed_test_erosion``-over-``test_erosion`` preference in
-    ``_score_audit``.  Returns ``None`` when there is no actionable erosion (no
-    deleted files and no negative delta) so a clean dimension adds nothing to
-    the payload.  ``deleted_test_files`` is capped at ``_MAX_DELETED_TEST_FILES``.
+    ``deleted_test_files`` is capped at ``_MAX_DELETED_TEST_FILES``.
+    Returns ``None`` when nothing is present (no deletions and all deltas
+    are zero).
     """
     if not isinstance(report, dict):
         return None
@@ -2259,7 +2279,7 @@ def _extract_test_erosion_detail(
     if (
         isinstance(test_delta, (int, float))
         and not isinstance(test_delta, bool)
-        and test_delta < 0
+        and test_delta != 0
     ):
         detail["test_count_delta"] = (
             int(test_delta) if float(test_delta).is_integer() else test_delta
@@ -2269,7 +2289,7 @@ def _extract_test_erosion_detail(
     if (
         isinstance(assertion_delta, (int, float))
         and not isinstance(assertion_delta, bool)
-        and assertion_delta < 0
+        and assertion_delta != 0
     ):
         detail["assertion_delta"] = (
             int(assertion_delta)

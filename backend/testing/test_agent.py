@@ -15842,6 +15842,282 @@ async def test_agent_status_pr_base_branch_gh_fail_open(
 
 
 @pytest.mark.asyncio
+async def test_required_diff_paths_missing_rejects_pr_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """When required_diff_paths declares paths absent from the PR diff,
+    the completion must be rejected with HTTP 400 naming the missing paths."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Required Diff Paths Missing", user_id="test-user-rdp-miss")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "implement the feature",
+                "required_diff_paths": [
+                    "backend/app/models.py",
+                    "backend/testing/test_models.py",
+                ],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-miss",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-miss")
+    headers = {"x-agent-token": token}
+
+    # PR diff only touches models.py — test file is missing.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19001",
+        "changed_files": ["backend/app/models.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
+    err = resp.json().get("error", {})
+    assert "message" in err
+    assert "backend/testing/test_models.py" in err["message"]
+    assert "required_diff_paths" in err["message"]
+
+    # No Artifact row must have been created.
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == [], "Rejected PR must not persist an Artifact row"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_all_present_accepts_pr_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """When all required_diff_paths are present in the PR diff, the submission is accepted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Required Diff Paths Present", user_id="test-user-rdp-ok")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-rdp-ok-sib",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "implement the feature",
+                "required_diff_paths": [
+                    "backend/app/models.py",
+                    "backend/testing/test_models.py",
+                ],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-ok",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(sibling)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-ok")
+    headers = {"x-agent-token": token}
+
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19002",
+        "changed_files": [
+            "backend/app/models.py",
+            "backend/testing/test_models.py",
+            "backend/app/other.py",
+        ],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_absent_when_undeclared(
+    client: AsyncClient, db_session, mocker
+):
+    """Tasks with no required_diff_paths declaration are unaffected — any diff is accepted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="No Required Diff Paths", user_id="test-user-rdp-none")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-rdp-none-sib",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],  # no required_diff_paths
+        vm_instance_id="agent-vm-rdp-none",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(sibling)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-none")
+    headers = {"x-agent-token": token}
+
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19003",
+        "changed_files": ["some/unrelated/file.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_not_enforced_on_failed_status(
+    client: AsyncClient, db_session, mocker
+):
+    """required_diff_paths enforcement only fires on COMPLETED — FAILED submissions
+    must pass through even when declared paths are absent from the diff."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="RDP Failed Status", user_id="test-user-rdp-fail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "required_diff_paths": ["backend/app/models.py"],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-fail",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-fail")
+    headers = {"x-agent-token": token}
+
+    # FAILED status — gate must not fire even though the required path is absent.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19004",
+        "changed_files": ["some/other/file.py"],
+        "logs": "failed",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200 for FAILED, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_enforced_on_git_commit_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """required_diff_paths enforcement fires for GIT_COMMIT artifact type, not just PULL_REQUEST."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="RDP GIT_COMMIT Test", user_id="test-user-rdp-commit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "required_diff_paths": ["backend/app/models.py"],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-commit",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-commit")
+    headers = {"x-agent-token": token}
+
+    # GIT_COMMIT artifact type — required path is absent from changed_files.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "GIT_COMMIT",
+        "commit_hash": "abc1234",
+        "changed_files": ["some/other/file.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 400, f"Expected 400 for GIT_COMMIT missing required path, got {resp.status_code}: {resp.text}"
+    err = resp.json().get("error", {})
+    assert "backend/app/models.py" in err.get("message", "")
+
+
+@pytest.mark.asyncio
 async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstream_artifact(
     client: AsyncClient, db_session, mocker
 ):

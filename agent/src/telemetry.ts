@@ -571,41 +571,64 @@ export function resetResidentTurnLatencyTelemetry(): void {
 }
 
 // ── Operator-decision capture telemetry ─────────────────────────────────────
-// Tracks how often the operator decision marker is present vs absent on
-// operator turns, so we can measure capture rate and detect silent drops.
+// Marker coverage consumed by the backend; corrective reviews never rewrite it.
 
-interface OperatorDecisionCaptureStats {
+export interface OperatorDecisionCaptureStats {
   total: number;
   captured: number;
 }
 
 let _operatorDecisionCaptureStats: OperatorDecisionCaptureStats = { total: 0, captured: 0 }; // @per-role
 
-/** Record whether an operator turn's result contained a valid OPERATOR-DECISION marker. */
-export function recordOperatorDecisionCapture(captured: boolean): void {
+/**
+ * Record one completed operator turn. `captured` means the reply carried its
+ * marker; `markerless` means it did not. Boolean input remains accepted for
+ * source compatibility (true→captured, false→markerless).
+ */
+export function recordOperatorDecisionCapture(
+  outcome: 'captured' | 'markerless' | boolean,
+): void {
   _operatorDecisionCaptureStats.total += 1;
-  if (captured) _operatorDecisionCaptureStats.captured += 1;
+  if (outcome === 'captured' || outcome === true) {
+    _operatorDecisionCaptureStats.captured += 1;
+  }
 }
 
 /** Snapshot the current operator-decision capture telemetry for heartbeat / status
- *  posts. Returns null when no operator turns have been processed yet. */
+ *  posts. Field meanings intentionally match the backend contract: `total` is
+ *  operator turns, and `captured` is turns ending with the marker. */
 export function getOperatorDecisionCaptureTelemetry(): {
   total: number;
   captured: number;
   missed: number;
   capture_rate: number | null;
 } | null {
-  if (_operatorDecisionCaptureStats.total === 0) return null;
   const { total, captured } = _operatorDecisionCaptureStats;
+  if (total === 0) return null;
   return {
     total,
     captured,
     missed: total - captured,
-    capture_rate: total > 0 ? Math.round((captured / total) * 100) : null,
+    capture_rate: Math.round((captured / total) * 100),
   };
 }
 
 /** Reset operator-decision capture accumulators between roles. */
 export function resetOperatorDecisionCaptureTelemetry(): void {
   _operatorDecisionCaptureStats = { total: 0, captured: 0 };
+}
+
+/** Restore the durable per-session counters after a resident process restart. */
+export function restoreOperatorDecisionCaptureTelemetry(
+  stats: OperatorDecisionCaptureStats | null | undefined,
+): void {
+  _operatorDecisionCaptureStats = {
+    total: Number.isFinite(stats?.total)
+      ? Math.max(0, Math.floor(stats?.total ?? 0)) : 0,
+    captured: Number.isFinite(stats?.captured)
+      ? Math.max(0, Math.min(
+        Math.floor(stats?.captured ?? 0),
+        Math.floor(stats?.total ?? 0),
+      )) : 0,
+  };
 }

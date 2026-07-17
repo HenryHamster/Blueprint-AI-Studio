@@ -34,6 +34,18 @@ try {
   HEAD_SHA = execSync('git rev-parse HEAD', { cwd: REPO_ROOT }).toString().trim();
 } catch (_) {}
 
+// Verify the SHA is real and reachable in this repo before writing any report.
+// Per the evidence-integrity contract: git cat-file -t <sha> must succeed.
+function verifyShaExists(sha) {
+  if (!sha || sha === 'unknown') return false;
+  try {
+    const type = execSync(`git cat-file -t ${sha}`, { cwd: REPO_ROOT }).toString().trim();
+    return type === 'commit';
+  } catch (_) {
+    return false;
+  }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const results = [];
@@ -226,6 +238,31 @@ async function main() {
   console.log(`Started:  ${startTs}`);
   console.log('='.repeat(70));
 
+  // ── STEP 0: Node >= 22 prerequisite check ────────────────────────────────
+  // Hard-fail LOUDLY here rather than silently dead-ending at step 1d.
+  // scripts/blueprint_runner.py:check_prerequisites → MIN_NODE_MAJOR = 22.
+  const nodeVer = process.version;
+  const nodeMajor = parseInt(nodeVer.split('.')[0].replace('v', ''), 10);
+  if (nodeMajor < 22) {
+    console.error('\n[STEP 0 FATAL] ════════════════════════════════════════════════');
+    console.error(`  Node ${nodeVer} is installed — this walkthrough REQUIRES Node >= 22.`);
+    console.error('  FIX: nvm install 22 && nvm use 22, then re-run this script.');
+    console.error('  (scripts/blueprint_runner.py MIN_NODE_MAJOR = 22)');
+    console.error('════════════════════════════════════════════════════════════════');
+    step('0. Node >= 22 prerequisite (hard gate)', 'FAIL', [
+      `Node ${nodeVer} installed — walkthrough hard-requires Node >= 22`,
+      'FIX: nvm install 22 && nvm use 22, then re-run this script.',
+      'Reason: scripts/blueprint_runner.py MIN_NODE_MAJOR = 22; daemon start would also fail.',
+      'This is a provisioning requirement, not a code defect.',
+    ]);
+    writeReport(startTs, { duplicates: [] });
+    process.exit(1);
+  }
+  step('0. Node >= 22 prerequisite (hard gate)', 'PASS', [
+    `Node ${nodeVer} ✓ — meets MIN_NODE_MAJOR=22 requirement`,
+    'scripts/blueprint_runner.py MIN_NODE_MAJOR = 22 satisfied',
+  ]);
+
   // ── PREFLIGHT: Backend health ─────────────────────────────────────────────
   console.log('\n[PREFLIGHT] Verifying backend health...');
   const health = await apiGet('/health');
@@ -331,17 +368,9 @@ async function main() {
         'UI dialog shows equivalent: runnerSetupSnippets(token, origin) → macosLinux',
       ]);
 
-      // 1d. Full daemon enrollment: preflight check then live daemon connect + heartbeat
-      const nodeVer = process.version;
-      const nodeMajor = parseInt(nodeVer.split('.')[0].replace('v', ''), 10);
-      if (nodeMajor < 22) {
-        step('1d. blueprint-runner start (enroll against live backend)', 'DEAD_END', [
-          `BLOCKED: Node ${nodeVer} installed; blueprint-runner requires Node >= 22`,
-          `(scripts/blueprint_runner.py:check_prerequisites → MIN_NODE_MAJOR = 22)`,
-          'Runner process would connect to backend on start — enrollment path verified at API level',
-          'Environment constraint, not a code defect',
-        ]);
-      } else {
+      // 1d. Full daemon enrollment: preflight check then live daemon connect + heartbeat.
+      // Node >= 22 is guaranteed by step 0 (hard gate); no need to re-check here.
+      {
         // Phase 1: --check preflight (validates token + orchestrator before daemon start)
         console.log('\n[FLOW 1d-1] Running local_runner --check (daemon enrollment preflight)...');
         const localRunnerPath = path.join(REPO_ROOT, 'scripts', 'local_runner.py');
@@ -733,6 +762,16 @@ async function main() {
 // ── Report writer ─────────────────────────────────────────────────────────────
 
 function writeReport(startTs, integrityResult) {
+  // SHA integrity gate: every SHA cited in the report must be a real, reachable commit.
+  // This prevents the fabricated-SHA class of failures (attempt-27 MEDIUM finding).
+  const shaValid = verifyShaExists(HEAD_SHA);
+  if (!shaValid) {
+    console.error(`\n[INTEGRITY ERROR] HEAD_SHA="${HEAD_SHA}" failed git cat-file -t check — report NOT written.`);
+    console.error('Fix: ensure git rev-parse HEAD succeeds in the repo root before running this script.');
+    process.exit(1);
+  }
+  console.log(`[INTEGRITY] SHA verified: git cat-file -t ${HEAD_SHA} = commit ✓`);
+
   const pass = results.filter(r => r.verdict === 'PASS').length;
   const fail = results.filter(r => r.verdict === 'FAIL').length;
   const dead = results.filter(r => r.verdict === 'DEAD_END').length;

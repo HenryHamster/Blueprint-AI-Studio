@@ -512,6 +512,7 @@ async def _run_stale_branch_cleanup():
                 try:
                     alert = Alert(
                         project_id=project.id,
+                        event_type="branch.cleanup_summary",
                         severity=AlertSeverity.INFO,
                         title=f"Cleaned up {project_deleted} stale branches",
                         message=(

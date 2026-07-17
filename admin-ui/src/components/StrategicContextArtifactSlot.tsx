@@ -4,6 +4,7 @@ import type {
   StrategicContextArtifactViewablePreview,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
+  StrategicContextDescriptorChartPoint,
   StrategicContextRenderableDescriptor,
 } from '../strategicStateApi';
 import { resolveArtifactDownloadUrl } from '../api';
@@ -585,6 +586,38 @@ function DetailValue({
   );
 }
 
+/** A compact SVG polyline sparkline for time-series chart descriptors.
+ *
+ *  Mirrors the sparkline pattern from ComputeJobsPanel.tsx (80×20 viewBox,
+ *  normalized Y range, cyan stroke) adapted for the strategic-canvas
+ *  descriptor card.  Points are drawn in order; x-axis is the ordinal index,
+ *  y-axis is auto-scaled to the min/max of the values. */
+function LineChart({ points }: { points: StrategicContextDescriptorChartPoint[] }) {
+  if (points.length === 0) return null;
+  // Plot raw values (not Math.abs) so negative, upward-trending metrics —
+  // common in RL, e.g. rewards -1.0 → -0.5 → 0.1 — render with the correct
+  // trend direction. Mirrors the ComputeJobsPanel.tsx sparkline, which scales
+  // raw values.
+  const vals = points.map(p => p.value);
+  const minVal = Math.min(...vals);
+  const maxVal = Math.max(...vals);
+  const range = maxVal - minVal || 1;
+  const W = 80;
+  const H = 20;
+  const polyPoints = vals
+    .map((v, i) => {
+      const x = vals.length === 1 ? W / 2 : (i / (vals.length - 1)) * W;
+      const y = H - ((v - minVal) / range) * H;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="w-full overflow-visible" aria-hidden="true">
+      <polyline points={polyPoints} fill="none" className="stroke-sky-400" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function DescriptorCard({
   descriptor,
   onOpenTarget,
@@ -748,19 +781,31 @@ function DescriptorCard({
 
       {/* Omitted-files warning for compute-artifact media previews — mirrors
           ComputeJobsPanel's wording and amber styling. Visible when any files
-          were dropped from the preview set (capped at 25 / 8 MiB each). */}
+          were dropped from the preview set (capped at 25 files; 8 MiB/image,
+          512 MiB/video). */}
       {(descriptor.kind === 'image' || descriptor.kind === 'video' || descriptor.kind === 'pdf' || descriptor.image || descriptor.video || descriptor.pdf || (descriptor.images?.length ?? 0) > 0 || (descriptor.videos?.length ?? 0) > 0 || (descriptor.pdfs?.length ?? 0) > 0) && descriptor.viewable_files_dropped != null && descriptor.viewable_files_dropped > 0 && (
         <div
           className="mt-2 text-ui-xs text-amber-400/90 font-mono"
           data-testid="strategic-artifact-omitted-note"
         >
-          {`${descriptor.viewable_files_dropped} file${descriptor.viewable_files_dropped === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+          {`${descriptor.viewable_files_dropped} file${descriptor.viewable_files_dropped === 1 ? '' : 's'} omitted (preview cap: 25 files · 8 MiB/image · 512 MiB/video)`}
         </div>
       )}
 
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
         <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">
-          {chartPoints.length > 0 ? chartPoints.slice(0, 6).map(point => {
+          {descriptor.chart?.kind === 'line' && chartPoints.length > 0 ? (
+            <div className="space-y-1">
+              {(descriptor.chart?.y_label || descriptor.chart?.x_label) && (
+                <div className="flex items-center gap-1.5 text-ui-sm font-mono text-neutral-500">
+                  {descriptor.chart.y_label && <span>{descriptor.chart.y_label}</span>}
+                  <span className="text-neutral-300">{formatCompactNumber(chartPoints[chartPoints.length - 1].value)}</span>
+                  <span className="text-neutral-600">({chartPoints.length} samples)</span>
+                </div>
+              )}
+              <LineChart points={chartPoints} />
+            </div>
+          ) : chartPoints.length > 0 ? chartPoints.slice(0, 6).map(point => {
             const pct = Math.max(2, Math.round((Math.abs(point.value) / maxChartValue) * 100));
             return (
               <div key={`${descriptor.id}:${point.label}`} className="grid min-w-0 grid-cols-[5.5rem_minmax(0,1fr)_3rem] items-center gap-2 text-xs">

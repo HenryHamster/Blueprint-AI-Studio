@@ -63,6 +63,44 @@ def _get_fernet() -> Fernet | None:
         return None
 
 
+def require_encryption_active(context: str) -> None:
+    """Fail closed if encryption is expected but not active.
+
+    Distinguishes two failure modes that ``is_encryption_active()`` conflates:
+
+    1. **Key configured but malformed** — always raises ``RuntimeError``, even
+       when ``ALLOW_PLAINTEXT_CREDENTIALS`` is set. A mis-keyed environment
+       must not silently stamp a backfill as complete while credentials remain
+       plaintext.
+    2. **Key absent and dev opt-in not set** — raises ``RuntimeError``. Production
+       environments without an explicit key and without the plaintext opt-in are
+       treated as mis-configured, not as a safe no-op.
+
+    Only permits pass-through when ``ALLOW_PLAINTEXT_CREDENTIALS`` is explicitly
+    set **and** no key is configured (local development / CI without encryption).
+    """
+    key = os.getenv(ENCRYPTION_KEY_ENV)
+    if key:
+        try:
+            Fernet(key.encode())
+        except Exception as exc:
+            raise RuntimeError(
+                f"{context}: {ENCRYPTION_KEY_ENV} is set but contains an invalid "
+                f"Fernet key — encryption cannot proceed. "
+                f"Supply a valid key generated with Fernet.generate_key(). "
+                f"(Error: {exc})"
+            ) from exc
+        return
+    if not os.getenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV):
+        raise RuntimeError(
+            f"{context}: {ENCRYPTION_KEY_ENV} is not set and "
+            f"{ALLOW_PLAINTEXT_CREDENTIALS_ENV} is not set — "
+            f"refusing to proceed without confirmed encryption or explicit "
+            f"plaintext development opt-in. "
+            f"Set {ALLOW_PLAINTEXT_CREDENTIALS_ENV}=true for keyless dev environments."
+        )
+
+
 def _require_encryption_available():
     """Guard: raise ``RuntimeError`` if encryption would silently pass through.
 
@@ -121,11 +159,11 @@ def decrypt_field(value: str | None) -> str | None:
         return value
     try:
         return f.decrypt(value.encode()).decode()
-    except InvalidToken:
-        # Value is either plaintext (pre-encryption) or corrupt — return as-is
-        # so callers can still use it.  A corrupt value will ultimately fail
-        # at the downstream secret-resolver (GCP Secret Manager).
-        return value
-    except Exception as e:
-        logger.error("Unexpected decryption error: %s", e)
+    except (InvalidToken, ValueError, TypeError) as e:
+        # InvalidToken: plaintext or corrupt value (pre-encryption backward compat).
+        # ValueError/TypeError: encoding failures (UnicodeEncodeError on value.encode(),
+        # UnicodeDecodeError on result .decode(), binascii.Error from malformed base64).
+        # All other exceptions propagate so library API changes or truly unexpected
+        # errors are not silently swallowed.
+        logger.debug("Decryption fallback (%s): %s", type(e).__name__, e)
         return value

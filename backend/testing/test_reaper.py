@@ -13792,6 +13792,7 @@ from app.reaper_sweeps import (  # noqa: E402
     sweep_resolve_linked_messages,
     sweep_decay_stale_open_messages,
     STALE_OPEN_DECAY_DAYS,
+    STALE_QUESTION_DECAY_DAYS,
 )
 
 
@@ -13917,8 +13918,9 @@ async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
-    """Recent NOTEs and BLOCKER are never decayed; stale QUESTIONs are."""
+    """Recent NOTEs, BLOCKER, and QUESTIONs under 30d are never decayed."""
     project = await _make_project(reaper_db)
+    # 19 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
     old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
     recent_note = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.NOTE
@@ -13926,20 +13928,24 @@ async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
     live_blocker = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
     )
+    # QUESTION at 19 days: below STALE_QUESTION_DECAY_DAYS (30d), must survive
+    young_question = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
 
     acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
 
     assert acted == 0
-    for m in (recent_note, live_blocker):
+    for m in (recent_note, live_blocker, young_question):
         await reaper_db.refresh(m)
         assert m.status == "open"
 
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
-    """An OPEN QUESTION with no activity past the decay window is auto-decayed."""
+    """An OPEN QUESTION past the 30-day question window is auto-decayed as 'stale_unanswered'."""
     project = await _make_project(reaper_db)
-    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    old = _utcnow() - timedelta(days=STALE_QUESTION_DECAY_DAYS + 1)
     msg = await _make_conversational_message(
         reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
     )
@@ -13949,15 +13955,58 @@ async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
     assert acted == 1
     await reaper_db.refresh(msg)
     assert msg.status == "resolved"
-    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolution == "stale_unanswered"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_survives_short_window(reaper_db):
+    """An OPEN QUESTION older than NOTE decay window (14d) but younger than the
+    question window (30d) must NOT be decayed — questions get more patience."""
+    project = await _make_project(reaper_db)
+    # 15 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
+    mildly_old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=mildly_old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_respects_runtime_config(reaper_db, monkeypatch):
+    """'stale_question_decay_days' runtime config overrides the default 30-day window."""
+    import app.shared_state as _ss
+
+    project = await _make_project(reaper_db)
+    # 5 days old — within default window (30d) but past the custom window (3d)
+    slightly_old = _utcnow() - timedelta(days=5)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=slightly_old
+    )
+
+    original = dict(_ss.runtime_config)
+    monkeypatch.setattr(_ss, "runtime_config", {**original, "stale_question_decay_days": 3})
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+    monkeypatch.setattr(_ss, "runtime_config", original)
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
 
 
 @pytest.mark.asyncio
 async def test_decay_stale_open_skips_operator_action_needed_note(reaper_db):
-    """An operator-action-needed NOTE older than 14 days survives the decay sweep."""
+    """An operator-action-needed NOTE older than 14 days but under 60 days survives."""
     from app.message_audience import OPERATOR_ACTION_NEEDED
 
     project = await _make_project(reaper_db)
+    # Older than the normal decay window (14 days) but younger than the OAN
+    # threshold (60 days) — must survive.
     old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
     ctx = {"audience": OPERATOR_ACTION_NEEDED}
     msg = await _make_conversational_message(
@@ -13991,6 +14040,234 @@ async def test_decay_stale_open_resolves_ordinary_note_with_operator_fyi(reaper_
     await reaper_db.refresh(msg)
     assert msg.status == "resolved"
     assert msg.resolution == "auto-decayed (stale)"
+
+
+# ── Step 18d: stale-open bug-class decay ─────────────────────────────────────
+
+from app.reaper_bug_message_sweeps import (  # noqa: E402
+    STALE_OPEN_BUG_CLASS_DECAY_DAYS,
+    sweep_decay_stale_open_bug_messages,
+)
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_bug_report(reaper_db):
+    """An OPEN unowned BUG_REPORT older than the threshold is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="old unowned bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_blocker(reaper_db):
+    """An OPEN unowned BLOCKER older than the threshold is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="agent",
+        content="old unowned blocker",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_recent(reaper_db):
+    """A BUG_REPORT younger than the threshold is left open."""
+    project = await _make_project(reaper_db)
+    recent = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS - 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="recent bug report",
+        status="open",
+        context={},
+        created_at=recent,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_user_authored(reaper_db):
+    """Operator-authored (user) BUG_REPORTs are never auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 10)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="operator-authored bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_linked(reaper_db):
+    """A BUG_REPORT with a live convergence link is skipped (Step-15 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="linked bug report",
+        status="open",
+        context={"_convergence_link": {"kind": "direction", "id": "some-direction"}},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_direction_owned(reaper_db):
+    """An old BUG_REPORT with direction_id ownership is skipped (Step 17 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 10)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="old direction-owned bug report",
+        status="open",
+        context={"direction_id": "d-still-active"},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_task_owned(reaper_db):
+    """An old BLOCKER with pr_number+source_task_id ownership is skipped (Step 17 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 20)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="agent",
+        content="old task-owned blocker",
+        status="open",
+        context={"pr_number": 1234, "source_task_id": "00000000-0000-0000-0000-000000000001"},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_operator_action_needed_eventually_decays(reaper_db):
+    """An operator-action-needed NOTE older than 60 days is eventually auto-decayed."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    # Older than the long threshold (60 days)
+    very_old = _utcnow() - timedelta(days=61)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=very_old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_operator_action_needed_preserved_within_threshold(reaper_db):
+    """An operator-action-needed NOTE younger than 60 days is preserved."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    # Older than the normal 14-day window but younger than the 60-day OAN threshold
+    mid_age = _utcnow() - timedelta(days=30)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=mid_age, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
 
 
 # ── Step 16: converge duplicate foundations ───────────────────────────────

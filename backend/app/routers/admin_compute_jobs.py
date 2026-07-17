@@ -343,6 +343,9 @@ async def _build_compute_job_payload(
                 "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
                 "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,
                 "require_durable_artifact": bool(fp.get("require_durable_artifact")) if fp.get("require_durable_artifact") is not None else None,
+                "setup_step": fp.get("setup_step") or None,
+                "no_progress_timeout_seconds": int(fp["no_progress_timeout_seconds"]) if fp.get("no_progress_timeout_seconds") is not None else None,
+                "input_artifact_job_id": fp.get("input_artifact_job_id") or None,
             }
         data["task_title"] = title
         data["task_type"] = task_type
@@ -384,6 +387,20 @@ async def _build_compute_job_payload(
         data["viewable_artifacts_dropped_count"] = int(
             pm.get("viewable_files_dropped") or 0
         )
+        # Live omissions reported by the runner while the job is still RUNNING.
+        # Contains the count of unique relpaths skipped due to per-kind size cap
+        # ("size_cap") or 25-file count cap ("count_cap"). Absent or null for
+        # terminal jobs (use viewable_artifacts_dropped_count instead).
+        raw_live_om = pm.get("viewable_live_omissions")
+        live_om: dict | None = None
+        if isinstance(raw_live_om, dict) and job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+            validated_om: dict = {}
+            for _key in ("size_cap", "count_cap"):
+                _val = raw_live_om.get(_key)
+                if isinstance(_val, int) and not isinstance(_val, bool) and _val >= 0:
+                    validated_om[_key] = _val
+            live_om = validated_om or None
+        data["viewable_artifacts_live_omissions"] = live_om
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
         data["runner_target_id"] = runner_target_id_str

@@ -469,6 +469,18 @@ export default function App() {
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
+  // Monotonic epoch that advances each time the strategic-state poll delivers
+  // new data. Threaded into MessagesPanel → useResidentConversation so the
+  // conversation refresh piggybacks on the strategic-state poll cadence instead
+  // of running its own independent timer (eliminating the duplicate assembly).
+  const strategicPollEpochRef = useRef(0);
+  const [strategicPollEpoch, setStrategicPollEpoch] = useState(0);
+  useEffect(() => {
+    if (strategicReadModel.data) {
+      strategicPollEpochRef.current += 1;
+      setStrategicPollEpoch(strategicPollEpochRef.current);
+    }
+  }, [strategicReadModel.data]);
   // Fast mode + resident-session liveness probe: resolves the mode indicator and
   // active/dead chip on reload well before the heavy strategic-state fetch lands.
   // Once strategicReadModel.data hydrates, its values take precedence (fallback
@@ -1374,6 +1386,7 @@ export default function App() {
                 strategicSessionTranscript={s.strategicSessionTranscript}
                 focusComposerSignal={strategicComposerFocusSignal}
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
+                strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
@@ -1395,7 +1408,7 @@ export default function App() {
               </Suspense>
             )}
             rail={(
-              <Suspense fallback={null}>
+              <Suspense fallback={<WorkspaceSkeleton />}>
               <StrategicContextRail
                 projectId={s.selectedProjectId}
                 state={strategicReadModel.data ?? null}

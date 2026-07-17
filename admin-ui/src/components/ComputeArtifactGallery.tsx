@@ -100,16 +100,33 @@ export function ComputeArtifactGallery({ projectId, job }: { projectId: string; 
 
   if (!projectId) return null;
 
-  const droppedCount = job.viewable_artifacts_dropped_count ?? 0;
-  if (artifacts.length === 0 && droppedCount <= 0) return null;
+  const isRunning = job.status === 'RUNNING' || job.status === 'STARTING';
+  const liveOm = isRunning ? job.viewable_artifacts_live_omissions : null;
+  const liveOmTotal = (liveOm?.size_cap ?? 0) + (liveOm?.count_cap ?? 0);
+  const terminalDropped = job.viewable_artifacts_dropped_count ?? 0;
+  const omissionCount = isRunning ? liveOmTotal : terminalDropped;
+
+  if (artifacts.length === 0 && omissionCount <= 0) return null;
+
+  function omissionDetail(): string {
+    if (liveOm) {
+      if ((liveOm.size_cap ?? 0) > 0 && !(liveOm.count_cap ?? 0)) {
+        return 'exceeded per-file size limit (8 MiB/image · 8 MiB/PDF · 512 MiB/video)';
+      }
+      if ((liveOm.count_cap ?? 0) > 0 && !(liveOm.size_cap ?? 0)) {
+        return '25-file count limit reached';
+      }
+    }
+    return 'preview cap: 25 files · 8 MiB/image · 512 MiB/video';
+  }
 
   const omittedNote =
-    droppedCount > 0 ? (
+    omissionCount > 0 ? (
       <div
         className="text-ui-xs text-amber-400/90 font-mono"
         data-testid="drawer-artifact-omitted-note"
       >
-        {`${droppedCount} file${droppedCount === 1 ? '' : 's'} omitted (exceeds preview cap: 25 files / 8 MiB each)`}
+        {`${omissionCount} file${omissionCount === 1 ? '' : 's'} omitted (${omissionDetail()})`}
       </div>
     ) : null;
 

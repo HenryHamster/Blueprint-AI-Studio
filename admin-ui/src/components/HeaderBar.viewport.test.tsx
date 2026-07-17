@@ -194,11 +194,15 @@ describe('HeaderBar — viewport regression', () => {
     });
 
     const settingsButton = host.querySelector<HTMLButtonElement>('button[title="Runtime settings"]');
-    const signOutButton = host.querySelector<HTMLButtonElement>('button[title="Sign out test@example.com"]');
+    const accountButton = host.querySelector<HTMLButtonElement>('button[title="Account: test@example.com"]');
     expect(settingsButton).toBeTruthy();
-    expect(signOutButton).toBeTruthy();
+    expect(accountButton).toBeTruthy();
 
     await act(async () => { settingsButton?.click(); });
+    await act(async () => { accountButton?.click(); });
+    const signOutButton = Array.from(host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
+      .find(button => button.textContent?.trim() === 'Sign out');
+    expect(signOutButton).toBeTruthy();
     await act(async () => { signOutButton?.click(); });
 
     expect(onOpenSettings).toHaveBeenCalledOnce();

@@ -1606,6 +1606,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 session.add(
                     Alert(
                         project_id=project.id,
+                        event_type="self_improvement.payload_too_large",
                         severity=AlertSeverity.WARNING,
                         title="Strategic review skipped: payload too large",
                         message=(
@@ -1906,6 +1907,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             triggers = ", ".join(anomaly_action.get("trigger_anomalies") or [])
             alert = Alert(
                 project_id=project.id,
+                event_type="research.anomaly_auto_adjusted",
                 severity=AlertSeverity.WARNING,
                 title="Pipeline auto-adjusted: anomaly threshold exceeded",
                 message=(
@@ -1933,6 +1935,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             gate = anomaly_action["failure_gate_threshold"]
             alert = Alert(
                 project_id=project.id,
+                event_type="research.anomaly_auto_adjusted",
                 severity=AlertSeverity.INFO,
                 title="Pipeline restored: anomaly conditions cleared",
                 message=(

@@ -5952,7 +5952,7 @@ class TestExtractTestErosionDetail:
         assert detail == {"deleted_test_files": ["testing/test_foo.py"]}
 
     def test_negative_deltas_carried(self):
-        """Net-negative test/assertion deltas are carried; zero/positive ignored."""
+        """Net-negative test/assertion deltas are carried (as before)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
@@ -5963,13 +5963,25 @@ class TestExtractTestErosionDetail:
         detail = rq._extract_test_erosion_detail(report)
         assert detail == {"test_count_delta": -2, "assertion_delta": -5}
 
-    def test_clean_erosion_returns_none(self):
-        """No deletions and no negative delta yields None (nothing to carry)."""
+    def test_positive_deltas_preserved_for_cumulative(self):
+        """Positive deltas are now carried (lossless for cumulative reconstruction)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
                 "test_count_delta": 3,
                 "assertion_delta": 10,
+            }
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"test_count_delta": 3, "assertion_delta": 10}
+
+    def test_zero_deltas_omitted(self):
+        """Zero deltas (no noise) are omitted; no other signal → None."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": [],
+                "test_count_delta": 0,
+                "assertion_delta": 0,
             }
         }
         assert rq._extract_test_erosion_detail(report) is None
@@ -6855,14 +6867,15 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
-    """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit child is spawned — NO qualifier-smoketest task — and
-    last_qualification records smoketest_enabled=False with
+    """Audit H3: with smoketest_enabled=False and env_preflight_enabled=False,
+    only the release_audit child is spawned — NO qualifier-smoketest task —
+    and last_qualification records smoketest_enabled=False with
     smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
     shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -6907,6 +6920,144 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
     assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_produces_env_preflight_evidence_unconditionally(
+    db_session, mocker
+):
+    """Env-preflight evidence is produced unconditionally during
+    run_qualification *even when both* smoketest_enabled and
+    env_preflight_enabled are False.
+
+    This decouples evidence production from the smoketest child task (the
+    grader gap that motived direction c-277fccb6).  The evidence is a cheap
+    pure-content introspection of the candidate tree done via the GitHub
+    contents API, so it must not depend on any feature flag.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "a1b2c3d4" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    # Serve the candidate tree's real source files so the evidence builder
+    # produces meaningful content.
+    repo_root = Path(__file__).resolve().parent.parent  # backend/
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # Evidence is present regardless of both flags being False.
+    assert "env_preflight_evidence" in qual, (
+        "env_preflight_evidence must be on the qual record when both flags are off"
+    )
+    evidence = qual["env_preflight_evidence"]
+    assert isinstance(evidence, dict), f"Expected dict, got {type(evidence)}"
+    assert "required_env" in evidence
+    assert "startup_check_names" in evidence
+    assert evidence.get("manifest_source") == "backend/app/required_runtime_env.py"
+
+    # The evidence must reflect the current REQUIRED_RUNTIME_ENV manifest.
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+    expected_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    actual_names = {e["name"] for e in evidence["required_env"]}
+    assert expected_names == actual_names, (
+        f"Evidence required_env {actual_names} does not match "
+        f"current REQUIRED_RUNTIME_ENV {expected_names} — "
+        "the evidence builder did not read the candidate tree correctly"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
+    db_session, mocker
+):
+    """Audit H3 / boot-gate: with smoketest_enabled=False but env_preflight_enabled=True,
+    run_qualification still spawns the smoketest child (carrying the env-preflight
+    run) and stamps smoketest_task_id non-None so the finalize gate can wait for it."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "babe5678" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["smoketest_enabled"] is False
+    assert result["env_preflight_enabled"] is True
+    # smoketest child IS spawned even though smoketest_enabled is False,
+    # because env_preflight_enabled triggers the same spawn path.
+    assert result["smoketest_task_id"] is not None
+
+    await db_session.refresh(version)
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["env_preflight_enabled"] is True
+    assert version.last_qualification["smoketest_task_id"] is not None
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    # Both release_audit and smoketest children are spawned.
+    assert types == ["release_audit", "smoketest"]
 
 
 @pytest.mark.asyncio
@@ -8667,6 +8818,669 @@ class TestIncrementalAuditBaseline:
 
 
 @pytest.mark.asyncio
+async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
+    db_session,
+    mocker,
+):
+    """Cross-SHA audit facts reuse identical trees and scope changed trees.
+
+    An excluded-only advance copies the prior fact without an audit spawn; a
+    one-file change uses the prior candidate as its incremental base and carries
+    only findings from unchanged paths.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    same_surface_sha = "sameonly" * 5
+    changed_sha = "changed1" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+    old_surface_hash = rq._audited_surface_hash_from_map(old_surface)
+    unchanged_finding = {
+        "severity": "low",
+        "summary": "Unchanged path still leaks internal timing detail",
+        "file": "backend/app/unchanged.py",
+        "key": rq._audit_finding_key(
+            "Unchanged path still leaks internal timing detail",
+            "backend/app/unchanged.py",
+        ),
+    }
+    superseded_finding = {
+        "severity": "low",
+        "summary": "Old changed-path finding",
+        "file": "backend/app/changed.py",
+        "key": rq._audit_finding_key(
+            "Old changed-path finding", "backend/app/changed.py"
+        ),
+    }
+    audit_detail = rq._audit_dimension_detail(
+        surface_paths=old_surface,
+        audit_findings=[unchanged_finding, superseded_finding],
+        excluded_audit_findings=[],
+        findings_meta={
+            "audit_findings_total": 2,
+            "audit_findings_truncated": False,
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        },
+        audit_missing_reason=None,
+        audit_scope={"mode": "full"},
+    )
+    audit_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="audit",
+        status="failed",
+        sub_score=0.96,
+        audited_surface_hash=old_surface_hash,
+        detail=audit_detail,
+        origin_attempt_id=origin_attempt,
+    )
+    erosion_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="test_erosion",
+        status="passed",
+        sub_score=1.0,
+        detail={},
+        origin_attempt_id=origin_attempt,
+    )
+    challenge_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="challenge",
+        status="passed",
+        detail={"verdicts": [{"verdict": "confirmed"}]},
+        origin_attempt_id=origin_attempt,
+    )
+    db_session.add_all([audit_row, erosion_row, challenge_row])
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": old_sha,
+        "qualification_attempt_id": str(origin_attempt),
+        "error": "merge_grade_report_unparseable",
+    }
+    version.active_qualification_attempt_id = origin_attempt
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=same_surface_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            side_effect=[
+                [
+                    {"path": path, "sha": blob_sha, "size": 1}
+                    for path, blob_sha in old_surface.items()
+                ],
+                [
+                    {
+                        "path": "backend/app/unchanged.py",
+                        "sha": "blob-unchanged",
+                        "size": 1,
+                    },
+                    {
+                        "path": "backend/app/changed.py",
+                        "sha": "blob-new",
+                        "size": 1,
+                    },
+                ],
+            ]
+        ),
+    )
+    spawned_task = MagicMock(id=uuid.uuid4())
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=spawned_task),
+    )
+
+    unchanged_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert unchanged_result["status"] == "spawned"
+    audit_spawn.assert_not_called()
+    active_attempt = uuid.UUID(unchanged_result["qualification_attempt_id"])
+    reused_row = await rq._load_dimension_result(
+        db_session, version, same_surface_sha, "audit"
+    )
+    assert reused_row is not None
+    assert reused_row.origin_attempt_id == origin_attempt
+    assert str(active_attempt) in (reused_row.reused_by_attempt_ids or [])
+    from app.qualification_state_resolver import (
+        resolve_dimension_states_from_ledger,
+    )
+
+    states = await resolve_dimension_states_from_ledger(db_session, version)
+    audit_state = next(state for state in states if state["key"] == "audit")
+    assert audit_state["provenance"]["currency"] == "reused"
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": same_surface_sha,
+        "qualification_attempt_id": str(active_attempt),
+        "error": "migration_apply_check_unavailable",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=changed_sha),
+    )
+
+    changed_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert changed_result["status"] == "spawned"
+    audit_spawn.assert_awaited_once()
+    assert audit_spawn.await_args.kwargs["audit_base_sha"] == same_surface_sha
+    assert version.last_qualification["changed_audited_paths"] == [
+        "backend/app/changed.py"
+    ]
+
+    fresh_report = {
+        "audit_score": 0.98,
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+            }
+        ],
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": same_surface_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "test_erosion": {},
+    }
+    merged_report, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fresh_report,
+        fresh_report,
+        reused_row.detail,
+        expected_base_sha=same_surface_sha,
+    )
+    merged_findings = rq._extract_audit_findings(merged_report)
+    assert {finding["summary"] for finding in merged_findings} == {
+        "Unchanged path still leaks internal timing detail",
+        "Fresh changed-path finding",
+    }
+    assert rq._score_audit(merged_report)[0] == pytest.approx(0.96)
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
+    db_session,
+    mocker,
+):
+    """Finalization with scoped audit merging persists the correct merged facts.
+
+    Prior ledger rows exist for an old SHA (audit + test_erosion).  A new
+    candidate triggers an incremental audit that finds one fresh issue on a
+    changed path and zero test erosion.  After ``_finalize_qualification``:
+    - The audit ledger row for the new SHA carries both the prior unchanged-path
+      finding and the fresh changed-path finding.
+    - The test_erosion ledger row carries cumulative deltas (prior -3 + current +1 = -2).
+    - ``last_qualification`` reflects the merged facts.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    new_sha = "newaudit" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+
+    # --- Prior ledger rows ----------------------------------------------------
+    prior_audit_detail = {
+        "audited_surface_paths": old_surface,
+        "audit_findings": [
+            {
+                "severity": "low",
+                "summary": "Unchanged path still leaks internal timing detail",
+                "file": "backend/app/unchanged.py",
+                "key": rq._audit_finding_key(
+                    "Unchanged path still leaks internal timing detail",
+                    "backend/app/unchanged.py",
+                ),
+            },
+            {
+                "severity": "low",
+                "summary": "Old changed-path finding (superseded)",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Old changed-path finding (superseded)",
+                    "backend/app/changed.py",
+                ),
+            },
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_total": 2,
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_total": 0,
+        "excluded_audit_findings_truncated": False,
+        "audit_scope": {"mode": "full"},
+    }
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+        "assertion_delta": 0,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            detail=prior_audit_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Spawn a completed audit task with scoped artifact --------------------
+    audit_task = Task(
+        project_id=project.id,
+        title="scoped-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": new_sha},
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # Scoped audit report: one fresh finding on changed.py, no test deletions
+    audit_report = {
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Fresh changed-path finding", "backend/app/changed.py"
+                ),
+            },
+        ],
+        "computed_test_erosion": {
+            "test_count_delta": 1,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    # --- Stamp last_qualification for finalization ---------------------------
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Finalize ------------------------------------------------------------
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Not promoted due to merged finding penalties (prior + fresh = 2 low findings).
+    assert result["status"] == "not_promoted"
+
+    # --- Assert audit ledger row ---------------------------------------------
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    merged_findings = audit_row.detail.get("audit_findings") or []
+    merged_summaries = {f["summary"] for f in merged_findings}
+    assert "Unchanged path still leaks internal timing detail" in merged_summaries, (
+        "prior unchanged-path finding must be carried forward"
+    )
+    assert "Fresh changed-path finding" in merged_summaries, (
+        "current scoped finding must be present"
+    )
+    assert "Old changed-path finding (superseded)" not in merged_summaries, (
+        "superseded path finding must NOT be carried"
+    )
+
+    # --- Assert test_erosion ledger row --------------------------------------
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    ed = erosion_row.detail or {}
+    assert ed.get("test_count_delta") == -2, (
+        f"expected cumulative -3 + 1 = -2, got {ed.get('test_count_delta')}"
+    )
+    assert ed.get("assertion_delta") == 0
+    # Prior deleted file not in current changed_paths → carried forward.
+    assert "testing/test_removed.py" in (ed.get("deleted_test_files") or [])
+    # Prior was blocked and blocking file still present → still blocked.
+    assert erosion_row.status == "blocked"
+    assert erosion_row.sub_score is None
+
+    # --- Assert last_qualification ------------------------------------------
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    lq_summaries = {f["summary"] for f in (lq.get("audit_findings") or [])}
+    assert "Unchanged path still leaks internal timing detail" in lq_summaries
+    assert "Fresh changed-path finding" in lq_summaries
+    assert "Old changed-path finding (superseded)" not in lq_summaries
+
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_restoration_clears_blocker(
+    db_session,
+    mocker,
+):
+    """When a prior blocking file is restored in the current scope, the
+    test_erosion blocker clears and the cumulative delta is computed correctly."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "erosion0" * 5
+    new_sha = "restored" * 5
+    origin_attempt = uuid.uuid4()
+
+    # --- Prior ledger: blocked test_erosion due to deleted test file ----------
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -5,
+        "assertion_delta": -3,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="passed",
+            sub_score=1.0,
+            detail={"audited_surface_paths": {}, "audit_findings": [],
+                    "excluded_audit_findings": [], "audit_scope": {"mode": "full"}},
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Completed audit task: file restored in current scope -----------------
+    audit_task = Task(
+        project_id=project.id,
+        title="restoration-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # testing/test_removed.py is in changed_paths but NOT in deleted_test_files
+    # → the scoped computation determined it was restored.
+    audit_report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 3,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Test erosion should no longer be blocked.
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    # File was in changed_paths but NOT in deleted_test_files → restored.
+    assert "testing/test_removed.py" not in (erosion_row.detail or {}).get(
+        "deleted_test_files", []
+    ), "restored file must not appear in deleted_test_files"
+    assert erosion_row.status == "passed", (
+        f"expected passed after restoration, got {erosion_row.status}"
+    )
+    assert erosion_row.sub_score is not None, (
+        "blocker must be cleared; sub_score should not be None"
+    )
+    # Cumulative delta: -5 + 3 = -2 → still has some erosion but not blocked.
+    assert (erosion_row.detail or {}).get("test_count_delta") == -2
+
+    # Audit ledger row: no findings.
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    assert len((audit_row.detail or {}).get("audit_findings") or []) == 0
+
+    # last_qualification reflects the merged state.
+    lq = version.last_qualification
+    assert lq.get("sub_scores", {}).get("test_erosion") is not None, (
+        "test_erosion sub_score should not be None after restoration"
+    )
+
+
+def test_scoped_audit_merge_requires_bound_path_complete_unique_facts():
+    base_sha = "a" * 40
+    prior = {
+        "audited_surface_paths": {"backend/app/a.py": "blob"},
+        "audit_findings": [
+            {"file": "backend/app/a.py", "severity": "low", "summary": "one", "surface_key": "same"},
+            {"file": "backend/app/a.py", "severity": "low", "summary": "two", "surface_key": "same"},
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_truncated": False,
+    }
+    report = {
+        "findings": [],
+        "reviewed_paths": {"backend/app/b.py": "clean"},
+        "audit_scope": {"mode": "incremental", "effective_base_sha": base_sha, "changed_paths": ["backend/app/b.py"]},
+    }
+    merged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        report, report, prior, expected_base_sha=base_sha
+    )
+    assert [finding["summary"] for finding in merged["findings"]] == ["one", "two"]
+    fallback = {**report, "audit_scope": {"mode": "full", "effective_base_sha": None}}
+    unmerged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fallback, fallback, prior, expected_base_sha=base_sha
+    )
+    assert unmerged["findings"] == []
+    pathless = {**prior, "audit_findings": [{"severity": "low", "summary": "global"}]}
+    assert rq._audit_detail_is_delta_reusable(pathless) is False
+
+
+def test_scoped_test_erosion_preserves_prior_blocker_and_cumulative_deltas():
+    """Prior blocked + file outside current scope carries forward unchanged."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": -2}},
+        {"deleted_test_files": ["testing/test_removed.py"], "test_count_delta": -3},
+        prior_blocked=True,
+    )
+    assert score is None
+    assert detail == {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -2,
+        "assertion_delta": -2,
+    }
+
+
+def test_scoped_test_erosion_restoration_clears_blocker():
+    """Prior-deleted file restored in current scope: blocker clears."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": 0},
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    # File was in changed_paths but NOT in current deleted_test_files → restored.
+    assert score is not None, "blocker should clear after restoration"
+    assert "deleted_test_files" not in (detail or {})
+    assert detail.get("test_count_delta") == -2  # -3 + 1
+
+
+def test_scoped_test_erosion_restoration_preserves_other_deletions():
+    """Only the restored file drops; other prior deletions remain."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 0, "assertion_delta": 0,
+            "deleted_test_files": ["testing/still_gone.py"],
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py", "testing/still_gone.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": [
+            "testing/test_removed.py", "testing/still_gone.py",
+        ],
+        "test_count_delta": -5,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    assert "testing/still_gone.py" in (detail or {}).get("deleted_test_files", [])
+    assert "testing/test_removed.py" not in (detail or {}).get("deleted_test_files", [])
+
+
+def test_scoped_test_erosion_positive_delta_preservation():
+    """Prior positive delta (stripped by old _extract_test_erosion_detail) is
+    now losslessly preserved so cumulative sum is correct."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": -5, "assertion_delta": 0}},
+        {"test_count_delta": 10, "assertion_delta": 0},
+        prior_blocked=False,
+    )
+    # Old behavior: prior's +10 stripped → merged = 0 + (-5) = -5 (incorrect penalty)
+    # New behavior: prior's +10 preserved → merged = 10 + (-5) = 5 (no penalty)
+    assert score == 1.0, f"expected no erosion penalty for cumulative +5, got {score}"
+    assert detail["test_count_delta"] == 5
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocker):
     """Content-hash cross-SHA reuse for a non-not_promoted verdict: when automain
     HEAD advances to a NEW commit whose audited surface is byte-identical to a
@@ -10135,6 +10949,7 @@ async def _seed_qualification_children(
         "candidate_sha": _candidate_sha,
         "ci_green": ci_green,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": "2026-05-19T00:00:00",
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
@@ -11425,6 +12240,75 @@ async def test_promotion_dimension_ledger_incomplete_when_dimension_missing(
 
 
 @pytest.mark.asyncio
+async def test_promotion_dimension_ledger_incomplete_when_required_fact_unavailable(
+    db_session,
+):
+    """A transient unavailable fact is not durable terminal proof for a required
+    dimension, even though the ledger row exists at the correct candidate SHA."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "merge_grade",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "migration_apply",
+        status="unavailable",
+        detail={
+            "infra_error": "migration_apply_check_unavailable",
+            "verdict": "defer",
+        },
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is False
+    assert missing == ["migration_apply"]
+
+
+@pytest.mark.asyncio
+async def test_promotion_dimension_ledger_accepts_explicit_non_applicable_fact(
+    db_session,
+):
+    """An explicitly non-applicable merge-grade fact remains valid terminal
+    evidence when there is no gradeable release goal."""
+    project, version = await _make_project_and_version(db_session)
+
+    for dim in [
+        "ci",
+        "audit",
+        "test_erosion",
+        "migration_identity",
+        "migration_apply",
+    ]:
+        await _seed_dimension_row(db_session, project, version, dim, status="passed")
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "merge_grade",
+        status="unavailable",
+        detail={"status": "not_applicable"},
+    )
+    await db_session.commit()
+
+    complete, missing = await rq._promotion_dimension_ledger_complete(
+        db_session, version, _LEDGER_SHA_A, smoketest_enabled=False
+    )
+    assert complete is True
+    assert missing == []
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mocker):
     """Integration: a clean candidate that would promote is HELD as an infra
     failure — promote() is NOT called — when the per-dimension ledger is
@@ -11455,22 +12339,25 @@ async def test_finalize_holds_when_ledger_incomplete_at_promote(db_session, mock
         },
     )
 
-    # Simulate a ledger that lost a required gating dimension: the dual-write
-    # writes every dimension EXCEPT migration_apply for this candidate tree.
-    async def _incomplete_dual_write(session, ver, base_record, composite):
-        sha = base_record.get("candidate_sha")
-        # Flush the caller's staged mutations first so each upsert's savepoint
-        # isolates only the ledger write (mirrors the real dual-write).
-        await session.flush()
-        for dim in ("ci", "audit", "test_erosion", "migration_identity",
-                    "smoketest", "merge_grade"):
-            await rq._upsert_dimension_result(
-                session, ver, sha, dim, status="passed"
-            )
+    # Simulate a ledger that loses one required gate across both the eager and
+    # final writers.  Patching only the final dual-write is insufficient now that
+    # migration gates are durably recorded as soon as they resolve.
+    real_upsert = rq._upsert_dimension_result
+
+    async def _drop_migration_apply(
+        session,
+        ver,
+        sha,
+        dimension,
+        **kwargs,
+    ):
+        if dimension == "migration_apply":
+            return
+        await real_upsert(session, ver, sha, dimension, **kwargs)
 
     mocker.patch(
-        "app.release_qualifier._dual_write_dimension_results",
-        new=_incomplete_dual_write,
+        "app.release_qualifier._upsert_dimension_result",
+        new=_drop_migration_apply,
     )
     promote_spy = mocker.patch(
         "app.release_qualifier.promote",
@@ -11749,11 +12636,11 @@ async def test_finalize_holds_when_ledger_empty_on_redrive(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, mocker):
+async def test_finalize_holds_on_empty_ledger_first_attempt(db_session, mocker):
     """When the per-dimension ledger is completely empty at the promotion gate
-    on the FIRST qualification (qualification_attempts == 1), the promotion
-    still fail-opens on the live composite -- a transient ledger-write failure
-    on the first qualification must not block an otherwise-qualified promotion."""
+    on the FIRST qualification (qualification_attempts == 1), promotion fails
+    closed.  A candidate with no durable same-tree facts must never promote from
+    only the mutable live composite."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -11795,9 +12682,10 @@ async def test_finalize_fails_open_on_empty_ledger_first_attempt(db_session, moc
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Fail-open: promoted despite empty ledger (first qualification).
-    assert result["status"] == "promoted"
-    promote_spy.assert_called_once()
+    # Held, not promoted -- empty ledger fails closed on the first attempt too.
+    assert result["status"] == "infra_failure"
+    assert result["error"] == "qualification_dimension_ledger_empty"
+    promote_spy.assert_not_called()
 
 
 # Fully-controlled gate inputs for finalize reuse-path tests: CI green, both
@@ -16593,10 +17481,12 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
     # Pre-cap completeness meta agrees with the carried (capped) list.
     assert version.last_qualification["audit_findings_total"] == len(findings)
     assert version.last_qualification["audit_findings_truncated"] is False
-    # Test-erosion detail is carried too: this fixture has positive deltas and
-    # no deleted files, so the clean dimension carries None (nothing to fix).
+    # Test-erosion detail carries the lossless deltas (positive included) so
+    # a later scoped-audit merge can reconstruct cumulative erosion correctly.
     assert "test_erosion_detail" in version.last_qualification
-    assert version.last_qualification["test_erosion_detail"] is None
+    assert version.last_qualification["test_erosion_detail"] == {
+        "test_count_delta": 373, "assertion_delta": 840,
+    }
     # Smoketest detail names the specific failing test so the agent can target it.
     smoketest_detail = version.last_qualification["smoketest_detail"]
     assert smoketest_detail["failed_tests"] == ["b"]
@@ -21762,6 +22652,7 @@ async def _seed_pending_qualification(
         "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
@@ -21919,6 +22810,7 @@ async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
     rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
     version.last_qualification = {
         **version.last_qualification,
+        "env_preflight_enabled": True,
         "rubric_snapshot": rubric_snapshot,
         "rubric_fingerprint": rubric_fingerprint,
         "rubric_lifecycle_snapshot": rubric_lifecycle,
@@ -21964,11 +22856,16 @@ async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
 
 
 @pytest.mark.asyncio
-async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session):
+async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session, monkeypatch):
     """Slice 2 acceptance: a qualification run stores the pure-content
     {required_env, startup_check_names, manifest_source} env_preflight artifact
-    on last_qualification, sanitized to presence-only, with promotion confidence
-    and blocker UNCHANGED vs the same run without the artifact (no gating)."""
+    on last_qualification, sanitized to presence-only.
+
+    The run WITH evidence passes (declared vars were all-present in
+    scope=cloud_run context).  The run WITHOUT evidence now fail-closes
+    with boot_prereq_evidence_missing — evidence absence is a
+    deterministic block, not a silent pass (the fix for Defect 2).
+    """
     base_smoke = {
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
@@ -21999,19 +22896,18 @@ async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_sessio
     }
     assert "value" not in stored["required_env"][0]
 
-    # No gating: the run WITHOUT the artifact carries env_preflight=None but the
-    # promotion decision, confidence, and blocker are byte-for-byte identical.
+    # WITHOUT evidence: now fail-closes (boot_prereq_evidence_missing).
     assert without_qual["env_preflight"] is None
-    assert with_result["status"] == without_result["status"] == "dry_run"
-    assert with_result["would_promote"] is without_result["would_promote"] is True
-    assert (
-        with_qual["confidence"]
-        == without_qual["confidence"]
+    assert without_qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {without_qual['blocker']!r} — "
+        "missing evidence must fail-closed"
     )
-    assert (
-        with_qual["blocker"]
-        == without_qual["blocker"]
-    )
+    assert without_result["status"] == "not_promoted"
+
+    # WITH evidence (cloud_run-scoped vars are present in cloud_run context):
+    # promotion proceeds normally.
+    assert with_result["status"] == "dry_run"
+    assert with_result["would_promote"] is True
 
 
 def test_policy_env_preflight_enabled_default_on():
@@ -22081,6 +22977,14 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
         },
         smoke_logs=smoke_logs,
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
@@ -22114,12 +23018,15 @@ async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkey
 
 @pytest.mark.asyncio
 async def test_env_preflight_gate_inert_when_no_artifact(db_session):
-    """When env_preflight_enabled is true but no env_preflight artifact was
-    produced by the smoketest (no manifest), the gate is inert — no
-    boot_prereq_missing block, and promotion proceeds normally.
+    """When env_preflight_enabled is true but no env_preflight evidence was
+    produced (the SMOKETEST_RESULT artifact exists but carries no env_preflight
+    key), the gate NOW FAILS CLOSED with boot_prereq_evidence_missing.
 
-    This distinguishes 'no declared requirements' (pass through) from 'declared
-    but absent' (hard block).
+    This is the corrected behavior (previously the defect was that missing
+    evidence silently passed through — a fail-open).  The evidence-missing
+    block is a deterministic quality verdict, never an infra-failure retry loop.
+    A real successful producer always emits a non-empty manifest (even
+    required_env: []), so 'no artifact while enabled' legitimately fail-closes.
     """
     from app import shared_state
 
@@ -22138,26 +23045,34 @@ async def test_env_preflight_gate_inert_when_no_artifact(db_session):
                 "test_count_delta": 0,
             },
         },
-        # No env_preflight key in smoke_logs — candidate declared no requirements.
+        # No env_preflight key in smoke_logs — no evidence produced.
         smoke_logs={
             "passed": True,
             "tests": [{"name": "a", "status": "pass"}],
             "suites": {"startup": {"passed": True}},
         },
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
     await db_session.refresh(version)
 
     qual = version.last_qualification
-    # Gate is inert when no artifact — no boot_prereq_missing.
-    assert qual["blocker"] != "boot_prereq_missing", (
-        "boot_prereq_missing must NOT fire when no env_preflight artifact was produced"
+    # Gate must hard-block with evidence-missing when enabled but no evidence.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must fail-closed when no evidence was produced"
     )
-    # Promotion proceeds (dry_run since promotion_enabled=False).
-    assert qual["status"] == "dry_run"
-    assert qual["would_promote"] is True
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
 
 
 @pytest.mark.asyncio
@@ -22204,6 +23119,14 @@ async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_
         },
         smoke_logs=smoke_logs,
     )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     await rq._finalize_qualification(db_session, version)
     await db_session.commit()
@@ -22258,9 +23181,10 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
         },
         smoke_logs=smoke_logs,
     )
-    # Arm the Slice-4 one-shot ack.
+    # Arm the Slice-4 one-shot ack and enable env_preflight (seed defaults to False).
     version.last_qualification = {
         **version.last_qualification,
+        "env_preflight_enabled": True,
         "ack_env_will_be_bound": {
             "actor": "test-operator",
             "acknowledged_at": "2026-07-16T00:00:00",
@@ -22285,6 +23209,195 @@ async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatc
     # Missing names still recorded for audit (presence-only, names never values).
     assert _ABSENT_VAR in qual["env_preflight_ack_applied"]["missing"]
     # Dry-run promotion proceeds.
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_blocks_without_smoketest_child(db_session):
+    """When env_preflight_enabled is True but smoketest_enabled is False
+    and NO env_preflight evidence is produced (the child was never spawned
+    or produced no usable artifact), the gate hard-blocks with
+    boot_prereq_evidence_missing — a deterministic quality verdict, NOT
+    an infra_failure retry loop.
+
+    This is the primary acceptance test: the boot gate is independently
+    enforceable even when the smoketest subsystem is disabled.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        # No env_preflight in smoke_logs — no evidence produced.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Must block with boot_prereq_evidence_missing — NOT infra_failure.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must hard-block when enabled but no evidence produced"
+    )
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_evidence_even_without_smoketest(db_session, monkeypatch):
+    """When env_preflight_enabled is True, smoketest_enabled is False, BUT the
+    evidence producer ran successfully and all declared prerequisites are present:
+    promotion proceeds normally (no block, no confidence erosion).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                # scope "always" → in scope for non-cloud-run.
+                {"name": "SOME_PRESENT_VAR", "scope": "always"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Ensure the declared required var is present in the deployed env.
+    monkeypatch.setenv("SOME_PRESENT_VAR", "1")
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence was produced and all vars are present.
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "gate must pass when evidence exists and all vars are present"
+    )
+    # Dry-run promotion proceeds (promotion_enabled=False but would_promote).
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_empty_requirements(db_session, monkeypatch):
+    """When env_preflight_enabled is True and the evidence producer ran
+    successfully reporting required_env: [] (candidate genuinely declares
+    zero prerequisites), the gate passes (score 1.0 — all zero requirements
+    are trivially met).  This must NOT block on evidence-missing or
+    boot_prereq_missing.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [],  # candidate genuinely declares zero prerequisites
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate env-preflight enabled (smoketest enabled is the seed default).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence exists (empty list = trivially all-present).
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "empty required_env must pass: candidate genuinely declares zero prerequisites"
+    )
     assert qual["status"] == "dry_run"
     assert qual["would_promote"] is True
 
@@ -25954,6 +27067,7 @@ async def _seed_audit_only_pending_qualification(
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": False,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": None,
@@ -26041,6 +27155,73 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
 
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_maybe_finalize_env_preflight_only_waits_for_smoketest_child(db_session):
+    """Boot-gate: when smoketest_enabled=False but env_preflight_enabled=True,
+    maybe_finalize_qualification must wait for the smoketest child (which carries
+    the env-preflight run) before finalizing — it must NOT call _finalize_qualification
+    while the smoketest child is still non-terminal."""
+    from app import shared_state
+    from app.time_utils import _utcnow
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-child",
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-audit-epf",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    # Smoketest child still running (env-preflight in progress).
+    smoke_task = Task(
+        project_id=project.id,
+        title="smoke-child",
+        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-smoke-epf",
+        status=TaskStatus.IN_PROGRESS,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
+        "candidate_sha": "cafe" * 10,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+        "started_at": _utcnow().isoformat(),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    version.active_qualification_attempt_id = attempt_id
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Triggering via the audit task — audit is done but smoketest is IN_PROGRESS.
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Must NOT finalize — smoketest child (env-preflight) is still running.
+    assert result is None
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -40725,3 +41906,252 @@ async def test_redrive_isolation_proven_evidence(db_session, resolved_status):
         f"resolved→resolved transition must be permitted: expected '{new_resolved_status}', "
         f"got '{row2.status}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attempt-contract freeze tests (version_goal, promotion_policy, proof mode)
+# ---------------------------------------------------------------------------
+
+
+class TestAttemptContractFreeze:
+    """The attempt contract (version_goal, promotion_policy_snapshot,
+    capability_proof_mode) is frozen at spawn time so mid-flight config
+    changes cannot combine children from one contract with a verdict from
+    another."""
+
+    @pytest.mark.asyncio
+    async def test_version_goal_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores version.goal as version_goal in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+        mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+        mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+            return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+        ))
+        mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+        mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+
+        project, version = await _make_project_and_version(db_session, phase="stabilize")
+        version.goal = "Deliver a working login flow"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await rq.run_qualification(db_session, project.id, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        qual = version.last_qualification or {}
+        assert qual.get("version_goal") == "Deliver a working login flow", (
+            f"version_goal not frozen at spawn: {qual.get('version_goal')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores capability_proof_gate_mode in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        shared_state.runtime_config["capability_proof_gate_mode"] = "observe"
+        try:
+            mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+            mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+            mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+                return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+            ))
+            mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+            mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+
+            project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+            await rq.run_qualification(db_session, project.id, version)
+            await db_session.commit()
+            await db_session.refresh(version)
+
+            qual = version.last_qualification or {}
+            assert qual.get("capability_proof_mode") == "observe", (
+                f"capability_proof_mode not frozen at spawn: {qual.get('capability_proof_mode')!r}"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)
+
+    @pytest.mark.asyncio
+    async def test_version_goal_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the frozen version_goal from last_qualification,
+        not the live version.goal — even if version.goal was mutated after spawn."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        # Seed children with an empty frozen goal so the merge-grade gate is a no-op.
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Freeze version_goal="" (no goal at spawn) but set a live goal afterwards.
+        qual = dict(version.last_qualification or {})
+        qual["version_goal"] = ""
+        version.last_qualification = qual
+        version.goal = "A non-empty live goal that should be ignored"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Mock evaluate_merge_grade so we can observe what goal it is called with.
+        called_with_goals: list[str | None] = []
+
+        def _fake_evaluate_merge_grade(goal, artifact, categories, evidence):
+            called_with_goals.append(goal)
+            return {"status": "not_applicable", "covers_goal": None, "coverage": None,
+                    "biggest_gap": None, "blocked": False, "detail": None}
+
+        mocker.patch("app.release_qualifier.evaluate_merge_grade", side_effect=_fake_evaluate_merge_grade)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Finalize must have used the frozen empty goal, not the live "non-empty" goal.
+        if called_with_goals:
+            assert called_with_goals[0] == "", (
+                f"_finalize_qualification passed live goal instead of frozen goal: "
+                f"{called_with_goals[0]!r}"
+            )
+        # Either way the run should not fail because the frozen goal is empty.
+        assert result.get("status") in ("dry_run", "not_promoted"), (
+            f"unexpected finalize status: {result.get('status')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_promotion_policy_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the promotion policy frozen at spawn time.
+
+        A promotion_policy_snapshot stored in last_qualification takes precedence
+        over the live runtime_config / _load_policy result.  Changing the threshold
+        after spawn must not affect the verdict for the in-flight attempt.
+        """
+        from app import shared_state
+
+        # Set a low threshold at "spawn" time that would allow promotion.
+        shared_state.runtime_config["promotion_enabled"] = False
+        _spawn_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                         "threshold": 0.50}
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.7, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Stamp the frozen policy into last_qualification.
+        qual = dict(version.last_qualification or {})
+        qual["promotion_policy_snapshot"] = _spawn_policy
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Raise the live threshold to something the score would fail.
+        _live_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                        "threshold": 0.99}
+        mocker.patch("app.release_qualifier._load_policy", return_value=_live_policy)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # With frozen threshold=0.50 the composite is roughly 0.7*0.4 + 1.0*0.3 + 1.0*0.3 = 0.88,
+        # which exceeds the frozen bar -- result is dry_run, not not_promoted.
+        # (With live threshold=0.99 the same composite would be not_promoted.)
+        assert result.get("status") == "dry_run", (
+            f"promotion policy was not frozen at spawn: expected dry_run "
+            f"(frozen threshold=0.50) but got {result.get('status')!r} — "
+            f"live threshold=0.99 may have been used"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the capability_proof_mode frozen at spawn.
+
+        Changing runtime_config['capability_proof_gate_mode'] between spawn and
+        finalize must not affect the qualification verdict for that attempt.
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        # Freeze "off" mode in last_qualification.
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        qual = dict(version.last_qualification or {})
+        qual["capability_proof_mode"] = "off"
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # After spawn: flip the live config to "enforce" with an unproven capability.
+        shared_state.runtime_config["capability_proof_gate_mode"] = "enforce"
+        # Inject an unproven working capability into the project's problem_model.
+        project.problem_model = {
+            "capabilities": [{"name": "github_api", "status": "working", "evidence_refs": []}]
+        }
+        db_session.add(project)
+        await db_session.commit()
+        try:
+            mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+            result = await rq._finalize_qualification(db_session, version)
+            await db_session.commit()
+
+            # With frozen "off" mode the capability proof gate is inert — should
+            # still produce dry_run, not a capability_proof_blocked not_promoted.
+            assert result.get("status") == "dry_run", (
+                f"capability_proof_mode was not frozen at spawn: expected dry_run "
+                f"(frozen mode=off) but got {result.get('status')!r} with "
+                f"blocker={result.get('blocker')!r}"
+            )
+            assert result.get("blocker") != "capability_proof_blocked", (
+                "capability_proof_blocked fired despite frozen 'off' mode"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)

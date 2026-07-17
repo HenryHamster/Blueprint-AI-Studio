@@ -101,6 +101,9 @@ _ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
 _HEARTBEAT_BODY_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "heartbeat_body.py").read_bytes()
 ).decode("ascii")
+_VIEWABLE_WATCH_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "viewable_watch.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
 
@@ -187,7 +190,7 @@ def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
         # Stale run-status files from the predecessor must not contaminate this job.
         if member.isreg() and os.path.basename(member.name) in _RESUME_STALE_ARTIFACT_FILENAMES:
             continue
-        tar.extract(member, path=dest_dir)
+        tar.extract(member, path=dest_dir, filter="data")
         # Count only regular files — directories are structural scaffolding only.
         if member.isreg():
             extracted += 1
@@ -249,8 +252,8 @@ async def _rehydrate_input_artifact_bundle(
         os.path.dirname(dest_dir),
         f".bp-resume-stage-{os.path.basename(dest_dir)}",
     )
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    os.makedirs(staging_dir, exist_ok=True)
+    await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+    await asyncio.to_thread(lambda: os.makedirs(staging_dir, exist_ok=True))
     try:
         try:
             downloaded = await asyncio.to_thread(
@@ -281,8 +284,8 @@ async def _rehydrate_input_artifact_bundle(
                 f"{input_artifact_job_id} contains no resumable files"
             )
         try:
-            shutil.rmtree(dest_dir, ignore_errors=True)
-            os.replace(staging_dir, dest_dir)
+            await asyncio.to_thread(shutil.rmtree, dest_dir, True)
+            await asyncio.to_thread(os.replace, staging_dir, dest_dir)
         except OSError as exc:
             shutil.rmtree(dest_dir, ignore_errors=True)
             raise RuntimeError(
@@ -292,11 +295,11 @@ async def _rehydrate_input_artifact_bundle(
         return file_count
     finally:
         try:
-            os.unlink(tmp_path)
+            await asyncio.to_thread(os.unlink, tmp_path)
         except OSError:
             pass
-        if os.path.exists(staging_dir):
-            shutil.rmtree(staging_dir, ignore_errors=True)
+        if await asyncio.to_thread(os.path.exists, staging_dir):
+            await asyncio.to_thread(shutil.rmtree, staging_dir, True)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -1158,7 +1161,16 @@ class GcpComputeBackend:
                 started_at=started_at or _utcnow(),
                 cost_rate_per_second=0.0,
                 message="adopted existing compute-job VM",
-                metadata={"zone": existing_zone, "artifact_uri": artifact_uri},
+                # The adopted VM was provisioned by this backend, so its startup
+                # script embeds the HMAC heartbeat token just like the normal
+                # path below. Stamp the marker so legacy UUID-bearer heartbeats
+                # are rejected for the crash-recovered job too — otherwise anyone
+                # knowing the job UUID could spoof its heartbeats.
+                metadata={
+                    "zone": existing_zone,
+                    "artifact_uri": artifact_uri,
+                    "heartbeat_auth": "hmac",
+                },
             )
         runtime_budget_seconds = spec.runtime_deadline_seconds
         if runtime_budget_seconds is not None:
@@ -1201,7 +1213,12 @@ class GcpComputeBackend:
         if not ok:
             raise RuntimeError("GCP compute-job VM provisioning failed")
         zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
-        metadata: Dict[str, Any] = {"artifact_uri": artifact_uri}
+        metadata: Dict[str, Any] = {
+            "artifact_uri": artifact_uri,
+            # Durable per-job marker: this VM's startup script embeds the HMAC
+            # heartbeat token, so legacy UUID-bearer heartbeats must be rejected.
+            "heartbeat_auth": "hmac",
+        }
         if spec.provisioning_deadline_at is not None:
             metadata["provisioning_deadline_at"] = (
                 spec.provisioning_deadline_at.isoformat()
@@ -3197,7 +3214,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
             f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -3238,7 +3255,7 @@ def _build_gcp_startup_script(
             f"{artifact_dir} FAILED 1 setup_step_failed "
             f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi"
@@ -3381,7 +3398,7 @@ def _build_gcp_startup_script(
             f'{artifact_dir} FAILED 1 resume_hydration_failed '
             f'{result_file} {command_log_path} "${{__BP_RESUME_D:-}}" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -3467,6 +3484,7 @@ TTL_PID=$!
 # `set -u` script can reference "$_NP_WATCHDOG_PID" in the setup-failure kill
 # paths (clone/setup/pull) that run before the watchdog is armed.
 _NP_WATCHDOG_PID=
+_VIEWABLE_PID=
 echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
@@ -3491,6 +3509,14 @@ _compute_heartbeat
   done
 ) &
 _HEARTBEAT_PID=$!
+echo '{_VIEWABLE_WATCH_B64}' | base64 -d > /tmp/blueprint_viewable_watch.py
+python3 /tmp/blueprint_viewable_watch.py \
+  {artifact_dir} \
+  "$_COMPUTE_ORCHESTRATOR_URL" \
+  "$_COMPUTE_JOB_ID" \
+  "$_COMPUTE_HB_TOKEN" \
+  >/dev/null 2>&1 &
+_VIEWABLE_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
@@ -3575,7 +3601,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
   "$__BP_RESUME_D" >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """

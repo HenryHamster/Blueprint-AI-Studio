@@ -7,6 +7,7 @@ omits heavy fields such as knowledge bodies and artifact logs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -665,29 +666,15 @@ _ARTIFACT_EVIDENCE_FETCH = 20
 _ARTIFACT_EVIDENCE_LIMIT = 4
 
 
-async def _sign_viewable_manifest(
+async def _validate_viewable_files(
     session: AsyncSession,
-    project_id,
+    project_id: Any,
     viewable_files: Any,
-) -> List[Dict[str, Any]]:
-    """Mint short-lived signed preview URLs for a ``viewable_files`` manifest.
-
-    Shared by the terminal-artifact path (``_resolve_viewable_previews``, reading
-    an Artifact's ``logs.viewable_files``) and the running-compute-job path
-    (``load_strategic_context_evidence``, reading a job's
-    ``polling_metadata['viewable_files']``). Each entry is
-    ``{filename, storage_uri, kind, ...}``; every one is independently verified
-    for project ownership and re-validated against the viewable-extension
-    allowlist (no svg — script execution via a signed URL), with a stamped
-    ``kind`` that must match the filename's classification.
-
-    Fail-soft: an ownership violation or signing failure skips that one file so
-    the rest of the manifest still resolves. Returns the signed preview list
-    (``[]`` when nothing resolves).
-    """
-    previews: List[Dict[str, Any]] = []
+) -> List[tuple]:
+    """Sequential ownership checks; returns (vf, classified) pairs that pass."""
+    valid: List[tuple] = []
     if not isinstance(viewable_files, list):
-        return previews
+        return valid
     for vf in viewable_files:
         if not isinstance(vf, dict):
             continue
@@ -707,26 +694,72 @@ async def _sign_viewable_manifest(
             await verify_artifact_project_ownership(
                 vf_storage_uri, project_id, session
             )
-            signed_url = await generate_download_signed_url(
-                vf_storage_uri,
+        except Exception:  # noqa: BLE001 — ownership violation
+            continue
+        valid.append((vf, classified))
+    return valid
+
+
+def _build_preview_from_vf(vf: dict, signed_url: str) -> Dict[str, Any]:
+    """Build a preview dict from a viewable_file entry and its signed URL."""
+    preview: Dict[str, Any] = {
+        "url": signed_url,
+        "storage_uri": vf.get("storage_uri"),
+        "kind": vf.get("kind", "image"),
+        "filename": vf.get("filename", ""),
+    }
+    if isinstance(vf.get("revision"), str) and vf["revision"]:
+        preview["revision"] = vf["revision"]
+    if isinstance(vf.get("live"), bool):
+        preview["live"] = vf["live"]
+    return preview
+
+
+async def _sign_viewable_manifest(
+    session: AsyncSession,
+    project_id: Any,
+    viewable_files: Any,
+) -> List[Dict[str, Any]]:
+    """Mint short-lived signed preview URLs for a ``viewable_files`` manifest.
+
+    Shared by the terminal-artifact path (``_resolve_viewable_previews``, reading
+    an Artifact's ``logs.viewable_files``) and the running-compute-job path
+    (``load_strategic_context_evidence``, reading a job's
+    ``polling_metadata['viewable_files']``). Each entry is
+    ``{filename, storage_uri, kind, ...}``; every one is independently verified
+    for project ownership and re-validated against the viewable-extension
+    allowlist (no svg — script execution via a signed URL), with a stamped
+    ``kind`` that must match the filename's classification.
+
+    Fail-soft: an ownership violation or signing failure skips that one file so
+    the rest of the manifest still resolves. Returns the signed preview list
+    (``[]`` when nothing resolves).
+
+    Two-phase: DB ownership checks run sequentially (AsyncSession is not
+    concurrency-safe), then all GCS signing coroutines are gathered in parallel.
+    """
+    # Phase 1: sequential ownership checks (session-dependent)
+    valid_entries = await _validate_viewable_files(session, project_id, viewable_files)
+    if not valid_entries:
+        return []
+
+    # Phase 2: parallel signing — all GCS round-trips in one gather
+    sign_results = await asyncio.gather(
+        *[
+            generate_download_signed_url(
+                vf.get("storage_uri"),
                 expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
             )
-            preview: Dict[str, Any] = {
-                "url": signed_url,
-                "storage_uri": vf_storage_uri,
-                "kind": vf_kind,
-                "filename": vf_filename,
-            }
-            if isinstance(vf.get("revision"), str) and vf["revision"]:
-                preview["revision"] = vf["revision"]
-            if isinstance(vf.get("live"), bool):
-                preview["live"] = vf["live"]
-            previews.append(preview)
-        except Exception:  # noqa: BLE001 — ownership violation or signing
-            # failure — skip this file so it degrades gracefully rather
-            # than breaking the whole evidence package.
-            continue
-    return previews
+            for vf, _ in valid_entries
+        ],
+        return_exceptions=True,
+    )
+
+    return [
+        _build_preview_from_vf(vf, result)
+        for (vf, _), result in zip(valid_entries, sign_results, strict=False)
+        if not isinstance(result, Exception)
+    ]
 
 
 async def _resolve_viewable_previews(
@@ -820,6 +853,13 @@ _NON_TERMINAL_COMPUTE_JOB_STATUSES = (
     ComputeJobStatus.POLLING,
 )
 
+_TERMINAL_COMPUTE_JOB_STATUSES = {
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+}
+
 
 async def _running_job_preview_items(
     session: AsyncSession,
@@ -865,17 +905,56 @@ async def _running_job_preview_items(
         )
     ).all()
 
-    items: List[Dict[str, Any]] = []
+    # Phase 1: sequential ownership checks across all jobs and files.
+    # AsyncSession is not concurrency-safe, so DB calls remain sequential.
+    job_meta: List[tuple] = []  # (job, task_title, pm, valid_entries)
     for job, task_title in rows:
         pm = job.polling_metadata if isinstance(job.polling_metadata, dict) else {}
         viewable_files = pm.get("viewable_files")
         if not isinstance(viewable_files, list) or not viewable_files:
             continue
-        previews = await _sign_viewable_manifest(
-            session, project_id, viewable_files
-        )
+        valid = await _validate_viewable_files(session, project_id, viewable_files)
+        if valid:
+            job_meta.append((job, task_title, pm, valid))
+
+    if not job_meta:
+        return []
+
+    # Phase 2: gather ALL signing coroutines from ALL jobs in one batch.
+    # generate_download_signed_url uses asyncio.to_thread and never touches
+    # the session, so concurrent dispatch is safe.
+    all_vf_flat = [
+        (vf, classified)
+        for _, _, _, valid in job_meta
+        for vf, classified in valid
+    ]
+    sign_results = await asyncio.gather(
+        *[
+            generate_download_signed_url(
+                vf.get("storage_uri"),
+                expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
+            )
+            for vf, _ in all_vf_flat
+        ],
+        return_exceptions=True,
+    )
+
+    # Phase 3: map results back to per-job previews and build items.
+    items: List[Dict[str, Any]] = []
+    offset = 0
+    for job, task_title, pm, valid in job_meta:
+        count = len(valid)
+        job_sign_results = sign_results[offset : offset + count]
+        offset += count
+
+        previews = [
+            _build_preview_from_vf(vf, result)
+            for (vf, _), result in zip(valid, job_sign_results, strict=False)
+            if not isinstance(result, Exception)
+        ]
         if not previews:
             continue
+
         label = _compact_text(task_title, max_chars=100) or "Live compute previews"
         item = _with_target(
             {
@@ -907,6 +986,12 @@ async def _running_job_preview_items(
         dropped = pm.get("viewable_files_dropped")
         if isinstance(dropped, int) and dropped > 0:
             item["viewable_files_dropped"] = dropped
+        # Stamp progress_series from polling_metadata so the strategic canvas can
+        # render a real time-series chart (e.g. eval-reward over env-steps) for
+        # running jobs while the operator watches mid-run evidence accrue.
+        series = pm.get("progress_series")
+        if isinstance(series, list) and series:
+            item["progress_series"] = series
         items.append(item)
     return items[:_RUNNING_JOB_PREVIEW_LIMIT]
 
@@ -1194,6 +1279,41 @@ async def load_strategic_context_evidence(
             provenance = provenance_by_task.get(item.get("task_id") or "")
             if provenance:
                 item.update(provenance)
+
+    # Stamp progress_series from the terminal ComputeJob for each artifact so
+    # _artifact_descriptor can build a real time-series line chart (instead of
+    # the static one-point placeholder). The artifact's task_id maps to a
+    # ComputeJob whose progress_series ring buffer carries the training/eval
+    # metrics recorded mid-run by runner heartbeats. One bounded, batched query
+    # keyed on the same ≤4 artifact task ids (no N+1).
+    if artifact_task_ids:
+        compute_job_rows = (
+            await session.execute(
+                select(
+                    ComputeJob.task_id,
+                    ComputeJob.polling_metadata,
+                )
+                .where(
+                    ComputeJob.task_id.in_(artifact_task_ids),
+                    ComputeJob.project_id == project_id,
+                    ComputeJob.status.in_(_TERMINAL_COMPUTE_JOB_STATUSES),
+                )
+                .order_by(ComputeJob.updated_at.desc())
+            )
+        ).all()
+        terminal_series_by_task: Dict[str, list] = {}
+        for row in compute_job_rows:
+            task_key = str(row.task_id)
+            if task_key in terminal_series_by_task:
+                continue  # newest per task (ordered updated_at desc)
+            pm = row.polling_metadata if isinstance(row.polling_metadata, dict) else {}
+            series = pm.get("progress_series")
+            if isinstance(series, list) and series:
+                terminal_series_by_task[task_key] = series
+        for item in artifact_items:
+            series = terminal_series_by_task.get(item.get("task_id") or "")
+            if series:
+                item["progress_series"] = series
 
     # Sort viewable-bearing terminal-artifact items first so the bounded
     # descriptor cut (_strategic_context_descriptors slices items[:4]) retains
@@ -1670,10 +1790,45 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
                 "unsupported_reason"
             ] = "PDF artifact previews require a signed preview URL."
     elif kind == "chart":
-        descriptor["chart"] = {
-            "kind": "bar",
-            "points": [{"label": "artifact", "value": 1}],
-        }
+        artifact_series = artifact.get("progress_series")
+        # Group progress samples by metric name; use the metric with the most
+        # entries (typically the declared progress metric). ``metric_groups``
+        # can end up empty even when ``artifact_series`` is non-empty (e.g. all
+        # entries are non-dicts or the series is malformed), so guard the
+        # ``max()`` call and fall through to the bar-chart fallback below.
+        metric_groups: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(artifact_series, list):
+            for sample in artifact_series:
+                if isinstance(sample, dict):
+                    name = str(sample.get("name", "unknown"))
+                    metric_groups.setdefault(name, []).append(sample)
+        if metric_groups:
+            best_metric = max(metric_groups, key=lambda k: len(metric_groups[k]))
+            best_samples = metric_groups[best_metric]
+            # Cap at 300 points to keep the descriptor bounded.
+            sample_count = len(best_samples)
+            if sample_count > 300:
+                step = sample_count // 300
+                best_samples = best_samples[::step]
+            descriptor["chart"] = {
+                "kind": "line",
+                "points": [
+                    {
+                        "label": str(s.get("value", "")),
+                        "value": float(v),
+                        "t": s.get("t", ""),
+                    }
+                    for s in best_samples
+                    if isinstance((v := s.get("value")), (int, float))
+                ],
+                "x_label": "time",
+                "y_label": best_metric,
+            }
+        else:
+            descriptor["chart"] = {
+                "kind": "bar",
+                "points": [{"label": "artifact", "value": 1}],
+            }
     return descriptor
 
 

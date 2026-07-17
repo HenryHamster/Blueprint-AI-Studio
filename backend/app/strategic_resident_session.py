@@ -39,7 +39,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import func, or_, text, update as sa_update
+from sqlalchemy import bindparam, func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -583,7 +583,12 @@ async def _compute_resident_work_state(
                           AND updated_at >= :terminal_cutoff
                     ) AS terminal_since
                 FROM task_tree
-            """),
+            """).bindparams(
+                bindparam("project_id", type_=Task.__table__.c.project_id.type),
+                bindparam("terminal_cutoff", type_=Task.__table__.c.updated_at.type),
+            ).columns(
+                max_updated=Task.__table__.c.updated_at.type,
+            ),
             {
                 "project_id": project_id,
                 "created_by": _STRATEGIC_AGENT_CREATED_BY,

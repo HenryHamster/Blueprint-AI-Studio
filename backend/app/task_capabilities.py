@@ -1039,6 +1039,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
+        TaskType.strategic_resident_turn.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering

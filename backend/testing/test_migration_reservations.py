@@ -82,7 +82,7 @@ async def test_task_base_head_overrides_stale_runtime_image_anchor(db_session, m
     db_session.add(project)
     await db_session.commit()
     task = await _make_task(db_session, project.id)
-    task.first_payload = {"base_branch": "release/next"}
+    task.payloads = [{"base_branch": "release/next"}]
     db_session.add(task)
     await db_session.commit()
     monkeypatch.setattr(

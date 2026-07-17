@@ -16,7 +16,7 @@ import asyncio
 import threading
 import uuid
 from datetime import datetime, timedelta
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
@@ -89,13 +89,14 @@ async def _add_image(
     project_id: uuid.UUID,
     digest: str,
     updated_at: datetime | None = None,
+    tag: str = "latest",
 ) -> ProjectComputeImage:
     img = ProjectComputeImage(
         project_id=project_id,
         image_name=_IMAGE_NAME,
         registry_repo=_REGISTRY_REPO,
         dep_hash=uuid.uuid4().hex,
-        tag="latest",
+        tag=tag,
         pinned_ref=f"{_REGISTRY_REPO}/{_IMAGE_NAME}@{digest}",
         digest=digest,
         built=True,
@@ -235,10 +236,10 @@ async def test_delete_tag_runs_off_event_loop_thread(db):
 async def test_applied_count_reflects_successful_tag_calls(db):
     """applied count equals the number of referenced digests for which apply_tag succeeds."""
     project = await _make_project(db)
-    # Two images recently built — both should be in the referenced set via
-    # the ProjectComputeImage freshness window.
+    other_project = await _make_project(db, "other-proj")
+    # Current defaults for two distinct project/image identities are protected.
     await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
-    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW)
+    await _add_image(db, other_project.id, _DIGEST_B, updated_at=_NOW)
 
     with patch(
         "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
@@ -325,8 +326,9 @@ async def test_apply_failures_are_counted_and_returned(db):
     digests whose apply fails must yield apply_failed=2 (not a silent 0).
     """
     project = await _make_project(db)
+    other_project = await _make_project(db, "failure-other-proj")
     await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
-    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW)
+    await _add_image(db, other_project.id, _DIGEST_B, updated_at=_NOW)
 
     with patch(
         "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
@@ -595,22 +597,110 @@ async def test_recently_built_image_is_protected_before_any_job(db):
 
 
 @pytest.mark.asyncio
-async def test_old_image_row_is_protected_as_standing_pin(db):
-    """An old ProjectComputeImage row is a STANDING PIN — protected regardless of age.
+async def test_explicit_manifest_tag_default_is_protected_before_any_job(db):
+    """An older explicit tag remains protected when another tag was built later.
 
-    A ProjectComputeImage row maps dep_hash -> digest and IS the project's default
-    image; the pin has no expiry. Even far outside the 30-day job-provenance window
-    (and with no live job referencing it) the digest must keep its ``inuse-`` tag,
-    or ``delete-old-tagged`` reclaims an image the DB still pins — the follow-up
-    called out in infra/terraform/registry.tf. (Previously such a row lost
-    protection once it aged past the window; that regression is what this asserts
-    against.)
+    ``resolve_digest_pinned_default_image`` resolves an explicit manifest tag to
+    the newest build for that tag, rather than to the newest build for the image
+    across all tags. The GC sweep must retain that same default even before it
+    has a job reference.
     """
     project = await _make_project(db)
-    # updated_at far outside the 30-day protection window — a stable, un-rebaked
-    # project default that nobody has touched in two months.
-    old_date = _NOW - timedelta(days=60)
-    await _add_image(db, project.id, _DIGEST_A, updated_at=old_date)
+    await _add_image(
+        db, project.id, _DIGEST_A, updated_at=_NOW - timedelta(days=1), tag="v1"
+    )
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW, tag="v2")
+
+    protected_digests: list[str] = []
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep", _PAST_NOW
+    ), patch(
+        "app.reaper_sweeps.resolve_project_default_container_image",
+        AsyncMock(return_value=f"{_FULL_REPO}@{_DIGEST_A}"),
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda _repo, digest: protected_digests.append(digest) or "inuse-tag",
+            _list_tags=lambda _repo: [],
+            _delete_tag=lambda _repo, _tag: False,
+        )
+
+    assert protected_digests == [_DIGEST_A]
+    assert result["applied"] == 1
+
+
+@pytest.mark.asyncio
+async def test_manifest_fetch_error_preserves_prior_protection_tags(db):
+    """A cached manifest error must not prune an older configured default tag."""
+    from app.compute_image_build import protection_tag_for_digest
+
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW - timedelta(days=1), tag="v1")
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW, tag="v2")
+    deleted: list[str] = []
+
+    with patch("app.reaper_sweeps._last_compute_image_gc_guard_sweep", _PAST_NOW), patch(
+        "app.reaper_sweeps.resolve_project_default_container_image", AsyncMock(return_value=None)
+    ), patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        AsyncMock(return_value={"compute": {"image": None}, "error": "GitHub unavailable"}),
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda _repo, _digest: "inuse-tag",
+            _list_tags=lambda _repo: [
+                protection_tag_for_digest(_DIGEST_A),
+                protection_tag_for_digest(_DIGEST_B),
+            ],
+            _delete_tag=lambda _repo, tag: deleted.append(tag) or True,
+        )
+
+    assert deleted == []
+    assert result["pruned"] == 0
+
+
+@pytest.mark.asyncio
+async def test_unconfigured_content_hash_tag_is_pruned_after_provenance_window(db):
+    """An unconfigured historical content-hash tag is not a standing pin."""
+    from app.compute_image_build import protection_tag_for_digest
+
+    project = await _make_project(db)
+    await _add_image(
+        db, project.id, _DIGEST_A, updated_at=_NOW - timedelta(days=90), tag="hash-a"
+    )
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW, tag="hash-b")
+
+    protected_digests: list[str] = []
+    deleted: list[str] = []
+    with patch(
+        "app.reaper_sweeps._last_compute_image_gc_guard_sweep", _PAST_NOW
+    ), patch(
+        "app.reaper_sweeps.resolve_project_default_container_image",
+        AsyncMock(return_value=f"{_FULL_REPO}@{_DIGEST_B}"),
+    ):
+        result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda _repo, digest: protected_digests.append(digest) or "inuse-tag",
+            _list_tags=lambda _repo: [protection_tag_for_digest(_DIGEST_A)],
+            _delete_tag=lambda _repo, tag: deleted.append(tag) or True,
+        )
+
+    assert protected_digests == [_DIGEST_B]
+    assert deleted == [protection_tag_for_digest(_DIGEST_A)]
+    assert result["applied"] == 1
+    assert result["pruned"] == 1
+
+
+@pytest.mark.asyncio
+async def test_superseded_digest_is_protected_only_while_referenced(db):
+    """A superseded digest survives exactly while an active/recent job needs it."""
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW - timedelta(days=60))
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW)
+    await _add_job(db, project.id, f"{_FULL_REPO}@{_DIGEST_A}")
 
     protected_digests: list[str] = []
 
@@ -630,27 +720,19 @@ async def test_old_image_row_is_protected_as_standing_pin(db):
             _delete_tag=lambda repo, tag: False,
         )
 
-    assert _DIGEST_A in protected_digests, (
-        f"Standing-pin digest {_DIGEST_A!r} was not protected; "
-        f"apply_tag was called with: {protected_digests}"
-    )
-    assert result["applied"] == 1
+    assert set(protected_digests) == {_DIGEST_A, _DIGEST_B}
+    assert result["applied"] == 2
 
 
 @pytest.mark.asyncio
-async def test_old_standing_pin_tag_is_not_pruned(db):
-    """An old standing-pin's existing ``inuse-`` tag must NOT be pruned.
-
-    Regression: the pruner deletes any ``inuse-`` tag whose digest is not in the
-    protected set. Before every ProjectComputeImage.digest became protection-
-    eligible, an aged row's own live protection tag was pruned — actively
-    UNprotecting a digest the DB still pins. It must now survive.
-    """
+async def test_expired_unreferenced_superseded_tag_is_pruned(db):
+    """An old superseded digest loses its inuse tag after the provenance window."""
     from app.compute_image_build import protection_tag_for_digest
 
     project = await _make_project(db)
     old_date = _NOW - timedelta(days=90)
     await _add_image(db, project.id, _DIGEST_A, updated_at=old_date)
+    await _add_image(db, project.id, _DIGEST_B, updated_at=_NOW)
 
     current_tag = protection_tag_for_digest(_DIGEST_A)
     deleted: list[str] = []
@@ -667,11 +749,8 @@ async def test_old_standing_pin_tag_is_not_pruned(db):
             _delete_tag=lambda repo, tag: deleted.append(tag) or True,
         )
 
-    assert current_tag not in deleted, (
-        f"standing-pin tag {current_tag!r} for an aged ProjectComputeImage was "
-        f"pruned (deleted={deleted}) — the digest is still DB-pinned"
-    )
-    assert result["pruned"] == 0
+    assert deleted == [current_tag]
+    assert result["pruned"] == 1
 
 
 # ── No-image baseline ─────────────────────────────────────────────────────────
@@ -879,50 +958,30 @@ def test_split_pinned_ref_parses_repo_and_digest():
     assert _split_pinned_ref(f"{_FULL_REPO}@notadigest") is None
 
 
-# ── Row-cap must not silently drop recent digests ─────────────────────────────
-#
-# The image query is capped at ``max_images`` rows. WITHOUT an ORDER BY, a
-# project with more rows than the cap drops an arbitrary subset — and if a
-# recently-rebuilt digest falls off, its ``inuse-`` protection tag is (actively)
-# pruned and the digest becomes GC-able out from under the project default that
-# still points at it. Ordering by ``updated_at`` DESC keeps the recent set.
+# ── Candidate pagination must not silently omit current images ────────────────
 
 
 @pytest.mark.asyncio
-async def test_recent_digests_protected_when_image_rows_exceed_cap(db):
-    """With >max_images image rows, the RECENT digests must still be protected.
-
-    Insertion order is adversarial: the 505 OLD rows are written FIRST (lowest
-    rowids) and the 5 RECENT rows LAST, so an unordered ``LIMIT 500`` returns the
-    old rows and drops the recent ones — precisely the GC trap. Only an
-    ``ORDER BY updated_at DESC`` keeps the recent digests inside the cap and
-    protects them.
-    """
+async def test_current_digests_are_complete_beyond_page_size(db):
+    """``max_images`` bounds a page, never the set of current-image candidates."""
     project = await _make_project(db)
-    old_date = _NOW - timedelta(days=60)  # outside the ~30-day protection window
-    old_count = 505  # exceeds the default max_images=500 cap on its own
-    recent_digests = [f"sha256:{900000 + i:064x}" for i in range(5)]
+    current_digests = [f"sha256:{900000 + i:064x}" for i in range(5)]
 
-    def _row(digest: str, updated_at: datetime) -> ProjectComputeImage:
+    def _row(index: int, digest: str) -> ProjectComputeImage:
         return ProjectComputeImage(
             project_id=project.id,
-            image_name=_IMAGE_NAME,
+            image_name=f"{_IMAGE_NAME}-{index}",
             registry_repo=_REGISTRY_REPO,
             dep_hash=uuid.uuid4().hex,
             tag="latest",
             pinned_ref=f"{_REGISTRY_REPO}/{_IMAGE_NAME}@{digest}",
             digest=digest,
             built=True,
-            updated_at=updated_at,
+            updated_at=_NOW - timedelta(seconds=index),
         )
 
-    # OLD rows first (fill the cap), committed before the RECENT rows so the
-    # recent rows get the highest rowids — an unordered LIMIT would drop them.
-    for i in range(old_count):
-        db.add(_row(f"sha256:{i:064x}", old_date))
-    await db.commit()
-    for digest in recent_digests:
-        db.add(_row(digest, _NOW))
+    for index, digest in enumerate(current_digests):
+        db.add(_row(index, digest))
     await db.commit()
 
     protected: list[str] = []
@@ -937,20 +996,11 @@ async def test_recent_digests_protected_when_image_rows_exceed_cap(db):
             _apply_tag=lambda repo, digest: protected.append(digest) or "inuse-tag",
             _list_tags=lambda repo: [],
             _delete_tag=lambda repo, tag: False,
+            max_images=2,
         )
 
-    missing = [d for d in recent_digests if d not in protected]
-    assert not missing, (
-        f"{len(missing)} of {len(recent_digests)} recently-rebuilt digests beyond "
-        f"the 500-row cap lost protection (e.g. {missing[:2]}): the image query "
-        "dropped them instead of ORDER BY updated_at DESC keeping the recent set — "
-        "a GC trap that would let a live project default be reclaimed"
-    )
-    # Every ProjectComputeImage row is a standing pin, so all rows that fit under
-    # the max_images=500 cap are protected; ORDER BY updated_at DESC guarantees the
-    # 5 recent digests are among the protected 500 (the specific GC trap this test
-    # guards). Applied therefore equals the cap, not just the recent count.
-    assert result["applied"] == 500
+    assert set(protected) == set(current_digests)
+    assert result["applied"] == len(current_digests)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1467,13 +1517,14 @@ async def test_sweep_only_visits_connected_repo_projects(db):
 async def test_sweep_per_project_failure_is_isolated(db):
     """One project's driver raising does not abort the sweep for the others."""
     p1 = await _make_repo_project(db, name="p1")
+    p1_id = p1.id
     await _make_repo_project(db, name="p2")
 
     seen: list = []
 
     async def _refresh(session, project, **kwargs):
         seen.append(project.name)
-        if project.id == p1.id:
+        if project.id == p1_id:
             raise RuntimeError("boom")
         return {"status": "unchanged"}
 
@@ -1660,3 +1711,119 @@ async def test_sweep_passes_progress_cb_to_driver(db):
     assert captured_kwargs.get("progress_cb") is _progress, (
         "sweep must pass progress_cb through to the driver"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Operator-visible drift alert: sweep surfaces a rebuilt image via Alert
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_creates_info_alert(db):
+    """A 'rebuilt' sweep result creates exactly one INFO alert for the project."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+    pinned = f"{_FULL_REPO}@{_DIGEST_A}"
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "rebuilt", "dep_hash": "deadbeef01234567", "pinned_ref": pinned}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["rebuilt"] == 1
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one drift alert expected after a rebuild"
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "deadbeef01234567" in alerts[0].message
+    assert _FULL_REPO in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_alert_deduped_on_second_sweep(db):
+    """A second rebuild sweep while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "rebuilt", "dep_hash": "aabbccdd", "pinned_ref": f"{_FULL_REPO}@{_DIGEST_A}"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                    Alert.dismissed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "open alert must be deduped, not duplicated on re-sweep"
+
+
+@pytest.mark.asyncio
+async def test_unchanged_creates_no_drift_alert(db):
+    """Unchanged and no_config sweep results do NOT create a drift alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.models import Alert
+
+    await _make_repo_project(db)
+
+    async def _refresh(session, project, **kwargs):
+        return {"status": "unchanged"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    alerts = (
+        (
+            await db.execute(
+                select(Alert).where(
+                    Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"

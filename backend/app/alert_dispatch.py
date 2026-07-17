@@ -1917,6 +1917,80 @@ async def _maybe_create_cost_telemetry_reconciliation_alert(
     )
 
 
+# Stable title for the per-project compute-image drift/rebuild alert. Kept
+# CONSTANT (the drifting dep_hash and pinned_ref live in the message) so a
+# project whose image is rebuilt across consecutive sweep ticks dedups to
+# exactly ONE open alert per project. Keep the title stable.
+_COMPUTE_IMAGE_DRIFT_ALERT_TITLE = (
+    "Compute image auto-rebuilt: dependency manifest changed"
+)
+
+
+async def _maybe_create_compute_image_drift_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    dep_hash: "str | None",
+    pinned_ref: "str | None",
+) -> bool:
+    """Create a deduplicated INFO alert when the hourly sweep auto-rebuilds a
+    project's baked compute image because its dependency manifest drifted.
+
+    The hourly refresh sweep logs the rebuild at INFO level only — there is no
+    operator-facing signal that a project's image changed. This surfaces the
+    event in the same Alerts banner as other pipeline health signals so the
+    operator can see which projects rebuilt and what digest they now pin.
+
+    Deduplicated on a STABLE title so a project that rebuilds on consecutive
+    sweep ticks raises exactly ONE open alert per project; the dep_hash and
+    pinned_ref live in the message so a moving metric never defeats dedup.
+    Commits its own ``Alert`` row and broadcasts ``alert_created``; caller
+    wraps best-effort so an alert failure can never abort the sweep.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.
+    """
+    title = _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    ref_label = pinned_ref or "(unknown)"
+    if len(ref_label) > 120:
+        ref_label = ref_label[:117] + "…"
+    hash_label = (dep_hash or "(unknown)")[:32]
+    message = (
+        f"The project's baked compute image was automatically rebuilt because "
+        f"its dependency manifest changed (dep_hash={hash_label}). "
+        f"New pinned ref: {ref_label}. "
+        f"Authoring agents and new compute jobs will use the updated image."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.INFO,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.INFO.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

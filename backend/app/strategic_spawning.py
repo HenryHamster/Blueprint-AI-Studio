@@ -149,6 +149,7 @@ from app.workbench_state import (
 
 from app.strategic_local_runner import (  # noqa: F401 — re-exported for callers/tests
     _RUNNER_LIVENESS_SECONDS,
+    _load_baked_image_ref,
     _load_local_runner_status,
     _agent_visible_vision,
     _local_runner_handles_task_type,
@@ -4100,6 +4101,7 @@ async def _spawn_design_doc_update(
     """
     from app.task_lifecycle import _has_active_strategic_task
 
+
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
         logger.warning(
@@ -4296,16 +4298,19 @@ async def _spawn_design_doc_update(
         coalesce_shadow_resident_turn,
     )
 
+    # Snapshot IDs before the try block so they remain accessible after rollback.
+    _project_id = project.id
+    _new_task_id = new_task.id
     try:
         async with session.begin_nested():
             await coalesce_shadow_resident_turn(
                 session,
-                project_id=project.id,
+                project_id=_project_id,
                 lane="background",
                 trigger_kind="project_change",
                 project_change_cursor={
                     "strategic_cycle_id": str(cycle_id),
-                    "phase1_task_id": str(new_task.id),
+                    "phase1_task_id": str(_new_task_id),
                 },
             )
     except ShadowResidentOwnershipError:
@@ -4313,7 +4318,7 @@ async def _spawn_design_doc_update(
         logger.warning(
             "[RESIDENT_SHADOW] Aborting legacy phase-1 spawn after Resident ownership flip "
             "(project=%s cycle=%s)",
-            project.id,
+            _project_id,
             cycle_id,
         )
         return False
@@ -4321,9 +4326,9 @@ async def _spawn_design_doc_update(
         logger.exception(
             "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
             "(cycle=%s task=%s)",
-            project.id,
+            _project_id,
             cycle_id,
-            new_task.id,
+            _new_task_id,
         )
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
@@ -7483,6 +7488,17 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    # Baked compute image ref: the most recent digest-pinned ref built for this
+    # project, so the strategist can prefer the project image over a raw NGC URI
+    # when authoring compute_experiments. Merged at the call site (not inside
+    # _load_local_runner_status) to keep that helper's return shape stable.
+    # Fail-open: any error is swallowed and the field is simply absent.
+    try:
+        _baked_ref = await _load_baked_image_ref(session, project.id)
+        if _baked_ref:
+            _local_runner_status["baked_image_ref"] = _baked_ref
+    except Exception:  # noqa: BLE001 — fail-open; baked ref is advisory
+        logger.debug("[STRATEGIC] baked image ref load failed; continuing")
     # Experiment-authoring context: the experiment LEDGER (a bounded query over
     # recent terminal compute_experiment tasks — what was already measured, at
     # what cost, with what verdict) plus one-line near-duplicate advisories for
@@ -7617,6 +7633,7 @@ async def _spawn_strategic_review(
                 if (
                     _local_runner_status.get("ever_registered")
                     or _local_runner_status.get("require_local_runner")
+                    or _local_runner_status.get("baked_image_ref")
                 )
                 else {}
             ),

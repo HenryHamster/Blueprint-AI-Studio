@@ -1589,6 +1589,33 @@ async def _commit_or_handle_duplicate_spawn(
     return True
 
 
+def _salvage_requires_browser(salvage_candidates: list[dict]) -> bool:
+    """Return whether a salvage bundle carries executable browser evidence.
+
+    Browser/viewport requirements used to be stranded inside finding prose and
+    ``related_files``. The runner dispatcher cannot safely infer capabilities
+    from prose, so surface a stable payload contract while the rich finding data
+    is still available. The path check covers the canonical viewport-test seam;
+    explicit acceptance-evidence kinds cover future producers without that suffix.
+    """
+
+    for finding in salvage_candidates:
+        related_files = finding.get("related_files") or []
+        for related in related_files:
+            path = related.get("path") if isinstance(related, dict) else related
+            if isinstance(path, str) and ".viewport." in path.lower():
+                return True
+
+        evidence = finding.get("acceptance_evidence")
+        if isinstance(evidence, dict):
+            kind = str(evidence.get("kind") or "").strip().lower()
+            if kind in {
+                "browser", "playwright", "screenshot", "viewport", "visual"
+            }:
+                return True
+    return False
+
+
 def _build_salvage_payload(
     salvage_candidates: list[dict],
     source_task_id: uuid.UUID | str,
@@ -1601,6 +1628,7 @@ def _build_salvage_payload(
     return {
         "type": "salvage_bundle",
         "source_task_id": str(source_task_id),
+        "requires_browser": _salvage_requires_browser(salvage_candidates),
         "salvaged_findings": [
             {
                 "title": f.get("title") or (f.get("description") or "")[:80],

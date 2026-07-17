@@ -11,6 +11,7 @@ from app.field_encryption import (
     encrypt_field,
     decrypt_field,
     is_encryption_active,
+    require_encryption_active,
     ENCRYPTION_KEY_ENV,
     ALLOW_PLAINTEXT_CREDENTIALS_ENV,
 )
@@ -231,6 +232,55 @@ class TestMaxPlanAccountFieldEncryption:
         assert result == legacy_ref
 
 
+class TestUnexpectedDecryptionErrorPropagates:
+    """Errors outside (InvalidToken, ValueError, TypeError) must propagate."""
+
+    def test_unexpected_exception_propagates(self, monkeypatch):
+        """An AttributeError from f.decrypt() propagates instead of being swallowed."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = AttributeError("library API changed")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            with pytest.raises(AttributeError, match="library API changed"):
+                decrypt_field("some_value")
+
+    def test_value_error_returns_unchanged(self, monkeypatch):
+        """A ValueError from encoding is caught and returns the value as-is."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = ValueError("bad encoding")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            result = decrypt_field("some_value")
+            assert result == "some_value"
+
+    def test_type_error_returns_unchanged(self, monkeypatch):
+        """A TypeError is caught and returns the value as-is."""
+        from unittest.mock import MagicMock, patch
+        from cryptography.fernet import Fernet as _Fernet
+
+        key = _Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+
+        mock_fernet = MagicMock()
+        mock_fernet.decrypt.side_effect = TypeError("unexpected type")
+
+        with patch("app.field_encryption._get_fernet", return_value=mock_fernet):
+            result = decrypt_field("some_value")
+            assert result == "some_value"
+
+
 class TestIsEncryptionActive:
     """is_encryption_active reports whether encryption is properly configured."""
 
@@ -249,3 +299,60 @@ class TestIsEncryptionActive:
         """is_encryption_active returns False when the key is not valid Fernet."""
         monkeypatch.setenv(ENCRYPTION_KEY_ENV, "not-a-valid-fernet-key")
         assert is_encryption_active() is False
+
+
+class TestRequireEncryptionActive:
+    """require_encryption_active fails closed on malformed/absent keys."""
+
+    def test_backfill_fails_closed_when_encryption_expected_but_inactive(
+        self, monkeypatch
+    ):
+        """RuntimeError when key is set-but-malformed, even with ALLOW_PLAINTEXT_CREDENTIALS.
+
+        This is the canonical acceptance case: a mis-keyed environment must never
+        silently stamp a backfill migration as complete while credentials remain plaintext.
+        """
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, "not-a-valid-fernet-key")
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
+        with pytest.raises(RuntimeError, match=ENCRYPTION_KEY_ENV):
+            require_encryption_active("test context")
+
+    def test_raises_on_malformed_key_without_plaintext_opt_in(self, monkeypatch):
+        """RuntimeError when key is malformed and ALLOW_PLAINTEXT_CREDENTIALS is absent."""
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, "bad-key")
+        monkeypatch.delenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, raising=False)
+        with pytest.raises(RuntimeError, match=ENCRYPTION_KEY_ENV):
+            require_encryption_active("migration 0531")
+
+    def test_raises_on_absent_key_without_plaintext_opt_in(self, monkeypatch):
+        """RuntimeError when key is absent and ALLOW_PLAINTEXT_CREDENTIALS is not set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.delenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, raising=False)
+        with pytest.raises(RuntimeError, match=ENCRYPTION_KEY_ENV):
+            require_encryption_active("migration 0621")
+
+    def test_passes_when_key_is_absent_and_plaintext_opted_in(self, monkeypatch):
+        """No error in dev mode: key absent, ALLOW_PLAINTEXT_CREDENTIALS set."""
+        monkeypatch.delenv(ENCRYPTION_KEY_ENV, raising=False)
+        monkeypatch.setenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, "true")
+        require_encryption_active("dev context")  # must not raise
+
+    def test_passes_when_key_is_valid(self, monkeypatch):
+        """No error when a valid Fernet key is configured."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, key)
+        monkeypatch.delenv(ALLOW_PLAINTEXT_CREDENTIALS_ENV, raising=False)
+        require_encryption_active("migration check")  # must not raise
+
+    def test_error_message_names_encryption_key_env(self, monkeypatch):
+        """Error message includes GITHUB_PAT_ENCRYPTION_KEY for operator guidance."""
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, "malformed")
+        with pytest.raises(RuntimeError) as exc_info:
+            require_encryption_active("Migration 0531")
+        assert ENCRYPTION_KEY_ENV in str(exc_info.value)
+
+    def test_context_string_is_included_in_error(self, monkeypatch):
+        """The context argument appears in the RuntimeError message."""
+        monkeypatch.setenv(ENCRYPTION_KEY_ENV, "malformed")
+        with pytest.raises(RuntimeError, match="Migration 0531"):
+            require_encryption_active("Migration 0531")

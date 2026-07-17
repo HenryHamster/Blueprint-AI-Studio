@@ -143,3 +143,127 @@ def test_sanitize_returns_none_for_non_dict():
     assert sanitize_env_preflight_artifact(None) is None
     assert sanitize_env_preflight_artifact("x") is None
     assert sanitize_env_preflight_artifact([1, 2]) is None
+
+
+# --------------------------------------------------------------------------- #
+# build_env_preflight_from_source — source-string entry point
+# --------------------------------------------------------------------------- #
+_REQUIRED_RUNTIME_SOURCE = """\
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"
+
+
+@dataclass(frozen=True)
+class EnvRequirement:
+    name: str
+    scope: str
+    presence_only: bool = True
+    reason: str = ""
+
+
+REQUIRED_RUNTIME_ENV: list[EnvRequirement] = [
+    EnvRequirement(name=ENCRYPTION_KEY_ENV, scope="cloud_run", reason="x"),
+    EnvRequirement(name="ALWAYS_VAR", scope="always", reason="y"),
+]
+"""
+
+_SMOKETEST_YAML_SOURCE = """\
+suites:
+  startup:
+    commands:
+      - "python3 -c \\"import app.main\\""
+      - "python3 -c \\"import app.github\\""
+"""
+
+
+def test_build_from_source_emits_exact_shape():
+    """build_env_preflight_from_source with a valid Python source yields the
+    same pure-content shape as build_env_preflight_evidence()."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source=_REQUIRED_RUNTIME_SOURCE,
+        smoketest_yaml_source=_SMOKETEST_YAML_SOURCE,
+    )
+    assert art is not None
+    assert set(art.keys()) == {"required_env", "startup_check_names", "manifest_source"}
+    assert art["manifest_source"] == "backend/app/required_runtime_env.py"
+
+
+def test_build_from_source_required_env_names_and_scope_only():
+    """Entries carry only name + scope — never a value or reason."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source=_REQUIRED_RUNTIME_SOURCE,
+    )
+    assert art is not None
+    assert {"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"} in art["required_env"]
+    assert {"name": "ALWAYS_VAR", "scope": "always"} in art["required_env"]
+    for entry in art["required_env"]:
+        assert set(entry.keys()) == {"name", "scope"}
+
+
+def test_build_from_source_startup_check_names():
+    """Startup check names are parsed from the optional smoketest YAML source."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source=_REQUIRED_RUNTIME_SOURCE,
+        smoketest_yaml_source=_SMOKETEST_YAML_SOURCE,
+    )
+    assert art is not None
+    assert art["startup_check_names"] == [
+        'python3 -c "import app.main"',
+        'python3 -c "import app.github"',
+    ]
+
+
+def test_build_from_source_returns_none_for_none_source():
+    """None source produces None (evidence unavailable)."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    assert build_env_preflight_from_source(None) is None
+    assert build_env_preflight_from_source(None, smoketest_yaml_source="a: b") is None
+
+
+def test_build_from_source_malformed_source_graceful():
+    """A syntactically invalid required_runtime_env source returns [] (empty
+    required_env) — the evidence builder degrades gracefully."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source="this is not valid python {{{",
+    )
+    assert art is not None
+    assert art["required_env"] == []
+    assert isinstance(art["startup_check_names"], list)
+    assert art["manifest_source"] == "backend/app/required_runtime_env.py"
+
+
+def test_build_from_source_missing_required_env_constant():
+    """Source without a REQUIRED_RUNTIME_ENV constant yields an empty list."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source="x = 1\\ny = 2",
+    )
+    assert art is not None
+    assert art["required_env"] == []
+
+
+def test_build_from_source_default_yaml_fallback():
+    """When smoketest_yaml_source is None and the file exists on disk, the
+    function falls back to the real smoketest.yaml (same as
+    build_env_preflight_evidence)."""
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    art = build_env_preflight_from_source(
+        required_runtime_env_py_source=_REQUIRED_RUNTIME_SOURCE,
+    )
+    assert art is not None
+    # The default smoketest.yaml on disk has startup commands referencing app.main.
+    assert any("app.main" in cmd for cmd in art["startup_check_names"])

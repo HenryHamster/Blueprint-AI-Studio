@@ -42,6 +42,7 @@ class _OpenPRLookup:
     outcome: str
     pr: dict | None = None
     retry_after: int | None = None
+    matches: list[dict] | None = None
 
 
 # ── Rate-limit / body-parse primitives ───────────────────────────────────────
@@ -282,7 +283,7 @@ async def _find_open_pull_request(
             )
             return _OpenPRLookup("uncertain")
         if items:
-            return _OpenPRLookup("found", pr=items[0])
+            return _OpenPRLookup("found", pr=items[0], matches=items)
         return _OpenPRLookup("none")
 
     # Non-200: rate-limited (real GitHub 403/429 or the local short-circuit's
@@ -295,6 +296,60 @@ async def _find_open_pull_request(
         + (f"; retry-after {retry_after}s" if retry_after else "")
     )
     return _OpenPRLookup("uncertain", retry_after=retry_after)
+
+
+async def get_open_pull_request_for_head_branch(
+    token: str,
+    owner: str,
+    repo: str,
+    head: str,
+    base: str,
+    project_id: str | None = None,
+) -> dict | None:
+    """Return the unique confirmed open PR for the head/base pair.
+
+    None means GitHub confirmed that no open PR exists. An unavailable
+    lookup, or multiple matches for a supposedly unique head/base pair, raises
+    503 instead of collapsing to a guess. Lifecycle callers must retry rather
+    than falsely terminalizing or rebinding a task.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    lookup = await _find_open_pull_request(
+        headers,
+        owner,
+        repo,
+        head,
+        base,
+        project_id,
+    )
+    if lookup.outcome == "found":
+        matches = lookup.matches or ([lookup.pr] if lookup.pr else [])
+        if len(matches) == 1:
+            return matches[0]
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Found {len(matches)} open pull requests for {head} -> {base}; "
+                "refusing ambiguous lifecycle rebinding"
+            ),
+        )
+    if lookup.outcome == "uncertain":
+        headers_out = {}
+        if lookup.retry_after is not None:
+            headers_out["Retry-After"] = str(lookup.retry_after)
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Could not confirm whether an open pull request exists for "
+                f"{head} -> {base}; retry before changing lifecycle state"
+            ),
+            headers=headers_out or None,
+        )
+    return None
 
 
 async def create_pull_request(

@@ -191,10 +191,12 @@ NEEDS_ACTION_MESSAGE_TYPES: frozenset[str] = frozenset(
     {MessageType.QUESTION.value, MessageType.BLOCKER.value}
 )
 
-# Conversational-era message types that age out under stale-open decay. NOTE,
-# FEEDBACK, and unanswered QUESTION items carry no live operator obligation once
-# sufficiently stale; BLOCKER is excluded (requires human resolution), and
-# BUG_REPORT is owned by the bug-class convergence sweeps (never decayed).
+# Conversational-era message types that age out under stale-open decay. NOTE
+# and FEEDBACK decay after STALE_OPEN_DECAY_DAYS (14d, 'auto-decayed (stale)').
+# Unanswered QUESTION items use a longer window (STALE_QUESTION_DECAY_DAYS, 30d)
+# and receive the resolution 'stale_unanswered' so operators can distinguish
+# auto-resolved from genuinely-answered questions. BLOCKER is excluded (requires
+# human resolution), and BUG_REPORT is owned by the bug-class convergence sweeps.
 CONVERSATIONAL_DECAY_MESSAGE_TYPES: frozenset[str] = frozenset(
     {MessageType.NOTE.value, MessageType.FEEDBACK.value, MessageType.QUESTION.value}
 )

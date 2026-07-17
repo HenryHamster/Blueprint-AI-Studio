@@ -14,9 +14,10 @@ from fastapi import HTTPException
 from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlmodel import select
 
 from app.database import resolve_dialect_name
+from sqlmodel import select
+
 from app.models import (
     MESSAGE_CONTENT_MAX,
     MessageHandlingState,

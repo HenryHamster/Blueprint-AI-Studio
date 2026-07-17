@@ -62,6 +62,10 @@ interface UseResidentConversationOptions {
   actorUserId: string | null;
   includeMessageId: string | null;
   realtimeRefreshSignal?: number;
+  /** Increments when the strategic-state poll completes with new data.
+   *  When set, the conversation refresh piggybacks on the strategic-state
+   *  poll cadence instead of running its own independent timer. */
+  strategicPollEpoch?: number;
   getMessages: () => ProjectMessage[];
   setMessages: Dispatch<SetStateAction<ProjectMessage[]>>;
   onLoadingChange: (loading: boolean) => void;
@@ -75,6 +79,7 @@ export function useResidentConversation({
   actorUserId,
   includeMessageId,
   realtimeRefreshSignal,
+  strategicPollEpoch,
   getMessages,
   setMessages,
   onLoadingChange,
@@ -230,6 +235,16 @@ export function useResidentConversation({
     const timer = window.setTimeout(() => { void refresh(true); }, 100);
     return () => window.clearTimeout(timer);
   }, [enabled, realtimeRefreshSignal, refresh]);
+
+  // When the strategic-state poll delivers new data, piggyback a conversation
+  // refresh on it instead of running an independent timer. This eliminates the
+  // duplicate strategic-state assembly request that the legacy independent poll
+  // would trigger on the backend (the conversation handler re-assembles state).
+  useEffect(() => {
+    if (!enabled || strategicPollEpoch == null || strategicPollEpoch === 0) return;
+    const timer = window.setTimeout(() => { void refresh(true); }, 100);
+    return () => window.clearTimeout(timer);
+  }, [enabled, strategicPollEpoch, refresh]);
 
   return { refresh, loadOlder, hasMore, loadingOlder };
 }

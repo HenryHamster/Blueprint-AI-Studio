@@ -134,4 +134,29 @@ describe('useMessageList', () => {
     // FEEDBACK is not critical severity; only BLOCKER survives the open filter
     expect(res.openMessages.map(m => m.id)).toEqual(['b']);
   });
+
+  it('promotes needs_operator attention item to high-signal even when event_type is muted', () => {
+    // failure_alert is high-signal by default; muting it demotes it to routine
+    const alert = makeMsg({
+      id: 'fa1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      context: { event_type: 'failure_alert' },
+    });
+    const eventPrefs = { failure_alert: 'mute' as const };
+    // Without needsOperatorIds the muted item goes to routine, not high-signal
+    const withoutAttention = run({ messages: [alert], eventPrefs });
+    expect(withoutAttention.highSignalOpen.map(m => m.id)).toEqual([]);
+    expect(withoutAttention.routineOpen.map(m => m.id)).toEqual([]);
+
+    // With the canonical attention model marking it needs_operator, it is
+    // promoted to highSignalOpen and excluded from routineOpen.
+    const withAttention = run({
+      messages: [alert],
+      eventPrefs,
+      needsOperatorIds: new Set(['fa1']),
+    });
+    expect(withAttention.highSignalOpen.map(m => m.id)).toEqual(['fa1']);
+    expect(withAttention.routineOpen.map(m => m.id)).toEqual([]);
+  });
 });

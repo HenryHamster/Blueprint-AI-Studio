@@ -864,6 +864,7 @@ async def _process_direction_lifecycle_locked(
         session.add(
             Alert(
                 project_id=project.id,
+                event_type="research.direction_auto_completed",
                 severity=AlertSeverity.INFO,
                 title="Direction auto-retired (lifetime burn)",
                 message=(
@@ -953,6 +954,7 @@ async def _process_direction_lifecycle_locked(
             session.add(
                 Alert(
                     project_id=project.id,
+                    event_type="research.direction_auto_completed",
                     severity=AlertSeverity.INFO,
                     title="Direction auto-retired (outcome scaffolding)",
                     message=(
@@ -1044,6 +1046,7 @@ async def _process_direction_lifecycle_locked(
             session.add(
                 Alert(
                     project_id=project.id,
+                    event_type="research.escalation_delivery_failed",
                     severity=AlertSeverity.ERROR,
                     title="Escalation notification delivery failed",
                     message=(
@@ -1318,6 +1321,7 @@ async def _process_direction_lifecycle_locked(
                 session.add(
                     Alert(
                         project_id=project.id,
+                        event_type="research.diagnosis_stalled",
                         severity=AlertSeverity.WARNING,
                         title="Direction diagnosis stalled",
                         message=(
@@ -1750,6 +1754,7 @@ async def _process_direction_lifecycle_locked(
                 session.add(
                     Alert(
                         project_id=project.id,
+                        event_type="research.churn_retirement_recommended",
                         severity=AlertSeverity.INFO,
                         title="Direction churn-retirement recommended",
                         message=(
@@ -1814,6 +1819,7 @@ async def _process_direction_lifecycle_locked(
 
                 alert = Alert(
                     project_id=project.id,
+                    event_type="research.direction_auto_completed",
                     severity=AlertSeverity.INFO,
                     title="Direction auto-retired",
                     message=(

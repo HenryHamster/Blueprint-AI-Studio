@@ -741,6 +741,41 @@ export function NewTaskModal({
                   <p className="text-ui-sm text-amber-500 mt-1">Job will stay queued until this runner is online — it will not fall back to another runner or cloud.</p>
                 )}
               </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Setup Step <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional — runs before main command)</span></label>
+                <input
+                  type="text"
+                  value={computeExperiment.setupStep}
+                  onChange={e => updateCompute('setupStep', e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  placeholder="e.g., pip install -r requirements.txt"
+                />
+                <p className="text-ui-sm text-neutral-600 mt-1">Executed as <code className="font-mono">bash -lc &lt;setup_step&gt;</code> after repo clone; non-zero exit fails the job.</p>
+              </div>
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">No-Progress Timeout <span className="text-neutral-600 normal-case font-normal tracking-normal">(seconds, optional)</span></label>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={computeExperiment.noProgressTimeoutSeconds}
+                    onChange={e => updateCompute('noProgressTimeoutSeconds', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="e.g., 1800"
+                  />
+                </div>
+                <div>
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Checkpoint Resume Job ID <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                  <input
+                    type="text"
+                    value={computeExperiment.inputArtifactJobId}
+                    onChange={e => updateCompute('inputArtifactJobId', e.target.value)}
+                    className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                    placeholder="prior compute job UUID"
+                  />
+                </div>
+              </div>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Spend Cap (USD)</label>

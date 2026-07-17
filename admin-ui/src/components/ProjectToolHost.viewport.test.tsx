@@ -413,7 +413,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     expect(host.textContent).toContain('Show hidden');
 
     // Persisted to localStorage keyed by projectId.
-    expect(localStorage.getItem(`blueprint:projectTools:hidden:${projectId}`)).toContain('durable-viewer');
+    expect(localStorage.getItem(`project_tools_hidden:${projectId}`)).toContain('durable-viewer');
 
     // Simulate a reload: unmount and remount the same project — the tool stays hidden.
     act(() => { r.unmount(); });
@@ -433,7 +433,7 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     await act(async () => { showBtn!.click(); });
     expect(host.textContent).toContain('Durable Viewer');
 
-    localStorage.removeItem(`blueprint:projectTools:hidden:${projectId}`);
+    localStorage.removeItem(`project_tools_hidden:${projectId}`);
   });
 
   test('renders manifest and registered tools without overflow at 1440px', async () => {

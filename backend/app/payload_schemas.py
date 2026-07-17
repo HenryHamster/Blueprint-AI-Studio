@@ -98,11 +98,38 @@ class BasePayload(BaseModel):
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
     prompt_suffix: str | None = None
     title: str | None = None
+    requires_browser: bool = Field(
+        default=False,
+        description=(
+            "Route this task only to execution environments that explicitly prove "
+            "browser automation support. Local runners with absent or false proof "
+            "are ineligible and the task falls through to cloud dispatch."
+        ),
+    )
+    required_diff_paths: list[str] | None = Field(
+        default=None,
+        description=(
+            "Repo-relative paths the merged PR diff MUST touch. "
+            "When declared, a PR whose diff omits any listed path fails "
+            "completion with an actionable error naming the missing paths. "
+            "Undeclared (None) tasks are unaffected."
+        ),
+    )
 
     @field_validator("base_branch")
     @classmethod
     def _check_base_branch(cls, v: str | None) -> str | None:
         return _validate_branch_name(v)
+
+    @field_validator("required_diff_paths")
+    @classmethod
+    def _check_required_diff_paths(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        cleaned = [p.strip() for p in v if isinstance(p, str) and p.strip()]
+        if not cleaned:
+            return None
+        return cleaned
 
 
 # ---------------------------------------------------------------------------

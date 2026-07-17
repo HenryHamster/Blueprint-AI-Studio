@@ -27,7 +27,6 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check-x")
 os.environ.setdefault("WS_TICKET_SECRET", "test-ws-secret-for-invariant-check")
 
-
 def _assert_backmerge_modules_do_not_import_rollup_management(
     source: str, *, filename: str
 ) -> None:
@@ -64,7 +63,6 @@ def _assert_backmerge_modules_do_not_import_rollup_management(
         "clear justification."
     )
 
-
 def _ast_called_name(call: ast.Call) -> str | None:
     func = call.func
     if isinstance(func, ast.Name):
@@ -73,10 +71,8 @@ def _ast_called_name(call: ast.Call) -> str | None:
         return func.attr
     return None
 
-
 def _ast_refs_names(node: ast.AST, names: set[str]) -> bool:
     return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
-
 
 def _ast_assign_targets_for_predicated_call(
     stmt: ast.stmt,
@@ -103,12 +99,10 @@ def _ast_assign_targets_for_predicated_call(
                 names.add(n.id)
     return names
 
-
 def _ast_branch_early_exits(stmts: list[ast.stmt]) -> bool:
     return any(
         isinstance(s, (ast.Return, ast.Raise, ast.Continue, ast.Break)) for s in stmts
     )
-
 
 def _ast_branch_implies_verdict(
     node: ast.AST,
@@ -223,7 +217,6 @@ def _ast_branch_implies_verdict(
 
     return False
 
-
 def _ast_branch_implies_named_str_compare(
     node: ast.AST,
     *,
@@ -285,7 +278,6 @@ def _ast_branch_implies_named_str_compare(
 
     return False
 
-
 def _collect_dependency_callables(
     dependant, visited: set[int] | None = None
 ) -> set[object]:
@@ -304,7 +296,6 @@ def _collect_dependency_callables(
         found.update(_collect_dependency_callables(dep, visited))
     return found
 
-
 def _is_admin_surface_route(route) -> bool:
     """True for live admin-surface routes and the mixed admin_agent_ops siblings."""
     from app.routers.admin_agent_ops import ADMIN_AGENT_OPS_MODULE
@@ -313,7 +304,6 @@ def _is_admin_surface_route(route) -> bool:
     return (
         route.path.startswith("/api/admin") or endpoint_module == ADMIN_AGENT_OPS_MODULE
     )
-
 
 def test_progression_never_gates_on_criterion_coverage():
     """Version/direction PROGRESSION must never consult a per-criterion signal.
@@ -369,7 +359,6 @@ def test_progression_never_gates_on_criterion_coverage():
         "a version or retiring a direction. A pre-qualification coverage gate is "
         "what deadlocked v25. Violations:\n  " + "\n  ".join(violations)
     )
-
 
 def test_all_admin_routes_require_auth():
     """Every admin-surface route must resolve an auth dependency somewhere."""
@@ -457,7 +446,6 @@ def test_all_admin_routes_require_auth():
         "with a reviewed justification."
     )
 
-
 def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatch):
     """get_metrics_reader is only valid on the narrow read-only metrics route."""
     config_cache: dict | None = None
@@ -537,7 +525,6 @@ def test_get_metrics_reader_routes_are_explicit_read_only_allowlisted(monkeypatc
     assert cfg["api_key"] == "agent-jwt-token"
     assert cfg["read_only"] is True
 
-
 def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
     """Routes using get_metrics_reader must stay on the narrow GET allowlist."""
     from fastapi.routing import APIRoute
@@ -571,9 +558,7 @@ def test_get_metrics_reader_routes_are_get_only_and_allowlisted():
         )
     )
 
-
 # ── Cross-cutting test file registry ────────────────────────────────────────
-
 
 def test_cross_cutting_test_files_registry_is_current():
     """Verify ``_CROSS_CUTTING_TEST_FILES`` in acceptance_gate.py is current.
@@ -638,9 +623,7 @@ def test_cross_cutting_test_files_registry_is_current():
             "the frozenset to prevent false-negative acceptance verdicts"
         )
 
-
 # ── Safety Constants ────────────────────────────────────────────────────────
-
 
 class TestSafetyConstants:
     def test_max_review_fix_iterations(self):
@@ -690,9 +673,7 @@ class TestSafetyConstants:
             "provision slot limit must be >= concurrent VM limit to avoid dispatch deadlock."
         )
 
-
 # ── Schema Revision Sync ───────────────────────────────────────────────────
-
 
 # CREATE/DROP [UNIQUE] INDEX ... CONCURRENTLY in a raw SQL string. Postgres
 # forbids CONCURRENTLY inside a transaction block, so a migration issuing it
@@ -702,7 +683,6 @@ _CONCURRENTLY_DDL_RE = re.compile(
     r"\b(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY\b",
     re.IGNORECASE,
 )
-
 
 def _ast_literal_text(node: ast.AST) -> str:
     """Return the static text of a string literal node.
@@ -722,7 +702,6 @@ def _ast_literal_text(node: ast.AST) -> str:
             if isinstance(part, ast.Constant) and isinstance(part.value, str)
         )
     return ""
-
 
 def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]:
     """Return violation strings for migration source that issues CONCURRENTLY
@@ -813,13 +792,38 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
                 current = parents.get(current)
             return False
 
+        # Collect line ranges of autocommit_block() with-statements: any
+        # CONCURRENTLY inside op.get_context().autocommit_block() already
+        # escapes the per-migration transaction and must not be flagged.
+        autocommit_ranges: list[tuple[int, int]] = []
+        for node in ast.walk(func):
+            if (
+                isinstance(node, ast.With)
+                and node.items
+                and isinstance(node.items[0].context_expr, ast.Call)
+            ):
+                ctx = node.items[0].context_expr
+                if (
+                    isinstance(ctx.func, ast.Attribute)
+                    and ctx.func.attr == "autocommit_block"
+                ):
+                    # Record start/end lines of this with-block.
+                    body_end = max(
+                        (getattr(n, "end_lineno", node.lineno) for n in ast.walk(node)),
+                        default=node.lineno,
+                    )
+                    autocommit_ranges.append((node.lineno, body_end))
+
+        def _in_autocommit_block(lineno: int) -> bool:
+            return any(start <= lineno <= end for start, end in autocommit_ranges)
+
         for node in ast.walk(func):
             if not isinstance(node, ast.Call) or not isinstance(
                 node.func, ast.Attribute
             ):
                 continue
-            attr = node.func.attr
             pos = (node.lineno, node.col_offset)
+            attr = node.func.attr
 
             if attr == "execute" and node.args:
                 text = _ast_literal_text(node.args[0])
@@ -864,7 +868,6 @@ def _concurrently_txn_escape_violations(source: str, revision: str) -> list[str]
             )
 
     return violations
-
 
 class TestSchemaRevisionSync:
     def test_expected_revision_matches_latest_migration(self):
@@ -1600,6 +1603,7 @@ class TestSchemaRevisionSync:
                 migration_columns.add((m.group(1), m.group(3)))
 
             # create_table('table', sa.Column('name', ...), ...)
+            # group 1 = string literal, group 2 = bare constant (_TABLE_CONST)
             for ct in create_table_re.finditer(content):
                 table = ct.group(1) or consts.get(ct.group(2) or "", "")
                 if not table:
@@ -2230,12 +2234,11 @@ class TestSchemaRevisionSync:
             + "\n  ".join(sorted(violations))
             + "\n\nInside the `if bind.dialect.name == \"postgresql\":` branch, "
             'emit `op.execute("COMMIT")` BEFORE the first CREATE/DROP INDEX '
-            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern)."
+            "CONCURRENTLY statement (see alembic 0489 / 0450 for the pattern), "
+            "or wrap the CONCURRENTLY DDL in `with op.get_context().autocommit_block():`."
         )
 
-
 # ── Chain-invariant detector self-certification (seeded bad fixtures) ────────
-
 
 class TestChainInvariantSeedFixtures:
     """Negative-coverage: prove each chain-invariant detector fires on seeded bad fixtures.
@@ -2471,6 +2474,18 @@ class TestChainInvariantSeedFixtures:
             "detector wrongly flagged a docstring/comment-only CONCURRENTLY mention"
         )
 
+        # GOOD 3: autocommit_block() context manager precedes the CONCURRENTLY DDL.
+        good_autocommit = (
+            "from alembic import op\n"
+            "def downgrade():\n"
+            "    if op.get_bind().dialect.name == 'postgresql':\n"
+            "        with op.get_context().autocommit_block():\n"
+            "            op.execute('DROP INDEX CONCURRENTLY IF EXISTS ix_z')\n"
+        )
+        assert not _concurrently_txn_escape_violations(good_autocommit, "9006"), (
+            "detector false-positived on autocommit_block()-escaped CONCURRENTLY DDL"
+        )
+
         # BAD 4: a sibling autocommit block does not bless DDL outside its body.
         sibling_autocommit = (
             "from alembic import op\n"
@@ -2530,9 +2545,7 @@ class TestChainInvariantSeedFixtures:
             nested_commit, "9011"
         ), "detector accepted an unexecuted nested COMMIT as an escape"
 
-
 # ── Pre-merge dual-head guard coverage (whole-package) ─────────────────────
-
 
 class TestPreMergeDualHeadGuardCoverage:
     """Whole-package invariant: EVERY PR-merge site under backend/app/ that can
@@ -3534,9 +3547,7 @@ class TestPreMergeDualHeadGuardCoverage:
             "exemption inline so the coverage invariant stays green."
         )
 
-
 # ── Merge-primitive enumeration lock (complementary to call-site coverage) ────
-
 
 class TestMergePrimitiveLock:
     """Complementary invariant: lock the set of merge primitives themselves.
@@ -3891,9 +3902,7 @@ async def evade_auto_merge(token: str, pr_node_id: str):
             f"_github_request. Offenders: {offenders}"
         )
 
-
 # ── Native-auto-merge migration-exclusion coverage (whole-package) ────────
-
 
 class TestNativeAutoMergeMigrationExclusionCoverage:
     """Whole-package invariant: EVERY ``enable_auto_merge`` call site under
@@ -4323,9 +4332,7 @@ class TestNativeAutoMergeMigrationExclusionCoverage:
             "auto-merge TOCTOU window)"
         ]
 
-
 # ── Operator message arming gate coverage (whole-package) ─────────────────
-
 
 class TestOperatorMessageArmingGateCoverage:
     """Whole-package invariant: EVERY backend/app/ site that constructs an
@@ -4636,9 +4643,7 @@ class TestOperatorMessageArmingGateCoverage:
             "Offenders:\n" + "\n".join(offenders)
         )
 
-
 # ── Security Scanner Integrity ──────────────────────────────────────────────
-
 
 class TestSecurityIntegrity:
     def test_injection_pattern_count(self):
@@ -4674,9 +4679,7 @@ class TestSecurityIntegrity:
             f"Only {len(high_patterns)} high-severity patterns — expected at least 10"
         )
 
-
 # ── Dialect-resolution footgun guard ───────────────────────────────────────
-
 
 class TestNoRawBindDialectIdiom:
     """Guard against the None-bind dialect footgun (triggering incident PR #7099).
@@ -4769,7 +4772,6 @@ class TestNoRawBindDialectIdiom:
             "app.database.resolve_dialect_name(session) instead.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
-
 
 class TestNoUnguardedPostgresJsonOp:
     """Guard against PostgreSQL-only JSON *operators* emitted with no dialect branch.
@@ -4985,9 +4987,7 @@ class TestNoUnguardedPostgresJsonOp:
         )
         assert self._scan_module_text(source) == []
 
-
 # ── Base-branch fallback hardening ─────────────────────────────────────────
-
 
 class TestBaseBranchFallback:
     """Guard against hardcoded 'main' fallbacks across backend/app."""
@@ -5044,7 +5044,6 @@ class TestBaseBranchFallback:
             "Offenders:\n" + "\n".join(offenders)
         )
 
-
 class TestBranchLiteralComplianceScanner:
     def test_scanner_reports_structured_offenders_across_backend_agent_frontend(
         self, tmp_path
@@ -5086,9 +5085,7 @@ class TestBranchLiteralComplianceScanner:
         ]
         assert offenders[0].snippet == 'branch = "main"'
 
-
 # ── Self-repo branch resolution guard ──────────────────────────────────────
-
 
 class TestSelfRepoBranchResolution:
     """Ensure self-repo projects resolve to correct integration branches."""
@@ -5119,9 +5116,7 @@ class TestSelfRepoBranchResolution:
 
         assert get_project_integration_branch(_FakeProject()) == "main"
 
-
 # ── Staging-branch prefix classification guard ────────────────────────────
-
 
 class TestStagingBranchClassification:
     """Guard against hardcoded staging-prefix startswith calls in backend/app/.
@@ -5172,9 +5167,7 @@ class TestStagingBranchClassification:
             "Offenders:\n" + "\n".join(offenders)
         )
 
-
 # ── Deployment State Model ──────────────────────────────────────────────────
-
 
 class TestDeploymentStateModel:
     def test_deployment_status_values(self):
@@ -5187,9 +5180,7 @@ class TestDeploymentStateModel:
             f"DeploymentStatus values changed: expected {expected}, got {actual}"
         )
 
-
 # ── Agent Model Forward Compatibility ───────────────────────────────────────
-
 
 class TestAgentModels:
     def test_agent_models_ignore_extra(self):
@@ -5202,9 +5193,7 @@ class TestAgentModels:
                 f"{model_cls.__name__} must have extra='ignore' for forward compatibility"
             )
 
-
 # ── CLAUDE.md Agent Restrictions ────────────────────────────────────────────
-
 
 def _find_claude_md() -> str:
     """Find CLAUDE.md — either copied into Docker image root or at repo root."""
@@ -5222,9 +5211,7 @@ def _find_claude_md() -> str:
             return path
     return ""
 
-
 _CLAUDE_MD = _find_claude_md()
-
 
 class TestAgentRestrictions:
     def test_claude_md_exists(self):
@@ -5251,9 +5238,7 @@ class TestAgentRestrictions:
             "CLAUDE.md must mention alembic as a restricted path"
         )
 
-
 # ── Agent Router Task-State Cache Invariants ───────────────────────────
-
 
 class TestAgentRouterInvariants:
     def test_agent_router_only_has_deny_list_task_cache(self):
@@ -5308,9 +5293,7 @@ class TestAgentRouterInvariants:
             "authorization of deleted/terminal tasks."
         )
 
-
 # -- Direction Lifecycle Regression Guards --
-
 
 class TestDirectionLifecycleInvariants:
     def test_max_active_directions_default(self):
@@ -5396,14 +5379,12 @@ class TestDirectionLifecycleInvariants:
             "Direction cap enforcement was lost in PR #832 and must not be removed again."
         )
 
-
 # ── Module Size Guardrails ─────────────────────────────────────────────────
 # These are loose upper bounds to catch runaway growth, not tight ceilings.
 # If a file hits the limit, consider a refactor — but do NOT "ratchet down"
 # the limit after every cleanup. These limits should stay stable.
 
 _SIZE_LIMITS_JSON = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
-
 
 def _load_size_limits() -> dict:
     """Load the size-limits JSON.  Single source of truth for both backend
@@ -5414,11 +5395,9 @@ def _load_size_limits() -> dict:
     with open(_SIZE_LIMITS_JSON) as f:
         return json.load(f)
 
-
 _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
-
 
 def _size_breach_message(
     rel_path: str, count: int, limit: int, module_kind: str
@@ -5440,7 +5419,6 @@ def _size_breach_message(
         f"task asked for. Do NOT refactor or extract code in this PR — that's\n"
         f"a strategic decision, not a create/fix one."
     )
-
 
 class TestBackendModuleSizeGuardrails:
     """Loose upper bounds to catch runaway file growth.
@@ -5483,7 +5461,6 @@ class TestBackendModuleSizeGuardrails:
             "recovery_post_commit.py instead."
         )
 
-
 _AGENT_SRC_ROOT = (
     os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "..", "agent", "src")
@@ -5493,7 +5470,6 @@ _AGENT_SRC_ROOT = (
     )
     else None
 )
-
 
 class TestAgentModuleSizeGuardrails:
     @staticmethod
@@ -5521,11 +5497,9 @@ class TestAgentModuleSizeGuardrails:
         backend-only Docker build context."""
         self._check_agent(relative_path)
 
-
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
 FRONTEND_SIZE_LIMITS = _SIZE_LIMITS["frontend"]
-
 
 def _resolve_admin_ui_src_root() -> str | None:
     """Locate ``admin-ui/src`` across local + Docker test environments.
@@ -5557,9 +5531,7 @@ def _resolve_admin_ui_src_root() -> str | None:
             return candidate
     return None
 
-
 _ADMIN_UI_SRC_ROOT = _resolve_admin_ui_src_root()
-
 
 def _get_frontend_path(relative: str) -> str:
     if _ADMIN_UI_SRC_ROOT is None:
@@ -5568,7 +5540,6 @@ def _get_frontend_path(relative: str) -> str:
         # surface as a clear file-not-found error.
         return os.path.join("admin-ui-src-not-found", relative)
     return os.path.join(_ADMIN_UI_SRC_ROOT, relative)
-
 
 class TestFrontendSizeGuardrails:
     """Loose upper bounds to catch runaway frontend file growth.
@@ -5633,7 +5604,6 @@ class TestFrontendSizeGuardrails:
     def test_sr_unhandled_edges_retrospectives_panel(self):
         self._check_frontend("components/SrUnhandledEdgesRetrospectivesPanel.tsx")
 
-
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
 #
 # The per-file guardrails above only constrain files explicitly listed in
@@ -5648,7 +5618,6 @@ class TestFrontendSizeGuardrails:
 # Generous threshold: high enough to catch only genuine monoliths, not routine
 # files. Any uncapped file over this must gain an explicit, reviewed cap entry.
 _COVERAGE_THRESHOLD = 1500
-
 
 def _missing_cap_message(offenders: list, section: str) -> str:
     """Direct the author to add a cap entry for each uncapped oversized file.
@@ -5669,7 +5638,6 @@ def _missing_cap_message(offenders: list, section: str) -> str:
         f"headroom (e.g. current + 100). This is a reviewed config edit, not a\n"
         f"refactor — do NOT extract or restructure the source in this PR."
     )
-
 
 def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> list:
     """Walk ``root`` collecting (tree_relative_path, line_count) for every file
@@ -5692,16 +5660,13 @@ def _scan_uncapped(root: str, section: dict, suffixes: tuple, is_excluded) -> li
     offenders.sort(key=lambda item: item[1], reverse=True)
     return offenders
 
-
 def _is_frontend_excluded(rel_path: str) -> bool:
     return rel_path.endswith((".test.ts", ".test.tsx", ".d.ts")) or rel_path.startswith(
         "test/"
     )
 
-
 def _is_agent_excluded(rel_path: str) -> bool:
     return rel_path.endswith((".test.ts", ".d.ts"))
-
 
 class TestSizeGuardrailCoverage:
     """Meta-guardrail: no large source file may escape having a cap entry.
@@ -5752,9 +5717,7 @@ class TestSizeGuardrailCoverage:
         )
         assert not offenders, _missing_cap_message(offenders, "agent")
 
-
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
-
 
 class TestLLMTokenPricingCoverage:
     """Verify that every selectable LLM model has a pricing entry.
@@ -5798,9 +5761,7 @@ class TestLLMTokenPricingCoverage:
             "should be priced at the closest GA-tier equivalent with a clarifying comment."
         )
 
-
 # ── Failure Classification Taxonomy ────────────────────────────────────────
-
 
 class TestFailureClassificationInvariants:
     """Structural invariants over failure_classification canonical classes.
@@ -5908,7 +5869,6 @@ class TestFailureClassificationInvariants:
                 f"{cls!r} must be either CODE_ERROR or a member of INFRA_CLASSES"
             )
 
-
 # ── Prompt Vocabulary Parity ───────────────────────────────────────────────
 
 # Always-on CI mirror of the SR category bullet list in agent/src/prompt.ts
@@ -5933,7 +5893,6 @@ AGENT_SELF_REVIEW_CATEGORIES = frozenset(
         "cross-system-contract",
     }
 )
-
 
 def _resolve_prompt_ts_path() -> "str | None":
     """Locate ``agent/src/prompt.ts`` across local + Docker test environments.
@@ -5964,7 +5923,6 @@ def _resolve_prompt_ts_path() -> "str | None":
             return candidate
     return None
 
-
 def _parse_sr_categories_from_prompt(prompt_text: str) -> "frozenset[str]":
     """Extract SR category IDs from the SR_CATEGORIES_START/END sentinel region.
 
@@ -5983,7 +5941,6 @@ def _parse_sr_categories_from_prompt(prompt_text: str) -> "frozenset[str]":
     # Matches both escaped-backtick form (\`id\`, inside TS template literals)
     # and plain-backtick form (`id`, for fixture strings in tests).
     return frozenset(re.findall(r"- \\?`([^\\`]+)\\?`", region))
-
 
 def _check_sr_category_parity(
     agent_cats: "frozenset[str]", backend_cats: "frozenset[str]"
@@ -6007,7 +5964,6 @@ def _check_sr_category_parity(
             f"and to AGENT_SELF_REVIEW_CATEGORIES in backend/testing/test_invariants.py."
         )
     return messages
-
 
 class TestPromptVocabularyParity:
     """Cross-check that agent self-review categories and backend categorizer
@@ -6060,7 +6016,6 @@ class TestPromptVocabularyParity:
             + "\n".join(issues)
         )
 
-
 class TestSrCategoryParityHelper:
     """Unit tests demonstrating both failure directions of the parity helper.
 
@@ -6106,7 +6061,6 @@ class TestSrCategoryParityHelper:
         assert any("not-in-mirror" in msg for msg in issues)
         assert any("security" in msg for msg in issues)
 
-
 # ── Reviewer-origin set parity (cross-language) ───────────────────────────────
 # The agent (agent/src/handlers/standard.ts) stamps an `origin` on every
 # self-review check_results entry. The author's own entries use origin "sr" (and
@@ -6120,7 +6074,6 @@ class TestSrCategoryParityHelper:
 # Author-side origins emitted by the agent origin-tagging handlers that must be
 # EXCLUDED from the reviewer-origin set.
 AGENT_AUTHOR_ORIGINS = frozenset({"sr", "author"})
-
 
 def _resolve_origin_source_paths() -> "list[str]":
     """Locate agent handler files that stamp self-review origin tags.
@@ -6153,7 +6106,6 @@ def _resolve_origin_source_paths() -> "list[str]":
             found.append(candidate)
     return found
 
-
 def _parse_origin_literals_from_agent_handlers(source_text: str) -> "frozenset[str]":
     """Extract every ``origin`` string literal assigned in the agent handlers.
 
@@ -6162,7 +6114,6 @@ def _parse_origin_literals_from_agent_handlers(source_text: str) -> "frozenset[s
     literals so including them does not change the resulting set.
     """
     return frozenset(re.findall(r"origin\s*[:=]\s*'([^']+)'", source_text))
-
 
 class TestReviewerOriginParity:
     """Pin the backend canonical reviewer-origin set to the exact set of
@@ -6236,14 +6187,12 @@ class TestReviewerOriginParity:
             "the non-author origins emitted by the agent handlers."
         )
 
-
 # ── Playbook-Learning Facade Compatibility ────────────────────────────────────
 # After the playbook-learning split, key symbols moved to sub-modules
 # (review_learning, playbook_lifecycle, playbook_storage, playbook_auto).
 # playbook_learning re-exports them so existing callers keep working.
 # These tests lock the re-export surface so future agents cannot drop
 # compatibility symbols without a CI failure.
-
 
 # Lifecycle/storage helpers + constants whose single canonical home is
 # ``app.playbook_storage``.  The ``playbook_lifecycle`` shim and the
@@ -6275,7 +6224,6 @@ _CANONICAL_PLAYBOOK_STORAGE_NAMES = frozenset(
     }
 )
 
-
 def _module_top_level_bound_names(module_path: str) -> set[str]:
     """Return names *defined* (not imported) at module top level.
 
@@ -6304,7 +6252,6 @@ def _module_top_level_bound_names(module_path: str) -> set[str]:
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             bound.add(node.target.id)
     return bound
-
 
 class TestPlaybookLearningFacadeCompat:
     def test_review_categories_is_canonical_object(self):
@@ -6423,7 +6370,6 @@ class TestPlaybookLearningFacadeCompat:
             "Offenders:\n" + "\n".join(offenders)
         )
 
-
 # ── edges_considered Schema Invariants ────────────────────────────────────────
 # MUST stay in sync with EDGES_CONSIDERED_GUIDANCE in agent/src/prompt.ts and
 # the entry-reading code in admin_digest._compute_edges_considered_metrics /
@@ -6433,7 +6379,6 @@ class TestPlaybookLearningFacadeCompat:
 EDGES_CONSIDERED_REQUIRED_KEYS = frozenset({"case", "handled"})
 # Optional keys that may appear in an edges_considered entry.
 EDGES_CONSIDERED_OPTIONAL_KEYS = frozenset({"evidence", "blind_spot"})
-
 
 class TestEdgesConsideredInvariants:
     """Structural invariants for the edges_considered field in self-review JSON.
@@ -6783,9 +6728,7 @@ class TestEdgesConsideredInvariants:
             "unhandled-flag sub-bucket is empty (no tasks qualify)"
         )
 
-
 # ── Reviewer-Disagreement Severity Invariants ─────────────────────────────────
-
 
 class TestReviewerDisagreementSeverityInvariants:
     """Contract tests for severity-stratified reviewer-disagreement tallying.
@@ -6893,13 +6836,11 @@ class TestReviewerDisagreementSeverityInvariants:
         assert isinstance(item["severity_breakdown"], dict)
         assert item["max_severity"] == "CRITICAL"
 
-
 # ── Design-Doc Lock Invariant ─────────────────────────────────────────────────
 
 _LOCK_BASELINE_JSON = os.path.join(
     os.path.dirname(__file__), "lock_assignment_baseline.json"
 )
-
 
 def _load_lock_baseline() -> dict:
     import json
@@ -6907,9 +6848,7 @@ def _load_lock_baseline() -> dict:
     with open(_LOCK_BASELINE_JSON) as f:
         return json.load(f)
 
-
 _LOCK_BASELINE = _load_lock_baseline()
-
 
 # Files with design_doc / vision writes that intentionally do NOT (yet) acquire
 # a project-row lock. These are PRE-EXISTING lock-free read-modify-write sites
@@ -6940,7 +6879,6 @@ _LOCK_GUARD_EXEMPT: dict[str, set[str]] = {
         "routers/admin_debug.py",
     },
 }
-
 
 def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
     """Return per-file counts of AST-level attribute assignments for attr_name.
@@ -6977,7 +6915,6 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
             counts[rel] = count
     return counts
 
-
 def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
     """Check if a file contains at least one of the given lock-acquisition patterns.
 
@@ -6991,7 +6928,6 @@ def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
         return False
 
     return any(pattern in source for pattern in patterns)
-
 
 def _check_lock_invariant(attr_name: str, baseline_key: str, helper_name: str) -> None:
     """Shared implementation for all three column-lock invariant tests."""
@@ -7015,7 +6951,6 @@ def _check_lock_invariant(attr_name: str, baseline_key: str, helper_name: str) -
         "Do NOT increase counts — that widens the tripwire hole."
     )
 
-
 class TestDesignDocLockInvariant:
     """Tripwire: direct <var>.design_doc attribute assignments must not increase
     above their per-file baseline recorded in lock_assignment_baseline.json.
@@ -7036,9 +6971,7 @@ class TestDesignDocLockInvariant:
     def test_no_new_unlocked_design_doc_writes(self):
         _check_lock_invariant("design_doc", "design_doc", "with_design_doc_locked")
 
-
 # ── Directions Lock Invariant ─────────────────────────────────────────────────
-
 
 class TestDirectionsLockInvariant:
     """Tripwire: direct <var>.directions attribute assignments must not increase
@@ -7060,7 +6993,6 @@ class TestDirectionsLockInvariant:
 
     def test_no_new_unlocked_directions_writes(self):
         _check_lock_invariant("directions", "directions", "with_directions_locked")
-
 
 class TestDirectionsLockAssignmentGuard:
     """Positive ratchet: files with non-zero .directions assignments must be
@@ -7118,7 +7050,6 @@ class TestDirectionsLockAssignmentGuard:
             "lock_project_or_429 call that was accidentally removed."
         )
 
-
 class TestResearchCompletionDirectionsLocked:
     """Positive ratchet: research_completion.py must keep its direction writes routed
     through with_directions_locked.
@@ -7158,7 +7089,6 @@ class TestResearchCompletionDirectionsLocked:
             "canonical locked helper — do not remove calls without replacing them "
             "or lowering _EXPECTED_MIN_CALLS with an explanation."
         )
-
 
 class TestRuntimeConfigProjectBranchBypasses:
     _ALLOWED_FILES = frozenset(
@@ -7208,9 +7138,7 @@ class TestRuntimeConfigProjectBranchBypasses:
             + "\n".join(violations)
         )
 
-
 # ── Vision Lock Invariant ─────────────────────────────────────────────────────
-
 
 class TestBasebranchMainFallbackInvariant:
     """Tripwire: spawn/recovery paths must not hardcode 'main' as the base_branch
@@ -7277,7 +7205,6 @@ class TestBasebranchMainFallbackInvariant:
             "See shared_state.get_project_integration_branch for the fallback ordering."
         )
 
-
 class TestVisionLockInvariant:
     """Tripwire: direct <var>.vision attribute assignments must not increase
     above their per-file baseline recorded in lock_assignment_baseline.json.
@@ -7299,9 +7226,7 @@ class TestVisionLockInvariant:
     def test_no_new_unlocked_vision_writes(self):
         _check_lock_invariant("vision", "vision", "with_vision_locked")
 
-
 # ── Running Update Lock Invariant ──────────────────────────────────────────────
-
 
 class TestRunningUpdateLockInvariant:
     """Tripwire: direct <var>.running_update attribute assignments must not
@@ -7331,9 +7256,7 @@ class TestRunningUpdateLockInvariant:
             "running_update", "running_update", "apply_reconciled_running_update"
         )
 
-
 # ── Design-Doc Lock Assignment Guard ─────────────────────────────────────────
-
 
 class TestDesignDocLockAssignmentGuard:
     """Positive ratchet: files with non-zero .design_doc assignments must be
@@ -7394,9 +7317,7 @@ class TestDesignDocLockAssignmentGuard:
             "lock_project_or_429 call that was accidentally removed."
         )
 
-
 # ── Vision Lock Assignment Guard ──────────────────────────────────────────────
-
 
 class TestVisionLockAssignmentGuard:
     """Positive ratchet: files with non-zero .vision assignments must be
@@ -7457,9 +7378,7 @@ class TestVisionLockAssignmentGuard:
             "lock_project_or_429 call that was accidentally removed."
         )
 
-
 # ── Behind-Recovery update_branch Guard ──────────────────────────────────────
-
 
 class TestBehindRecoveryUpdateBranchGuard:
     """Tripwire: every behind-recovery caller of ``update_branch`` /
@@ -7808,9 +7727,7 @@ class TestBehindRecoveryUpdateBranchGuard:
             + ", ".join(unresolved)
         )
 
-
 # ── BuildConfig Schema Coverage ───────────────────────────────────────────────
-
 
 class TestBuildConfigSchemaCoverage:
     """Guard: every build_config key read by a Project property must be declared
@@ -7851,7 +7768,6 @@ class TestBuildConfigSchemaCoverage:
             + "\n".join(f"  - {k}" for k in sorted(undeclared))
             + "\n\nAdd each missing key to BuildConfig in backend/app/schemas.py."
         )
-
 
 class TestVmCostRateConsolidation:
     """Verify that VM cost rates are centralized and used consistently across consumers."""
@@ -7916,9 +7832,7 @@ class TestVmCostRateConsolidation:
             f"e2-standard-2 spot rate ({expected_spot}), got {unknown_spot}"
         )
 
-
 # ── pr_merged "landed on integration" writer allowlist ─────────────────────
-
 
 class TestPrMergedLandedWriterAllowlist:
     """Tripwire: NO backend/app/ site may SET the ``pr_merged`` "landed on
@@ -8060,7 +7974,6 @@ class TestPrMergedLandedWriterAllowlist:
         # uses, so ``app/landed_signal.py`` is correctly left undetected.
         assert not self._DICT_PATTERN.search("        LANDED_SIGNAL_KEY: True,")
 
-
 # ── Typed mock-call helper convention ─────────────────────────────────────────
 #
 # Once a project-internal function's mock-call assertions adopt the type-safe
@@ -8111,7 +8024,6 @@ _TYPED_MOCK_EXEMPT: "dict[str, str]" = {}
 #   2. /agent/src (Docker volume-mount target used by scripts/test-backend.sh).
 #   3. Host filesystem at ../../agent/src from this test file.
 
-
 def _resolve_agent_src_for_typed_mock() -> "Path | None":
     candidates: list[Path] = []
     env_override = os.getenv("AGENT_SRC_ROOT")
@@ -8124,9 +8036,7 @@ def _resolve_agent_src_for_typed_mock() -> "Path | None":
             return candidate
     return None
 
-
 _TYPED_MOCK_AGENT_SRC = _resolve_agent_src_for_typed_mock()
-
 
 # Matches a RAW argument-bearing mock-call assertion on ANY binding:
 #   expect(vi.mocked(setupWorkspace)).toHaveBeenCalledWith(
@@ -8160,11 +8070,9 @@ _DYNAMIC_BINDING_RE = re.compile(
     r"import\(\s*['\"](?P<spec>[^'\"]+)['\"]"
 )
 
-
 def _spec_is_internal(spec: str) -> bool:
     """A relative module specifier denotes project-internal source."""
     return spec.startswith("./") or spec.startswith("../")
-
 
 def _bindings_from_static_clause(clause: str) -> "list[str]":
     """Extract every runtime binding name from a static ``import`` clause.
@@ -8197,7 +8105,6 @@ def _bindings_from_static_clause(clause: str) -> "list[str]":
         bindings.append(lead)
     return bindings
 
-
 def _bindings_from_destructure(names: str) -> "list[str]":
     """Extract bindings from a dynamic ``const { a, default: fs } = await import``
     destructure pattern (the right-hand side of ``key: alias`` is the binding).
@@ -8213,7 +8120,6 @@ def _bindings_from_destructure(names: str) -> "list[str]":
         if head:
             bindings.append(head.group(1))
     return bindings
-
 
 def _parse_import_map(src: str) -> "dict[str, bool]":
     """Map each imported binding name -> ``is_internal`` (relative specifier).
@@ -8240,7 +8146,6 @@ def _parse_import_map(src: str) -> "dict[str, bool]":
     for m in _DYNAMIC_BINDING_RE.finditer(text):
         _record(m.group("name"), m.group("spec"))
     return result
-
 
 def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
     """Return ``(lineno, text)`` pairs with comment lines/regions removed.
@@ -8281,7 +8186,6 @@ def _strip_ts_comments(src: str) -> "list[tuple[int, str]]":
         result.append((i, stripped))
     return result
 
-
 def _scan_source_for_raw_typed_mock(
     name: str, src: str, exempt: "dict[str, str] | None" = None
 ) -> "list[str]":
@@ -8308,18 +8212,15 @@ def _scan_source_for_raw_typed_mock(
         offenders.append(f"{name}:{lineno}: {line.strip()}")
     return offenders
 
-
 def _scan_for_raw_typed_mock(path: Path) -> "list[str]":
     """Return ``file:lineno: <line>`` offenders in a single agent test file."""
     return _scan_source_for_raw_typed_mock(path.name, path.read_text(encoding="utf-8"))
-
 
 def _iter_agent_test_files() -> "list[Path]":
     """Glob every ``*.test.ts`` under the resolved agent/src tree."""
     if _TYPED_MOCK_AGENT_SRC is None:
         return []
     return sorted(_TYPED_MOCK_AGENT_SRC.rglob("*.test.ts"))
-
 
 class TestTypedMockAssertConvention:
     """Static guard: call-argument assertions on project-internal functions
@@ -8555,7 +8456,6 @@ class TestTypedMockAssertConvention:
             "An exempt internal function must be suppressed by _TYPED_MOCK_EXEMPT."
         )
 
-
 # ── Agent ⇄ backend test-runner detector parity (CI-enforced) ─────────────────
 #
 # Blueprint's no-CI merge gate depends on TWO test-suite detectors emitting the
@@ -8589,7 +8489,6 @@ class TestTypedMockAssertConvention:
 #      LOUDLY on a parse miss (anchor/region not found) and SKIPS with a clear
 #      marker only when agent/src is genuinely absent (the GH-only Docker
 #      context, exactly like the SR-category test).
-
 
 # Family → command the agent detector (``detectTestRunners``) emits for each
 # supported layout. MUST stay byte-for-byte in sync with BOTH:
@@ -8625,14 +8524,12 @@ def _load_agent_runner_commands() -> "dict[str, str]":
     with open(fixture_path, encoding="utf-8") as fh:
         return json.load(fh)
 
-
 AGENT_TEST_RUNNER_COMMANDS = _load_agent_runner_commands()
 
 # The lone family whose command the agent builds from a loop variable rather than
 # a literal ``args`` array, so it can't be reconstructed from the runner literal
 # and is verified via its script-list literal instead.
 _AGENT_DYNAMIC_ARG_FAMILIES = {"script"}
-
 
 def _load_shared_runner_layouts() -> list:
     """Load the shared test-runner layout fixture (read-only)."""
@@ -8645,7 +8542,6 @@ def _load_shared_runner_layouts() -> list:
 
     with open(fixture_path, encoding="utf-8") as fh:
         return json.load(fh)
-
 
 def _resolve_agent_test_runners_ts_path() -> "str | None":
     """Locate ``agent/src/utils/test-runners.ts`` across local + Docker envs.
@@ -8682,7 +8578,6 @@ def _resolve_agent_test_runners_ts_path() -> "str | None":
             return candidate
     return None
 
-
 # Matches a single-line TestRunner object literal's ``cmd``/``args`` pair, e.g.
 #   cmd: 'python3', args: ['-m', 'pytest']
 #   cmd: 'vendor/bin/phpunit', args: []
@@ -8690,7 +8585,6 @@ def _resolve_agent_test_runners_ts_path() -> "str | None":
 # single-line match captures the command name and the raw args array body.
 _AGENT_RUNNER_LITERAL_RE = re.compile(r"cmd:\s*'([^']+)',\s*args:\s*\[([^\]]*)\]")
 _AGENT_QUOTED_STRING_RE = re.compile(r"'([^']*)'")
-
 
 def _reconstruct_agent_commands(source: str) -> "set[str]":
     """Reconstruct every literal ``<cmd> <args...>`` the agent detector emits.
@@ -8714,7 +8608,6 @@ def _reconstruct_agent_commands(source: str) -> "set[str]":
             "backend/testing/test_invariants.py to match the new emit format."
         )
     return commands
-
 
 def _extract_extra_family_region(source: str) -> str:
     """Return the body of the ``detectExtraFamilyRunner`` helper.
@@ -8742,7 +8635,6 @@ def _extract_extra_family_region(source: str) -> str:
         )
     return source[start:end]
 
-
 def _extract_generic_fallback_region(source: str) -> str:
     """Return the body of the ``detectGenericFallbackRunner`` helper.
 
@@ -8767,7 +8659,6 @@ def _extract_generic_fallback_region(source: str) -> str:
             "helper's structure changed. Update _extract_generic_fallback_region."
         )
     return source[start:end]
-
 
 def _extract_core_root_region(source: str) -> str:
     """Return the region where core root-level runners are emitted.
@@ -8795,7 +8686,6 @@ def _extract_core_root_region(source: str) -> str:
         )
     return source[start:end]
 
-
 def _extract_nested_package_region(source: str) -> str:
     """Return the region where nested-package runners are emitted.
 
@@ -8820,7 +8710,6 @@ def _extract_nested_package_region(source: str) -> str:
             "in agent/src/utils/test-runners.ts. Update _extract_nested_package_region."
         )
     return source[start:end]
-
 
 def _extract_classifier_region(source: str) -> str:
     """Extract the classifyTestExecution function from test-runners.ts.
@@ -8847,7 +8736,6 @@ def _extract_classifier_region(source: str) -> str:
     # Include the return statement and closing brace
     end = source.find("\n}", end) + 1
     return source[start:end]
-
 
 def _extract_setup_classifier_region(source: str) -> str:
     """Extract the classifySetupFailure function from test-runners.ts.
@@ -8881,7 +8769,6 @@ def _extract_setup_classifier_region(source: str) -> str:
     end = end + 2
     return source[start:end]
 
-
 def _extract_env_failure_region(source: str) -> str:
     """Extract the matchesEnvironmentFailureSignature function from test-runners.ts.
 
@@ -8905,7 +8792,6 @@ def _extract_env_failure_region(source: str) -> str:
             "classifyTestExecution in the file."
         )
     return source[start:end]
-
 
 class TestAgentEnvFailureSignatureParity:
     """SOURCE-SCAN: when agent/src is mounted, the agent-side env-failure
@@ -9020,7 +8906,6 @@ class TestAgentEnvFailureSignatureParity:
             _extract_env_failure_region(
                 "export function matchesEnvironmentFailureSignature(output: string) {}"
             )
-
 
 class TestAgentTestRunnerTableParity:
     """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
@@ -9188,7 +9073,6 @@ class TestAgentTestRunnerTableParity:
             "scripts/test.sh'. Restore the script command in "
             "test_runner_commands.json / AGENT_TEST_RUNNER_COMMANDS."
         )
-
 
 class TestAgentTestRunnerSourceParity:
     """SOURCE-SCAN: when agent/src is mounted, the agent detector's literal
@@ -9725,7 +9609,6 @@ class TestAgentTestRunnerSourceParity:
             "would misclassify a mixed pass-with-skips run as all_skipped."
         )
 
-
 class TestAgentTestRunnerParseHelpers:
     """ALWAYS-ON unit tests for the source-scan parser, driven by synthetic
     source strings (no agent/src required). Demonstrates the scan catches drift
@@ -9837,7 +9720,6 @@ class TestAgentTestRunnerParseHelpers:
             in region
         )
 
-
 # ── No-CI UNVERIFIED-merge reason-label parity ────────────────────────────────
 # The orchestrator writes a stable reason KEY into
 # review_loop["unverified_merge_reason"] at each no-CI fall-open decision site.
@@ -9874,7 +9756,6 @@ _UNVERIFIED_REASON_KEYS = frozenset(
     }
 )
 
-
 def _frontend_unverified_reason_keys() -> "set[str] | None":
     """Extract the key set of the frontend UNVERIFIED_REASON_LABELS map.
 
@@ -9896,7 +9777,6 @@ def _frontend_unverified_reason_keys() -> "set[str] | None":
     body = match.group(1)
     return set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*):", body, re.MULTILINE))
 
-
 def test_unverified_reason_labels_backend_covers_all_keys():
     """The backend alert label map labels every emitted fall-open reason key."""
     from app.alert_dispatch import _UNVERIFIED_REASON_LABELS
@@ -9906,7 +9786,6 @@ def test_unverified_reason_labels_backend_covers_all_keys():
         "backend _UNVERIFIED_REASON_LABELS (app/alert_dispatch.py) is missing "
         f"labels for emitted reason keys: {sorted(missing)}"
     )
-
 
 def test_unverified_reason_labels_frontend_backend_parity():
     """Frontend and backend reason-label maps must cover the same key set.
@@ -9937,7 +9816,6 @@ def test_unverified_reason_labels_frontend_backend_parity():
         f"{sorted(_UNVERIFIED_REASON_KEYS - frontend_keys)}"
     )
 
-
 # Canonical set of degraded no-CI reasons that escalate to ERROR severity.
 # These are environment/setup failures where verification was expected but
 # could not proceed due to infrastructure/tooling issues.
@@ -9953,7 +9831,6 @@ _DEGRADED_REASON_KEYS = frozenset(
         "acceptance_test_not_run",
     }
 )
-
 
 def test_unverified_reason_severity_covers_all_keys():
     """The severity map must classify every canonical emitted fall-open reason key.
@@ -9972,7 +9849,6 @@ def test_unverified_reason_severity_covers_all_keys():
         f"{sorted(missing)}. Every canonical reason must have an explicit severity "
         "classification (ERROR for degraded environment/setup failures, WARNING for benign)."
     )
-
 
 def test_unverified_reason_severity_degraded_are_error():
     """Known degraded reasons (environment/setup failures) must be classified ERROR.
@@ -9993,7 +9869,6 @@ def test_unverified_reason_severity_degraded_are_error():
             "_UNVERIFIED_REASON_SEVERITY (app/alert_dispatch.py), but got {severity}. "
             "Degraded environment/setup failures must escalate loudly to ERROR, not WARNING."
         )
-
 
 def test_unverified_reason_severity_derives_from_shared_sets():
     """The alert severity map is the SINGLE-SOURCE-OF-TRUTH wiring: it must be
@@ -10023,7 +9898,6 @@ def test_unverified_reason_severity_derives_from_shared_sets():
         **{r: AlertSeverity.WARNING for r in BENIGN_UNVERIFIED_REASONS},
     }
     assert _UNVERIFIED_REASON_SEVERITY == expected
-
 
 class TestSpawnResumeNeedSignalParity:
     """The spawn-time prerequisite resolver and the resume-time blocked-need
@@ -10158,7 +10032,6 @@ class TestSpawnResumeNeedSignalParity:
                 f"'{label}'"
             )
 
-
 def test_standalone_smoke_modules_importable_as_root():
     env = os.environ.copy()
     env.setdefault("AGENT_JWT_SECRET", "test-secret-for-invariant-check")
@@ -10180,7 +10053,6 @@ def test_standalone_smoke_modules_importable_as_root():
         )
         assert "ImportError" not in result.stderr
         assert "circular import" not in result.stderr
-
 
 def test_all_load_only_projection_sites_require_raiseload():
     """Every load_only() and defer() call in backend/app must pass raiseload=True.
@@ -10235,7 +10107,6 @@ def test_all_load_only_projection_sites_require_raiseload():
         "an un-projected column raises synchronously at test time instead of "
         "triggering a MissingGreenlet 500 in production.\n" + "\n".join(violations)
     )
-
 
 def test_stall_alert_functions_reachable_from_canonical_import_path():
     """Every _check_/_alert_/_resolve_ function in release_stall_alerts.py must be
@@ -10306,7 +10177,6 @@ def test_stall_alert_functions_reachable_from_canonical_import_path():
         "Unreachable functions:\n" + "\n".join(f"  {f}" for f in unreachable)
     )
 
-
 def test_summarize_release_artifacts_callers_always_pass_project():
     """Every call to summarize_release_artifacts in backend/app/ passes project=.
 
@@ -10375,7 +10245,6 @@ def test_summarize_release_artifacts_callers_always_pass_project():
         + "\n".join(violations)
     )
 
-
 def test_serving_status_reads_route_through_aggregate():
     """All read-path files must use version_serving_summary, not private copies.
 
@@ -10431,7 +10300,6 @@ def test_serving_status_reads_route_through_aggregate():
         + "\n".join(duplicates)
     )
 
-
 # ---------------------------------------------------------------------------
 # Dead-column guard: confirm five dropped columns stay gone from models.py
 # and their write sites stay removed from production code.
@@ -10446,7 +10314,6 @@ _DEAD_ORM_COLUMNS = [
     ("Project", "regression_signal_state", None),
     ("DeploymentState", "prior_deployed_at", "main.py"),
 ]
-
 
 def test_dropped_dead_orm_columns_absent_from_models():
     """Verify the five dead ORM columns are not re-introduced in models.py.
@@ -10480,7 +10347,6 @@ def test_dropped_dead_orm_columns_absent_from_models():
         + "\n".join(violations)
     )
 
-
 def test_dropped_dead_orm_columns_write_sites_removed():
     """Verify known write sites for the dead columns are gone from production code.
 
@@ -10512,7 +10378,6 @@ def test_dropped_dead_orm_columns_write_sites_removed():
         "These columns have no live readers and were dropped in migration 0300.\n"
         + "\n".join(violations)
     )
-
 
 def test_authorized_test_deletion_allowlist_is_sealed():
     """The hardcoded test-deletion allowlist must NOT be importable.
@@ -10549,7 +10414,6 @@ def test_authorized_test_deletion_allowlist_is_sealed():
         from app.release_scoring import (  # noqa: F401
             _get_lifecycle_bounded_authorized_deletions,
         )
-
 
 def test_main_py_admin_endpoints_auth_and_401_path():
     """All @app.{method}('/api/admin/...') handlers declared directly in main.py
@@ -10709,7 +10573,6 @@ def test_main_py_admin_endpoints_auth_and_401_path():
         "Add a 401 path or add the endpoint to OPTIONAL_401_ALLOWLIST with justification."
     )
 
-
 def test_deleted_test_file_classification_fails_open_without_genuine_erosion():
     """The deleted-test-file gate must FAIL OPEN on unclassified deletions.
 
@@ -10791,9 +10654,7 @@ def test_deleted_test_file_classification_fails_open_without_genuine_erosion():
         "(erosion=None) — the one case fail-open preserves."
     )
 
-
 # ── TaskType evaluation registry consistency (always-on smoke invariant) ───────
-
 
 def test_task_type_evaluation_registry_is_consistent():
     """Mirror DB-free registry assertions into always-on smoke suite.
@@ -10848,6 +10709,7 @@ def test_task_type_evaluation_registry_is_consistent():
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
+        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",
@@ -10877,7 +10739,6 @@ def test_task_type_evaluation_registry_is_consistent():
         "This invariant is always-on (every PR) to catch vocabulary changes early. "
         "If the drift is intentional, update both task_capabilities.py AND this assertion."
     )
-
 
 def test_pytest_filterwarnings_includes_httpx_error_guard():
     """pyproject.toml must configure filterwarnings to turn httpx DeprecationWarnings into errors.
@@ -10918,7 +10779,6 @@ def test_pytest_filterwarnings_includes_httpx_error_guard():
         "This guard ensures httpx deprecation warnings surface as test failures "
         "before they become hard removals in the next version bump."
     )
-
 
 def _ci_wait_true_literals_missing_pr_number(app_dir: str) -> list[str]:
     """Return "file:line" sites where a dict LITERAL sets ``"ci_waiting": True``
@@ -10961,7 +10821,6 @@ def _ci_wait_true_literals_missing_pr_number(app_dir: str) -> list[str]:
             if arms_ci_wait and "pr_number" not in const_keys:
                 offenders.append(f"{rel}:{node.lineno}")
     return offenders
-
 
 def test_ci_wait_arm_literals_costamp_pr_number():
     """Tripwire: no dict literal may arm ``ci_waiting=True`` without ``pr_number``.
@@ -11022,7 +10881,6 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
 # create_branch's conflict-retry (branch-write context, not a hot read path).
 _LIVE_REF_SCAN_SKIP_FILES = frozenset({"github.py", "github_refs.py"})
 
-
 def _live_true_get_branch_sha_sites(tree, rel_path):
     """Yield ``"<rel_path>:<function>"`` for each get_branch_sha(..., live=True)."""
     parent = {}
@@ -11059,7 +10917,6 @@ def _live_true_get_branch_sha_sites(tree, rel_path):
             ):
                 yield f"{rel_path}:{_enclosing_fn(node)}"
 
-
 def test_get_branch_sha_live_true_is_allowlisted():
     """Every ``get_branch_sha(..., live=True)`` in backend/app must be a reviewed
     member of the must-be-live allowlist. This is what makes cache-by-default
@@ -11088,7 +10945,6 @@ def test_get_branch_sha_live_true_is_allowlisted():
         "justification; otherwise drop live=True (cached is the safe default)."
     )
 
-
 def test_get_branch_sha_live_guard_scanner_flags_injected_site():
     """Self-test: the scanner actually detects a live=True call, so the guard
     above can't silently pass by matching nothing."""
@@ -11102,7 +10958,6 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
     )
     tree = ast.parse(src)
     assert list(_live_true_get_branch_sha_sites(tree, "fake.py")) == ["fake.py:_bad"]
-
 
 # ---------------------------------------------------------------------------
 # String patch-target resolution invariant
@@ -11159,14 +11014,12 @@ def _iter_app_patch_target_sites(testing_dir: Path) -> list[tuple[str, int, str]
                 sites.append((py_file.name, node.lineno, target))
     return sites
 
-
 def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
     """Return {filename: {target, ...}} for app.* string patch targets in test files."""
     result: dict[str, set[str]] = {}
     for filename, _lineno, target in _iter_app_patch_target_sites(testing_dir):
         result.setdefault(filename, set()).add(target)
     return result
-
 
 @cache
 def _parse_python_file(path: Path) -> "ast.Module | None":
@@ -11181,7 +11034,6 @@ def _parse_python_file(path: Path) -> "ast.Module | None":
         return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     except (SyntaxError, UnicodeDecodeError, OSError):
         return None
-
 
 @cache
 def _app_module_file(app_dir: Path, module_dotted: str) -> Path | None:
@@ -11199,7 +11051,6 @@ def _app_module_file(app_dir: Path, module_dotted: str) -> Path | None:
         if not candidate.exists():
             return None
     return candidate
-
 
 def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] | None:
     """Return the set of top-level names in a module file, or None if not found.
@@ -11236,7 +11087,6 @@ def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] |
             for alias in node.names:
                 names.add(alias.asname if alias.asname else alias.name)
     return names
-
 
 def test_string_patch_targets_resolve():
     """Every app.* string patch target in backend/testing/*.py must resolve to
@@ -11289,7 +11139,6 @@ def test_string_patch_targets_resolve():
         "or remove the test if the functionality was deleted."
     )
 
-
 def test_string_patch_target_scanner_self_tests():
     """Self-tests for the patch-target scanner helpers."""
     import textwrap
@@ -11318,7 +11167,6 @@ def test_string_patch_target_scanner_self_tests():
         (tmpdir_path / "test_create.py").write_text(src_create)
         assert _collect_app_patch_targets(tmpdir_path) == {}
 
-
 # ---------------------------------------------------------------------------
 # Vacuous-mock invariant: a patched app.* function production no longer calls
 # ---------------------------------------------------------------------------
@@ -11334,7 +11182,6 @@ def test_string_patch_target_scanner_self_tests():
 # ``get_pull_request_reviews_checked`` while three test helpers kept patching
 # ``get_pull_request_reviews``. The stale mocks went inert, a genuinely rejected PR was
 # downgraded FAILED->CANCELLED, and the suite stayed green.
-
 
 def _app_symbol_kind(
     app_dir: Path, module_dotted: str, attr: str, _depth: int = 0
@@ -11401,7 +11248,6 @@ def _app_symbol_kind(
                 return _app_symbol_kind(app_dir, source_mod, alias.name, _depth + 1)
     return "absent"  # caught by test_string_patch_targets_resolve, not here
 
-
 def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
     """The set of every symbol name REFERENCED anywhere under ``roots``.
 
@@ -11460,7 +11306,6 @@ def _referenced_symbol_names(roots: "tuple[Path, ...]") -> set[str]:
                     names.add(node.args[1].value)
     return names
 
-
 def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
     """Trees whose code a pytest mock can actually intercept — i.e. code the suite drives
     IN-PROCESS.
@@ -11484,7 +11329,6 @@ def _production_reference_roots(backend_dir: Path) -> "tuple[Path, ...]":
         if d.is_dir()
     )
 
-
 # app.* FUNCTIONS that are patched in backend/testing/ but have NO call site in any
 # in-process production tree — and are nonetheless legitimate. Each entry needs a REASON:
 # an escape hatch without one decays into a blanket suppression (enforced below).
@@ -11505,7 +11349,6 @@ _VACUOUS_MOCK_ALLOWLIST: "dict[str, str]" = {
     # (empty — the tree is clean as of this invariant landing; see the docstring above
     # for what qualifies before you add anything here)
 }
-
 
 def _find_vacuous_mocks(
     testing_dir: Path,
@@ -11544,7 +11387,6 @@ def _find_vacuous_mocks(
             f"test is VACUOUS."
         )
     return findings
-
 
 def test_patched_app_symbols_have_production_call_sites():
     """A patched ``app.*`` function that production never calls is an INERT mock.
@@ -11595,7 +11437,6 @@ def test_patched_app_symbols_have_production_call_sites():
         "  3. If the symbol is genuinely reached by dynamic dispatch this AST scan "
         "cannot see, add it to _VACUOUS_MOCK_ALLOWLIST **with a reason**."
     )
-
 
 def test_vacuous_mock_guard_scanner_self_tests():
     """The vacuous-mock guard must flag a dead patch target and must NOT flag live ones.
@@ -11731,7 +11572,6 @@ def test_vacuous_mock_guard_scanner_self_tests():
         # Re-export hop: classified by its real definition, not by the import alias.
         assert _app_symbol_kind(app_dir, "app.svc", "reexported_only") == "function"
 
-
 # Redundant ``create=True`` patches currently in the suite (target already exists
 # at module top level). ``create=True`` is legitimate ONLY when the attribute is
 # absent; these are grandfathered so this invariant fails only on NEWLY-accreted
@@ -11745,7 +11585,6 @@ _KNOWN_REDUNDANT_CREATE_TRUE: "frozenset[str]" = frozenset({
     "test_release_stall_alerts.py::app.release_promotion._notify_operator",
     "test_warm_vm_integration.py::app.broadcast.broadcast_to_project",
 })
-
 
 def test_redundant_create_true_patches_flagged():
     """A ``create=True`` patch whose target now EXISTS at module top level is
@@ -11798,7 +11637,6 @@ def test_redundant_create_true_patches_flagged():
         "test_string_patch_targets_resolve)."
     )
 
-
 def test_redundant_create_true_scanner_self_test():
     """Self-test: the create=True collector returns create=True targets and only those.
 
@@ -11825,9 +11663,7 @@ def test_redundant_create_true_scanner_self_test():
         ("test_synthetic.py", "app.some_module.exists"),
     ]
 
-
 # ── Route Contract Ownership ────────────────────────────────────────────────
-
 
 def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
     """Return names of test functions whose body contains the given pattern."""
@@ -11840,11 +11676,9 @@ def _find_test_funcs_matching(content: str, pattern: re.Pattern) -> list[str]:
             offending.append(match.group(1))
     return offending
 
-
 _API_URL_RE = re.compile(r'["\'](/api/[a-z][^"\'\s?#{]*)["\']')
 
 _TEST_FUNC_DEF_RE = re.compile(r"^(?:async )?def (test_\w+)", re.MULTILINE)
-
 
 def _validate_route_contract_registry(
     testing_dir: Path,
@@ -11920,7 +11754,6 @@ def _validate_route_contract_registry(
 
     return errors
 
-
 def _find_unregistered_duplicated_contracts(
     testing_dir: Path,
     registry: dict,
@@ -11951,7 +11784,6 @@ def _find_unregistered_duplicated_contracts(
             continue
         violations.append((url, sorted(files)))
     return violations
-
 
 class TestRouteContractOwnership:
     """Standalone guard: each endpoint's response-shape contract must live in
@@ -12280,7 +12112,6 @@ class TestRouteContractOwnership:
             f"valid, got: {errors}"
         )
 
-
 def test_no_deprecated_datetime_utcnow_calls():
     """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
 
@@ -12321,8 +12152,6 @@ def test_no_deprecated_datetime_utcnow_calls():
         "Offending files:\n" + "\n".join(violating_files)
     )
 
-
-
 def test_spawn_budget_partition_is_exhaustive():
     """Assert that the autonomous spawn-budget partition is exhaustive and disjoint.
 
@@ -12361,7 +12190,6 @@ def test_spawn_budget_partition_is_exhaustive():
         f"partition union {sorted(union)} != all task types {sorted(all_types)}"
     )
 
-
 def test_orchestrator_health_task_type_vocab_is_registry_known():
     """orchestrator_health hand-maintained type sets must contain only registry-known types.
 
@@ -12389,7 +12217,6 @@ def test_orchestrator_health_task_type_vocab_is_registry_known():
             "or remove the stale literal from the frozenset."
         )
 
-
 def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
     """Self-test: the vocab guard above must catch a deliberately injected fake type.
 
@@ -12405,7 +12232,6 @@ def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
         "Guard logic failed to detect the injected fake type '__nonexistent_type__'. "
         "The standing vocab check would silently pass on real drift."
     )
-
 
 def test_mock_patch_targets_resolve():
     """Every first-party mock.patch() string target in the test suite must resolve.
@@ -12460,7 +12286,6 @@ def test_mock_patch_targets_resolve():
         + "\n".join(sorted(failures)[:50])
         + ("" if len(failures) <= 50 else f"\n... and {len(failures) - 50} more")
     )
-
 
 def test_acceptance_window_evidence_call_site_wired():
     """release_qualifier_sweep.py must import and call record_acceptance_window_coverage_evidence.
@@ -12519,7 +12344,6 @@ def test_acceptance_window_evidence_call_site_wired():
         "restore the call site."
     )
 
-
 def test_metrics_integrity_sweep_wired_in_reaper():
     """sweep_metrics_integrity must be imported from reaper_sweeps and called in reaper.py."""
     import ast
@@ -12553,7 +12377,6 @@ def test_metrics_integrity_sweep_wired_in_reaper():
         "The metrics-integrity sweep must be invoked in the reaper service loop."
     )
 
-
 def test_v22_finding_backfill_wired_in_orchestrator():
     """_sweep_v22_finding_backfill must be imported and called inside orchestrator.py."""
     import ast
@@ -12586,7 +12409,6 @@ def test_v22_finding_backfill_wired_in_orchestrator():
         "_sweep_v22_finding_backfill is imported but never called in orchestrator.py. "
         "The v22 finding backfill must be invoked on a cadence in the orchestrator loop."
     )
-
 
 def test_v22_live_verification_evidence_wired_in_sweep():
     """record_v22_live_verification_evidence must be called inside _sweep_v22_finding_backfill.
@@ -12656,7 +12478,6 @@ def test_v22_live_verification_evidence_wired_in_sweep():
         "The live-verification evidence backfill is effectively disabled — "
         "restore the call site."
     )
-
 
 def test_record_task_merge_evidence_gates_on_acceptance_is_proven():
     """record_task_merge_evidence must gate on acceptance_is_proven before writing CriterionEvidence rows.

@@ -1583,3 +1583,36 @@ def acceptance_window_sub_scores_violations(sub_scores: dict) -> list[str]:
             )
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Required-diff-paths completion contract
+# ---------------------------------------------------------------------------
+
+
+def check_required_diff_paths(
+    task: Task, changed_files: list[str]
+) -> list[str]:
+    """Return declared required_diff_paths that are absent from the PR diff.
+
+    When the task's first_payload declares ``required_diff_paths``, every listed
+    path must appear in ``changed_files``. The comparison is exact-string (after
+    stripping leading slashes so both ``backend/app/foo.py`` and
+    ``/backend/app/foo.py`` normalise identically). Returns an empty list when
+    all declared paths are present, no paths are declared, or ``changed_files``
+    is empty and no paths are declared (fail-open for undeclared tasks).
+
+    Callers that receive a non-empty return value MUST reject the PR submission
+    with an actionable error naming the missing paths — fail-closed when declared.
+    """
+    first_payload = task.first_payload or {}
+    required: list[str] | None = first_payload.get("required_diff_paths")
+    if not required:
+        return []
+
+    changed_normalised = {p.lstrip("/") for p in changed_files if isinstance(p, str)}
+    missing = [
+        p for p in required
+        if isinstance(p, str) and p.lstrip("/") not in changed_normalised
+    ]
+    return missing

@@ -1,9 +1,9 @@
 # v26 Operator Walkthrough Report
 
 > **Qualification target:** criterion c-5214996f
-> **SHA walked:** `88d8efb25d5e7bae31a5bab8e1a0e2f3c4d5e6f7`
-> **Date:** 2026-07-16
-> **Run at:** 2026-07-16T18:27:12.505Z
+> **SHA walked:** `28baf8895c3966675c69f4e10c4ec43fcfd24062`
+> **Date:** 2026-07-17
+> **Run at:** 2026-07-17T06:02:52.054Z
 
 ## Environment
 
@@ -20,9 +20,9 @@
 
 | Verdict | Count |
 |---------|-------|
-| ✅ PASS | 16 |
+| ✅ PASS | 19 |
 | ❌ FAIL | 0 |
-| ⚠️ DEAD_END | 2 |
+| ⚠️ DEAD_END | 0 |
 
 ## Screenshot Integrity
 
@@ -31,15 +31,20 @@
 ### Screenshot Hashes (md5)
 
 ```
-  dd7d9a9625448edc…  flow0-app-load.png  (step: App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in))
-  332b44f20d9110b2…  flow2-ui-project-tools.png  (step: 2f. UI state for project tools)
-  343e23c4d050cb18…  flow3-messages-ui.png  (step: 3e. MessagesPanel renders in UI)
-  d5184344978a14ab…  flow3f-cross-tab-alert-indicator.png  (step: 3f. Cross-tab alert indicator (PR #15230))
+  310de31e3df869b4…  flow0-app-load.png  (step: App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in))
+  07e76c6244e16290…  flow2-ui-project-tools.png  (step: 2f. UI state for project tools)
+  a4e2afacaf55505f…  flow3-messages-ui.png  (step: 3e. MessagesPanel renders in UI)
+  6e59fc65dae663ad…  flow3f-cross-tab-alert-indicator.png  (step: 3f. Cross-tab alert indicator (PR #15230))
 ```
 
 ---
 
 ## Flow 1 — Runner Enrollment (c-dfdc9d82)
+
+### ✅ `PASS` — 0. Node >= 22 prerequisite (hard gate)
+
+- Node v22.23.1 ✓ — meets MIN_NODE_MAJOR=22 requirement
+- scripts/blueprint_runner.py MIN_NODE_MAJOR = 22 satisfied
 
 ### ✅ `PASS` — Backend health check
 
@@ -51,7 +56,7 @@
 ### ✅ `PASS` — App loads (VITE_DASHBOARD_API_TOKEN bypasses Firebase sign-in)
 
 - Page title: "Blueprint AI Studio"
-- Body length: 1359 chars
+- Body length: 587 chars
 - First 200 chars: All Projects Manage Ctrl K Search, ask, open task... Chat Pipeline Project Runtime health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkth
 - Console errors so far: 0
 
@@ -60,15 +65,15 @@
 ### ✅ `PASS` — 1a. Runner registration API
 
 - POST /api/admin/projects/00000000-0000-4000-8000-000000000001/runners/register → 200
-- runner_id: 0e5204c0-be61-428d-8986-d1e1117f3834
+- runner_id: 98197e23-0cc1-43d7-9070-f9188af73d78
 - token: 43 chars (one-time secret, not stored)
 - hostname: walkthrough-playwright-vm-2026-07-16
 
 ### ✅ `PASS` — 1b. Enrolled runner visible in fleet list
 
 - GET /api/admin/projects/00000000-0000-4000-8000-000000000001/runners → 200
-- Total runners: 3
-- Runner 0e5204c0-be61-428d-8986-d1e1117f3834: FOUND
+- Total runners: 1
+- Runner 98197e23-0cc1-43d7-9070-f9188af73d78: FOUND
 - status: active, hostname: walkthrough-playwright-vm-2026-07-16
 
 ### ✅ `PASS` — 1c. Install snippet generated
@@ -84,9 +89,9 @@
 - Exit code: 0
 - ✓ Preflight passed — token valid, orchestrator reachable
 -   Blueprint local fleet runner — preflight
--     runner host     : agent-vm-5cfd2c65e0af4f6c90c08d4f2e0dadb7
+-     runner host     : agent-vm-c9ac12e8537740b1b1da7db356930f52
 -     orchestrator    : http://127.0.0.1:8080   [reachable]
--     runner token    : ubj_x1JB...   [valid]
+-     runner token    : peBkMhem...   [valid]
 -     python          : 3.10.12
 -     workspace       : /tmp/blueprint-agent-workspaces   [writable]
 -     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
@@ -105,30 +110,41 @@
 -       compute      : CLAIMED via docker (image jobs, --nv/--gpus)
 - --- Phase 2: full daemon connect + heartbeat ---
 - Node v22.23.1 ✓ — daemon mode (not --check; real connection to orchestrator)
-- Fleet snapshot BEFORE daemon start: last_seen_at=null
-- Fleet snapshot AFTER 10s daemon run: last_seen_at=2026-07-16T18:27:28.413Z
+- Fleet snapshot BEFORE daemon start: last_seen_at=2026-07-17T06:02:57.548801
+- Fleet snapshot AFTER 10s daemon run: last_seen_at=2026-07-17T06:03:00.484293
 - current_token_heartbeat_confirmed: true
 - Heartbeat observed in fleet state: ✓ YES — runner is live
 - Token generation confirmed: ✓ YES
 - Health status: connected
-- ✓ Full daemon enrollment PROVEN: runner 0e5204c0-be61-428d-8986-d1e1117f3834 connected and heartbeated
+- ✓ Full daemon enrollment PROVEN: runner 98197e23-0cc1-43d7-9070-f9188af73d78 connected and heartbeated
 - --- fleet API response after enrollment (key fields) ---
--   id: 0e5204c0-be61-428d-8986-d1e1117f3834
--   hostname: agent-vm-5cfd2c65e0af4f6c90c08d4f2e0dadb7
+-   id: 98197e23-0cc1-43d7-9070-f9188af73d78
+-   hostname: agent-vm-c9ac12e8537740b1b1da7db356930f52
 -   status: active
--   last_seen_at: 2026-07-16T18:27:28.413Z
+-   last_seen_at: 2026-07-17T06:03:00.484293
 -   current_token_heartbeat_confirmed: true
 -   health.device_status: connected
 - --- daemon stdout/stderr (first 20 lines) ---
--   [runner] token loaded from BLUEPRINT_RUNNER_TOKEN env
--   Blueprint local fleet runner — starting
--     runner host     : agent-vm-5cfd2c65e0af4f6c90c08d4f2e0dadb7
--     orchestrator    : http://127.0.0.1:8080
--   [runner] heartbeat OK (HTTP 200) — runner active, compute available
--   [runner] heartbeat OK (HTTP 200) — runner active, compute available
--   [runner] heartbeat OK (HTTP 200) — runner active, compute available
--   [runner] heartbeat OK (HTTP 200) — runner active, compute available
--   [runner] SIGTERM received — shutting down gracefully
+-   Blueprint local fleet runner — preflight
+-     runner host     : agent-vm-c9ac12e8537740b1b1da7db356930f52
+-     orchestrator    : http://127.0.0.1:8080   [reachable]
+-     runner token    : peBkMhem...   [valid]
+-     python          : 3.10.12
+-     workspace       : /tmp/blueprint-agent-workspaces   [writable]
+-     concurrency     : agents=2  compute=2  (separate pools; up to 4 tasks total)
+-     isolation boundaries:
+-       bwrap        : not installed
+-       apptainer    : not installed
+-       docker       : usable
+-       podman       : not installed
+-       resource cap : /usr/bin/systemd-run (resource caps available)
+-     gpus            : 0x [none]
+-     gpu policy      : allowlist=[none]  per_job=1
+-     verification    : INCAPABLE — no bwrap sandbox (install bubblewrap; kernel userns required)
+-     provider creds  : NONE (compute-only runner — not required)
+-     task classes:
+-       agent        : DECLINED — no bwrap sandbox (install bubblewrap; kernel userns required)
+-       compute      : CLAIMED via docker (image jobs, --nv/--gpus)
 
 ### ✅ `PASS` — 2a. Tool-kinds registry
 
@@ -177,22 +193,24 @@
 ### ✅ `PASS` — 3a. Messages API returns data
 
 - GET /api/admin/projects/00000000-0000-4000-8000-000000000001/messages → 200
-- Message count: 0
-- No messages returned
+- Message count: 2
+- First message: id=00000000-0000-4000-8000-000000000011, type=QUESTION, status=open
 
 ### ✅ `PASS` — 3b. Alerts API (notification surface)
 
 - GET /api/admin/alerts?project_id=00000000-0000-4000-8000-000000000001 → 200
 - Alert count: 2
-- First alert: Branch backfill failed — integration_branch or promotion_target still NULL (WARNING)
+- First alert: Orchestrator error loop (ERROR)
 
-### ⚠️ `DEAD_END` — 3c. Message resolve (self-clearing action)
+### ✅ `PASS` — 3c. Message resolve (self-clearing action)
 
-- No messages to test with
+- PATCH /api/admin/messages/00000000-0000-4000-8000-000000000011 → 200
+- Message 00000000-0000-4000-8000-000000000011 resolved — self-clearing confirmed (PATCH /api/admin/messages/{id})
 
-### ⚠️ `DEAD_END` — 3d. Resolved message removed from open list
+### ✅ `PASS` — 3d. Resolved message removed from open list
 
-- No messages to test with
+- Messages after resolve: 2
+- Message 00000000-0000-4000-8000-000000000011 still open: false
 
 ### ✅ `PASS` — 3e. MessagesPanel renders in UI
 
@@ -201,7 +219,7 @@
 - Composer textarea visible: false
 - Alerts banner visible: true
 - Message bubbles visible: false
-- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat 1 Pipeline Project Runtime health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Chat Workday SAVING Dismiss all Branch bac
+- Body excerpt (first 300 chars): v26 Walkthrough Test Project Manage Ctrl K Search, ask, open task... Chat 2 Pipeline Project Runtime health D AUTONOMY Active BRANCH CONFIG 1 NEED FIX 1 project missing branch config — falling back to 'main' v26 Walkthrough Test Project / Configure Backfill Chat Workday SAVING Dismiss all Orchestrat
 
 ![3e. MessagesPanel renders in UI](screenshots/flow3-messages-ui.png)
 
@@ -224,12 +242,7 @@
 
 The following steps were blocked by environment constraints (not code defects):
 
-**3c. Message resolve (self-clearing action)** (DEAD_END):
-- No messages to test with
-
-**3d. Resolved message removed from open list** (DEAD_END):
-- No messages to test with
-
+*None.*
 ---
 
 ## Acceptance Evidence for c-5214996f
@@ -244,7 +257,7 @@ The following steps were blocked by environment constraints (not code defects):
 - Fleet list API returns enrolled runner ✅ CONFIRMED
 - Install snippet generation ✅ CONFIRMED (bash blueprint-runner start --token <tok> --url <url>)
 - Node >= 22 prerequisite ✅ CONFIRMED (v22.23.1 installed)
-- **Full daemon enrollment** ✅ CONFIRMED — daemon connected to orchestrator; `last_seen_at` transitioned from `null` → `2026-07-16T18:27:28.413Z`; `current_token_heartbeat_confirmed=true`; `health.device_status=connected`
+- **Full daemon enrollment** ✅ CONFIRMED — daemon connected to orchestrator; `last_seen_at` observed in fleet state; `current_token_heartbeat_confirmed=true`
 
 ### c-f52fd975 — Project Tools iframe subresource token (PR #15163)
 - Path-embedded token route `/t/{token}/assets/{path}` ✅ REGISTERED AND RESPONDING
@@ -260,8 +273,7 @@ The following steps were blocked by environment constraints (not code defects):
 
 ### c-5214996f — Real walkthrough criterion
 > This document IS the real walkthrough. Execution evidence:
-> - SHA: `88d8efb25d5e7bae31a5bab8e1a0e2f3c4d5e6f7`
-> - Timestamp: 2026-07-16T18:27:12.505Z
+> - SHA: `28baf8895c3966675c69f4e10c4ec43fcfd24062`
+> - Timestamp: 2026-07-17T06:02:52.054Z
 > - Live HTTP responses recorded above
 > - Screenshots in `docs/walkthroughs/screenshots/`
-> - **Step 1d daemon enrollment**: runner spawned as live daemon, heartbeat observed in fleet API, `last_seen_at` set, `current_token_heartbeat_confirmed=true`

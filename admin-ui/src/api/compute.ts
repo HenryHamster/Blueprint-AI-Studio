@@ -62,6 +62,14 @@ export interface ComputeExperimentLaunchRequest {
   // When set, the job stays QUEUED until that runner is available rather than
   // falling back to another runner or cloud. Omit for auto-selection.
   runner_target_id?: string;
+  // Optional setup step executed as `bash -lc <setup_step>` before the main command.
+  setup_step?: string;
+  // Optional no-progress watchdog window in seconds. When set, a stalled job
+  // writing no progress within this window is torn down early.
+  no_progress_timeout_seconds?: number;
+  // Optional cross-job checkpoint resume: rehydrate a prior job's artifact bundle
+  // into this job's workspace before the command runs.
+  input_artifact_job_id?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -872,6 +880,9 @@ export interface ComputeJob {
     deadline_seconds?: number | null;
     require_live_release?: boolean | null;
     require_durable_artifact?: boolean | null;
+    setup_step?: string | null;
+    no_progress_timeout_seconds?: number | null;
+    input_artifact_job_id?: string | null;
     // Provenance persisted at launch time; absent on legacy or manually-configured launches.
     provenance?: {
       idea?: string | null;
@@ -885,10 +896,21 @@ export interface ComputeJob {
    *  or jobs without viewable output. */
   viewable_artifacts?: ViewableArtifact[] | null;
   /** Job-level aggregate: number of viewable files omitted from
-   *  `viewable_artifacts` for exceeding the 25-file count cap or the 8 MiB
-   *  per-file size cap. Additive/backward-compatible — absent or 0 on legacy
-   *  rows and jobs where nothing was omitted. */
+   *  `viewable_artifacts` for exceeding the 25-file count cap or the per-file
+   *  size cap (8 MiB/image, 512 MiB/video). Additive/backward-compatible —
+   *  absent or 0 on legacy rows and jobs where nothing was omitted.
+   *  Only populated at terminal time; use viewable_artifacts_live_omissions
+   *  for running jobs. */
   viewable_artifacts_dropped_count?: number | null;
+  /** Live omission telemetry for RUNNING jobs. Contains the count of unique
+   *  artifact files the runner skipped due to the per-kind size cap
+   *  ("size_cap": images ≤ 8 MiB, videos ≤ 512 MiB) or the 25-file count
+   *  cap ("count_cap"). Absent or null on terminal jobs — use
+   *  viewable_artifacts_dropped_count instead once the job finishes. */
+  viewable_artifacts_live_omissions?: {
+    size_cap?: number | null;
+    count_cap?: number | null;
+  } | null;
   /** Bounded time-series of intermediate progress samples emitted during the
    *  job. `t` is runner-authored presentation time; `received_at` is the
    *  authenticated server clock used for watchdog enforcement. */

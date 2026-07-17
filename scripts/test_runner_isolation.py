@@ -1123,6 +1123,124 @@ class TestProbeDockerCdiGpu(unittest.TestCase):
         with mock.patch.object(iso.subprocess, "run", return_value=self._info("")):
             self.assertFalse(iso.probe_docker_cdi_gpu())
 
+
+class TestProbeContainerGpuPassthrough(unittest.TestCase):
+    @staticmethod
+    def _info(stdout, rc=0):
+        return subprocess.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr="")
+
+    def test_docker_cdi_probe_uses_job_argv_and_requires_gpu_output(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Test GPU (UUID: GPU-1)\n", stderr=""
+        )
+        caps = _caps(docker_usable=True, docker_cdi_gpu=True, gpu_indices=(0,))
+        with mock.patch.dict(os.environ, {"BLUEPRINT_RUNNER_TOKEN": "secret"}), \
+             mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            proof = iso.probe_container_gpu_passthrough(caps, image="probe:image")
+        self.assertEqual(proof["docker"]["verified"], True)
+        self.assertEqual(proof["docker"]["mode"], "cdi")
+        self.assertIn("--device", run.call_args.args[0])
+        self.assertNotIn("--gpus", run.call_args.args[0])
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", run.call_args.kwargs["env"])
+
+    def test_configured_private_image_is_used_for_retryable_gpu_proof(self):
+        """A Docker-Hub-blocked runner can prove its configured project image."""
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Project GPU\n", stderr=""
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_GPU_PROBE_IMAGE": "registry.example/project/cuda:stable"},
+            clear=False,
+        ), mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            proof = iso.refresh_container_gpu_passthrough(caps)
+
+        self.assertTrue(proof.container_gpu_passthrough["docker"]["verified"])
+        self.assertIn("registry.example/project/cuda:stable", run.call_args.args[0])
+        self.assertNotIn(iso._GPU_PROBE_IMAGE, run.call_args.args[0])
+
+    def test_runtime_presence_without_host_gpu_is_negative_evidence(self):
+        proof = iso.probe_container_gpu_passthrough(_caps(podman_usable=True))
+        self.assertEqual(
+            proof,
+            {"podman": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}},
+        )
+
+    def test_timeout_force_removes_probe_container(self):
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[1:3] == ["rm", "-f"]:
+                return subprocess.CompletedProcess(args=argv, returncode=0)
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=45)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            proof = iso.probe_container_gpu_passthrough(caps)
+
+        self.assertEqual(proof["docker"]["reason"], "probe_timeout")
+        cleanup = next(call for call in calls if call[1:3] == ["rm", "-f"])
+        self.assertRegex(cleanup[3], r"^bp-gpu-passthrough-probe-\d+-[0-9a-f]{8}$")
+
+    def test_probe_names_do_not_collide_after_runner_restart(self):
+        """A stale predecessor probe name must not poison the next daemon probe."""
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Test GPU\n", stderr=""
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            iso.probe_container_gpu_passthrough(caps)
+            first_name = run.call_args_list[0].args[0][
+                run.call_args_list[0].args[0].index("--name") + 1
+            ]
+            iso.probe_container_gpu_passthrough(caps)
+            second_name = run.call_args_list[1].args[0][
+                run.call_args_list[1].args[0].index("--name") + 1
+            ]
+
+        self.assertNotEqual(first_name, second_name)
+        self.assertTrue(first_name.startswith("bp-gpu-passthrough-probe-"))
+
+    def test_zero_exit_without_gpu_is_no_gpu_visible(self):
+        caps = _caps(podman_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            proof = iso.probe_container_gpu_passthrough(caps)
+        self.assertEqual(
+            proof["podman"],
+            {"verified": False, "mode": "hook", "reason": "no_gpu_visible"},
+        )
+
+    def test_nonzero_exit_retains_exit_reason(self):
+        caps = _caps(podman_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=125, stdout="", stderr="hook unavailable"
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            proof = iso.probe_container_gpu_passthrough(caps)
+        self.assertEqual(proof["podman"]["reason"], "probe_exit_125")
+
+    def test_only_recoverable_proof_failures_are_retried(self):
+        transient = _caps(docker_usable=True, gpu_indices=(0,))
+        transient = iso.replace(
+            transient,
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "probe_timeout"}
+            },
+        )
+        no_host_gpu = iso.replace(
+            _caps(docker_usable=True),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
+            },
+        )
+        self.assertTrue(iso.container_gpu_passthrough_needs_retry(transient))
+        self.assertFalse(iso.container_gpu_passthrough_needs_retry(no_host_gpu))
+
     def test_false_when_spec_dir_missing_or_empty(self):
         with tempfile.TemporaryDirectory() as d:
             missing = os.path.join(d, "nonexistent")
@@ -1291,7 +1409,8 @@ class TestCapabilitiesInventory(unittest.TestCase):
             systemd_run_path="/usr/bin/systemd-run",
         )
         inv = iso.capabilities_inventory(caps)
-        self.assertTrue(all(inv.values()))
+        self.assertTrue(all(value for key, value in inv.items() if key != "enroot_ok"))
+        self.assertFalse(inv["enroot_ok"])
         self.assertEqual(set(inv), self._EXPECTED_KEYS)
 
     def test_bwrap_ok_reflects_userns_property_semantics(self):
@@ -1311,7 +1430,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
         )
         inv = iso.capabilities_inventory(caps)
         self.assertTrue(inv["apptainer_ok"])
-        self.assertTrue(inv["enroot_ok"])
+        self.assertFalse(inv["enroot_ok"])
         self.assertTrue(inv["systemd_run_ok"])
 
     def test_empty_caps_all_false(self):

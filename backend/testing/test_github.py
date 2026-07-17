@@ -4281,6 +4281,40 @@ async def test_create_pull_request_posts_when_no_existing_pr(mocker):
 
 
 @pytest.mark.asyncio
+async def test_open_pr_head_lookup_rejects_ambiguous_matches(mocker):
+    """Lifecycle rebinding must not pick arbitrarily between duplicate open PRs."""
+    from app.github import get_open_pull_request_for_head_branch
+
+    duplicate_a = {
+        "number": 124,
+        "head": {"ref": "feat/duplicate"},
+        "base": {"ref": "automain"},
+    }
+    duplicate_b = {
+        "number": 125,
+        "head": {"ref": "feat/duplicate"},
+        "base": {"ref": "automain"},
+    }
+    mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, [duplicate_a, duplicate_b]),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_open_pull_request_for_head_branch(
+            "token",
+            "owner",
+            "repo",
+            "feat/duplicate",
+            "automain",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert "ambiguous" in str(exc_info.value.detail).lower()
+
+
+@pytest.mark.asyncio
 async def test_create_pull_request_precheck_error_refuses_post(mocker):
     """FAIL-CLOSED (WI-3): a failing pre-check lookup is UNCERTAIN, not
     "no existing PR". create_pull_request must REFUSE to POST (a POST here could

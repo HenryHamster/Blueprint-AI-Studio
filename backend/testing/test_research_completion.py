@@ -6908,6 +6908,140 @@ async def test_apply_post_spawn_state_no_degradation_on_clean_task(db_session, m
 
 
 @_pytest.mark.asyncio
+async def test_apply_post_spawn_state_records_quality_grader_verdict(db_session):
+    """apply_post_spawn_state must fold quality_grader_verdict from task.context
+    into the direction's research_history entry when the verdict is present."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-pass"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": True,
+            "reason": "findings are well-grounded",
+            "grader_task_id": "grader-aaa",
+            "strategy": "forward-quality",
+        },
+    }
+    finding = _make_finding("QG verdict finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" in last_entry, (
+        f"quality_grader_verdict missing from history entry: {last_entry}"
+    )
+    assert last_entry["quality_grader_verdict"]["passed"] is True
+    assert last_entry["quality_grader_verdict"]["reason"] == "findings are well-grounded"
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_records_quality_grader_failed_verdict(db_session):
+    """apply_post_spawn_state must record a failed quality_grader_verdict too."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-fail"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": False,
+            "reason": "findings lack actionable evidence",
+            "grader_task_id": "grader-bbb",
+            "strategy": "forward-quality",
+        },
+    }
+    finding = _make_finding("QG verdict failed finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv-fail")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" in last_entry
+    assert last_entry["quality_grader_verdict"]["passed"] is False
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_omits_quality_grader_when_absent(db_session):
+    """apply_post_spawn_state must NOT add quality_grader_verdict when the task
+    context has no quality grader result (legacy or ungraded research)."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-absent"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        # No QUALITY_GRADER_VERDICT_KEY
+    }
+    task.context.pop(QUALITY_GRADER_VERDICT_KEY, None)
+    finding = _make_finding("No QG finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv-absent")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" not in last_entry, (
+        f"quality_grader_verdict should not be present when absent from task context: {last_entry}"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_capacity_degradation_no_false_positive_on_clean_task(
     db_session, mocker
 ):

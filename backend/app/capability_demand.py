@@ -538,6 +538,8 @@ def missing_demand_prompt_hint(
 def compute_unproven_demanded_capabilities(
     demand_result: dict[str, Any] | None,
     problem_model: dict[str, Any] | None,
+    proof_records: object = None,
+    now: Any = None,
 ) -> list[dict[str, Any]]:
     """Return demand entries whose capability is both demanded AND unproven-working.
 
@@ -548,9 +550,13 @@ def compute_unproven_demanded_capabilities(
         ``ref`` normalizes to a canonical name.
 
       * **Unproven working capabilities** from ``problem_model``: capabilities
-        declared ``working`` whose :func:`working_capability_proof_status` returns
+        declared ``working`` whose :func:`consumer_gate_proof_status` returns
         an evidence status other than ``"proven"`` (i.e. ``unproven`` / ``partial``
         / ``unverified`` / ``contradicted``).
+
+    ``proof_records`` is the platform-authored proof ledger. An absent ledger is
+    empty, so a self-declared ``proven`` evidence ref remains an earn candidate,
+    while a platform proof that survived only in the ledger is excluded.
 
     Each returned demand entry is enriched with the additional key
     ``"proof_status"`` so the caller (the earning loop, the reaper sweep, or the
@@ -559,8 +565,8 @@ def compute_unproven_demanded_capabilities(
     Returns ``[]`` when either input is empty or absent — never raises.
     """
     from app.capability_registry import (
+        consumer_gate_proof_status,
         normalize_capability_name,
-        working_capability_proof_status,
     )
 
     if not demand_result:
@@ -570,7 +576,9 @@ def compute_unproven_demanded_capabilities(
         return []
 
     # Build the proof-status map for working capabilities only.
-    proof_by_name = working_capability_proof_status(problem_model)
+    proof_by_name = consumer_gate_proof_status(
+        problem_model, proof_records, now=now
+    )
     if not proof_by_name:
         return []
 

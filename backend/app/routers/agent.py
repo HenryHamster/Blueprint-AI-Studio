@@ -3845,8 +3845,10 @@ async def claim_task(
                         }
                     )
                 # Safety: drop trailing entries if total exceeds 1500 chars
-                while arch_ctx and len(json.dumps(arch_ctx)) > 1500:
+                serialized = json.dumps(arch_ctx)
+                while len(serialized) > 1500 and arch_ctx:
                     arch_ctx.pop()
+                    serialized = json.dumps(arch_ctx)
                 if arch_ctx:
                     if "project_context" not in response:
                         response["project_context"] = {}
