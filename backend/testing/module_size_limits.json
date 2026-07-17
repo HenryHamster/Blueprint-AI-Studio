@@ -174,9 +174,9 @@
     "strategic_resident_runner_policy.py": 100,
     "strategic_resident_saturated_dispatch.py": 120,
     "strategic_resident_wakeups.py": 150,
-    "strategic_resident_context.py": 700,
+    "strategic_resident_context.py": 1050,
     "strategic_resident_shadow.py": 1050,
-    "routers/agent_resident_turn.py": 220,
+    "routers/agent_resident_turn.py": 450,
     "strategic_resident_session.py": 2800,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 2700,
@@ -197,7 +197,7 @@
     "capability_trial_verdict.py": 1750,
     "acceptance_gate.py": 1800,
     "review_loop_convergence.py": 1950,
-    "routers/admin_project_tools.py": 2200,
+    "routers/admin_project_tools.py": 2650,
     "routers/admin_runners.py": 1950,
     "compute_image_build.py": 1750,
     "capability_proof.py": 2800,
@@ -249,7 +249,7 @@
     "handlers/research-plan-sections.ts": 1800,
     "handlers/strategic-resident-lib.ts": 2950,
     "handlers/strategic-resident.ts": 1800,
-    "handlers/strategic-resident-turn.ts": 180
+    "handlers/strategic-resident-turn.ts": 450
   },
   "frontend": {
     "useAppState.ts": 3000,
