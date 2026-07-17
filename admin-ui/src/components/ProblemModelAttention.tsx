@@ -79,7 +79,8 @@ function PendingItemRow({
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
-          className="shrink-0 p-1 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 rounded text-neutral-600 hover:text-neutral-300 transition"
+          className="shrink-0 p-1 min-h-[44px] md:min-h-0 rounded text-neutral-600 hover:text-neutral-300 transition"
+          style={{ minWidth: 44 }}
           title={expanded ? 'Collapse' : 'Show details'}
           aria-expanded={expanded}
         >
@@ -90,7 +91,8 @@ function PendingItemRow({
             type="button"
             disabled={accepting || dismissing}
             onClick={() => handleAccept()}
-            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+            style={{ minWidth: 44 }}
             title={acceptLabel}
           >
             <Check size={11} />
@@ -107,7 +109,8 @@ function PendingItemRow({
               setDismissing(true);
               try { await onDismiss(answer.trim() || undefined); } finally { setDismissing(false); }
             }}
-            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
+            style={{ minWidth: 44 }}
             title="Mark as resolved without action"
           >
             <X size={11} />
@@ -134,7 +137,8 @@ function PendingItemRow({
                 type="button"
                 disabled={accepting || !answer.trim()}
                 onClick={() => handleAccept(answer.trim())}
-                className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 min-h-[44px] min-w-[44px] md:min-h-0 md:min-w-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+                className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+                style={{ minWidth: 44 }}
               >
                 <Check size={11} />
                 {acceptLabel}

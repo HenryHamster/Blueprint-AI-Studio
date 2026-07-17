@@ -564,8 +564,10 @@ jobs:
           # Extract failed/erroring test IDs from pytest's "short test summary
           # info" section. Fixture setup/teardown regressions are reported as
           # ERROR (not FAILED) and must be compared against the baseline too.
+          # Restrict matches to collected backend node IDs: captured application
+          # logs can legitimately start with ERROR while the test still passes.
           extract_failures() {
-            grep -E "^(FAILED|ERROR) " test-output.txt | sed -E 's/^(FAILED|ERROR) //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+            grep -E "^(FAILED|ERROR) testing/[^[:space:]]+::" test-output.txt | sed -E 's/^(FAILED|ERROR) //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
           }
           run_shard; pytest_status=$?
           extract_failures
@@ -575,7 +577,7 @@ jobs:
           # the shard ONCE so a transient crash self-heals instead of writing the
           # sentinel, which always counts as net-new and blocks the promotion gate
           # (the crash-sentinel wedge). Real FAILED lines are NOT retried — a
-          # genuine regression fails fast on the first run.
+          # genuine FAILED or ERROR result fails fast on the first run.
           if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
             echo "::warning::shard ${{ matrix.shard }} exited $pytest_status with no FAILED/ERROR summary (crash/hang) — retrying once"
             run_shard; pytest_status=$?
