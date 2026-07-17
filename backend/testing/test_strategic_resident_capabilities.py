@@ -29,6 +29,36 @@ from app.strategic_resident_task_inspection import (
 )
 
 
+def test_inspection_capability_kinds_match_real_capabilities():
+    """Every INSPECTION_CAPABILITY_KINDS key must be a real inspect capability_id.
+
+    A stale/typo'd key silently drops that inspection's revisioned evidence from
+    the trusted-evidence index (fail-closed) the moment inspection receipts are
+    written, so guard the map against drift and duplicate operation_kinds.
+    """
+    from app.strategic_resident_evidence_policy import INSPECTION_CAPABILITY_KINDS
+
+    inspect_ids = {
+        item.capability_id
+        for item in RESIDENT_CAPABILITIES
+        if item.mode is CapabilityMode.inspect
+    }
+    unknown = set(INSPECTION_CAPABILITY_KINDS) - inspect_ids
+    assert not unknown, f"map references non-existent inspect capabilities: {sorted(unknown)}"
+    # The five task inspections that actually produce evidence today must be mapped.
+    invokable = {
+        "task.inspect",
+        "task.logs.inspect",
+        "task.failure.inspect",
+        "task.provider.inspect",
+        "task.lineage.inspect",
+    }
+    assert invokable <= set(INSPECTION_CAPABILITY_KINDS)
+    # operation_kind values are the receipt contract — they must be distinct.
+    kinds = list(INSPECTION_CAPABILITY_KINDS.values())
+    assert len(kinds) == len(set(kinds)), "duplicate operation_kind in the map"
+
+
 def test_capability_registry_declares_complete_safety_contracts():
     assert len({item.capability_id for item in RESIDENT_CAPABILITIES}) == len(
         RESIDENT_CAPABILITIES

@@ -31,20 +31,26 @@ EVIDENCE_KINDS = frozenset(
         "other",
     }
 )
+# Maps a declared inspection capability_id (see ``strategic_resident_capabilities``)
+# to the ``operation_kind`` a receipt for that inspection must carry, so that
+# ``build_trusted_evidence_index`` only trusts revisioned evidence whose receipt
+# was written by the matching capability. EVERY key MUST be a real inspection
+# capability_id — a stale/typo'd key silently drops that inspection's evidence
+# from the trusted index (fail-closed), which is only observable once inspection
+# receipts are written. ``test_inspection_capability_kinds_match_real_capabilities``
+# guards against drift.
 INSPECTION_CAPABILITY_KINDS = {
-    "project.inspect": "inspect_project",
     "task.inspect": "inspect_task",
-    "task_log.inspect": "inspect_task_log",
-    "failure.inspect": "inspect_failure",
-    "provider.inspect": "inspect_provider",
+    "task.logs.inspect": "inspect_task_log",
+    "task.failure.inspect": "inspect_failure",
+    "task.provider.inspect": "inspect_provider",
+    "task.lineage.inspect": "inspect_task_lineage",
     "runner.inspect": "inspect_runner",
     "pipeline.inspect": "inspect_pipeline",
     "qualification.inspect": "inspect_qualification",
     "pr.inspect": "inspect_pr",
-    "ci.inspect": "inspect_ci",
+    "ci.run.inspect": "inspect_ci",
     "deployment.inspect": "inspect_deployment",
-    "artifact.inspect": "inspect_artifact",
-    "message.inspect": "inspect_message",
 }
 SUCCESSFUL_INSPECTION_STATUSES = frozenset({"applied", "reconciled"})
 

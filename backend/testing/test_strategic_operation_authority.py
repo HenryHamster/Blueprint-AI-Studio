@@ -245,7 +245,7 @@ async def test_operation_context_hash_is_derived_and_persisted(authority_db):
         **{
             **request.__dict__,
             "operation_kind": "inspect_ci",
-            "capability": "ci.inspect",
+            "capability": "ci.run.inspect",
         }
     )
 
