@@ -2556,10 +2556,23 @@ def test_probe_key_continuity_fails_closed_for_incompatible_key(monkeypatch):
     a canonical reference ciphertext with the CURRENT key; if the key has been rotated
     without re-encrypting at-rest data, InvalidToken fires and a RuntimeError is raised
     so the service fails closed rather than silently serving the wrong plaintexts.
+
+    The reference ciphertext is KEY-SPECIFIC (source-hardcoding it with a CI key
+    would crash every production boot), so we supply it at test time via monkeypatch
+    of the module-level CONTINUITY_REFERENCE_CIPHERTEXT constant — the same pattern
+    that test_field_encryption.py uses for the TestProbeKeyContinuity suite.
     """
     from cryptography.fernet import Fernet
     import pytest
     from app import field_encryption
+
+    # key_a is the "old" key that encrypted the reference; key_b is the "wrong"
+    # (current) key that cannot decrypt the reference.
+    key_a = Fernet.generate_key()
+    reference_ciphertext = Fernet(key_a).encrypt(
+        field_encryption.CONTINUITY_REFERENCE_PLAINTEXT.encode()
+    ).decode()
+    monkeypatch.setattr(field_encryption, "CONTINUITY_REFERENCE_CIPHERTEXT", reference_ciphertext)
 
     wrong_key = Fernet.generate_key()
     monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", wrong_key.decode())
