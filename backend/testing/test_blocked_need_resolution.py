@@ -578,12 +578,20 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
     )
 
 
-def test_proof_aware_resolver_declared_absorbs_without_marker_is_not_folded():
+def test_proof_aware_resolver_declared_absorbs_without_marker_cannot_inherit_survivor_status():
     """SECURITY: an agent-declared ``absorbs`` with NO platform forwarding marker
-    does NOT fold the old name into the survivor's proof map — the old name is
-    simply absent (no-match), so it cannot inherit the survivor's status."""
+    does NOT allow the old name to inherit the survivor's PROVEN status — the old
+    name appears as ``"unproven"`` (not ``"proven"``) so a need naming it is gated
+    by enforce mode.
+
+    Before the bypass fix, the alias was absent from the proof map (proof_status=None),
+    which capability_need_blocked_by_proof_gate treated as a free pass in enforce mode.
+    After the fix, the alias is ``"unproven"`` — still NOT proven — so enforce blocks it,
+    and the security property holds: a forged absorbs declaration cannot transfer the
+    survivor's proven status to an unverified alias."""
     from app.capability_registry import (
         capability_need_proof_status,
+        capability_need_blocked_by_proof_gate,
         working_capability_proof_status,
     )
 
@@ -598,12 +606,24 @@ def test_proof_aware_resolver_declared_absorbs_without_marker_is_not_folded():
         ]
     )
     proof = working_capability_proof_status(model)  # no ledger, no marker
-    assert (
-        capability_need_proof_status(
-            {"kind": "capability", "ref": "old-harness-name"}, proof
-        )
-        is None
-    ), "a declared-only absorb must not fold the old name into the survivor's proof map"
+
+    # Survivor is proven, but the alias must NOT inherit that status.
+    assert proof.get("unified-harness") == "proven", "survivor must be proven"
+
+    # The alias appears in the map as 'unproven' (not 'proven' — cannot inherit survivor's proof).
+    alias_status = capability_need_proof_status(
+        {"kind": "capability", "ref": "old-harness-name"}, proof
+    )
+    assert alias_status == "unproven", (
+        f"agent-declared absorbs alias must be 'unproven', not 'proven' or None "
+        f"(got {alias_status!r}) — it must not inherit the survivor's proven status"
+    )
+
+    # And enforce mode correctly blocks it (since "unproven" != "proven").
+    need = {"kind": "capability", "ref": "old-harness-name"}
+    assert capability_need_blocked_by_proof_gate(need, proof, mode="enforce"), (
+        "agent-declared absorbs alias must be blocked in enforce mode"
+    )
 
 
 def test_working_capability_proof_status_accepts_dict_form_problem_model():
@@ -965,6 +985,77 @@ def test_blocked_resume_sweep_routes_unproven_by_mode():
         "seeded-evaluation-harness", proof, proof_gate_mode="off"
     )
     assert off["completed_needs"] and not off["residual"]
+
+
+def test_absorbs_alias_without_marker_stays_residual_in_enforce_mode():
+    """SECURITY: an agent-declared absorbs alias that has no platform forwarding
+    marker appears in the proof map as ``"unproven"`` (not absent/None after the
+    fix).  The blocked-resume sweep must leave it in ``residual`` under enforce,
+    not route it to ``completed_needs``.
+
+    Uses ``_classify_capability_need`` with a proof map that simulates what
+    ``working_capability_proof_status`` returns for an absorbs-declared alias with
+    no platform forwarding marker."""
+    # The fix registers absorbs aliases as "unproven" in the proof map;
+    # simulate that here to pin the sweep-side behavior.
+    proof = {"unified-harness": "proven", "old-harness-name": "unproven"}
+    disp = _classify_capability_need(
+        "old-harness-name", proof, proof_gate_mode="enforce"
+    )
+
+    # The unproven alias must NOT satisfy the need under enforce.
+    assert disp["residual"] == [{"kind": "capability", "ref": "old-harness-name"}], (
+        "absorbs alias with unproven status must stay residual in enforce mode"
+    )
+    assert disp["completed_needs"] == []
+
+
+def test_absorbs_alias_without_marker_satisfies_in_observe_mode():
+    """Observe mode treats the same unproven absorbs alias as satisfied — the need
+    routes to completed_needs and does not block the dependent."""
+    proof = {"unified-harness": "proven", "old-harness-name": "unproven"}
+    disp = _classify_capability_need(
+        "old-harness-name", proof, proof_gate_mode="observe"
+    )
+
+    assert disp["completed_needs"] == [{"kind": "capability", "ref": "old-harness-name"}]
+    assert disp["residual"] == []
+
+
+def test_working_capability_proof_status_includes_absorbs_aliases():
+    """Integration: working_capability_proof_status registers agent-declared absorbs
+    aliases as 'unproven' so capability_need_proof_status returns a non-None status
+    for them — the precondition the gate bypass fix depends on."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                # No evidence_refs → the survivor and all aliases are unproven.
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)  # no ledger, no platform marker
+
+    # The alias is in the map (not absent).
+    assert "old-harness-name" in proof, (
+        "absorbs alias must appear in the proof map after the fix"
+    )
+    # The alias reads as unproven (not "proven" — no verification has occurred).
+    assert proof["old-harness-name"] == "unproven"
+
+    # capability_need_proof_status returns "unproven", not None.
+    alias_need = {"kind": "capability", "ref": "old-harness-name"}
+    assert capability_need_proof_status(alias_need, proof) == "unproven", (
+        "proof status for an absorbs alias must be 'unproven', not None — "
+        "None would bypass the enforce gate"
+    )
 
 
 class _StubProject:

@@ -801,6 +801,16 @@ def working_capability_proof_status(
         for name in names:
             if name not in out:
                 out[name] = proof_status
+        # Register agent-declared absorbs aliases that have no platform forwarding
+        # marker so they appear as "unproven" rather than absent. Without this, a
+        # need naming such an alias returns proof_status=None from
+        # capability_need_proof_status, and capability_need_blocked_by_proof_gate
+        # treats None as a free pass (not blocked) — clearing enforce mode with
+        # zero verification. A platform-forwarded alias is already in the map via
+        # forwarded_absorbed above and is not overwritten (if alias not in out).
+        for alias in _normalized_absorbed_names(_absorbs):
+            if alias not in out:
+                out[alias] = "unproven"
     return out
 
 
