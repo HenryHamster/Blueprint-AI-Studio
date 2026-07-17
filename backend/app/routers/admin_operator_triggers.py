@@ -867,7 +867,9 @@ async def trigger_rollup(
                 "status": task.status,
                 "merge_blocked_reason": _hold_reason,
             }
-        merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             (
                 record_pr_merged,

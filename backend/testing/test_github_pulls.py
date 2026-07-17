@@ -11,7 +11,9 @@ Also covers ``merge_pull_request`` (same rate-limit classification, body parsed
 only behind the status check) and ``get_pull_request_reviews_checked`` pagination.
 """
 
+import ast
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
@@ -223,7 +225,9 @@ async def test_merge_pr_hard_rate_limit_403_raises_retryable_503(mocker):
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await github_pulls.merge_pull_request("ghs_token", "owner", "repo", 42)
+        await github_pulls.merge_pull_request(
+            "ghs_token", "owner", "repo", 42, allow_changes_requested=True
+        )
 
     exc = exc_info.value
     assert exc.status_code == 503, "rate limit must NOT be reported as a hard 500"
@@ -250,7 +254,9 @@ async def test_merge_pr_secondary_rate_limit_429_raises_retryable_503(mocker):
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await github_pulls.merge_pull_request("ghs_token", "owner", "repo", 7)
+        await github_pulls.merge_pull_request(
+            "ghs_token", "owner", "repo", 7, allow_changes_requested=True
+        )
 
     assert exc_info.value.status_code == 503
     assert (exc_info.value.headers or {}).get("Retry-After") == "45"
@@ -277,7 +283,9 @@ async def test_merge_pr_html_5xx_body_does_not_raise_jsondecodeerror(mocker):
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await github_pulls.merge_pull_request("ghs_token", "owner", "repo", 99)
+        await github_pulls.merge_pull_request(
+            "ghs_token", "owner", "repo", 99, allow_changes_requested=True
+        )
 
     assert exc_info.value.status_code == 500
     assert "502" in str(exc_info.value.detail)
@@ -294,7 +302,9 @@ async def test_merge_pr_html_body_on_405_still_returns_blocked_shape(mocker):
         new=mocker.AsyncMock(return_value=HtmlBodyResponse(405, text="<html>nope")),
     )
 
-    result = await github_pulls.merge_pull_request("ghs_token", "owner", "repo", 12)
+    result = await github_pulls.merge_pull_request(
+        "ghs_token", "owner", "repo", 12, allow_changes_requested=True
+    )
 
     assert result == {"merged": False, "conflict": False, "message": "Merge failed"}
 
@@ -309,7 +319,9 @@ async def test_merge_pr_success_and_conflict_shapes_unchanged(mocker):
         "app.github._github_request",
         new=mocker.AsyncMock(return_value=MockResponse(200, {"message": "Merged"})),
     )
-    assert await github_pulls.merge_pull_request("t", "o", "r", 1) == {
+    assert await github_pulls.merge_pull_request(
+        "t", "o", "r", 1, allow_changes_requested=True
+    ) == {
         "merged": True,
         "message": "Merged",
     }
@@ -320,12 +332,139 @@ async def test_merge_pr_success_and_conflict_shapes_unchanged(mocker):
             return_value=MockResponse(409, {"message": "Merge conflict"})
         ),
     )
-    assert await github_pulls.merge_pull_request("t", "o", "r", 2) == {
+    assert await github_pulls.merge_pull_request(
+        "t", "o", "r", 2, allow_changes_requested=True
+    ) == {
         "merged": False,
         "conflict": True,
         "message": "Merge conflict",
     }
 
+
+def test_changes_requested_override_is_limited_to_explicit_operator_lanes():
+    """Autonomous merge callers may not opt out of the external-review veto."""
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+    overrides = set()
+    for source_path in app_dir.rglob("*.py"):
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        for function in (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ):
+            for call in (
+                node for node in ast.walk(function) if isinstance(node, ast.Call)
+            ):
+                called = (
+                    call.func.id
+                    if isinstance(call.func, ast.Name)
+                    else call.func.attr
+                    if isinstance(call.func, ast.Attribute)
+                    else ""
+                )
+                if called != "merge_pull_request":
+                    continue
+                override = next(
+                    (
+                        keyword.value
+                        for keyword in call.keywords
+                        if keyword.arg == "allow_changes_requested"
+                    ),
+                    None,
+                )
+                if override is None:
+                    continue
+                assert isinstance(override, ast.Constant) and override.value is True
+                overrides.add(
+                    (source_path.relative_to(app_dir).as_posix(), function.name)
+                )
+
+    assert overrides == {
+        ("admin_task_mutations.py", "_handle_rollup_pr_approval"),
+        ("admin_task_mutations.py", "_merge_critical_pr"),
+        ("routers/admin_operator_triggers.py", "trigger_rollup"),
+    }
+
+@pytest.mark.asyncio
+async def test_merge_pr_default_vetoes_changes_requested_before_put(mocker):
+    from app import github_pulls
+
+    decision_mock = mocker.patch(
+        "app.github_pulls.get_pull_request_review_decision",
+        new=AsyncMock(return_value="CHANGES_REQUESTED"),
+    )
+    request_mock = mocker.patch("app.github._github_request", new=AsyncMock())
+
+    result = await github_pulls.merge_pull_request("t", "o", "r", 42)
+
+    assert result == {
+        "merged": False,
+        "conflict": False,
+        "review_veto": True,
+        "message": "GitHub has outstanding changes requested",
+    }
+    decision_mock.assert_awaited_once()
+    request_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("decision", [None, "APPROVED"])
+async def test_merge_pr_cleared_or_absent_review_decision_allows_put(mocker, decision):
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github_pulls.get_pull_request_review_decision",
+        new=AsyncMock(return_value=decision),
+    )
+    request_mock = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, {"message": "Merged"})),
+    )
+
+    result = await github_pulls.merge_pull_request("t", "o", "r", 42)
+
+    assert result["merged"] is True
+    assert request_mock.await_args.args[0] == "PUT"
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_review_decision_lookup_failure_never_reaches_put(mocker):
+    from app import github_pulls
+
+    mocker.patch(
+        "app.github_pulls.get_pull_request_review_decision",
+        new=AsyncMock(
+            side_effect=HTTPException(status_code=502, detail="unavailable")
+        ),
+    )
+    request_mock = mocker.patch("app.github._github_request", new=AsyncMock())
+
+    with pytest.raises(HTTPException) as exc_info:
+        await github_pulls.merge_pull_request("t", "o", "r", 42)
+
+    assert exc_info.value.status_code == 502
+    request_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_merge_pr_operator_override_is_explicit_and_skips_veto_lookup(mocker):
+    from app import github_pulls
+
+    decision_mock = mocker.patch(
+        "app.github_pulls.get_pull_request_review_decision", new=AsyncMock()
+    )
+    request_mock = mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=MockResponse(200, {"message": "Merged"})),
+    )
+
+    result = await github_pulls.merge_pull_request(
+        "t", "o", "r", 42, allow_changes_requested=True
+    )
+
+    assert result["merged"] is True
+    decision_mock.assert_not_awaited()
+    assert request_mock.await_args.args[0] == "PUT"
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", [None, "APPROVED", "CHANGES_REQUESTED"])

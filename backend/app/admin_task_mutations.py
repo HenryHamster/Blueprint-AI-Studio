@@ -614,7 +614,9 @@ async def _handle_rollup_pr_approval(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             _project = await session.get(Project, task.project_id)
             base_branch = (task.first_payload).get(
@@ -910,7 +912,9 @@ async def _merge_critical_pr(
             )
             raise HTTPException(status_code=409, detail=detail)
 
-        merge_result = await merge_pull_request(gh_token, owner, repo, pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             record_pr_merged = await merged_pr_counts_as_integration_landing(
                 task,

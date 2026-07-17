@@ -849,6 +849,8 @@ async def merge_pull_request(
     pr_number: int,
     merge_method: str = "squash",
     project_id: str | None = None,
+    *,
+    allow_changes_requested: bool = False,
 ) -> dict:
     """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict.
 
@@ -863,7 +865,30 @@ async def merge_pull_request(
     error page from GitHub's edge is not JSON, and the previous unconditional
     ``response.json()`` on the raw response raised a bare ``JSONDecodeError``
     that no caller handles.
+
+    Autonomous callers fail closed on GitHub's aggregate ``reviewDecision``:
+    ``CHANGES_REQUESTED`` returns a distinct non-merge result before the PUT,
+    and an unavailable decision lookup raises. Only explicit human/operator
+    approval lanes may set ``allow_changes_requested=True``; a static invariant
+    pins that override allowlist.
     """
+    if not allow_changes_requested:
+        decision = await get_pull_request_review_decision(
+            token, owner, repo, pr_number, project_id=project_id
+        )
+        if decision == "CHANGES_REQUESTED":
+            logger.info(
+                "[PR] Merge held for PR #%s — GitHub reviewDecision is "
+                "CHANGES_REQUESTED",
+                pr_number,
+            )
+            return {
+                "merged": False,
+                "conflict": False,
+                "review_veto": True,
+                "message": "GitHub has outstanding changes requested",
+            }
+
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/vnd.github.v3+json",
