@@ -9,7 +9,7 @@
 migration, locking, latency, provider-boundary, and affected-suite review/fix
 loops converged. M3 adds typed operations and revision-safe human-tool handoff;
 its capability-boundedness inspection contract converged and it was rebased onto
-`origin/automain` `02661c0d9` (ArtifactRef migration re-chained to `0629`).
+`origin/automain` `d3031e3c4` (ArtifactRef migration re-chained to `0630`).
 
 This plan tracks the migration from disposable Resident sessions to one durable,
 project-owned Strategic Resident. It is intentionally separate from the historical
@@ -268,11 +268,13 @@ Current implementation checklist:
 
 Post-rebase evidence:
 
-- Rebased onto `origin/automain` at `02661c0d9`. automain landed
-  `0628_backfill_github_oauth_token_encrypted`, so the M3 ArtifactRef migration
-  is re-chained as `0629_project_tool_artifact_refs` (down_revision `0628`) with
-  `EXPECTED_SCHEMA_REVISION` bumped to `0629`; the migration-chain and
-  divergence gates report one linear head (`152 passed`).
+- Rebased onto `origin/automain` at `d3031e3c4`. automain landed migrations
+  through `0629_ix_computejob_completed_at`, so the M3 ArtifactRef migration is
+  re-chained as `0630_project_tool_artifact_refs` (down_revision `0629`) with
+  `EXPECTED_SCHEMA_REVISION` bumped to `0630`; the migration-chain and
+  divergence gates report one linear head. The `storage.py` import block and the
+  `iam.tf` artifact bucket lifecycle rules were merge-resolved (artifact-refs/
+  is retained by not matching any lifecycle rule).
 - Focused affected suites are green under SQLite: capability/inspection,
   lineage, runtime/context, and ArtifactRef promotion (`72 passed`, one
   PostgreSQL-only concurrency skip), plus the new mutation-proved

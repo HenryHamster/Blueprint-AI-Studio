@@ -203,7 +203,8 @@
     "capability_proof.py": 2800,
     "plan_completion.py": 1750,
     "migration_apply_gate.py": 2150,
-    "capability_registry.py": 1750
+    "capability_registry.py": 1750,
+    "storage.py": 1750
   },
   "agent": {
     "index.ts": 4600,

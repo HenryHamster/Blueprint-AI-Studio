@@ -1,7 +1,7 @@
 """Add immutable human-tool ArtifactRefs.
 
-Revision ID: 0629
-Revises: 0628
+Revision ID: 0630
+Revises: 0629
 Create Date: 2026-07-17
 """
 
@@ -12,8 +12,8 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision = "0629"
-down_revision = "0628"
+revision = "0630"
+down_revision = "0629"
 branch_labels = None
 depends_on = None
 
