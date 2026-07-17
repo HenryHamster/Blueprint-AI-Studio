@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react';
 import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
 import { authGet, fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
@@ -13,6 +13,11 @@ vi.mock('../firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
 }));
+
+// This file tests drawer data flow, not the separately-covered lazy Markdown renderer.
+// Keep assertions independent of dynamic chunk scheduling under the full Vitest pool.
+vi.mock('./MarkdownContent', () => ({ MarkdownContent: ({ content }: { content: string }) => <div>{content}</div> }));
+
 
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
@@ -1136,10 +1141,19 @@ describe('DetailsTab — Knowledge Document', () => {
 
   it('fetches and renders the full document body on demand', async () => {
     const { fetchKnowledgeDocument } = await import('../api');
+    let resolveDocument!: (document: { id: string; body: string }) => void;
+    const fullDocument = new Promise<{ id: string; body: string }>((resolve) => {
+      resolveDocument = resolve;
+    });
+    vi.mocked(fetchKnowledgeDocument).mockReturnValue(fullDocument as never);
     render(<DetailsTab task={knowledgeTask()} />);
-    fireEvent.click(screen.getByText('View document'));
+    await act(async () => {
+      fireEvent.click(screen.getByText('View document'));
+      resolveDocument({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' });
+      await fullDocument;
+    });
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
-    expect(await screen.findByText(/Detailed markdown/, {}, { timeout: 3000 })).toBeInTheDocument();
+    expect(screen.getByText(/Detailed markdown/)).toBeInTheDocument();
   });
 
   it('surfaces live-proof release evidence (promoted SHA + serving status) after the full-doc fetch', async () => {

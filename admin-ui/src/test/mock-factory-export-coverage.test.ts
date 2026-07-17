@@ -910,9 +910,10 @@ describe('mock-factory-export-coverage', () => {
       ['./useEfficiencySnapshot-mock-complete', 'createUseEfficiencySnapshotMock', '../hooks/useEfficiencySnapshot', 'useEfficiencySnapshot-mock-complete.ts'],
     ];
 
-    // Collect source module runtime exports for use in both tier 1 and tier 2.
-    // Key = module tail (last path segment), Value = Set of runtime export names.
-    const runtimeExportsByTail = new Map<string, Set<string>>();
+    // Reuse authoritative tier-1 imports in tier 2. Importing the same large
+    // barrels again made this repository-wide guard contend with the full test
+    // pool and exceed its timeout nondeterministically.
+    const runtimeExportsByPath = new Map<string, Set<string>>();
 
     for (const [helperPath, fnName, sourcePath, label] of helperChecks) {
       // Load the helper factory
@@ -944,9 +945,11 @@ describe('mock-factory-export-coverage', () => {
         sourceExports = extractRuntimeExportsFromText(srcFilePath);
       }
 
-      // Cache for tier 2 scanner (keyed by module tail)
-      const tail = sourcePath.split('/').pop() ?? '';
-      runtimeExportsByTail.set(tail, sourceExports);
+      const helperTestFile = path.join(SRC_DIR, 'test', 'mock-factory-export-coverage.test.ts');
+      const resolvedSourcePath = resolveRealSrcModule(helperTestFile, sourcePath);
+      if (resolvedSourcePath) {
+        runtimeExportsByPath.set(resolvedSourcePath, sourceExports);
+      }
 
       for (const exportName of sourceExports) {
         if (!factoryKeys.has(exportName)) {
@@ -975,16 +978,13 @@ describe('mock-factory-export-coverage', () => {
     // Live map used to regenerate the grandfathering baseline
     // (relTestFile -> moduleSpec -> currently-omitted exports).
     const liveMissing: Record<string, Record<string, string[]>> = {};
-    // Cache real-module exports across test files that mock the same module.
-    const exportsByPath = new Map<string, Set<string>>();
-
     for (const file of testFiles) {
       const mockFindings = findInlineMockFindings(file);
       for (const finding of mockFindings) {
-        let sourceExports = exportsByPath.get(finding.resolvedPath);
+        let sourceExports = runtimeExportsByPath.get(finding.resolvedPath);
         if (!sourceExports) {
           sourceExports = await loadRuntimeExportsForPath(finding.resolvedPath);
-          exportsByPath.set(finding.resolvedPath, sourceExports);
+          runtimeExportsByPath.set(finding.resolvedPath, sourceExports);
         }
 
         const rel = path.relative(SRC_DIR, finding.file).replaceAll(path.sep, '/');
