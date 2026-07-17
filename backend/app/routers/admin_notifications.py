@@ -42,7 +42,7 @@ from app.admin import (
 )
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
-from app.message_audience import operator_visible_audience_filter
+from app.message_audience import operator_visible_alert_filter, operator_visible_audience_filter
 from app.project_message_creation import (
     create_operator_project_message,
     lock_project_and_next_message_sequence,
@@ -417,6 +417,7 @@ async def get_alerts(
     query = (
         select(Alert)
         .where(Alert.project_id.in_(_user_project_ids(current_user["user_id"])))
+        .where(operator_visible_alert_filter(Alert.event_type))
         .order_by(Alert.created_at.desc())
     )
     if project_id:

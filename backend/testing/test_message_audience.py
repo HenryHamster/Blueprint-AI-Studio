@@ -72,6 +72,33 @@ def test_route_event_criterion_mutations_maps_to_operator_action_needed():
     assert route_event("criterion_superseded") == OPERATOR_ACTION_NEEDED
 
 
+def test_route_event_directly_authored_escalations_are_operator_facing():
+    """Directly-authored operator escalations (previously unregistered → NULL
+    audience, fail-OPEN) now resolve to their intended operator audience so the
+    emitter stamp is fail-closed, not read-side NULL fall-through."""
+    # BLOCKER / attention escalations need operator action.
+    assert route_event("handmerge_pr_preserved") == OPERATOR_ACTION_NEEDED
+    assert route_event("unsafe_branch_configuration") == OPERATOR_ACTION_NEEDED
+    assert (
+        route_event("review_fix_lane_gate_integrity_violation")
+        == OPERATOR_ACTION_NEEDED
+    )
+    # Lane-pilot lifecycle WARNING notices remain operator-visible (fyi).
+    for event_type in (
+        "lane_killed_exhausted",
+        "lane_killed_stranded",
+        "lane_checkpoint_recover",
+        "lane_budget_near_exhausted",
+        "pilot_auto_disabled",
+    ):
+        assert route_event(event_type) == OPERATOR_FYI, event_type
+    # Being operator-visible, none are in the non-operator exclusion set.
+    non_operator = get_non_operator_event_types()
+    assert "handmerge_pr_preserved" not in non_operator
+    assert "unsafe_branch_configuration" not in non_operator
+    assert "lane_killed_exhausted" not in non_operator
+
+
 def test_route_event_capability_proof_gate_graduation_split_by_mode():
     """Gate auto-graduation splits audience by target mode: observe is FYI,
     enforce (which begins blocking spawns/promotion) needs operator attention."""
@@ -625,6 +652,13 @@ def test_stamp_message_audience_handles_none_context():
 _AUDIENCE_STAMP_CALLS = frozenset({"stamp_message_audience", "route_event"})
 _OPERATOR_REACHING_FROM_TYPES: frozenset[str] = frozenset({"system", "agent", "strategic"})
 
+# Both the raw model constructor and the canonical builder produce a
+# ``ProjectMessage`` row.  ``build_project_message`` does NOT stamp an audience
+# itself (it only resolves surface/handling_state), so every operator-reaching
+# call of EITHER must stamp the audience in its enclosing function — otherwise
+# the row lands with a NULL audience that the read filter fails OPEN on.
+_MESSAGE_BUILDER_CALLS = frozenset({"ProjectMessage", "build_project_message"})
+
 
 def _ast_called_name(call: ast.Call) -> str | None:
     """Return the bare callee name for ``foo(...)`` or ``mod.foo(...)``."""
@@ -659,8 +693,8 @@ def _collect_ungated_emitters(source: str, *, filename: str, rel: str) -> list[s
         return defaults
 
     def _is_operator_reaching_message_call(node: ast.Call, enclosing) -> bool:
-        """A ProjectMessage(...) construction whose ``from_type`` provably reaches
-        the operator surface (system/agent/strategic).
+        """A ProjectMessage(...)/build_project_message(...) construction whose
+        ``from_type`` provably reaches the operator surface (system/agent/strategic).
 
         ``from_type`` is operator-reaching when it is either a literal constant in
         the operator-reaching set, OR a bare parameter reference whose *default*
@@ -670,7 +704,7 @@ def _collect_ungated_emitters(source: str, *, filename: str, rel: str) -> list[s
         skipped even though its default reaches the operator. A parameter with no
         resolvable constant default stays skipped (its runtime value is unknown at
         scan time)."""
-        if _ast_called_name(node) != "ProjectMessage":
+        if _ast_called_name(node) not in _MESSAGE_BUILDER_CALLS:
             return False
         param_defaults = _param_defaults(enclosing) if enclosing is not None else {}
         for kw in node.keywords:
@@ -701,7 +735,7 @@ def _collect_ungated_emitters(source: str, *, filename: str, rel: str) -> list[s
 
     offenders: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or _ast_called_name(node) != "ProjectMessage":
+        if not isinstance(node, ast.Call) or _ast_called_name(node) not in _MESSAGE_BUILDER_CALLS:
             continue
         enclosing = None
         for fn in funcs:
@@ -978,30 +1012,91 @@ def test_scan_skips_defaulted_user_from_type():
     assert offenders == []
 
 
-def test_no_operator_visible_emitter_bypasses_audience_gate():
-    """Whole-file invariant: every operator-reaching ProjectMessage constructed in
-    notification_dispatch.py routes its audience through the shared gate.
+# Modules with directly-authored operator-reaching ProjectMessage/build_project_message
+# sites.  notification_dispatch.py is the original choke-point; the other three
+# construct their escalation/attention rows via ``build_project_message`` and used
+# to land them with a NULL audience (fail-OPEN) — they now stamp at the emitter.
+_MODULES_WITH_OPERATOR_MESSAGES = [
+    "notification_dispatch.py",
+    "review_loop_convergence.py",
+    "branch_resolution.py",
+    "review_fix_lane_pilot.py",
+]
 
-    Exercises the production stamping seam: reverting any of the seven
-    escalation-poster stamps (or adding a new raw operator-reaching
-    ProjectMessage) makes this scan flag the offending site and fail CI.
+
+def test_scan_flags_unstamped_build_project_message():
+    """A build_project_message(...) call (the canonical builder) with an
+    operator-reaching from_type and no audience stamp is flagged — the builder
+    does NOT stamp on its own, so the emitter must."""
+    source = dedent(
+        """
+        async def post_thing(session, project_id, content):
+            return await build_project_message(
+                session,
+                project_id=project_id,
+                from_type="system",
+                content=content,
+                context={"event_type": "some_escalation"},
+            )
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == [
+        "  synthetic.py:3 in post_thing() — operator-reaching ProjectMessage site not "
+        "routed through the audience gate (no stamp_message_audience/route_event call)"
+    ]
+
+
+def test_scan_accepts_stamped_build_project_message():
+    """A build_project_message(...) call whose function stamps passes."""
+    source = dedent(
+        """
+        async def post_thing(session, project_id, content):
+            ctx = stamp_message_audience({"x": 1}, "some_escalation")
+            return await build_project_message(
+                session,
+                project_id=project_id,
+                from_type="system",
+                content=content,
+                context=ctx,
+            )
+        """
+    )
+    offenders = _collect_ungated_emitters(
+        source, filename="synthetic.py", rel="synthetic.py"
+    )
+    assert offenders == []
+
+
+def test_no_operator_visible_emitter_bypasses_audience_gate():
+    """Whole-file invariant: every operator-reaching ProjectMessage /
+    build_project_message construction in the message-authoring modules routes its
+    audience through the shared gate.
+
+    Exercises the production stamping seam: reverting any escalation/attention
+    poster stamp (or adding a new operator-reaching row via the raw model
+    constructor OR the canonical ``build_project_message`` builder) makes this
+    scan flag the offending site and fail CI.
     """
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
-    fpath = os.path.join(app_dir, "notification_dispatch.py")
-    with open(fpath, encoding="utf-8") as f:
-        source = f.read()
-
-    offenders = _collect_ungated_emitters(
-        source, filename=fpath, rel="notification_dispatch.py"
-    )
-    assert not offenders, (
-        "Found operator-reaching ProjectMessage site(s) in notification_dispatch.py "
-        "that do NOT route their audience through the shared gate "
+    all_offenders: list[str] = []
+    for module_name in _MODULES_WITH_OPERATOR_MESSAGES:
+        fpath = os.path.join(app_dir, module_name)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_ungated_emitters(source, filename=fpath, rel=module_name)
+        )
+    assert not all_offenders, (
+        "Found operator-reaching ProjectMessage/build_project_message site(s) that "
+        "do NOT route their audience through the shared gate "
         "(stamp_message_audience/route_event). Every operator-reaching emitter must "
         "be stamped so a fail-closed audience classification is guaranteed:\n"
-        + "\n".join(offenders)
+        + "\n".join(all_offenders)
     )
 
 
@@ -1300,6 +1395,7 @@ _DOMAIN_MODULES_WITH_ALERTS = [
     "branch_cleanup.py",
     "direction_lifecycle.py",
     "warm_pool_maintainer.py",
+    "branch_resolution.py",
 ]
 
 

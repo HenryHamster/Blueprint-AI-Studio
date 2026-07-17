@@ -88,6 +88,31 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # Criterion mutation removes/replaces a quality gate → operator-action-needed
     "criterion_retracted": OPERATOR_ACTION_NEEDED,
     "criterion_superseded": OPERATOR_ACTION_NEEDED,
+    # Directly-authored operator escalations (previously unregistered → landed
+    # with a NULL audience that both read filters fail OPEN on).  Registering
+    # them with their intended, operator-facing audience makes the audience gate
+    # structurally fail-closed at the emitter: the message is stamped by
+    # ``stamp_message_audience`` at construction instead of relying on the
+    # read-side NULL fall-through.
+    #
+    # review_loop_convergence._create_handmerge_attention_message: a preserved
+    # hand-merge PR needs the operator to merge it by hand.
+    "handmerge_pr_preserved": OPERATOR_ACTION_NEEDED,
+    # branch_resolution.signal_unsafe_branch_configuration: a blocking-class
+    # branch-safety BLOCKER — fleet work would route to the promotion target.
+    "unsafe_branch_configuration": OPERATOR_ACTION_NEEDED,
+    # review_fix_lane_pilot.raise_gate_integrity_alert: a non-negotiable
+    # gate-integrity violation BLOCKER.
+    "review_fix_lane_gate_integrity_violation": OPERATOR_ACTION_NEEDED,
+    # review_fix_lane_pilot.emit_lane_event_message: per-lane terminal/degraded
+    # WARNING notices the operator currently sees.  Kept operator-fyi to preserve
+    # their current visibility while closing the structural NULL hole; a later
+    # messaging-redesign task may reclassify lane bookkeeping to strategist-internal.
+    "lane_killed_exhausted": OPERATOR_FYI,
+    "lane_killed_stranded": OPERATOR_FYI,
+    "lane_checkpoint_recover": OPERATOR_FYI,
+    "lane_budget_near_exhausted": OPERATOR_FYI,
+    "pilot_auto_disabled": OPERATOR_FYI,
     # === Alert event types (from alert_policy.ALERT_EVENT_POLICIES) =======
     # Core portable alerts — operator-facing
     "task.failed": OPERATOR_FYI,
