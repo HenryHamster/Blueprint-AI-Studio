@@ -810,6 +810,48 @@ def test_cap_bump_resolves_messages_panel_tsx_breach():
     )
 
 
+def test_cap_bump_resolves_orchestrator_ci_monitor_breach():
+    """After bumping caps via check_size_limits --fix, orchestrator_ci_monitor.py
+    must be within its new cap on the real file tree.
+
+    This is the breach the 2026-07-17 ci-compliance remediation targets: automain
+    HEAD 5203c5fd reported backend/orchestrator_ci_monitor.py at 3069 lines over
+    its old cap of 3000. The fix bumps that cap to 3550 in module_size_limits.json;
+    this merge-test gate proves the bumped JSON is consistent with the actual file
+    size on disk, so the test fails if the cap is reverted (or the file grows past
+    the new cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "orchestrator_ci_monitor.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+
+    # Resolve app/ as testing/'s sibling, matching the Docker harness layout.
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_cap_bump_resolves_strategic_state_api_breach():
     """After bumping caps via check_size_limits --fix,
     frontend/strategicStateApi.ts must be within its new cap on the real file
