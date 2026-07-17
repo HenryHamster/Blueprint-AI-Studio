@@ -1244,7 +1244,7 @@ async def test_fabricated_operation_receipt_is_rejected(db_session):
         await _resident_turn_rows(db_session)
     )
     result = _turn_result()
-    result["operations"] = [_operation("op-1", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("op-1", "ci.run.inspect", "reconciled")]
     result["receipts"] = [
         {
             "operation_id": "op-1",
@@ -1271,7 +1271,7 @@ async def test_matching_durable_operation_receipt_is_accepted(db_session):
         authority_generation=7,
         operation_id="op-1",
         operation_kind="inspect_ci",
-        capability="ci.inspect",
+        capability="ci.run.inspect",
         risk_level="low",
         request_hash="a" * 64,
         status="reconciled",
@@ -1279,7 +1279,7 @@ async def test_matching_durable_operation_receipt_is_accepted(db_session):
     db_session.add(receipt)
     await db_session.commit()
     result = _turn_result()
-    result["operations"] = [_operation("op-1", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("op-1", "ci.run.inspect", "reconciled")]
     result["receipts"] = [
         {
             "operation_id": "op-1",
@@ -1309,7 +1309,7 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         authority_generation=7,
         operation_id="op-inspection",
         operation_kind="inspect_ci",
-        capability="ci.inspect",
+        capability="ci.run.inspect",
         risk_level="low",
         request_hash="8" * 64,
         expected_revisions={"context_hash": context_hash},
@@ -1337,7 +1337,7 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         checksum="7" * 64,
     )
     result["operations"] = [
-        _operation("op-inspection", "ci.inspect", "reconciled")
+        _operation("op-inspection", "ci.run.inspect", "reconciled")
     ]
     result["receipts"] = [
         {
@@ -1374,10 +1374,10 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
     ("capability", "operation_kind", "status", "evidence_item"),
     [
         ("evil.inspect", "inspect_ci", "reconciled", None),
-        ("ci.inspect", "deploy", "reconciled", None),
-        ("ci.inspect", "inspect_ci", "failed", None),
+        ("ci.run.inspect", "deploy", "reconciled", None),
+        ("ci.run.inspect", "inspect_ci", "failed", None),
         (
-            "ci.inspect",
+            "ci.run.inspect",
             "inspect_ci",
             "reconciled",
             {
@@ -1388,7 +1388,7 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
             },
         ),
         (
-            "ci.inspect",
+            "ci.run.inspect",
             "inspect_ci",
             "reconciled",
             {
@@ -1462,7 +1462,7 @@ async def test_orphan_operation_is_rejected_when_ledger_is_empty(db_session):
         await _resident_turn_rows(db_session)
     )
     result = _turn_result()
-    result["operations"] = [_operation("orphan", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("orphan", "ci.run.inspect", "reconciled")]
     with pytest.raises(ReconciliationResultInvalid, match="map 1:1"):
         await reconcile_strategic_resident_turn(
             _factory(db_session),
@@ -1497,7 +1497,7 @@ async def test_operation_capability_must_match_durable_receipt(db_session):
         authority_generation=7,
         operation_id="op-mismatch",
         operation_kind="inspect_ci",
-        capability="ci.inspect",
+        capability="ci.run.inspect",
         risk_level="low",
         request_hash="9" * 64,
         status="reconciled",
@@ -1565,7 +1565,7 @@ async def test_omitted_settled_durable_receipt_is_rejected(db_session):
             authority_generation=7,
             operation_id="op-omitted-settled",
             operation_kind="inspect_ci",
-            capability="ci.inspect",
+            capability="ci.run.inspect",
             risk_level="low",
             request_hash="e" * 64,
             status="reconciled",
@@ -2058,7 +2058,7 @@ async def test_operation_and_receipt_statuses_match_durable_ledger_exactly(
         authority_generation=7,
         operation_id="op-status-mismatch",
         operation_kind="inspect_ci",
-        capability="ci.inspect",
+        capability="ci.run.inspect",
         risk_level="low",
         request_hash="5" * 64,
         status="reconciled",
@@ -2067,7 +2067,7 @@ async def test_operation_and_receipt_statuses_match_durable_ledger_exactly(
     await db_session.commit()
     result = _turn_result()
     result["operations"] = [
-        _operation("op-status-mismatch", "ci.inspect", operation_status)
+        _operation("op-status-mismatch", "ci.run.inspect", operation_status)
     ]
     result["receipts"] = [
         {
