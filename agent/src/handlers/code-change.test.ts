@@ -6,6 +6,7 @@ vi.mock('../index.js', async (importOriginal) => {
   return {
     ...actual,
     git: vi.fn(),
+    gitAsync: vi.fn().mockResolvedValue(''),
     sendLog: vi.fn(),
     persistAndPostStatus: vi.fn().mockResolvedValue(undefined),
     runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '' }),
@@ -33,8 +34,13 @@ vi.mock('fs', () => {
 
 // ── Imports under test ────────────────────────────────────────────────────────
 import { augmentSelfReview, runCodeChangeTask } from './code-change.js';
-import { git, persistAndPostStatus, runClaudeCode } from '../index.js';
+import { git, gitAsync, persistAndPostStatus, runClaudeCode } from '../index.js';
 import { writeCodeChangeHelpers } from '../prompt.js';
+import {
+  buildTaskCheckpointCommitMessage,
+  prepareTaskWorkBranch,
+} from '../task-checkpoint.js';
+import { writePrHelper } from '../prompts/pr-helper.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import * as fs from 'fs';
 
@@ -514,5 +520,117 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
     const payload = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(payload.status).toBe('FAILED');
     expect(payload.failure_category).toBe('incomplete');
+  });
+});
+
+// ── durable unshipped-work checkpoint / retry transition ─────────────────────
+describe('durable unshipped-work checkpoint retry transition', () => {
+  const taskId = 'checkpoint-retry-task';
+  const workBranch = 'blueprint/task-checkpoint';
+  const baseCommit = 'abc1234567890';
+  const baseOpts = {
+    taskId,
+    prompt: 'make the requested code change',
+    ws: null,
+    statusRef: { value: '' },
+    workBranch,
+    baseBranch: 'main',
+    owner: 'owner',
+    repo: 'repo',
+    testsOnMainBranch: true,
+    baseCommit,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.writeFileSync).mockImplementation(() => {});
+    vi.mocked(fs.unlinkSync).mockImplementation(() => {});
+    vi.mocked(git).mockImplementation((args: string[]) => {
+      if (args[0] === 'status') return ' M agent/src/handlers/code-change.ts';
+      if (args[0] === 'rev-parse') return baseCommit;
+      return '';
+    });
+    vi.mocked(gitAsync).mockResolvedValue('');
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: 'ended without a terminal verb',
+      lastResultText: '',
+    });
+  });
+
+  it('durably pushes a provenance checkpoint before posting incomplete', async () => {
+    await runCodeChangeTask({ ...baseOpts });
+
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
+    const commitCall = vi.mocked(git).mock.calls.find(([args]) => args[0] === 'commit');
+    expect(commitCall).toBeDefined();
+    expect(commitCall?.[0]).toContain('--allow-empty');
+    expect(commitCall?.[0].join('\n')).toContain(`blueprint-checkpoint: preserve unshipped task ${taskId}`);
+    expect(commitCall?.[0].join('\n')).toContain(`Blueprint-Base-Commit: ${baseCommit}`);
+    expect(vi.mocked(gitAsync)).toHaveBeenCalledWith([
+      'push', '--force-with-lease', 'origin',
+      `HEAD:refs/heads/${workBranch}`,
+    ]);
+
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      ([, payload]) => payload.status === 'FAILED',
+    );
+    expect(failedCall?.[1].failure_category).toBe('incomplete');
+    expect(vi.mocked(gitAsync).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(persistAndPostStatus).mock.invocationCallOrder[0],
+    );
+  });
+
+  it('restores the checkpoint as retry work and keeps publication force-with-lease capable', async () => {
+    const checkpointMessage = buildTaskCheckpointCommitMessage(taskId, baseCommit);
+    const gitOps = vi.fn((args: string[]): string => {
+      if (args[0] === 'ls-remote') return `deadbeef\trefs/heads/${workBranch}`;
+      if (args[0] === 'show') return checkpointMessage;
+      return '';
+    });
+    const listOpen = vi.fn().mockResolvedValue([]);
+    const log = vi.fn();
+
+    const result = await prepareTaskWorkBranch(
+      {
+        owner: 'owner', repo: 'repo', ghToken: 'token', baseBranch: 'main',
+        workBranch, taskId, ws: null,
+      },
+      { git: gitOps, listOpenPullRequestsForBranch: listOpen, sendLog: log },
+    );
+
+    expect(result.restoredCheckpoint).toBe(true);
+    expect(gitOps).toHaveBeenCalledWith([
+      'fetch', '--no-tags', '--depth=100', 'origin',
+      `+refs/heads/${workBranch}:refs/remotes/origin/${workBranch}`,
+    ]);
+    expect(gitOps).toHaveBeenCalledWith(['checkout', '-b', workBranch]);
+    expect(gitOps).toHaveBeenCalledWith([
+      'merge', '--squash', '--no-commit', `origin/${workBranch}`,
+    ]);
+    expect(gitOps.mock.calls.some(([args]) => args.includes('--delete'))).toBe(false);
+
+    // The durable remote checkpoint intentionally remains as the lease target.
+    // The generated ./pr publication path must replace it with force-with-lease,
+    // not a plain non-fast-forward push that would wedge the recovered retry.
+    vi.mocked(fs.writeFileSync).mockClear();
+    writePrHelper({
+      taskId,
+      workBranch,
+      baseBranch: 'main',
+      owner: 'owner',
+      repo: 'repo',
+      testsOnMainBranch: true,
+    });
+    const prWrite = vi.mocked(fs.writeFileSync).mock.calls.find(
+      ([path]) => String(path).endsWith('/pr'),
+    );
+    expect(prWrite).toBeDefined();
+    const prScript = prWrite?.[1];
+    expect(typeof prScript).toBe('string');
+    expect(prScript as string).toContain(
+      `git push --force-with-lease origin "${workBranch}"`,
+    );
   });
 });
