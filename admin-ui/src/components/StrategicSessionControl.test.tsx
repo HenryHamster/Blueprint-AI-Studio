@@ -698,4 +698,58 @@ describe('StrategicSessionControl', () => {
     );
     expect(screen.queryByText(/op-decision capture/i)).toBeNull();
   });
+
+  it('renders the turn-latency chip showing operator turn stats', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        turnLatencySummary={{
+          operator: { count: 3, mean_turn_ms: 2500, max_turn_ms: 4500, mean_ttft_ms: 400, interrupted_count: 0, total_tool_calls: 7, total_tool_call_duration_ms: 1200, mean_inter_token_ms: 85, mean_pickup_lag_ms: 320 },
+          autonomous: { count: 5, mean_turn_ms: 8000, max_turn_ms: 15000, mean_ttft_ms: null, interrupted_count: 2, total_tool_calls: 12, total_tool_call_duration_ms: 3500, mean_inter_token_ms: null, mean_pickup_lag_ms: null },
+        }}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/operator:/i)).toBeInTheDocument();
+    expect(screen.getByText(/3 turns/i)).toBeInTheDocument();
+    expect(screen.getByText(/avg 2\.5s/i)).toBeInTheDocument();
+  });
+
+  it('renders the turn-latency chip with autonomous-only data when operator turns are absent', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        turnLatencySummary={{
+          operator: { count: 0, mean_turn_ms: null, max_turn_ms: 0, mean_ttft_ms: null, interrupted_count: 0, total_tool_calls: 0, total_tool_call_duration_ms: 0, mean_inter_token_ms: null, mean_pickup_lag_ms: null },
+          autonomous: { count: 2, mean_turn_ms: 30000, max_turn_ms: 60000, mean_ttft_ms: null, interrupted_count: 0, total_tool_calls: 4, total_tool_call_duration_ms: 800, mean_inter_token_ms: null, mean_pickup_lag_ms: null },
+        }}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.getByText(/autonomous:/i)).toBeInTheDocument();
+    expect(screen.getByText(/2 turns/i)).toBeInTheDocument();
+  });
+
+  it('hides the turn-latency chip when the summary is absent', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        turnLatencySummary={null}
+        onModeChange={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+    expect(screen.queryByText(/turn/i)).toBeNull();
+  });
 });

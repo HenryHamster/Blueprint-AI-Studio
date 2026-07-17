@@ -1140,6 +1140,21 @@ export async function handleStrategicResident(
     msgs: ResidentInboundMessage[],
   ): Promise<'stop' | 'continue'> => {
     const pickupLagMs = computePickupLagMs(msgs);
+    // Early acknowledgment: post a NOTE immediately so the operator sees feedback
+    // before the full turn completes (which can take 4+ minutes). This is a
+    // separate, lightweight message — the real reply lands at persistReply below.
+    try {
+      const ackText = msgs.length === 1
+        ? `Acknowledged — working on your message (this may take a moment).`
+        : `Acknowledged ${msgs.length} messages — working on them (this may take a moment).`;
+      await apiPost('/api/agent/strategic', {
+        task_id: taskId,
+        op: 'create_message',
+        data: { type: 'NOTE', content: ackText },
+      });
+    } catch (e) {
+      sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
+    }
     const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
     if (turnWedgedSession(r)) return 'stop';
     await persistReply(r);

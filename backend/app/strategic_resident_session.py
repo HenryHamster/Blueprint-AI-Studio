@@ -439,6 +439,7 @@ def resident_session_snapshot(vision: dict[str, Any] | None) -> dict[str, Any] |
         "compaction_count": blob.get("compaction_count"),
         "last_compaction_at": blob.get("last_compaction_at"),
         "operator_decision_summary": blob.get("_operator_decision_summary"),
+        "turn_latency_summary": blob.get("_turn_latency_summary"),
     }
 
 

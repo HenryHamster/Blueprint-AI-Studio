@@ -57,6 +57,30 @@ interface StrategicContextWorkspaceProps {
     missed: number;
     capture_rate: number | null;
   } | null;
+  turnLatencySummary?: {
+    operator: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+    autonomous: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+  } | null;
   projectId?: string | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
@@ -602,6 +626,7 @@ export function StrategicContextWorkspace({
   sessionRunners = null,
   sessionSelectedRunnerId = null,
   operatorDecisionSummary = null,
+  turnLatencySummary = null,
   projectId,
   onSelectRunner,
   onStartSession,
@@ -865,6 +890,7 @@ export function StrategicContextWorkspace({
                   sessionRunners={sessionRunners}
                   sessionSelectedRunnerId={sessionSelectedRunnerId}
                   operatorDecisionSummary={operatorDecisionSummary}
+                  turnLatencySummary={turnLatencySummary}
                   onSelectRunner={onSelectRunner}
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}

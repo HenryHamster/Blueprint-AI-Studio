@@ -4631,6 +4631,51 @@ async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session)
 
 
 @pytest.mark.asyncio
+async def test_resident_session_snapshot_includes_turn_latency_summary(db_session):
+    """``resident_session_snapshot`` projects ``turn_latency_summary`` to the API."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    latency = {
+        "operator": {
+            "count": 3, "mean_turn_ms": 2500, "max_turn_ms": 4500,
+            "mean_ttft_ms": 400, "interrupted_count": 0, "total_tool_calls": 7,
+            "total_tool_call_duration_ms": 1200, "mean_inter_token_ms": 85,
+            "mean_pickup_lag_ms": 320,
+        },
+        "autonomous": {
+            "count": 5, "mean_turn_ms": 8000, "max_turn_ms": 15000,
+            "mean_ttft_ms": None, "interrupted_count": 2, "total_tool_calls": 12,
+            "total_tool_call_duration_ms": 3500, "mean_inter_token_ms": None,
+            "mean_pickup_lag_ms": None,
+        },
+    }
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        turn_latency_summary=latency,
+    )
+
+    fresh = await db_session.get(Project, project.id)
+    snap = resident_session_snapshot(fresh.vision)
+    assert snap is not None
+    assert "turn_latency_summary" in snap
+    assert snap["turn_latency_summary"]["operator"]["count"] == 3
+    assert snap["turn_latency_summary"]["operator"]["mean_turn_ms"] == 2500
+    assert snap["turn_latency_summary"]["operator"]["max_turn_ms"] == 4500
+    assert snap["turn_latency_summary"]["autonomous"]["count"] == 5
+    assert snap["turn_latency_summary"]["autonomous"]["mean_turn_ms"] == 8000
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_persists_operator_decision_summary(db_session):
     """A heartbeat carrying ``operator_decision_summary`` stores it on the session blob."""
     project = await _make_project_with_member(db_session)

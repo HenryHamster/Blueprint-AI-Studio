@@ -831,6 +831,22 @@ export interface StrategicConversationQuery {
 }
 
 /**
+ * Per-kind turn-latency statistics for one turn type (operator or autonomous).
+ * Mirrors the shape computed by `getResidentTurnLatencyTelemetry` in the agent.
+ */
+export interface TurnLatencyKindSummary {
+  count: number;
+  mean_turn_ms: number | null;
+  max_turn_ms: number;
+  mean_ttft_ms: number | null;
+  interrupted_count: number;
+  total_tool_calls: number;
+  total_tool_call_duration_ms: number;
+  mean_inter_token_ms: number | null;
+  mean_pickup_lag_ms: number | null;
+}
+
+/**
  * Bounded projection of the resident Strategic session state returned by the
  * start/stop endpoints (mirrors `resident_session_snapshot` in
  * `strategic_resident_session.py`). Null when no resident session exists.
@@ -861,6 +877,17 @@ export interface StrategicResidentSessionSnapshot {
     captured: number;
     missed: number;
     capture_rate: number | null;
+  } | null;
+  /**
+   * Per-kind turn-latency summary for this session (mirrors
+   * `_turn_latency_summary` on the backend session blob, projected by
+   * `resident_session_snapshot`). Contains rolling mean/max turn ms for
+   * operator and autonomous turns. `null` when no turns have been recorded yet
+   * or on legacy sessions.
+   */
+  turn_latency_summary?: {
+    operator: TurnLatencyKindSummary;
+    autonomous: TurnLatencyKindSummary;
   } | null;
 }
 

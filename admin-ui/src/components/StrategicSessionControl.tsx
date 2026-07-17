@@ -196,6 +196,37 @@ export interface StrategicSessionControlProps {
     missed: number;
     capture_rate: number | null;
   } | null;
+  /**
+   * Per-kind turn-latency telemetry for the live resident session (mirrors
+   * `turn_latency_summary` on the session snapshot). When present, a small chip
+   * renders in Workday mode showing rolling mean/max turn times for operator
+   * and/or autonomous turns so the operator can see the session's responsiveness.
+   * Absent/null hides the chip entirely (no turns recorded / legacy session).
+   */
+  turnLatencySummary?: {
+    operator: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+    autonomous: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+  } | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -886,6 +917,82 @@ function operatorDecisionCaptureView(
   };
 }
 
+/**
+ * Per-kind turn-latency statistics shape (mirrors the agent telemetry).
+ */
+interface TurnLatencyKindSummary {
+  count: number;
+  mean_turn_ms: number | null;
+  max_turn_ms: number;
+  mean_ttft_ms: number | null;
+  interrupted_count: number;
+  total_tool_calls: number;
+  total_tool_call_duration_ms: number;
+  mean_inter_token_ms: number | null;
+  mean_pickup_lag_ms: number | null;
+}
+
+interface TurnLatencyView {
+  tone: Tone;
+  label: string;
+  detail: string;
+}
+
+/**
+ * Build a human-readable summary string from one kind's stats.
+ * E.g. "3 turns, avg 42s, max 87s".
+ */
+function formatTurnLatencyKind(stats: TurnLatencyKindSummary): string {
+  const { count, mean_turn_ms, max_turn_ms } = stats;
+  if (typeof count !== 'number' || count <= 0) return '';
+  const parts: string[] = [`${count} turn${count !== 1 ? 's' : ''}`];
+  if (typeof mean_turn_ms === 'number' && mean_turn_ms > 0) {
+    parts.push(`avg ${(mean_turn_ms / 1000).toFixed(1)}s`);
+  }
+  if (typeof max_turn_ms === 'number' && max_turn_ms > 0) {
+    parts.push(`max ${(max_turn_ms / 1000).toFixed(1)}s`);
+  }
+  return parts.length > 0 ? parts.join(', ') : '';
+}
+
+/**
+ * Build the turn-latency chip view from the session summary, or `null` when
+ * there is nothing to show (absent summary, or no turns measured yet).
+ * Shows operator turn latency; falls back to autonomous when no operator
+ * turns exist but autonomous do.
+ */
+function turnLatencyView(
+  summary:
+    | {
+        operator: TurnLatencyKindSummary;
+        autonomous: TurnLatencyKindSummary;
+      }
+    | null
+    | undefined,
+): TurnLatencyView | null {
+  if (!summary) return null;
+  const { operator: op, autonomous: au } = summary;
+  const opText = formatTurnLatencyKind(op);
+  const auText = formatTurnLatencyKind(au);
+  if (!opText && !auText) return null;
+
+  // Prefer showing operator latency; fall back to autonomous.
+  if (opText) {
+    return {
+      tone: op.mean_turn_ms && op.mean_turn_ms > 120_000 ? 'warning' : 'neutral',
+      label: `Operator: ${opText}`,
+      detail: auText
+        ? `Autonomous: ${auText}`
+        : 'Operator turn latency — measured across this session',
+    };
+  }
+  return {
+    tone: 'neutral',
+    label: `Autonomous: ${auText}`,
+    detail: 'Autonomous turn latency — measured across this session',
+  };
+}
+
 function StatusDot({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClasses[tone].dot}`} aria-hidden="true" />;
 }
@@ -907,6 +1014,7 @@ export function StrategicSessionControl({
   sessionRunners = null,
   sessionSelectedRunnerId = null,
   operatorDecisionSummary = null,
+  turnLatencySummary = null,
   onSelectRunner,
   onStartSession,
   onStopSession,
@@ -965,6 +1073,7 @@ export function StrategicSessionControl({
   );
   const SessionIcon = sessionView.Icon;
   const captureView = operatorDecisionCaptureView(operatorDecisionSummary);
+  const latencyView = turnLatencyView(turnLatencySummary);
 
   const runner = runnerStatus
     ? (() => {
@@ -1077,6 +1186,23 @@ export function StrategicSessionControl({
                 {!compact && (
                   <span className={`truncate text-xs font-semibold ${toneClasses[captureView.tone].text}`}>
                     {captureView.label}
+                  </span>
+                )}
+              </span>
+            )}
+            {latencyView && (
+              <span
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                } ${toneClasses[latencyView.tone].border} ${toneClasses[latencyView.tone].bg}`}
+                role="status"
+                aria-label={`${latencyView.label} — ${latencyView.detail}`}
+                title={`${latencyView.label} — ${latencyView.detail}`}
+              >
+                <StatusDot tone={latencyView.tone} />
+                {!compact && (
+                  <span className={`truncate text-xs font-semibold ${toneClasses[latencyView.tone].text}`}>
+                    {latencyView.label}
                   </span>
                 )}
               </span>

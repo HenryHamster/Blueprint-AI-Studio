@@ -537,6 +537,7 @@ export default function App() {
     strategicWorkbenchRestoreProjectRef,
   } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
   const strategicOperatorDecisionSummary = residentStrategicSession?.operator_decision_summary ?? null;
+  const strategicTurnLatencySummary = residentStrategicSession?.turn_latency_summary ?? null;
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -1261,6 +1262,7 @@ export default function App() {
         sessionRunners={residentStrategicSessionRunners}
         sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
         operatorDecisionSummary={strategicOperatorDecisionSummary}
+        turnLatencySummary={strategicTurnLatencySummary}
         projectId={selectedProjectId}
         onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
@@ -1347,6 +1349,7 @@ export default function App() {
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
                 operatorDecisionSummary={strategicOperatorDecisionSummary}
+                turnLatencySummary={strategicTurnLatencySummary}
                 onSelectRunner={handleSelectStrategicRunner}
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}
