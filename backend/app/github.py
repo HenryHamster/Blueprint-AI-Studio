@@ -59,6 +59,10 @@ _FILE_CONTENT_CACHE_MAX_SIZE = 2000   # ~2000 entries ≈ ~3-5 MB at average fil
 _file_content_cache: "OrderedDict[tuple[str, str, str, str], tuple[str, float]]" = OrderedDict()
 
 
+class StaleBranchHeadError(RuntimeError):
+    """A compare-and-swap branch write lost its lease to a newer tip."""
+
+
 def _get_client() -> httpx.AsyncClient:
     global _github_client
     if _github_client is None or _github_client.is_closed:
@@ -1117,6 +1121,7 @@ async def commit_file_changes(
     deletes: list[str] | None = None,
     message: str,
     project_id: str | None = None,
+    expected_head_sha: str | None = None,
 ) -> str:
     """Commit *upserts* (path -> text) and *deletes* to *branch* atomically.
 
@@ -1126,9 +1131,12 @@ async def commit_file_changes(
     base tree (deletions are entries with ``sha: null``), create a commit
     parented on the tip, then fast-forward ``heads/{branch}`` to it.
 
-    Returns the new commit SHA. RAISES ``RuntimeError`` on any unexpected status
-    (the caller treats a failed push as "could not reconcile" and falls back to
-    the operator-alert path).
+    ``expected_head_sha`` turns the write into a compare-and-swap operation: if
+    the branch moved after the caller read its inputs, no blobs or commits are
+    created and :class:`StaleBranchHeadError` is raised. If the requested tree
+    is already the current tree, the current tip SHA is returned without
+    creating an empty commit. Otherwise returns the new commit SHA. RAISES
+    ``RuntimeError`` on any unexpected GitHub status.
     """
     deletes = deletes or []
     headers = {
@@ -1154,6 +1162,11 @@ async def commit_file_changes(
         project_id=project_id,
     )
     tip_sha = _json(ref_resp, 200, "get-ref")["object"]["sha"]
+    if expected_head_sha is not None and tip_sha != expected_head_sha:
+        raise StaleBranchHeadError(
+            f"stale branch head for {owner}/{repo}@{branch}: "
+            f"expected {expected_head_sha}, found {tip_sha}"
+        )
 
     # 2. Base tree of that commit.
     commit_resp = await _github_request(
@@ -1190,6 +1203,20 @@ async def commit_file_changes(
         project_id=project_id,
     )
     new_tree_sha = _json(tree_resp, 201, "create-tree")["sha"]
+
+    # GitHub accepts a commit whose tree is identical to its parent's tree.
+    # Under concurrent auto-remediation that turns a stale cached write into an
+    # unbounded stream of empty commits, so stop before create-commit/update-ref.
+    if new_tree_sha == base_tree_sha:
+        logger.info(
+            "[GITHUB] commit_file_changes no-op on %s/%s@%s tip=%s; "
+            "requested tree already present",
+            owner,
+            repo,
+            branch,
+            tip_sha[:12],
+        )
+        return tip_sha
 
     # 5. Commit parented on the current tip.
     commit_create_resp = await _github_request(

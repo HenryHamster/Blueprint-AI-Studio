@@ -10800,6 +10800,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "strategic_spawning.py:_spawn_strategic_review",
         "task_completion.py:_ensure_branch",
         "rollup_management.py:_check_and_trigger_rollup",
+        # Size-cap remediation reads a mutable PR branch, derives a tree update,
+        # then writes it under an expected-head lease. Cached tips would defeat
+        # the compare-and-swap and can recreate the empty-commit loop.
+        "rollup_size_preflight.py:preflight_rollup_size_caps",
     }
 )
 

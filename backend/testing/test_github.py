@@ -5397,3 +5397,63 @@ async def test_deferrable_consumers_respect_quota_reserve_floor(mocker):
 
     # Cleanup to avoid contaminating sibling tests.
     _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+@pytest.mark.asyncio
+async def test_commit_file_changes_stale_head_lease_creates_no_commit(mocker):
+    """A concurrent tip advance aborts before blobs, trees, or commits exist."""
+    from app.github import StaleBranchHeadError, commit_file_changes
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        return_value=MockResponse(200, {"object": {"sha": "new-tip"}}),
+    )
+
+    with pytest.raises(StaleBranchHeadError):
+        await commit_file_changes(
+            "t",
+            "o",
+            "r",
+            "staging",
+            upserts={"f.py": "new\n"},
+            message="stale writer",
+            expected_head_sha="old-tip",
+        )
+
+    assert req.await_count == 1
+    assert req.await_args.args[0] == "GET"
+    assert "/git/ref/heads/staging" in req.await_args.args[1]
+
+
+@pytest.mark.asyncio
+async def test_commit_file_changes_identical_tree_creates_no_empty_commit(mocker):
+    """An idempotent replay returns the tip before create-commit/update-ref."""
+    from app.github import commit_file_changes
+
+    req = mocker.patch(
+        "app.github._github_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            MockResponse(200, {"object": {"sha": "tip"}}),
+            MockResponse(200, {"tree": {"sha": "same-tree"}}),
+            MockResponse(201, {"sha": "same-blob"}),
+            MockResponse(201, {"sha": "same-tree"}),
+        ],
+    )
+
+    result = await commit_file_changes(
+        "t",
+        "o",
+        "r",
+        "staging",
+        upserts={"f.py": "already current\n"},
+        message="must not become an empty commit",
+        expected_head_sha="tip",
+    )
+
+    assert result == "tip"
+    assert req.await_count == 4
+    urls = [call.args[1] for call in req.await_args_list]
+    assert not any(url.endswith("/git/commits") for url in urls)
+    assert not any("/git/refs/heads/" in url for url in urls)
