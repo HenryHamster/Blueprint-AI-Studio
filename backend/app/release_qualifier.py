@@ -268,6 +268,9 @@ from app.migration_apply_gate import (
     run_migration_apply_gate,
 )
 from app.env_preflight_evidence import sanitize_env_preflight_artifact
+from app.qualification_dimensions import (
+    PROMOTION_REQUIRED_DIMENSIONS,
+)
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
 )
@@ -4467,14 +4470,8 @@ def _ledger_fact_satisfies_promotion(
 # a promotion may compose from the ledger — the informational dimensions
 # (challenge / acceptance_window / debt_pressure) never gate promotion and are
 # excluded.  smoketest is required only when the run had it enabled (audit H3).
-_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = (
-    "ci",
-    "audit",
-    "test_erosion",
-    "migration_identity",
-    "migration_apply",
-    "merge_grade",
-)
+# Sourced from the canonical dimension registry (see qualification_dimensions).
+_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = PROMOTION_REQUIRED_DIMENSIONS
 
 
 async def _load_prior_dimension_results(

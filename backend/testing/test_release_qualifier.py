@@ -7006,6 +7006,125 @@ async def test_run_qualification_produces_env_preflight_evidence_unconditionally
 
 
 @pytest.mark.asyncio
+async def test_env_preflight_evidence_rebuilt_on_full_dimension_reuse(
+    db_session, mocker
+):
+    """When all expensive gate dimensions (audit, test_erosion, smoketest,
+    merge_grade) are already resolved in the QualificationDimensionResult ledger
+    at the same candidate_sha, _build_env_preflight_evidence_for_candidate is
+    still called and env_preflight_evidence is a non-None dict in the resulting
+    last_qualification record.
+
+    This locks the fail-closed boot gate against a future reuse-side
+    short-circuit that would skip env_preflight evidence collection when every
+    ledger dimension is already resolved — the rebuild must always run.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+
+    # Seed all four reuse-eligible dimensions as already resolved so that
+    # run_qualification will carry them forward from the ledger and skip
+    # re-spawning any child task.
+    for dim in ("audit", "test_erosion", "smoketest", "merge_grade"):
+        await _seed_dimension_row(
+            db_session, project, version, dim,
+            status="passed", candidate_sha=candidate,
+        )
+    await db_session.commit()
+
+    # Stamp a prior infra_failure qual at the same sha so the reuse path fires.
+    prior_attempt_id = uuid.uuid4()
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(prior_attempt_id),
+        "retry_episode": 0,
+        "candidate_sha": candidate,
+        "error": "smoketest_task_failed",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-01-01T00:00:00",
+        "finalized_at": "2026-01-01T00:01:00",
+    }
+    version.active_qualification_attempt_id = prior_attempt_id
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-deadbeef",
+    )
+
+    # Serve real file content so the evidence builder produces a non-None dict.
+    repo_root = Path(__file__).resolve().parent.parent
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    # Spy on the evidence builder to confirm it is invoked even when all
+    # expensive gate dimensions are already resolved in the ledger.
+    evidence_spy = mocker.spy(rq, "_build_env_preflight_evidence_for_candidate")
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"Expected 'spawned' but got {result['status']!r}"
+    )
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # Core assertion: the evidence builder must have been called exactly once
+    # regardless of full ledger reuse.
+    evidence_spy.assert_awaited_once(), (
+        "_build_env_preflight_evidence_for_candidate was NOT called — "
+        "a reuse-side short-circuit skipped the fail-closed boot gate"
+    )
+
+    # The evidence must be present and non-None in the pending record.
+    assert "env_preflight_evidence" in qual, (
+        "env_preflight_evidence key missing from last_qualification on full-reuse re-drive"
+    )
+    evidence = qual["env_preflight_evidence"]
+    assert isinstance(evidence, dict), (
+        f"env_preflight_evidence should be a dict; got {type(evidence)}"
+    )
+    assert "required_env" in evidence, (
+        "env_preflight_evidence missing 'required_env' key — builder did not run"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
     db_session, mocker
 ):

@@ -55,6 +55,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import QualificationVerdict
+from app.qualification_dimensions import (
+    BLOCKER_TO_DIMENSION,
+    LEDGER_DIMENSION_KEYS,
+    MUTABLE_DIMENSION_KEYS,
+    UI_DIMENSIONS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.models import ReleaseVersion, Project
@@ -437,36 +443,10 @@ def resolve_dimension_states(
     """
     q: dict[str, Any] = last_qualification if isinstance(last_qualification, dict) else {}
 
-    _DIMENSIONS: list[tuple[str, str]] = [
-        ("audit", "Audit"),
-        ("test_erosion", "Test Erosion"),
-        ("smoketest", "Smoketest"),
-        ("ci", "CI"),
-        ("migration_identity", "Migration Identity"),
-        ("migration_apply", "Migration Apply"),
-        ("merge_grade", "Merge Grade"),
-        ("challenge", "Challenge"),
-        ("acceptance_window", "Acceptance Window"),
-        ("criterion_coverage", "Criterion Coverage"),
-        ("debt_pressure", "Debt Pressure"),
-        ("goal_alignment", "Goal Alignment"),
-        ("capability_proof", "Capability Proof"),
-        ("env_preflight", "Env Preflight"),
-    ]
-
-    _BLOCKER_TO_DIM: dict[str, str] = {
-        "ci_not_green": "ci",
-        "ci_unresolved": "ci",
-        "migration_identity_collision": "migration_identity",
-        "migration_apply_drift": "migration_apply",
-        "merge_grade_misses": "merge_grade",
-        "criterion_coverage_incomplete": "criterion_coverage",
-        "smoketest_startup_failed": "smoketest",
-        "audit_missing": "audit",
-        "test_file_deleted": "test_erosion",
-        "capability_proof_gate_blocked": "capability_proof",
-        "boot_prereq_missing": "env_preflight",
-    }
+    # Ordered UI dimensions + labels and the blocker-code routing both come from
+    # the canonical dimension registry (see qualification_dimensions).
+    _DIMENSIONS: tuple[tuple[str, str], ...] = UI_DIMENSIONS
+    _BLOCKER_TO_DIM: dict[str, str] = BLOCKER_TO_DIMENSION
 
     def _all(status: str, reason: str | None = None) -> list[dict[str, Any]]:
         return [
@@ -731,20 +711,15 @@ def resolve_dimension_states(
 # (criterion_coverage, goal_alignment, env_preflight) must still be derived from
 # the blob — env_preflight (Slice 3) is blob-only until the Slice-5 M0 alignment
 # promotes it to a per-(candidate_sha, dimension) ledger dimension.
-_LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
-    "audit", "test_erosion", "smoketest", "ci",
-    "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
-    "capability_proof", "challenge", "acceptance_window",
-})
+# Sourced from the canonical dimension registry (see qualification_dimensions).
+_LEDGER_DIMENSION_KEYS: frozenset[str] = LEDGER_DIMENSION_KEYS
 
 # Dimensions whose live result is re-measured on every re-drive.  A ledger row
 # whose currency is "reused" (i.e. it belongs to a prior attempt that the
 # active attempt merely reused) must NOT overwrite the blob-derived state for
 # these dimensions: the blob already reflects the fresh live measurement while
 # the ledger row carries the stale prior-attempt fact.
-_MUTABLE_DIMENSION_KEYS: frozenset[str] = frozenset({
-    "ci", "migration_identity", "migration_apply",
-})
+_MUTABLE_DIMENSION_KEYS: frozenset[str] = MUTABLE_DIMENSION_KEYS
 
 
 def _ledger_status_to_ui(status: str) -> str:
