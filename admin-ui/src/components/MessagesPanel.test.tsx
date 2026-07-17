@@ -7222,10 +7222,12 @@ describe('MessagesPanel composer draft persistence', () => {
         }}
       />,
     );
-    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
-
-    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
-    expect(textarea.value).toBe('use the clean chat path');
+    const textarea = await waitFor(() => {
+      const element = container.querySelector('textarea') as HTMLTextAreaElement | null;
+      expect(element).not.toBeNull();
+      expect(element?.value).toBe('use the clean chat path');
+      return element as HTMLTextAreaElement;
+    });
     const sendButton = getAllByRole('button', { name: 'Send message' })
       .find((button): button is HTMLButtonElement => button instanceof HTMLButtonElement && !button.disabled);
     if (!sendButton) throw new Error('Expected enabled Strategic send button');
