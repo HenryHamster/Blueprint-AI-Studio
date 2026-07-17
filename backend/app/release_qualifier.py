@@ -3278,6 +3278,28 @@ async def run_qualification(
     if env_preflight_enabled and "smoketest" in resolved_dims and not smoketest_task_id:
         smoketest_task_id = prior_qual.get("smoketest_task_id")
 
+    # Unconditionally produce candidate-side env-preflight evidence (Slice 2,
+    # design 245212a4).  Decoupled from the smoketest child task: this is a
+    # cheap pure-content introspection of the candidate tree done via the
+    # GitHub contents API (no VM required), so it must not depend on
+    # ``smoketest_enabled``.  A failure to fetch the source is caught and
+    # treated as "evidence unavailable" — the env-preflight judge (Slice 3)
+    # handles the None by either pass-through (judge disabled) or
+    # ``boot_prereq_evidence_missing`` (judge enabled, fail-closed).
+    env_preflight_evidence: dict[str, Any] | None = None
+    try:
+        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
+            session, project, token, owner, repo, candidate_sha
+        )
+    except Exception:  # noqa: BLE001 — GitHub API I/O can fail in many ways (network, HTTP, parse); evidence absence is handled gracefully by the Slice-3 judge.
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
+            "v%d candidate %s — evidence unavailable",
+            version.version_number,
+            candidate_sha[:8],
+            exc_info=True,
+        )
+
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
     #    and the reaper sweep both treat a None smoketest id as "no smoketest
@@ -3303,6 +3325,11 @@ async def run_qualification(
         # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
         # judge flag, captured at spawn so finalize scores against the in-force state.
         "env_preflight_enabled": env_preflight_enabled,
+        # Candidate-side env-preflight evidence artifact, produced unconditionally
+        # (decoupled from the smoketest child).  Pure-content presence-only shape
+        # — names and scopes only, never values.  None when the evidence could not
+        # be fetched from the candidate tree (caught and handled in finalize).
+        "env_preflight_evidence": env_preflight_evidence,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
@@ -5007,6 +5034,54 @@ async def _dual_write_dimension_results(
         )
 
 
+async def _build_env_preflight_evidence_for_candidate(
+    session: AsyncSession,
+    project: Project,
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+) -> dict[str, Any] | None:
+    """Build env-preflight evidence from the candidate tree via the GitHub API.
+
+    Reads ``backend/app/required_runtime_env.py`` and
+    ``backend/testing/smoketest.yaml`` from the candidate SHA through the GitHub
+    contents API (cheap, no VM needed) and produces the same pure-content artifact
+    as :func:`build_env_preflight_evidence`.
+
+    Returns ``None`` when either source file is missing or unreadable — the
+    caller treats this as "evidence unavailable", which triggers
+    ``boot_prereq_evidence_missing`` when the env-preflight judge is enabled.
+
+    Uses the in-memory content cache (10-minute TTL) so repeated reads of the
+    same file at the same ref on the same orchestrator avoid redundant API calls.
+    """
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    required_runtime_py = await github.get_file_text_at_ref(
+        "backend/app/required_runtime_env.py",
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=candidate_sha,
+        project_id=str(project.id),
+        use_content_cache=True,
+    )
+    smoketest_yaml = await github.get_file_text_at_ref(
+        "backend/testing/smoketest.yaml",
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=candidate_sha,
+        project_id=str(project.id),
+        use_content_cache=True,
+    )
+    return build_env_preflight_from_source(
+        required_runtime_env_py_source=required_runtime_py,
+        smoketest_yaml_source=smoketest_yaml,
+    )
+
+
 def _deployed_env_presence_snapshot(
     env_preflight_artifact: dict[str, Any] | None,
 ) -> dict[str, bool]:
@@ -5804,20 +5879,17 @@ async def _finalize_qualification(
         # so the agent can target it when smoketest is the binding constraint.
         smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
-    # Candidate-side env-preflight evidence (Slice 2, design 245212a4). The
-    # smoketest agent introspected the candidate tree's OWN env manifest and
-    # folded a pure-content artifact into SMOKETEST_RESULT. Read it back and
-    # sanitize it to the strict presence-only shape. This is EVIDENCE ONLY:
-    # env_preflight (the CANDIDATE evidence artifact) itself NEVER feeds
-    # compute_composite — it is stored on last_qualification unchanged as the
-    # candidate's declaration. The Slice-3 DEPLOYED judge below reads it as input.
-    # None when no fresh smoketest_result exists (e.g. the same-SHA ledger-reuse
-    # path) or the artifact was absent/malformed.
-    env_preflight = (
-        sanitize_env_preflight_artifact(smoketest_result.get("env_preflight"))
-        if isinstance(smoketest_result, dict)
-        else None
-    )
+    # Candidate-side env-preflight evidence (Slice 2, design 245212a4).
+    # ``run_qualification`` now produces this artifact unconditionally via
+    # the GitHub contents API (decoupled from the smoketest child) and stores
+    # it as ``qual["env_preflight_evidence"]``.  Read that first; fall back to
+    # the SMOKETEST_RESULT-carried artifact for backward compatibility with
+    # qualification runs that predate the decoupling.
+    # None when no evidence was produced (smoketest artifact also absent).
+    _env_preflight_raw = qual.get("env_preflight_evidence")
+    if _env_preflight_raw is None and isinstance(smoketest_result, dict):
+        _env_preflight_raw = smoketest_result.get("env_preflight")
+    env_preflight = sanitize_env_preflight_artifact(_env_preflight_raw)
 
     # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
     # default.  The flag was resolved above (before the smoketest result read)

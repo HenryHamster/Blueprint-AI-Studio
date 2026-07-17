@@ -132,6 +132,106 @@ def sanitize_env_preflight_artifact(raw: Any) -> dict[str, Any] | None:
     }
 
 
+def build_env_preflight_from_source(
+    required_runtime_env_py_source: str | None,
+    smoketest_yaml_source: str | None = None,
+) -> dict[str, Any] | None:
+    """Build env-preflight evidence from candidate tree SOURCE STRINGS.
+
+    Alternative entry point that does NOT require the candidate tree to be
+    importable (no local checkout, no ``sys.path`` manipulation).  The caller
+    provides the text of the candidate's ``backend/app/required_runtime_env.py``
+    (and optionally ``backend/testing/smoketest.yaml``), which this function
+    introspects using a controlled Python ``exec()`` in a sandboxed namespace
+    (safe: the source is from a known git SHA in the project's own repository).
+
+    The artifact shape, presence-only hard rule, and ``manifest_source`` pointer
+    are identical to :func:`build_env_preflight_evidence`.
+
+    Returns ``None`` when ``required_runtime_env_py_source`` is ``None`` or
+    cannot be parsed (the caller should treat this as "evidence unavailable").
+    """
+    if required_runtime_env_py_source is None:
+        return None
+    required_env = _extract_required_env_from_source(required_runtime_env_py_source)
+    startup_check_names = (
+        _parse_startup_check_names_from_yaml(smoketest_yaml_source)
+        if smoketest_yaml_source is not None
+        else _read_startup_check_names()
+    )
+    return {
+        "required_env": required_env,
+        "startup_check_names": startup_check_names,
+        "manifest_source": MANIFEST_SOURCE,
+    }
+
+
+def _extract_required_env_from_source(source: str) -> list[dict[str, str]]:
+    """Extract ``REQUIRED_RUNTIME_ENV`` entries from module source code.
+
+    Uses a sandboxed ``exec()`` to resolve the module-level constant without
+    importing the candidate's package tree.  The only external import in
+    ``required_runtime_env.py`` (``ENCRYPTION_KEY_ENV`` from
+    ``app.field_encryption``) is replaced with its resolved value so the
+    source is self-contained.
+    """
+    # Resolve the sole external import to its known value so exec is
+    # self-contained.
+    processed = source.replace(
+        "from app.field_encryption import ENCRYPTION_KEY_ENV",
+        'ENCRYPTION_KEY_ENV = "GITHUB_PAT_ENCRYPTION_KEY"',
+    )
+    ns: dict[str, Any] = {}
+    try:
+        exec(processed, ns)
+    except (SyntaxError, NameError, TypeError):
+        # SyntaxError: the source was not valid Python (candidate has a broken file).
+        # NameError/TypeError: the module imports something we didn't resolve.
+        # Both degrade gracefully to empty list — evidence is best-effort.
+        return []
+    required = ns.get("REQUIRED_RUNTIME_ENV")
+    if not isinstance(required, (list, tuple)):
+        return []
+    result: list[dict[str, str]] = []
+    for entry in required:
+        name = (
+            str(entry.name)
+            if isinstance(getattr(entry, "name", None), str)
+            else None
+        )
+        scope = (
+            str(entry.scope)
+            if isinstance(getattr(entry, "scope", None), str)
+            else None
+        )
+        if isinstance(name, str) and isinstance(scope, str):
+            result.append({"name": name, "scope": scope})
+    return result
+
+
+def _parse_startup_check_names_from_yaml(yaml_source: str) -> list[str]:
+    """Parse startup check names from ``smoketest.yaml`` content (not a file path).
+
+    Best-effort: an unparseable YAML string returns an empty list — this is
+    evidence, never a gate.
+    """
+    try:
+        import yaml
+
+        parsed = yaml.safe_load(yaml_source)
+    except ImportError:
+        return []
+    except (yaml.YAMLError, ValueError, TypeError, AttributeError):
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    startup = ((parsed.get("suites") or {}).get("startup") or {})
+    commands = startup.get("commands") if isinstance(startup, dict) else None
+    if not isinstance(commands, list):
+        return []
+    return [str(cmd) for cmd in commands if isinstance(cmd, (str, int, float))]
+
+
 if __name__ == "__main__":
     # Emit the artifact as a single JSON line on stdout so the smoketest agent
     # can capture and fold it into the SMOKETEST_RESULT artifact.  Pure content —

@@ -6923,6 +6923,89 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_produces_env_preflight_evidence_unconditionally(
+    db_session, mocker
+):
+    """Env-preflight evidence is produced unconditionally during
+    run_qualification *even when both* smoketest_enabled and
+    env_preflight_enabled are False.
+
+    This decouples evidence production from the smoketest child task (the
+    grader gap that motived direction c-277fccb6).  The evidence is a cheap
+    pure-content introspection of the candidate tree done via the GitHub
+    contents API, so it must not depend on any feature flag.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "a1b2c3d4" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    # Serve the candidate tree's real source files so the evidence builder
+    # produces meaningful content.
+    repo_root = Path(__file__).resolve().parent.parent  # backend/
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # Evidence is present regardless of both flags being False.
+    assert "env_preflight_evidence" in qual, (
+        "env_preflight_evidence must be on the qual record when both flags are off"
+    )
+    evidence = qual["env_preflight_evidence"]
+    assert isinstance(evidence, dict), f"Expected dict, got {type(evidence)}"
+    assert "required_env" in evidence
+    assert "startup_check_names" in evidence
+    assert evidence.get("manifest_source") == "backend/app/required_runtime_env.py"
+
+    # The evidence must reflect the current REQUIRED_RUNTIME_ENV manifest.
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+    expected_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    actual_names = {e["name"] for e in evidence["required_env"]}
+    assert expected_names == actual_names, (
+        f"Evidence required_env {actual_names} does not match "
+        f"current REQUIRED_RUNTIME_ENV {expected_names} — "
+        "the evidence builder did not read the candidate tree correctly"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
     db_session, mocker
 ):
