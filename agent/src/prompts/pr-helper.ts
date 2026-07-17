@@ -49,7 +49,8 @@ function loadScreenshotsSectionScriptB64(): string {
 
 export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   validateCfgShellSafety(cfg);
-  // Idempotent push + PR creation/update. Gates on ./check first.
+  // Idempotent push + PR creation/update. Runs a bounded ./check gate first:
+  // deterministic failures block; timeout/tool unavailability is receipted.
   // Writes /tmp/pr_url_<task_id> on success so the wrapper + ./done can
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
@@ -61,7 +62,8 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
-# Gates on ./check (must pass). Then commits any pending changes, pushes
+# Gates on bounded ./check. Deterministic failures block; timeout/tool
+# unavailability requires authoritative CI. Then commits and pushes
 # to ${cfg.workBranch}, and creates a PR (or pushes an update to an
 # existing PR for review-fix tasks).
 #
@@ -231,8 +233,72 @@ fi
 #    branch) and the diff touches backend/ — see the WITH_TESTS=1 block above).
 # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
 # aborts on an empty array expansion, so just call ./check directly.
+GATE_TIMEOUT_SECONDS="\${PR_GATE_TIMEOUT_SECONDS:-600}"
+case "$GATE_TIMEOUT_SECONDS" in
+  ''|*[!0-9]*|0) GATE_TIMEOUT_SECONDS=600 ;;
+esac
+if [ "$GATE_TIMEOUT_SECONDS" -gt 900 ]; then
+  echo "[pr] PR_GATE_TIMEOUT_SECONDS=$GATE_TIMEOUT_SECONDS exceeds the 900s safety ceiling; capping it." >&2
+  GATE_TIMEOUT_SECONDS=900
+fi
+GATE_RECEIPT_FILE="/tmp/pr_gate_receipt_${cfg.taskId}.json"
+GATE_SECTION=""
+GATE_COMMAND="./check"
+
+write_gate_receipt() {
+  local status="$1"
+  local exit_code="$2"
+  local fallback="$3"
+  local recorded_at
+  recorded_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"status":"%s","command":"%s","timeout_seconds":%s,"exit_code":%s,"authoritative_ci_required":%s,"recorded_at":"%s"}\n' \
+    "$status" "$GATE_COMMAND" "$GATE_TIMEOUT_SECONDS" "$exit_code" "$fallback" "$recorded_at" > "$GATE_RECEIPT_FILE"
+  GATE_SECTION=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s' \
+    '<!-- blueprint:local-gate -->' \
+    '### Local publication gate' \
+    "- Status: $status" \
+    "- Command: $GATE_COMMAND" \
+    "- Deadline: \${GATE_TIMEOUT_SECONDS}s (hard ceiling 900s)" \
+    "- Exit code: $exit_code; authoritative CI required: $fallback" \
+    '<!-- /blueprint:local-gate -->')
+}
+
+run_pr_gate() {
+  GATE_COMMAND="./check"
+  [ "$#" -gt 0 ] && GATE_COMMAND="./check $*"
+  if ! command -v timeout >/dev/null 2>&1; then
+    GATE_STATUS=127
+  else
+    echo "[pr] Running bounded local gate: $GATE_COMMAND (deadline \${GATE_TIMEOUT_SECONDS}s)"
+    timeout --signal=TERM --kill-after=10s "\${GATE_TIMEOUT_SECONDS}s" ./check "$@"
+    GATE_STATUS=$?
+  fi
+  case "$GATE_STATUS" in
+    0)
+      write_gate_receipt passed "$GATE_STATUS" false
+      return 0
+      ;;
+    124|137)
+      write_gate_receipt timed_out "$GATE_STATUS" true
+      echo "[pr] $GATE_COMMAND exceeded its bounded \${GATE_TIMEOUT_SECONDS}s local deadline and was terminated." >&2
+      echo "[pr] Publishing with a timeout receipt; authoritative CI must decide the gate." >&2
+      return 0
+      ;;
+    125|126|127)
+      write_gate_receipt unavailable "$GATE_STATUS" true
+      echo "[pr] The bounded local gate could not execute (exit $GATE_STATUS)." >&2
+      echo "[pr] Publishing with an unavailable receipt; authoritative CI must decide the gate." >&2
+      return 0
+      ;;
+    *)
+      write_gate_receipt failed "$GATE_STATUS" false
+      return "$GATE_STATUS"
+      ;;
+  esac
+}
+
 if [ "$WITH_TESTS" = "1" ]; then
-  if ! ./check test; then
+  if ! run_pr_gate test; then
     echo ""
     echo "[pr] ./check test failed — fix lint/build/tests then re-run ./pr open."
     exit 1
@@ -244,23 +310,29 @@ if [ "$WITH_TESTS" = "1" ]; then
   # tests fail regardless of the diff). Surface the marker so the evidence
   # trail is explicit instead of silently green; CI runs the authoritative
   # suite on the PR.
-  if [ -s /tmp/check_gate_env_${cfg.taskId}.txt ]; then
+  if [ "$GATE_STATUS" = "0" ] && [ -s /tmp/check_gate_env_${cfg.taskId}.txt ]; then
     echo ""
     echo "[pr] NOTE: the test gate ran in GATE-ENVIRONMENT mode on this VM:"
     sed 's/^/[pr]   /' /tmp/check_gate_env_${cfg.taskId}.txt
     echo "[pr] Record your faithful test evidence (sanctioned harness run) in the PR body; CI runs the authoritative suite."
+    write_gate_receipt passed_with_environment_limitations "$GATE_STATUS" true
   fi
 else
-  if ! ./check; then
+  if ! run_pr_gate; then
     echo ""
     echo "[pr] ./check failed — fix lint/build then re-run ./pr open."
     exit 1
   fi
 fi
+# Persist the gate result in the PR body; retries replace a stale receipt.
+BODY=$(printf '%s' "$BODY" | sed '/<!-- blueprint:local-gate -->/,/<!-- \\/blueprint:local-gate -->/d')
+BODY=$(printf '%s\n\n%s' "$BODY" "$GATE_SECTION")
+
 
 classify_push_error() {
   local msg="$1"
   if printf '%s' "$msg" | grep -qiE 'refusing to allow a GitHub App to create or update workflow|workflow(s)? permission|github app.*workflow'; then
+
     echo "[pr] GitHub rejected the push because this GitHub App cannot create or update workflow files without the workflows permission." >&2
     echo "[pr] Revert the workflow file(s) below before pushing, or move them to a branch/token path with workflows permission:" >&2
     printf '%s\n' "$_WORKFLOW_CHANGES" | sed 's/^/[pr]   /' >&2
@@ -445,8 +517,9 @@ ${cfg.existingPrNumber !== undefined ? `
 # the original create task, so we don't need to call the endpoint here.
 PR_URL="https://github.com/${cfg.owner}/${cfg.repo}/pull/${cfg.existingPrNumber}"
 echo "[pr] Pushed updates to existing PR #${cfg.existingPrNumber}"
-# Update existing PR body with fresh SR + screenshots sections (best-effort).
-if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
+# Update existing PR body with fresh SR + screenshots + local-gate sections
+# (best-effort). The gate receipt is always non-empty after the bounded gate.
+if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ] || [ -n "$GATE_SECTION" ]; then
   _PTRESP=$(curl -f -sS --max-time 30 \\
     -H "X-Agent-Token: $TOKEN" \\
     "$API/api/agent/github/token?task_id=$TASK" 2>/dev/null) || _PTRESP=""
@@ -464,11 +537,15 @@ if [ -n "$SR_SECTION" ] || [ -n "$SHOTS_SECTION" ]; then
       # Strip any prior blocks (idempotent), then re-append the fresh non-empty ones.
       _UPDBODY=$(printf '%s' "$_CURBODY" | sed '/<!-- blueprint:self-review -->/,/<!-- \\/blueprint:self-review -->/d')
       _UPDBODY=$(printf '%s' "$_UPDBODY" | sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d')
+      _UPDBODY=$(printf '%s' "$_UPDBODY" | sed '/<!-- blueprint:local-gate -->/,/<!-- \\/blueprint:local-gate -->/d')
       if [ -n "$SR_SECTION" ]; then
         _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SR_SECTION")
       fi
       if [ -n "$SHOTS_SECTION" ]; then
         _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$SHOTS_SECTION")
+      fi
+      if [ -n "$GATE_SECTION" ]; then
+        _UPDBODY=$(printf '%s\\n\\n%s' "$_UPDBODY" "$GATE_SECTION")
       fi
       _PHTTP=$(printf '{"body":%s}' "$(_json_str "$_UPDBODY")" | curl -sS -o /dev/null -w '%{http_code}' \\
         --max-time 30 -X PATCH \\
