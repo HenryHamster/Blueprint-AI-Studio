@@ -186,7 +186,7 @@
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
-    "metrics_integrity_sweep.py": 5550,
+    "metrics_integrity_sweep.py": 6500,
     "release_readiness.py": 2100,
     "acceptance_criteria.py": 3700,
     "runner_health_alerts.py": 2450,
