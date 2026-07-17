@@ -4047,4 +4047,3 @@ async def test_capability_proof_gate_enforcement_full_lifecycle(_grad_db):
 
     finally:
         _rc.pop("capability_proof_gate_mode", None)
-

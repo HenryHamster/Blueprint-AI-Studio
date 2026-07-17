@@ -1323,9 +1323,13 @@ class TestEnvPreflightGate:
         assert result["confidence"] == baseline["confidence"]
         assert result["promote"] == baseline["promote"]
 
-    def test_enabled_none_score_does_not_block(self):
-        # Manifest absent on the candidate → None score, empty missing → no block,
-        # and no env_preflight sub_score recorded.
+    def test_enabled_none_score_now_fails_closed(self):
+        # Manifest absent on the candidate (env_preflight_score=None) with
+        # env_preflight_enabled=True now hard-blocks with
+        # boot_prereq_evidence_missing — a deterministic quality verdict,
+        # never an infra-failure retry loop.  The old behavior (no block)
+        # was the exact defect being fixed: missing evidence silently passed
+        # through, making the boot gate unenforceable.
         result = rs.compute_composite(
             **_perfect_kwargs(
                 env_preflight_enabled=True,
@@ -1333,7 +1337,10 @@ class TestEnvPreflightGate:
                 env_preflight_missing=[],
             )
         )
-        assert result["blocker"] is None
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        # No env_preflight sub_score recorded (score is None, not 0.0 or 1.0).
         assert "env_preflight" not in result["sub_scores"]
 
     def test_ci_red_precedes_boot_prereq(self):
@@ -1456,3 +1463,121 @@ class TestEnvPreflightGate:
         )
         assert result["blocker"] is None
         assert "env_preflight_ack_override" not in result["sub_scores"]
+
+    # --- boot_prereq_evidence_missing (new deterministic block) --------------
+
+    def test_evidence_missing_hard_blocks_when_enabled_and_score_is_none(self):
+        """When env_preflight_enabled is True and env_preflight_score is None
+        (no usable manifest produced), promotion hard-blocks with
+        boot_prereq_evidence_missing — a deterministic quality verdict, never
+        an infra-failure retry loop.
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+
+    def test_evidence_missing_does_not_fire_when_disabled(self):
+        """When env_preflight_enabled is False, a None score is inert
+        (the entire dimension is dark).
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=False,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] is None
+        assert "env_preflight" not in result["sub_scores"]
+
+    def test_evidence_missing_precedes_boot_prereq(self):
+        """With no evidence, evidence-missing fires before boot_prereq_missing
+        — individual prerequisite presence is moot when no evidence exists.
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=["SOME_VAR"],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+
+    def test_migration_apply_precedes_evidence_missing(self):
+        """Deploy-safety ordering: migration gates report before evidence-missing."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                migration_apply_blocked=True,
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] == "migration_apply_drift"
+
+    def test_ci_red_precedes_evidence_missing(self):
+        """A confirmed red build still wins the ordered chain over evidence-missing."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                ci_green=False,
+                ci_state=rs._CI_RED,
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] == "ci_not_green"
+
+    def test_evidence_missing_precedes_capability_proof(self):
+        """Evidence-missing is checked before capability-proof (both are
+        non-migration gates that fall after the migration family).
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+                capability_proof_blocked=True,
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+
+    def test_ack_override_does_not_suppress_evidence_missing(self):
+        """The owner ack suppresses ONLY boot_prereq_missing — it does NOT
+        suppress evidence-missing because an ack presumes evidence exists.
+        Evidence-missing fires even with the override armed.
+        """
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+                env_preflight_ack_override=True,
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+
+    def test_evidence_missing_is_classified_candidate_side(self):
+        """boot_prereq_evidence_missing is candidate-side — the fix is
+        producing evidence on the candidate tree, not a deploy or operator action.
+        """
+        assert (
+            rs.blocker_execution_site("boot_prereq_evidence_missing")
+            == rs.EXECUTION_SITE_CANDIDATE
+        )
+
+    def test_evidence_missing_label_is_distinct(self):
+        """The evidence-missing label is distinct from boot_prereq_missing."""
+        label = rs.blocker_execution_site_label("boot_prereq_evidence_missing")
+        assert label is not None
+        assert label == rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_CANDIDATE]
+        # Distinct from operator-env and deployed phrases.
+        assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_OPERATOR_ENV]
+        assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
