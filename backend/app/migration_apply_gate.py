@@ -76,6 +76,7 @@ from app.migration_chain import (
     build_migration_chain,
     find_filename_revision_mismatches,
     find_heads,
+    parse_revision_identifiers,
 )
 from app.migration_reconciliation import reconcile_pre_renumber_divergence
 from app.time_utils import exponential_backoff
@@ -866,6 +867,123 @@ def _is_migration_source(filename: str) -> bool:
     )
 
 
+# ---- Data-migration proof gate -----------------------------------------------
+#
+# A migration is a "data migration" when it performs DML operations (UPDATE,
+# INSERT INTO, DELETE FROM) or bulk-inserts directly against table rows.
+# Running such migrations against the EMPTY scratch database always succeeds —
+# there are no rows to touch — so the scratch-apply verdict cannot prove
+# production safety.  Authors must declare a proof via:
+#
+#   # BLUEPRINT_DATA_MIGRATION_PROOF: <invariants or fixture description>
+#
+# in the migration file.  Missing proof causes the gate to defer (HOLD) with an
+# actionable message rather than returning an uninformative 'ok'.
+#
+# Detection is heuristic and intentionally conservative (false negatives for
+# unusual patterns are preferred over false positives that block structural
+# migrations).  Covered patterns:
+#   - op.bulk_insert(...)
+#   - .execute(sa.update/insert/delete(...))   — ORM DML via execute
+#   - .execute("UPDATE ..."/.execute(sa.text("UPDATE ...")/sa.text(f"""UPDATE...)
+#
+# DML inside DDL bodies (trigger functions, stored procedures) is NOT detected
+# because the surrounding context (CREATE FUNCTION / CREATE TRIGGER) is DDL.
+
+_DATA_OP_RE = re.compile(
+    r"\bop\.bulk_insert\b"  # op.bulk_insert(table, rows)
+    # ORM DML via any .execute() — covers op.execute, conn.execute, bind.execute
+    r"|\.execute\s*\(\s*sa\.(?:update|insert|delete)\s*\("
+    # Literal DML string in .execute() or .execute(sa.text(...))
+    r"|\.execute\s*\(\s*(?:sa\.text\s*\()?\s*[bBfFrRuU]*[\"']{1,3}\s*"
+    r"(?:UPDATE\b|INSERT\s+INTO\b|DELETE\s+FROM\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_DATA_MIGRATION_PROOF_RE = re.compile(
+    r"#\s*BLUEPRINT_DATA_MIGRATION_PROOF\s*:",
+    re.IGNORECASE,
+)
+
+
+def _migration_has_data_ops(source: str) -> bool:
+    """Return True when the migration source contains detectable DML operations."""
+    return bool(_DATA_OP_RE.search(source))
+
+
+def _migration_has_proof_declaration(source: str) -> bool:
+    """Return True when the migration carries a BLUEPRINT_DATA_MIGRATION_PROOF marker."""
+    return bool(_DATA_MIGRATION_PROOF_RE.search(source))
+
+
+def _new_migration_sources(
+    candidate_sources: dict[str, str],
+    prod_revision: str | None,
+) -> dict[str, str]:
+    """Return candidate migration sources that are not yet applied in production.
+
+    Walks the chain backwards from heads to *prod_revision*, collecting revisions
+    that postdate the live stamp.  When *prod_revision* is ``None`` or absent from
+    the chain, all migration sources are returned (conservative: check everything).
+    """
+    all_mig = {k: v for k, v in candidate_sources.items() if _is_migration_source(k)}
+    if not prod_revision:
+        return all_mig
+
+    chain, _, _ = build_migration_chain(all_mig)
+    if prod_revision not in chain:
+        return all_mig  # prod revision not in candidate chain — check all conservatively
+
+    new_revs: set[str] = set()
+    queue: list[str] = list(find_heads(chain))
+    visited: set[str] = set()
+    while queue:
+        rev = queue.pop()
+        if rev in visited:
+            continue
+        visited.add(rev)
+        if rev == prod_revision:
+            continue
+        new_revs.add(rev)
+        parent = chain.get(rev)
+        if parent and parent not in visited and parent != prod_revision:
+            queue.append(parent)
+
+    result: dict[str, str] = {}
+    for filename, source in all_mig.items():
+        rev_id, _ = parse_revision_identifiers(source)
+        if rev_id in new_revs:
+            result[filename] = source
+    return result
+
+
+def _check_data_migration_proof_gate(new_sources: dict[str, str]) -> Verdict | None:
+    """Defer when any new migration has DML operations but no proof declaration.
+
+    Data migrations produce correct verdicts on the empty scratch database (no
+    rows to touch) but may behave differently on real production data.  Requiring
+    an explicit ``# BLUEPRINT_DATA_MIGRATION_PROOF: <description>`` comment forces
+    authors to document the invariants or fixtures that validate production safety,
+    making the gate's 'ok' verdict meaningful for data-touching migrations.
+
+    Returns ``('defer', reason)`` if proof is missing, ``None`` otherwise.
+    """
+    offenders = [
+        filename
+        for filename, source in sorted(new_sources.items())
+        if _migration_has_data_ops(source) and not _migration_has_proof_declaration(source)
+    ]
+    if not offenders:
+        return None
+    return (
+        "defer",
+        f"data_migration_proof_missing: {len(offenders)} new migration(s) contain "
+        "data operations (DML / bulk-insert) but no "
+        "# BLUEPRINT_DATA_MIGRATION_PROOF: declaration — add proof evidence to: "
+        + ", ".join(offenders),
+    )
+
+
 def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | None:
     """Detect deterministically-defective migration chains.
 
@@ -1171,6 +1289,14 @@ async def run_migration_apply_gate(
             "production's recorded Alembic revision is unset/unreadable "
             "(no alembic_version stamp) — cannot reproduce the deploy",
         )
+
+    # 3b. Data-migration proof gate: new migrations with DML must declare proof.
+    # Runs after reading prod_state (needed to identify which migrations are new)
+    # but before the expensive scratch-DB provisioning path.
+    _new_sources = _new_migration_sources(candidate_sources, prod_state.revision)
+    _data_proof_verdict = _check_data_migration_proof_gate(_new_sources)
+    if _data_proof_verdict is not None:
+        return _data_proof_verdict
 
     if required_metadata is None:
         # Derive the candidate's required schema from a clean apply of its OWN
