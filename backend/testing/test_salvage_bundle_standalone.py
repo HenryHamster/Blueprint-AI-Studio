@@ -31,6 +31,26 @@ Findings covered here (7-finding compute-images bundle):
   cb-6 — build_and_push scans inputs AND image layers for platform credentials
   cb-7 — _prune_docker_images is called after each compute job (proactive cache hygiene)
 
+Findings covered here (16-finding compute viewable artifacts bundle):
+  v-1  — local_runner and storage._VIEWABLE_CONTENT_TYPES both include pdf; allowlists are aligned
+  v-2  — GCP-VM jobs stream mid-run viewables via /api/agent/compute-jobs/<id>/viewable (viewable_watch.py)
+  v-3  — extension guard applies to BOTH signing paths (manifest and ComputeJobFile row); orphan purge exists
+  v-4  — ComputeJobsPanel delegates gallery rendering to ComputeArtifactGallery (no inline copy)
+  v-5  — scanner fairness rotation prevents early-sorted overwritten files from starving later files
+         (covered in test_local_runner_viewable_selection.py::test_frequently_rewritten_early_file…)
+  v-6  — StrategicContextWorkspace suppresses duplicate media in evidence section for promoted artifacts
+  v-7  — UI (ComputeArtifactGallery) accurately describes per-kind size limits (image ≠ video)
+  v-8  — backend evidence returns artifact_total separately from item count; frontend reads live_count
+  v-9  — runner.py viewable endpoint authorizes against allowed_project_ids (multi-project runners)
+  v-10 — design: atomic terminal artifact handoff (implemented, covered by v-13 / test_local_runner.py)
+  v-11 — useFreshMediaUrl keys cache on (storage_uri, revision) so overwritten same-path files update
+  v-12 — _artifact_descriptor emits image + video + pdf preview groups; mixed-media not collapsed
+  v-13 — upload_compute_job_artifact calls _link_terminal_artifact for late first bundles
+  v-14 — evidence viewable-sort puts viewable-bearing artifacts first; running items prepended
+  v-15 — local_runner reports viewable_omissions (size_cap, count_cap) to backend via report endpoint
+  v-16 — PDF is in all three allowlists (local_runner, storage, 422 error message)
+         (overlaps v-1; full upload test in test_local_runner_viewable_selection.py::test_pdf_file_uploaded)
+
 Findings covered here (18-finding compute-viewable salvage bundle, 2026-07-17):
   f1  — parallel signBlob: _sign_viewable_manifest uses asyncio.gather, not sequential loop
   f2  — live indicator: StrategicContextArtifactSlot renders LiveBadge for live=true media
@@ -864,13 +884,7 @@ def test_compute_job_runner_calls_prune_docker_images_after_job():
 
 
 # =========================================================================== #
-# 12-finding compute-viewable salvage bundle (2026-07-17)
-#
-# Findings: live-preview starvation, canvas dedup, honest media limits,
-# artifact sampling disclosure, bound-project uploads, atomic terminal handoff
-# design, refresh overwritten previews, mixed-media preservation, atomic
-# terminal handoff impl, reserve slots for viewable runs, omission telemetry,
-# PDF support.
+# 16-finding compute viewable artifacts bundle
 # =========================================================================== #
 
 
@@ -920,7 +934,7 @@ def _admin_compute_jobs_source() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Finding 1: live-preview fairness — scanner rotates past last-uploaded path
+# Finding 1 / v-5 — live-preview fairness: scanner rotates past last-uploaded path
 # --------------------------------------------------------------------------- #
 
 
@@ -958,14 +972,178 @@ def test_stream_viewable_files_rotates_candidate_list():
 
 
 # --------------------------------------------------------------------------- #
-# Finding 5: live-viewable endpoint authorizes against allowed_project_ids
+# Finding v-2 — GCP-VM jobs stream mid-run viewables via a dedicated endpoint
+# --------------------------------------------------------------------------- #
+
+
+def test_gcp_vm_viewable_endpoint_exists_in_agent_compute_jobs():
+    """agent_compute_jobs.py exposes a mid-run viewable upload endpoint for GCP VMs.
+
+    Finding v-2: compute_job_vm_heartbeat (the GCP heartbeat handler) never ingested
+    viewable multipart bodies; GCP VM jobs had no path to stream mid-run plots to the
+    canvas.  The fix adds a separate POST /compute-jobs/{job_id}/viewable endpoint
+    in agent_compute_jobs.py, mirroring the runner-subprocess path, and a companion
+    viewable_watch.py daemon that runs inside the VM and calls that endpoint.
+    """
+    import inspect
+    from app.routers import agent_compute_jobs as acj_mod
+
+    source = inspect.getsource(acj_mod)
+
+    # The endpoint must exist and use HMAC authentication (same secret as heartbeat).
+    assert "compute-jobs/{job_id}/viewable" in source or "/viewable" in source, (
+        "agent_compute_jobs.py must expose a /viewable upload endpoint for GCP-VM "
+        "mid-run viewable streaming (analogous to runner.py's viewable endpoint)"
+    )
+    assert "compute_job_heartbeat_secret" in source, (
+        "The GCP-VM viewable endpoint must authenticate via compute_job_heartbeat_secret, "
+        "the same per-job HMAC secret used by the heartbeat endpoint"
+    )
+    assert "viewable_files" in source, (
+        "The GCP-VM viewable endpoint must stamp polling_metadata['viewable_files'] "
+        "so the canvas can render mid-run previews before terminal finalization"
+    )
+
+    # viewable_watch.py must also exist and call the right URL path.
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "_compute_scripts" / "viewable_watch.py",
+        Path("/repo/backend/app/_compute_scripts/viewable_watch.py"),
+    ]
+    watch_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            watch_source = p.read_text(encoding="utf-8")
+            break
+
+    assert watch_source is not None, (
+        "backend/app/_compute_scripts/viewable_watch.py must exist — "
+        "GCP VMs run this daemon to upload mid-run viewable files to the orchestrator"
+    )
+    assert "/compute-jobs/" in watch_source and "/viewable" in watch_source, (
+        "viewable_watch.py must POST to /api/agent/compute-jobs/<job_id>/viewable "
+        "to deliver mid-run previews for GCP-VM jobs"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-3 — extension guard on both signing paths; orphan purge present
+# --------------------------------------------------------------------------- #
+
+
+def test_signing_extension_guard_applies_to_computejobfile_branch():
+    """The signed-URL endpoint applies the viewable extension guard on BOTH paths.
+
+    Finding v-3 (unify viewable surfaces): the ComputeJobFile signing branch in
+    main.py formerly accepted any URI whose row existed in the DB without
+    re-validating the extension, while the manifest branch called
+    viewable_content_type_for_filename.  Both branches must now share the same guard
+    so a mis-classified row cannot produce a signed URL for a non-viewable file.
+    """
+    import inspect
+    import app.main as main_mod
+
+    source = inspect.getsource(main_mod)
+
+    # The ComputeJobFile signing branch must import + apply viewable_content_type_for_filename
+    # (or alias it as _vctype) to validate the extension before generating a signed URL.
+    assert "viewable_content_type_for_filename" in source, (
+        "app.main must reference viewable_content_type_for_filename in the "
+        "compute-job URI signing path so the extension guard covers ComputeJobFile rows"
+    )
+    # The guard must be applied on the ComputeJobFile row's safe_relpath.
+    # The implementation aliases the function as _vctype and calls _vctype(cjf.safe_relpath).
+    assert "_vctype" in source, (
+        "app.main must alias viewable_content_type_for_filename as _vctype and call it "
+        "on cjf.safe_relpath so non-viewable extensions are rejected in the ComputeJobFile branch"
+    )
+    # The rejection path (404 on None result) must exist.
+    assert "Artifact not found" in source, (
+        "app.main must return 404 when the extension guard rejects the ComputeJobFile "
+        "relpath — so callers receive the same response as for a missing artifact"
+    )
+
+
+def test_orphaned_viewable_rows_purge_exists_in_compute_jobs():
+    """compute_jobs.py defines a purge helper for orphaned ComputeJobFile rows.
+
+    Finding v-3: _record_viewable_job_files only inserted/updated rows but never
+    deleted mid-run uploads that were excluded from the terminal top-25 manifest.
+    Those orphaned rows appeared in the signing allowlist without being in the
+    displayed manifest, creating a silent asymmetry.  The purge helper reconciles
+    both surfaces to the authoritative terminal manifest.
+    """
+    import inspect
+    import app.compute_jobs as cj_mod
+
+    source = inspect.getsource(cj_mod)
+
+    assert "_purge_orphaned_viewable_rows" in source, (
+        "app.compute_jobs must define _purge_orphaned_viewable_rows to delete "
+        "ComputeJobFile rows from mid-run uploads that were not selected into the "
+        "terminal top-25 manifest"
+    )
+    # The purge must be called from the terminal extraction path.
+    assert source.count("_purge_orphaned_viewable_rows") >= 2, (
+        "_purge_orphaned_viewable_rows must be both defined AND called during terminal "
+        "artifact extraction — found fewer than 2 occurrences"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-4 — ComputeJobsPanel delegates to ComputeArtifactGallery (no inline copy)
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_jobs_panel_uses_compute_artifact_gallery():
+    """ComputeJobsPanel renders viewable files through ComputeArtifactGallery.
+
+    Finding v-4 (de-duplicate gallery): ComputeJobsPanel.tsx formerly contained a
+    near-verbatim inline copy of the resolve/cache/mark-error/open-full-size pipeline
+    duplicated from ComputeArtifactGallery.tsx.  The two copies auto-resolved
+    differently and had divergent cap messaging.  The fix replaces the inline copy
+    with a <ComputeArtifactGallery> import so both surfaces share one implementation.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ComputeJobsPanel.tsx",
+        Path("/repo/admin-ui/src/components/ComputeJobsPanel.tsx"),
+    ]
+    panel_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            panel_source = p.read_text(encoding="utf-8")
+            break
+
+    if panel_source is None:
+        import pytest
+
+        pytest.skip("ComputeJobsPanel.tsx not found — skipping frontend source check")
+
+    assert "ComputeArtifactGallery" in panel_source, (
+        "ComputeJobsPanel.tsx must import and render ComputeArtifactGallery so that "
+        "the viewable file gallery is not duplicated inline in the panel component"
+    )
+    # The inline resolve pipeline (useFreshMediaUrl called directly inside the panel)
+    # would be a sign of duplication.  The gallery component owns it instead.
+    assert panel_source.count("useFreshMediaUrl") == 0, (
+        "ComputeJobsPanel.tsx must NOT contain useFreshMediaUrl — that hook belongs "
+        "in ComputeArtifactGallery.tsx; a copy in the panel means the two surfaces "
+        "resolve and cache signed URLs independently"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 5 / v-9 — live-viewable endpoint authorizes against allowed_project_ids
 # --------------------------------------------------------------------------- #
 
 
 def test_viewable_endpoint_uses_allowed_project_ids():
     """The /compute-job/{job_id}/viewable endpoint must use allowed_project_ids.
 
-    Finding 5 claim: 'The live-viewable endpoint filters ComputeJob.project_id
+    Finding 5 / v-9 claim: 'The live-viewable endpoint filters ComputeJob.project_id
     against runner.project_id rather than the runner's allowed_project_ids set.'
     The current code must use the broader allowed_project_ids so bound secondary
     projects can stream their plots.
@@ -984,54 +1162,216 @@ def test_viewable_endpoint_uses_allowed_project_ids():
         "runner.project_id directly) so a runner bound to a secondary project "
         "can upload previews for jobs in that project"
     )
-
-
-# --------------------------------------------------------------------------- #
-# Finding 7: cache key includes revision so overwritten files refresh
-# --------------------------------------------------------------------------- #
-
-
-def test_pdf_in_viewable_content_types():
-    """PDF must be in the storage viewable content-type registry.
-
-    Finding 12 claim: 'compute_backends._VIEWABLE_CONTENT_TYPES has no pdf entry.'
-    """
-    from app import storage
-
-    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES, (
-        "storage._VIEWABLE_CONTENT_TYPES must include 'pdf' so PDF viewable files "
-        "can be classified and uploaded via the live-viewable pipeline"
-    )
-    content_type, kind = storage._VIEWABLE_CONTENT_TYPES["pdf"]
-    assert content_type == "application/pdf"
-    assert kind == "pdf"
-
-
-def test_local_runner_pdf_in_viewable_content_types():
-    """PDF must also be in the runner's local copy of _VIEWABLE_CONTENT_TYPES.
-
-    Finding 12 claim: the runner must mirror the server's allowlist so it does
-    not skip PDF files before attempting upload.
-    """
-    source = _local_runner_source()
-
-    assert '"pdf": ("application/pdf", "pdf")' in source or (
-        '"pdf"' in source and "application/pdf" in source
-    ), (
-        "local_runner.py _VIEWABLE_CONTENT_TYPES must include a 'pdf' entry "
-        "matching ('application/pdf', 'pdf')"
+    # The filter must use .in_(allowed_projects) not an == comparison.
+    assert "in_(allowed_projects)" in source, (
+        "runner.py must build an allowed_projects set via allowed_project_ids() and "
+        "filter ComputeJob.project_id with .in_(allowed_projects) — not an == comparison "
+        "to runner.project_id — so bound secondary projects are accepted"
     )
 
 
 # --------------------------------------------------------------------------- #
-# Finding 8/12: mixed-media descriptor retains all preview kinds
+# Finding v-6 — StrategicContextWorkspace suppresses duplicate media for promoted artifacts
+# --------------------------------------------------------------------------- #
+
+
+def test_strategic_workspace_suppresses_evidence_media_for_promoted_artifacts():
+    """StrategicContextWorkspace hides evidence-section media when already on canvas.
+
+    Finding v-6 (deduplicate artifact media galleries): when a compute artifact is
+    selected as a primary canvas descriptor, its inline image/video gallery rendered
+    the same signed URLs a second time in the Evidence section.  The fix guards the
+    ArtifactViewablePreviews render with `!isPromoted`, silencing duplicates while
+    keeping the evidence row (label + navigation) visible.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "StrategicContextWorkspace.tsx",
+        Path("/repo/admin-ui/src/components/StrategicContextWorkspace.tsx"),
+    ]
+    ws_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            ws_source = p.read_text(encoding="utf-8")
+            break
+
+    if ws_source is None:
+        import pytest
+
+        pytest.skip("StrategicContextWorkspace.tsx not found — skipping frontend source check")
+
+    assert "isPromoted" in ws_source, (
+        "StrategicContextWorkspace.tsx must compute isPromoted for each evidence artifact "
+        "so that media previews are not rendered a second time when the artifact is "
+        "already displayed as a primary canvas descriptor"
+    )
+    assert "!isPromoted" in ws_source, (
+        "The ArtifactViewablePreviews block must be conditional on !isPromoted "
+        "to suppress duplicate media for promoted artifacts"
+    )
+    # The !isPromoted guard and ArtifactViewablePreviews must appear near each other
+    # in the source (both in the evidence artifact render block).
+    not_promoted_idx = ws_source.index("!isPromoted")
+    # ArtifactViewablePreviews is imported at the top but also used after !isPromoted.
+    # Find the first usage AFTER the !isPromoted guard.
+    after_guard = ws_source[not_promoted_idx:]
+    assert "ArtifactViewablePreviews" in after_guard, (
+        "ArtifactViewablePreviews must appear after !isPromoted in "
+        "StrategicContextWorkspace.tsx so the conditional guard wraps the preview render"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-7 — UI accurately describes per-kind size limits (image ≠ video)
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_shows_accurate_per_kind_caps():
+    """ComputeArtifactGallery describes the actual per-kind size limits.
+
+    Finding v-7 (report media preview limits honestly): all three artifact surfaces
+    formerly described a uniform 8-MiB-per-file cap.  The backend applies 8 MiB for
+    images/PDFs but a separately configurable cap (default 512 MiB) for videos.
+    The UI must state both limits so operators understand why a large video may be
+    omitted while smaller images are still delivered.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ComputeArtifactGallery.tsx",
+        Path("/repo/admin-ui/src/components/ComputeArtifactGallery.tsx"),
+    ]
+    gallery_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            gallery_source = p.read_text(encoding="utf-8")
+            break
+
+    if gallery_source is None:
+        import pytest
+
+        pytest.skip("ComputeArtifactGallery.tsx not found — skipping frontend source check")
+
+    assert "512 MiB" in gallery_source, (
+        "ComputeArtifactGallery.tsx must mention '512 MiB' (the video cap) so the "
+        "operator understands that videos have a different (larger) per-file limit"
+    )
+    assert "8 MiB" in gallery_source, (
+        "ComputeArtifactGallery.tsx must mention '8 MiB' (the image/PDF cap) so the "
+        "operator understands that images and PDFs have a smaller per-file limit"
+    )
+    # The two caps must appear in the SAME context so they're not ambiguous.
+    assert "video" in gallery_source.lower(), (
+        "ComputeArtifactGallery.tsx must use 'video' in the cap description to "
+        "distinguish the 512-MiB video limit from the 8-MiB image limit"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-8 — backend returns artifact_total; frontend exposes live_count
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_response_returns_artifact_total_and_live_count():
+    """load_strategic_context_evidence returns durable total + live_count separately.
+
+    Finding v-8 (disclose artifact sampling): the workspace displayed a count derived
+    from the bounded item list (≤4) rather than the durable artifact total.  The fix
+    adds 'total' (durable DB count) and 'live_count' (number of running-job preview
+    rows prepended) to the evidence artifacts dict so the frontend can distinguish
+    'showing 4 of 12 durable artifacts' from 'there are exactly 4'.
+    """
+    source = _strategic_pkg_source()
+
+    # The evidence-load function must return 'total' in the artifacts dict.
+    assert '"total"' in source or "'total'" in source, (
+        "load_strategic_context_evidence must include 'total' (durable artifact count) "
+        "in the returned artifacts dict so the frontend can show 'N of M' sampling disclosure"
+    )
+    assert '"live_count"' in source or "'live_count'" in source, (
+        "load_strategic_context_evidence must include 'live_count' (running-job preview "
+        "row count) so the frontend can label live items separately from terminal ones"
+    )
+
+    # The frontend type definition must reflect both fields.
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "strategicStateApi.ts",
+        Path("/repo/admin-ui/src/strategicStateApi.ts"),
+    ]
+    api_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            api_source = p.read_text(encoding="utf-8")
+            break
+
+    if api_source is not None:
+        assert "live_count" in api_source, (
+            "strategicStateApi.ts must type-check live_count in the evidence artifacts "
+            "shape so consuming components can safely read it"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Finding v-11 — useFreshMediaUrl caches by (storage_uri, revision) so overwrites trigger refresh
+# --------------------------------------------------------------------------- #
+
+
+def test_fresh_media_url_hook_uses_revision_in_generation_key():
+    """useFreshMediaUrl keys the signed-URL cache on (storage_uri, revision).
+
+    Finding v-11 (refresh overwritten live previews): the hook previously keyed only
+    on storage_uri.  The backend deliberately overwrites the same canonical URI when
+    a runner re-uploads a changed same-filename file, so a stale signed URL cached
+    under the old content would never refresh even though the server had new bytes at
+    the same path.  Folding revision into the generation key forces a fresh URL fetch
+    whenever a new revision token arrives.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "StrategicContextArtifactSlot.tsx",
+        Path("/repo/admin-ui/src/components/StrategicContextArtifactSlot.tsx"),
+    ]
+    slot_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            slot_source = p.read_text(encoding="utf-8")
+            break
+
+    if slot_source is None:
+        import pytest
+
+        pytest.skip("StrategicContextArtifactSlot.tsx not found — skipping frontend source check")
+
+    assert "revision" in slot_source, (
+        "StrategicContextArtifactSlot.tsx must accept a 'revision' prop in useFreshMediaUrl "
+        "so overwritten same-path files cause a cache miss and a fresh signed URL"
+    )
+    assert "generation" in slot_source, (
+        "useFreshMediaUrl must build a 'generation' string that includes both storage_uri "
+        "and revision; a change to either must trigger a URL re-fetch"
+    )
+    # The generation must concatenate storage_uri AND revision (not just one).
+    gen_line_idx = slot_source.find("generation")
+    segment = slot_source[gen_line_idx : gen_line_idx + 200]
+    assert "revision" in segment, (
+        "The 'generation' variable in useFreshMediaUrl must reference 'revision' so the "
+        "cache key changes when a same-path file is overwritten with new content"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 8 / v-12 — mixed-media descriptor retains all preview kinds
 # --------------------------------------------------------------------------- #
 
 
 def test_artifact_descriptor_retains_mixed_media_kinds():
     """_artifact_descriptor emits image, video, AND pdf groups from a mixed manifest.
 
-    Finding 8 claim: 'After choosing a kind, the descriptor emits only that
+    Finding 8 / v-12 claim: 'After choosing a kind, the descriptor emits only that
     kind's list for the main tile.' The fix must call add_preview_group for every
     present kind regardless of the primary kind selection.
     """
@@ -1065,15 +1405,53 @@ def test_artifact_descriptor_retains_mixed_media_kinds():
     assert isinstance(descriptor.get("pdfs"), list) and len(descriptor["pdfs"]) >= 1
 
 
+def test_artifact_descriptor_mixed_image_and_pdf():
+    """_artifact_descriptor retains both image and pdf keys on a mixed artifact."""
+    from app.strategic_context_package import _artifact_descriptor
+
+    artifact = {
+        "id": "mix-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "result",
+        "label": "mixed result",
+        "viewable_previews": [
+            {
+                "url": "https://cdn.example.com/reward.png?sig=a",
+                "kind": "image",
+                "filename": "reward_curve.png",
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/reward_curve.png",
+            },
+            {
+                "url": "https://cdn.example.com/report.pdf?sig=b",
+                "kind": "pdf",
+                "filename": "full_report.pdf",
+                "storage_uri": "gs://b/compute-jobs/j/artifacts/viewable/full_report.pdf",
+            },
+        ],
+    }
+
+    desc = _artifact_descriptor(artifact)
+
+    assert "image" in desc, (
+        "_artifact_descriptor must include 'image' key when a viewable preview of kind='image' exists"
+    )
+    assert "pdf" in desc, (
+        "_artifact_descriptor must include 'pdf' key when a viewable preview of kind='pdf' exists — "
+        "a mixed image+PDF compute result must NOT collapse to image only"
+    )
+    assert desc["image"]["url"] == "https://cdn.example.com/reward.png?sig=a"
+    assert desc["pdf"]["url"] == "https://cdn.example.com/report.pdf?sig=b"
+
+
 # --------------------------------------------------------------------------- #
-# Finding 9: late bundle arrival backfills artifact_id / result_reference
+# Finding 9 / v-13 — late bundle arrival backfills artifact_id / result_reference
 # --------------------------------------------------------------------------- #
 
 
 def test_late_bundle_upload_triggers_artifact_linkage():
     """runner.py backfills artifact_id when a bundle arrives after terminalization.
 
-    Finding 9 claim: 'A terminal runner job can currently retain a stored bundle
+    Finding 9 / v-13 claim: 'A terminal runner job can currently retain a stored bundle
     pointer without artifact_id or result_reference being backfilled.' The fix
     calls _link_terminal_artifact for the first late upload on a terminal job.
     """
@@ -1092,14 +1470,14 @@ def test_late_bundle_upload_triggers_artifact_linkage():
 
 
 # --------------------------------------------------------------------------- #
-# Finding 10: viewable-bearing artifacts sort first in evidence slice
+# Finding 10 / v-14 — viewable-bearing artifacts sort first in evidence slice
 # --------------------------------------------------------------------------- #
 
 
 def test_evidence_loader_sorts_viewable_artifacts_first():
     """Terminal artifact evidence sorts viewable-bearing rows before non-viewable.
 
-    Finding 10 claim: 'Terminal evidence queries the four newest meaningful
+    Finding 10 / v-14 claim: 'Terminal evidence queries the four newest meaningful
     artifacts before resolving viewable previews.' The sort must put viewable
     items first so the _ARTIFACT_EVIDENCE_LIMIT cap retains media-bearing rows.
     """
@@ -1119,14 +1497,14 @@ def test_evidence_loader_sorts_viewable_artifacts_first():
 
 
 # --------------------------------------------------------------------------- #
-# Finding 11: live omission telemetry surfaced via polling_metadata
+# Finding 11 / v-15 — live omission telemetry surfaced via polling_metadata
 # --------------------------------------------------------------------------- #
 
 
 def test_live_omissions_stamped_in_polling_metadata():
     """The runner stamps viewable_live_omissions into polling_metadata on running reports.
 
-    Finding 11 claim: 'The runner logs local oversize/count-budget skips but does
+    Finding 11 / v-15 claim: 'The runner logs local oversize/count-budget skips but does
     not report them to the backend.' The fix stamps both counts via viewable_omissions
     in the running heartbeat, which the server converts to viewable_live_omissions.
     """
@@ -1147,7 +1525,7 @@ def test_live_omissions_stamped_in_polling_metadata():
 def test_admin_api_exposes_viewable_live_omissions():
     """The admin compute-jobs API exposes viewable_live_omissions to the frontend.
 
-    Finding 11 claim: omission telemetry must flow from runner heartbeat through
+    Finding 11 / v-15 claim: omission telemetry must flow from runner heartbeat through
     polling_metadata to the API response so the UI can display it.
     """
     source = _admin_compute_jobs_source()
@@ -1155,6 +1533,50 @@ def test_admin_api_exposes_viewable_live_omissions():
     assert "viewable_live_omissions" in source or "viewable_artifacts_live_omissions" in source, (
         "admin_compute_jobs.py must expose the runner's live omission counts "
         "as viewable_artifacts_live_omissions in the compute-job polling response"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding 12 / v-1 / v-16 — PDF in all three allowlists
+# --------------------------------------------------------------------------- #
+
+
+def test_pdf_in_viewable_content_types():
+    """PDF must be in the storage viewable content-type registry.
+
+    Finding 12 / v-16 claim: 'compute_backends._VIEWABLE_CONTENT_TYPES has no pdf entry.'
+    """
+    from app import storage
+
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES, (
+        "storage._VIEWABLE_CONTENT_TYPES must include 'pdf' so PDF viewable files "
+        "can be classified and uploaded via the live-viewable pipeline"
+    )
+    content_type, kind = storage._VIEWABLE_CONTENT_TYPES["pdf"]
+    assert content_type == "application/pdf"
+    assert kind == "pdf"
+
+
+def test_local_runner_pdf_in_viewable_content_types():
+    """PDF must also be in the runner's local copy of _VIEWABLE_CONTENT_TYPES.
+
+    Finding 12 / v-1 claim: the runner must mirror the server's allowlist so it does
+    not skip PDF files before attempting upload.
+    """
+    source = _local_runner_source()
+
+    assert '"pdf": ("application/pdf", "pdf")' in source or (
+        '"pdf"' in source and "application/pdf" in source
+    ), (
+        "local_runner.py _VIEWABLE_CONTENT_TYPES must include a 'pdf' entry "
+        "matching ('application/pdf', 'pdf')"
+    )
+
+    # The runner 422 error message must list pdf so the operator knows what is accepted.
+    runner_source = _runner_router_source()
+    assert "pdf" in runner_source and "422" in runner_source, (
+        "runner.py must include 'pdf' in the 422 error message for unsupported "
+        "viewable extensions so operators see the full supported set"
     )
 
 
