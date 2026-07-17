@@ -27338,3 +27338,145 @@ async def test_design_doc_set_shrink_allowed_when_over_cap(
     assert "too large" in resp2.json().get("detail", "").lower() or "too large" in str(
         resp2.json()
     ).lower(), f"Expected 'too large' in error detail: {resp2.json()}"
+
+
+@pytest.mark.asyncio
+async def test_warm_claim_finalizer_fences_unproven_capability(db_session):
+    """Shared warm-claim finalizer denies a claim under enforce when a durable
+    capability requirement has no CURRENT platform proof.
+
+    The task admitted in a permissive mode carries a
+    ``_capability_execution_requirements`` record; at warm-claim time the gate is
+    ``enforce`` and the capability is ``working`` with only a self-declared
+    (uncorroborated) proof. The finalizer must NOT flip the task to IN_PROGRESS —
+    it parks it BLOCKED with machine-resolvable needs, clears the warm pin, and
+    returns 204 so all three warm callers decline the claim.
+    """
+    from app.routers.agent_warm_continuity import _finalize_warm_claim
+    from app.capability_execution_fence import CAPABILITY_EXECUTION_REQUIREMENTS_KEY
+    from app.task_blocked import get_blocker_needs
+    import app.shared_state as _ss
+
+    project = Project(name="Warm Fence Test", user_id="u")
+    # 'forged-cap' is 'working' with a self-declared proven ref but NO platform
+    # ledger entry → uncorroborated → unproven under enforce.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "forged-cap",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                ],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        vm_instance_id="agent-vm-warm",
+        context={
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [
+                {"kind": "capability", "ref": "forged-cap"}
+            ],
+            "warm_pool_pin": True,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prev = _ss.runtime_config.get("capability_proof_gate_mode")
+    _ss.runtime_config["capability_proof_gate_mode"] = "enforce"
+    try:
+        result = await _finalize_warm_claim(
+            db_session,
+            task,
+            "agent-vm-warm",
+            origin="warm_pool",
+            refresh_capable=True,
+            boot_account=None,
+        )
+    finally:
+        if prev is None:
+            _ss.runtime_config.pop("capability_proof_gate_mode", None)
+        else:
+            _ss.runtime_config["capability_proof_gate_mode"] = prev
+
+    # Claim declined (204) — not a warm-start response dict.
+    assert getattr(result, "status_code", None) == 204
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    assert get_blocker_needs(task) == [{"kind": "capability", "ref": "forged-cap"}]
+    # Durable requirement preserved; transient warm pin unwound.
+    assert task.context.get(CAPABILITY_EXECUTION_REQUIREMENTS_KEY) == [
+        {"kind": "capability", "ref": "forged-cap"}
+    ]
+    assert "warm_pool_pin" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_warm_claim_finalizer_allows_when_gate_off(db_session):
+    """Control: the same unproven capability requirement does NOT deny the warm
+    claim when the gate is ``off`` — off/observe execution behavior is preserved
+    (the finalizer proceeds past the fence to the normal warm-start path)."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        evaluate_execution_authority_block,
+    )
+    import app.shared_state as _ss
+
+    project = Project(name="Warm Fence Off Test", user_id="u")
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "forged-cap",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                ],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        vm_instance_id="agent-vm-warm-off",
+        context={
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [
+                {"kind": "capability", "ref": "forged-cap"}
+            ]
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prev = _ss.runtime_config.get("capability_proof_gate_mode")
+    _ss.runtime_config["capability_proof_gate_mode"] = "off"
+    try:
+        # Under 'off' the fence grants authority (no blocking needs), so the
+        # finalizer would proceed rather than 204.
+        blocking = await evaluate_execution_authority_block(db_session, task)
+        assert blocking == []
+    finally:
+        if prev is None:
+            _ss.runtime_config.pop("capability_proof_gate_mode", None)
+        else:
+            _ss.runtime_config["capability_proof_gate_mode"] = prev
+
+    await db_session.refresh(task)
+    # Fence did not mutate the task — still QUEUED, requirement intact.
+    assert task.status == TaskStatus.QUEUED

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
@@ -48,7 +49,6 @@ import {
   prepareTaskWorkBranch,
 } from '../task-checkpoint.js';
 import { writePrHelper } from '../prompts/pr-helper.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {
@@ -579,7 +579,9 @@ describe('durable unshipped-work checkpoint retry transition', () => {
       'push', '--force-with-lease', 'origin',
       `HEAD:refs/heads/${workBranch}`,
     ]);
-    expectCalledWith(apiGet, `/api/agent/github/token?task_id=${taskId}&force_refresh=true`);
+    expectCalledWith(apiGet,
+      `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
+    );
     expectCalledWith(writeGitTokenFile, 'fresh-checkpoint-token');
 
     const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(

@@ -14674,3 +14674,117 @@ class TestZoneExhaustionColdProvisionGate:
                 assert row.status == TaskStatus.PROVISIONING
         finally:
             _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+
+@pytest.mark.asyncio
+async def test_cold_dispatch_fence_blocks_unproven_capability(db_session):
+    """Cold-dispatch execution-authority fence: a QUEUED task carrying a durable
+    capability requirement whose ``working`` capability is uncorroborated is moved
+    to first-class BLOCKED under enforce, consuming NO dispatch slot
+    (``attempt_count`` untouched, no failure recorded). This is the exact
+    evaluate+block pair the orchestrator inlines before every cold route."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        block_task_for_capability_proof,
+        evaluate_execution_authority_block,
+    )
+    from app.task_blocked import get_blocker_needs
+
+    cap_need = {"kind": "capability", "ref": "forged-cap"}
+    project = make_project(
+        name="cold-fence",
+        user_id=_TEST_USER,
+        problem_model={
+            "capabilities": [
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "p"}],
+        context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    _prior_attempts = task.attempt_count or 0
+
+    blocking = await evaluate_execution_authority_block(
+        db_session, task, mode="enforce"
+    )
+    assert blocking == [cap_need]
+    block_task_for_capability_proof(task, blocking, source="cold dispatch")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.BLOCKED
+    assert get_blocker_needs(task) == [cap_need]
+    # No dispatch slot consumed: BLOCKED is not a failure/attempt.
+    assert (task.attempt_count or 0) == _prior_attempts
+
+
+@pytest.mark.asyncio
+async def test_cold_dispatch_fence_grants_after_ledger_proof(db_session):
+    """Restoration: once the platform proof ledger records a machine-verified
+    entry for the required capability, the same durable requirement grades proven
+    and the fence grants execution authority (no blocking needs)."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        evaluate_execution_authority_block,
+    )
+
+    cap_need = {"kind": "capability", "ref": "real-cap"}
+    project = make_project(
+        name="cold-fence-restored",
+        user_id=_TEST_USER,
+        problem_model={
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        },
+        # Platform-recorded machine proof corroborates the claim.
+        capability_proof_records={
+            "real-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "p"}],
+        context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    blocking = await evaluate_execution_authority_block(
+        db_session, task, mode="enforce"
+    )
+    assert blocking == []
+    assert task.status == TaskStatus.QUEUED

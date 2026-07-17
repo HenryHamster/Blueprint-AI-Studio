@@ -115,6 +115,10 @@ from app.shared_state import (
 )
 from app.task_locking import task_lock
 from app.task_blocked import strip_fresh_attempt_context
+from app.capability_execution_fence import (
+    block_task_for_capability_proof,
+    evaluate_execution_authority_block,
+)
 from app.time_utils import (
     _is_cadence_due,
     _utcnow,
@@ -3214,6 +3218,44 @@ async def orchestrator_worker():
                             continue
                         if task.requires_approval:
                             await session.rollback()
+                            continue
+                        # Execution-authority fence: immediately before this
+                        # locked QUEUED task gains authority on ANY cold route
+                        # (strategic/local runner, direct compute, pull runner,
+                        # warm-pool lease, Cloud Run/GCE — all reached below),
+                        # re-grade its capability-proof requirements against the
+                        # live gate mode and the project's current platform-only
+                        # proof ledger. Under enforce, an absent/expired/revoked/
+                        # contradicted/uncorroborated capability atomically parks
+                        # the task BLOCKED with machine-resolvable needs and
+                        # consumes NO dispatch slot (we do not increment
+                        # _cycle_dispatched on this branch). No account/VM has been
+                        # claimed at this point, so nothing needs unwinding.
+                        _fence_blocking = await evaluate_execution_authority_block(
+                            session, task
+                        )
+                        if _fence_blocking:
+                            block_task_for_capability_proof(
+                                task, _fence_blocking, source="cold dispatch"
+                            )
+                            session.add(task)
+                            await session.commit()
+                            logger.warning(
+                                "[ORCHESTRATOR][capability-proof-enforce] Task %s "
+                                "parked BLOCKED at cold dispatch — required "
+                                "capability proof not current: %s",
+                                task.id,
+                                ", ".join(n["ref"] for n in _fence_blocking),
+                            )
+                            await broadcast_to_project(
+                                str(task.project_id),
+                                "task_updated",
+                                {
+                                    "task_id": str(task.id),
+                                    "status": task.status,
+                                    "message": task.blocked_reason,
+                                },
+                            )
                             continue
                         # vm_instance_id read via __dict__ after the strategic
                         # path call. _hold_strategic_local_runner_task's

@@ -848,7 +848,7 @@ def record_capability_named_test_execution_proof(
 
 
 def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
-    """Remove the ``named_test_exec:<cap>`` ledger entry (and its evidence_ref) for
+    """Remove all ``named_test``-tier ledger entries (and their evidence_refs) for
     ``cap_name`` after a definitive RED trial proves the capability broken at HEAD.
 
     Called from :func:`app.task_completion._handle_capability_proof_trial_completion`
@@ -857,12 +857,18 @@ def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
     an earlier revision) keeps clearing the enforce gate until the 30-day TTL expires
     — even though the capability is demonstrably broken at the current HEAD.
 
+    Removes ALL ``proof_kind == "named_test"`` entries — both the executed-proof
+    entry (``task_id=named_test_exec:<cap>``) and any older merge-gate proofs
+    (``proof_kind=named_test``, ``task_id=<uuid>``). The merge-gate proof is minted
+    by ``record_capability_proof`` when a PR passes acceptance evidence; a definitive
+    RED at current HEAD supersedes it regardless of the SHA at which it was minted.
+
     Non-raising: all errors are logged at WARNING level so a revocation failure can
     never strand the surrounding commit or prevent the contradiction from being
     recorded.
 
-    Returns ``True`` when the ledger entry was present and removed, ``False`` when
-    no entry existed (nothing to revoke) or on error.
+    Returns ``True`` when at least one entry was present and removed, ``False`` when
+    no named_test proof existed (nothing to revoke) or on error.
     """
     norm = normalize_capability_name(cap_name)
     if not norm:
@@ -874,9 +880,23 @@ def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
 
         dedup_task_id = f"named_test_exec:{norm}"
         existing = list(project.capability_proof_records.get(norm) or [])
-        pruned = [e for e in existing if not (isinstance(e, dict) and e.get("task_id") == dedup_task_id)]
+        # Supersede ALL named_test proof records on a definitive RED — both the
+        # executed-proof entry (task_id=named_test_exec:<cap>) and older merge-gate
+        # proofs (proof_kind=named_test, task_id=<uuid>). The merge-gate proof
+        # remains authoritative under the old code until its 30-day TTL; a RED
+        # trial running at HEAD overrides it immediately.
+        pruned = [
+            e for e in existing
+            if not (
+                isinstance(e, dict)
+                and (
+                    e.get("task_id") == dedup_task_id
+                    or e.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+                )
+            )
+        ]
         if len(pruned) == len(existing):
-            # No executed-proof entry was present — nothing to revoke.
+            # No executed-proof entry or merge-gate named_test proof was present.
             return False
 
         project.capability_proof_records[norm] = pruned
@@ -890,7 +910,7 @@ def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
             return False
 
         # Mirror the revocation into problem_model evidence_refs so the
-        # tier-1 proof_status no longer sees the executed-proof ref.
+        # tier-1 proof_status no longer sees any named_test ref.
         try:
             pm = getattr(project, "problem_model", None)
             if isinstance(pm, dict):
@@ -910,7 +930,13 @@ def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
                             continue
                         new_refs = [
                             r for r in refs
-                            if not (isinstance(r, dict) and r.get("source_id") == dedup_task_id)
+                            if not (
+                                isinstance(r, dict)
+                                and (
+                                    r.get("source_id") == dedup_task_id
+                                    or r.get("kind") == _PROOF_KIND_NAMED_TEST
+                                )
+                            )
                         ]
                         if len(new_refs) < len(refs):
                             cap["evidence_refs"] = new_refs
@@ -924,7 +950,7 @@ def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
             )
 
         logger.info(
-            "[CAPABILITY_PROOF] revoked stale execution proof for cap=%s (definitive RED)",
+            "[CAPABILITY_PROOF] revoked stale named_test proofs for cap=%s (definitive RED)",
             norm,
         )
         return True
@@ -1122,16 +1148,29 @@ async def enroll_capability_proof_trial(
             )
             return None
         refs = refs[:MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES]
+        # Belt-and-suspenders: MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES must never
+        # be 0, but guard defensively so a misconfigured constant can't produce
+        # a fabricated empty proof.
+        if not refs:
+            logger.warning(
+                "[CAP_TRIAL] cannot enroll trial for cap=%s — refs empty after cap "
+                "(MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES=%d)",
+                norm,
+                MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
+            )
+            return None
 
         from sqlalchemy import select
 
         from app.models import Task, TaskStatus
 
-        # Dedup guard: if a trial for this capability is already QUEUED,
-        # PROVISIONING, IN_PROGRESS, or EVALUATING, do not enroll another.
-        # This ensures "revision B commissions exactly one re-verification" and
-        # prevents concurrent earn sweeps from creating duplicate trials that race
-        # to replace each other's proof.
+        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
+        # trial exists.  Terminal states (COMPLETED, FAILED) deliberately do NOT
+        # block a fresh enrollment so a completed trial can be re-run after a new
+        # commit lands.  Note: a narrow TOCTOU window exists — two concurrent
+        # sweeps that both miss the in-flight check can both enroll; this is
+        # tolerated (idempotent proof recording handles the duplicate) and only
+        # risks one extra runner job per capability per sweep cycle.
         project_id = getattr(project, "id", None)
         in_flight_statuses = [
             TaskStatus.QUEUED,

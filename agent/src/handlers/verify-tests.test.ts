@@ -1271,8 +1271,7 @@ describe('handleVerifyTests — diff-aware runner filtering', () => {
 
     await handleVerifyTests('df-fetch', payload, {}, 'tok', 'o', 'r', null, { value: '' });
 
-    expectCalledWith(
-      execFileAsync,
+    expectCalledWith(execFileAsync,
       'git',
       ['fetch', 'origin', '+refs/heads/main:refs/remotes/origin/main'],
       expect.objectContaining({ cwd: '/tmp/workspace' }),

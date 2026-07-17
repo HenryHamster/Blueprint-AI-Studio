@@ -81,7 +81,6 @@ async def _hotfix_promote_locked(
     if version.status != "open":
         return {"status": "not_open", "version_status": version.status}
     from app.qualification_state_resolver import resolve_newest_qualification_verdict
-
     _latest_verdict = await resolve_newest_qualification_verdict(session, version)
     _promo = _rq._promotion_in_flight_result(version, latest_verdict=_latest_verdict)
     if _promo is not None:

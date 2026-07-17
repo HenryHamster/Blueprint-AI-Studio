@@ -20733,6 +20733,58 @@ class TestRequeueClearsBlockerMetadata:
         # Clean attempt: counter reset like any leaf requeue.
         assert task.attempt_count == 0
 
+    @pytest.mark.asyncio
+    async def test_requeue_preserves_capability_execution_requirement(self, db_session):
+        """Generic manual/bulk retry strips ordinary blocker metadata but must NOT
+        strip the durable capability-execution requirement — otherwise a retry
+        would bypass the execution-authority fence and let the task run without
+        current platform proof. The requirement survives the fresh attempt so the
+        fence re-blocks it at the next dispatch/claim."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+        from app.capability_execution_fence import (
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+            block_task_for_capability_proof,
+        )
+        from app.task_blocked import BLOCKER_CONTEXT_KEY
+
+        project = await _make_project(db_session)
+        cap_need = {"kind": "capability", "ref": "forged-cap"}
+        task = Task(
+            project_id=project.id,
+            title="Fence-blocked then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-old",
+            context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # The fence parks it BLOCKED with the capability need.
+        block_task_for_capability_proof(task, [cap_need], source="cold dispatch")
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.BLOCKED
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+        await db_session.refresh(task)
+
+        # Ordinary blocker metadata cleared, but the durable requirement survives.
+        assert task.status == TaskStatus.QUEUED
+        assert BLOCKER_CONTEXT_KEY not in (task.context or {})
+        assert (task.context or {}).get(CAPABILITY_EXECUTION_REQUIREMENTS_KEY) == [
+            cap_need
+        ]
+
 
 class TestManualRequeueGuidance:
     @pytest.mark.asyncio
