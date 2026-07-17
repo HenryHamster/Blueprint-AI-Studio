@@ -15984,6 +15984,7 @@ def _patch_hotfix_promote_github(mocker, *, changed_files):
         "app.github.merge_pull_request",
         new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
     )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
     mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock())
     return create_branch_mock, create_pr_mock
 
@@ -16100,6 +16101,14 @@ async def test_hotfix_promote_accepts_machinery_diff_and_writes_audit_trail(
         ],
     )
 
+    # Promotion opens a best-effort staged-direction session. Under the in-memory
+    # SQLite StaticPool it must share this test session or a second session close
+    # can roll back the outer transaction.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
+    )
+
     result = await rq.hotfix_promote_current_version(
         db_session,
         project.id,
@@ -16193,6 +16202,14 @@ async def test_hotfix_promote_pending_auto_merge_still_writes_audit_trail(
     enable_auto_merge_mock = mocker.patch(
         "app.github.enable_auto_merge",
         new=AsyncMock(return_value={"enabled": True, "message": "auto-merge enabled"}),
+    )
+
+    # Promotion opens a best-effort staged-direction session. Under the in-memory
+    # SQLite StaticPool it must share this test session or a second session close
+    # can roll back the outer transaction.
+    mocker.patch(
+        "app.database.AsyncSessionLocal",
+        new=_shared_session_factory(db_session),
     )
 
     result = await rq.hotfix_promote_current_version(

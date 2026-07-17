@@ -65,6 +65,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
