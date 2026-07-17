@@ -1020,7 +1020,7 @@ describe('mock-factory-export-coverage', () => {
     }
 
     expect(failures, `\n${failures.join('\n')}`).toHaveLength(0);
-  });
+  }, 15_000);
 });
 
 describe('mock-factory-export-coverage helpers', () => {

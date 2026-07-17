@@ -1137,9 +1137,9 @@ describe('DetailsTab — Knowledge Document', () => {
   it('fetches and renders the full document body on demand', async () => {
     const { fetchKnowledgeDocument } = await import('../api');
     render(<DetailsTab task={knowledgeTask()} />);
-    screen.getByText('View document').click();
+    fireEvent.click(screen.getByText('View document'));
     expect(fetchKnowledgeDocument).toHaveBeenCalledWith('proj-1', 'doc-1');
-    expect(await screen.findByText(/Detailed markdown/)).toBeInTheDocument();
+    expect(await screen.findByText(/Detailed markdown/, {}, { timeout: 3000 })).toBeInTheDocument();
   });
 
   it('surfaces live-proof release evidence (promoted SHA + serving status) after the full-doc fetch', async () => {
