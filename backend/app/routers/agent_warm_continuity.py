@@ -393,6 +393,7 @@ async def _resolve_retarget(
         project_id=str(task.project_id) if task.project_id else None,
         # No runner_available_clis: warm retarget dispatches to cloud VMs that
         # have all LLM CLIs pre-installed, so CLI-based filtering is not needed.
+        raise_resident_policy_hold=True,
     )
     if selection is None:
         return None, ctx, None
@@ -581,6 +582,13 @@ async def _finalize_warm_claim(
     same account because refresh tokens rotate independently of account identity.
     The field remains additive for older agents that ignore it.
     """
+    from app.strategic_resident_runner_policy import is_resident_turn
+
+    if is_resident_turn(task):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident turns require the dedicated lineage-validated claim path",
+        )
     from app.compute import VM_PROVISIONING_MODEL
 
     task.vm_instance_id = vm_instance_id

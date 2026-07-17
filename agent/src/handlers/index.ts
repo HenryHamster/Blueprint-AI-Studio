@@ -34,6 +34,7 @@ import { handleComputeExperiment } from './compute-experiment.js';
 import { handleWebResearch } from './web-research.js';
 import { handleDesign } from './design.js';
 import { handleCapabilityProofTrial } from './capability-proof-trial.js';
+import { handleStrategicResidentTurn } from './strategic-resident-turn.js';
 import {
   resolveTaskCapabilityContract,
   resolveGenericRunner,
@@ -118,6 +119,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   repo_bootstrap: handleRepoBootstrap,
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
+  strategic_resident_turn: handleStrategicResidentTurn,
 };
 
 // ── Contract-driven handler resolution ───────────────────────────────────────

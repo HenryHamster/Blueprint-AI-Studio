@@ -86,6 +86,8 @@ import {
   claudeHelpSupportsPartialMessages,
   probeClaudeCapabilities,
   stripUnsupportedClaudeOptionalArgs,
+  applyProviderProcessBoundary,
+  requireResidentClaudeCapabilities,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -1926,6 +1928,80 @@ describe('VmConfigMissingError', () => {
 });
 
 describe('provider runner prompt transport', () => {
+  it('applies the Resident boundary without ambient credentials or customization', () => {
+    const runner = getProviderRunner('anthropic', 'api_key');
+    const command = runner.buildRunCommand('prompt', undefined, undefined, ['*']);
+    command.env.ORCHESTRATOR_URL = 'secret-control-plane';
+    command.env.AGENT_API_TOKEN = 'secret-agent-token';
+    command.env.GITHUB_TOKEN = 'secret-github-token';
+    command.env.ANTHROPIC_API_KEY = 'provider-key';
+    applyProviderProcessBoundary(command, 'anthropic', ['*'], {
+      cwd: '/tmp/resident/work',
+      promptDirectory: '/tmp/resident/tmp',
+      allowedEnvKeys: ['PATH', 'ANTHROPIC_API_KEY'],
+      envOverrides: {
+        HOME: '/tmp/resident/home',
+        CLAUDE_CONFIG_DIR: '/tmp/resident/config',
+      },
+      skipAmbientHelpers: true,
+      enforceNoTools: true,
+    });
+
+    expect(command.env).toMatchObject({
+      ANTHROPIC_API_KEY: 'provider-key',
+      HOME: '/tmp/resident/home',
+      CLAUDE_CONFIG_DIR: '/tmp/resident/config',
+    });
+    expect(command.env).not.toHaveProperty('ORCHESTRATOR_URL');
+    expect(command.env).not.toHaveProperty('AGENT_API_TOKEN');
+    expect(command.env).not.toHaveProperty('GITHUB_TOKEN');
+    expect(command.args).toEqual(expect.arrayContaining([
+      '--disallowedTools', '*', '--safe-mode', '--tools', '',
+      '--disable-slash-commands', '--strict-mcp-config', '--no-session-persistence',
+    ]));
+    const denied = command.args.flatMap((arg, index) => (
+      arg === '--disallowedTools' ? [command.args[index + 1]] : []
+    ));
+    expect(denied).toEqual(['*']);
+  });
+
+  it('requires every Resident Claude safety capability when help is available', () => {
+    const allCapabilities = new Set([
+      '--disallowedTools', '--safe-mode', '--tools', '--disable-slash-commands',
+      '--strict-mcp-config', '--no-session-persistence',
+    ]);
+    expect(() => requireResidentClaudeCapabilities(allCapabilities)).not.toThrow();
+    allCapabilities.delete('--strict-mcp-config');
+    expect(() => requireResidentClaudeCapabilities(allCapabilities))
+      .toThrow('missing --strict-mcp-config');
+    expect(() => requireResidentClaudeCapabilities(null)).not.toThrow();
+  });
+
+  it('rejects a Resident boundary without the wildcard tool fence', () => {
+    const command = getProviderRunner('anthropic', 'api_key').buildRunCommand('prompt');
+    expect(() => applyProviderProcessBoundary(command, 'anthropic', [], {
+      cwd: '/tmp/resident/work',
+      promptDirectory: '/tmp/resident/tmp',
+      allowedEnvKeys: ['PATH'],
+      envOverrides: {},
+      skipAmbientHelpers: true,
+      enforceNoTools: true,
+    })).toThrow('cannot satisfy the Resident no-tool process boundary');
+  });
+
+  it('passes the documented all-tools deny rule to Claude-compatible CLIs', () => {
+    const runner = getProviderRunner('anthropic', 'api_key');
+    const deniedTools = ['*', 'Task', 'Agent', 'Workflow', 'Skill'];
+    const command = runner.buildRunCommand(
+      'Bounded Resident prompt', undefined, undefined, deniedTools,
+    );
+
+    const denied = command.args.flatMap((arg, index) => (
+      arg === '--disallowedTools' ? [command.args[index + 1]] : []
+    ));
+    expect(denied).toEqual(deniedTools);
+  });
+
   it('uses stdin for OpenAI run commands instead of argv prompts', () => {
     const runner = getProviderRunner('openai', 'api_key');
     const command = runner.buildRunCommand('Very long prompt body', 'gpt-5');

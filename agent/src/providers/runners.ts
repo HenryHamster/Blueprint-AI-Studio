@@ -1,5 +1,6 @@
 import fs from 'fs';
 import os from 'os';
+import path from 'path';
 import { execFileSync, spawn } from 'child_process';
 import type WebSocket from 'ws';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
@@ -72,6 +73,11 @@ const CLAUDE_PARTIAL_MESSAGES_FLAG = '--include-partial-messages';
 const CLAUDE_OPTIONAL_FLAG_VALUE_COUNTS: Readonly<Record<string, number>> = {
   [CLAUDE_PARTIAL_MESSAGES_FLAG]: 0,
   '--effort': 1,
+  '--safe-mode': 0,
+  '--tools': 1,
+  '--disable-slash-commands': 0,
+  '--strict-mcp-config': 0,
+  '--no-session-persistence': 0,
 };
 const claudeCapabilityCache = new Map<string, ReadonlySet<string> | null>();
 const claudeCapabilityByCommand = new Map<string, ReadonlySet<string> | null>();
@@ -660,6 +666,73 @@ export interface RunnerCommand {
   displayName: string;
 }
 
+export interface ProviderProcessBoundary {
+  cwd: string;
+  promptDirectory: string;
+  allowedEnvKeys: readonly string[];
+  envOverrides: Readonly<Record<string, string>>;
+  skipAmbientHelpers: boolean;
+  enforceNoTools: boolean;
+}
+
+export interface ProviderRunOptions {
+  processBoundary?: ProviderProcessBoundary;
+}
+
+const RESIDENT_SAFE_CLAUDE_ARGS = [
+  '--safe-mode',
+  '--tools', '',
+  '--disable-slash-commands',
+  '--strict-mcp-config',
+  '--no-session-persistence',
+] as const;
+const RESIDENT_REQUIRED_CLAUDE_FLAGS = [
+  '--disallowedTools',
+  '--safe-mode',
+  '--tools',
+  '--disable-slash-commands',
+  '--strict-mcp-config',
+  '--no-session-persistence',
+] as const;
+
+export function requireResidentClaudeCapabilities(
+  capabilities: ReadonlySet<string> | null,
+): void {
+  // An unavailable probe launches with every required flag; an older CLI then
+  // rejects unknown argv before model execution. An explicit help surface is
+  // authoritative and must never cause the generic compatibility layer to
+  // silently delete a Resident safety flag.
+  if (capabilities === null) return;
+  const missing = RESIDENT_REQUIRED_CLAUDE_FLAGS.filter(
+    flag => !capabilities.has(flag),
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `Claude CLI cannot satisfy the Resident process boundary; missing ${missing.join(', ')}`,
+    );
+  }
+}
+
+export function applyProviderProcessBoundary(
+  command: RunnerCommand,
+  provider: ProviderName,
+  disallowedTools: readonly string[] | undefined,
+  boundary: ProviderProcessBoundary,
+): void {
+  if (
+    boundary.enforceNoTools
+    && (provider === 'openai' || provider === 'gemini' || !disallowedTools?.includes('*'))
+  ) {
+    throw new Error(`Provider ${provider} cannot satisfy the Resident no-tool process boundary`);
+  }
+  const allowed = new Set(boundary.allowedEnvKeys);
+  command.env = Object.fromEntries(
+    Object.entries(command.env).filter(([key]) => allowed.has(key)),
+  );
+  Object.assign(command.env, boundary.envOverrides);
+  if (boundary.enforceNoTools) command.args.push(...RESIDENT_SAFE_CLAUDE_ARGS);
+}
+
 export interface ValidationCommand {
   command: string;
   args: string[];
@@ -954,6 +1027,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
 type RunClaudeCodeOverride = (
   prompt: string, ws: WebSocket | null, statusRef: { value: string },
   model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean,
+  options?: ProviderRunOptions,
 ) => Promise<{ exitCode: number; allOutput: string; lastResultText: string }>;
 
 let _runClaudeCodeOverride: RunClaudeCodeOverride | null = null;
@@ -1067,24 +1141,30 @@ exit $rc
   }
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, options?: ProviderRunOptions): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
 }> {
   if (_runClaudeCodeOverride) {
-    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+    return _runClaudeCodeOverride(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog, options);
   }
-  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
+  return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog, options);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean, options?: ProviderRunOptions): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
 }> {
   const runner = getProviderRunner();
   const runCommand = runner.buildRunCommand(prompt, model, effort, disallowedTools);
+  const processBoundary = options?.processBoundary;
+  if (processBoundary) {
+    applyProviderProcessBoundary(
+      runCommand, runner.provider, disallowedTools, processBoundary,
+    );
+  }
   let allOutput = '';
   let lastResultText = '';
   let stderrBuffer = '';
@@ -1188,6 +1268,9 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   let partialMessageProgressAvailable = runCommand.args.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
   if (cliCommand === 'claude') {
     const capabilities = probeClaudeCapabilities(cliCommand, runCommand.env);
+    if (processBoundary?.enforceNoTools) {
+      requireResidentClaudeCapabilities(capabilities);
+    }
     const compatibleArgs = stripUnsupportedClaudeOptionalArgs(runCommand.args, capabilities);
     const removedPartialMessages = partialMessageProgressAvailable
       && !compatibleArgs.includes(CLAUDE_PARTIAL_MESSAGES_FLAG);
@@ -1226,7 +1309,9 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // Provision the ambient helper CLIs (./note, ./playbook, ./messages) that
   // every model task may use regardless of handler. Self-guarding and
   // idempotent — see provisionAmbientHelpers.
-  provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
+  if (!processBoundary?.skipAmbientHelpers) {
+    provisionAmbientHelpers(process.env.TASK_ID || '', WORKSPACE);
+  }
 
   const exitCode = await new Promise<number>((resolve) => {
     let promptFile = '';
@@ -1234,13 +1319,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
     let child = null as ReturnType<typeof spawn> | null;
 
     if (runCommand.promptInput === 'stdin-file') {
-      promptFile = `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
+      promptFile = processBoundary
+        ? path.join(processBoundary.promptDirectory, 'prompt.txt')
+        : `/tmp/agent_prompt_${process.env.TASK_ID || 'unknown'}.txt`;
       writePrivateFileSync(promptFile, withExecutionModePrompt(prompt));
       promptFd = fs.openSync(promptFile, 'r');
     }
 
     child = spawn(runCommand.command, runCommand.args, {
-      cwd: WORKSPACE,
+      cwd: processBoundary?.cwd ?? WORKSPACE,
       env: runCommand.env,
       detached: true,
       stdio: [runCommand.promptInput === 'stdin' ? 'pipe' : (promptFd ?? 'ignore'), 'pipe', 'pipe'],

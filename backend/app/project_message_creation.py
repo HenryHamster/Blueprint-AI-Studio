@@ -34,7 +34,6 @@ from app.strategic_trigger import (
     ARMING_RESIDENT_SESSION,
     ARMING_STEERING,
     maybe_arm_operator_refresh,
-    strategic_refresh_pending,
 )
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
@@ -509,25 +508,6 @@ async def create_operator_project_message(
     """Create or idempotently return an operator-authored ProjectMessage."""
 
     project_id = project.id
-    # Whether a live resident Workday session owns the project — captured NOW,
-    # while ``project.vision`` is loaded, so the read cannot become a lazy load on
-    # an attribute expired by the message commit below. When active, the standing
-    # agent handles the reply live and cadence steering must not be armed.
-    from app.strategic_resident_session import (
-        read_resident_session,
-        resident_session_is_active,
-    )
-
-    resident_blob = read_resident_session(project.vision)
-    resident_active = resident_session_is_active(resident_blob)
-    # Stamp the live session id so this operator message is scoped to the session
-    # it was sent into; NULL when no session is active (cadence path). See the
-    # scoping queries in strategic_resident_session.py and the poll endpoint.
-    resident_session_id = (
-        resident_blob.get("session_id")
-        if isinstance(resident_blob, dict) and resident_active
-        else None
-    )
     trimmed_content = content.strip()
     if not trimmed_content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
@@ -605,6 +585,9 @@ async def create_operator_project_message(
             arm_interaction_mode=False,
             commit=False,
         )
+        # Persistence locks prefs -> Project. Flush the already-locked Project
+        # mutation before populate_existing refreshes the ownership fence.
+        await session.flush()
         stored_workbench = workbench_write.state
         workbench_context_for_snapshot = None
         if workbench_context is not None:
@@ -629,43 +612,56 @@ async def create_operator_project_message(
             }
     _ensure_context_size(message_context, compact=compact_context_size)
 
-    locked_vision = await session.scalar(
-        select(Project.vision).where(Project.id == project_id)
-    )
-    refresh_was_pending = strategic_refresh_pending(locked_vision)
-    arming = await maybe_arm_operator_refresh(
-        session,
-        project_id,
-        message_type,
-        message_content=trimmed_content,
-        resident_session_active=resident_active,
-    )
-    if not session.in_transaction() and should_persist_workbench:
-        # ``request_strategic_refresh`` may roll back after exhausting its
-        # bounded project-lock retry.  The message is still durably accepted as
-        # waiting. The bounded wake helper rolls back a poisoned transaction
-        # before returning ``not_armed``; re-apply the small staged workbench
-        # write so acceptance does not silently discard explicit operator state.
-        await persist_strategic_workbench_update(
-            session,
-            user_id,
-            project_id,
-            workbench_context or {},
-            sync_local_continuation_marker=sync_local_continuation_marker,
-            arm_interaction_mode=False,
-            commit=False,
-        )
+    # Fence the ownership decision before touching either legacy arming state
+    # or the durable Resident successor. Ownership transitions take these rows
+    # in the same Project -> Resident order, so send vs rollback/cutover cannot
+    # observe one owner and enqueue for the other.
+    from app.strategic_resident_message_locking import lock_resident_message_owner_state
 
-    # Establish the parent fence before locking reply/source/attachment rows.
-    # This keeps sends ordered with strategic spawning while all potentially
-    # slow validation remains outside the sequence-counter critical section.
-    locked_project = (
-        await session.execute(
-            select(Project)
-            .where(Project.id == project_id)
-            .with_for_update(read=True, key_share=True)
+    (
+        locked_project,
+        strategic_resident_owns,
+        refresh_was_pending,
+        resident_active,
+        resident_session_id,
+    ) = await lock_resident_message_owner_state(session, project_id)
+    if strategic_resident_owns:
+        # Never revive legacy refresh/session state after cutover.
+        refresh_was_pending = False
+        arming = ARMING_NOT_ARMED
+    else:
+        arming = await maybe_arm_operator_refresh(
+            session,
+            project_id,
+            message_type,
+            message_content=trimmed_content,
+            resident_session_active=resident_active,
         )
-    ).scalar_one()
+    if not session.in_transaction():
+        # A failed legacy wake releases every lock. Restore the canonical
+        # prefs -> Project order before refencing Project -> Resident.
+        if should_persist_workbench:
+            await persist_strategic_workbench_update(
+                session,
+                user_id,
+                project_id,
+                workbench_context or {},
+                sync_local_continuation_marker=sync_local_continuation_marker,
+                arm_interaction_mode=False,
+                commit=False,
+            )
+            await session.flush()
+        (
+            locked_project,
+            strategic_resident_owns,
+            refresh_was_pending,
+            resident_active,
+            resident_session_id,
+        ) = await lock_resident_message_owner_state(session, project_id)
+        if strategic_resident_owns:
+            arming = ARMING_NOT_ARMED
+        elif resident_active:
+            arming = ARMING_RESIDENT_SESSION
 
     if idem_key:
         # Same-identity retries serialize before reply/source/attachment
@@ -739,6 +735,7 @@ async def create_operator_project_message(
 
     locked_resident = None
     locked_turn_tasks = None
+    locked_resident_owner = None
     if surface == MessageSurface.CONVERSATION:
         from app.strategic_resident_message_locking import (
             prelock_resident_message_turn_state,
@@ -775,6 +772,7 @@ async def create_operator_project_message(
         else:
             locked_resident = prelock.resident
             locked_turn_tasks = prelock.tasks
+            locked_resident_owner = prelock.engine_owner
 
     # Reserve only after all potentially slow validation. From this point to
     # commit, all pre-existing Resident/Task rows are already locked, keeping
@@ -825,14 +823,15 @@ async def create_operator_project_message(
     # rollout-only defect cannot reject an otherwise durable operator message.
     # Once ownership flips, turn enqueue is authoritative and therefore fails
     # closed with the message (atomic message + successor contract).
+    resident_wake = None
     if locked_resident is not None:
         try:
             async with session.begin_nested():
-                from app.strategic_resident_turns import (
-                    coalesce_shadow_resident_turn,
+                from app.strategic_resident_runtime import (
+                    coalesce_resident_turn,
                 )
 
-                await coalesce_shadow_resident_turn(
+                resident_wake = await coalesce_resident_turn(
                     session,
                     project_id=project_id,
                     lane="interactive",
@@ -845,7 +844,7 @@ async def create_operator_project_message(
             # The outer Resident lock survives SAVEPOINT rollback, so ownership
             # cannot flip while this transaction decides whether enqueue is
             # authoritative.
-            if locked_resident.engine_owner == "strategic_resident":
+            if locked_resident_owner == "strategic_resident":
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -862,9 +861,16 @@ async def create_operator_project_message(
                 next_sequence,
             )
 
-    wakeup_state = wakeup_state_for_arming(
-        arming,
-        refresh_was_pending=refresh_was_pending,
+    wakeup_state = (
+        resident_wake.state
+        if (
+            resident_wake is not None
+            and locked_resident_owner == "strategic_resident"
+        )
+        else wakeup_state_for_arming(
+            arming,
+            refresh_was_pending=refresh_was_pending,
+        )
     )
     message_context = {
         **message_context,

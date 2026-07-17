@@ -148,7 +148,10 @@ async def _record_residual_audit_deferral(
 
 
 async def _spawn_residual_fingerprint_remediation(
-    project: Project, session: AsyncSession
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> int:
     """Spawn a create-type remediation task for the top uncooled residual CODE_ERROR fingerprint.
 
@@ -178,7 +181,11 @@ async def _spawn_residual_fingerprint_remediation(
         _project_spend_ceiling_spawn_defer_reason,
     )  # deferred — avoids circular import
 
-    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(project, session)
+    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(
+        project,
+        session,
+        expected_legacy_generation=expected_legacy_generation,
+    )
     if _spend_defer:
         logger.info(
             "[AUTO REMEDIATION] Skipping residual spawn for project %s: %s",
@@ -186,6 +193,10 @@ async def _spawn_residual_fingerprint_remediation(
             _spend_defer,
         )
         return 0
+    if expected_legacy_generation is not None:
+        from app.notification_dispatch import begin_deferred_external_notifications
+
+        begin_deferred_external_notifications(session)
 
     # Load case rows we need for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; REMEDIATING + last_spawned_at
@@ -262,7 +273,20 @@ async def _spawn_residual_fingerprint_remediation(
             recovery_attempts=new_attempts,
         )
     if recovered_any:
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
+        if expected_legacy_generation is not None:
+            from app.notification_dispatch import begin_deferred_external_notifications
+
+            begin_deferred_external_notifications(session)
 
     # Project-wide concurrency cap. Count case rows currently in the
     # in-flight REMEDIATING state — independent of the CI auto-fix
@@ -519,14 +543,26 @@ async def _spawn_residual_fingerprint_remediation(
             f"[AUTO REMEDIATION] Spawned create task {new_task.id} for residual "
             f"fingerprint {fp[:40]} (project {project.id})"
         )
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
         return 1
 
     return 0
 
 
 async def _spawn_viewport_regression_remediation(
-    project: Project, session: AsyncSession
+    project: Project,
+    session: AsyncSession,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> int:
     """Spawn a create-type remediation task for the top uncooled viewport regression fingerprint.
 
@@ -553,7 +589,11 @@ async def _spawn_viewport_regression_remediation(
         _project_spend_ceiling_spawn_defer_reason,
     )  # deferred — avoids circular import
 
-    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(project, session)
+    _spend_defer = await _project_spend_ceiling_spawn_defer_reason(
+        project,
+        session,
+        expected_legacy_generation=expected_legacy_generation,
+    )
     if _spend_defer:
         logger.info(
             "[VIEWPORT REMEDIATION] Skipping viewport spawn for project %s: %s",
@@ -561,6 +601,10 @@ async def _spawn_viewport_regression_remediation(
             _spend_defer,
         )
         return 0
+    if expected_legacy_generation is not None:
+        from app.notification_dispatch import begin_deferred_external_notifications
+
+        begin_deferred_external_notifications(session)
 
     # Load case rows for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; last_spawned_at drives per-fingerprint
@@ -634,7 +678,20 @@ async def _spawn_viewport_regression_remediation(
             recovery_attempts=new_attempts,
         )
     if recovered_any:
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
+        if expected_legacy_generation is not None:
+            from app.notification_dispatch import begin_deferred_external_notifications
+
+            begin_deferred_external_notifications(session)
 
     # Project-wide concurrency cap (shared with CODE_ERROR lane; both write to the
     # same ResidualRemediationCase table so REMEDIATING rows from either lane count).
@@ -761,7 +818,16 @@ async def _spawn_viewport_regression_remediation(
             f"[VIEWPORT REMEDIATION] Spawned create task {new_task.id} for viewport "
             f"fingerprint {fp[:60]} (project {project.id})"
         )
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
         return 1
 
     return 0

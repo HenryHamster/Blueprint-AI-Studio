@@ -47,7 +47,7 @@ from app.runner_config import (
     live_safe_config_generation,
 )
 from app.schemas import redact_command_log_text
-from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
+from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, TaskType
 from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -81,7 +81,7 @@ _SUCCESS_STALE_SECONDS = 1800  # 30 min
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 # Advisory low-memory flag (does not by itself degrade a runner).
 _LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
-_STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
+_STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
 # Max chars of command-log tail surfaced inline on a failed recent-outcome row.
 # Kept small so the per-runner stats payload stays lean — operators wanting the

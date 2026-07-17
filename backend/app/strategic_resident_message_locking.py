@@ -12,6 +12,7 @@ from sqlmodel import select
 from app.database import resolve_dialect_name
 from app.models import Project, StrategicResident, Task
 from app.strategic_resident_turns import lock_shadow_resident_turn_state
+from app.strategic_trigger import strategic_refresh_pending
 
 
 @dataclass(frozen=True)
@@ -20,6 +21,53 @@ class ResidentMessagePrelock:
     tasks: dict[uuid.UUID, Task] | None
     engine_owner: str | None
     error: Exception | None
+
+
+async def lock_resident_message_owner_fence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[Project, StrategicResident | None]:
+    """Lock the ownership root once before choosing legacy or Resident wake."""
+
+    project = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+    resident = (
+        await session.execute(
+            select(StrategicResident)
+            .where(StrategicResident.project_id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    return project, resident
+
+
+async def lock_resident_message_owner_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[Project, bool, bool, bool, str | None]:
+    """Lock the owner fence and return current owner and legacy session state."""
+
+    project, resident = await lock_resident_message_owner_fence(session, project_id)
+    strategic_owner = (
+        resident is not None and resident.engine_owner == "strategic_resident"
+    )
+    refresh_pending = False if strategic_owner else strategic_refresh_pending(project.vision)
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+
+    resident_blob = read_resident_session(project.vision)
+    resident_active = not strategic_owner and resident_session_is_active(resident_blob)
+    session_id = resident_blob.get("session_id") if resident_active else None
+    return project, strategic_owner, refresh_pending, resident_active, session_id
 
 
 async def prelock_resident_message_turn_state(
@@ -69,5 +117,7 @@ async def prelock_resident_message_turn_state(
 
 __all__ = [
     "ResidentMessagePrelock",
+    "lock_resident_message_owner_fence",
+    "lock_resident_message_owner_state",
     "prelock_resident_message_turn_state",
 ]

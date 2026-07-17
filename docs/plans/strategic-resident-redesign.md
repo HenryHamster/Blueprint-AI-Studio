@@ -2,12 +2,13 @@
 
 **Target:** `automain`
 
-**Status:** Milestone 1 merged; Milestone 2a validated and ready to publish.
+**Status:** Milestones 1 and 2a merged; Milestone 2b post-rebase review converged,
+publication pending.
 
-**Last refreshed:** 2026-07-16. The milestone branch is rebased onto
-`origin/automain` at `88d8efb25`; the Resident migration is renumbered to
-`0611`, the consolidated gate is green (`513 passed`, `21 skipped`), and the
-full strategic-spawning suite is green (`480 passed`, one skipped).
+**Last refreshed:** 2026-07-16. M2a merged through PR `#15292` at merge commit
+`7b9b8c80b`. M2b is rebased onto `origin/automain` at `ef2d993a8`; migration,
+locking, latency, provider-boundary, and affected-suite review/fix loops have
+converged. The milestone is ready for publication.
 
 This plan tracks the migration from disposable Resident sessions to one durable,
 project-owned Strategic Resident. It is intentionally separate from the historical
@@ -58,7 +59,7 @@ Chat/Workday session plans.
 
 Merged by PR `#15186`, commit `516a94a2f`.
 
-### M2a — Resident control plane and shadow turns — in progress
+### M2a — Resident control plane and shadow turns — merged
 
 - Add one `StrategicResident` per project with engine ownership, background policy,
   monotonic authority generation, active/successor turn pointers, checkpoint
@@ -137,7 +138,9 @@ Current convergence checklist:
 - [x] Complete an independent post-rebase review/fix iteration with no actionable
   correctness, migration, latency, or ergonomics findings.
 
-### M2b — Mutation-authorized bounded Resident turns
+Merged by PR `#15292`, commit `7b9b8c80b`.
+
+### M2b — Mutation-authorized bounded Resident turns — in progress
 
 - Reconstruct turns from stable instructions, charter, working strategy, active
   mission, recent conversation, and explicitly retrieved evidence.
@@ -152,6 +155,69 @@ Current convergence checklist:
 - The ownership-flip transaction must cancel/supersede all shadow active and
   successor pointers atomically before enabling authoritative turns; no queued
   shadow work may be stranded across cutover.
+
+Current implementation checklist:
+
+- [x] Add bounded typed turn results and adversarial result-size validation.
+- [x] Reconstruct authoritative interactive/background turns from checkpoint,
+  recent conversation, active mission, and explicit revisioned evidence.
+- [x] Reconcile proposed memory through Resident-only immutable checkpoint CAS;
+  require decisive evidence before strategy-changing or high-impact implications.
+- [x] Apply direct typed mutations only through fenced operation receipts and
+  reconcile unknown external effects before retry.
+- [x] Atomically flip one project from legacy shadow ownership to authoritative
+  Resident ownership while cancelling/superseding every shadow pointer.
+- [x] Roll back by fencing the authoritative generation, reconciling unknown
+  receipts, projecting the latest checkpoint into legacy inputs, and restoring
+  legacy ownership.
+- [x] Rebase onto `bbf1e51f7`, run focused affected suites, and complete
+  iterative post-rebase review/fix convergence.
+- [x] Refresh latest `origin/automain` through `ef2d993a8`; the four late commits
+  are non-overlapping and the migration/size/diff smoke gates remain green.
+- [ ] Publish and merge M2b.
+
+Pre-rebase evidence:
+
+- Claim, failure/reaper, runner/capacity, cutover/message, legacy cadence,
+  evidence/receipt, and migration boundary review/fix loops converged.
+- Terminal complete/fail/reaper paths durably claim Max-plan slot release before
+  best-effort cache repair, preserve concurrent reservations, count legacy active
+  identities with a scalar query, and remain replay-safe without an unbounded
+  process cache.
+- Resident provider routing now fails closed before generic environment fallback;
+  the agent requires the server-selected provider and runs the provider child from
+  an ephemeral non-repository home/config/cwd with only provider credentials and
+  a complete no-tools boundary. Unsupported provider CLIs truthfully wait.
+- Late boundary gates are green: authoritative orchestrator holds (`5 passed`),
+  provider selector (`9 passed`), capacity (`14 passed`), claim (`10 passed`),
+  slot release (`10 passed`), and single-worker agent security/dispatch tests
+  (`32 passed`, `525 skipped`) with typecheck clean.
+- The combined affected backend gate is green (`333 passed`, `13 skipped`);
+  the focused TypeScript agent gate is green (`551 passed`) with typecheck clean.
+- The forward-only cutover repair is revision `0627`, chained from refreshed
+  `origin/automain`'s single `0626` head. Its direct upgrade-path test covers the
+  exact cutover authority boundary after the upstream chain.
+
+Post-rebase evidence:
+
+- Alembic and the standalone migration parser report one `0627` head; the schema
+  lock and direct upgrade/downgrade test are green (`2 passed`, one local
+  PostgreSQL-only smoke test skipped).
+- Message acceptance preserves canonical prefs -> Project -> Resident lock order,
+  uses PostgreSQL `FOR NO KEY UPDATE`, refreshes stale ORM identities, recomputes
+  legacy session routing after rollback, and never reads SAVEPOINT-expired owner
+  state. Workbench persistence is flushed under its existing Project lock before
+  owner refresh, keeping the Resident-lock latency window bounded.
+- Serialized backend gates are green: capacity/claim/runtime/slot/runner/reaper
+  (`58 passed`), ownership/reconciliation/realtime (`100 passed`, `2 skipped`),
+  message/locking/latency (`51 passed`, `9 skipped`), and changed spawning cases
+  (`6 passed`).
+- Single-worker agent security/dispatch tests are green (`102 passed`) and
+  TypeScript typecheck is clean. Backend/agent size caps, focused lint, and diff
+  checks are clean without cap increases.
+- Independent post-rebase review/fix iterations converged on migration parsing,
+  upstream handler preservation, provider isolation, lock/FK compatibility,
+  stale identity/session routing, workbench autoflush, and SAVEPOINT recovery.
 
 ### M3 — Typed operations and human-tool compatibility
 

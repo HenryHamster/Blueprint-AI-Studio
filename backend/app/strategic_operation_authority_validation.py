@@ -44,6 +44,7 @@ _SUPPORTED_EXPECTED_REVISIONS = frozenset(
         "current_checkpoint_id",
         "resident_checkpoint_version",
         "resident_checkpoint_hash",
+        "context_hash",
         "running_update_revision",
         "vision_revision",
         "problem_model_revision",
@@ -121,10 +122,13 @@ class MutationPlanTooLarge(StrategicAuthorityError):
 
 
 class BoundedOperationResult(BaseModel):
+    reply: str | None = None
     facts: list[dict[str, Any]] = Field(default_factory=list)
     evidence: list[dict[str, Any]] = Field(default_factory=list)
     operations: list[dict[str, Any]] = Field(default_factory=list)
-    strategic_implications: list[str] = Field(default_factory=list)
+    receipts: list[dict[str, Any]] = Field(default_factory=list)
+    unknown_effects: list[dict[str, Any]] = Field(default_factory=list)
+    strategic_implications: list[str | dict[str, Any]] = Field(default_factory=list)
     proposed_memory: list[dict[str, Any]] = Field(default_factory=list)
     follow_up: dict[str, Any] | None = None
     required_attention: list[dict[str, Any]] = Field(default_factory=list)
@@ -435,6 +439,22 @@ async def _observed_revisions(
         "problem_model_revision": _revision_from_mapping(project.problem_model),
         "design_doc_revision": _revision_from_mapping(project.design_doc),
     }
+    if "context_hash" in expected:
+        # Deferred to avoid a module-load cycle: context reconstruction imports
+        # the authority lineage validators above. The hash is derived under the
+        # already-held Project/Resident/Task locks, never copied from the caller.
+        from app.strategic_resident_context import (
+            reconstruct_authoritative_turn_input,
+        )
+
+        provider_input = await reconstruct_authoritative_turn_input(
+            session,
+            project_id=project.id,
+            turn_task_id=task.id,
+        )
+        observed["context_hash"] = str(
+            (provider_input.get("lineage") or {}).get("context_hash") or ""
+        )
     artifact_keys = [
         key for key in expected if isinstance(key, str) and key.startswith("artifact:")
     ]

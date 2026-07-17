@@ -68,6 +68,9 @@ from app.stall_alert_diagnostics import (
     _format_stall_alert,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.strategic_resident_runner_policy import (
+    resident_turn_requires_local_runner,
+)
 from app.time_utils import _utcnow
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -800,6 +803,8 @@ async def _try_runner_dispatch(
 def _task_requires_strategic_local_runner(task: Task) -> bool:
     payload = task.first_payload or {}
     task_type = str(payload.get("type") or "")
+    if resident_turn_requires_local_runner(task):
+        return True
     return (
         task_type in STRATEGIC_TASK_TYPES
         and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
@@ -2848,6 +2853,9 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
+        is_resident_hold = bool(strategic_stamp) and resident_turn_requires_local_runner(
+            task
+        )
         is_strategic_hold = (
             bool(strategic_stamp)
             and task_type in STRATEGIC_TASK_TYPES
@@ -2860,7 +2868,13 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not is_container_hold
             and not is_forced_runner_hold
             and not is_strategic_hold
+            and not is_resident_hold
         ):
+            continue
+
+        # Resident local-only authority has no timeout and no cloud fallback.
+        # The main dispatch loop will pin it when compatible capacity appears.
+        if is_resident_hold:
             continue
 
         if is_strategic_hold:

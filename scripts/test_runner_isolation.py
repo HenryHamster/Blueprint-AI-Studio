@@ -162,7 +162,8 @@ class TestDecisionTable(unittest.TestCase):
     def test_agent_docker_types_membership(self):
         # The MUST-include read-only slice is present.
         for t in (
-            "strategic_review", "research", "web_research", "plan", "design",
+            "strategic_resident_turn", "strategic_review", "research",
+            "web_research", "plan", "design",
             "memo", "investigate", "design_doc_update",
         ):
             self.assertIn(t, iso.AGENT_DOCKER_TYPES)

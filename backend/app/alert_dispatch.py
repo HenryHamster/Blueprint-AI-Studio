@@ -727,6 +727,8 @@ async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
     reason: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a WARNING alert when the circuit breaker opens for a project.
     Deduplicates: skips if an undismissed circuit-breaker alert already exists."""
@@ -748,6 +750,12 @@ async def _maybe_create_circuit_breaker_alert(
         message=reason,
     )
     session.add(alert)
+    if expected_legacy_generation is not None:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -820,6 +828,7 @@ async def _maybe_create_spend_ceiling_alert(
     window_spend_usd: float,
     ceiling_usd: float,
     spend_window_days: int,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a deduplicated WARNING alert when a project's spend ceiling is hit.
 
@@ -849,7 +858,14 @@ async def _maybe_create_spend_ceiling_alert(
         ),
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -870,6 +886,7 @@ async def _maybe_create_approaching_ceiling_alert(
     ceiling_usd: float,
     warning_fraction: float,
     spend_window_days: int,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a deduplicated WARNING alert when a project's spend approaches its ceiling.
 
@@ -902,7 +919,14 @@ async def _maybe_create_approaching_ceiling_alert(
         ),
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -1996,6 +2020,8 @@ async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
     message: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a WARNING alert for strategic cycle failures. Deduplicates by title."""
     title = "Strategic cycle issue"
@@ -2016,7 +2042,14 @@ async def _create_strategic_alert(
         message=message[:1000],
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",

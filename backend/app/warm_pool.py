@@ -1011,6 +1011,10 @@ async def try_pool_dispatch(
     atomic (FOR UPDATE SKIP LOCKED) so two concurrent dispatches — or a concurrent
     agent poll — can never double-lease one member.
     """
+    from app.strategic_resident_runner_policy import is_resident_turn
+
+    if is_resident_turn(task):
+        return None
     if not is_warm_pool_enabled():
         return None
     from app.shared_state import is_warm_pool_suppressed, record_pool_claim_failure
