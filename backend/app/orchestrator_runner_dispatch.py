@@ -607,6 +607,20 @@ async def _load_runner_active_task_counts(
     return by_runner
 
 
+_BROWSER_EVIDENCE_KINDS = frozenset(
+    {"browser", "playwright", "screenshot", "viewport", "visual"}
+)
+
+
+def _payload_requires_browser(payload: dict) -> bool:
+    """Read the generic browser-capability contract from a task payload."""
+    if payload.get("requires_browser") is True:
+        return True
+    evidence = payload.get("acceptance_evidence")
+    if not isinstance(evidence, dict):
+        return False
+    return str(evidence.get("kind") or "").strip().lower() in _BROWSER_EVIDENCE_KINDS
+
 async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
@@ -706,7 +720,7 @@ async def _try_runner_dispatch(
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
         requires_project_verification=requires_project_verification,
-        requires_browser=payload.get("requires_browser") is True,
+        requires_browser=_payload_requires_browser(payload),
     )
     if runner is None:
         return False
