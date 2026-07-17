@@ -17,6 +17,78 @@ logger = logging.getLogger("blueprint")
 _REPLACEMENT_PUBLICATION_GRACE_SECONDS = 15 * 60
 _REPLACEMENT_WAIT_KEY = "closed_pr_replacement_wait_started"
 
+# These fields describe evidence, latches, or retry budgets for one concrete
+# pull-request attempt. A replacement PR may reuse the same branch while
+# pointing at a different head, so carrying any of them across the PR-number
+# boundary can merge without fresh proof or immediately exhaust a stale
+# timeout/retry budget. Chain-level fields such as ``iteration``,
+# ``original_task_id`` and ``fix_reason`` intentionally remain intact.
+_REPLACEMENT_ATTEMPT_KEYS = frozenset(
+    {
+        "_behind_update_retries",
+        "_ci_backstop_first_defer_at",
+        "_conflict_deferred_count",
+        "_conflict_deferred_state",
+        "acceptance_test_targeted_descriptor",
+        "acceptance_test_targeted_green",
+        "ci_checks_seen",
+        "ci_first_check_seen_at",
+        "ci_fix_spawned",
+        "ci_last_polled",
+        "ci_passed",
+        "ci_poll_interval",
+        "conflict_fix_spawned",
+        "escalated",
+        "fetch_escalated",
+        "last_merge_msg",
+        "merge_error_streak",
+        "merge_escalated",
+        "merge_failures",
+        "merge_in_progress_resets",
+        "merge_last_error",
+        "merge_pattern_alerted",
+        "merge_pattern_paused",
+        "merge_pattern_pr_count",
+        "merge_rule_blocked",
+        "mergeable_null_count",
+        "mergeable_null_first_ts",
+        "mergeable_null_reopen_attempts",
+        "mergeable_state",
+        "no_checks_escalated",
+        "no_ci_degraded_block_reason",
+        "no_ci_degraded_blocked",
+        "no_ci_escalation_base",
+        "no_ci_escalation_verify_gate",
+        "no_ci_no_test_block_reason",
+        "no_ci_no_test_blocked",
+        "no_ci_runtime_recorded",
+        "pending_reopen",
+        "pr_fetch_failures",
+        "recovered_test_command",
+        "reopen_alert_fired",
+        "reopen_attempts",
+        "review_approved",
+        "review_changes_requested",
+        "review_history",
+        "review_recovery_at",
+        "review_recovery_attempted",
+        "review_wait_escalated",
+        "review_wait_respawn_count",
+        "review_wait_respawn_task_id",
+        "review_wait_respawned",
+        "review_wait_started",
+        "test_coverage_result",
+        "unverified_merge_reason",
+        "update_branch_failures",
+        "verdict",
+        "verify_tests_output",
+        "verify_tests_retries",
+        "verify_tests_spawn_deferrals",
+        "verify_tests_task_id",
+        "verify_tests_verdict",
+    }
+)
+
 
 async def reconcile_closed_pr_replacement(
     *,
@@ -110,21 +182,33 @@ async def reconcile_closed_pr_replacement(
         review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
         return False
 
+    from app import pause_clock
+    from app.ci_merge_helpers import arm_ci_wait
+
     replacement_head = ((replacement_pr.get("head") or {}).get("sha") or "")
-    review_loop["pr_number"] = replacement_number
+    replacement_base = (
+        ((replacement_pr.get("base") or {}).get("ref") or "") or closed_base
+    )
+    for key in _REPLACEMENT_ATTEMPT_KEYS:
+        review_loop.pop(key, None)
     review_loop["branch"] = (
         ((replacement_pr.get("head") or {}).get("ref") or "") or closed_head
     )
-    review_loop["base_branch"] = (
-        ((replacement_pr.get("base") or {}).get("ref") or "") or closed_base
+    arm_ci_wait(
+        review_loop,
+        pr_number=replacement_number,
+        head_sha=replacement_head,
+        base_branch=replacement_base,
+        now_iso=_utcnow().isoformat(),
+        pause_baseline=await pause_clock.current_baseline(session),
     )
-    review_loop["ci_waiting"] = True
     review_loop["polls_since_pr_fetch"] = 999
     review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
-    if replacement_head:
-        review_loop["head_sha"] = replacement_head
 
     rebound_context = {**(task.context or {}), "review_loop": review_loop}
+    # This legacy parent-level verdict is also PR-scoped. Leaving it behind
+    # lets rollup convergence treat the replacement as already approved.
+    rebound_context.pop("blueprint_review_verdict", None)
     if rebound_context.get("rollup_pr_number") == pr_number:
         rebound_context["rollup_pr_number"] = replacement_number
     task.context = rebound_context
