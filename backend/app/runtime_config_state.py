@@ -247,16 +247,16 @@ runtime_config: Dict = {
     # (i.e. from a version at least min_versions_back back) AND older than
     # min_age_days. Mode mirrors metrics_integrity_sweep_mode exactly:
     #   off     — never supersede.
-    #   observe — measure the would-be resolutions + log, mutate nothing (default).
-    #   enforce — stamp the eligible messages resolved.
+    #   observe — measure the would-be resolutions + log, mutate nothing.
+    #   enforce — stamp the eligible messages resolved (default).
     # Unresolved BUG_REPORT/BLOCKER messages are ALWAYS left open (a bug does not
     # become fixed just because a version promoted).
     "message_supersession_mode": os.getenv(
-        "MESSAGE_SUPERSESSION_MODE", "observe"
+        "MESSAGE_SUPERSESSION_MODE", "enforce"
     ).lower()
-    if os.getenv("MESSAGE_SUPERSESSION_MODE", "observe").lower()
+    if os.getenv("MESSAGE_SUPERSESSION_MODE", "enforce").lower()
     in ("off", "observe", "enforce")
-    else "observe",
+    else "enforce",
     # A message must be at least this many days old to be superseded (safety margin).
     "message_supersession_min_age_days": int(
         os.getenv("MESSAGE_SUPERSESSION_MIN_AGE_DAYS", "14")
@@ -1391,9 +1391,6 @@ _DORMANT_MODE_KNOBS = {
     ),
     "metrics_integrity_sweep_mode": (
         "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
-    ),
-    "message_supersession_mode": (
-        "Message supersession measuring stale-message backlog but not resolving them"
     ),
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"

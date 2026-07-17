@@ -728,6 +728,121 @@ async def run_metrics_integrity_sweep(
 
 
 # Near-cap warning constants — patchable in tests.
+# =============================================================================
+# Check: audience_routing_attestation
+# =============================================================================
+
+
+@register_check(
+    "audience_routing_attestation",
+    "Sample recent ProjectMessage rows, re-route each by event_type via the "
+    "canonical route_event() resolver, and flag per-project any mismatch between "
+    "the stamped audience and the canonical audience (or NULL audience — the legacy "
+    "fallthrough that the read-side filter retains, making it a latent leak vector).",
+)
+async def check_audience_routing_attestation(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: every ProjectMessage with a registered event_type must carry
+    a context["audience"] that matches ``route_event(context["event_type"])``.
+    A NULL audience (legacy pass-through where the read-side filter retains the
+    row as operator-visible) or a mismatched audience is a latent leak vector:
+    a message intended for strategist-internal visibility can reach the operator.
+
+    Bounded to ``sample_limit`` rows, filtered to messages within ``window_days``;
+    groups flags per project. Pure recompute — never writes to ProjectMessage
+    in any mode.
+    """
+    from app.message_audience import route_event
+    from app.models import ProjectMessage
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+    messages = (
+        await ctx.session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.created_at >= cutoff)
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(ctx.sample_limit)
+        )
+    ).scalars().all()
+
+    if not messages:
+        return [
+            CheckResult(
+                check="audience_routing_attestation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no ProjectMessage rows in sample window",
+            )
+        ]
+
+    # Per-project counters: total messages with a known event_type, and how many
+    # carry a canonical audience stamp.  NULL audience counts as mismatched — it
+    # is the legacy fallthrough that the read-side filter retains as operator-visible.
+    per_project: Dict[str, Dict[str, int]] = {}
+    for msg in messages:
+        ctx_dict = msg.context or {}
+        event_type = ctx_dict.get("event_type")
+        if not event_type:
+            continue
+        stamped_audience = ctx_dict.get("audience")
+        canonical_audience = route_event(str(event_type))
+        pid = str(msg.project_id)
+        if pid not in per_project:
+            per_project[pid] = {"correct": 0, "total": 0}
+        per_project[pid]["total"] += 1
+        if stamped_audience == canonical_audience:
+            per_project[pid]["correct"] += 1
+
+    if not per_project:
+        return [
+            CheckResult(
+                check="audience_routing_attestation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no ProjectMessage rows with a known event_type in sample window",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for pid, counts in per_project.items():
+        total = counts["total"]
+        correct = counts["correct"]
+        mismatches = total - correct
+        if mismatches > 0:
+            results.append(
+                CheckResult(
+                    check="audience_routing_attestation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=correct,
+                    ground_truth=total,
+                    delta=mismatches,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{mismatches}/{total} sampled ProjectMessage(s) have an "
+                        "audience stamp that diverges from the canonical "
+                        "route_event() derivation (mis-routed or NULL audience)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="audience_routing_attestation",
+                    status=CheckStatus.OK,
+                    self_reported=correct,
+                    ground_truth=total,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {total} sampled ProjectMessage(s) carry canonical "
+                        "audience stamps matching route_event()"
+                    ),
+                )
+            )
+
+    return results
+
+
 _NEAR_CAP_RATIO: float = 0.95
 _NEAR_CAP_LIMITS_PATH: str = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "testing", "module_size_limits.json")

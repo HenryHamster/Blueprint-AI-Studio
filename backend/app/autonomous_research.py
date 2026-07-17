@@ -716,6 +716,7 @@ def _stage_anomaly_action_alert(
             Alert(
                 project_id=project_id,
                 severity=AlertSeverity.WARNING,
+                event_type="research.anomaly_auto_adjusted",
                 title="Pipeline auto-adjusted: anomaly threshold exceeded",
                 message=(
                     f"max_concurrent_vms reduced from {pre_vms} to {new_vms}, "
@@ -729,6 +730,7 @@ def _stage_anomaly_action_alert(
             Alert(
                 project_id=project_id,
                 severity=AlertSeverity.INFO,
+                event_type="research.anomaly_auto_adjusted",
                 title="Pipeline restored: anomaly conditions cleared",
                 message=(
                     "max_concurrent_vms restored to "

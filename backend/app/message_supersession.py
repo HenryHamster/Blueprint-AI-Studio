@@ -19,8 +19,8 @@ Safety, mirroring the observe-mode-first precedent already shipped in
 ``metrics_integrity_sweep`` and ``structural_health_audit``:
 
 * **Mode-gated** — ``message_supersession_mode`` (off / observe / enforce),
-  default ``observe``. ``observe`` measures the would-be resolutions and records
-  nothing; only ``enforce`` mutates rows.
+  default ``enforce``. ``enforce`` stamps the eligible messages resolved; ``observe``
+  measures the would-be resolutions and records nothing.
 * **Wide safety margin** — a message is only superseded when it is BOTH older
   than ``min_age_days`` (default 14) AND from a version at least
   ``min_versions_back`` back (default 2). Both conditions must hold, so nothing
@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 
 # Mode vocabulary — mirrors metrics_integrity_sweep / structural_health_audit.
 SUPERSESSION_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
-DEFAULT_MODE = "observe"
+DEFAULT_MODE = "enforce"
 
 # A message must be at least this many days old to be eligible (safety margin).
 DEFAULT_MIN_AGE_DAYS = 14
