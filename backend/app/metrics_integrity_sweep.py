@@ -536,6 +536,81 @@ async def _enroll_capability_proof_research(
     return True
 
 
+async def _enroll_trial_ineligible_earn_obligation(
+    session, *, project_id, cap_name: str, backing_paths: list[str]
+) -> bool:
+    """Enroll a per-capability earn obligation for a cap that is permanently
+    stuck at path_proven because it has NO discoverable covering test.
+
+    These caps carry a ``backing_path`` proof (so they are NOT missing
+    backing_paths) but cannot advance to ``proven`` via the execution-trial earn
+    path until a convention-named test file is added.  Recording this obligation
+    makes the gap operator-and-strategist-visible and surfaces a concrete action:
+    add a test that covers the backing paths so the trial path can fire.
+
+    Idempotent via :func:`~app.completion_debt.capability_earn_obligation_dedupe_key`:
+    repeated ticks upsert the same row.  Returns ``True`` when a NEW row was
+    created or an existing resolved/reopened row was reopened.  Never raises.
+    """
+    from app.completion_debt import (
+        KIND_CAPABILITY_EARN_OBLIGATION,
+        arecord_completion_debt,
+        capability_earn_obligation_dedupe_key,
+    )
+
+    dedupe_key = capability_earn_obligation_dedupe_key(str(project_id), cap_name)
+    title = f"Add test coverage to unlock trial-proven path for capability: {cap_name}"
+    paths_preview = ", ".join(backing_paths[:5])
+    detail = (
+        f"Capability '{cap_name}' carries a path_proven (backing_path) proof but "
+        "has no convention-named test file covering its declared backing paths. "
+        "The execution-trial earn path — the only automated route to the real "
+        "'proven' tier — requires a covering test. "
+        f"Backing paths: {paths_preview}. "
+        "Add a test file following the project's test-naming convention that "
+        "imports and exercises the modules at these paths. Once a covering test "
+        "exists the sweep will auto-enroll a capability_proof_trial; a green run "
+        "mints the 'proven' tier and clears the enforce-gate gap."
+    )
+    return await arecord_completion_debt(
+        session,
+        dedupe_key=dedupe_key,
+        kind=KIND_CAPABILITY_EARN_OBLIGATION,
+        title=title,
+        project_id=project_id,
+        detail={"description": detail, "backing_paths": backing_paths},
+    )
+
+
+async def _resolve_trial_ineligible_earn_obligation(
+    session, *, project_id, cap_name: str, reason: str | None = None
+) -> bool:
+    """Resolve an open earn obligation when a previously trial-ineligible
+    capability is no longer stuck.
+
+    Called when a capability that carried ONLY a ``backing_path`` proof
+    (path_proven tier, no discoverable covering test) gains test coverage —
+    a named_test_present proof is recorded, an execution trial is enrolled,
+    a fresh executed proof clears the enforce gate, or the capability becomes
+    platform-exempt under the existing registry semantics.  The resolution is
+    idempotent on the stable dedup key — a missing or already-resolved row is
+    a no-op that returns ``False``.  Never raises.
+    """
+    from app.completion_debt import (
+        aresolve_completion_debt,
+        capability_earn_obligation_dedupe_key,
+    )
+
+    dedupe_key = capability_earn_obligation_dedupe_key(str(project_id), cap_name)
+    resolution_reason = reason or (
+        f"capability '{cap_name}' gained test coverage or proof, "
+        "no longer trial-ineligible"
+    )
+    return await aresolve_completion_debt(
+        session, dedupe_key, reason=resolution_reason
+    )
+
+
 # --- Leader-only recurring sweep (called from the reaper cycle) --------------
 
 # Module-level cadence gate, exactly like structural_health_audit._last_audit_scan.
@@ -3809,11 +3884,16 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         #   verification_failed — declared file-like backing_paths that do not
         #     resolve at HEAD (stale/moved paths) or a proof-recording exception;
         #     genuinely unresolvable by self-heal, so these also enroll research.
-        #   already_recorded — a proof was already present (record was a dedup
-        #     no-op); the cap carries path_proven evidence and needs no research
-        #     (only a real green merge verdict reaches ``proven``).
+        #   already_recorded_has_test — dedup no-op on a named_test_present proof;
+        #     cap is TRIAL-ELIGIBLE (test exists; trial awaits flag or cadence).
+        #   already_recorded_no_test — dedup no-op on a backing_path proof only;
+        #     cap has NO covering test → TRIAL-INELIGIBLE (permanently stuck at
+        #     path_proven until a test is added). These earn obligations are
+        #     enrolled in enforce mode so the gap is operator-visible.
         verification_failed: list[str] = []
-        already_recorded: list[str] = []
+        already_recorded_has_test: list[str] = []
+        already_recorded_no_test: list[str] = []  # trial-ineligible; file_paths per-cap
+        already_recorded_no_test_paths: dict[str, list[str]] = {}
 
         for cap_name in unproven_names:
             raw_name, backing_paths = cap_backing.get(cap_name, (cap_name, []))
@@ -3887,7 +3967,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                             named_test_present_resolved.append(cap_name)
                         else:
                             # Dedup: named_test_present proof already present.
-                            already_recorded.append(cap_name)
+                            # Cap is TRIAL-ELIGIBLE (test exists; only awaiting
+                            # trial flag or cadence window).
+                            already_recorded_has_test.append(cap_name)
                     else:
                         recorded = record_capability_backing_path_proof(
                             project, raw_name or cap_name
@@ -3895,9 +3977,12 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         if recorded:
                             auto_resolved.append(cap_name)
                         else:
-                            # Dedup: proof already present (path_proven tier, not
-                            # fully proven).
-                            already_recorded.append(cap_name)
+                            # Dedup: backing_path proof already present but NO
+                            # covering test → TRIAL-INELIGIBLE.  Permanently stuck
+                            # at path_proven until a test is added.  Track the
+                            # file_paths so the earn obligation can cite them.
+                            already_recorded_no_test.append(cap_name)
+                            already_recorded_no_test_paths[cap_name] = file_paths
                 except Exception:  # noqa: BLE001 — proof recording is non-fatal
                     logger.warning(
                         "[METRICS_INTEGRITY] capability_proof_gate_gap: "
@@ -4048,6 +4133,58 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 verification_failed.extend(auto_resolved)
                 auto_resolved.clear()
 
+        # ENFORCE mode: resolve earn obligations for caps that are no longer
+        # trial-ineligible. When a cap that was previously stuck at backing_path-only
+        # (already_recorded_no_test bucket in a prior sweep) gains test coverage —
+        # a named_test_present proof is recorded, an execution trial is enrolled, or
+        # a fresh executed proof already covers HEAD — the corresponding earn
+        # obligation is explicitly RESOLVED. Also resolve obligations for exempt
+        # caps since they are no longer counted in the gap. Resolution is idempotent
+        # on the stable dedupe key — a missing or already-resolved row is a no-op.
+        resolved_earn: list[str] = []
+        if ctx.mode == "enforce":
+            no_longer_stuck = (
+                set(named_test_present_resolved)
+                | set(trials_enrolled)
+                | set(already_recorded_has_test)
+            )
+            if exempt_set:
+                no_longer_stuck |= exempt_set
+            if no_longer_stuck:
+                project_uuid = _uuid.UUID(pid)
+                for cap_name in sorted(no_longer_stuck):
+                    try:
+                        if await _resolve_trial_ineligible_earn_obligation(
+                            ctx.session,
+                            project_id=project_uuid,
+                            cap_name=cap_name,
+                        ):
+                            resolved_earn.append(cap_name)
+                    except Exception:  # noqa: BLE001, PERF203 — resolution must not abort per-cap loop
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                            "earn-obligation resolve failed for cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        with contextlib.suppress(Exception):
+                            await ctx.session.rollback()
+            if resolved_earn:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: earn-obligation "
+                        "resolve commit failed for project %s after resolving %d "
+                        "obligation(s): %s",
+                        pid,
+                        len(resolved_earn),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+
         # ENFORCE mode only: for caps that cannot be auto-proven (no file-like
         # backing_paths, no proof), enroll ONE deduped per-capability research
         # obligation so the evergreen fill loop later spawns a proof-earn probe.
@@ -4100,6 +4237,46 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     with contextlib.suppress(Exception):
                         await ctx.session.rollback()
 
+        # ENFORCE mode: for caps that already carry a backing_path proof but have
+        # NO covering test, enroll a per-capability earn obligation so the gap is
+        # operator-and-strategist-visible with a concrete action (add a test file).
+        # Committed in the same batch as the research obligations above.
+        enrolled_earn: list[str] = []
+        if ctx.mode == "enforce" and already_recorded_no_test:
+            project_uuid = _uuid.UUID(pid)
+            for cap_name in already_recorded_no_test:
+                try:
+                    if await _enroll_trial_ineligible_earn_obligation(
+                        ctx.session,
+                        project_id=project_uuid,
+                        cap_name=cap_name,
+                        backing_paths=already_recorded_no_test_paths.get(cap_name, []),
+                    ):
+                        enrolled_earn.append(cap_name)
+                except Exception:  # noqa: BLE001, PERF203 — enrollment must not abort the check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "earn-obligation enroll failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+            if enrolled_earn:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: earn-obligation "
+                        "commit failed for project %s after enrolling %d obligation(s): %s",
+                        pid,
+                        len(enrolled_earn),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+
         # ``auto_resolved`` are path_proven (backing_path / named_test_present
         # tier) — NOT the genuine ``proven`` tier. ground_truth is the count of
         # working capabilities that have actually reached ``proven``, which is
@@ -4108,6 +4285,7 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # throughput without conflating path_proven with proven.
         auto_resolved_nt = len(named_test_present_resolved)
         auto_resolved_bp = len(auto_resolved) - auto_resolved_nt
+        already_recorded = already_recorded_has_test + already_recorded_no_test
         # Caps with an enrolled execution trial are NOT yet proven — the trial
         # must run green first — so they still count as an unresolved gap this
         # sweep, but are reported distinctly (a real proof is en route) rather
@@ -4164,13 +4342,32 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     f"{len(verification_failed)} backing_paths failed verification: "
                     f"{preview_vf}"
                 )
-            if already_recorded:
-                preview_ir = ", ".join(sorted(already_recorded)[:3])
-                if len(already_recorded) > 3:
-                    preview_ir += f" (+{len(already_recorded) - 3} more)"
+            if already_recorded_has_test:
+                preview_ir = ", ".join(sorted(already_recorded_has_test)[:3])
+                if len(already_recorded_has_test) > 3:
+                    preview_ir += f" (+{len(already_recorded_has_test) - 3} more)"
                 detail_parts.append(
-                    f"{len(already_recorded)} already carry a path_proven proof "
-                    f"(awaiting a real merge verdict to reach proven): {preview_ir}"
+                    f"{len(already_recorded_has_test)} already carry a named_test_present "
+                    f"proof (trial-eligible, awaiting execution run → proven): {preview_ir}"
+                )
+            if already_recorded_no_test:
+                preview_nt = ", ".join(sorted(already_recorded_no_test)[:3])
+                if len(already_recorded_no_test) > 3:
+                    preview_nt += f" (+{len(already_recorded_no_test) - 3} more)"
+                _earn_note = (
+                    " (earn obligations enrolled)" if enrolled_earn else ""
+                )
+                detail_parts.append(
+                    f"{len(already_recorded_no_test)} carry a backing_path proof but "
+                    f"have no covering test (trial-ineligible{_earn_note}): {preview_nt}"
+                )
+            if resolved_earn:
+                preview_re = ", ".join(sorted(resolved_earn)[:3])
+                if len(resolved_earn) > 3:
+                    preview_re += f" (+{len(resolved_earn) - 3} more)"
+                detail_parts.append(
+                    f"{len(resolved_earn)} earn obligation(s) resolved (capability "
+                    f"no longer trial-ineligible): {preview_re}"
                 )
             _detail = (
                 f"{len(unresolved)} working capability(ies) remain unproven "

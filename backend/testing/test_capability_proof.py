@@ -5973,6 +5973,64 @@ async def test_resolve_gap_trial_fresh():
     assert result["trial_enrolled"] is False
 
 
+# ── capability_earn_obligation_dedupe_key ─────────────────────────────────────
+
+
+class TestCapabilityEarnObligationDedupeKey:
+    """capability_earn_obligation_dedupe_key produces stable, unique keys."""
+
+    def test_key_is_stable_across_calls(self):
+        """Same project_id + cap_name always produces the same key."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        assert capability_earn_obligation_dedupe_key(pid, "repo-map") == (
+            capability_earn_obligation_dedupe_key(pid, "repo-map")
+        )
+
+    def test_key_includes_project_and_cap(self):
+        """The key encodes both project_id and cap_name for global uniqueness."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        key = capability_earn_obligation_dedupe_key(pid, "repo-map")
+        assert "repo-map" in key
+        assert str(pid) in key
+
+    def test_different_caps_produce_different_keys(self):
+        """Two distinct cap_names under the same project yield distinct keys."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        assert capability_earn_obligation_dedupe_key(pid, "repo-map") != (
+            capability_earn_obligation_dedupe_key(pid, "ci-integration")
+        )
+
+    def test_different_projects_produce_different_keys(self):
+        """Same cap_name under different projects yields distinct keys."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid_a = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        pid_b = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+        assert capability_earn_obligation_dedupe_key(pid_a, "repo-map") != (
+            capability_earn_obligation_dedupe_key(pid_b, "repo-map")
+        )
+
+    def test_key_has_expected_prefix(self):
+        """The key starts with the 'capability_earn_obligation:' prefix."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+        key = capability_earn_obligation_dedupe_key(pid, "test-cap")
+        assert key.startswith("capability_earn_obligation:")
+
+    def test_kind_constant_is_correct(self):
+        """KIND_CAPABILITY_EARN_OBLIGATION is the expected string literal."""
+        from app.completion_debt import KIND_CAPABILITY_EARN_OBLIGATION
+
+        assert KIND_CAPABILITY_EARN_OBLIGATION == "capability_earn_obligation"
+
+
 @pytest.mark.asyncio
 async def test_resolve_gap_discovery_degrades_gracefully():
     """A discovery failure degrades to unresolved (never raises)."""

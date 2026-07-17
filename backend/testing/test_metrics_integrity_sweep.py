@@ -5270,6 +5270,429 @@ async def test_capability_proof_gate_gap_path_proven_not_counted_as_proven(db):
     )
 
 
+# --- earn obligations for trial-ineligible (path_proven, no covering test) ---
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_enrolls_earn_obligation_for_no_test_cap(db):
+    """ENFORCE mode: a working cap that already has a backing_path proof but NO
+    covering test (trial-ineligible) gets a CompletionDebtEntry enrolled with
+    kind='capability_earn_obligation' and the stable dedupe key.
+
+    This test exercises the production path added in
+    _enroll_trial_ineligible_earn_obligation (metrics_integrity_sweep.py) and
+    capability_earn_obligation_dedupe_key (completion_debt.py).
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.completion_debt import (
+        KIND_CAPABILITY_EARN_OBLIGATION,
+        STATUS_OPEN,
+        capability_earn_obligation_dedupe_key,
+    )
+    from app.models import CompletionDebtEntry
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+    # First tick: path exists but no covering test file (read_head → None so
+    # _named_tests_covering_paths returns []).  The backing_path proof is NOT
+    # yet recorded — it will be recorded on this tick and auto-resolved.
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results = await mis.check_capability_proof_gate_gap(ctx)
+
+    pid = str(project.id)
+    # First tick auto-resolves the cap to path_proven (backing_path tier).
+    # The cap is NOT yet in already_recorded_no_test — it was auto-resolved.
+    assert any(r.subject == pid for r in results)
+
+    # Second tick: now the proof exists (dedup no-op → already_recorded_no_test).
+    ctx2 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        results2 = await mis.check_capability_proof_gate_gap(ctx2)
+
+    # The earn obligation must now exist.
+    project_uuid = project.id
+    expected_key = capability_earn_obligation_dedupe_key(str(project_uuid), "repo-map")
+    debt_rows = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project_uuid,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows) == 1, (
+        f"expected 1 earn obligation, got {[r.dedupe_key for r in debt_rows]}"
+    )
+    row = debt_rows[0]
+    assert row.dedupe_key == expected_key
+    assert row.status == STATUS_OPEN
+    assert "backing_path" in (row.detail or {}).get("description", "")
+
+    # The flagged result must mention the no-test wording.
+    flagged2 = [r for r in results2 if r.flagged and r.subject == pid]
+    assert len(flagged2) == 1
+    assert "trial-ineligible" in flagged2[0].detail or "no covering test" in flagged2[0].detail
+
+    # Idempotency: a third tick must NOT create a duplicate obligation.
+    ctx3 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        await mis.check_capability_proof_gate_gap(ctx3)
+
+    debt_rows_after = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project_uuid,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows_after) == 1, (
+        "third tick must not create duplicate earn obligations"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_observe_does_not_enroll_earn_obligation(db):
+    """OBSERVE mode: the earn obligation for a trial-ineligible cap is NOT enrolled
+    (obligations are enforce-mode only, matching the research-obligation policy).
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.completion_debt import KIND_CAPABILITY_EARN_OBLIGATION
+    from app.models import CompletionDebtEntry
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    # Run twice so the second tick hits already_recorded_no_test.
+    for _ in range(2):
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        with patch(
+            "app.source_ref_validation._path_exists_at_head",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "app.capability_proof._read_file_at_head",
+            new=AsyncMock(return_value=None),
+        ):
+            await mis.check_capability_proof_gate_gap(ctx)
+
+    debt_rows = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project.id,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows) == 0, (
+        "observe mode must not enroll earn obligations for trial-ineligible caps"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_has_test_does_not_enroll_earn_obligation(db):
+    """A cap with a named_test_present proof (trial-ELIGIBLE) must NOT get an
+    earn obligation — it already has test coverage and is just awaiting trial
+    execution.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.completion_debt import KIND_CAPABILITY_EARN_OBLIGATION
+    from app.models import CompletionDebtEntry
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    FAKE_TEST_CONTENT = "import backend.app.models\n"
+
+    # Run twice so the second tick hits already_recorded_has_test.
+    for _ in range(2):
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="enforce",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        with patch(
+            "app.source_ref_validation._path_exists_at_head",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "app.capability_proof._read_file_at_head",
+            new=AsyncMock(return_value=FAKE_TEST_CONTENT),
+        ):
+            await mis.check_capability_proof_gate_gap(ctx)
+
+    debt_rows = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project.id,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows) == 0, (
+        "trial-eligible cap (has covering test) must not get an earn obligation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_resolves_earn_obligation_on_remediation(db):
+    """Regression: when a trial-ineligible cap gains test coverage, its earn
+    obligation is explicitly RESOLVED without duplicate open debt.
+
+    Lifecycle:
+    1. Tick 1 (no test coverage) → auto-resolves backing_path proof.
+    2. Tick 2 (no test coverage, dedup) → cap is already_recorded_no_test;
+       earn obligation ENROLLED.
+    3. Tick 3 (test coverage appears) → cap auto-resolves named_test_present;
+       the earn obligation must transition to RESOLVED.
+    4. Tick 4 (test coverage still present, dedup) → already_recorded_has_test;
+       NO new earn obligation enrolled, prior row stays RESOLVED.
+    """
+    from unittest.mock import AsyncMock, patch
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.completion_debt import (
+        KIND_CAPABILITY_EARN_OBLIGATION,
+        STATUS_OPEN,
+        STATUS_RESOLVED,
+        capability_earn_obligation_dedupe_key,
+    )
+    from app.models import CompletionDebtEntry
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [],
+                "backing_paths": ["backend/app/models.py"],
+            },
+        ]
+    }
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    project_uuid = project.id
+    expected_key = capability_earn_obligation_dedupe_key(str(project_uuid), "repo-map")
+
+    FAKE_TEST_CONTENT = "from app.models import Something\n"
+
+    # ── Tick 1: no test coverage → backing_path proof auto-resolved ──────────
+    ctx1 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        await mis.check_capability_proof_gate_gap(ctx1)
+
+    # ── Tick 2: no test coverage, dedup → earn obligation enrolled ───────────
+    ctx2 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=None),
+    ):
+        await mis.check_capability_proof_gate_gap(ctx2)
+
+    # Confirm the obligation was enrolled and is OPEN.
+    debt_rows = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project_uuid,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows) == 1
+    row = debt_rows[0]
+    assert row.dedupe_key == expected_key
+    assert row.status == STATUS_OPEN
+
+    # ── Tick 3: test coverage appears → auto-resolves named_test_present ─────
+    # The earn obligation must transition to RESOLVED.
+    ctx3 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=FAKE_TEST_CONTENT),
+    ):
+        await mis.check_capability_proof_gate_gap(ctx3)
+
+    # Verify the obligation is now RESOLVED.
+    debt_rows_after = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project_uuid,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows_after) == 1, (
+        "remediation must not create duplicate debt rows"
+    )
+    resolved_row = debt_rows_after[0]
+    assert resolved_row.dedupe_key == expected_key
+    assert resolved_row.status == STATUS_RESOLVED, (
+        f"expected RESOLVED after gaining test coverage, got {resolved_row.status}"
+    )
+
+    # ── Tick 4: test coverage still present, dedup → already_recorded_has_test ──
+    # Must NOT re-open or create a new obligation.
+    ctx4 = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="enforce",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    with patch(
+        "app.source_ref_validation._path_exists_at_head",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "app.capability_proof._read_file_at_head",
+        new=AsyncMock(return_value=FAKE_TEST_CONTENT),
+    ):
+        await mis.check_capability_proof_gate_gap(ctx4)
+
+    # The row must STILL be RESOLVED (not reopened) and there must be exactly
+    # one row — no duplicate.
+    debt_rows_final = (
+        await db.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.project_id == project_uuid,
+                CompletionDebtEntry.kind == KIND_CAPABILITY_EARN_OBLIGATION,
+            )
+        )
+    ).scalars().all()
+    assert len(debt_rows_final) == 1, (
+        "subsequent ticks must not create duplicate earn obligations"
+    )
+    final_row = debt_rows_final[0]
+    assert final_row.status == STATUS_RESOLVED, (
+        f"earn obligation must stay RESOLVED across subsequent ticks, "
+        f"got {final_row.status}"
+    )
+
+
 # --- Check: capability_proof_gate_auto_graduation ----------------------------
 
 

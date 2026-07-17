@@ -54,6 +54,12 @@ KIND_NO_CI_GATE = "no_ci_gate"
 KIND_HOTFIX_DEPLOY_PENDING_BACKFILL = "hotfix_deploy_pending_backfill"
 KIND_RETIREMENT_RESIDUAL = "retirement_residual"
 KIND_SEED_INVENTORY = "seed_inventory"
+# A working capability that already carries a structural path_proven proof
+# (backing_path tier) but has NO discoverable covering test — permanently stuck
+# because the execution-trial earn path requires a convention-named test file.
+# The obligation surfaces this to the operator/strategist so a test can be
+# added, unblocking the trial path and enabling graduation to ``proven``.
+KIND_CAPABILITY_EARN_OBLIGATION = "capability_earn_obligation"
 
 # --- Statuses ---
 STATUS_OPEN = "open"
@@ -74,6 +80,18 @@ def hotfix_deploy_debt_dedupe_key(project_id: Any, candidate_sha: str) -> str:
 def hotfix_deploy_alert_dedupe_key(project_id: Any, candidate_sha: str) -> str:
     """Stable identity for the operator alert accompanying one hotfix deploy."""
     return f"hotfix_deploy_alert:{project_id}:{candidate_sha}"
+
+
+def capability_earn_obligation_dedupe_key(project_id: Any, cap_name: str) -> str:
+    """Stable per-capability identity for a trial-ineligible earn obligation.
+
+    A capability earns this obligation when it already carries a ``backing_path``
+    (path_proven) proof but has NO discoverable covering test — so the execution-
+    trial earn path is blocked until a convention-named test file is added.
+    The key is deterministic and globally unique across projects and caps so
+    repeated sweep ticks upsert the same obligation row rather than duplicating.
+    """
+    return f"capability_earn_obligation:{project_id}:{cap_name}"
 
 
 def _is_async_session(session: Any) -> bool:
