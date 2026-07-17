@@ -712,6 +712,9 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
                 "branch": "feat/closed",
                 "base_branch": "main",
                 "ci_wait_started": _naive_utcnow().isoformat(),
+                "closed_pr_replacement_wait_started": _naive_utc_ago(
+                    minutes=16
+                ).isoformat(),
             }
         },
     )
@@ -764,6 +767,93 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
         "pr_merged must not be set when PR was closed without merging"
     )
     alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ci_polling_graces_replacement_publication_then_rebinds(orch_db, mocker):
+    """A just-closed PR cannot kill a fix while its replacement is publishing."""
+    session, _Session = orch_db
+
+    project = Project(name="CI Replacement Publication Grace", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "branch": "feat/publishing-replacement"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/publishing-replacement",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "fix_reason": "migration_guard",
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/publishing-replacement"},
+            "base": {"ref": "automain"},
+            "mergeable": None,
+        },
+    )
+    replacement_lookup = mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        side_effect=[
+            None,
+            {
+                "number": 91,
+                "state": "open",
+                "head": {"sha": "newsha", "ref": "feat/publishing-replacement"},
+                "base": {"ref": "automain"},
+            },
+        ],
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    # First poll lands inside the publication race: no replacement is visible yet.
+    await _run_one_cycle(mocker)
+    async with _Session() as verify_session:
+        first = await verify_session.get(Task, task_id)
+        assert first.status == TaskStatus.EVALUATING
+        first_loop = (first.context or {}).get("review_loop", {})
+        assert first_loop.get("closed_pr_replacement_wait_started")
+        assert "waiting for replacement publication" in (
+            first.latest_status_message or ""
+        ).lower()
+
+    # Next poll sees the authoritative same-head/base replacement and rebinds.
+    await _run_one_cycle(mocker)
+    async with _Session() as verify_session:
+        rebound = await verify_session.get(Task, task_id)
+        assert rebound.status == TaskStatus.EVALUATING
+        rebound_loop = (rebound.context or {}).get("review_loop", {})
+        assert rebound_loop.get("pr_number") == 91
+        assert rebound_loop.get("head_sha") == "newsha"
+        assert "closed_pr_replacement_wait_started" not in rebound_loop
+
+    assert replacement_lookup.await_count == 2
+    alert_mock.assert_not_called()
 
 
 @pytest.mark.asyncio
