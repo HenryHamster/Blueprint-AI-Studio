@@ -10795,11 +10795,11 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         # Hotfix-promote pins the candidate SHA it deploys (integration HEAD) and
         # the prior-deployed SHA (promotion-target HEAD, the diff base + audit
         # field) — both are SHA-critical live reads, same as force_promote above.
-        "release_qualifier.py:hotfix_promote_current_version",
+        "release_hotfix_promotion.py:hotfix_promote_current_version",
         # The scope preview mirrors hotfix_promote_current_version's SHA reads
         # exactly (same live=True for both integration HEAD and promotion-target
         # HEAD) — the diff is meaningless if the SHAs are stale.
-        "release_qualifier.py:check_hotfix_scope_preview",
+        "release_hotfix_promotion.py:check_hotfix_scope_preview",
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
         "release_reconciliation.py:_reconcile_if_pending_auto_merge_landed",
