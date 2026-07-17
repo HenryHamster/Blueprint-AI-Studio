@@ -1538,6 +1538,135 @@ describe('handleStrategicResident — autonomous marker-miss corrective loop', (
     const ledger = JSON.parse((withFallback as Record<string, string>).note) as { operatorDecisionReview: unknown };
     expect(ledger.operatorDecisionReview).toBeNull();
   });
+
+  it('id-less overflow sentinel: repeated escape-hatch trips through the handler loop produce at most one decisions-register entry (sentinelKey dedup guard)', async () => {
+    // The id-less overflow sentinel (messageIds:[], overflowed:true) has no stable
+    // message ids, so the same sentinel can re-trip the MAX_REVIEW_ATTEMPTS escape
+    // hatch on every failed autonomous turn. The alreadyAdmitted guard at
+    // strategic-resident.ts:1464-1465 detects a prior sentinel entry by the
+    // sentinel:${startedAt} key embedded in the note and skips re-admission.
+    //
+    // This test exercises the guard through the full handler loop:
+    //   - decisions_reg is pre-seeded with one entry already carrying the sentinel key
+    //     (representing what was admitted on a prior autonomous turn / prior handler run)
+    //   - the exam ledger seeds the id-less overflow sentinel at attempts=1 so two
+    //     autonomous turns are needed: turn 1 retains (2 < MAX_REVIEW_ATTEMPTS=3, no
+    //     escape hatch), turn 2 retains (3 >= MAX_REVIEW_ATTEMPTS, escape hatch fires)
+    //   - on the escape-hatch turn, alreadyAdmitted=true and no second entry is added
+    //   - the final decisions_reg must still carry exactly one sentinel-key entry
+    const STARTED_AT = '2026-07-10T09:00:00Z';
+    const SENTINEL_KEY = `sentinel:${STARTED_AT}`;
+    const EXCHANGE_TEXT = 'operator preferred keeping the table-based layout as-is';
+
+    let turnCount = 0;
+    let hbRev = 0;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    // Pre-seed one sentinel entry representing what was admitted on a prior trip.
+    const preSeededDecisionsReg = JSON.stringify({
+      entries: [{
+        atTick: 8,
+        at: STARTED_AT,
+        surfaceKey: 'operator:message',
+        verdict: 'operator',
+        note: `[unclassified after 3 attempts ${SENTINEL_KEY}] ${EXCHANGE_TEXT}`,
+      }],
+    });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        hbRev += 1;
+        // Increment work_state_rev on every heartbeat so the autonomous-turn
+        // gate fires immediately on the next iteration (world-moved signal).
+        return Promise.resolve({ authority_held: true, work_state_rev: `rev-${hbRev}` });
+      }
+      return Promise.resolve({});
+    });
+
+    // Two turns: neither emits a classification marker so the review is retained,
+    // then on the second turn the escape hatch fires with alreadyAdmitted=true.
+    const session = makeSession(
+      () => {
+        turnCount += 1;
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent operator batch. Nothing newly actionable.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => turnCount < 2,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-sentinel-dedup',
+      // Small tick intervals keep the between-turn gating wait short.
+      {
+        project_name: 'Proj', open_messages: [],
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.75,
+      },
+      {
+        project_metadata: { project_id: 'proj-sentinel-dedup' },
+        context: {
+          // Pre-existing sentinel entry from a prior trip — the guard must block
+          // a second admission of an entry with the same sentinel key.
+          _decisions_reg: preSeededDecisionsReg,
+          // Id-less overflow sentinel at attempts=1: two retains (turns 1 and 2)
+          // are needed before the escape hatch fires (3 >= MAX_REVIEW_ATTEMPTS=3).
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 9,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: [],
+              overflowed: true,
+              overflowExchanges: 2,
+              exchangeText: EXCHANGE_TEXT,
+              startedAt: STARTED_AT,
+              attempts: 1, // one retain reaches 2 (no hatch); second reach 3 (hatch)
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Both turns must have executed.
+    expect(turnCount).toBe(2);
+
+    // (a) The last heartbeat's decisions_reg must contain exactly one entry with
+    //     the sentinel key — the dedup guard blocked the second admission.
+    const lastWithDecisions = [...heartbeatBodies].reverse().find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string' && typeof b.note === 'string',
+    );
+    expect(lastWithDecisions).toBeDefined();
+    const reg = JSON.parse((lastWithDecisions as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const sentinelEntries = reg.entries.filter(
+      (e) => e.surfaceKey === 'operator:message' && e.note.includes(SENTINEL_KEY),
+    );
+    expect(sentinelEntries).toHaveLength(1);
+
+    // (b) The review is cleared in the serialized ledger (advance returned null
+    //     because coversOverflow:activeOverflowSentinel was passed on the hatch turn).
+    const finalLedger = JSON.parse((lastWithDecisions as Record<string, string>).note) as {
+      operatorDecisionReview: unknown;
+    };
+    expect(finalLedger.operatorDecisionReview).toBeNull();
+  });
 });
 
 describe('recloneResidentWorkspace', () => {
