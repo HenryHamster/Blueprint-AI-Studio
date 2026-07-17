@@ -3454,6 +3454,103 @@ def test_merge_empty_proposed_preserves_agent_owned_collections():
     assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p1"}
 
 
+def test_friction_status_monotonic_stale_echo_does_not_regress():
+    """Regression: a stale concurrent write echoing a friction entry with status
+    'active' must NOT regress a terminal status (resolved or mitigated) back to
+    'active'.  Reproduces the revs-1332-1341 stale-echo sequence: resolved
+    tracker regressed to active by a concurrent write, then re-resolved.
+
+    Three sub-scenarios:
+      1. Resolved → stale active → still resolved (monotonic).
+      2. Mitigated → stale active → still mitigated (monotonic).
+      3. Active → resolved → works (forward progress not blocked)."""
+    # --- Sub-scenario 1: resolved is not regressed ---
+    current = {
+        "revision": 10,
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "resolved",
+                "description": "Fixed by retry logic.",
+                "mitigations_tried": ["added retry", "increased timeout"],
+            }
+        ],
+    }
+    proposed = {
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "active",
+            }
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-07-17T12:00:00")
+    fr = new_raw["friction"][0]
+    assert fr["status"] == "resolved", (
+        f"Expected 'resolved' (monotonic), got '{fr['status']}'"
+    )
+    # Durable fields the stale echo omitted (description, mitigations_tried)
+    # must still be preserved when the floor is NOT applied — a stale echo
+    # just omits the field, which is NOT the same as a blank under floor marker.
+    assert fr["name"] == "flaky CI"
+    assert fr["id"] == "f-1"
+
+    # --- Sub-scenario 2: mitigated is not regressed ---
+    current2 = {
+        "revision": 11,
+        "friction": [
+            {
+                "id": "f-2",
+                "name": "slow builds",
+                "status": "mitigated",
+                "description": "Build cache reduced time by 40%.",
+            }
+        ],
+    }
+    proposed2 = {
+        "friction": [
+            {
+                "id": "f-2",
+                "name": "slow builds",
+                "status": "active",
+            }
+        ],
+    }
+    new_raw2, _ = apply_agent_update(current2, proposed2, "2026-07-17T12:00:00")
+    fr2 = new_raw2["friction"][0]
+    assert fr2["status"] == "mitigated", (
+        f"Expected 'mitigated' (monotonic), got '{fr2['status']}'"
+    )
+
+    # --- Sub-scenario 3: forward progress from active still works ---
+    current3 = {
+        "revision": 12,
+        "friction": [
+            {
+                "id": "f-3",
+                "name": "flakey test",
+                "status": "active",
+            }
+        ],
+    }
+    proposed3 = {
+        "friction": [
+            {
+                "id": "f-3",
+                "name": "flakey test",
+                "status": "resolved",
+            }
+        ],
+    }
+    new_raw3, _ = apply_agent_update(current3, proposed3, "2026-07-17T12:00:00")
+    fr3 = new_raw3["friction"][0]
+    assert fr3["status"] == "resolved", (
+        f"Expected 'resolved' (forward progress), got '{fr3['status']}'"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Strategic-payload integration — smoke tests
 # ---------------------------------------------------------------------------
