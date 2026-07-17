@@ -3182,6 +3182,14 @@ async def run_qualification(
     version.qualification_retry_episode = retry_episode
     if is_new_attempt:
         version.qualification_attempts = (version.qualification_attempts or 0) + 1
+    # Attempt contract: freeze promotion policy and capability-proof mode BEFORE
+    # the first child-spawn await so a mid-flight operator/config change cannot
+    # compose children spawned under one contract with a verdict computed under
+    # another.  Legacy records that predate the freeze fall back to live values.
+    _spawn_policy_snapshot = _load_policy(project)
+    _spawn_capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -3328,6 +3336,13 @@ async def run_qualification(
         # per-dimension ledger so _finalize_qualification can compose from
         # them without re-running their gates.
         "resolved_dimensions": resolved_dims if resolved_dims else None,
+        # Attempt contract: freeze the version goal, promotion policy, and
+        # capability-proof mode at spawn so mid-flight configuration changes
+        # cannot compose children spawned under one contract with a verdict
+        # computed under another.
+        "version_goal": version_goal,
+        "promotion_policy_snapshot": _spawn_policy_snapshot,
+        "capability_proof_mode": _spawn_capability_proof_mode,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -5163,6 +5178,20 @@ async def _finalize_qualification(
         qual["retry_episode"] = int(
             getattr(version, "qualification_retry_episode", 0) or 0
         )
+    # Attempt contract: read values frozen at spawn so mid-flight configuration
+    # changes do not compose children spawned under one contract with a verdict
+    # computed under another.  Legacy records that predate the freeze fall back
+    # to the live values so existing finalizes continue to work.
+    _frozen_version_goal: str = (
+        str(qual["version_goal"]).strip()
+        if "version_goal" in qual
+        else (version.goal or "").strip()
+    )
+    _frozen_capability_proof_mode: str | None = (
+        str(qual["capability_proof_mode"]).strip().lower()
+        if "capability_proof_mode" in qual
+        else None
+    )
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
@@ -5211,7 +5240,20 @@ async def _finalize_qualification(
         )
 
     _policy_project = await session.get(Project, version.project_id)
-    policy = _load_policy(_policy_project)
+    # Prefer the promotion policy frozen at spawn; fall back to the live policy
+    # for legacy records that predate the attempt-contract freeze.
+    policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
+
+    # Derive whether enforce mode was active at spawn from the frozen (or fallback)
+    # policy.  _apply_completion_debt_weight_mode baked the freeze-time mode into
+    # weights.completion_debt, so a present positive value means enforce was active
+    # when the policy was captured.  Used below for debt-scoring fallback (line 6393)
+    # and the enforce preview gate (line 6584) so mid-flight knob changes cannot
+    # omit the fail-closed debt score or produce metadata under the wrong contract.
+    _frozen_cd_weight: float = float(
+        (policy.get("weights") or {}).get("completion_debt", 0.0) or 0.0
+    )
+    _frozen_cd_was_enforce: bool = _frozen_cd_weight > 0.0
 
     # Resolve env_preflight_enabled EARLY — before the child-terminal-status
     # checks and artifact reads — so both can reference it.  The flag was
@@ -5323,7 +5365,7 @@ async def _finalize_qualification(
                         candidate_sha=candidate_sha,
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
-                        version_goal=version.goal,
+                        version_goal=_frozen_version_goal,
                     )
                     new_count = rl_respawn_count + 1
                     updated_qual = {
@@ -5383,7 +5425,7 @@ async def _finalize_qualification(
                         candidate_sha=candidate_sha,
                         qualification_attempt_id=attempt_id,
                         audit_base_sha=fp.get("audit_base_sha"),
-                        version_goal=version.goal,
+                        version_goal=_frozen_version_goal,
                     )
                     new_count = infra_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -5873,7 +5915,7 @@ async def _finalize_qualification(
                 qualification_attempt_id=attempt_id,
                 primary_audit_task_id=audit_task_id,
                 primary_findings=primary_findings,
-                version_goal=version.goal,
+                version_goal=_frozen_version_goal,
             )
         except PayloadTooLargeError as _spawn_exc:
             logger.warning(
@@ -6000,7 +6042,7 @@ async def _finalize_qualification(
                                         qualification_attempt_id=attempt_id,
                                         primary_audit_task_id=audit_task_id,
                                         primary_findings=_chal_primary_findings,
-                                        version_goal=version.goal,
+                                        version_goal=_frozen_version_goal,
                                     )
                                 )
                             except PayloadTooLargeError as _chal_exc:
@@ -6146,7 +6188,7 @@ async def _finalize_qualification(
                     qualification_attempt_id=attempt_id,
                     primary_audit_task_id=audit_task_id,
                     primary_findings=primary_findings,
-                    version_goal=version.goal,
+                    version_goal=_frozen_version_goal,
                 )
             except PayloadTooLargeError as _early_exc:
                 logger.warning(
@@ -6261,7 +6303,7 @@ async def _finalize_qualification(
                         qualification_attempt_id=attempt_id,
                         primary_audit_task_id=audit_task_id,
                         primary_findings=primary_findings,
-                        version_goal=version.goal,
+                        version_goal=_frozen_version_goal,
                     )
                 except PayloadTooLargeError as _spawn_exc:
                     logger.warning(
@@ -6702,7 +6744,7 @@ async def _finalize_qualification(
             else None
         )
         merge_grade_cert = evaluate_merge_grade(
-            version.goal,
+            _frozen_version_goal,
             merge_grade_artifact,
             active_categories or None,
             _verified_merge_evidence,
@@ -6886,12 +6928,14 @@ async def _finalize_qualification(
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
+                        qualification_attempt_id=attempt_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
                     version.id,
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
+                    qualification_attempt_id=attempt_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
                 logger.warning(
@@ -6923,7 +6967,8 @@ async def _finalize_qualification(
             # the re-drive path where no fresh artifact was re-evaluated).
             try:
                 _ledger_verdicts = await _category_ledger.get_category_verdicts(
-                    session, version.id, candidate_sha
+                    session, version.id, candidate_sha,
+                    qualification_attempt_id=attempt_id,
                 )
                 # FIX 1 — filter to the CURRENTLY-ACTIVE criterion keys.  The ledger
                 # returns EVERY row for the (version, sha) pair, including a
@@ -6957,7 +7002,8 @@ async def _finalize_qualification(
                     else None
                 )
                 _gate_residual = await _category_ledger.get_residual(
-                    session, version.id, candidate_sha
+                    session, version.id, candidate_sha,
+                    qualification_attempt_id=attempt_id,
                 )
             except Exception:  # noqa: BLE001 — a read failure fails CLOSED (below)
                 # Fail-open state 3/3: the ledger read itself raised, so the
@@ -7022,7 +7068,8 @@ async def _finalize_qualification(
         capability_proof_gate_release_status as _cp_release_status,
     )
 
-    _capability_proof_mode = str(
+    # Prefer the mode frozen at spawn; fall back to live config for legacy records.
+    _capability_proof_mode = _frozen_capability_proof_mode or str(
         _runtime_config.get("capability_proof_gate_mode", "off") or "off"
     ).strip().lower()
     capability_proof_blocked, capability_proof_detail = _cp_release_status(
@@ -7086,7 +7133,7 @@ async def _finalize_qualification(
         _debt_pressure_score: float | None = _score_completion_debt_pressure(
             _completion_debt_scoring_snapshot
         )
-    elif _resolve_completion_debt_weight_mode() == "enforce":
+    elif _frozen_cd_was_enforce:
         # In enforce mode a failed debt-snapshot read must NOT inflate confidence
         # by silently dropping the (1 - w_debt) down-scaling inside
         # compute_composite.  Use 0.0 (maximum-debt worst case) so the composite
@@ -7284,7 +7331,7 @@ async def _finalize_qualification(
     # completion_debt_weight_mode knob with accumulated evidence rather than
     # flying blind.  Has no effect on the live composite.
     if (
-        _resolve_completion_debt_weight_mode() != "enforce"
+        not _frozen_cd_was_enforce
         and composite["blocker"] is None
         and _debt_pressure_score is not None
     ):

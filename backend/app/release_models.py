@@ -880,6 +880,21 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Per-attempt goal-verification verdict snapshot: the per-category verdicts
+    # and residual gap that drove the criterion_coverage gate at finalize time.
+    # Persisted so a re-qualification overwrite of last_qualification does NOT
+    # lose which category/residual facts belonged to this attempt.  Nullable —
+    # rows written before this column existed or for attempts where no rubric /
+    # grade was issued carry None.
+    category_verdicts: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    residual_uncaptured_gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     # Promotion-attempt context (only set on the promotion_failed / promoted
     # paths): the merge PR URL, whether the merge hit a conflict, and the
     # error/detail string describing why the merge failed.
@@ -1223,12 +1238,22 @@ class CategoryVerdict(SQLModel, table=True):
         sa_column=Column(String(64), nullable=True),
     )
 
+    # The qualification attempt this verdict belongs to, for attempt-scoped
+    # querying and to prevent cross-attempt overwrites on same-SHA re-grades.
+    # Nullable for backward compatibility with rows created before this field
+    # was added.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "version_id",
             "candidate_sha",
             "category_key",
-            name="uq_categoryverdict_version_sha_category",
+            "qualification_attempt_id",
+            name="uq_categoryverdict_version_sha_category_attempt",
         ),
     )
 
@@ -1243,7 +1268,9 @@ class ResidualVerdict(SQLModel, table=True):
     met even if every category is ``met``
     (:func:`app.category_verdict_ledger.is_candidate_fully_met`).
 
-    One row PER ``(version_id, candidate_sha)``; a re-grade UPSERTs it.
+    One row PER ``(version_id, candidate_sha, qualification_attempt_id)``;
+    a re-grade UPSERTs it within an attempt, and different attempts on the
+    same candidate each retain their own residual row.
     """
 
     __tablename__ = "residualverdict"
@@ -1278,11 +1305,21 @@ class ResidualVerdict(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
+    # The qualification attempt this residual belongs to, for attempt-scoped
+    # querying and to prevent cross-attempt overwrites on same-SHA re-grades.
+    # Nullable for backward compatibility with rows created before this field
+    # was added.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "version_id",
             "candidate_sha",
-            name="uq_residualverdict_version_sha",
+            "qualification_attempt_id",
+            name="uq_residualverdict_version_sha_attempt",
         ),
     )
 

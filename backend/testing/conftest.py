@@ -86,6 +86,27 @@ import app.database as _app_database  # noqa: E402
 _app_database._LazyEngine._engine = engine
 
 
+def _postgres_cleanup_tables():
+    """Return a delete order that also handles the Resident checkpoint cycle."""
+    ordered_tables = list(reversed(SQLModel.metadata.sorted_tables))
+
+    # A Resident owns checkpoints (checkpoint.project_id -> resident, CASCADE)
+    # while also pointing at its current/previous checkpoint (SET NULL). The
+    # generic dependency sort cannot linearize that cycle and puts checkpoints
+    # first. Deleting one then fires the production rotation fence, which
+    # correctly refuses to clear a live Resident pointer. Delete the Resident
+    # first instead: PostgreSQL cascades its checkpoints/receipts atomically,
+    # and the remaining generic sweep sees empty child tables.
+    resident = next(
+        (table for table in ordered_tables if table.name == "strategicresident"),
+        None,
+    )
+    if resident is not None:
+        ordered_tables.remove(resident)
+        ordered_tables.insert(0, resident)
+    return ordered_tables
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session():
     """
@@ -126,7 +147,7 @@ async def db_session():
         # runs after its dependents are already empty and no FK constraint is
         # violated. ``alembic_version`` is NOT a SQLModel table, so it is
         # intentionally left untouched (the migration head must persist).
-        ordered_tables = list(reversed(SQLModel.metadata.sorted_tables))
+        ordered_tables = _postgres_cleanup_tables()
         if ordered_tables:
             async with engine.begin() as conn:
                 for table in ordered_tables:

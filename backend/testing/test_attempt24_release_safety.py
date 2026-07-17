@@ -173,6 +173,7 @@ async def test_attempt24_release_safety_contract(tmp_path, monkeypatch, mocker):
     migration = _load_migration()
     assert migration.revision == "0609"
     assert migration.down_revision == "0608"
+    assert EXPECTED_SCHEMA_REVISION >= "0609"
 
     # Alembic must leave the prior stamp intact for absent, malformed, and
     # invalid-padding keys, even when the normal test/dev plaintext opt-in is present.

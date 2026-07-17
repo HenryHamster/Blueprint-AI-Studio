@@ -41823,3 +41823,252 @@ async def test_redrive_isolation_proven_evidence(db_session, resolved_status):
         f"resolved→resolved transition must be permitted: expected '{new_resolved_status}', "
         f"got '{row2.status}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attempt-contract freeze tests (version_goal, promotion_policy, proof mode)
+# ---------------------------------------------------------------------------
+
+
+class TestAttemptContractFreeze:
+    """The attempt contract (version_goal, promotion_policy_snapshot,
+    capability_proof_mode) is frozen at spawn time so mid-flight config
+    changes cannot combine children from one contract with a verdict from
+    another."""
+
+    @pytest.mark.asyncio
+    async def test_version_goal_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores version.goal as version_goal in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+        mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+        mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+            return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+        ))
+        mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+        mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+
+        project, version = await _make_project_and_version(db_session, phase="stabilize")
+        version.goal = "Deliver a working login flow"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await rq.run_qualification(db_session, project.id, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        qual = version.last_qualification or {}
+        assert qual.get("version_goal") == "Deliver a working login flow", (
+            f"version_goal not frozen at spawn: {qual.get('version_goal')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores capability_proof_gate_mode in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        shared_state.runtime_config["capability_proof_gate_mode"] = "observe"
+        try:
+            mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+            mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+            mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+                return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+            ))
+            mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+            mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+
+            project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+            await rq.run_qualification(db_session, project.id, version)
+            await db_session.commit()
+            await db_session.refresh(version)
+
+            qual = version.last_qualification or {}
+            assert qual.get("capability_proof_mode") == "observe", (
+                f"capability_proof_mode not frozen at spawn: {qual.get('capability_proof_mode')!r}"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)
+
+    @pytest.mark.asyncio
+    async def test_version_goal_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the frozen version_goal from last_qualification,
+        not the live version.goal — even if version.goal was mutated after spawn."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        # Seed children with an empty frozen goal so the merge-grade gate is a no-op.
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Freeze version_goal="" (no goal at spawn) but set a live goal afterwards.
+        qual = dict(version.last_qualification or {})
+        qual["version_goal"] = ""
+        version.last_qualification = qual
+        version.goal = "A non-empty live goal that should be ignored"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Mock evaluate_merge_grade so we can observe what goal it is called with.
+        called_with_goals: list[str | None] = []
+
+        def _fake_evaluate_merge_grade(goal, artifact, categories, evidence):
+            called_with_goals.append(goal)
+            return {"status": "not_applicable", "covers_goal": None, "coverage": None,
+                    "biggest_gap": None, "blocked": False, "detail": None}
+
+        mocker.patch("app.release_qualifier.evaluate_merge_grade", side_effect=_fake_evaluate_merge_grade)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Finalize must have used the frozen empty goal, not the live "non-empty" goal.
+        if called_with_goals:
+            assert called_with_goals[0] == "", (
+                f"_finalize_qualification passed live goal instead of frozen goal: "
+                f"{called_with_goals[0]!r}"
+            )
+        # Either way the run should not fail because the frozen goal is empty.
+        assert result.get("status") in ("dry_run", "not_promoted"), (
+            f"unexpected finalize status: {result.get('status')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_promotion_policy_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the promotion policy frozen at spawn time.
+
+        A promotion_policy_snapshot stored in last_qualification takes precedence
+        over the live runtime_config / _load_policy result.  Changing the threshold
+        after spawn must not affect the verdict for the in-flight attempt.
+        """
+        from app import shared_state
+
+        # Set a low threshold at "spawn" time that would allow promotion.
+        shared_state.runtime_config["promotion_enabled"] = False
+        _spawn_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                         "threshold": 0.50}
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.7, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Stamp the frozen policy into last_qualification.
+        qual = dict(version.last_qualification or {})
+        qual["promotion_policy_snapshot"] = _spawn_policy
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Raise the live threshold to something the score would fail.
+        _live_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                        "threshold": 0.99}
+        mocker.patch("app.release_qualifier._load_policy", return_value=_live_policy)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # With frozen threshold=0.50 the composite is roughly 0.7*0.4 + 1.0*0.3 + 1.0*0.3 = 0.88,
+        # which exceeds the frozen bar -- result is dry_run, not not_promoted.
+        # (With live threshold=0.99 the same composite would be not_promoted.)
+        assert result.get("status") == "dry_run", (
+            f"promotion policy was not frozen at spawn: expected dry_run "
+            f"(frozen threshold=0.50) but got {result.get('status')!r} — "
+            f"live threshold=0.99 may have been used"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the capability_proof_mode frozen at spawn.
+
+        Changing runtime_config['capability_proof_gate_mode'] between spawn and
+        finalize must not affect the qualification verdict for that attempt.
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        # Freeze "off" mode in last_qualification.
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        qual = dict(version.last_qualification or {})
+        qual["capability_proof_mode"] = "off"
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # After spawn: flip the live config to "enforce" with an unproven capability.
+        shared_state.runtime_config["capability_proof_gate_mode"] = "enforce"
+        # Inject an unproven working capability into the project's problem_model.
+        project.problem_model = {
+            "capabilities": [{"name": "github_api", "status": "working", "evidence_refs": []}]
+        }
+        db_session.add(project)
+        await db_session.commit()
+        try:
+            mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+            result = await rq._finalize_qualification(db_session, version)
+            await db_session.commit()
+
+            # With frozen "off" mode the capability proof gate is inert — should
+            # still produce dry_run, not a capability_proof_blocked not_promoted.
+            assert result.get("status") == "dry_run", (
+                f"capability_proof_mode was not frozen at spawn: expected dry_run "
+                f"(frozen mode=off) but got {result.get('status')!r} with "
+                f"blocker={result.get('blocker')!r}"
+            )
+            assert result.get("blocker") != "capability_proof_blocked", (
+                "capability_proof_blocked fired despite frozen 'off' mode"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)
