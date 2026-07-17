@@ -260,7 +260,8 @@ def get_project_id(project_id: str | None = None) -> str:
          CLI flags, already resolved to an id by the caller;
       2. the ``BLUEPRINT_PROJECT_ID`` env var;
       3. ``project_id`` configured in the config file;
-      4. the first project returned by the API.
+      4. the unique project whose GitHub repo matches default_repo;
+      5. the only project returned by the API.
 
     Previously (1) was honored but (2) was silently dropped and it fell straight
     to (4), so an explicit env selection was ignored and the CLI targeted an
@@ -280,6 +281,46 @@ def get_project_id(project_id: str | None = None) -> str:
     projects = list_projects()
     if not projects:
         print("ERROR: No projects found.")
+        sys.exit(1)
+
+    default_repo = str(cfg.get("default_repo") or "").strip().casefold()
+    if default_repo:
+        repo_matches = []
+        for candidate in projects:
+            owner = str(candidate.get("github_owner") or "").strip()
+            repo = str(candidate.get("github_repo") or "").strip()
+            qualified = f"{owner}/{repo}".casefold() if owner and repo else ""
+            if default_repo == qualified or (
+                "/" not in default_repo and default_repo == repo.casefold()
+            ):
+                repo_matches.append(candidate)
+        if len(repo_matches) == 1:
+            _project_id_cache = repo_matches[0]["id"]
+            return _project_id_cache
+        if len(repo_matches) > 1:
+            names = ", ".join(
+                str(candidate.get("name") or candidate.get("id") or "?")
+                for candidate in repo_matches
+            )
+            print(
+                f"ERROR: default_repo {cfg.get('default_repo')!r} matches "
+                f"multiple projects: {names}. Set project_id in "
+                f"{CONFIG_FILE} or BLUEPRINT_PROJECT_ID explicitly.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    if len(projects) > 1:
+        names = ", ".join(
+            str(candidate.get("name") or candidate.get("id") or "?")
+            for candidate in projects
+        )
+        print(
+            "ERROR: no default project is configured and multiple projects are "
+            f"available: {names}. Set project_id in "
+            f"{CONFIG_FILE}, BLUEPRINT_PROJECT_ID, or pass --project-id.",
+            file=sys.stderr,
+        )
         sys.exit(1)
     _project_id_cache = projects[0]["id"]
     return _project_id_cache

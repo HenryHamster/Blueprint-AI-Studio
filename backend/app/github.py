@@ -1305,6 +1305,7 @@ from app.github_pulls import (  # noqa: F401
     REVIEWS_TRUNCATED,
     REVIEWS_FAILED,
     get_open_pull_requests,
+    get_open_pull_request_for_head_branch,
     get_pull_request_diff,
     get_pull_request_commits,
     merge_pull_request,

@@ -16,6 +16,59 @@ import pytest
 import blueprint
 import blueprint_api
 
+
+def test_get_project_id_matches_configured_default_repo(monkeypatch):
+    """Unscoped commands target the configured repo, not API list position."""
+    monkeypatch.delenv("BLUEPRINT_PROJECT_ID", raising=False)
+    monkeypatch.setattr(
+        blueprint_api,
+        "load_config",
+        lambda: {"default_repo": "HenryHamster/BlueprintAIStudio"},
+    )
+    monkeypatch.setattr(
+        blueprint_api,
+        "list_projects",
+        lambda: [
+            {
+                "id": "playground-id",
+                "name": "HenryHamster/playground",
+                "github_owner": "HenryHamster",
+                "github_repo": "playground",
+            },
+            {
+                "id": "blueprint-id",
+                "name": "Blueprint",
+                "github_owner": "HenryHamster",
+                "github_repo": "BlueprintAIStudio",
+            },
+        ],
+    )
+    monkeypatch.setattr(blueprint_api, "_project_id_cache", None)
+
+    assert blueprint_api.get_project_id() == "blueprint-id"
+
+
+def test_get_project_id_refuses_ambiguous_unconfigured_fallback(
+    monkeypatch, capsys
+):
+    """Multiple projects without a repo/id selection must never pick first."""
+    monkeypatch.delenv("BLUEPRINT_PROJECT_ID", raising=False)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {})
+    monkeypatch.setattr(
+        blueprint_api,
+        "list_projects",
+        lambda: [
+            {"id": "newest", "name": "Playground"},
+            {"id": "intended", "name": "Blueprint"},
+        ],
+    )
+    monkeypatch.setattr(blueprint_api, "_project_id_cache", None)
+
+    with pytest.raises(SystemExit):
+        blueprint_api.get_project_id()
+
+    assert "multiple projects" in capsys.readouterr().err.lower()
+
 # ── root wrapper existence and invocation tests ───────────────────────────────
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
