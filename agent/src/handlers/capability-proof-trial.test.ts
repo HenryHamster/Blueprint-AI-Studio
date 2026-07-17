@@ -1,4 +1,5 @@
-import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { afterEach, beforeEach, describe, it, expect, vi, type MockInstance } from 'vitest';
+import fs from 'fs';
 
 vi.mock('../index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../index.js')>();
@@ -30,6 +31,7 @@ import {
   handleCapabilityProofTrial,
   isRefSetTargetable,
   parseTrialSkippedSummary,
+  provisionNodeDepsForTrial,
 } from './capability-proof-trial.js';
 import { isDockerAvailable } from '../utils/test-runners.js';
 import { execFileAsync, persistAndPostStatus } from '../index.js';
@@ -263,5 +265,140 @@ describe('handleCapabilityProofTrial checkout provenance', () => {
     expect(result).toMatchObject({
       head_sha: null, queued_head_sha: 'queued-sha', ran: true, passed: true, could_not_run: false,
     });
+  });
+});
+
+describe('provisionNodeDepsForTrial', () => {
+  let existsSyncSpy: MockInstance;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    existsSyncSpy = vi.spyOn(fs, 'existsSync');
+  });
+
+  afterEach(() => {
+    existsSyncSpy.mockRestore();
+  });
+
+  it('runs npm ci when package-lock.json is present', async () => {
+    existsSyncSpy.mockImplementation((p: unknown) => {
+      const path = String(p);
+      if (path.endsWith('/package.json')) return true;
+      if (path.endsWith('/package-lock.json')) return true;
+      return false;
+    });
+    vi.mocked(execFileAsync).mockResolvedValueOnce('');
+
+    const ok = await provisionNodeDepsForTrial('/tmp/ws/agent', null, 'my-cap', 60_000);
+
+    expect(ok).toBe(true);
+    expect(execFileAsync).toHaveBeenCalledWith('npm', ['ci'], { cwd: '/tmp/ws/agent', timeoutMs: 60_000 });
+  });
+
+  it('runs pnpm install --frozen-lockfile when pnpm-lock.yaml is present', async () => {
+    existsSyncSpy.mockImplementation((p: unknown) => {
+      const path = String(p);
+      if (path.endsWith('/package.json')) return true;
+      if (path.endsWith('/pnpm-lock.yaml')) return true;
+      return false;
+    });
+    vi.mocked(execFileAsync).mockResolvedValueOnce('');
+
+    const ok = await provisionNodeDepsForTrial('/tmp/ws/agent', null, 'my-cap', 60_000);
+
+    expect(ok).toBe(true);
+    expect(execFileAsync).toHaveBeenCalledWith('pnpm', ['install', '--frozen-lockfile'], { cwd: '/tmp/ws/agent', timeoutMs: 60_000 });
+  });
+
+  it('returns false without running install when no package.json present', async () => {
+    existsSyncSpy.mockReturnValue(false);
+
+    const ok = await provisionNodeDepsForTrial('/tmp/ws/agent', null, 'my-cap', 60_000);
+
+    expect(ok).toBe(false);
+    expect(execFileAsync).not.toHaveBeenCalled();
+  });
+
+  it('returns false and does not throw when install fails (fail-open)', async () => {
+    existsSyncSpy.mockImplementation((p: unknown) => {
+      const path = String(p);
+      return path.endsWith('/package.json') || path.endsWith('/package-lock.json');
+    });
+    vi.mocked(execFileAsync).mockRejectedValueOnce(new Error('npm ci failed'));
+
+    const ok = await provisionNodeDepsForTrial('/tmp/ws/agent', null, 'my-cap', 60_000);
+
+    expect(ok).toBe(false);
+    // Confirms the error was caught (not re-thrown) — the trial can still proceed.
+  });
+});
+
+describe('handleCapabilityProofTrial TS/JS dependency provisioning', () => {
+  const tsPayload = {
+    cap: 'agent-diagnostics',
+    head_sha: 'abc-sha',
+    test_refs: ['agent/src/handlers/capability-proof-trial.test.ts'],
+  };
+  const statusRef = { value: '' };
+  let existsSyncSpy: MockInstance;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(prepareWorkspaceForRole).mockResolvedValue(undefined);
+    // Simulate: package.json exists but pnpm-lock.yaml and package-lock.json do not.
+    existsSyncSpy = vi.spyOn(fs, 'existsSync').mockImplementation((p: unknown) => {
+      const path = String(p);
+      return path.endsWith('/package.json');
+    });
+  });
+
+  afterEach(() => {
+    existsSyncSpy.mockRestore();
+  });
+
+  it('runs npm install before vitest for TS refs (no lockfile → bare npm install)', async () => {
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('abc-sha\n')  // git rev-parse HEAD
+      .mockResolvedValueOnce('')            // npm install (provisioning)
+      .mockResolvedValueOnce('1 passed\n'); // npx vitest run
+
+    await handleCapabilityProofTrial(
+      'task-ts-prov', tsPayload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+
+    const calls = vi.mocked(execFileAsync).mock.calls;
+    // Call 0: git rev-parse
+    expect(calls[0][0]).toBe('git');
+    // Call 1: npm install (provisioning)
+    expect(calls[1][0]).toBe('npm');
+    expect(calls[1][1]).toContain('install');
+    // Call 2: npx vitest
+    expect(calls[2][0]).toBe('npx');
+    expect(calls[2][1]).toContain('vitest');
+
+    const report = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const result = JSON.parse(report.logs as string) as Record<string, unknown>;
+    expect(result).toMatchObject({ ran: true, passed: true, could_not_run: false });
+  });
+
+  it('still runs vitest even when provisioning fails (fail-open)', async () => {
+    vi.mocked(execFileAsync)
+      .mockResolvedValueOnce('abc-sha\n')           // git rev-parse HEAD
+      .mockRejectedValueOnce(new Error('npm fail'))  // provisioning failure
+      .mockResolvedValueOnce('1 passed\n');           // npx vitest run
+
+    await handleCapabilityProofTrial(
+      'task-ts-prov-fail', tsPayload, {}, 'token', 'owner', 'repo', null, statusRef,
+    );
+
+    const calls = vi.mocked(execFileAsync).mock.calls;
+    expect(calls[0][0]).toBe('git');     // rev-parse
+    expect(calls[1][0]).toBe('npm');     // provision (failed)
+    expect(calls[2][0]).toBe('npx');     // vitest still ran
+
+    const report = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    const result = JSON.parse(report.logs as string) as Record<string, unknown>;
+    // Test runner succeeded despite provisioning failure
+    expect(result).toMatchObject({ ran: true, passed: true });
   });
 });

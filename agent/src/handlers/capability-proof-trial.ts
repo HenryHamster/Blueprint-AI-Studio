@@ -18,6 +18,7 @@
  * `could_not_run: true` and mints nothing — fully fail-open.
  */
 
+import fs from 'fs';
 import type WebSocket from 'ws';
 import {
   WORKSPACE, sanitize, sendLog, persistAndPostStatus, execFileAsync,
@@ -155,6 +156,47 @@ export function buildCapabilityProofTrialRunner(
   return { cmd: 'npx', args, cwd };
 }
 
+/**
+ * Detect and run the appropriate dependency-install command for a package dir
+ * before running vitest.  Mirrors `detectProvisioningSteps` in test-runners.ts
+ * for the targeted single-package case.
+ *
+ * Priority: pnpm-lock.yaml → `pnpm install --frozen-lockfile`,
+ *           package-lock.json → `npm ci`, bare package.json → `npm install`.
+ * Returns true on success, false when install failed or no package.json found.
+ * Never throws — a failed install degrades to could_not_run on a cold VM but
+ * does not prevent the attempt.
+ */
+export async function provisionNodeDepsForTrial(
+  pkgDir: string,
+  ws: WebSocket | null,
+  cap: string,
+  wallClockMs: number,
+): Promise<boolean> {
+  if (!fs.existsSync(`${pkgDir}/package.json`)) return false;
+
+  let cmd: string;
+  let args: string[];
+  if (fs.existsSync(`${pkgDir}/pnpm-lock.yaml`)) {
+    cmd = 'pnpm'; args = ['install', '--frozen-lockfile'];
+  } else if (fs.existsSync(`${pkgDir}/package-lock.json`)) {
+    cmd = 'npm'; args = ['ci'];
+  } else {
+    cmd = 'npm'; args = ['install'];
+  }
+
+  sendLog(ws, `Capability proof trial [${cap}]: ${cmd} ${args.join(' ')} (cwd=${pkgDir})\n`);
+  try {
+    await execFileAsync(cmd, args, { cwd: pkgDir, timeoutMs: wallClockMs });
+    sendLog(ws, `Capability proof trial [${cap}]: dependency install OK\n`);
+    return true;
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    sendLog(ws, `Capability proof trial [${cap}]: dependency install failed — ${msg.slice(0, 300)}\n`);
+    return false;
+  }
+}
+
 /** Best-effort pass/skip summary parsed from pytest / vitest output. Returns
  *  undefined when counts could not be reliably parsed — the backend then treats
  *  the run as verifying (it relies on the authoritative ran/passed flags), rather
@@ -255,6 +297,14 @@ export async function handleCapabilityProofTrial(
       ran: false, passed: false, could_not_run: true,
     });
     return;
+  }
+
+  // For TS/JS tests, provision committed dependencies before invoking vitest.
+  // Python tests use scripts/test-backend.sh which manages its own environment.
+  // Fail-open: an install failure is logged but never blocks the test attempt —
+  // on warm VMs node_modules survive git checkout so the run can still succeed.
+  if (runner.cmd === 'npx') {
+    await provisionNodeDepsForTrial(runner.cwd, ws, cap, wallClockMs);
   }
 
   statusRef.value = `Running covering tests for capability '${cap}'...`;
