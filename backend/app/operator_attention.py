@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
 from sqlmodel import select
 
-from app.message_convergence import OPEN_STATUS
+from app.message_convergence import OPEN_STATUS, derive_needs_action
 from app.acceptance_criteria import (
     UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
     get_criteria_for_version,
@@ -554,12 +554,8 @@ def _message_attention_item(message: ProjectMessage, *, unread: bool) -> dict[st
 
 
 def _message_needs_operator_attention(message: ProjectMessage) -> bool:
-    """Whether the canonical audience model marks this message actionable."""
-    context = message.context if isinstance(message.context, dict) else {}
-    return (
-        message.message_type in _NEEDS_OPERATOR_MESSAGE_TYPES
-        or context.get("audience") == OPERATOR_ACTION_NEEDED
-    )
+    """Whether this message needs operator attention — delegates to derive_needs_action."""
+    return derive_needs_action(message)
 
 
 def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str, Any]:
