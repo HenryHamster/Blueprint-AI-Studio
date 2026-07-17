@@ -4046,7 +4046,7 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
 
     project = await _project(db)
     # Two working capabilities: one unproven (no evidence_refs, no backing_paths),
-    # one proven.
+    # one proven via both evidence_refs and the platform ledger.
     project.problem_model = {
         "capabilities": [
             {
@@ -4066,7 +4066,14 @@ async def test_capability_proof_gate_gap_flags_unproven_working(db):
             },
         ]
     }
+    # Seed a platform ledger entry so consumer_gate_proof_status corroborates it.
+    project.capability_proof_records = {
+        "ci-integration": [
+            {"proof_kind": "named_test", "proven": True, "ref": "backend/app/ci.py"},
+        ]
+    }
     flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
     db.add(project)
     await db.commit()
 
@@ -4799,7 +4806,7 @@ async def test_capability_proof_gate_gap_proposes_backing_paths(db):
 
 @pytest.mark.asyncio
 async def test_capability_proof_gate_gap_ok_when_all_proven(db):
-    """All working capabilities with proven evidence produce an OK result."""
+    """All working capabilities with corroborated proof produce an OK result."""
     from sqlalchemy.orm.attributes import flag_modified
 
     project = await _project(db)
@@ -4812,7 +4819,14 @@ async def test_capability_proof_gate_gap_ok_when_all_proven(db):
             },
         ]
     }
+    # Seed a platform ledger entry so consumer_gate_proof_status corroborates it.
+    project.capability_proof_records = {
+        "repo-map": [
+            {"proof_kind": "named_test", "proven": True, "ref": "backend/app/x.py"},
+        ]
+    }
     flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
     db.add(project)
     await db.commit()
 
@@ -4826,6 +4840,161 @@ async def test_capability_proof_gate_gap_ok_when_all_proven(db):
     ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
     assert len(ok) == 1
     assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_exempt_not_flagged(db):
+    """A working capability with an operator-recorded platform exemption is NOT
+    counted in the gap delta — the enforce gate would clear it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "exempt-cap",
+                "status": "working",
+                "evidence_refs": [],  # no machine proof
+            },
+            {
+                "name": "non-exempt-cap",
+                "status": "working",
+                "evidence_refs": [],  # genuinely unproven
+            },
+        ]
+    }
+    # Operator-recorded exemption in the platform ledger.
+    project.capability_proof_records = {
+        "exempt-cap": [
+            {
+                "task_id": "operator:exempt-cap",
+                "proved_at": _utcnow().isoformat(),
+                "proof_kind": "operator_exemption",
+                "proof_ref": "exempt-cap",
+                "commit_sha": "",
+            }
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    f = flagged[0]
+    # The exempt cap is excluded from both total_working and delta.
+    # Only non-exempt-cap remains in the gap.
+    assert f.self_reported == 2  # total working including exempt
+    # exempt-cap grades proven via platform exemption → ground_truth = 1
+    assert f.ground_truth == 1
+    # delta = non-exempt-cap still needs proof
+    assert f.delta == 1
+    assert "non-exempt-cap" in f.detail
+    # Exempt must be mentioned in the detail.
+    assert "exempt" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_ledger_only_proof_not_flagged(db):
+    """A working capability whose platform ledger holds a proof entry but whose
+    problem_model evidence_refs append was lost is NOT flagged as a gap —
+    consumer_gate_proof_status folds the ledger proof up to proven."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "ledger-only-cap",
+                "status": "working",
+                "evidence_refs": [],  # problem_model evidence was lost
+            },
+        ]
+    }
+    # Platform ledger still holds the proof.
+    project.capability_proof_records = {
+        "ledger-only-cap": [
+            {
+                "task_id": "test:ledger-only-cap",
+                "proved_at": _utcnow().isoformat(),
+                "proof_kind": "named_test",
+                "proof_ref": "testing/test_foo.py",
+                "commit_sha": "a" * 40,
+            }
+        ]
+    }
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    # No flagged results — the ledger-only proof is recognized.
+    assert not any(r.flagged for r in results if r.subject == pid), (
+        f"expected no flagged result for ledger-only proof, got {results}"
+    )
+    ok = [r for r in results if r.subject == pid and r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+    assert ok[0].ground_truth == 1  # ledger-only cap is proven
+    assert ok[0].self_reported == 1
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_gap_unverified_proven_is_flagged(db):
+    """A working capability that self-declares ``proven`` via problem_model
+    evidence_refs but has NO platform ledger corroboration is demoted to
+    ``unverified`` by consumer_gate_proof_status and correctly counted in the
+    gap delta — the enforce gate would reject it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = await _project(db)
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "self-declared-cap",
+                "status": "working",
+                "evidence_refs": [{"proven": True, "ref": "backend/app/x.py"}],
+            },
+        ]
+    }
+    # NO capability_proof_records — the self-declared claim cannot be corroborated.
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_gap(ctx)
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, (
+        f"expected 1 flagged result for self-declared unverified cap, got {results}"
+    )
+    f = flagged[0]
+    assert f.self_reported == 1
+    # ground_truth = 0 because the self-declared claim is NOT corroborated
+    assert f.ground_truth == 0, (
+        f"ground_truth should be 0 (self-declared without ledger is unverified), "
+        f"got {f.ground_truth}"
+    )
+    assert f.delta == 1
+    # The detail should mention the capability name.
+    assert "self-declared-cap" in f.detail
 
 
 @pytest.mark.asyncio
@@ -5130,12 +5299,45 @@ def _set_auto_graduation_config(
     _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = enforce_threshold
 
 
+async def _seed_auto_graduation_deployment_state(db) -> None:
+    """Create the durable singleton required before a gate mode can advance."""
+    from app.models import DeploymentState
+
+    if await db.get(DeploymentState, 1) is None:
+        db.add(DeploymentState())
+        await db.commit()
+
+
 def _proven_ref(recorded_at: str | None = None) -> dict:
     """A minimal proven evidence_ref for a named_test."""
     ref = {"kind": "named_test", "ref": "testing/test_foo.py::test_bar", "proven": True}
     if recorded_at is not None:
         ref["recorded_at"] = recorded_at
     return ref
+
+
+def _set_machine_proof_records(
+    project, *names: str, proved_at: str | None = None
+) -> None:
+    """Corroborate test capabilities through the platform proof ledger."""
+    from app.capability_registry import normalize_capability_name
+
+    timestamp = proved_at or _utcnow().isoformat()
+    records = dict(project.capability_proof_records or {})
+    for raw_name in names:
+        name = normalize_capability_name(raw_name)
+        assert name is not None
+        records[name] = [
+            {
+                "task_id": f"proof:{name}",
+                "proof_kind": "named_test",
+                "proof_ref": f"testing/test_{name}.py::test_{name}",
+                "proved_at": timestamp,
+                "commit_sha": "a" * 40,
+            }
+        ]
+    project.capability_proof_records = records
+    flag_modified(project, "capability_proof_records")
 
 
 @pytest.mark.asyncio
@@ -5160,6 +5362,7 @@ async def test_auto_graduation_check_disabled_by_default(db):
 @pytest.mark.asyncio
 async def test_auto_graduation_already_at_enforce_is_noop(db):
     """When the gate is already at enforce, the check returns OK without advancing."""
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="enforce")
     ctx = SweepContext(
         session=db, now=_utcnow(), mode="observe", max_projects=25,
@@ -5176,6 +5379,7 @@ async def test_auto_graduation_already_at_enforce_is_noop(db):
 @pytest.mark.asyncio
 async def test_auto_graduation_skipped_when_no_projects(db):
     """When there are no projects, the check is SKIPPED."""
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off")
     ctx = SweepContext(
         session=db, now=_utcnow(), mode="observe", max_projects=25,
@@ -5208,10 +5412,12 @@ async def test_auto_graduation_off_to_observe(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5256,10 +5462,14 @@ async def test_auto_graduation_observe_to_enforce(db):
             },
         ]
     }
+    _set_machine_proof_records(
+        project, "repo-map", "ci-integration", proved_at=fresh
+    )
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="observe", enforce_threshold=0.95)
 
     ctx = SweepContext(
@@ -5307,6 +5517,7 @@ async def test_auto_graduation_no_advancement_below_threshold(db):
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.6)
 
     ctx = SweepContext(
@@ -5321,6 +5532,46 @@ async def test_auto_graduation_no_advancement_below_threshold(db):
     assert "below threshold" in r.detail
     # Gate must NOT advance.
     assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
+async def test_self_declared_proof_empty_ledger_cannot_advance_global_mode(db):
+    """A problem-model proof claim cannot inflate ledger-backed fleet coverage."""
+    project = await _project(db)
+    now = _utcnow()
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(now.isoformat())],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    db.add(project)
+    await db.commit()
+
+    coverage = await mis.compute_fleet_proof_coverage(db, max_projects=25, now=now)
+    assert coverage["total_non_exempt_working"] == 1
+    assert coverage["total_proven"] == 0
+    assert coverage["coverage_ratio"] == 0.0
+
+    await _seed_auto_graduation_deployment_state(db)
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+    assert results[0].status == CheckStatus.OK
+    assert _rc["capability_proof_gate_mode"] == "off"
 
 
 @pytest.mark.asyncio
@@ -5345,10 +5596,12 @@ async def test_auto_graduation_posts_operator_notification(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5390,10 +5643,12 @@ async def test_auto_graduation_notification_sent_for_each_contributing_project(d
     for _ in range(2):
         p = await _project(db)
         p.problem_model = {"capabilities": [cap]}
+        _set_machine_proof_records(p, "repo-map", proved_at=fresh)
         flag_modified(p, "problem_model")
         db.add(p)
     await db.commit()
 
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5)
 
     ctx = SweepContext(
@@ -5434,6 +5689,7 @@ async def test_auto_graduation_notification_skipped_when_no_advancement(db):
     await db.commit()
 
     # Coverage = 0.5, threshold = 0.8 → below threshold, no advancement.
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.8)
 
     ctx = SweepContext(
@@ -5551,6 +5807,7 @@ async def test_auto_graduation_fleet_coverage_stale_proof_counts_without_now(db)
             }
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=stale_ts)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5621,6 +5878,7 @@ async def test_compute_fleet_proof_coverage_trial_eligible_unproven(db):
             },
         ]
     }
+    _set_machine_proof_records(project, "Cap Proven")
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
@@ -5654,12 +5912,14 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
             {"name": "repo-map", "status": "working", "evidence_refs": [_proven_ref(fresh)]},
         ]
     }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
     flag_modified(project, "problem_model")
     db.add(project)
     await db.commit()
 
     # Both thresholds at 0.5 so 100% coverage triggers both — verifies the
     # code uses if/elif (one step) not two separate ifs (two steps).
+    await _seed_auto_graduation_deployment_state(db)
     _set_auto_graduation_config(mode="off", observe_threshold=0.5, enforce_threshold=0.5)
 
     ctx = SweepContext(
@@ -5680,6 +5940,164 @@ async def test_auto_graduation_advances_by_one_step_per_run(db):
     assert _rc.get("capability_proof_gate_mode") == "enforce"
     assert "observe" in results2[0].detail
     assert "enforce" in results2[0].detail
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_db_failure_leaves_in_memory_mode_unchanged(db):
+    """When the DB commit fails, in-memory mode must not be advanced.
+
+    The check should abort with an ERROR result and leave _rc unchanged so the
+    running process does not enforce a mode that was never durably committed.
+    """
+    from datetime import timedelta
+
+    from app.models import DeploymentState
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    # Create a DeploymentState row so the graduation code has a row to update.
+    dep_state = DeploymentState()
+    db.add(dep_state)
+    await db.commit()
+
+    await _seed_auto_graduation_deployment_state(db)
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+
+    # Use a proxy that delegates all ops to the real session but raises on the
+    # first commit call, avoiding AsyncMock/AsyncSession interaction quirks.
+    class _FailOnFirstCommit:
+        _commits = 0
+
+        def __init__(self, real):
+            object.__setattr__(self, "_real", real)
+            object.__setattr__(self, "_commits", 0)
+
+        def __getattr__(self, name):
+            return getattr(object.__getattribute__(self, "_real"), name)
+
+        async def commit(self):
+            c = object.__getattribute__(self, "_commits")
+            object.__setattr__(self, "_commits", c + 1)
+            if c == 0:
+                raise RuntimeError("simulated DB failure")
+            return await object.__getattribute__(self, "_real").commit()
+
+    fail_db = _FailOnFirstCommit(db)
+    ctx = SweepContext(
+        session=fail_db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    r = results[0]
+    # Must return ERROR, not FLAGGED, so the tick shows the failed advancement.
+    assert r.status == CheckStatus.ERROR
+    assert "off" in r.detail or "persist" in r.detail
+    # Critical invariant: in-memory mode must remain unchanged.
+    assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_missing_state_leaves_in_memory_mode_unchanged(db):
+    """A missing durable singleton must abort graduation without changing memory."""
+    from datetime import timedelta
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.ERROR
+    assert "deployment state is missing" in results[0].detail
+    assert _rc.get("capability_proof_gate_mode") == "off"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_notification_failure_does_not_rollback_mode(db):
+    """When notification posting fails, the already-committed mode must persist.
+
+    The gate advancement (DB + in-memory) is already durable; a notification
+    error must not undo the mode or report failure to the tick.
+    """
+    from datetime import timedelta
+    from unittest.mock import patch
+
+    project = await _project(db)
+    now = _utcnow()
+    fresh = (now - timedelta(days=1)).isoformat()
+
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "repo-map",
+                "status": "working",
+                "evidence_refs": [_proven_ref(fresh)],
+            },
+        ]
+    }
+    _set_machine_proof_records(project, "repo-map", proved_at=fresh)
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    await _seed_auto_graduation_deployment_state(db)
+    _set_auto_graduation_config(mode="off", observe_threshold=0.5)
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+
+    with patch(
+        "app.notification_dispatch.post_capability_proof_gate_graduated_message",
+        side_effect=RuntimeError("notification service down"),
+    ):
+        results = await mis.check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    r = results[0]
+    # Advancement still reported as FLAGGED (info).
+    assert r.status == CheckStatus.FLAGGED
+    assert "observe" in r.detail
+    # In-memory mode must still be advanced despite notification failure.
+    assert _rc.get("capability_proof_gate_mode") == "observe"
 
 
 # --- observe_mode_unverified_resolution ---------------------------------------

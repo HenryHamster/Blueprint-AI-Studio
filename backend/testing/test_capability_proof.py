@@ -34,6 +34,7 @@ from app.capability_proof import (
     carry_proof_records_for_consolidation,
     commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
+    resolve_no_backing_paths_gap,
     record_capability_backing_path_proof,
     record_capability_named_test_execution_proof,
     record_capability_named_test_proof,
@@ -43,10 +44,10 @@ from app.capability_proof import (
     should_record_capability_proof,
 )
 from app.capability_registry import (
-    _alias_to_survivor_map,
     _ledger_proof_status,
     capability_need_blocked_by_proof_gate,
     ledger_corroborated_proof_status,
+    platform_recorded_alias_map,
     registry_capability_evidence_refs_map,
     working_capability_proof_status,
 )
@@ -840,6 +841,24 @@ def _make_proof_entry(task_id: str, proof_ref: str = "test_foo.py") -> dict:
     }
 
 
+def _fwd_marker(survivor: str, absorbed: str) -> dict:
+    """A platform-authored consolidation forwarding marker, as written under an
+    absorbed capability's ledger key by ``carry_proof_records_for_consolidation``.
+
+    Only this platform record (never the agent-writable ``problem_model.absorbs``
+    field) establishes an absorbed→survivor alias edge for the authority seams.
+    """
+    return {
+        "task_id": f"absorbed_into:{absorbed}",
+        "proof_kind": "absorbed_into",
+        "survivor": survivor,
+        "absorbed": absorbed,
+        "proof_ref": survivor,
+        "proved_at": "2026-06-01T00:00:00",
+        "commit_sha": "",
+    }
+
+
 class TestCarryProofRecordsForConsolidation:
     def test_consolidation_carries_proof_records_to_survivor(self):
         """Absorbed entries are merged onto the survivor and their keys removed."""
@@ -854,10 +873,17 @@ class TestCarryProofRecordsForConsolidation:
 
         result = carry_proof_records_for_consolidation(consolidated, proof_records)
 
-        # Absorbed keys removed.
-        assert "old-cap-a" not in result
-        assert "old-cap-b" not in result
-        # Survivor now holds merged entries.
+        # Absorbed keys are REPLACED with a platform-authored forwarding marker
+        # (pointing at the survivor), not popped — so the platform-recorded alias
+        # map can still resolve a dependent naming the old name to the survivor.
+        for old in ("old-cap-a", "old-cap-b"):
+            assert len(result[old]) == 1
+            marker = result[old][0]
+            assert marker["proof_kind"] == "absorbed_into"
+            assert marker["survivor"] == "survivor-cap"
+            assert marker["absorbed"] == old
+        # Survivor now holds merged real entries (the forwarding markers are NOT
+        # merged onto the survivor as proof).
         assert "survivor-cap" in result
         task_ids = {e["task_id"] for e in result["survivor-cap"]}
         assert task_ids == {"task-s1", "task-a1", "task-a2", "task-b1"}
@@ -922,7 +948,9 @@ class TestCarryProofRecordsForConsolidation:
 
         result = carry_proof_records_for_consolidation(consolidated, proof_records)
 
-        assert "old-cap" not in result
+        # The absorbed key is replaced with a forwarding marker (not popped).
+        assert result["old-cap"][0]["proof_kind"] == "absorbed_into"
+        assert result["old-cap"][0]["survivor"] == "new-survivor"
         assert result["new-survivor"][0]["task_id"] == "task-x"
 
     def test_input_dict_not_mutated(self):
@@ -1677,7 +1705,15 @@ class TestCommissionProofEarnLoop:
     async def test_already_proven_cap_excluded(self):
         """A demanded capability that is already proven is excluded from earning."""
         project = MagicMock()
-        project.capability_proof_records = {}
+        project.capability_proof_records = {
+            "proven-cap": [
+                {
+                    "task_id": "platform:test:proven-cap",
+                    "proof_kind": "named_test",
+                    "proof_ref": "t1",
+                }
+            ]
+        }
         project.problem_model = {"capabilities": [
             {"name": "proven-cap", "status": "working",
              "evidence_refs": [{"proven": True, "ref": "t1", "source_id": "s1"}]},
@@ -2050,7 +2086,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "source": _exemption_source()},
         ]
     }
-    project.capability_proof_records = {}
+    project.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     async def _verify(p: str) -> bool:
         return True
@@ -2091,7 +2127,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "backing_paths": ["backend/app/main.py"]},
         ]
     }
-    project2.capability_proof_records = {}
+    project2.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     with patch("app.capability_proof.flag_modified"):
         result2 = asyncio.get_event_loop().run_until_complete(
@@ -2439,7 +2475,15 @@ async def test_earn_loop_demand_driven_intersection_and_proof():
     - the return summary reports earned, no_backing_paths, still_unproven correctly
     """
     project = MagicMock()
-    project.capability_proof_records = {}
+    project.capability_proof_records = {
+        "demanded-proven": [
+            {
+                "task_id": "platform:test:demanded-proven",
+                "proof_kind": "named_test",
+                "proof_ref": "test_demanded_proven",
+            }
+        ]
+    }
     problem_model = {
         "capabilities": [
             # demanded + unproven working + has backing_paths → WILL be earned
@@ -4263,39 +4307,32 @@ class TestLedgerCorroborationAliases:
     unblocked when the survivor has a ledger proof — while a forged claim on a
     non-absorbed name is never accidentally corroborated.
 
-    The alias map (:func:`_alias_to_survivor_map`) maps each absorbed canonical
-    name to its survivor. ``ledger_corroborated_proof_status`` retries the
-    survivor's ledger key when a direct lookup fails and the name appears in the
-    alias map.
+    The alias edge is PLATFORM-recorded: :func:`platform_recorded_alias_map` reads
+    the ``absorbed_into`` forwarding markers left in the ledger by a genuine
+    consolidation. It is NOT derived from the agent-writable ``problem_model.absorbs``
+    field — declaring ``absorbs`` alone never establishes an alias edge here.
+    ``ledger_corroborated_proof_status`` retries the survivor's ledger key when a
+    direct lookup fails and the name appears in the alias map.
     """
 
     def test_absorbed_alias_corroborated_through_survivor(self):
         """A blocked dependent that names an absorbed alias ``old-y`` clears when
-        the survivor ``survivor-x`` has a platform ledger proof — the alias is
-        retried against the survivor's ledger key."""
-        # ``working_capability_proof_status`` folds absorbed aliases, so
-        # ``old-y`` grades ``proven`` from the survivor's self-reported evidence_refs.
-        model = {
-            "capabilities": [
-                {
-                    "name": "survivor-x",
-                    "status": "working",
-                    "absorbs": ["old-y"],
-                    "evidence_refs": [
-                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
-                    ],
-                }
-            ]
-        }
-        # The platform ledger stores proof only under the SURVIVOR's name.
+        the survivor ``survivor-x`` has a platform ledger proof AND a forwarding
+        marker records the genuine consolidation — the alias is retried against the
+        survivor's ledger key."""
+        # The platform ledger stores proof under the SURVIVOR's name and a
+        # forwarding marker under the absorbed name (genuine consolidation).
         records = {
             "survivor-x": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
-            ]
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
         }
-        alias_map = _alias_to_survivor_map(model)
+        alias_map = platform_recorded_alias_map(records)
+        assert alias_map == {"old-y": "survivor-x"}
 
-        # Without alias_map: ``old-y`` is demoted to unverified (no direct entry).
+        # Without alias_map: ``old-y`` is demoted to unverified (its own ledger key
+        # holds only a forwarding marker, which is not machine proof).
         no_alias = ledger_corroborated_proof_status(
             {"old-y": "proven"}, records
         )
@@ -4342,28 +4379,40 @@ class TestLedgerCorroborationAliases:
             "the survivor must be corroborated through its absorbed alias's ledger key"
         )
 
-    def test_self_declared_non_absorbed_not_corroborated(self):
-        """A self-declared ``proven`` claim on a name NOT in the alias map is never
-        accidentally corroborated — even if the name coincidentally resembles an
-        alias that happens to have a survivor with a ledger entry."""
-        model = {
-            "capabilities": [
-                {
-                    "name": "survivor-x",
-                    "status": "working",
-                    "absorbs": ["real-y"],
-                    "evidence_refs": [],
-                }
-            ]
-        }
-        # ``forged-x`` is NOT absorbed by any survivor — it is a wholly separate,
-        # self-declared capability.
+    def test_declared_absorbs_without_marker_is_no_alias(self):
+        """An agent declaring ``absorbs`` with NO platform forwarding marker
+        establishes NO alias edge: the absorbed name is not corroborated through
+        the survivor's ledger. This is the insecure raw-``absorbs`` inheritance the
+        fix removes."""
+        # survivor-x has a real ledger proof, but there is NO forwarding marker for
+        # old-y — the agent merely declared ``absorbs: [old-y]`` in problem_model.
         records = {
             "survivor-x": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
             ]
         }
-        alias_map = _alias_to_survivor_map(model)
+        alias_map = platform_recorded_alias_map(records)
+        assert alias_map == {}, "a declared-only absorb leaves no platform alias edge"
+        corroborated = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records, alias_map=alias_map
+        )
+        assert corroborated["old-y"] == "unverified", (
+            "a declared-but-not-consolidated absorb must not inherit the survivor's proof"
+        )
+
+    def test_self_declared_non_absorbed_not_corroborated(self):
+        """A self-declared ``proven`` claim on a name NOT in the alias map is never
+        accidentally corroborated — even alongside a genuine consolidation of a
+        different name."""
+        # A genuine consolidation of ``real-y`` into ``survivor-x`` exists, but
+        # ``forged-x`` is a wholly separate self-declared capability outside it.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "real-y": [_fwd_marker("survivor-x", "real-y")],
+        }
+        alias_map = platform_recorded_alias_map(records)
         corroborated = ledger_corroborated_proof_status(
             {"forged-x": "proven"}, records, alias_map=alias_map
         )
@@ -4373,52 +4422,46 @@ class TestLedgerCorroborationAliases:
         )
         assert corroborated["forged-x"] == "unverified"
 
-    def test_alias_map_is_built_from_problem_model(self):
-        """``_alias_to_survivor_map`` correctly maps absorbed names to survivors."""
-        model = {
-            "capabilities": [
-                {
-                    "name": "alpha",
-                    "status": "working",
-                    "absorbs": ["old-alpha"],
-                },
-                {
-                    "name": "beta",
-                    "status": "working",
-                    "absorbs": ["old-beta-1", "old-beta-2"],
-                },
-                {
-                    "name": "gamma",
-                    "status": "working",
-                    # No absorbs.
-                },
-            ]
+    def test_alias_map_is_built_from_forwarding_markers(self):
+        """``platform_recorded_alias_map`` maps absorbed names to survivors from the
+        platform ledger's forwarding markers, resolving chains to the terminal
+        survivor."""
+        records = {
+            "alpha": [_make_proof_entry("A1")],
+            "old-alpha": [_fwd_marker("alpha", "old-alpha")],
+            "beta": [_make_proof_entry("B1")],
+            "old-beta-1": [_fwd_marker("beta", "old-beta-1")],
+            "old-beta-2": [_fwd_marker("beta", "old-beta-2")],
+            # Chained: gamma-old -> gamma-mid -> gamma (terminal survivor).
+            "gamma": [_make_proof_entry("G1")],
+            "gamma-mid": [_fwd_marker("gamma", "gamma-mid")],
+            "gamma-old": [_fwd_marker("gamma-mid", "gamma-old")],
         }
-        alias_map = _alias_to_survivor_map(model)
+        alias_map = platform_recorded_alias_map(records)
         assert alias_map["old-alpha"] == "alpha"
         assert alias_map["old-beta-1"] == "beta"
         assert alias_map["old-beta-2"] == "beta"
-        assert "gamma" not in alias_map, "a survivor is not its own alias"
+        assert alias_map["gamma-mid"] == "gamma"
+        assert alias_map["gamma-old"] == "gamma", "chained forwards resolve to terminal"
+        assert "alpha" not in alias_map, "a survivor is not its own alias"
 
-    def test_alias_map_empty_for_no_absorbs(self):
-        """A model with no ``absorbs`` anywhere returns ``{}``."""
-        model = {
-            "capabilities": [
-                {"name": "cap-a", "status": "working"},
-                {"name": "cap-b", "status": "working"},
-            ]
+    def test_alias_map_empty_for_no_markers(self):
+        """A ledger with only real proof entries (no forwarding markers) returns ``{}``."""
+        records = {
+            "cap-a": [_make_proof_entry("t1")],
+            "cap-b": [_make_proof_entry("t2")],
         }
-        assert _alias_to_survivor_map(model) == {}
+        assert platform_recorded_alias_map(records) == {}
 
-    def test_alias_map_empty_for_missing_model(self):
-        """A missing / empty model gracefully returns ``{}``."""
-        assert _alias_to_survivor_map({}) == {}
-        assert _alias_to_survivor_map(None) == {}
-        assert _alias_to_survivor_map({"capabilities": []}) == {}
+    def test_alias_map_empty_for_missing_records(self):
+        """A missing / empty / malformed ledger gracefully returns ``{}``."""
+        assert platform_recorded_alias_map({}) == {}
+        assert platform_recorded_alias_map(None) == {}
+        assert platform_recorded_alias_map({"cap-a": "junk"}) == {}
 
-    def test_consumer_gate_wires_alias_map(self):
-        """``consumer_gate_proof_status`` uses the alias map so a consumer seam
-        does not strand an absorbed alias."""
+    def test_consumer_gate_wires_platform_alias_map(self):
+        """``consumer_gate_proof_status`` resolves an absorbed alias through the
+        platform forwarding marker so a consumer seam does not strand it."""
         from app.capability_registry import consumer_gate_proof_status
 
         model = {
@@ -4430,16 +4473,200 @@ class TestLedgerCorroborationAliases:
                 }
             ]
         }
-        # Ledger has proof under the survivor's name, not the alias.
+        # Ledger has proof under the survivor's name AND a forwarding marker for the
+        # genuine consolidation of old-y.
         records = {
             "survivor-x": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
-            ]
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
         }
         gate = consumer_gate_proof_status(model, records)
         # The absorbed alias "old-y" must grade proven (survivor's ledger).
         assert gate["old-y"] == "proven"
         assert gate["survivor-x"] == "proven"
+
+    def test_consumer_gate_declared_absorbs_without_marker_stays_blocked(self):
+        """SECURITY: a survivor that merely DECLARES ``absorbs: [proven-cap]`` with
+        NO genuine consolidation inherits nothing — it stays blocked while the real
+        proven capability remains proven on its own."""
+        from app.capability_registry import consumer_gate_proof_status
+
+        model = {
+            "capabilities": [
+                # The genuinely proven capability, standing on its own.
+                {
+                    "name": "proven-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::p", "proven": True}
+                    ],
+                },
+                # The attacker: declares absorbs of the proven cap, no real proof.
+                {
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        records = {
+            "proven-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::p"}
+            ]
+            # No forwarding marker: no genuine consolidation happened.
+        }
+        gate = consumer_gate_proof_status(model, records)
+        assert gate["proven-cap"] == "proven", "the real capability stays proven"
+        assert gate["attacker-cap"] != "proven", (
+            "a declared-only absorb must NOT inherit the absorbed cap's proof"
+        )
+
+
+class TestAgentDeclaredAbsorbsDoesNotTransferPlatformAuthority:
+    """SECURITY (capability alias proof laundering): the agent-writable
+    ``problem_model.capabilities[].absorbs`` field must NOT transfer platform proof
+    or an operator exemption from an absorbed capability to the declaring survivor.
+
+    The trust boundary is the PLATFORM ledger: only a genuine, destructive
+    consolidation (a survivor absorbing a JUST-DELETED capability) leaves an
+    ``absorbed_into`` forwarding marker via ``carry_proof_records_for_consolidation``,
+    and only that marker binds an absorbed name to a survivor for the authority
+    seams. Declaring ``absorbs: [proven-or-exempt-name]`` without a real
+    consolidation binds nothing.
+    """
+
+    @staticmethod
+    def _release(problem_model, proof_records):
+        from app.capability_registry import capability_proof_gate_release_status
+
+        return capability_proof_gate_release_status(
+            problem_model, "enforce", proof_records
+        )
+
+    @staticmethod
+    def _consumer(problem_model, proof_records):
+        from app.capability_registry import consumer_gate_proof_status
+
+        return consumer_gate_proof_status(problem_model, proof_records)
+
+    def test_agent_declared_absorbs_does_not_transfer_platform_authority(self):
+        """The named acceptance proof for this fix.
+
+        (i)   An agent-declared ``absorbs`` of a PROVEN capability does NOT clear the
+              enforce gate for the declaring capability when no platform
+              consolidation/forwarding record exists.
+        (ii)  An agent-declared ``absorbs`` of an operator-EXEMPT capability does NOT
+              transfer the exemption.
+        (iii) A GENUINE consolidation (via ``carry_proof_records_for_consolidation``
+              producing a ``capabilities_consolidated`` forwarding record) STILL
+              clears the survivor AND STILL resolves a dependent that names the old
+              absorbed name.
+        """
+        # ── (i) declared absorbs of a PROVEN capability transfers NO proof ────────
+        proven_ledger = {
+            "proven-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::p"}
+            ]
+        }
+        attack_proof_model = {
+            "capabilities": [
+                {
+                    "name": "proven-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::p", "proven": True}
+                    ],
+                },
+                {
+                    # Attacker: no real proof, just declares it absorbs the proven cap.
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        blocked, detail = self._release(attack_proof_model, proven_ledger)
+        assert blocked is True, "the fake absorber must block promotion"
+        assert "attacker-cap" in detail["unproven"], (
+            f"attacker-cap must stay unproven; detail={detail}"
+        )
+        # The consumer gate agrees: attacker-cap does not grade proven.
+        gate = self._consumer(attack_proof_model, proven_ledger)
+        assert gate["attacker-cap"] != "proven"
+        assert gate["proven-cap"] == "proven", "the real capability is unaffected"
+
+        # ── (ii) declared absorbs of an EXEMPT capability transfers NO exemption ──
+        exempt_ledger = _platform_exemption_ledger("exempt-cap")
+        attack_exempt_model = {
+            "capabilities": [
+                {"name": "exempt-cap", "status": "working", "evidence_refs": []},
+                {
+                    "name": "greedy-cap",
+                    "status": "working",
+                    "absorbs": ["exempt-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        from app.capability_registry import exempt_capability_names
+
+        exempt_set = exempt_capability_names(attack_exempt_model, exempt_ledger)
+        assert "exempt-cap" in exempt_set, "the genuinely-exempt cap stays exempt"
+        assert "greedy-cap" not in exempt_set, (
+            "a declared-only absorb must NOT inherit the operator exemption"
+        )
+        blocked, detail = self._release(attack_exempt_model, exempt_ledger)
+        assert blocked is True, "the fake absorber of an exempt cap must block"
+        assert "greedy-cap" in detail["unproven"]
+        assert detail["exempt_cleared"] == ["exempt-cap"]
+
+        # ── (iii) a GENUINE consolidation still clears + forwards to the old name ──
+        # Start with a proof recorded under the old (to-be-absorbed) capability, then
+        # run the real consolidation carry: it moves the proof onto the survivor and
+        # leaves a forwarding marker under the old name.
+        pre_consolidation_ledger = {
+            "old-real-cap": [
+                {"task_id": "T9", "proof_kind": "named_test", "proof_ref": "t.py::r"}
+            ]
+        }
+        consolidated_ledger = carry_proof_records_for_consolidation(
+            [{"survivor": "surviving-cap", "absorbed": ["old-real-cap"]}],
+            pre_consolidation_ledger,
+        )
+        # The survivor now owns the real proof; the old key holds a forwarding marker.
+        assert any(
+            e["task_id"] == "T9" for e in consolidated_ledger["surviving-cap"]
+        )
+        assert consolidated_ledger["old-real-cap"][0]["proof_kind"] == "absorbed_into"
+
+        consolidated_model = {
+            "capabilities": [
+                {
+                    "name": "surviving-cap",
+                    "status": "working",
+                    "absorbs": ["old-real-cap"],
+                    # tier-1 append may be lost; the ledger is authoritative.
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::r", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # The survivor clears the release gate.
+        blocked, detail = self._release(consolidated_model, consolidated_ledger)
+        assert blocked is False, f"the genuine survivor must clear; detail={detail}"
+        assert detail["unproven"] == []
+        # And a dependent that still names the OLD absorbed capability resolves
+        # through the survivor's platform proof (consumer gate).
+        gate = self._consumer(consolidated_model, consolidated_ledger)
+        assert gate["old-real-cap"] == "proven", (
+            "a dependent naming the genuinely-absorbed old name must resolve through "
+            "the survivor's forwarded platform proof"
+        )
+        assert gate["surviving-cap"] == "proven"
 
 
 class TestReleaseQualifierAliases:
@@ -4472,10 +4699,13 @@ class TestReleaseQualifierAliases:
                 }
             ]
         }
+        # Genuine consolidation: proof under the survivor + a forwarding marker for
+        # the absorbed old-y. The platform-recorded alias resolves old-y here.
         records = {
             "survivor-x": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
-            ]
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
         }
         blocked, detail = self._status(model, records)
         assert blocked is False
@@ -4512,10 +4742,13 @@ class TestReleaseQualifierAliases:
                 },
             ]
         }
+        # real-cap genuinely consolidated old-y (forwarding marker present), but the
+        # release seam does NOT fold ledger upgrades, so real-cap/old-y stay unproven.
         records = {
             "real-cap": [
                 {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
-            ]
+            ],
+            "old-y": [_fwd_marker("real-cap", "old-y")],
         }
         blocked, detail = self._status(model, records)
         assert blocked is True
@@ -4523,13 +4756,13 @@ class TestReleaseQualifierAliases:
         assert "forged-cap" in detail["uncorroborated"], (
             "a forged name outside the alias map must not be corroborated"
         )
-        # real-cap and old-y are unproven in the base map (no evidence_refs) and
-        # NOT proven in the release gate (which does NOT fold ledger upgrades like
-        # consumer_gate_proof_status does), so they are in the unproven set only —
-        # they never reach the corroborated/uncorroborated distinction.
-        assert "real-cap" in detail["unproven"]
-        assert "old-y" in detail["unproven"]
-
+        # The release seam now folds platform-ledger upgrades just like the
+        # consumer seams. The genuine consolidation therefore proves real-cap and
+        # its forwarded alias, while the unrelated forged name remains blocked.
+        assert "real-cap" in detail["corroborated"]
+        assert "old-y" in detail["corroborated"]
+        assert "real-cap" not in detail["unproven"]
+        assert "old-y" not in detail["unproven"]
 
 class TestAuthorizedExemptionLedgerCarveOut:
     """Findings #2 + #9: WHO may authorize the one bypass of the machine-proof
@@ -4823,6 +5056,9 @@ class TestTaskBackedCapabilityProofGate:
         assert not self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
 
     def test_absorbed_alias_uses_canonical_proof_and_exemption(self):
+        """A dependent naming a GENUINELY-absorbed old name resolves through the
+        survivor's platform proof / exemption — via the forwarding marker, NOT the
+        agent-writable ``absorbs`` list."""
         from datetime import datetime, timedelta, timezone
         from app.capability_registry import build_operator_exemption_record
 
@@ -4837,18 +5073,56 @@ class TestTaskBackedCapabilityProofGate:
         }
         need = {"kind": "capability", "ref": "old-cap"}
         fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        # Genuine consolidation: proof under the survivor + forwarding marker for old-cap.
         assert not self._blocked(
             need,
-            {"surviving-cap": [{"proof_kind": "named_test", "proved_at": fresh}]},
+            {
+                "surviving-cap": [{"proof_kind": "named_test", "proved_at": fresh}],
+                "old-cap": [_fwd_marker("surviving-cap", "old-cap")],
+            },
             model,
         )
+        # And the survivor's operator exemption forwards to the old name too.
         assert not self._blocked(
             need,
             {
                 "surviving-cap": [
                     build_operator_exemption_record("surviving-cap", "operator")
-                ]
+                ],
+                "old-cap": [_fwd_marker("surviving-cap", "old-cap")],
             },
+            model,
+        )
+
+    def test_declared_absorbs_without_marker_does_not_transfer_to_task_gate(self):
+        """SECURITY: a need naming a capability that merely DECLARES ``absorbs:
+        [proven-cap]`` (no genuine consolidation / forwarding marker) stays blocked —
+        it inherits neither the absorbed cap's ledger proof nor its exemption."""
+        from datetime import datetime, timedelta, timezone
+        from app.capability_registry import build_operator_exemption_record
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                }
+            ]
+        }
+        need = {"kind": "capability", "ref": "attacker-cap"}
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        # proven-cap has a real ledger proof, but there is NO forwarding marker
+        # binding attacker-cap to it — only the agent's declared ``absorbs``.
+        assert self._blocked(
+            need,
+            {"proven-cap": [{"proof_kind": "named_test", "proved_at": fresh}]},
+            model,
+        )
+        # Likewise an operator exemption for proven-cap does not transfer.
+        assert self._blocked(
+            need,
+            {"proven-cap": [build_operator_exemption_record("proven-cap", "operator")]},
             model,
         )
 
@@ -5431,3 +5705,205 @@ class TestEarnLoopWithoutCheckout:
             "no local checkout present"
         )
         assert "prod-cap" in project.capability_proof_records
+
+
+# ── resolve_no_backing_paths_gap ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_without_discovery():
+    """A cap with no discoverable backing_paths returns unresolved."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _no_candidates(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_no_candidates,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "no-backing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["trial_enrolled"] is False
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_discovery_backing_path():
+    """A cap with discoverable candidates but no covering test records a
+    backing_path proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _no_test(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_no_test,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_backing_path_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_BACKING_PATH
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_named_test_present():
+    """A cap with discoverable candidates that are test-covered records a
+    named_test_present proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value=None,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_named_test_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+    assert result["named_test_earned"] is True
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_enrolled():
+    """A cap whose covering tests trigger trial enrollment returns
+    trial_enrolled=True."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="enrolled",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_enrolled"] is True
+    assert result["proof_kind"] is None
+    assert result["named_test_earned"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_fresh():
+    """A cap with a fresh executed proof already at HEAD returns trial_fresh."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="fresh",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_fresh"] is True
+    assert result["trial_enrolled"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_discovery_degrades_gracefully():
+    """A discovery failure degrades to unresolved (never raises)."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _raise_error(*_a, **_kw):
+        raise RuntimeError("transient discovery failure")
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_raise_error,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "failing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["discovery_suggestions"] == []

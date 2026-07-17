@@ -27,6 +27,7 @@ from app.capability_registry import (
     compose_capability_markers,
     exempt_capability_names,
     normalize_capability_name,
+    working_capability_proof_status,
 )
 from app.evidence_primitive import (
     KNOWN_PROOF_KINDS,
@@ -48,6 +49,7 @@ __all__ = [
     "record_capability_proof",
     "record_capability_proof_from_trial",
     "record_gap_evidence",
+    "resolve_no_backing_paths_gap",
     "revoke_stale_execution_proof",
     "should_record_capability_proof",
 ]
@@ -1294,6 +1296,35 @@ def record_gap_evidence(task: Any, project: Any) -> None:
         )
 
 
+def _absorption_forward_marker(
+    survivor_norm: str, abs_norm: str, proved_at: str
+) -> dict[str, Any]:
+    """Build the durable, PLATFORM-authored forwarding marker left under an absorbed
+    capability's ledger key after its real proof/exemption entries are moved onto
+    the survivor's key by :func:`carry_proof_records_for_consolidation`.
+
+    This marker is the trustworthy record of a GENUINE rename: it is written only
+    from the model-write consolidation path (which required the absorbed capability
+    to actually be deleted), never by an agent editing ``problem_model``. It carries
+    :data:`~app.capability_registry.CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND`, so every
+    machine-proof and exemption pass filters it out — it never itself becomes proof or
+    an exemption — and :func:`~app.capability_registry.platform_recorded_alias_map`
+    reads it to reconstruct the absorbed→survivor relationship the authority seams use
+    in place of the agent-writable ``absorbs`` field.
+    """
+    from app.capability_registry import CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND
+
+    return {
+        "task_id": f"absorbed_into:{abs_norm}",
+        "proof_kind": CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
+        "survivor": survivor_norm,
+        "absorbed": abs_norm,
+        "proof_ref": survivor_norm,
+        "proved_at": proved_at,
+        "commit_sha": "",
+    }
+
+
 def carry_proof_records_for_consolidation(
     capabilities_consolidated: list[dict[str, Any]],
     proof_records: dict[str, Any],
@@ -1302,14 +1333,30 @@ def carry_proof_records_for_consolidation(
 
     For each {survivor, absorbed[...]} consolidation event, all proof entries
     keyed under absorbed names are merged into the survivor's list, deduped by
-    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted), and
-    the absorbed keys are removed.
+    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted). Each
+    absorbed key is then REPLACED with a single platform-authored FORWARDING marker
+    (:func:`_absorption_forward_marker`) recording the survivor it merged into —
+    rather than being popped empty. Because this carry runs ONLY from the genuine,
+    destructive model-write consolidation path (the ``capabilities_consolidated``
+    diff, emitted only when a survivor's ``absorbs`` names a JUST-DELETED
+    capability), the marker is a trustworthy record of a real rename. The authority
+    seams read it via :func:`~app.capability_registry.platform_recorded_alias_map`
+    instead of the agent-writable ``problem_model.absorbs`` list, so a survivor's
+    proof/exemption forwards to the old name only after a genuine consolidation —
+    never because an agent merely declares ``absorbs: [proven-or-exempt-name]``.
+
+    A pre-existing forwarding marker under an absorbed key is NOT carried onto the
+    survivor as proof (it is not evidence of anything); only real proof/exemption
+    entries move.
 
     Returns a NEW dict — does not mutate the input.  Callers are responsible for
     flag_modified on the JSONB column after assigning the result.
     """
     if not capabilities_consolidated or not isinstance(proof_records, dict):
         return proof_records
+
+    from app.capability_registry import _entry_is_absorption_forward
+    from app.time_utils import _utcnow
 
     result = dict(proof_records)
     for event in capabilities_consolidated:
@@ -1325,19 +1372,32 @@ def carry_proof_records_for_consolidation(
 
         merged: list[dict[str, Any]] = list(result.get(survivor_norm) or [])
         seen_task_ids: set[str] = {e.get("task_id", "") for e in merged}
+        proved_at = _utcnow().isoformat()
 
         for abs_name in absorbed_names:
             abs_norm = normalize_capability_name(abs_name)
-            if not abs_norm:
+            # A self-referential absorb (survivor absorbs its own name) would corrupt
+            # the survivor's own ledger — skip it and never mark the survivor as
+            # forwarding to itself.
+            if not abs_norm or abs_norm == survivor_norm:
                 continue
             for entry in result.get(abs_norm) or []:
                 if not isinstance(entry, dict):
+                    continue
+                # A prior consolidation's forwarding marker is a pointer, not proof;
+                # do not launder it onto the survivor as an evidence entry.
+                if _entry_is_absorption_forward(entry):
                     continue
                 tid = entry.get("task_id", "")
                 if tid not in seen_task_ids:
                     merged.append(entry)
                     seen_task_ids.add(tid)
-            result.pop(abs_norm, None)
+            # Leave a durable forwarding marker under the absorbed key instead of
+            # popping it, so the platform-recorded alias map can resolve a dependent
+            # naming the old absorbed capability to the survivor's moved proof.
+            result[abs_norm] = [
+                _absorption_forward_marker(survivor_norm, abs_norm, proved_at)
+            ]
 
         if len(merged) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
             merged = merged[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
@@ -1799,6 +1859,156 @@ async def _discover_candidate_backing_paths(
     return verified
 
 
+async def resolve_no_backing_paths_gap(
+    cap_name: str,
+    *,
+    raw_name: str | None = None,
+    verify_path=None,
+    read_head=None,
+    session: Any = None,
+    read_head_sha=None,
+    now: Any = None,
+    project: Any = None,
+) -> dict[str, Any]:
+    """Attempt to resolve a proof gap for a working capability with no backing_paths.
+
+    Performs automated discovery of candidate backing paths by deriving search
+    tokens from the capability name and scanning the HEAD file tree. When
+    candidates are found:
+
+    * If a convention-named test file for EVERY candidate exists at HEAD and
+      imports it, a ``named_test_present`` proof is recorded (``path_proven``
+      tier).  Under the execution-trials flag an actual trial is enrolled instead,
+      earning the eventual ``proven`` tier.
+    * Otherwise, if candidates exist at HEAD but lack test coverage, a
+      ``backing_path`` proof is recorded (``path_proven`` tier).
+
+    When no candidates are found at all, returns ``resolved=False`` so the caller
+    can report the cap as needing manual backing-path assignment.
+
+    All IO callables are injectable so the function is unit-testable without a
+    git checkout. Never raises: any error degrades to ``{"resolved": False}``.
+
+    Returns
+    -------
+    A dict with the following keys:
+        resolved (bool): True when a proof was recorded (or trial enrolled).
+        proof_kind (str | None): ``"named_test_present"``, ``"backing_path"``,
+            or ``None`` when unresolved.
+        trial_enrolled (bool): True when an execution trial was enrolled.
+        named_test_earned (bool): True when a ``named_test_present`` proof was
+            recorded (as opposed to the ``backing_path`` fallback).
+        trial_fresh (bool): True when a fresh executed proof already covers HEAD.
+        discovery_suggestions (list[str]): Candidate paths discovered, if any.
+    """
+    from app.source_ref_validation import _path_exists_at_head
+
+    _verify = verify_path or _path_exists_at_head
+    _read_head = read_head or _read_file_at_head
+
+    try:
+        candidates = await _discover_candidate_backing_paths(
+            cap_name, verify_path=_verify,
+        )
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: discovery "
+            "failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        candidates = []
+
+    if not candidates:
+        return {
+            "resolved": False,
+            "proof_kind": None,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": [],
+        }
+
+    try:
+        test_refs = await _named_tests_covering_paths(
+            candidates, verify_path=_verify, read_head=_read_head
+        )
+    except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: named-test "
+            "discovery failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        test_refs = []
+
+    if test_refs:
+        trial_outcome = await _maybe_enroll_proof_trial(
+            session,
+            project,
+            raw_name or cap_name,
+            cap_name,
+            test_refs,
+            read_head_sha=read_head_sha,
+            now=now,
+        )
+        if trial_outcome == "enrolled":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": True,
+                "named_test_earned": False,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+        if trial_outcome == "fresh":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": False,
+                "named_test_earned": False,
+                "trial_fresh": True,
+                "discovery_suggestions": candidates,
+            }
+
+        recorded = record_capability_named_test_proof(
+            project, raw_name or cap_name, test_refs
+        )
+        if recorded:
+            return {
+                "resolved": True,
+                "proof_kind": _PROOF_KIND_NAMED_TEST_PRESENT,
+                "trial_enrolled": False,
+                "named_test_earned": True,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+
+    # Fallback: backing_path proof when candidates exist but no covering test.
+    recorded = record_capability_backing_path_proof(
+        project, raw_name or cap_name
+    )
+    if recorded:
+        return {
+            "resolved": True,
+            "proof_kind": _PROOF_KIND_BACKING_PATH,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": candidates,
+        }
+
+    # Dedup or recording failure — cap stays unresolved but suggestions exist.
+    return {
+        "resolved": False,
+        "proof_kind": None,
+        "trial_enrolled": False,
+        "named_test_earned": False,
+        "trial_fresh": False,
+        "discovery_suggestions": candidates,
+    }
+
+
 async def commission_proof_earn_loop(
     project: Any,
     demand_result: dict[str, Any],
@@ -1837,9 +2047,14 @@ async def commission_proof_earn_loop(
        (:func:`record_capability_backing_path_proof`, also ``path_proven``).
 
     3. For each demanded unproven capability that has NO ``backing_paths``:
-       no automated verification is possible — the gap is reported in the
-       return summary so callers (reaper sweeps, advisory hint builders) can
-       surface it.
+       automated discovery is attempted via :func:`resolve_no_backing_paths_gap`:
+       search tokens derived from the capability name locate candidate files at
+       HEAD; when candidates are found and a covering test exists, a
+       ``named_test_present`` (path_proven) proof is recorded (or an execution
+       trial enrolled); when candidates exist but lack test coverage, a
+       ``backing_path`` (path_proven) proof is recorded.  Caps that cannot be
+       auto-resolved (no discoverable candidates) are reported in the return
+       summary so callers can surface the gap.
 
     Parameters
     ----------
@@ -1916,8 +2131,74 @@ async def commission_proof_earn_loop(
 
     # Step 1: compute the intersection.
     demanded_unproven = compute_unproven_demanded_capabilities(
-        demand_result, problem_model
+        demand_result,
+        problem_model,
+        getattr(project, "capability_proof_records", None),
+        now=now,
     )
+    # A still-fresh executed proof can clear the ordinary proof gate while being
+    # bound to an older revision. Keep such demanded capabilities in the earn
+    # loop when execution trials are enabled so the cadence guard below can
+    # re-enroll them after HEAD moves (or the proof ages out). Without this
+    # revision-aware supplement, the initial gate-status intersection filters
+    # them out before _maybe_enroll_proof_trial can compare commit_sha to HEAD.
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _trials_enabled = bool(
+            session is not None
+            and (_rc or {}).get("capability_proof_execution_trials_enabled", False)
+        )
+    except Exception:  # noqa: BLE001 - optional trial path must degrade safely
+        _trials_enabled = False
+
+    if _trials_enabled:
+        _resolve_sha = read_head_sha or _default_read_head_sha
+        try:
+            _current_head_sha = await _resolve_sha()
+        except Exception:  # noqa: BLE001 - indeterminate HEAD permits re-verification
+            _current_head_sha = None
+
+        _records = getattr(project, "capability_proof_records", None)
+        _already = {
+            normalize_capability_name(entry.get("ref"))
+            for entry in demanded_unproven
+            if isinstance(entry, dict)
+        }
+        _working_names = set(
+            working_capability_proof_status(
+                problem_model, now=now, proof_records=_records
+            )
+        )
+        for _demand in (demand_result.get("demands") or []):
+            if not isinstance(_demand, dict) or _demand.get("kind") != "capability":
+                continue
+            _cap = normalize_capability_name(_demand.get("ref"))
+            if not _cap or _cap in _already or _cap not in _working_names:
+                continue
+            _entries = _records.get(_cap) if isinstance(_records, dict) else None
+            _has_revision_bound_proof = any(
+                isinstance(_entry, dict)
+                and (
+                    _entry.get("task_id") == f"named_test_exec:{_cap}"
+                    or (
+                        _entry.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+                        and isinstance(_entry.get("commit_sha"), str)
+                        and bool(_entry.get("commit_sha"))
+                    )
+                )
+                for _entry in (_entries or [])
+            )
+            if (
+                _has_revision_bound_proof
+                and not _fresh_executed_proof_covers_head(
+                    project, _cap, _current_head_sha, now=now
+                )
+            ):
+                _candidate = dict(_demand)
+                _candidate["proof_status"] = "revision_stale"
+                demanded_unproven.append(_candidate)
+                _already.add(_cap)
     if not demanded_unproven:
         return {
             "total_demanded_unproven": 0,
@@ -1929,10 +2210,12 @@ async def commission_proof_earn_loop(
             "named_test_executed": [],
         }
 
-    # Step 1b: defensive filter — skip exempt capabilities (they classify as
-    # "proven" via working_capability_proof_status, so they should never appear
-    # in demanded_unproven, but this is a belt-and-suspenders guard).
-    _exempt = exempt_capability_names(problem_model)
+    # Step 1b: defensive filter — skip platform-exempt capabilities (the
+    # authoritative grade already clears them, so they should never appear in
+    # demanded_unproven, but this is a belt-and-suspenders guard).
+    _exempt = exempt_capability_names(
+        problem_model, getattr(project, "capability_proof_records", None)
+    )
     if _exempt:
         demanded_unproven = [
             e
@@ -1982,7 +2265,25 @@ async def commission_proof_earn_loop(
 
         raw_name, backing_paths = cap_backing.get(canonical, (None, []))
         if not backing_paths:
-            no_backing_paths.append(canonical)
+            # Try automated discovery + auto-resolve for caps without backing_paths.
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                earned_names.append(canonical)
+                if gap_result.get("named_test_earned"):
+                    named_test_earned.append(canonical)
+                if gap_result.get("trial_enrolled"):
+                    named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Filter to file-like paths.
@@ -1991,7 +2292,26 @@ async def commission_proof_earn_loop(
             if isinstance(p, str) and _looks_like_file_path(p)
         ]
         if not file_paths:
-            no_backing_paths.append(canonical)
+            # Same discovery + auto-resolve for caps whose declared paths are
+            # not file-like (no automated verification possible from them).
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                earned_names.append(canonical)
+                if gap_result.get("named_test_earned"):
+                    named_test_earned.append(canonical)
+                if gap_result.get("trial_enrolled"):
+                    named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Verify every path at HEAD.  A single None (indeterminate) or False
