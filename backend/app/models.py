@@ -2473,6 +2473,7 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_task_status", "task_id", "status"),
         Index("ix_computejob_backend_external", "backend", "external_compute_id"),
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
+        Index("ix_computejob_status_completed_at", "status", "completed_at"),
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
         Index("ix_computejob_updated_at", "updated_at"),

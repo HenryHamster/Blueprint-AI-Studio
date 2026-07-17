@@ -1168,6 +1168,72 @@ async def sweep_expired_message_attachment_uploads(
     return removed
 
 
+async def sweep_retire_compute_job_viewable_files(
+    session,
+    *,
+    batch_size: int = 50,
+    timeout_seconds: float = 30.0,
+) -> int:
+    """Delete a bounded batch of individually-addressable viewable-media objects
+    whose owning compute job completed more than COMPUTE_JOB_VIEWABLE_RETIRE_DAYS
+    days ago (default 180).
+
+    For each selected ComputeJobFile the GCS object is deleted first; only rows
+    whose deletion succeeded are removed from the DB, keeping the index in sync
+    with storage.  A TimeoutError rolls back and returns 0 so the reaper loop
+    continues unblocked.
+    """
+    import os
+
+    retire_days = int(os.getenv("COMPUTE_JOB_VIEWABLE_RETIRE_DAYS", "180"))
+    horizon = _utcnow() - timedelta(days=retire_days)
+
+    from app.compute_jobs import _COMPUTE_JOB_TERMINAL_STATUSES
+
+    rows = (
+        await session.execute(
+            select(ComputeJobFile)
+            .join(ComputeJob, ComputeJobFile.compute_job_id == ComputeJob.id)
+            .where(
+                ComputeJob.status.in_(list(_COMPUTE_JOB_TERMINAL_STATUSES)),
+                ComputeJob.completed_at.is_not(None),
+                ComputeJob.completed_at < horizon,
+            )
+            .order_by(ComputeJob.completed_at.asc())
+            .limit(max(1, min(int(batch_size), 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not rows:
+        return 0
+    try:
+        deleted = await asyncio.wait_for(
+            asyncio.gather(
+                *(delete_storage_uri_best_effort(row.storage_uri) for row in rows)
+            ),
+            timeout=max(0.1, float(timeout_seconds)),
+        )
+    except TimeoutError:
+        await session.rollback()
+        logger.warning("[REAPER] Viewable-media retirement timed out")
+        return 0
+
+    removed = 0
+    for row, object_deleted in zip(rows, deleted, strict=True):
+        if object_deleted:
+            await session.delete(row)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Retired %d expired compute-job viewable-media file(s)",
+            removed,
+        )
+    else:
+        await session.rollback()
+    return removed
+
+
 async def sweep_evergreen_fill_decision_retention(
     session, *, retention_days: int = 30
 ) -> int:
