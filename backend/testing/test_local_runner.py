@@ -12233,6 +12233,39 @@ async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
     await db_session.refresh(project)
     assert cap not in (project.capability_proof_records or {})
     assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    await db_session.refresh(task)
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "test_refs_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_head_sha_is_rejected(db_session):
+    """A green receipt without the enrolled revision cannot mint a proof."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "missing-sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+
+    receipt_without_sha = {
+        "type": "capability_proof_trial", "cap": cap,
+        "test_refs": test_refs, "ran": True, "passed": True, "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(receipt_without_sha), db_session
+        )
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    assert cap not in (project.capability_proof_records or {})
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "head_sha_mismatch"
 
 
 @pytest.mark.asyncio
