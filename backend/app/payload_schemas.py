@@ -98,6 +98,14 @@ class BasePayload(BaseModel):
     effort: str | None = Field(default=None, pattern=r"^(low|medium|high|max)$")
     prompt_suffix: str | None = None
     title: str | None = None
+    requires_browser: bool = Field(
+        default=False,
+        description=(
+            "Route this task only to execution environments that explicitly prove "
+            "browser automation support. Local runners with absent or false proof "
+            "are ineligible and the task falls through to cloud dispatch."
+        ),
+    )
     required_diff_paths: list[str] | None = Field(
         default=None,
         description=(
