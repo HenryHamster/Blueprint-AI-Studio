@@ -34,6 +34,18 @@ try {
   HEAD_SHA = execSync('git rev-parse HEAD', { cwd: REPO_ROOT }).toString().trim();
 } catch (_) {}
 
+// Verify the SHA is real and reachable in this repo before writing any report.
+// Per the evidence-integrity contract: git cat-file -t <sha> must succeed.
+function verifyShaExists(sha) {
+  if (!sha || sha === 'unknown') return false;
+  try {
+    const type = execSync(`git cat-file -t ${sha}`, { cwd: REPO_ROOT }).toString().trim();
+    return type === 'commit';
+  } catch (_) {
+    return false;
+  }
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 
 const results = [];
@@ -733,6 +745,16 @@ async function main() {
 // ── Report writer ─────────────────────────────────────────────────────────────
 
 function writeReport(startTs, integrityResult) {
+  // SHA integrity gate: every SHA cited in the report must be a real, reachable commit.
+  // This prevents the fabricated-SHA class of failures (attempt-27 MEDIUM finding).
+  const shaValid = verifyShaExists(HEAD_SHA);
+  if (!shaValid) {
+    console.error(`\n[INTEGRITY ERROR] HEAD_SHA="${HEAD_SHA}" failed git cat-file -t check — report NOT written.`);
+    console.error('Fix: ensure git rev-parse HEAD succeeds in the repo root before running this script.');
+    process.exit(1);
+  }
+  console.log(`[INTEGRITY] SHA verified: git cat-file -t ${HEAD_SHA} = commit ✓`);
+
   const pass = results.filter(r => r.verdict === 'PASS').length;
   const fail = results.filter(r => r.verdict === 'FAIL').length;
   const dead = results.filter(r => r.verdict === 'DEAD_END').length;
