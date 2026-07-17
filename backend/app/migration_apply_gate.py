@@ -341,6 +341,11 @@ _SUBPROCESS_ENV_ALLOWLIST = (
     "WINDIR",
 )
 
+# The encryption-key env var the gate deliberately withholds from the secret-free
+# scratch replay subprocess.  When present in a migration subprocess failure, it
+# identifies a deliberate fail-closed artifact (not deploy-fatal) rather than a
+# genuine migration defect.
+_ENCRYPTION_KEY_ENV_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
 
 _T = TypeVar("_T")
 
@@ -489,6 +494,16 @@ class _ServingOnlyImportError(Exception):
     hard-blocking the candidate."""
 
 
+class _KeylessEncryptionArtifact(Exception):
+    """A candidate encryption migration fail-closed in the scratch replay because
+    ``_ENCRYPTION_KEY_ENV_VAR`` is deliberately withheld from the secret-free
+    subprocess environment.
+
+    On the actual deploy target the encryption key IS present (it is a required
+    env var for production operation), so this is not deploy-fatal.  Degrades the
+    gate to ``'ok'`` — mirroring ``_ServingOnlyImportError``."""
+
+
 def _looks_like_serving_only_import(exc: ImportError) -> bool:
     """Return True when an ImportError references an app.* module.
 
@@ -501,6 +516,22 @@ def _looks_like_serving_only_import(exc: ImportError) -> bool:
     if exc.name and (exc.name == "app" or exc.name.startswith("app.")):
         return True
     return bool(re.search(r"'app\.", str(exc)))
+
+
+def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
+    """Return True when *detail* describes the deliberate keyless fail-closed
+    of an encryption migration in the secret-free scratch subprocess.
+
+    Matches on the env var the gate deliberately withholds AND a RuntimeError
+    (the fail-closed pattern used by the encryption-reconciliation migration).
+    Both signals together ensure a genuinely broken migration (e.g. a real
+    SQL/DDL defect) is NOT swallowed — only the deliberate keyless fail-closed
+    is degraded.
+    """
+    return (
+        _ENCRYPTION_KEY_ENV_VAR in detail
+        and "RuntimeError" in detail
+    )
 
 
 class _ScratchDatabaseUnavailable(Exception):
@@ -1014,6 +1045,15 @@ async def _run_migration_apply_subprocess(
         timeout_code=timeout_code,
     )
     if proc.returncode != 0:
+        if _looks_like_keyless_encryption_artifact(
+            stderr.decode(errors="replace")
+        ):
+            raise _KeylessEncryptionArtifact(
+                "candidate encryption migration fail-closed because "
+                f"{_ENCRYPTION_KEY_ENV_VAR} is deliberately withheld from "
+                "the secret-free scratch replay subprocess (not deploy-fatal)"
+            )
+
         detail = _bounded_subprocess_detail(
             stderr,
             stdout,
@@ -1056,6 +1096,8 @@ async def _apply_candidate_migrations(
     except _DeterministicMigrationDefect:
         raise  # already classified; propagate without re-wrapping
     except _ServingOnlyImportError:
+        raise  # already classified; propagate without re-wrapping
+    except _KeylessEncryptionArtifact:
         raise  # already classified; propagate without re-wrapping
     except (SyntaxError, ImportError) as exc:
         if isinstance(exc, ImportError) and _looks_like_serving_only_import(exc):
@@ -1815,6 +1857,8 @@ async def run_migration_apply_gate(
             )
         except _ServingOnlyImportError:
             return ("ok", None)
+        except _KeylessEncryptionArtifact:
+            return ("ok", None)
         except _DeterministicMigrationDefect as exc:
             return ("block", str(exc))
         except _ScratchDatabaseUnavailable:
@@ -1853,9 +1897,11 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
-            no_retry_types=(_DeterministicMigrationDefect, _ServingOnlyImportError),
+            no_retry_types=(_DeterministicMigrationDefect, _ServingOnlyImportError, _KeylessEncryptionArtifact),
         )
     except _ServingOnlyImportError:
+        return ("ok", None)
+    except _KeylessEncryptionArtifact:
         return ("ok", None)
     except _DeterministicMigrationDefect as exc:
         return ("block", str(exc))

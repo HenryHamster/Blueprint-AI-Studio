@@ -2243,3 +2243,149 @@ async def test_candidate_only_app_symbol_import_degrades_not_blocks(monkeypatch)
     assert apply_call_count == 1, (
         f"serving-only import retried {apply_call_count} time(s); must degrade on first attempt"
     )
+
+
+# --- Keyless-encryption artifact degrade (runs everywhere) --------------------
+#
+# Migration 0609 fail-closes with RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is
+# absent.  The scratch subprocess intentionally withholds this key, so 0609
+# ALWAYS fails in the replay.  The artifact must degrade to ('ok', None) —
+# mirroring _ServingOnlyImportError — rather than deferring forever.
+
+
+def test_looks_like_keyless_encryption_artifact():
+    """The predicate helper must identify the deliberate keyless fail-closed
+    artifact and reject unrelated migration failures."""
+    import app.migration_apply_gate as gate_mod
+
+    # True positive: the error message from migration 0609 when the encryption
+    # key is deliberately withheld in the scratch subprocess.
+    fail_closed_detail = (
+        "Traceback (most recent call last):\n"
+        "  ...\n"
+        "RuntimeError: Migration 0609 requires GITHUB_PAT_ENCRYPTION_KEY "
+        "to be set to the live Fernet key before encrypted-column "
+        "reconciliation; ALLOW_PLAINTEXT_CREDENTIALS does not permit "
+        "this migration to stamp."
+    )
+    assert gate_mod._looks_like_keyless_encryption_artifact(fail_closed_detail), (
+        "must identify the deliberate keyless fail-closed artifact"
+    )
+
+    # False positive: an unrelated RuntimeError that does NOT reference the
+    # withheld env var — a genuinely broken migration must NOT be degraded.
+    unrelated_runtime_error = (
+        "RuntimeError: could not connect to the database server: "
+        "connection refused"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(unrelated_runtime_error), (
+        "must NOT swallow an unrelated RuntimeError"
+    )
+
+    # False positive: a mention of the env var WITHOUT a RuntimeError (e.g. a
+    # log line that happens to name the var, or a different exception type).
+    env_var_mention = (
+        "psycopg.errors.NotNullViolation: GITHUB_PAT_ENCRYPTION_KEY "
+        "column violates not-null constraint"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(env_var_mention), (
+        "must NOT match the env var name alone without a RuntimeError"
+    )
+
+    # False positive: a bare non-RuntimeError migration failure with no env-var
+    # reference — the most common case for a genuinely broken migration.
+    sql_defect_detail = (
+        "psycopg.errors.UndefinedTable: relation \"widget\" does not exist\n"
+        "LINE 1: INSERT INTO widget (id) VALUES (1)"
+    )
+    assert not gate_mod._looks_like_keyless_encryption_artifact(sql_defect_detail), (
+        "must NOT swallow a genuine SQL defect with no env-var reference"
+    )
+
+
+@pytest.mark.asyncio
+async def test_keyless_encryption_migration_replay_degrades_not_defers(monkeypatch):
+    """The keyless-encryption fail-closed artifact in the scratch subprocess
+    must degrade to ``('ok', None)`` — mirroring ``_ServingOnlyImportError`` —
+    so qualification is not permanently wedged when the gate deliberately
+    withholds GITHUB_PAT_ENCRYPTION_KEY from the secret-free replay.
+
+    This exercises ``_KeylessEncryptionArtifact``, its no-retry classification,
+    and the ``except _KeylessEncryptionArtifact`` handler in
+    ``run_migration_apply_gate`` that returns ``("ok", None)``.
+    """
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    apply_call_count = 0
+
+    async def _keyless_encryption_artifact_apply(
+        scratch_engine, candidate_sources, **kwargs
+    ):
+        nonlocal apply_call_count
+        apply_call_count += 1
+        # Mirrors the error raised when migration 0609 fail-closes because the
+        # gate deliberately withholds GITHUB_PAT_ENCRYPTION_KEY from the scratch
+        # subprocess environment.
+        raise gate_mod._KeylessEncryptionArtifact(
+            "candidate encryption migration fail-closed because "
+            "GITHUB_PAT_ENCRYPTION_KEY is deliberately withheld from "
+            "the secret-free scratch replay subprocess (not deploy-fatal)"
+        )
+
+    monkeypatch.setattr(
+        gate_mod, "_apply_candidate_migrations", _keyless_encryption_artifact_apply
+    )
+
+    engine = create_async_engine(
+        "postgresql+asyncpg://prod_user:secret@prod-db:5432/proddb"
+    )
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={
+                "a01_init.py": _MIG_A01,
+                "0609_encrypt.py": (
+                    "revision='0609'\ndown_revision='a01'\n"
+                    "def upgrade():\n"
+                    "    import os\n"
+                    "    key = os.environ.get('GITHUB_PAT_ENCRYPTION_KEY')\n"
+                    "    if not key:\n"
+                    "        raise RuntimeError('requires GITHUB_PAT_ENCRYPTION_KEY')\n"
+                    "def downgrade(): pass\n"
+                ),
+            },
+            required_metadata=prod_meta,
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", (
+        f"expected 'ok' for keyless-encryption artifact, got {verdict!r}: {detail}"
+    )
+    assert apply_call_count == 1, (
+        f"keyless-encryption artifact retried {apply_call_count} time(s); "
+        "must degrade on first attempt"
+    )
