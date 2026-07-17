@@ -4,6 +4,7 @@ import type {
   StrategicContextArtifactViewablePreview,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
+  StrategicContextDescriptorChartPoint,
   StrategicContextRenderableDescriptor,
 } from '../strategicStateApi';
 import { resolveArtifactDownloadUrl } from '../api';
@@ -585,6 +586,34 @@ function DetailValue({
   );
 }
 
+/** A compact SVG polyline sparkline for time-series chart descriptors.
+ *
+ *  Mirrors the sparkline pattern from ComputeJobsPanel.tsx (80×20 viewBox,
+ *  normalized Y range, cyan stroke) adapted for the strategic-canvas
+ *  descriptor card.  Points are drawn in order; x-axis is the ordinal index,
+ *  y-axis is auto-scaled to the min/max of the values. */
+function LineChart({ points }: { points: StrategicContextDescriptorChartPoint[] }) {
+  if (points.length === 0) return null;
+  const vals = points.map(p => Math.abs(p.value));
+  const minVal = Math.min(...vals);
+  const maxVal = Math.max(...vals);
+  const range = maxVal - minVal || 1;
+  const W = 80;
+  const H = 20;
+  const polyPoints = vals
+    .map((v, i) => {
+      const x = vals.length === 1 ? W / 2 : (i / (vals.length - 1)) * W;
+      const y = H - ((v - minVal) / range) * H;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(' ');
+  return (
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} className="w-full overflow-visible" aria-hidden="true">
+      <polyline points={polyPoints} fill="none" stroke="#38bdf8" strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function DescriptorCard({
   descriptor,
   onOpenTarget,
@@ -761,7 +790,18 @@ function DescriptorCard({
 
       {(descriptor.kind === 'chart' || descriptor.kind === 'plot') && (
         <div className="mt-2 space-y-1.5 rounded border border-neutral-800 bg-neutral-950/45 p-2">
-          {chartPoints.length > 0 ? chartPoints.slice(0, 6).map(point => {
+          {descriptor.chart?.kind === 'line' && chartPoints.length > 0 ? (
+            <div className="space-y-1">
+              {(descriptor.chart?.y_label || descriptor.chart?.x_label) && (
+                <div className="flex items-center gap-1.5 text-ui-sm font-mono text-neutral-500">
+                  {descriptor.chart.y_label && <span>{descriptor.chart.y_label}</span>}
+                  <span className="text-neutral-300">{formatCompactNumber(chartPoints[chartPoints.length - 1].value)}</span>
+                  <span className="text-neutral-600">({chartPoints.length} samples)</span>
+                </div>
+              )}
+              <LineChart points={chartPoints} />
+            </div>
+          ) : chartPoints.length > 0 ? chartPoints.slice(0, 6).map(point => {
             const pct = Math.max(2, Math.round((Math.abs(point.value) / maxChartValue) * 100));
             return (
               <div key={`${descriptor.id}:${point.label}`} className="grid min-w-0 grid-cols-[5.5rem_minmax(0,1fr)_3rem] items-center gap-2 text-xs">
