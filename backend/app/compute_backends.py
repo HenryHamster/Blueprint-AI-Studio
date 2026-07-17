@@ -4798,6 +4798,107 @@ async def resolve_project_default_container_image(
         return None
 
 
+async def resolve_project_baked_image_strict(
+    session: Any,
+    project: Any,
+) -> tuple[str | None, str | None]:
+    """Resolve a project's declared baked compute image — fail CLOSED on unresolvable.
+
+    Returns ``(pinned_ref, None)`` when the project's manifest declares
+    ``compute.image.name`` AND a ``ProjectComputeImage`` row exists with
+    ``built=True`` and a non-null ``digest``.
+
+    Returns ``(None, None)`` when the project declares NO baked image (no
+    manifest, manifest error, or no ``compute.image.name`` key) — the caller
+    must preserve image-less behavior, identical to today.
+
+    Returns ``(None, reason)`` when the project declares a baked image name but
+    no resolved, digest-pinned build record can be found — the caller MUST
+    terminal-fail the dispatch with the returned reason rather than silently
+    running image-less on the host toolchain.
+
+    Unlike :func:`resolve_project_default_container_image` (which is
+    fail-OPEN and used at authoring time), this function is used at dispatch
+    time where the baked-image isolation contract must be enforced: running a
+    declared-but-unbuilt image on the host toolchain is a reproducibility and
+    isolation failure that must surface to the operator.
+    """
+    if project is None:
+        return None, None
+    try:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        manifest = await _discover_manifest_tools(project)
+        compute_image = (manifest.get("compute") or {}).get("image") or {}
+        name = compute_image.get("name") if isinstance(compute_image, dict) else None
+        if not name:
+            return None, None
+    except Exception:  # noqa: BLE001 — no manifest means no image declared
+        logger.debug(
+            "[COMPUTE] manifest fetch failed for project=%s; treating as no baked image",
+            getattr(project, "id", None),
+        )
+        return None, None
+
+    # Image is declared — resolve to a built, digest-pinned record or fail closed.
+    if "@sha256:" in name:
+        # Already content-addressed; accept as-is (no build record needed).
+        return name, None
+
+    registry_repo, image_name, ref_tag = _split_image_ref(name)
+
+    try:
+        from sqlalchemy import select
+
+        conditions = [
+            ProjectComputeImage.project_id == project.id,
+            ProjectComputeImage.image_name == image_name,
+            ProjectComputeImage.built.is_(True),
+            ProjectComputeImage.digest.is_not(None),
+        ]
+        if registry_repo:
+            conditions.append(ProjectComputeImage.registry_repo == registry_repo)
+
+        row = None
+        if ref_tag:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions, ProjectComputeImage.tag == ref_tag)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+        if row is None:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001
+        reason = (
+            f"Project declares baked compute image '{name}' but the build-record "
+            f"lookup failed: {exc} — refusing to run image-less on host toolchain"
+        )
+        logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+        return None, reason
+
+    if row is not None and row.pinned_ref:
+        return row.pinned_ref, None
+
+    reason = (
+        f"Project declares baked compute image '{name}' but no built, "
+        "digest-pinned build record exists — image has not been built yet or the "
+        "build failed; refusing to run image-less on host toolchain"
+    )
+    logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+    return None, reason
+
+
 def resolve_compute_image_registry_repo() -> str:
     """Return the Artifact Registry repo base for compute images.
 

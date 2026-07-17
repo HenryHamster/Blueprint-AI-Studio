@@ -1828,13 +1828,19 @@ async def _dispatch_compute_experiment_directly(
     # image-less behavior (helper returns None).
     resolved_default_container_image: str | None = None
     if not container_image:
-        from app.compute_backends import resolve_project_default_container_image
+        from app.compute_backends import resolve_project_baked_image_strict
 
-        resolved_default_container_image = (
-            await resolve_project_default_container_image(
-                session, await session.get(Project, task.project_id)
-            )
+        project = await session.get(Project, task.project_id)
+        resolved_default_container_image, image_error = (
+            await resolve_project_baked_image_strict(session, project)
         )
+        if image_error is not None:
+            return await _fail_compute_experiment_task(
+                session,
+                task,
+                "baked_image_unresolvable",
+                image_error,
+            )
         if resolved_default_container_image:
             container_image = resolved_default_container_image
     # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
