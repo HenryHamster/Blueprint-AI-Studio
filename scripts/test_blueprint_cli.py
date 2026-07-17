@@ -1995,6 +1995,48 @@ def test_tasks_cancel_requeue_guards(mock_api, monkeypatch, capsys):
     )
 
 
+def test_tasks_requeue_guidance_is_sent_atomically(mock_api, monkeypatch):
+    """--guidance travels in the same PATCH that makes the task dispatchable."""
+    monkeypatch.setattr(
+        blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"}
+    )
+    monkeypatch.setattr(
+        blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"}
+    )
+    mock_api.clear()
+
+    blueprint.main(
+        [
+            "tasks",
+            "requeue",
+            "task-123",
+            "--yes",
+            "--guidance",
+            "  Do not renumber the migration.  ",
+        ]
+    )
+
+    assert any(
+        method == "PATCH"
+        and "/tasks/task-123" in path
+        and body
+        == {
+            "status": "QUEUED",
+            "requeue_prompt_suffix": "Do not renumber the migration.",
+        }
+        for method, path, body in mock_api
+    )
+
+
+def test_tasks_requeue_rejects_empty_guidance_before_api(mock_api, monkeypatch):
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_key": "y"})
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint.main(["tasks", "requeue", "task-123", "--yes", "--guidance", " "])
+    assert exc_info.value.code == 2
+    assert mock_api == []
+
+
 def test_tasks_failures_json(mock_api, capsys):
     """tasks failures --json groups by cause bucket with correct counts."""
     rc = blueprint.main(["--json", "tasks", "failures"])

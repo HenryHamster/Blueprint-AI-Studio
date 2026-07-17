@@ -1502,6 +1502,14 @@ Maximum 5 responses per iteration.  Skip writing the file entirely if every issu
     }
   }
 
+  // Fix tasks assemble their prompt independently of the standard handler.
+  // Keep the backend-supplied suffix last so manual retry guidance is actually
+  // delivered and can explicitly correct a stale original fix premise.
+  if (payload.prompt_suffix) {
+    enrichedPrompt =
+      `${enrichedPrompt}\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}`;
+  }
+
   // Run Claude with the review feedback as the prompt
   const fixTelemetry = buildPromptSizeTelemetry(enrichedPrompt, [
     ['claude_md', fixClaudeMd],
