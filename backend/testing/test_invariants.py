@@ -10792,6 +10792,14 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "release_qualifier.py:run_qualification",
         "release_qualifier.py:_guard_ci_unresolved_promotion_in_flight",
         "release_qualifier.py:force_promote_current_version",
+        # Hotfix-promote pins the candidate SHA it deploys (integration HEAD) and
+        # the prior-deployed SHA (promotion-target HEAD, the diff base + audit
+        # field) — both are SHA-critical live reads, same as force_promote above.
+        "release_hotfix_promotion.py:hotfix_promote_current_version",
+        # The scope preview mirrors hotfix_promote_current_version's SHA reads
+        # exactly (same live=True for both integration HEAD and promotion-target
+        # HEAD) — the diff is meaningless if the SHAs are stale.
+        "release_hotfix_promotion.py:check_hotfix_scope_preview",
         "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
         "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
         "release_reconciliation.py:_reconcile_if_pending_auto_merge_landed",
@@ -10800,6 +10808,10 @@ _LIVE_REF_READ_ALLOWLIST = frozenset(
         "strategic_spawning.py:_spawn_strategic_review",
         "task_completion.py:_ensure_branch",
         "rollup_management.py:_check_and_trigger_rollup",
+        # Size-cap remediation reads a mutable PR branch, derives a tree update,
+        # then writes it under an expected-head lease. Cached tips would defeat
+        # the compare-and-swap and can recreate the empty-commit loop.
+        "rollup_size_preflight.py:preflight_rollup_size_caps",
     }
 )
 

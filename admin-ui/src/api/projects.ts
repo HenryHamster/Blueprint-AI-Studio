@@ -219,6 +219,8 @@ export interface CompletionDebtQualSnapshot {
 }
 
 export type QualificationStatus =
+  | 'pending'
+  | 'qualifying'
   | 'not_promoted'
   | 'dry_run'
   | 'cached_verdict'

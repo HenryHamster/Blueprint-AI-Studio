@@ -55,6 +55,35 @@ _ANALYSIS_ARTIFACT_KEYS = (
     ("_analysis_plan", "_previous_analysis_plan"),
 )
 
+_OPERATOR_RETRY_GUIDANCE_HEADING = "## Operator retry guidance"
+
+
+def materialize_operator_retry_guidance(payload: dict, guidance: str) -> None:
+    """Persist the latest operator retry instruction in the delivered payload.
+
+    ``context['_original_prompt_suffix']`` is an internal dedup snapshot, not an
+    agent-facing prompt field. Manual retries therefore use this helper to put
+    guidance in ``payload.prompt_suffix`` -- the field rendered by handlers.
+    The prior operator block is replaced (not stacked), while every non-operator
+    suffix supplied when the task was spawned is preserved verbatim.
+    """
+    guidance = guidance.strip()
+    previous = payload.get("operator_retry_guidance")
+    existing = payload.get("prompt_suffix")
+    existing = existing if isinstance(existing, str) else ""
+
+    if isinstance(previous, str) and previous.strip():
+        previous_block = f"{_OPERATOR_RETRY_GUIDANCE_HEADING}\n{previous.strip()}"
+        # Defensive loop for rows written during an earlier duplicate retry.
+        while previous_block in existing:
+            existing = existing.replace(previous_block, "", 1).strip()
+
+    current_block = f"{_OPERATOR_RETRY_GUIDANCE_HEADING}\n{guidance}"
+    payload["operator_retry_guidance"] = guidance
+    payload["prompt_suffix"] = (
+        f"{existing.rstrip()}\n\n{current_block}" if existing.strip() else current_block
+    )
+
 
 def _extract_failing_tests(text: str) -> list[str]:
     """Extract up to 10 failing test identifiers from error output.

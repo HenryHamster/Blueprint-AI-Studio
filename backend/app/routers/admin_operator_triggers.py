@@ -349,6 +349,7 @@ async def trigger_force_promote(
         project_id,
         candidate_sha=_body.candidate_sha,
         actor=str(current_user["user_id"]),
+        reason=_body.reason,
     )
     await session.commit()
     status = result.get("status")
@@ -368,6 +369,15 @@ async def trigger_force_promote(
         raise HTTPException(status_code=409, detail=detail)
     return result
 
+
+from app.routers.admin_hotfix_promote import (
+    _HotfixPromoteRequest as _HotfixPromoteRequest,
+    get_hotfix_scope_preview as get_hotfix_scope_preview,
+    router as _hotfix_promote_router,
+    trigger_hotfix_promote as trigger_hotfix_promote,
+)
+
+router.include_router(_hotfix_promote_router)
 
 # Blocker provenance sources that mark a depends_on edge as a real, structural
 # prerequisite rather than legacy queue-wave serialization.
@@ -857,7 +867,9 @@ async def trigger_rollup(
                 "status": task.status,
                 "merge_blocked_reason": _hold_reason,
             }
-        merge_result = await merge_pull_request(gh_token, owner, repo, rollup_pr_number)
+        merge_result = await merge_pull_request(
+            gh_token, owner, repo, rollup_pr_number, allow_changes_requested=True
+        )
         if merge_result.get("merged"):
             (
                 record_pr_merged,

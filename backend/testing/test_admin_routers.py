@@ -18751,6 +18751,98 @@ class TestModifyTaskApplySeam:
         assert "requires_approval" in result
 
     @pytest.mark.asyncio
+    async def test_admin_cancel_persists_provenance_and_cascades_dependents(
+        self, db_session
+    ):
+        """Manual cancellation is durable and cannot become AGENT_TIMEOUT later."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_helpers import modify_task_apply
+        from app.failure_classification import (
+            ADMIN_CANCEL,
+            classify_failure,
+            is_non_death_cancellation,
+        )
+        from app.models import TaskHistory
+
+        project = await _make_project(db_session)
+        task = await self._make_task(db_session, project.id, TaskStatus.IN_PROGRESS)
+        child = Task(
+            project_id=project.id,
+            parent_task_id=task.id,
+            title="Active child",
+            status=TaskStatus.IN_PROGRESS,
+            created_by="ORCHESTRATOR",
+        )
+        dependent = Task(
+            project_id=project.id,
+            title="Waiting dependent",
+            status=TaskStatus.QUEUED,
+            depends_on=[str(task.id)],
+            created_by="ORCHESTRATOR",
+        )
+        unrelated = Task(
+            project_id=project.id,
+            title="Unrelated queued task",
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        db_session.add_all([child, dependent, unrelated])
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.admin_task_mutations.broadcast_to_project",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "app.task_lifecycle.close_orphan_pr_if_any",
+                new_callable=AsyncMock,
+            ),
+        ):
+            await modify_task_apply(
+                task=task,
+                payload={"status": TaskStatus.CANCELLED.value},
+                background_tasks=BackgroundTasks(),
+                session=db_session,
+            )
+
+        for row in (task, child, dependent, unrelated):
+            await db_session.refresh(row)
+
+        assert task.status == TaskStatus.CANCELLED
+        assert task.context["failure_category"] == ADMIN_CANCEL
+        assert task.context["failure_class"] == ADMIN_CANCEL
+        assert task.context["cancelled_by"] == "USER"
+        assert classify_failure(task) == ADMIN_CANCEL
+        assert is_non_death_cancellation(task)
+
+        for cascaded in (child, dependent):
+            assert cascaded.status == TaskStatus.CANCELLED
+            assert cascaded.context["failure_category"] == ADMIN_CANCEL
+            assert cascaded.context["failure_class"] == ADMIN_CANCEL
+            assert cascaded.context["cancelled_by"] == "USER"
+            assert cascaded.context["cancelled_by_task_id"] == str(task.id)
+            assert is_non_death_cancellation(cascaded)
+        assert dependent.latest_status_message.startswith("Cancelled: dependency task")
+        assert unrelated.status == TaskStatus.QUEUED
+
+        histories = (
+            (
+                await db_session.execute(
+                    select(TaskHistory).where(TaskHistory.task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert any(
+            history.action == "MODIFIED"
+            and (history.details or {}).get("modified_by") == "USER"
+            for history in histories
+        )
+
+    @pytest.mark.asyncio
     async def test_rollup_pr_approval_skips_pr_merged_on_promotion_target(
         self, db_session, mocker
     ):
@@ -19857,6 +19949,148 @@ class TestRequeueClearsBlockerMetadata:
         assert task.attempt_count == 0
 
 
+class TestManualRequeueGuidance:
+    @pytest.mark.asyncio
+    async def test_stale_fix_prompt_gets_agent_facing_operator_guidance(
+        self, db_session
+    ):
+        """Manual guidance lands in payload.prompt_suffix, not internal context."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        stale_prompt = "Renumber the migration to 0626."
+        task = Task(
+            project_id=project.id,
+            title="Fix stale migration advice",
+            payloads=[
+                {
+                    "pr_number": 15420,
+                    "branch": "fix/stale-migration",
+                    "type": "fix",
+                    "prompt": stale_prompt,
+                    "prompt_suffix": "Preserve the original review constraints.",
+                }
+            ],
+            status=TaskStatus.FAILED,
+            vm_instance_id="agent-vm-old",
+            context={
+                "_original_prompt_suffix": "This internal snapshot is not guidance."
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await modify_task_apply(
+            task,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "requeue_prompt_suffix": (
+                    "Do not create 0626. Remove the duplicate migration instead."
+                ),
+            },
+            BackgroundTasks(),
+            db_session,
+        )
+
+        await db_session.refresh(task)
+        assert task.first_payload["prompt"] == stale_prompt
+        suffix = task.first_payload["prompt_suffix"]
+        assert suffix.startswith("Preserve the original review constraints.")
+        assert suffix.endswith(
+            "Do not create 0626. Remove the duplicate migration instead."
+        )
+        assert "## Operator retry guidance" in suffix
+        assert (
+            task.first_payload["operator_retry_guidance"]
+            == "Do not create 0626. Remove the duplicate migration instead."
+        )
+
+        # A later operator correction replaces the earlier block instead of
+        # stacking contradictory retry instructions.
+        await modify_task_apply(
+            task,
+            {
+                "status": TaskStatus.QUEUED.value,
+                "requeue_prompt_suffix": "Delete only the semantic duplicate.",
+            },
+            BackgroundTasks(),
+            db_session,
+        )
+        await db_session.refresh(task)
+        suffix = task.first_payload["prompt_suffix"]
+        assert "Do not create 0626" not in suffix
+        assert suffix.count("## Operator retry guidance") == 1
+        assert suffix.endswith("Delete only the semantic duplicate.")
+
+    @pytest.mark.asyncio
+    async def test_internal_suffix_context_write_is_rejected_on_requeue(
+        self, db_session
+    ):
+        """The old silent no-op operator pattern fails with an actionable 400."""
+        from fastapi import BackgroundTasks, HTTPException
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Reject internal suffix mutation",
+            payloads=[{"type": "fix", "prompt": "stale"}],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await modify_task_apply(
+                task,
+                {
+                    "status": TaskStatus.QUEUED.value,
+                    "context": {"_original_prompt_suffix": "operator advice"},
+                },
+                BackgroundTasks(),
+                db_session,
+            )
+        assert exc_info.value.status_code == 400
+        assert "use requeue_prompt_suffix instead" in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_guidance_without_queued_status_is_rejected(self, db_session):
+        """Guidance-only PATCHes cannot succeed while delivering nothing."""
+        from fastapi import BackgroundTasks, HTTPException
+
+        from app.admin_task_mutations import modify_task_apply
+
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Reject detached guidance",
+            payloads=[
+                {
+                    "type": "fix",
+                    "prompt": "stale",
+                    "pr_number": 15420,
+                    "branch": "fix/stale",
+                }
+            ],
+            status=TaskStatus.FAILED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await modify_task_apply(
+                task,
+                {"requeue_prompt_suffix": "new guidance"},
+                BackgroundTasks(),
+                db_session,
+            )
+        assert exc_info.value.status_code == 400
+
+
 class TestRequeueClearsStaleFailureVerdict:
     @pytest.mark.asyncio
     async def test_manual_requeue_pops_failure_class_and_category(self, db_session):
@@ -19960,6 +20194,197 @@ class TestRequeueStuckTask:
         assert task.last_heartbeat is None
         assert task.attempt_count == 0
         mock_delete_vm.assert_awaited_once_with("stuck-vm-abc123", reason="admin_requeue")
+
+
+class TestHotfixScopePreview:
+    """Router-level coverage for the read-only hotfix-scope preview
+    (``GET /projects/{id}/promote/hotfix/preview``).
+
+    The endpoint must report eligibility without triggering any promotion,
+    thread through the optional ``candidate_sha`` query parameter, enforce
+    owner-only access, and map internal statuses to the right HTTP codes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_reports_eligibility_without_promoting(
+        self, db_session, mocker
+    ):
+        """Happy path: machinery-only diff → eligible=True, no promotion occurs.
+
+        This is the named acceptance-evidence test for the task.  The endpoint
+        delegates to ``check_hotfix_scope_preview`` (mocked) and returns its
+        result verbatim.  A real ``promote`` call would also need
+        ``release_qualifier.hotfix_promote_current_version`` — we verify that
+        function is NEVER called, proving the preview is side-effect-free.
+        """
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "changed_files": ["backend/app/release_qualifier.py"],
+                    "offending_files": [],
+                    "reason": "all changed files are allowlisted release machinery",
+                    "candidate_sha": "deadbeef" * 5,
+                    "prior_deployed_sha": "cafecafe" * 5,
+                }
+            ),
+        )
+        promote_mock = mocker.patch(
+            "app.release_qualifier.hotfix_promote_current_version",
+            new=AsyncMock(),
+        )
+
+        result = await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["eligible"] is True
+        assert result["status"] == "eligible"
+        assert result["offending_files"] == []
+        assert "backend/app/release_qualifier.py" in result["changed_files"]
+        # The preview must NOT trigger an actual promotion.
+        promote_mock.assert_not_called()
+        preview_mock.assert_awaited_once_with(
+            db_session,
+            project.id,
+            candidate_sha=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_reports_ineligible_with_offending_files(
+        self, db_session, mocker
+    ):
+        """A diff touching a non-allowlisted file → eligible=False with offending_files."""
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "ineligible",
+                    "eligible": False,
+                    "changed_files": [
+                        "backend/app/release_qualifier.py",
+                        "backend/app/compute_jobs.py",
+                    ],
+                    "offending_files": ["backend/app/compute_jobs.py"],
+                    "reason": "backend/app/compute_jobs.py is outside the release-machinery allowlist",
+                    "candidate_sha": "deadbeef" * 5,
+                    "prior_deployed_sha": "cafecafe" * 5,
+                }
+            ),
+        )
+
+        result = await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result["eligible"] is False
+        assert result["status"] == "ineligible"
+        assert "backend/app/compute_jobs.py" in result["offending_files"]
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_respects_candidate_sha_param(
+        self, db_session, mocker
+    ):
+        """An explicit ``candidate_sha`` is threaded through to
+        ``check_hotfix_scope_preview``."""
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "changed_files": [],
+                    "offending_files": [],
+                    "reason": "all changed files are allowlisted release machinery",
+                    "candidate_sha": "abc1234" * 5 + "abc1234",
+                    "prior_deployed_sha": "main000" * 5 + "main000",
+                }
+            ),
+        )
+
+        explicit_sha = "abc1234" * 5 + "abc1234"
+        await get_hotfix_scope_preview(
+            project.id,
+            candidate_sha=explicit_sha,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        preview_mock.assert_awaited_once_with(
+            db_session,
+            project.id,
+            candidate_sha=explicit_sha,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_returns_404_when_no_open_version(
+        self, db_session, mocker
+    ):
+        """``no_open_version`` from the preview helper maps to HTTP 404."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+
+        project = await _make_project(db_session)
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(return_value={"status": "no_open_version"}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_hotfix_scope_preview(
+                project.id,
+                candidate_sha=None,
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_hotfix_scope_preview_requires_owner_role(self, db_session, mocker):
+        """A member (non-owner) cannot call the preview endpoint — 404 from role check."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import get_hotfix_scope_preview
+        import uuid as _uuid
+
+        # Create a member user with a fresh user ID (not the owner).
+        project = await _make_project(db_session)
+        member_id = str(_uuid.uuid4())
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(return_value={"status": "eligible", "eligible": True}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_hotfix_scope_preview(
+                project.id,
+                candidate_sha=None,
+                session=db_session,
+                current_user={"user_id": member_id},
+            )
+        # _get_user_project_with_role raises 404 for users without the required role.
+        assert exc_info.value.status_code == 404
 
 
 class TestTriggerRollup:

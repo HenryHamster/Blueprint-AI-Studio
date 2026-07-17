@@ -2,10 +2,12 @@ import * as fs from 'fs';
 import type WebSocket from 'ws';
 import {
   sanitize, sendLog, runClaudeCode, persistAndPostStatus, git,
-  rotateOAuthCredentialsIfChanged,
+  apiGet, gitAsync, rotateOAuthCredentialsIfChanged,
 } from '../index.js';
+import { writeGitTokenFile } from '../git-credential.js';
 import type { BuildConfig } from '../index.js';
 import { writeCodeChangeHelpers, SELF_REVIEW_PROMPT_VERSION } from '../prompt.js';
+import { buildTaskCheckpointCommitMessage } from '../task-checkpoint.js';
 // buildPromptSizeTelemetry / setPromptSizeTelemetry are NOT called here —
 // callers (standard.ts, review-fix.ts, specialized.ts) set richer
 // per-section decompositions before invoking runCodeChangeTask.
@@ -219,6 +221,67 @@ export async function maybeRunIncompleteReviewRecovery(
   if (cats.includes('incomplete_review') && !hasFindings) {
     sendLog(ws, '[FreshReview] SR reports incomplete_review — auto-triggering recovery pass.\n');
     await recoveryFn();
+  }
+}
+
+function workspaceHasChanges(baseCommit: string): boolean {
+  try {
+    return git(['status', '--porcelain']).length > 0 || git(['rev-parse', 'HEAD']) !== baseCommit;
+  } catch {
+    return false;
+  }
+}
+
+/** Persist work that reached the fail-closed path without a terminal marker.
+ *
+ * The provenance-marked commit is intentionally pushed to the canonical task
+ * branch without opening a PR or completing the task. A fresh retry recognizes
+ * this marker in prepareTaskWorkBranch and restores its diff onto the current
+ * base. force-with-lease permits a second failed retry to replace the previous
+ * checkpoint while refusing to clobber an unexpected concurrent branch update.
+ */
+async function checkpointUnshippedWork(
+  opts: Pick<CodeChangeTaskOpts, 'taskId' | 'workBranch' | 'baseCommit'>,
+  ws: WebSocket | null,
+): Promise<boolean> {
+  try {
+    git(['add', '-A']);
+    const message = buildTaskCheckpointCommitMessage(opts.taskId, opts.baseCommit);
+    const [subject, ...bodyLines] = message.split('\n');
+    git(['commit', '--allow-empty', '-m', subject, '-m', bodyLines.join('\n').trim()]);
+    // Refresh here: a long session may outlive its installation token.
+    try {
+      const fresh = await apiGet(
+        `/api/agent/github/token?task_id=${encodeURIComponent(opts.taskId)}&force_refresh=true`,
+      ) as { data?: { token?: string } };
+      if (fresh.data?.token) writeGitTokenFile(fresh.data.token);
+    } catch (error) {
+      // The credential already in the helper file may still be valid. Preserve
+      // best-effort checkpointing instead of turning refresh availability into
+      // a new way to lose the worktree.
+      sendLog(
+        ws,
+        `[wrapper] WARNING: checkpoint token refresh failed; trying the existing credential: ` +
+        `${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    }
+    await gitAsync([
+      'push', '--force-with-lease', 'origin',
+      `HEAD:refs/heads/${opts.workBranch}`,
+    ]);
+    sendLog(
+      ws,
+      `[wrapper] Preserved unshipped work on durable checkpoint branch ${opts.workBranch}; ` +
+      'the next retry will restore it before running.\n',
+    );
+    return true;
+  } catch (error) {
+    sendLog(
+      ws,
+      `[wrapper] WARNING: failed to persist unshipped-work checkpoint: ` +
+      `${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    return false;
   }
 }
 
@@ -443,12 +506,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
 
   // No PR opened and no ./done|./fail|./blocked marker. Did Claude make any
   // changes?
-  let hasChanges = false;
-  try {
-    const diff = git(['status', '--porcelain']);
-    const head = git(['rev-parse', 'HEAD']);
-    hasChanges = diff.length > 0 || head !== opts.baseCommit;
-  } catch { /* git may be in odd state */ }
+  let hasChanges = workspaceHasChanges(opts.baseCommit);
 
   // ── FORCED TERMINAL-VERB CONTINUATION BACKSTOP (2026-06-06) ──────────────
   // A passive end_turn — Claude ended its final turn with a plain assistant
@@ -483,6 +541,10 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     // Re-inspect exactly as the existing code does. Only if there is STILL no
     // terminal marker / no PR do we fall through and fail the task.
     if (await inspectTerminalMarkers(opts, ws, ' after forced continuation') === 'handled') return;
+    // The continuation may have added, committed, or reverted work. Checkpoint
+    // exactly the state that will be reported incomplete, not the pre-continuation
+    // snapshot that merely triggered this one capped recovery turn.
+    hasChanges = workspaceHasChanges(opts.baseCommit);
   }
 
   // SAFEGUARD (2026-06-01): a bare no-diff clean exit is NOT auto-completed.
@@ -521,6 +583,9 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     : `Claude subprocess exited with code ${exitCode} without shipping a PR.`;
   const logs = `${reason}\n\n--- Claude output tail ---\n${sanitize(allOutput.slice(-10_000))}`;
   sendLog(ws, `[wrapper] ${reason}\n`);
+  if (hasChanges) {
+    await checkpointUnshippedWork(opts, ws);
+  }
   await persistAndPostStatus(taskId, {
     task_id: taskId,
     status: 'FAILED',

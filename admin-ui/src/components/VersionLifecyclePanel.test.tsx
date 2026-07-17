@@ -706,7 +706,7 @@ describe('VersionLifecyclePanel', () => {
 
       const headline = screen.getByTestId('version-headline');
       expect(headline).toHaveTextContent('open in stabilize with 7 merged');
-      expect(headline).toHaveTextContent('4/7 proven');
+      expect(headline).toHaveTextContent('4/7 merged-task proofs');
       expect(headline).toHaveTextContent('conf 84% / thr 90%');
       // Status for the current (open) version is always 'open'.
       expect(headline).toHaveTextContent('stabilize · open');
@@ -725,6 +725,44 @@ describe('VersionLifecyclePanel', () => {
       );
 
       expect(screen.queryByTestId('version-headline')).not.toBeInTheDocument();
+    });
+
+    it('renders qualification progress instead of misleading zero percentages and 0/0 proof', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              phase: 'stabilize',
+              qualification_state: { state: 'qualifying', summary: 'Qualification is running.' },
+              last_qualification: makeQualification({
+                status: 'qualifying',
+                confidence: 0,
+                threshold: 0.9,
+                finalized_at: null,
+              }),
+              highlights: {
+                headline: 'qualification candidate is being evaluated',
+                merged_count: 636,
+                proven: 0,
+                total_merged_for_acceptance: 0,
+                qualification_confidence: 0,
+                qualification_threshold: 0.9,
+              },
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const headline = screen.getByTestId('version-headline');
+      expect(headline).toHaveTextContent('636 merged');
+      expect(headline).toHaveTextContent('no eligible merged-task proofs');
+      expect(headline).toHaveTextContent('qualification in progress');
+      expect(headline).not.toHaveTextContent('conf 0%');
+      expect(headline).not.toHaveTextContent('0/0');
+      expect(screen.getByTestId('qualification-progress')).toHaveTextContent('qualification in progress');
     });
   });
 

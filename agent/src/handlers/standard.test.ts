@@ -5265,6 +5265,10 @@ describe('prompt size telemetry', () => {
     // overwrite caller-set telemetry.
     const real = await vi.importActual<typeof import('./code-change.js')>('./code-change.js');
     const realRunCodeChangeTask = real.runCodeChangeTask;
+    // This telemetry-only test owns no workspace diff. Keep HEAD equal to the
+    // supplied base so it cannot enter the emergency checkpoint/push path.
+    vi.mocked(git).mockImplementation((args: string[]) =>
+      args[0] === 'rev-parse' ? 'abc123' : '');
 
     await realRunCodeChangeTask({
       taskId: 'test-telemetry-cc',

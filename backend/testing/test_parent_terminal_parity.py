@@ -220,6 +220,42 @@ async def test_parent_terminal_parity_all_co_deferred_cancelled(cleanup_db, mock
 
 
 @pytest.mark.asyncio
+async def test_parent_terminal_parity_all_admin_cancelled(cleanup_db, mocker):
+    """Operator-cancelled children finalize both paths as quiet CANCELLED."""
+    record_failure, failure_alert = _mock_finalizer_deps(mocker)
+    session = cleanup_db
+    project = await _make_project(session)
+
+    admin_cancelled = [
+        {
+            "failure_category": "ADMIN_CANCEL",
+            "failure_class": "ADMIN_CANCEL",
+            "cancelled_by": "USER",
+        },
+        {
+            "failure_category": "ADMIN_CANCEL",
+            "failure_class": "ADMIN_CANCEL",
+            "cancelled_by": "USER",
+        },
+    ]
+    reaper_parent, _ = await _make_parent_with_cancelled_children(
+        session, project.id, admin_cancelled
+    )
+    _, rollup_child = await _make_parent_with_cancelled_children(
+        session, project.id, admin_cancelled
+    )
+
+    status_reaper, category_reaper = await _drive_reaper(session, reaper_parent)
+    status_rollup, category_rollup = await _drive_rollup(session, rollup_child)
+
+    assert status_reaper == status_rollup == TaskStatus.CANCELLED
+    assert category_reaper == category_rollup is None
+    assert "AGENT_TIMEOUT" not in (reaper_parent.context or {}).values()
+    record_failure.assert_not_called()
+    failure_alert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_parent_terminal_parity_all_genuine_cancelled(cleanup_db, mocker):
     """Every child a genuine cancel (bare CANCELLED, no non-genuine markers):
     BOTH finalizers must reach FAILED + AGENT_TIMEOUT. The shared verdict treats

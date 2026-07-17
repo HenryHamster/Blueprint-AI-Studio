@@ -170,17 +170,17 @@ describe('Operator workspaces', () => {
     expect(onRuntimeSectionChange).toHaveBeenCalledWith('compute');
   });
 
-  test('shows admin-only runtime settings only for admins and falls back for non-admin selection', () => {
+  test('shows admin-only runtime settings only for admins and falls back for non-admin selection', async () => {
     const { rerender } = render(<RuntimeWorkspace {...runtimeProps({ userRole: 'user', runtimeConfigSection: 'deploy' })} />);
 
     const nav = screen.getByLabelText('Runtime settings sections');
     expect(within(nav).queryByRole('button', { name: /Deploy/ })).not.toBeInTheDocument();
     expect(within(nav).queryByRole('button', { name: /Provider routing/ })).not.toBeInTheDocument();
-    expect(screen.getByTestId('settings-section')).toHaveTextContent('general');
+    expect(await screen.findByTestId('settings-section')).toHaveTextContent('general');
 
     rerender(<RuntimeWorkspace {...runtimeProps({ userRole: 'admin', runtimeConfigSection: 'deploy' })} />);
     expect(within(screen.getByLabelText('Runtime settings sections')).getByRole('button', { name: /Deploy/ })).toBeInTheDocument();
-    expect(screen.getByTestId('settings-section')).toHaveTextContent('deploy');
+    expect(await screen.findByTestId('settings-section')).toHaveTextContent('deploy');
   });
 
   test('keeps project settings disabled when no project is selected', () => {
@@ -236,17 +236,17 @@ describe('Operator workspaces', () => {
     expect(onProjectManageSectionChange).toHaveBeenCalledWith('access');
   });
 
-  test('rehosts project and runtime settings sections through SettingsSectionRouter', () => {
+  test('rehosts project and runtime settings sections through SettingsSectionRouter', async () => {
     const { rerender } = render(
       <ProjectWorkspace {...projectProps({ projectSection: 'manage', projectManageSection: 'alert-domains' })} />,
     );
-    expect(screen.getByTestId('settings-section')).toHaveTextContent('alert-domains');
+    expect(await screen.findByTestId('settings-section')).toHaveTextContent('alert-domains');
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'accounts' })} />);
-    expect(screen.getByTestId('runtime-accounts-panel')).toHaveTextContent('account monitor');
+    expect(await screen.findByTestId('runtime-accounts-panel')).toHaveTextContent('account monitor');
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'settings', runtimeConfigSection: 'provider-settings' })} />);
-    expect(screen.getByTestId('settings-section')).toHaveTextContent('provider-settings');
+    expect(await screen.findByTestId('settings-section')).toHaveTextContent('provider-settings');
   });
 
   test('keeps every settings section assigned to one canonical workbench home', () => {

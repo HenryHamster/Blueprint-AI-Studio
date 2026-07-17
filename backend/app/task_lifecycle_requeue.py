@@ -25,7 +25,11 @@ from app.retry_budget import (
     classify_override_reason,
     compute_effective_max_requeues,
 )
-from app.retry_prompt import _build_retry_prompt_suffix, merge_retry_prompt_suffix
+from app.retry_prompt import (
+    _build_retry_prompt_suffix,
+    materialize_operator_retry_guidance,
+    merge_retry_prompt_suffix,
+)
 from app.task_blocked import (
     restore_requested_payload_model_for_fresh_attempt,
     strip_fresh_attempt_context,
@@ -238,8 +242,8 @@ async def _terminate_all_non_death_cancelled(
     cancelled_count = len([c for c in children if c.status == TaskStatus.CANCELLED])
     parent.status = TaskStatus.CANCELLED
     parent.latest_status_message = (
-        f"All {cancelled_count} subtask(s) deliberately shelved or superseded — "
-        f"not a failure"
+        f"All {cancelled_count} subtask(s) deliberately shelved or superseded, or "
+        f"administratively cancelled — not a failure"
     )
     session.add(parent)
     await session.commit()
@@ -250,13 +254,18 @@ async def _terminate_all_non_death_cancelled(
     )
     logger.info(
         f"[REQUEUE] Parent {parent.id} CANCELLED — all {cancelled_count} "
-        f"subtask(s) non-death cancelled (co-deferred / superseded / scope-empty). "
+        f"subtask(s) non-death cancelled (admin / co-deferred / superseded / "
+        f"scope-empty). "
         f"No direction-health penalty, no failure alert."
     )
     return 0
 
 
-async def _requeue_parent_task(parent: Task, session: AsyncSession):
+async def _requeue_parent_task(
+    parent: Task,
+    session: AsyncSession,
+    operator_retry_guidance: str | None = None,
+):
     """Re-evaluate a parent task by retrying its failed children.
     Cancels FAILED children and clones them as new QUEUED tasks.
     Remaps depends_on from old (cancelled) IDs to new (cloned) IDs.
@@ -796,6 +805,16 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             if extra_guidance:
                 new_payloads[0]["prompt_suffix"] = merge_retry_prompt_suffix(
                     extra_guidance, existing_suffix, clone_ctx
+                )
+            # Preserve previously materialized operator guidance across later
+            # automatic retries as well as attaching fresh manual guidance.
+            effective_operator_guidance = (
+                operator_retry_guidance
+                or new_payloads[0].get("operator_retry_guidance")
+            )
+            if effective_operator_guidance:
+                materialize_operator_retry_guidance(
+                    new_payloads[0], effective_operator_guidance
                 )
 
         # Escalate effort one tier when the requeued child execution-timed-out

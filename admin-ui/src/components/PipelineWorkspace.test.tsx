@@ -244,7 +244,7 @@ describe('PipelineWorkspace status strip', () => {
     expect(screen.getByText('API healthy')).toBeInTheDocument();
   });
 
-  test('renders bounded project scope in board mode', () => {
+  test('renders bounded project scope in board mode', async () => {
     renderWorkspace({
       surface: {
         pipelineSection: 'board',
@@ -266,7 +266,7 @@ describe('PipelineWorkspace status strip', () => {
       },
     });
 
-    expect(screen.getByTestId('kanban-board')).toBeInTheDocument();
+    expect(await screen.findByTestId('kanban-board')).toBeInTheDocument();
     expect(screen.getByText('very-long-owner-name/very-long-repository-name-that-should-not-stretch-the-strip'))
       .toHaveAttribute(
         'title',
@@ -276,7 +276,7 @@ describe('PipelineWorkspace status strip', () => {
 });
 
 describe('PipelineWorkspace section routing', () => {
-  test('renders archive from the selected section even when the legacy archive flag is stale', () => {
+  test('renders archive from the selected section even when the legacy archive flag is stale', async () => {
     renderWorkspace({
       surface: {
         pipelineSection: 'archive',
@@ -289,7 +289,7 @@ describe('PipelineWorkspace section routing', () => {
     });
 
     expect(screen.getByRole('button', { name: 'Archive' })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByTestId('archive-view')).toBeInTheDocument();
+    expect(await screen.findByTestId('archive-view')).toBeInTheDocument();
     expect(screen.queryByTestId('pipeline-view')).not.toBeInTheDocument();
     expect(screen.queryByTestId('kanban-board')).not.toBeInTheDocument();
   });

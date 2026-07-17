@@ -65,6 +65,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import logging
+import os
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -2805,6 +2806,7 @@ async def _resolve_migration_identity_at_finalize(
         )
         if verdict != "defer":
             return verdict, detail
+
         # First attempt deferred — retry once with freshly-resolved credentials.
         # _resolve_github_with_session returns a fresh token if the cache was
         # invalidated by a 401 during the first attempt.
@@ -2843,6 +2845,27 @@ async def _resolve_migration_identity_at_finalize(
             exc,
         )
         return ("defer", f"migration-identity gate error: {exc}")
+
+
+def _migration_apply_timeout_detail(detail: str | None) -> bool:
+    """Return whether detail starts with one stable migration watchdog code."""
+
+    if not detail:
+        return False
+    code = detail.partition(":")[0].strip()
+    return code.startswith("migration_apply_") and code.endswith("_timeout")
+
+
+def _migration_apply_infra_error(detail: str | None) -> str:
+    """Preserve stable timeout codes; retain the legacy code for other defers."""
+
+    if _migration_apply_timeout_detail(detail):
+        return str(detail)
+    return (
+        f"migration_apply_check_unavailable: {detail}"
+        if detail
+        else "migration_apply_check_unavailable"
+    )
 
 
 async def _resolve_migration_apply_at_finalize(
@@ -2892,6 +2915,7 @@ async def _resolve_migration_apply_at_finalize(
             return ("ok", None)
         token, owner, repo = resolved
         prod_engine = resolve_async_engine(session)
+        scratch_db_url = os.getenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL")
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,
@@ -2900,6 +2924,7 @@ async def _resolve_migration_apply_at_finalize(
                 repo=repo,
                 candidate_ref=candidate_sha,
                 project_id=str(version.project_id),
+                scratch_db_url=scratch_db_url,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -2919,6 +2944,11 @@ async def _resolve_migration_apply_at_finalize(
         )
         if verdict != "defer":
             return verdict, detail
+        if _migration_apply_timeout_detail(detail):
+            # Fresh credentials cannot repair a wedged import, lock, or database
+            # stage. The next qualification cycle may retry; this finalize must
+            # not blindly double the watchdog budget.
+            return verdict, detail
         # First attempt deferred — retry once with freshly-resolved credentials.
         logger.info(
             "[RELEASE_QUALIFIER] finalize migration-apply gate deferred for v%d "
@@ -2936,6 +2966,7 @@ async def _resolve_migration_apply_at_finalize(
             repo=repo,
             candidate_ref=candidate_sha,
             project_id=str(version.project_id),
+            scratch_db_url=scratch_db_url,
         )
         logger.info(
             "[RELEASE_QUALIFIER] finalize migration-apply gate retry for v%d "
@@ -5085,7 +5116,9 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            "migration_identity_check_unavailable",
+            f"migration_identity_check_unavailable: {migration_detail}"
+            if migration_detail
+            else "migration_identity_check_unavailable",
         )
     migration_collision = migration_verdict == "block"
 
@@ -5113,7 +5146,7 @@ async def _finalize_qualification(
             session,
             version,
             qual,
-            "migration_apply_check_unavailable",
+            _migration_apply_infra_error(apply_detail),
         )
     migration_apply_blocked = apply_verdict == "block"
 
@@ -6635,6 +6668,7 @@ async def _force_promote_locked(
     candidate_sha: str,
     candidate_diff_hash: str | None,
     actor: str | None,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Lock + FORCE-promote an open version on a dedicated session (no audit).
 
@@ -6683,16 +6717,18 @@ async def _force_promote_locked(
         "forced_promote": True,
         "forced_promote_by": actor,
         "forced_promote_at": now.isoformat(),
+        "forced_promote_reason": reason,
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE: v%d cutting release branch + opening "
         "promotion PR at candidate %s (audit gate SKIPPED; CI still gates the "
-        "merge) — actor=%s",
+        "merge) — actor=%s reason=%s",
         version.version_number,
         candidate_sha[:8],
         actor,
+        reason,
     )
     result = await promote(
         session,
@@ -6711,6 +6747,7 @@ async def _force_promote_in_dedicated_session(
     candidate_diff_hash: str | None,
     actor: str | None,
     *,
+    reason: str | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run FORCE-promote on a DEDICATED session (mirrors the reuse-promote path).
@@ -6724,7 +6761,7 @@ async def _force_promote_in_dedicated_session(
     async with factory() as session:
         try:
             result = await _force_promote_locked(
-                session, version_id, candidate_sha, candidate_diff_hash, actor
+                session, version_id, candidate_sha, candidate_diff_hash, actor, reason
             )
         except Exception:
             try:
@@ -6753,6 +6790,7 @@ async def force_promote_current_version(
     *,
     candidate_sha: str | None = None,
     actor: str | None = None,
+    reason: str | None = None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Operator FORCE-PROMOTE the project's open version.
@@ -6795,20 +6833,29 @@ async def force_promote_current_version(
     )
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
-        "actor=%s — SKIPPING the audit/qualify gate (CI still gates the merge)",
+        "actor=%s reason=%s — SKIPPING the audit/qualify gate (CI still gates the "
+        "merge)",
         project_id,
         version.version_number,
         candidate_sha[:8],
         actor,
+        reason,
     )
     return await _force_promote_in_dedicated_session(
         version.id,
         candidate_sha,
         candidate_diff_hash,
         actor,
+        reason=reason,
         session_factory=session_factory,
     )
 
+
+# Stable facade for the narrow operator-approved release-machinery lane.
+from app.release_hotfix_promotion import (
+    check_hotfix_scope_preview as check_hotfix_scope_preview,
+    hotfix_promote_current_version as hotfix_promote_current_version,
+)
 
 def _qualification_timeout_age_seconds(
     version: release_version.ReleaseVersion,

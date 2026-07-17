@@ -275,6 +275,8 @@ async def test_fetch_failure_defers(monkeypatch):
         return None
 
     monkeypatch.setattr(gate_mod, "_download_candidate_repo_archive", _no_archive)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
     async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
         await _seed_prod_sim(prod_engine, {"widget": True}, revision="a01")
         verdict, detail = await run_migration_apply_gate(
@@ -288,6 +290,132 @@ async def test_fetch_failure_defers(monkeypatch):
 
     assert verdict == "defer", detail
     assert "deadbeef" in detail
+
+
+@pytest.mark.asyncio
+async def test_transient_fetch_recovers_on_retry(monkeypatch):
+    """A transient GitHub fetch failure (None twice, then success) self-clears on
+    internal retry — the gate returns ``ok`` instead of deferring to a fresh
+    qualification cycle."""
+    import io
+    import tarfile
+
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    call_count = 0
+
+    async def _fails_then_succeeds(*_a, **_k):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return None
+        # Third call: return a valid minimal archive.
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            data = b"revision = '0001'\ndown_revision = None\n"
+            info = tarfile.TarInfo("repo-abc/backend/alembic/versions/0001_init.py")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    monkeypatch.setattr(
+        gate_mod, "_download_candidate_repo_archive", _fails_then_succeeds
+    )
+
+    # Fast-path the DB operations with mocks.
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="0001", metadata=prod_meta)
+        ),
+    )
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", AsyncMock(return_value=[]))
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            gh_token="t",
+            owner="o",
+            repo="r",
+            candidate_ref="deadbeef",
+            required_metadata=sa.MetaData(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    # Verify the retry mechanism actually fired.
+    assert call_count == 3, (
+        f"_download_candidate_repo_archive called {call_count} times, expected 3"
+    )
+
+
+@pytest.mark.asyncio
+async def test_transient_seed_recovers_on_retry(monkeypatch):
+    """A transient seed failure (``_MigrationApplyError`` on first call,
+    success on second) self-clears on the internal backoff retry — the gate
+    returns ``ok`` without deferring."""
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    # Mock the prod state read so we skip to the provision/seed/apply/drift leg.
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(
+            return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)
+        ),
+    )
+
+    call_count = 0
+
+    async def _flaky_seed(scratch_engine, prod_state):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise gate_mod._MigrationApplyError("transient seed failure")
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        yield object(), "scratch-gate"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", _flaky_seed)
+    monkeypatch.setattr(gate_mod, "_apply_candidate_migrations", AsyncMock())
+    monkeypatch.setattr(gate_mod, "_reflect_scratch_drift", AsyncMock(return_value=[]))
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=sa.MetaData(),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+    # Seed was called twice — once (failing) and once (succeeding).
+    assert call_count == 2
 
 
 @pytest.mark.asyncio
@@ -339,52 +467,361 @@ async def test_candidate_sources_read_from_tarball_no_contents_calls(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_concurrent_applies_are_serialized():
-    """Alembic's runtime is PROCESS-GLOBAL — the ``op``/``context`` proxies are
-    module-level singletons rebound on every ``EnvironmentContext`` enter — so two
-    in-process migration applies running concurrently corrupt each other. That is
-    the flaky ``KeyError: 'config'`` that false-failed a release qualification to
-    ``infra_failure`` on 2026-06-16: the qualifier runs this gate PRE-LOCK, so two
-    overlapping finalize attempts genuinely invoke it at the same time.
+async def test_concurrent_applies_are_serialized(monkeypatch):
+    """The retained capacity lock admits only one migration subprocess at a time."""
 
-    ``_apply_candidate_migrations`` must therefore serialize the apply so no two
-    are ever live at once. The fake connection models the real apply, whose
-    greenlet-bridged DDL yields to the event loop at each statement — the exact
-    window a concurrent apply would interleave into and clobber the global proxy.
-    Without the lock, ``active`` would exceed 1."""
     import app.migration_apply_gate as gate_mod
 
     state = {"active": 0, "max": 0}
+    first_entered = asyncio.Event()
+    release = asyncio.Event()
 
-    class _FakeConn:
-        async def run_sync(self, _fn):
-            state["active"] += 1
-            state["max"] = max(state["max"], state["active"])
-            await asyncio.sleep(0.02)  # yield: a concurrent apply could interleave
-            state["active"] -= 1
+    async def _fake_runner(_engine, _script_location, *, timeout_code):
+        del timeout_code
+        state["active"] += 1
+        state["max"] = max(state["max"], state["active"])
+        first_entered.set()
+        await release.wait()
+        state["active"] -= 1
 
-    @contextlib.asynccontextmanager
-    async def _fake_connect():
-        yield _FakeConn()
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _fake_runner
+    )
 
     class _FakeEngine:
-        def connect(self):
-            return _fake_connect()
+        pass
 
-    sources = {"0001_init.py": "revision = '0001'\ndown_revision = None\n"}
-    await asyncio.gather(
-        *(
+    sources = {
+        "0001_init.py": """revision = '0001'
+down_revision = None
+"""
+    }
+    tasks = [
+        asyncio.create_task(
             gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
-            for _ in range(3)
+        )
+        for _ in range(3)
+    ]
+    await first_entered.wait()
+    await asyncio.sleep(0)
+    assert state["max"] == 1
+    release.set()
+    await asyncio.gather(*tasks)
+    assert state["max"] == 1
+
+
+class _HangingProcess:
+    def __init__(self):
+        self.pid = 424242
+        self.returncode = None
+        self.entered = asyncio.Event()
+        self.communicate_calls = 0
+        self.killed = False
+
+    async def communicate(self, input=None):
+        del input
+        self.communicate_calls += 1
+        if self.communicate_calls == 1:
+            self.entered.set()
+            await asyncio.Event().wait()
+        return b"", b""
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self):
+        return self.returncode
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_timeout_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(gate_mod, "_CANDIDATE_METADATA_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=b"archive"),
+    )
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+
+    with pytest.raises(
+        gate_mod._MigrationApplyTimeout,
+        match="migration_apply_candidate_metadata_timeout",
+    ):
+        await gate_mod._build_candidate_required_metadata_from_snapshot(
+            "token", "owner", "repo", "sha", None
+        )
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+    assert proc.returncode == -9
+
+
+@pytest.mark.asyncio
+async def test_candidate_metadata_subprocess_happy_path(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    archive = _make_tar_bytes(
+        [
+            ("repo/backend/app/__init__.py", b""),
+            (
+                "repo/backend/app/models.py",
+                b"""from sqlmodel import Field, SQLModel
+class Widget(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+""",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=archive),
+    )
+
+    metadata = await gate_mod._build_candidate_required_metadata_from_snapshot(
+        "token", "owner", "repo", "sha", None
+    )
+
+    assert "widget" in metadata.tables
+    assert list(metadata.tables["widget"].columns.keys()) == ["id"]
+
+@pytest.mark.asyncio
+async def test_subprocess_cancellation_kills_and_reaps(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    proc = _HangingProcess()
+    monkeypatch.setattr(
+        gate_mod.os,
+        "killpg",
+        lambda _pid, _sig: proc.kill(),
+        raising=False,
+    )
+    task = asyncio.create_task(
+        gate_mod._communicate_bounded(
+            proc,
+            timeout_seconds=60,
+            timeout_code="migration_apply_test_timeout",
         )
     )
+    await proc.entered.wait()
+    task.cancel()
 
-    assert state["max"] == 1, (
-        f"concurrent in-process Alembic applies observed (max={state['max']}); the "
-        "apply must be serialized to protect Alembic's process-global op/context "
-        "proxies"
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.communicate_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_create_timeout_still_attempts_drop(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    timeout = gate_mod._MigrationApplyTimeout(
+        "migration_apply_scratch_provision_timeout", 0.01
+    )
+    monkeypatch.setattr(
+        gate_mod, "_create_database", AsyncMock(side_effect=timeout)
+    )
+    drop = AsyncMock()
+    monkeypatch.setattr(gate_mod, "_drop_database", drop)
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            raise AssertionError("unreachable")
+
+    drop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ephemeral_cleanup_finishes_before_cancellation_propagates(
+    monkeypatch,
+):
+    import app.migration_apply_gate as gate_mod
+
+    body_entered = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    monkeypatch.setattr(gate_mod, "_create_database", AsyncMock())
+    monkeypatch.setattr(
+        gate_mod, "create_async_engine", lambda *_args, **_kwargs: object()
     )
 
+    async def _cleanup(_engine, _base_url, _name):
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(gate_mod, "_cleanup_ephemeral_database", _cleanup)
+
+    async def _use_database():
+        async with gate_mod.ephemeral_postgres_database(
+            make_url("postgresql+asyncpg://u:p@localhost/postgres")
+        ):
+            body_entered.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(_use_database())
+    await body_entered.wait()
+    task.cancel()
+    await cleanup_started.wait()
+    assert not task.done()
+    allow_cleanup.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert cleanup_finished.is_set()
+
+@pytest.mark.asyncio
+async def test_timeout_is_not_retried_internally():
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _timeout():
+        nonlocal calls
+        calls += 1
+        raise gate_mod._MigrationApplyTimeout(
+            "migration_apply_replay_apply_timeout", 0.01
+        )
+
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._with_transient_retry(_timeout, label="test timeout")
+
+    assert calls == 1
+
+@pytest.mark.asyncio
+async def test_apply_timeout_releases_capacity_lock(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    calls = 0
+
+    async def _runner(_engine, _script_location, *, timeout_code):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise gate_mod._MigrationApplyTimeout(timeout_code, 0.01)
+
+    monkeypatch.setattr(
+        gate_mod, "_run_migration_apply_subprocess", _runner
+    )
+
+    class _FakeEngine:
+        pass
+
+    sources = {"0001_init.py": "revision = '0001'"}
+    with pytest.raises(gate_mod._MigrationApplyTimeout):
+        await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+
+    # A timeout must release the capacity lock before temp-file cleanup. If it
+    # did not, this second call would wait for the 240-second lock watchdog.
+    await gate_mod._apply_candidate_migrations(_FakeEngine(), sources)
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_receives_only_scratch_database_url(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setenv("BLUEPRINT_TEST_SECRET", "must-not-leak")
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "must-not-leak-either")
+    observed = {}
+
+    class _CompletedProcess:
+        returncode = 0
+        pid = 123
+
+        async def communicate(self, input=None):
+            del input
+            return b"", b""
+
+    async def _spawn(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return _CompletedProcess()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _spawn)
+
+    class _FakeEngine:
+        url = make_url(
+            "postgresql+asyncpg://scratch_user:scratch_secret@"
+            "scratch-host:5432/mig_apply_gate_test"
+        )
+
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeEngine(),
+        "candidate-versions",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+    env = observed["kwargs"]["env"]
+    expected = _FakeEngine.url.render_as_string(hide_password=False)
+    assert env["DATABASE_URL"] == expected
+    assert env["MIGRATION_APPLY_DATABASE_URL"] == expected
+    assert "prod" not in env["DATABASE_URL"]
+    assert "BLUEPRINT_TEST_SECRET" not in env
+    assert "GITHUB_PAT_ENCRYPTION_KEY" not in env
+    assert observed["kwargs"]["start_new_session"] == (os.name == "posix")
+
+
+def test_subprocess_diagnostic_is_bounded_and_redacted():
+    import app.migration_apply_gate as gate_mod
+
+    password = "super-secret-password"
+    token = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    stderr = (
+        b"x" * (gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100)
+        + f" postgresql+asyncpg://user:{password}@host/db bearer {token}".encode()
+    )
+
+    detail = gate_mod._bounded_subprocess_detail(
+        stderr, b"", 1, sensitive_values=(password,)
+    )
+
+    assert password not in detail
+    assert token not in detail
+    assert "<redacted>" in detail
+    assert "<redacted-token>" in detail
+    assert detail.startswith("[truncated to last ")
+    assert len(detail.encode()) < gate_mod._SUBPROCESS_DIAGNOSTIC_MAX_BYTES + 100
+
+
+@pytest.mark.parametrize("member_type", [tarfile.SYMTYPE, tarfile.LNKTYPE])
+def test_legacy_tar_fallback_rejects_link_escape(
+    monkeypatch, member_type
+):
+    import app.migration_apply_gate as gate_mod
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        link = tarfile.TarInfo("repo/link")
+        link.type = member_type
+        link.linkname = "../../outside"
+        tar.addfile(link)
+
+    monkeypatch.setattr(gate_mod.sys, "version_info", (3, 11, 3))
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(buf.getvalue()), mode="r:") as tar:
+            with pytest.raises(ValueError, match="link member"):
+                gate_mod._safe_tar_extractall(tar, tmp)
 
 # --- Fail-safe cases that need no scratch DB (run everywhere) ---------------
 
@@ -769,3 +1206,191 @@ async def test_drop_database_rejects_invalid_name_without_connecting():
     url = make_url("postgresql+asyncpg://u:p@localhost:5432/nope")
     with pytest.raises(ValueError, match="Invalid database name"):
         await _drop_database(url, "my\"db")
+
+
+# --- scratch_db_url routing -------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_scratch_db_url_routes_scratch_provisioning_to_dedicated_target(
+    monkeypatch,
+):
+    """When ``scratch_db_url`` is provided, the gate must provision the scratch
+    and reference databases on the dedicated target, NOT the production URL.
+
+    The deployed production Postgres user typically cannot ``CREATE DATABASE``,
+    so every candidate would defer with ``migration_apply_check_unavailable``.
+    Providing a scratch-capable target unblocks the gate pre-promotion.
+    """
+    import app.migration_apply_gate as gate_mod
+    from sqlalchemy.engine import make_url
+
+    scratch_target = "postgresql+asyncpg://scratch_user:p@scratch-host:5432/postgres"
+    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    # Capture the base_url passed to _build_candidate_reference_schema and
+    # _provision_seed_and_detect_drift to verify the scratch target is used.
+    observed: dict[str, object] = {}
+
+    async def _capture_build_candidate_reference_schema(
+        base_url, candidate_sources
+    ):
+        observed["build_reference_base_url"] = base_url
+        return prod_meta
+
+    async def _capture_provision_seed_and_detect_drift(
+        scratch_base_url, prod_state, candidate_sources, required_metadata
+    ):
+        observed["provision_base_url"] = scratch_base_url
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _capture_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=prod_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_provision_seed_and_detect_drift",
+        _capture_provision_seed_and_detect_drift,
+    )
+
+    # Create an engine whose URL differs from the scratch target to prove the
+    # gate does NOT fall back to prod_url when scratch_db_url is given.
+    engine = create_async_engine(str(prod_url))
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            scratch_db_url=scratch_target,
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+
+    # Both internal functions must receive the scratch target URL, not prod.
+    # Compare URL components individually: str(URL) redacts passwords to "***",
+    # so we check host/port/database which are stable across password redaction.
+    expected = make_url(scratch_target)
+    build_ref = observed.get("build_reference_base_url")
+    assert build_ref is not None, (
+        "_build_candidate_reference_schema was not called"
+    )
+    assert build_ref.host == expected.host, (
+        f"_build_candidate_reference_schema host {build_ref.host!r} != {expected.host!r}"
+    )
+    assert build_ref.database == expected.database, (
+        f"_build_candidate_reference_schema database {build_ref.database!r} != {expected.database!r}"
+    )
+
+    provision_ref = observed.get("provision_base_url")
+    assert provision_ref is not None, (
+        "_provision_seed_and_detect_drift was not called"
+    )
+    assert provision_ref.host == expected.host, (
+        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {expected.host!r}"
+    )
+    assert provision_ref.database == expected.database, (
+        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {expected.database!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scratch_db_url_none_falls_back_to_prod_url(monkeypatch):
+    """When ``scratch_db_url`` is ``None`` (default), the gate must fall back
+    to the production engine's URL for scratch provisioning — the correct path
+    for dev/test environments where the Postgres user can CREATE DATABASE."""
+    import app.migration_apply_gate as gate_mod
+    from sqlalchemy.engine import make_url
+
+    prod_url = make_url("postgresql+asyncpg://prod_user:p@prod-db:5432/proddb")
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    observed: dict[str, object] = {}
+
+    async def _capture_build_candidate_reference_schema(
+        base_url, candidate_sources
+    ):
+        observed["build_reference_base_url"] = base_url
+        return prod_meta
+
+    async def _capture_provision_seed_and_detect_drift(
+        scratch_base_url, prod_state, candidate_sources, required_metadata
+    ):
+        observed["provision_base_url"] = scratch_base_url
+        return []
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_reference_schema",
+        _capture_build_candidate_reference_schema,
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_build_candidate_required_metadata",
+        AsyncMock(return_value=prod_meta),
+    )
+    monkeypatch.setattr(
+        gate_mod,
+        "_provision_seed_and_detect_drift",
+        _capture_provision_seed_and_detect_drift,
+    )
+
+    engine = create_async_engine(str(prod_url))
+    try:
+        verdict, detail = await run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_init.py": "revision='0001'\ndown_revision=None\n"},
+            # scratch_db_url omitted — should default to None
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "ok", detail
+
+    # With scratch_db_url=None, the gate must use the prod engine's URL.
+    # Compare host/database individually — str(URL) redacts passwords.
+    build_ref = observed.get("build_reference_base_url")
+    assert build_ref is not None, (
+        "_build_candidate_reference_schema was not called"
+    )
+    assert build_ref.host == prod_url.host, (
+        f"_build_candidate_reference_schema host {build_ref.host!r} != {prod_url.host!r}"
+    )
+    assert build_ref.database == prod_url.database, (
+        f"_build_candidate_reference_schema database {build_ref.database!r} != {prod_url.database!r}"
+    )
+
+    provision_ref = observed.get("provision_base_url")
+    assert provision_ref is not None, (
+        "_provision_seed_and_detect_drift was not called"
+    )
+    assert provision_ref.host == prod_url.host, (
+        f"_provision_seed_and_detect_drift host {provision_ref.host!r} != {prod_url.host!r}"
+    )
+    assert provision_ref.database == prod_url.database, (
+        f"_provision_seed_and_detect_drift database {provision_ref.database!r} != {prod_url.database!r}"
+    )

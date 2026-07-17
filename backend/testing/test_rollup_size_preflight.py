@@ -26,6 +26,18 @@ _SAMPLE_CAPS = {
 }
 
 _CAPS_JSON = json.dumps(_SAMPLE_CAPS, indent=2) + "\n"
+_PINNED_HEAD = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def _stable_live_branch_head():
+    """Keep existing preflight tests on one immutable synthetic branch tip."""
+    with patch(
+        "app.rollup_size_preflight.get_branch_sha",
+        new_callable=AsyncMock,
+        return_value=_PINNED_HEAD,
+    ) as mock_head:
+        yield mock_head
 
 
 def _pr_files(*paths):
@@ -316,6 +328,7 @@ async def test_preflight_commit_bump_false_returns_hold_budget_exhausted():
         patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
         patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
         patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
         mock_fetch.side_effect = [_CAPS_JSON, file_content]
@@ -500,3 +513,77 @@ async def test_preflight_mixed_chronic_and_routine_holds_without_commit():
     assert "models.py" in reason
     assert "decomposition" in reason.lower()
     mock_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_pins_reads_and_commit_to_same_head(_stable_live_branch_head):
+    """Mutable branch names never feed the bump; one immutable SHA is leased."""
+    file_content = "line\n" * 600
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_commit.return_value = "b" * 40
+
+        verdict, _ = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "bumped"
+    assert _stable_live_branch_head.await_count == 2
+    assert all(call.kwargs["ref"] == _PINNED_HEAD for call in mock_fetch.await_args_list)
+    assert mock_commit.await_args.kwargs["expected_head_sha"] == _PINNED_HEAD
+
+
+@pytest.mark.asyncio
+async def test_preflight_concurrent_branch_advance_defers_without_commit(
+    _stable_live_branch_head,
+):
+    """A concurrent branch update invalidates the read lease before any write."""
+    _stable_live_branch_head.side_effect = [_PINNED_HEAD, "b" * 40]
+    file_content = "line\n" * 600
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "defer"
+    assert "advanced during" in (reason or "")
+    mock_commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_preflight_idempotent_commit_result_does_not_rearm_bump(
+    _stable_live_branch_head,
+):
+    """Core no-diff result is treated as already current, not a fresh bump."""
+    file_content = "line\n" * 600
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_commit.return_value = _PINNED_HEAD
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "ok"
+    assert reason is None
+    mock_commit.assert_awaited_once()

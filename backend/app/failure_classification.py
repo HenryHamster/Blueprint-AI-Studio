@@ -354,21 +354,23 @@ def is_non_death_cancellation(task: "Task") -> bool:
     policy, consulted by both the resume system's dead-foundation detector
     (:func:`app.blocked_need_resolution.need_matched_dead_foundation`) and the
     dispatch-time cascade-cancel classifier
-    (:func:`app.orchestrator_health._check_candidate_task_deps`). Recognizes three
-    non-death markers, all of which mean the work either continues elsewhere or is
-    coming back:
+    (:func:`app.orchestrator_health._check_candidate_task_deps`). Recognizes four
+    non-death markers, all of which mean the work either continues elsewhere, is
+    coming back, or was deliberately stopped:
 
     - ``_replaced_by_task_id`` — a requeue-replacement clone; work continues under
       the replacement.
     - ``failure_category == SCOPE_EMPTY`` — a deliberate "scope already covered"
       no-op exit; the branch is intact.
+    - ``failure_category == ADMIN_CANCEL`` — an operator/admin deliberately ended
+      the task; this is not an agent timeout or code death.
     - ``_co_deferred_shelved`` — a co-deferred dependent re-shelved alongside its
       same-cycle-deferred prerequisite; recoverable shelving, not a failure.
     """
     ctx = getattr(task, "context", None) or {}
     if ctx.get("_replaced_by_task_id"):
         return True
-    if ctx.get("failure_category") == SCOPE_EMPTY:
+    if ctx.get("failure_category") in (ADMIN_CANCEL, SCOPE_EMPTY):
         return True
     if ctx.get(CO_DEFERRED_SHELVED):
         return True

@@ -3812,11 +3812,85 @@ async def test_eval_sweep_all_non_genuine_cancelled_finalizes_failed_scope_empty
 
 
 @pytest.mark.asyncio
+async def test_eval_sweep_all_admin_cancelled_finalizes_cancelled_without_alert(
+    eval_db, mocker
+):
+    """The real evaluating sweep keeps operator cancellation out of timeout health."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mock_cleanup = mocker.patch(
+        "app.rollup_management._cleanup_branches", new_callable=AsyncMock
+    )
+    mock_alert = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mock_parent_failure = mocker.patch(
+        "app.task_lifecycle_requeue._record_parent_failure"
+    )
+    mock_signals = mocker.patch("app.rollup_management._record_rollup_failure_signals")
+
+    project = Project(name="Eval Admin Cancel", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "research parent"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": "d-admin", "_rollup_retries": 1},
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    first_child_id = None
+    for index in range(2):
+        child = Task(
+            project_id=project.id,
+            parent_task_id=parent.id,
+            payloads=[{"type": "create", "prompt": f"c{index}"}],
+            status=TaskStatus.CANCELLED,
+            context={
+                "failure_category": "ADMIN_CANCEL",
+                "failure_class": "ADMIN_CANCEL",
+                "cancelled_by": "USER",
+                **(
+                    {"cancelled_by_task_id": str(first_child_id)}
+                    if first_child_id is not None
+                    else {}
+                ),
+            },
+            latest_status_message=(
+                "Cancelled: dependency task administratively cancelled"
+                if first_child_id is not None
+                else "Cancelled by operator"
+            ),
+        )
+        eval_db.add(child)
+        await eval_db.flush()
+        if first_child_id is None:
+            first_child_id = child.id
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.CANCELLED
+    assert (parent.context or {}).get("failure_category") != "AGENT_TIMEOUT"
+    assert (parent.context or {}).get("timeout_subtype") is None
+    mock_alert.assert_not_awaited()
+    mock_parent_failure.assert_not_called()
+    mock_signals.assert_not_called()
+    mock_cleanup.assert_awaited()
+    assert "_rollup_retries" not in (parent.context or {})
+
+
+@pytest.mark.asyncio
 async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
     eval_db, mocker
 ):
-    """A parent whose children are ALL GENUINE cancels (no non-genuine markers —
-    e.g. an operator manually cancelled every child), reached via the same real
+    """A parent whose children are genuine review-cap cancellations, reached via
+    the same real
     sweep + un-mocked finalizer, now finalizes FAILED (NOT the old quiet
     CANCELLED) with a failure alert + direction-health signal — matching the
     requeue/reaper verdict so the two sweeps cannot disagree."""
@@ -3858,6 +3932,8 @@ async def test_eval_sweep_all_genuine_cancelled_finalizes_failed_with_alert(
                 parent_task_id=parent.id,
                 payloads=[{"type": "create", "prompt": f"c{_i}"}],
                 status=TaskStatus.CANCELLED,
+                context={"failure_detail": "review_cap_exhausted"},
+                latest_status_message="Cancelled after review cap exhausted",
             )
         )
     await eval_db.commit()

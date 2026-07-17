@@ -520,6 +520,7 @@ async def _attempt_merge_with_retry_and_escalation(
     if (
         not merge_result.get("merged")
         and not merge_result.get("conflict")
+        and not merge_result.get("review_veto")
         and source != "webhook"
     ):
         # Retry with backoff (skip in webhook context — would timeout delivery).
@@ -593,7 +594,11 @@ async def _attempt_merge_with_retry_and_escalation(
     _recheck_err: BaseException | None = None
     _ms: str = ""
     _upd: dict | None = None
-    if not merge_result.get("merged") and not _in_progress:
+    if (
+        not merge_result.get("merged")
+        and not merge_result.get("review_veto")
+        and not _in_progress
+    ):
         try:
             _recheck_pr = await get_pull_request(gh_token, owner, repo, ci_pr_number)
             _ms = ((_recheck_pr or {}).get("mergeable_state") or "").lower()
@@ -656,6 +661,12 @@ async def _attempt_merge_with_retry_and_escalation(
     task = fresh_task
     ci_loop = (task.context or {}).get("review_loop", {})
 
+    if merge_result.get("review_veto"):
+        task.latest_status_message = (
+            f"Merge held — GitHub has outstanding changes requested on PR #{ci_pr_number}"
+        )[:500]
+        session.add(task)
+        return False
     if merge_result.get("merged"):
         # GitHub artefacts already posted (above). Apply DB state under the lock.
         task.status = TaskStatus.COMPLETED

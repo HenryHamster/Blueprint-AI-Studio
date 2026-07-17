@@ -706,6 +706,10 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
   const exists = (p: string): boolean => {
     try { return fs.existsSync(p); } catch { return false; }
   };
+  const configuredDirectories = (buildConfig?.directories ?? []).filter((dir) => {
+    const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
+    try { return fs.statSync(abs).isDirectory(); } catch { return false; }
+  });
   const steps: ProvisioningStep[] = [];
   const seenCwds = new Set<string>();
   const add = (step: ProvisioningStep): void => {
@@ -716,8 +720,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
 
   // 1) Operator-declared install commands take precedence.
   const declaredCwds = new Set<string>();
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       const installCmd = (dir.install_cmd || '').trim();
       if (!installCmd) continue;
       const abs = dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE;
@@ -738,8 +742,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     if (declaredCwds.has(absDir) || !pyprojectOnly(absDir)) return;
     add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       if (dir.type !== 'python') continue;
       addPyprojectAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
@@ -766,8 +770,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
       }
     }
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       if (dir.type !== 'python') continue;
       addRequirementsTxtAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
@@ -787,8 +791,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     if (!exists(`${absDir}/pyproject.toml`) || !exists(`${absDir}/poetry.lock`)) return;
     add({ cmd: 'poetry', args: ['install'], cwd: absDir, label: `poetry install (${label})` });
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       if (dir.type !== 'python') continue;
       addPoetryAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
@@ -808,8 +812,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     if (!exists(`${absDir}/Pipfile`)) return;
     add({ cmd: 'pipenv', args: ['install', '--system'], cwd: absDir, label: `pipenv install --system (${label})` });
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       if (dir.type !== 'python') continue;
       addPipenvAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
@@ -836,8 +840,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     if (declaredCwds.has(absDir) || !bareSetupPy(absDir)) return;
     add({ cmd: 'pip', args: ['install', '.'], cwd: absDir, label: `pip install . (${label})` });
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       if (dir.type !== 'python') continue;
       addBareSetupAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
@@ -919,8 +923,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
       return;
     }
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       addExtraFamilyAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
   }
@@ -964,8 +968,8 @@ export function detectProvisioningSteps(buildConfig?: BuildConfig): Provisioning
     // Bare package.json, no committed lockfile: npm ci would fail, so npm install.
     add({ cmd: 'npm', args: ['install'], cwd: absDir, label: `npm install (${label})` });
   };
-  if (buildConfig?.directories) {
-    for (const dir of buildConfig.directories) {
+  if (configuredDirectories.length > 0) {
+    for (const dir of configuredDirectories) {
       addNodeAuto(dir.path ? `${WORKSPACE}/${dir.path}` : WORKSPACE, dir.path || 'root');
     }
   }

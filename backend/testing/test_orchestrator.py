@@ -164,6 +164,18 @@ async def test_ci_monitor_extraction_contract(db_session, mocker):
     assert refreshed.status == TaskStatus.EVALUATING
 
 
+def test_verify_spawn_forces_fresh_pr_state_after_cached_open_fast_path():
+    """The expensive spawn path forces the next poll to refresh PR state."""
+    import inspect
+
+    from app.orchestrator_ci_monitor import _monitor_evaluating_tasks
+
+    source = inspect.getsource(_monitor_evaluating_tasks)
+    assert "elif not _v_task_id:" in source
+    assert "if not need_pr_fetch:" in source
+    assert 'ci_loop["polls_since_pr_fetch"] = 999' in source
+    assert "refreshing live PR state" in source
+
 # ── Contention quarantine bound ───────────────────────────────────────────────
 
 

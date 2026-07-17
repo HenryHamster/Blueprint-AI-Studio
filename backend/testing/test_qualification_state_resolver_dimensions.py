@@ -1525,3 +1525,145 @@ async def test_strategic_recent_version_entry_no_ledger_matches_blob(db_session)
     assert qual_state is not None
     assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
     assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)
+@pytest.mark.asyncio
+async def test_qualifying_dimensions_are_scoped_to_started_at_generation(db_session):
+    """An in-flight attempt must not inherit stale same-candidate ledger rows."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Attempt generation project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    started_at = datetime.now(UTC).replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "qualifying",
+            "started_at": started_at.isoformat(),
+            "candidate_sha": "sha-generation",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add_all([
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-generation",
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            blocker=None,
+            computed_at=started_at + timedelta(seconds=1),
+        ),
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-generation",
+            dimension="ci",
+            status="unavailable",
+            blocker=None,
+            computed_at=started_at + timedelta(seconds=1),
+        ),
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-generation",
+            dimension="merge_grade",
+            status="failed",
+            sub_score=0.2,
+            blocker="merge_grade_misses",
+            computed_at=started_at - timedelta(minutes=5),
+        ),
+    ])
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["audit"]["status"] == "passed"
+    assert states["audit"]["score"] == pytest.approx(0.96)
+    assert states["ci"]["status"] == "pending"
+    assert states["merge_grade"]["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_finalized_dimensions_keep_terminal_same_candidate_failure(db_session):
+    """Generation filtering applies only while the attempt is in flight."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Finalized generation project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    started_at = datetime.now(UTC).replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "started_at": started_at.isoformat(),
+            "candidate_sha": "sha-finalized-generation",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-finalized-generation",
+        dimension="merge_grade",
+        status="failed",
+        sub_score=0.2,
+        blocker="merge_grade_misses",
+        computed_at=started_at - timedelta(minutes=5),
+    ))
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["merge_grade"]["status"] == "failed"
+    assert states["merge_grade"]["reason"] == "merge_grade_misses"
+
+
+@pytest.mark.asyncio
+async def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
+    """Missing generation identity must stay pending rather than claim stale proof."""
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Missing generation project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "qualifying",
+            "candidate_sha": "sha-missing-generation",
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-missing-generation",
+        dimension="ci",
+        status="passed",
+    ))
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    assert states["ci"]["status"] == "pending"

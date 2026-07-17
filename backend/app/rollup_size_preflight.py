@@ -28,7 +28,9 @@ import re
 import httpx
 
 from app.github import (
+    StaleBranchHeadError,
     commit_file_changes,
+    get_branch_sha,
     get_file_content_at_ref,
     get_file_text_at_ref,
     get_pr_files,
@@ -66,7 +68,7 @@ def _is_transient_commit_error(exc: BaseException) -> bool:
     error, a code defect) are NOT transient and still HOLD so the operator is
     surfaced rather than the rollup looping forever.
     """
-    if isinstance(exc, httpx.HTTPError):
+    if isinstance(exc, (httpx.HTTPError, StaleBranchHeadError)):
         return True
     msg = str(exc)
     m = _HTTP_STATUS_RE.search(msg)
@@ -110,14 +112,29 @@ async def preflight_rollup_size_caps(
     above and *reason* is a human-readable detail string (or ``None`` for
     ``"ok"``).
     """
-    # 1. Fetch caps JSON at the staging-branch tip.
+    # Pin every read to one immutable branch tip. Branch-name content reads are
+    # cached for ten minutes and were the direct cause of repeated stale bumps:
+    # after the first commit, each poll kept re-reading the old caps document.
+    try:
+        observed_head_sha = await get_branch_sha(
+            gh_token,
+            owner,
+            repo,
+            staging_branch,
+            project_id=project_id,
+            live=True,
+        )
+    except Exception as exc:
+        return ("defer", f"could not resolve live staging head: {exc}")
+
+    # 1. Fetch caps JSON and changed source at the pinned immutable tip.
     try:
         caps_text = await get_file_text_at_ref(
             _CAPS_JSON_PATH,
             token=gh_token,
             owner=owner,
             repo=repo,
-            ref=staging_branch,
+            ref=observed_head_sha,
             project_id=project_id,
         )
     except Exception as exc:
@@ -135,7 +152,7 @@ async def preflight_rollup_size_caps(
             token=gh_token,
             owner=owner,
             repo=repo,
-            ref=staging_branch,
+            ref=observed_head_sha,
             project_id=project_id,
         )
         if exists is False:
@@ -197,7 +214,7 @@ async def preflight_rollup_size_caps(
                     token=gh_token,
                     owner=owner,
                     repo=repo,
-                    ref=staging_branch,
+                    ref=observed_head_sha,
                     project_id=project_id,
                 )
             except Exception as exc:
@@ -246,6 +263,27 @@ async def preflight_rollup_size_caps(
                         new_cap,
                     )
 
+    # Verify the PR branch did not move while we assembled the verdict. This
+    # protects every outcome (including "ok") from authorizing a merge based on
+    # a stale tree; the write path below also enforces the same head as a CAS.
+    try:
+        current_head_sha = await get_branch_sha(
+            gh_token,
+            owner,
+            repo,
+            staging_branch,
+            project_id=project_id,
+            live=True,
+        )
+    except Exception as exc:
+        return ("defer", f"could not revalidate live staging head: {exc}")
+    if current_head_sha != observed_head_sha:
+        return (
+            "defer",
+            "staging branch advanced during size-cap preflight "
+            f"({observed_head_sha[:12]} -> {current_head_sha[:12]})",
+        )
+
     # Any chronic offender blocks ALL auto-bumps — never partially commit caps
     # while an operator decomposition decision is pending.
     if chronic_holders:
@@ -290,7 +328,7 @@ async def preflight_rollup_size_caps(
     )
 
     try:
-        await commit_file_changes(
+        committed_sha = await commit_file_changes(
             gh_token,
             owner,
             repo,
@@ -298,6 +336,7 @@ async def preflight_rollup_size_caps(
             upserts={_CAPS_JSON_PATH: updated_json},
             message=commit_msg,
             project_id=project_id,
+            expected_head_sha=observed_head_sha,
         )
     except Exception as exc:
         # A transient/retryable commit failure (rate-limit 403/429, a
@@ -320,6 +359,15 @@ async def preflight_rollup_size_caps(
             exc,
         )
         return ("hold", f"auto-bump commit failed: {exc}")
+
+    if committed_sha == observed_head_sha:
+        logger.info(
+            "[ROLLUP-SIZE] PR #%s: size-cap update was already present on %s; "
+            "no commit created",
+            rollup_pr_number,
+            staging_branch,
+        )
+        return ("ok", None)
 
     logger.info(
         "[ROLLUP-SIZE] PR #%s: committed size-cap bumps on %s: %s",

@@ -478,7 +478,15 @@ def _tasks_requeue(args: argparse.Namespace) -> None:
     if not _confirm(f"Requeue task {args.task_id}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
-    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", {"status": "QUEUED"})
+    body = {"status": "QUEUED"}
+    guidance = getattr(args, "requeue_prompt_suffix", None)
+    if guidance is not None:
+        guidance = guidance.strip()
+        if not guidance:
+            print("ERROR: --prompt-suffix/--guidance cannot be empty", file=sys.stderr)
+            sys.exit(2)
+        body["requeue_prompt_suffix"] = guidance
+    result = api("PATCH", f"/api/admin/tasks/{args.task_id}", body)
     _emit(args, result, lambda d: print(f"  {args.task_id}: {d.get('status', 'ok')}"))
 
 
@@ -5052,6 +5060,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_tasks_requeue.add_argument("task_id", help="Task id (full uuid).")
     p_tasks_requeue.add_argument("--yes", action="store_true",
                                  help="Skip the confirmation prompt (for scripting).")
+    p_tasks_requeue.add_argument(
+        "--prompt-suffix",
+        "--guidance",
+        dest="requeue_prompt_suffix",
+        help=(
+            "Operator guidance to append to the payload delivered on the retry. "
+            "Replaces guidance from an earlier manual retry without changing "
+            "the original task prompt."
+        ),
+    )
     p_tasks_scope = tasks_sub.add_parser("scope", parents=[common],
                                          help="Show prompt, research question, and payload scope for a task.")
     p_tasks_scope.add_argument("task_id", help="Task id (full uuid).")

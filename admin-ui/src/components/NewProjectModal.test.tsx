@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { NewProjectModal } from './NewProjectModal';
 
@@ -172,21 +172,23 @@ describe('NewProjectModal onboarding steering', () => {
     );
 
     const repoInput = await screen.findByPlaceholderText('owner/repo or https://github.com/owner/repo');
-    await user.type(repoInput, 'acme/platform');
-    await user.type(screen.getByPlaceholderText('What do you want Blueprint to achieve on this repo?'), 'Ship the core fix');
-    await user.type(screen.getByPlaceholderText('startup / research / product / personal / enterprise'), 'startup');
-    await user.type(screen.getByPlaceholderText('Who this is for, in one line'), 'Platform team');
-    await user.type(screen.getByPlaceholderText('solo / 3 engineers + 1 PM / etc.'), '4 engineers + 1 PM');
-    await user.type(screen.getByPlaceholderText('continuous / weekly / quarterly / sporadic'), 'weekly');
-    await user.type(screen.getByPlaceholderText('Risk tolerance, compliance constraints, or other context'), 'Reliability over speed');
-    await user.type(screen.getByPlaceholderText("e.g., Don't modify .github/workflows/"), 'No workflow edits');
+    // These fields exercise controlled-state propagation, not keyboard behavior.
+    // Dispatch one change per field so this test has bounded runtime even when
+    // Vitest is running the full suite under constrained CI worker capacity.
+    fireEvent.change(repoInput, { target: { value: 'acme/platform' } });
+    fireEvent.change(screen.getByPlaceholderText('What do you want Blueprint to achieve on this repo?'), { target: { value: 'Ship the core fix' } });
+    fireEvent.change(screen.getByPlaceholderText('startup / research / product / personal / enterprise'), { target: { value: 'startup' } });
+    fireEvent.change(screen.getByPlaceholderText('Who this is for, in one line'), { target: { value: 'Platform team' } });
+    fireEvent.change(screen.getByPlaceholderText('solo / 3 engineers + 1 PM / etc.'), { target: { value: '4 engineers + 1 PM' } });
+    fireEvent.change(screen.getByPlaceholderText('continuous / weekly / quarterly / sporadic'), { target: { value: 'weekly' } });
+    fireEvent.change(screen.getByPlaceholderText('Risk tolerance, compliance constraints, or other context'), { target: { value: 'Reliability over speed' } });
+    fireEvent.change(screen.getByPlaceholderText("e.g., Don't modify .github/workflows/"), { target: { value: 'No workflow edits' } });
     await user.click(screen.getByRole('button', { name: 'Add constraint' }));
     await user.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByText('Merge-gate draft');
     const requiresCiToggle = screen.getByRole('checkbox', { name: 'Require CI checks' });
     await user.click(requiresCiToggle);
-    await user.clear(screen.getByPlaceholderText('Leave blank to keep the merge gate unverified'));
-    await user.type(screen.getByPlaceholderText('Leave blank to keep the merge gate unverified'), 'python3 -m pytest');
+    fireEvent.change(screen.getByPlaceholderText('Leave blank to keep the merge gate unverified'), { target: { value: 'python3 -m pytest' } });
     await user.click(await screen.findByRole('button', { name: 'Create Project' }));
 
     await waitFor(() => expect(mocks.previewOnboardProjectMock).toHaveBeenCalled());

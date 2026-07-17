@@ -712,6 +712,9 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
                 "branch": "feat/closed",
                 "base_branch": "main",
                 "ci_wait_started": _naive_utcnow().isoformat(),
+                "closed_pr_replacement_wait_started": _naive_utc_ago(
+                    minutes=16
+                ).isoformat(),
             }
         },
     )
@@ -767,6 +770,93 @@ async def test_ci_polling_closed_without_merge_fails_task(orch_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_ci_polling_graces_replacement_publication_then_rebinds(orch_db, mocker):
+    """A just-closed PR cannot kill a fix while its replacement is publishing."""
+    session, _Session = orch_db
+
+    project = Project(name="CI Replacement Publication Grace", user_id="user1")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+
+    ci_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "branch": "feat/publishing-replacement"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/publishing-replacement",
+                "base_branch": "automain",
+                "ci_wait_started": _naive_utcnow().isoformat(),
+                "fix_reason": "migration_guard",
+            }
+        },
+    )
+    session.add(ci_task)
+    await session.commit()
+    await session.refresh(ci_task)
+    task_id = ci_task.id
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        return_value=("fake-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        return_value={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/publishing-replacement"},
+            "base": {"ref": "automain"},
+            "mergeable": None,
+        },
+    )
+    replacement_lookup = mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        side_effect=[
+            None,
+            {
+                "number": 91,
+                "state": "open",
+                "head": {"sha": "newsha", "ref": "feat/publishing-replacement"},
+                "base": {"ref": "automain"},
+            },
+        ],
+    )
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+
+    # First poll lands inside the publication race: no replacement is visible yet.
+    await _run_one_cycle(mocker)
+    async with _Session() as verify_session:
+        first = await verify_session.get(Task, task_id)
+        assert first.status == TaskStatus.EVALUATING
+        first_loop = (first.context or {}).get("review_loop", {})
+        assert first_loop.get("closed_pr_replacement_wait_started")
+        assert "waiting for replacement publication" in (
+            first.latest_status_message or ""
+        ).lower()
+
+    # Next poll sees the authoritative same-head/base replacement and rebinds.
+    await _run_one_cycle(mocker)
+    async with _Session() as verify_session:
+        rebound = await verify_session.get(Task, task_id)
+        assert rebound.status == TaskStatus.EVALUATING
+        rebound_loop = (rebound.context or {}).get("review_loop", {})
+        assert rebound_loop.get("pr_number") == 91
+        assert rebound_loop.get("head_sha") == "newsha"
+        assert "closed_pr_replacement_wait_started" not in rebound_loop
+
+    assert replacement_lookup.await_count == 2
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker):
     """A unique same-head/base replacement owns the task after old PR closure."""
     session, _Session = orch_db
@@ -784,12 +874,24 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         status=TaskStatus.EVALUATING,
         context={
             "rollup_pr_number": 77,
+            "blueprint_review_verdict": "APPROVE",
             "review_loop": {
                 "ci_waiting": True,
                 "pr_number": 77,
                 "branch": "feat/replaced",
                 "base_branch": "automain",
-                "ci_wait_started": _naive_utcnow().isoformat(),
+                "ci_wait_started": _naive_utc_ago(hours=2).isoformat(),
+                "ci_wait_pause_baseline": 1234.0,
+                "ci_passed": True,
+                "review_approved": True,
+                "verdict": "APPROVE",
+                "merge_in_progress_resets": 3,
+                "_ci_backstop_first_defer_at": _naive_utc_ago(
+                    hours=1
+                ).isoformat(),
+                "review_recovery_attempted": True,
+                "review_history": [{"verdict": "APPROVE"}],
+                "iteration": 2,
             },
         },
     )
@@ -846,6 +948,25 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
     loop = (updated.context or {}).get("review_loop", {})
     assert loop.get("pr_number") == 91
     assert loop.get("head_sha") == "newsha"
+    assert datetime.fromisoformat(loop["ci_wait_started"]) > _naive_utc_ago(
+        minutes=1
+    )
+    assert loop.get("ci_wait_pause_baseline") == 0.0
+    assert loop.get("iteration") == 2, "chain-level convergence budget is durable"
+    for stale_key in (
+        "ci_passed",
+        "review_approved",
+        "verdict",
+        "merge_in_progress_resets",
+        "_ci_backstop_first_defer_at",
+        "review_recovery_attempted",
+        "review_history",
+        "escalated",
+    ):
+        assert stale_key not in loop, (
+            f"replacement inherited old-attempt state {stale_key}"
+        )
+    assert "blueprint_review_verdict" not in (updated.context or {})
     assert (updated.context or {}).get("rollup_pr_number") == 91
     assert "superseded by open pr #91" in (
         updated.latest_status_message or ""
@@ -858,7 +979,109 @@ async def test_ci_polling_rebinds_closed_pr_to_open_replacement(orch_db, mocker)
         "automain",
         project_id=str(project.id),
     )
-    alert_mock.assert_not_called()
+    # The old PR was already beyond the soft-alert threshold when this cycle
+    # began. Its one alert is allowed, but the replacement must not inherit
+    # the `escalated` latch (asserted above).
+    assert alert_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_replacement_ci_backstop_uses_new_attempt_clock(eval_db, mocker):
+    """A replacement gets a full backstop window, then expires from that clock."""
+    from app.closed_pr_reconciliation import reconcile_closed_pr_replacement
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.github.get_open_pull_request_for_head_branch",
+        new_callable=AsyncMock,
+        return_value={
+            "number": 91,
+            "state": "open",
+            "head": {"sha": "newsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+    )
+
+    project = Project(name="Replacement Backstop Clock", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    stale_wait = _naive_utc_ago(hours=2).isoformat()
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "branch": "feat/replaced"}],
+        status=TaskStatus.EVALUATING,
+        context={
+            "rollup_pr_number": 77,
+            "review_loop": {
+                "ci_waiting": True,
+                "pr_number": 77,
+                "branch": "feat/replaced",
+                "base_branch": "automain",
+                "ci_wait_started": stale_wait,
+                "ci_passed": False,
+                "_ci_backstop_first_defer_at": stale_wait,
+                "ci_fix_spawned": "old-fix-task",
+            },
+        },
+    )
+    eval_db.add(task)
+    await eval_db.commit()
+    await eval_db.refresh(task)
+
+    old_loop = dict((task.context or {})["review_loop"])
+    await reconcile_closed_pr_replacement(
+        task=task,
+        session=eval_db,
+        review_loop=old_loop,
+        pr_number=77,
+        pr_data={
+            "number": 77,
+            "state": "closed",
+            "merged": False,
+            "head": {"sha": "oldsha", "ref": "feat/replaced"},
+            "base": {"ref": "automain"},
+        },
+        github_token="fake-token",
+        github_owner="owner",
+        github_repo="repo",
+    )
+    await eval_db.refresh(task)
+    new_wait = (task.context or {})["review_loop"]["ci_wait_started"]
+    assert new_wait != stale_wait
+    assert "ci_fix_spawned" not in (task.context or {})["review_loop"]
+
+    # The stale predecessor clock cannot kill the replacement immediately.
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.EVALUATING
+
+    # Once the replacement's own clock ages past the threshold, the same
+    # backstop remains effective; this is a reset, not a timeout bypass.
+    new_loop = dict((task.context or {})["review_loop"])
+    new_loop["ci_wait_started"] = _naive_utc_ago(minutes=90).isoformat()
+    new_loop["review_recovery_attempted"] = True
+    task.context = {**(task.context or {}), "review_loop": new_loop}
+    eval_db.add(task)
+    await eval_db.commit()
+    mocker.patch(
+        "app.recovery_evaluating_ci_backstop._verify_ci_before_backstop",
+        new_callable=AsyncMock,
+        return_value=False,
+    )
+
+    await _check_evaluating_timeouts()
+    await eval_db.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert "backstop" in (task.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio

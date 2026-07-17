@@ -29,6 +29,7 @@ import {
   setCurrentPromptFingerprint, listOpenPullRequestsForBranch, deriveTaskBranch, matchesRateLimit,
   resolveBaseBranch, resolveTaskBranchNamespace,
 } from '../index.js';
+import { prepareTaskWorkBranch } from '../task-checkpoint.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
 import type { BuildConfig } from '../index.js';
 import { DEFAULT_CLONE_DEPTH } from '../constants.js';
@@ -206,31 +207,10 @@ export async function handleMigrate(
   git(['config', 'user.name', migrateBuildConfig?.git_user_name || 'Blueprint Agent']);
 
   const workBranch = deriveTaskBranch('migrate', taskId, resolveTaskBranchNamespace(task));
-  let staleBranchExists = false;
-  try {
-    git(['ls-remote', '--exit-code', 'origin', workBranch]);
-    staleBranchExists = true;
-  } catch { /* branch doesn't exist on remote — normal case */ }
-  if (staleBranchExists) {
-    // Refuse to delete the branch if it has open PRs — that auto-closes them
-    // and silently destroys the previous attempt's work.
-    const openPrs = await listOpenPullRequestsForBranch(ghToken, owner, repo, workBranch);
-    if (openPrs.length > 0) {
-      const prList = openPrs.map(p => `#${p.number}`).join(', ');
-      throw new Error(
-        `Refusing to delete stale branch ${workBranch}: has ${openPrs.length} open PR(s) (${prList}) ` +
-        `from a previous attempt. Resolve the PR(s) manually before retrying.`
-      );
-    }
-    try {
-      git(['push', 'origin', '--delete', workBranch]);
-      sendLog(ws, `Deleted stale remote branch ${workBranch} from previous attempt (no open PRs)\n`);
-    } catch (e) {
-      sendLog(ws, `WARNING: Could not delete stale remote branch ${workBranch}: ${e instanceof Error ? e.message : String(e)}\n`);
-    }
-  }
-  git(['checkout', '-b', workBranch]);
-  sendLog(ws, `Working branch: ${workBranch}\n`);
+  await prepareTaskWorkBranch(
+    { owner, repo, ghToken, baseBranch, workBranch, taskId, ws },
+    { git, listOpenPullRequestsForBranch, sendLog },
+  );
 
   // Migration layout. Blueprint's `backend/alembic/versions/`, `app/models/`,
   // and `app/main.py:EXPECTED_SCHEMA_REVISION` conventions are the DEFAULT, but

@@ -2675,6 +2675,70 @@ async def test_requeue_agent_timeout_does_not_stack_suffix_on_repeat_retry(
         not in clone.context["_original_prompt_suffix"]
     )
 
+@pytest.mark.asyncio
+async def test_requeue_preserves_operator_guidance_across_automatic_retry(
+    tl_db, mocker
+):
+    """A later automatic retry must not discard manual operator correction."""
+    mocker.patch("app.playbook_learning._maybe_auto_playbook", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="AGENT_TIMEOUT")
+    session, _ = tl_db
+    project = await _make_project(session)
+    parent = await _make_task(session, project.id, status=TaskStatus.EVALUATING)
+
+    guidance = "Do not create 0626. Remove the duplicate migration instead."
+    failed_child = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.FAILED,
+        parent_task_id=parent.id,
+        context={
+            "_attempt_number": 2,
+            "_original_prompt_suffix": "ORIGINAL_NOTE: keep this.",
+        },
+        latest_status_message="Agent timed out",
+    )
+    failed_child.payloads = [
+        {
+            "type": "create",
+            "prompt": "Renumber the migration to 0626.",
+            "operator_retry_guidance": guidance,
+            "prompt_suffix": (
+                "IMPORTANT: The previous attempt TIMED OUT.\n"
+                "ORIGINAL_NOTE: keep this.\n\n"
+                f"## Operator retry guidance\n{guidance}"
+            ),
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(failed_child, "payloads")
+    session.add(failed_child)
+    await session.commit()
+
+    await _requeue_parent_task(parent, session)
+
+    clone = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .first()
+    )
+    assert clone is not None
+    prompt_suffix = clone.first_payload.get("prompt_suffix", "")
+    assert prompt_suffix.count("## Operator retry guidance") == 1
+    assert prompt_suffix.endswith(guidance)
+    assert "IMPORTANT: The previous attempt TIMED OUT" in prompt_suffix
+    assert "ORIGINAL_NOTE: keep this." in prompt_suffix
+    assert clone.first_payload["operator_retry_guidance"] == guidance
+
 
 @pytest.mark.asyncio
 async def test_requeue_rate_limit_injects_rate_limit_guidance(tl_db, mocker):
