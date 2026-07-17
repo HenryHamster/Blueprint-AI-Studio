@@ -1590,6 +1590,15 @@ export function mergePendingOperatorDecisionReview(
   };
 }
 
+/**
+ * Number of consecutive failed autonomous review turns (missing/malformed marker)
+ * after which a stalled operator-decision review is force-admitted into the durable
+ * register as an exchange text fallback — so the original operator correction is
+ * not silently lost at the next restart or compaction. The caller checks
+ * `retained.attempts >= MAX_REVIEW_ATTEMPTS` immediately after retaining.
+ */
+export const MAX_REVIEW_ATTEMPTS = 3;
+
 export function retainPendingOperatorDecisionReview(
   current: PendingOperatorDecisionReview,
 ): PendingOperatorDecisionReview {

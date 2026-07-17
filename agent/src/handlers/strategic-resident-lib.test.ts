@@ -12,6 +12,7 @@ import {
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
   parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   mergePendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
+  retainPendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   classifyOperatorDecisionReview,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
   AUTONOMOUS_FLOOR_TICK_MS,
@@ -1311,6 +1312,53 @@ describe('pending operator-decision review state machine', () => {
     expect(advancePendingOperatorDecisionReview(sentinel)).toBe(sentinel);
     expect(advancePendingOperatorDecisionReview(sentinel, { coversOverflow: false })).toBe(sentinel);
     expect(advancePendingOperatorDecisionReview(sentinel, { coversOverflow: true })).toBeNull();
+  });
+
+  it('falls back to admitting exchange text after attempt threshold', () => {
+    // Verify that the library primitives support the fallback path implemented in
+    // strategic-resident.ts: after MAX_REVIEW_ATTEMPTS consecutive retain calls on
+    // a stalled review, the handler force-admits the available exchange text as an
+    // operator-verdict entry and clears the review queue.
+    const exchangeText = 'do not pursue the images-first compute rewrite';
+    const review = mergePendingOperatorDecisionReview(null, ['m-1'], startedAt, exchangeText);
+
+    // Simulate MAX_REVIEW_ATTEMPTS consecutive retain calls (missed markers).
+    let retained = review;
+    for (let i = 0; i < MAX_REVIEW_ATTEMPTS; i++) {
+      expect(retained.attempts).toBeLessThan(MAX_REVIEW_ATTEMPTS);
+      retained = retainPendingOperatorDecisionReview(retained);
+    }
+
+    // The handler checks this condition to trigger the fallback.
+    expect(retained.attempts).toBeGreaterThanOrEqual(MAX_REVIEW_ATTEMPTS);
+
+    // Simulate the handler's force-admit: build the fallback note from exchangeText.
+    const fallbackNote = retained.exchangeText
+      ? `[unclassified after ${retained.attempts} attempts] ${retained.exchangeText}`
+      : `[unclassified after ${retained.attempts} attempts — exchange text unavailable]`;
+    const register: DecisionsRegisterEntry[] = [];
+    admitDecisionEntry(register, {
+      atTick: 10,
+      at: startedAt,
+      surfaceKey: 'operator:message',
+      verdict: OPERATOR_DECISION_VERDICT,
+      note: fallbackNote,
+    }, DECISIONS_REGISTER_CAP);
+
+    // The admission must produce exactly one operator entry containing the exchange text.
+    expect(register).toHaveLength(1);
+    expect(register[0].verdict).toBe(OPERATOR_DECISION_VERDICT);
+    expect(register[0].note).toContain(exchangeText);
+    expect(register[0].note).toContain(`${MAX_REVIEW_ATTEMPTS} attempts`);
+
+    // After admission the review should be advanced (cleared) so the queue drains.
+    const advanced = advancePendingOperatorDecisionReview(review);
+    expect(advanced).toBeNull(); // no queued exchanges — queue is now empty
+
+    // The admitted entry survives a serialize→restore round-trip so the correction
+    // is not lost at restart or compaction.
+    const restored = restoreDecisionsReg(serializeDecisionsReg(register));
+    expect(restored?.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(exchangeText))).toBe(true);
   });
 });
 

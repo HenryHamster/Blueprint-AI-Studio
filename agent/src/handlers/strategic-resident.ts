@@ -35,7 +35,7 @@ import {
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
   classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
-  retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview,
+  retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
@@ -651,6 +651,11 @@ export async function handleStrategicResident(
   // Pacing for the "watching" ephemeral status line emitted while gated-idle so
   // deliberate quiet looks different from a dark/crashed session.
   let lastWatchingEmitAt = 0;
+  // Set true when workspace vanish has been handled for the current vanish event
+  // so the guard does not restart the subprocess again on the NEXT iteration
+  // (which would still see no .git if the recovery clone hasn't fully landed yet).
+  // Reset to false when .git is observed, arming the guard for the next event.
+  let workspaceVanishHandled = false;
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
@@ -1176,10 +1181,52 @@ export async function handleStrategicResident(
       // minutes (so a re-clone deep into a multi-hour session would just throw).
       // See recloneResidentWorkspace.
       if (!fs.existsSync(`${WORKSPACE}/.git`)) {
-        sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
-        streamer.status('workspace vanished — re-cloning');
-        await recloneResidentWorkspace(ws, owner, repo, baseBranch);
-        sendLog(ws, '[resident] workspace restored\n');
+        if (!workspaceVanishHandled) {
+          workspaceVanishHandled = true;
+          sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
+          streamer.status('workspace vanished — re-cloning');
+          await recloneResidentWorkspace(ws, owner, repo, baseBranch);
+          sendLog(ws, '[resident] workspace restored\n');
+
+          // Re-provision all generated helper tools into the recreated checkout.
+          // They were written into the deleted directory inode and are gone.
+          writePlaybookHelper(taskId);
+          writeMessagesHelper(taskId);
+          writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
+          configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
+          writeStrategicHelpers(taskId, projectId, WORKSPACE);
+          provisionAmbientHelpers(taskId, WORKSPACE);
+          sendLog(ws, '[resident] workspace recovery — helper tools re-provisioned\n');
+
+          // Restart the subprocess so its cwd points to the new directory inode.
+          // The live subprocess is still attached to the deleted inode.
+          session.close();
+          const recoverySession = startResidentClaudeSession({
+            model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+          });
+          recoverySession.onEvent(onSessionEvent);
+          session = recoverySession;
+
+          // Prime with the compaction checkpoint to carry pre-loss decision context.
+          streamer.status('workspace recovery — priming restarted subprocess with checkpoint');
+          try {
+            const primeResult = await recoverySession.sendTurn(
+              buildCompactionCheckpoint(buildCheckpointContext()),
+            );
+            if (primeResult.processGone) {
+              sendLog(ws, '[resident] FATAL: recovery subprocess died during checkpoint prime\n');
+              stopReason = 'workspace_recovery_prime_failed';
+              break;
+            }
+            sendLog(ws, '[resident] workspace recovery complete — subprocess restarted and primed\n');
+          } catch (e) {
+            sendLog(ws, `[resident] FATAL: workspace recovery prime threw: ${String(e)}\n`);
+            stopReason = 'workspace_recovery_prime_failed';
+            break;
+          }
+        }
+      } else {
+        workspaceVanishHandled = false;
       }
 
       if (!session.isAlive()) {
@@ -1381,9 +1428,31 @@ export async function handleStrategicResident(
           });
           streamer.status('operator exchange confirmed routine/no-decision — review cleared');
         } else {
-          operatorDecisionReview = retainPendingOperatorDecisionReview(reviewForTurn);
-          streamer.status(reviewOutcome.statusNote
-            ?? 'operator-decision overflow needs an explicit whole-batch classification — durable review remains pending');
+          const retained = retainPendingOperatorDecisionReview(reviewForTurn);
+          if (retained.attempts >= MAX_REVIEW_ATTEMPTS) {
+            // The model has repeatedly failed to emit a valid classification marker.
+            // Rather than silently losing the operator's exchange at restart or
+            // compaction, admit the available exchange text as a best-effort entry
+            // and advance past this review so the queue can drain.
+            const fallbackNote = reviewForTurn.exchangeText
+              ? `[unclassified after ${retained.attempts} attempts] ${reviewForTurn.exchangeText}`
+              : `[unclassified after ${retained.attempts} attempts — exchange text unavailable]`;
+            admitDecisionEntry(decisionsReg, {
+              atTick: examTick,
+              at: upd.record.at,
+              surfaceKey: 'operator:message',
+              verdict: OPERATOR_DECISION_VERDICT,
+              note: fallbackNote,
+            }, DECISIONS_REGISTER_CAP);
+            operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
+              coversOverflow: reviewOutcome.coversOverflow,
+            });
+            streamer.status(`operator-decision review admitted after ${retained.attempts} failed attempts — exchange text recorded as fallback`);
+          } else {
+            operatorDecisionReview = retained;
+            streamer.status(reviewOutcome.statusNote
+              ?? 'operator-decision overflow needs an explicit whole-batch classification — durable review remains pending');
+          }
         }
       }
 

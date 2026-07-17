@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
 
 // ── Hoisted mock sinks ────────────────────────────────────────────────────────
 const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
@@ -96,6 +97,9 @@ import {
 } from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { writePlaybookHelper } from '../prompt.js';
+import { writeStrategicHelpers } from './strategic-helpers.js';
+import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
   ResidentSession, ResidentSessionEvent, ResidentTurnResult,
@@ -204,6 +208,9 @@ const mockStartSession = vi.mocked(startResidentClaudeSession);
 const mockWriteGitTokenFile = vi.mocked(writeGitTokenFile);
 const mockSetupGitCredentialHelper = vi.mocked(setupGitCredentialHelper);
 const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
+const mockWritePlaybookHelper = vi.mocked(writePlaybookHelper);
+const mockWriteStrategicHelpers = vi.mocked(writeStrategicHelpers);
+const mockProvisionAmbientHelpers = vi.mocked(provisionAmbientHelpers);
 
 /** A ResidentTurnResult with sane defaults, overridable per test. */
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
@@ -259,7 +266,11 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     mockSendLog.mockReset();
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    // Workspace guard must NOT fire in general-purpose tests (WORKSPACE='' otherwise
+    // always looks vanished). Recovery-specific tests override this spy.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it('primes the compacted session WITH the settled operator decision and WITHOUT the answered message, and marks the message handled before fetching checkpoint state', async () => {
     // The single operator message whose content must NOT survive into the
@@ -535,12 +546,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
   });
 
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
-    // WORKSPACE is stubbed to '' so `${WORKSPACE}/.git` never exists → the per-turn
-    // "workspace vanished" guard fires on the first iteration. This pins the CALL
-    // SITE (not just the helper): the guard must route through
-    // recloneResidentWorkspace, which mints a fresh read-scoped token — not re-use
-    // the push-capable `ghtok` captured at session start (expired by mid-session,
-    // and a standing ambient push credential).
+    // Override the default existsSync=true spy so the workspace-vanish guard fires.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
     mockPrepareWorkspaceForRole.mockReset();
     mockWriteGitTokenFile.mockReset();
 
@@ -553,7 +560,9 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     });
     mockApiPost.mockResolvedValue({ authority_held: true });
 
-    // A single dead session so the loop primes nothing and exits after one guard pass.
+    // Each startResidentClaudeSession call returns a new dead session: startup
+    // session + recovery session (post-guard restart). Both die immediately so the
+    // loop exits after the recovery prime.
     mockStartSession.mockImplementation(() => makeSession(
       () => Promise.resolve(turnResult({ resultText: 'x', inputTokens: 0 })),
       () => false,
@@ -578,7 +587,94 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
   });
 
+  it('re-provisions helper tools and restarts the subprocess after workspace vanish', async () => {
+    // Override existsSync to simulate workspace vanish (guard fires exactly once).
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    mockWritePlaybookHelper.mockReset();
+    mockWriteStrategicHelpers.mockReset();
+    mockProvisionAmbientHelpers.mockReset();
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // Two sessions: session1 from startup, session2 from recovery restart.
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    const session2 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    await handleStrategicResident(
+      'task-recovery', { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'p' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // subprocess restarted: startResidentClaudeSession called once at startup + once for recovery
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    // old subprocess was closed before the new one was started
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session1.close).toHaveBeenCalled();
+    // recovery session received the prime (compaction checkpoint)
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+    // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
+    expect(mockWritePlaybookHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockWriteStrategicHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockProvisionAmbientHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('stops gracefully when the workspace-recovery prime returns processGone', async () => {
+    // Simulate workspace vanish so the guard fires and the recovery prime runs.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => true,
+    );
+    const session2 = makeSession(
+      () => Promise.resolve(turnResult({ processGone: true })),
+      () => true,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    // Should resolve without throwing even when the prime fails.
+    await expect(handleStrategicResident(
+      'task-prime-fail', { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'p' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    )).resolves.toBeUndefined();
+
+    // The prime was the only turn on session2 — no operator/autonomous turns followed.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+  });
+
   it('preserves the advanced message cursor across workspace reclone', async () => {
+    // Override the default existsSync=true spy so the workspace-vanish guard fires.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
     const initialCursor = '2026-01-01T00:00:00.000000';
     const advancedCursor = '2026-07-15T14:00:00.000000Z';
     const operatorMessage = {
@@ -706,11 +802,15 @@ describe('refreshResidentGitReadToken — the resident holds no ambient push-cap
 describe('recloneResidentWorkspace — fresh READ-scoped credential at the moment of use', () => {
   beforeEach(() => {
     mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
     mockSendLog.mockReset();
     mockWriteGitTokenFile.mockReset();
     mockSetupGitCredentialHelper.mockReset();
     mockPrepareWorkspaceForRole.mockReset();
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it('mints a FRESH read-scoped token and clones with it — never the stale push token', async () => {
     mockApiGet.mockResolvedValue({ token: 'fresh-read-token' });
@@ -876,7 +976,9 @@ describe('handleStrategicResident — autonomous marker-miss corrective loop', (
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
     vi.mocked(recordOperatorDecisionCapture).mockClear();
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
+  afterEach(() => { vi.restoreAllMocks(); });
 
   /** Build a task whose context restores operatorDecisionCorrective=true so the
    *  first autonomous tick runs as the marker-miss corrective. */
