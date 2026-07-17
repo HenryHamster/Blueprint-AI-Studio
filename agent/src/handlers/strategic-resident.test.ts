@@ -97,7 +97,7 @@ import {
 } from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { writePlaybookHelper } from '../prompt.js';
+import { writePlaybookHelper, buildContextPrefix } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
@@ -211,6 +211,7 @@ const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
 const mockWritePlaybookHelper = vi.mocked(writePlaybookHelper);
 const mockWriteStrategicHelpers = vi.mocked(writeStrategicHelpers);
 const mockProvisionAmbientHelpers = vi.mocked(provisionAmbientHelpers);
+const mockBuildContextPrefix = vi.mocked(buildContextPrefix);
 
 /** A ResidentTurnResult with sane defaults, overridable per test. */
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
@@ -810,6 +811,119 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // first autonomous prompt, including the message-id metadata line.
     expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
     expect(autonomousPrompt).toContain('msg-op-review-1');
+  });
+
+  it('compaction checkpoint carries contextPrefix (operator purpose + constraints) from buildContextPrefix', async () => {
+    // Finding: buildBootstrapPrompt receives contextPrefix but CompactionCheckpointContext
+    // formerly had no corresponding field — a compacted session would operate without
+    // the operator purpose / constraints preamble. This test verifies the integration:
+    // contextPrefix from buildContextPrefix flows into the checkpoint primed into the
+    // fresh subprocess.
+    const CONTEXT_PREFIX = 'Operator Purpose: build great software.\nConstraints: do not break prod.\nCurrent focus: stabilize v26.';
+    mockBuildContextPrefix.mockReturnValue(CONTEXT_PREFIX);
+
+    let capturedCheckpoint = '';
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '', open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // Session 1: high input tokens to trip compaction (threshold 100).
+    // Session 2: post-compaction subprocess — captures the checkpoint, then dies.
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'did some work', inputTokens: 5_000 })),
+      () => true,
+    );
+    const session2 = makeSession(
+      (text) => {
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ resultText: 'primed', inputTokens: 0 }));
+      },
+      () => false, // dead ⇒ loop exits
+    );
+    let spawnCount = 0;
+    mockStartSession.mockImplementation(() => {
+      spawnCount += 1;
+      return spawnCount === 1 ? session1 : session2;
+    });
+
+    await handleStrategicResident(
+      'task-ctx-prefix-compaction',
+      {
+        project_name: 'Proj',
+        open_messages: [],
+        strategic_session_compaction_threshold_tokens: 100,
+      },
+      { project_metadata: { project_id: 'proj-ctx' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The compacted session was primed — it received the checkpoint.
+    expect(capturedCheckpoint.length).toBeGreaterThan(0);
+    // The checkpoint must contain the operator purpose / constraints preamble.
+    expect(capturedCheckpoint).toContain('Operator Purpose: build great software.');
+    expect(capturedCheckpoint).toContain('Constraints: do not break prod.');
+    expect(capturedCheckpoint).toContain('stabilize v26');
+  });
+
+  it('workspace recovery checkpoint carries contextPrefix so the restarted subprocess has operator grounding', async () => {
+    // Finding: the subprocess spawned after workspace recovery was primed with a
+    // compaction checkpoint that lacked contextPrefix — the restored session would
+    // operate without the operator purpose / constraints preamble. This test verifies
+    // contextPrefix flows into the recovery prime.
+    const CONTEXT_PREFIX = 'Operator Purpose: autonomous research.\nConstraints: no prod writes.\nCurrent focus: v26 fix wave.';
+    mockBuildContextPrefix.mockReturnValue(CONTEXT_PREFIX);
+
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    let capturedCheckpoint = '';
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    const session2 = makeSession(
+      (text) => {
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ resultText: 'primed after recovery', inputTokens: 0 }));
+      },
+      () => false,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    await handleStrategicResident(
+      'task-ctx-prefix-recovery',
+      { project_name: 'RecoveryProj', open_messages: [] },
+      { project_metadata: { project_id: 'proj-recovery' }, context: {} },
+      'PUSH-CAPABLE-GHTOK', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The recovery subprocess received a prime with the checkpoint.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+    // The checkpoint must carry the operator purpose / constraints.
+    expect(capturedCheckpoint).toContain('Operator Purpose: autonomous research.');
+    expect(capturedCheckpoint).toContain('Constraints: no prod writes.');
+    expect(capturedCheckpoint).toContain('v26 fix wave');
   });
 });
 
