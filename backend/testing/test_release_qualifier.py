@@ -12224,6 +12224,149 @@ async def test_infra_failure_isolates_to_failing_dimension(db_session):
 
 
 @pytest.mark.asyncio
+async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
+    """_handle_infra_failure stamps engine_sha into the top-level record and
+    each attempt_entry in infra_attempt_history so engine vs candidate triage
+    reads directly off the persisted qualification record."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in return value, got {result.get('engine_sha')!r}"
+    )
+    # Verify the persisted record also carries engine_sha.
+    lq = version.last_qualification
+    assert lq["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in last_qualification record, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history, "infra_attempt_history must be non-empty"
+    latest = history[-1]
+    assert latest["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in attempt_entry, got {latest.get('engine_sha')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_engine_sha_none_when_deploy_sha_absent(db_session, monkeypatch):
+    """When DEPLOY_SHA is not set, engine_sha degrades gracefully to None
+    rather than raising — callers read 'unknown' in messages but the record
+    stays structurally intact."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.delenv("DEPLOY_SHA", raising=False)
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result.get("engine_sha") is None, (
+        f"expected engine_sha None when DEPLOY_SHA absent, got {result.get('engine_sha')!r}"
+    )
+    lq = version.last_qualification
+    assert lq.get("engine_sha") is None, (
+        f"expected engine_sha None in last_qualification, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history[-1].get("engine_sha") is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_gate_incapacity_message_includes_engine_sha(db_session, monkeypatch):
+    """The permanent-gate-incapacity operator notification embeds the engine SHA
+    so the triage reader can distinguish engine build without parsing tracebacks."""
+    from app import release_qualifier_audit as rqa
+    from app import release_qualifier as rq_module
+    from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK, _infra_failure_signature
+
+    monkeypatch.setenv("DEPLOY_SHA", "deadbeef12345ab")
+
+    notified: list[str] = []
+
+    async def _capture_notify(session, version, event, message, extra=None):
+        notified.append(message)
+
+    monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
+
+    project, version = await _make_project_and_version(db_session)
+    # Compute the expected signature so pre-seeded history entries match.
+    _infra_error = "migration_apply_check_unavailable"
+    _sig = _infra_failure_signature(_infra_error, [])
+    _seed_count = _MIN_INFRA_ERROR_STREAK - 1
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        # prior_infra_streak drives current_streak so the alert fires.
+        "prior_infra_streak": _seed_count,
+        # Pre-seed matching-signature history so same_signature_streak reaches threshold.
+        "infra_attempt_history": [
+            {
+                "finalized_at": "2026-07-10T00:00:00",
+                "error": _infra_error,
+                "signature": _sig,
+                "candidate_sha": _LEDGER_SHA_A,
+            }
+        ] * _seed_count,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        _infra_error,
+    )
+    await db_session.commit()
+
+    assert notified, "operator notification was never sent"
+    msg = notified[-1]
+    assert "deadbeef12345ab" in msg, (
+        f"engine SHA 'deadbeef12345ab' not found in permanent-incapacity message: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_infra_failure_streak_is_per_dimension(db_session):
     """The consecutive-infra-error streak is tracked PER-DIMENSION: two migration
     infra failures raise migration_identity's streak to 2 while a single audit

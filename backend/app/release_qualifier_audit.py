@@ -37,6 +37,7 @@ from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
+from app.deployed_sha import get_serving_sha
 
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
@@ -924,12 +925,14 @@ async def _handle_infra_failure(
         and qual.get("candidate_sha")
         and previous_candidate_sha != qual.get("candidate_sha")
     )
+    engine_sha = get_serving_sha()
     prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
     attempt_entry = {
         "finalized_at": finalized_at,
         "error": infra_error,
         "signature": signature,
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "failing_leg": _infer_infra_leg(infra_error),
         "child_failures": child_failures,
     }
@@ -978,6 +981,7 @@ async def _handle_infra_failure(
         "retry_episode": qual.get("retry_episode", 0),
         "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
@@ -1104,7 +1108,7 @@ async def _handle_infra_failure(
                 f"{preview_text}Sanctioned remediation: use the hotfix scope "
                 f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
                 f"not whole-tree force-promotion. "
-                f"Signature: {signature}."
+                f"Signature: {signature}. Engine: {engine_sha or 'unknown'}."
             )
         else:
             alert_message = (
@@ -1152,7 +1156,7 @@ async def _handle_infra_failure(
             f"will not self-resolve by retry. "
             f"Use the sanctioned hotfix scope preview and endpoint "
             f"(POST /projects/{{id}}/promote/hotfix), not whole-tree force-promotion."
-            f"{preview_text}"
+            f"{preview_text} Engine: {engine_sha or 'unknown'}."
         )
     else:
         notify_message = (
@@ -1224,6 +1228,7 @@ async def _handle_infra_failure(
     return {
         "status": "infra_failure",
         "error": infra_error,
+        "engine_sha": engine_sha,
         "infra_failure_signature": signature,
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
