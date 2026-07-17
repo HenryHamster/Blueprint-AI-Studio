@@ -2176,7 +2176,9 @@ _VIEWABLE_CONTENT_TYPES = {
     "pdf": ("application/pdf", "pdf"),
 }
 _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
-_MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
+_MAX_VIEWABLE_VIDEO_BYTES = int(
+    os.environ.get("BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES", str(512 * 1024 * 1024))
+)  # mirrors backend/app/compute_backends.py BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
 _FINAL_VIEWABLE_DRAIN_SECONDS = 10.0
 # Maximum total directory entries (files + dirs) inspected per scan cycle.

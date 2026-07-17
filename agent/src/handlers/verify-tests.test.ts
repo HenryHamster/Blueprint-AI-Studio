@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // Mock ../index.js so module-level imports resolve and main() never runs.
 // Keep strVal/sanitize/resolveBaseBranch real (pure helpers the handler relies

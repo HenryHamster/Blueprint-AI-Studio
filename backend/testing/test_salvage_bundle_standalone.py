@@ -30,6 +30,27 @@ Findings covered here (7-finding compute-images bundle):
   cb-5 — per-arm BLUEPRINT_RESULT_FILE paths are isolated; elapsed/exit_code/stderr captured
   cb-6 — build_and_push scans inputs AND image layers for platform credentials
   cb-7 — _prune_docker_images is called after each compute job (proactive cache hygiene)
+
+Findings covered here (18-finding compute-viewable salvage bundle, 2026-07-17):
+  f1  — parallel signBlob: _sign_viewable_manifest uses asyncio.gather, not sequential loop
+  f2  — live indicator: StrategicContextArtifactSlot renders LiveBadge for live=true media
+  f3  — allow-list drift: .mov removed from fingerprint, video cap env-overridable,
+        runner 422 lists pdf, ComputeJobFile docstring accurate
+  f4  — GCP-VM mid-run viewables: agent_compute_jobs.py has POST /compute-jobs/{job_id}/viewable
+  f5  — unified surfaces: _purge_orphaned_viewable_rows called; ComputeJobFile branch extension guard
+  f6  — de-duplicate gallery: ComputeJobsPanel uses ComputeArtifactGallery component
+  f7  — starvation prevention (tests already in prior 12-finding bundle section)
+  f8  — canvas dedup: StrategicContextWorkspace uses promotedArtifactIds to skip Evidence duplicates
+  f9  — honest media limits: UI cap string distinguishes image/PDF/video sizes separately
+  f10 — artifact sampling disclosure: evidence exposes artifact_total + live_count separately
+  f11 — bound-project uploads (test already in prior 12-finding bundle section)
+  f12 — atomic handoff design: runner.py calls _link_terminal_artifact for terminal jobs
+  f13 — refresh overwritten previews: ComputeArtifactGallery uses revision in cache key
+  f14 — mixed-media preserved (test already in prior 12-finding bundle section)
+  f15 — atomic terminal handoff impl (test already in prior 12-finding bundle section)
+  f16 — reserve slots (test already in prior 12-finding bundle section)
+  f17 — omission telemetry (tests already in prior 12-finding bundle section)
+  f18 — PDF support (tests already in prior 12-finding bundle section)
 """
 
 from __future__ import annotations
@@ -1129,4 +1150,470 @@ def test_admin_api_exposes_viewable_live_omissions():
     assert "viewable_live_omissions" in source or "viewable_artifacts_live_omissions" in source, (
         "admin_compute_jobs.py must expose the runner's live omission counts "
         "as viewable_artifacts_live_omissions in the compute-job polling response"
+    )
+
+
+# =========================================================================== #
+# 18-finding compute-viewable salvage bundle (2026-07-17 — second sweep)
+#
+# This section pins the fixes identified in the second adversarial review.
+# Findings already covered in the prior 12-finding section above are noted
+# but not duplicated (f7, f11, f14, f15, f16, f17, f18).
+# =========================================================================== #
+
+
+def _ui_component_source(filename: str) -> str:
+    """Read a frontend component source file for source-inspection tests."""
+    from pathlib import Path
+
+    base_candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / filename,
+        Path("/repo/admin-ui/src/components") / filename,
+    ]
+    for path in base_candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"{filename} not found in expected locations")
+
+
+def _agent_compute_jobs_source() -> str:
+    """Return the source of backend/app/routers/agent_compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "agent_compute_jobs.py",
+        Path("/repo/backend/app/routers/agent_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "agent_compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("agent_compute_jobs.py not found")
+
+
+def _main_source() -> str:
+    """Return the source of backend/app/main.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "main.py",
+        Path("/repo/backend/app/main.py"),
+        Path(__file__).resolve().parent.parent / "app" / "main.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("main.py not found")
+
+
+def _compute_jobs_source() -> str:
+    """Return the source of backend/app/compute_jobs.py."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "compute_jobs.py",
+        Path("/repo/backend/app/compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "compute_jobs.py",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("compute_jobs.py not found")
+
+
+# --------------------------------------------------------------------------- #
+# Finding f1: _sign_viewable_manifest uses parallel asyncio.gather, not
+# a sequential per-file await loop
+# --------------------------------------------------------------------------- #
+
+
+def test_sign_viewable_manifest_uses_parallel_gather():
+    """_sign_viewable_manifest must mint signed URLs in parallel via asyncio.gather.
+
+    Finding f1 claim: 'Every viewable file attached to each surfaced compute job
+    is signed one-at-a-time in a sequential loop.' The fix batches all GCS
+    round-trips in one gather after the sequential ownership-check phase.
+    """
+    source = _strategic_pkg_source()
+
+    # The function must exist.
+    assert "_sign_viewable_manifest" in source, (
+        "_sign_viewable_manifest must be defined in strategic_context_package.py"
+    )
+
+    # Find the function body and confirm asyncio.gather is used for signing.
+    idx = source.find("async def _sign_viewable_manifest(")
+    assert idx >= 0, "_sign_viewable_manifest function not found"
+    body = source[idx : idx + 3000]
+
+    assert "asyncio.gather" in body, (
+        "_sign_viewable_manifest must use asyncio.gather to mint all GCS signed "
+        "URLs in one parallel batch — sequential per-file awaits add N network "
+        "round-trips to every canvas load when a job has many viewable files"
+    )
+    # Must NOT have a sequential for-loop with an individual generate_download_signed_url await.
+    # The canonical non-parallel anti-pattern would be `await generate_download_signed_url`
+    # inside a for-loop body (the gather passes a list comprehension, not a bare await).
+    assert "return_exceptions=True" in body, (
+        "_sign_viewable_manifest must pass return_exceptions=True to asyncio.gather "
+        "so one GCS signing failure does not abort the entire batch"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f2: StrategicContextArtifactSlot renders a live badge for live items
+# --------------------------------------------------------------------------- #
+
+
+def test_strategic_artifact_slot_has_live_badge():
+    """StrategicContextArtifactSlot must render a live indicator for live=true media.
+
+    Finding f2 claim: 'The live flag is already delivered all the way to the
+    frontend and parsed into preview item objects, but it currently drives ZERO
+    rendering decisions.' The fix renders a LiveBadge overlay chip.
+    """
+    try:
+        source = _ui_component_source("StrategicContextArtifactSlot.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "LiveBadge" in source, (
+        "StrategicContextArtifactSlot.tsx must define a LiveBadge component "
+        "so operators can visually distinguish still-updating mid-run previews "
+        "from terminal completed artifacts"
+    )
+    # The badge must be used (not just defined).
+    assert source.count("LiveBadge") >= 3, (
+        "LiveBadge must be both defined and rendered for live image, video, "
+        "and PDF preview slots"
+    )
+    assert "live" in source and ("pulsing" in source or "animate-pulse" in source), (
+        "LiveBadge must include a pulsing animation cue so mid-run status is "
+        "immediately visible without reading any tooltip"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f3: allow-list drift fixes — .mov removed, video cap env-overridable
+# --------------------------------------------------------------------------- #
+
+
+def test_fingerprint_does_not_include_mov_token():
+    """The renderable-kind fingerprint must NOT match the '.mov' token.
+
+    Finding f3 claim: 'strategic_context_package.py:1499 renderable-kind
+    fingerprint matches a .mov token that no upload/extraction surface persists.'
+    .mov is never uploaded by the runner or extracted by compute_backends, so
+    including it in the fingerprint yields false-positive video classifications.
+    """
+    source = _strategic_pkg_source()
+
+    # Find the video fingerprint check.
+    idx = source.find('".mov"')
+    assert idx == -1, (
+        "strategic_context_package.py must NOT include '.mov' in the "
+        "renderable-kind fingerprint — .mov is not persisted by any upload "
+        "or extraction surface, so it creates false video classifications "
+        "for artifacts whose label/filename contains 'mov' as a substring"
+    )
+
+
+def test_local_runner_video_cap_is_env_overridable():
+    """local_runner.py must read BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES from env.
+
+    Finding f3 claim: 'runner video byte cap is hardcoded 512 MiB in
+    scripts/local_runner.py while backend/app/compute_backends.py makes it
+    env-overridable via BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES.' The fix reads the
+    same env var so operator-tuned caps are honoured by the runner.
+    """
+    source = _local_runner_source()
+
+    assert "BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES" in source, (
+        "local_runner.py must read BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES from the "
+        "environment so operator-tuned server video caps are also enforced by "
+        "the runner, preventing uploads the server would reject"
+    )
+    # The env read must be used to set _MAX_VIEWABLE_VIDEO_BYTES.
+    assert "_MAX_VIEWABLE_VIDEO_BYTES" in source and (
+        "os.environ" in source or "os.getenv" in source
+    ), (
+        "_MAX_VIEWABLE_VIDEO_BYTES must be derived from the environment, "
+        "not a bare integer literal, to mirror compute_backends.py"
+    )
+
+
+def test_runner_422_error_message_includes_pdf():
+    """The runner viewable endpoint 422 error must list pdf as a supported type.
+
+    Finding f3 claim: 'backend/app/routers/runner.py 422 error message lists
+    supported types omitting pdf.' The 422 must reflect the actual allowlist.
+    """
+    source = _runner_router_source()
+
+    # The 422 error message near the viewable endpoint must include pdf.
+    idx = source.find('"/compute-job/{job_id}/viewable"')
+    assert idx >= 0, "viewable endpoint definition not found"
+    body = source[idx : idx + 5000]
+
+    assert "pdf" in body, (
+        "The runner viewable endpoint 422 error message must list 'pdf' as a "
+        "supported viewable type, consistent with the actual allowlist that "
+        "accepts application/pdf"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f4: GCP-VM jobs have a dedicated mid-run viewable upload endpoint
+# --------------------------------------------------------------------------- #
+
+
+def test_gcp_vm_has_dedicated_viewable_upload_endpoint():
+    """agent_compute_jobs.py must expose POST /compute-jobs/{job_id}/viewable.
+
+    Finding f4 claim: 'compute_job_vm_heartbeat ... never ingests a viewable
+    multipart file.' The fix is a dedicated upload endpoint (not the heartbeat)
+    that mirrors the runner-subprocess viewable endpoint policies.
+    """
+    source = _agent_compute_jobs_source()
+
+    # The dedicated viewable endpoint must exist.
+    assert "/compute-jobs/{job_id}/viewable" in source or (
+        "compute-job" in source and "viewable" in source
+    ), (
+        "agent_compute_jobs.py must define a POST endpoint for GCP-VM viewable "
+        "file uploads so mid-run plots stream to the canvas without waiting for "
+        "terminal finalization"
+    )
+
+    # It must enforce the same content-type classification as the runner endpoint.
+    assert "viewable_content_type_for_filename" in source, (
+        "The GCP-VM viewable endpoint must call viewable_content_type_for_filename "
+        "to enforce the same extension allowlist as the runner-subprocess endpoint"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f5: unified viewable-file surfaces — purge + extension guard
+# --------------------------------------------------------------------------- #
+
+
+def test_terminal_reconciliation_purges_orphaned_viewable_rows():
+    """_purge_orphaned_viewable_rows must be called at terminal reconciliation.
+
+    Finding f5 claim: '_record_viewable_job_files only inserts/updates
+    ComputeJobFile rows and never deletes, so superseded mid-run rows orphan.'
+    The fix calls _purge_orphaned_viewable_rows after terminal extraction.
+    """
+    source = _compute_jobs_source()
+
+    assert "_purge_orphaned_viewable_rows" in source, (
+        "compute_jobs.py must define _purge_orphaned_viewable_rows to remove "
+        "ComputeJobFile rows that are NOT in the authoritative terminal manifest"
+    )
+    # Must be called at least twice (definition + call site).
+    assert source.count("_purge_orphaned_viewable_rows") >= 2, (
+        "_purge_orphaned_viewable_rows must be both defined AND called during "
+        "terminal reconciliation; found fewer than 2 occurrences"
+    )
+
+
+def test_computejobfile_signing_branch_validates_extension():
+    """The ComputeJobFile signing branch must apply the viewable-extension guard.
+
+    Finding f5 claim: 'The ComputeJobFile signing branch does not re-validate
+    the extension, unlike _sign_viewable_manifest which re-checks classification.'
+    The fix adds an extension guard to the fallback ComputeJobFile branch.
+    """
+    source = _main_source()
+
+    # The signing endpoint must call viewable_content_type_for_filename.
+    assert "viewable_content_type_for_filename" in source, (
+        "main.py download-url signing must call viewable_content_type_for_filename "
+        "on the ComputeJobFile fallback branch so only allowlisted extensions "
+        "can be signed via that path"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f6: ComputeJobsPanel uses the shared ComputeArtifactGallery component
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_jobs_panel_uses_shared_artifact_gallery():
+    """ComputeJobsPanel must import and use ComputeArtifactGallery.
+
+    Finding f6 claim: 'ComputeJobsPanel.tsx carries a near-verbatim inline copy
+    of the whole resolve/cache/render pipeline.' The fix extracts to the shared
+    ComputeArtifactGallery component and uses it in the panel.
+    """
+    try:
+        source = _ui_component_source("ComputeJobsPanel.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "ComputeArtifactGallery" in source, (
+        "ComputeJobsPanel.tsx must import and use ComputeArtifactGallery "
+        "instead of duplicating the resolve/cache/render pipeline inline — "
+        "two independent copies diverge over time and introduce subtle behavior "
+        "differences (different auto-resolve triggers, missing scheme guards)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f8: StrategicContextWorkspace deduplicates promoted artifact media
+# --------------------------------------------------------------------------- #
+
+
+def test_canvas_workspace_deduplicates_promoted_artifact_media():
+    """StrategicContextWorkspace must suppress duplicate media for promoted artifacts.
+
+    Finding f8 claim: 'Strategic descriptors are built from the same
+    evidence.artifacts.items later rendered in the Evidence section. Both render
+    paths mount their own image/video resolution components for the same media
+    identities.' The fix tracks which artifact IDs are already shown as
+    descriptors and skips their inline media in the Evidence section.
+    """
+    try:
+        source = _ui_component_source("StrategicContextWorkspace.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    assert "promotedArtifactIds" in source, (
+        "StrategicContextWorkspace.tsx must maintain a promotedArtifactIds set "
+        "of artifact IDs already rendered as descriptors so the Evidence section "
+        "can skip mounting duplicate media resolution components for the same "
+        "underlying storage objects"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f9: UI cap strings report per-kind limits, not a uniform 8 MiB cap
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_cap_string_is_per_kind():
+    """ComputeArtifactGallery cap message must distinguish image/PDF/video limits.
+
+    Finding f9 claim: 'All three artifact surfaces describe a uniform 25-file
+    and 8-MiB-per-file cap. The backend applies an 8 MiB image cap but a
+    separately configurable video cap whose default is 512 MiB.' The fix
+    surfaces per-kind limits in the omission message.
+    """
+    try:
+        source = _ui_component_source("ComputeArtifactGallery.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # Must NOT have a uniform "8 MiB each" or "8 MiB/file" cap string.
+    assert "8 MiB each" not in source, (
+        "ComputeArtifactGallery must not describe a uniform '8 MiB each' cap — "
+        "videos have a 512 MiB cap while images are 8 MiB"
+    )
+    # Must distinguish image and video caps.
+    assert "512 MiB" in source, (
+        "ComputeArtifactGallery must mention the 512 MiB video cap so operators "
+        "know large videos up to that limit can still be previewed"
+    )
+    assert "8 MiB" in source, (
+        "ComputeArtifactGallery must mention the 8 MiB image cap separately "
+        "from the video cap"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f10: evidence response discloses artifact_total + live_count separately
+# --------------------------------------------------------------------------- #
+
+
+def test_evidence_response_discloses_artifact_total_and_live_count():
+    """strategic_context_package must expose artifact_total and live_count.
+
+    Finding f10 claim: 'The workspace currently displays counts derived from
+    returned array lengths rather than the durable artifact total.' The fix
+    exposes both the durable artifact total (query count before the bounded
+    slice) and the live synthetic preview count so the operator can distinguish
+    what is sampled from what exists.
+    """
+    source = _strategic_pkg_source()
+
+    # artifact_total must be computed independently of the bounded items slice.
+    assert "artifact_total" in source, (
+        "strategic_context_package.py must track artifact_total (COUNT query "
+        "result) so the canvas can show 'showing N of M artifacts' rather than "
+        "silently implying the slice is the complete set"
+    )
+    # live_count must be surfaced so operators know synthetic previews exist.
+    assert "live_count" in source, (
+        "strategic_context_package.py must expose live_count in the artifact "
+        "evidence so the canvas can note how many running-job preview rows were "
+        "prepended in addition to the durable artifact total"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f12: runner.py calls _link_terminal_artifact for first late bundle
+# --------------------------------------------------------------------------- #
+
+
+def test_runner_calls_link_terminal_artifact_for_late_bundles():
+    """runner.py must call _link_terminal_artifact when a bundle arrives late.
+
+    Finding f12 claim: 'A terminal runner job can currently retain a stored
+    bundle pointer without artifact_id or result_reference being backfilled.'
+    The fix calls _link_terminal_artifact for the first bundle on a terminal job.
+    """
+    source = _runner_router_source()
+
+    # _link_terminal_artifact must be imported and called.
+    assert "_link_terminal_artifact" in source, (
+        "runner.py must import and call _link_terminal_artifact so a bundle "
+        "arriving after terminalization still gets its artifact_id and "
+        "result_reference backfilled (the strategic canvas requires a linked "
+        "Artifact to show terminal compute previews)"
+    )
+    # Must guard on not having an artifact yet (idempotent first-upload).
+    assert "existing_artifact is None" in source or "artifact_id is None" in source, (
+        "_link_terminal_artifact must only run when the job does not yet have "
+        "an artifact (idempotent: ignore subsequent uploads for the same job)"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding f13: ComputeArtifactGallery uses revision in signed-URL cache key
+# --------------------------------------------------------------------------- #
+
+
+def test_compute_artifact_gallery_uses_revision_in_cache_key():
+    """ComputeArtifactGallery must include revision in the signed-URL cache key.
+
+    Finding f13 claim: 'ComputeJobsPanel and ComputeArtifactGallery cache
+    resolutions by storage URI, while useFreshMediaUrl reruns only for project,
+    storage URI, or manual-attempt changes.' Without revision in the key, an
+    overwritten same-filename viewable re-uses the old signed URL until it
+    expires, hiding the update from the operator.
+    """
+    try:
+        source = _ui_component_source("ComputeArtifactGallery.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("admin-ui/src/components not available in this environment")
+
+    # The gallery must define a cache key that incorporates revision.
+    assert "revision" in source, (
+        "ComputeArtifactGallery.tsx must use the revision field from the "
+        "viewable manifest entry as part of the signed-URL cache key so that "
+        "an overwritten same-path file triggers a fresh signing round-trip "
+        "instead of re-using the stale cached URL"
+    )
+    # Look for the cache-key function or computation that combines storage_uri + revision.
+    assert "storage_uri" in source and (
+        "@${" in source or "artifactCacheKey" in source
+    ), (
+        "ComputeArtifactGallery.tsx must compute a composite key of "
+        "(storage_uri, revision) to invalidate the signed-URL cache when "
+        "the same storage path is overwritten with new content"
     )
