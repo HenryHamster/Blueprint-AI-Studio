@@ -21637,6 +21637,118 @@ async def _fake_viewable_upload(job_id, basename, data, content_type, *, calls):
 
 
 @pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_large_video_uses_streaming_seam(
+    client, db_session, monkeypatch
+):
+    """A video body above the spool threshold is uploaded via the STREAMING seam.
+
+    The whole point of the spool+streaming path: a multi-hundred-MiB video must
+    never be buffered whole in the orchestrator heap.  The test shrinks the spool
+    threshold to a trivially small value so the test payload (a few KB) rolls to
+    disk and the streaming branch activates, then asserts that
+    ``upload_compute_job_viewable_stream`` is called with a file-like object that
+    reads back the exact file bytes — while ``upload_compute_job_viewable_file``
+    (the OOM vector) is never called.
+    """
+    from app.routers import agent_compute_jobs as agent_mod
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="GCP VM Stream Viewable", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    video_bytes = b"\x00\x01FAKE-MP4-PAYLOAD" * 64  # ~1 KiB, distinctive
+
+    captured: dict = {}
+    fake_uri = (
+        f"gs://test-bucket/compute-jobs/{job.id}/artifacts/viewable/rollout.mp4"
+    )
+
+    async def _fake_stream(job_id, basename, fileobj, content_type, *, size=None):
+        captured["read"] = fileobj.read()
+        captured["size"] = size
+        captured["content_type"] = content_type
+        captured["basename"] = basename
+        return fake_uri
+
+    body, content_type = _build_viewable_multipart_body(video_bytes, "rollout.mp4")
+
+    # Shrink the spool threshold so the modest test payload rolls to disk and
+    # activates the streaming branch.  The in-memory seam MUST NOT be touched.
+    with monkeypatch.context() as mp:
+        mp.setattr(agent_mod, "_MAX_VIEWABLE_FILE_BYTES", 8)
+        mp.setattr(agent_mod, "_MULTIPART_BODY_MARGIN", 8)
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_stream",
+            _fake_stream,
+        )
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_file",
+            AsyncMock(
+                side_effect=AssertionError(
+                    "rolled video must not use the in-memory upload seam"
+                )
+            ),
+        )
+
+        resp = await client.post(
+            f"/api/agent/compute-jobs/{job.id}/viewable",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+    assert resp.status_code == 200, (
+        f"Expected 200 for streamed video, got {resp.status_code}: {resp.text}"
+    )
+    body_json = resp.json()
+    assert body_json["ok"] is True
+    assert body_json["entry"]["kind"] == "video"
+    assert body_json["entry"]["storage_uri"] == fake_uri
+    assert body_json["entry"]["size_bytes"] == len(video_bytes)
+
+    # The streamed bytes are EXACTLY the file part — no multipart framing.
+    assert captured["read"] == video_bytes, (
+        "streaming seam must yield exactly the file part bytes, no multipart framing"
+    )
+    assert captured["size"] == len(video_bytes)
+    assert captured["content_type"] == "video/mp4"
+
+    # DB row + manifest recorded with the streamed size.
+    await db_session.refresh(job)
+    vf = (job.polling_metadata or {}).get("viewable_files", [])
+    assert len(vf) == 1 and vf[0]["size_bytes"] == len(video_bytes)
+
+
+@pytest.mark.asyncio
 async def test_gcp_vm_heartbeat_stamps_live_viewable_file(
     client, db_session, monkeypatch
 ):

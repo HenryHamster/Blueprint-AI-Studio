@@ -238,3 +238,91 @@ def test_main_returns_1_on_missing_args():
     assert result == 1
 
 
+# ---------------------------------------------------------------------------
+# Size guard — _upload_file skips oversized files without reading them
+# ---------------------------------------------------------------------------
+
+
+def test_upload_file_skips_image_exceeding_in_memory_cap(tmp_path):
+    """An image file larger than _IN_MEMORY_BYTES returns True without reading.
+
+    The server would reject it with HTTP 413 anyway, so the watcher treats it
+    as a permanent skip (True) so the same file is not retried on the next poll.
+    ``urlopen`` must NOT be called — no bytes should reach the network.
+    """
+    big_img = tmp_path / "huge.png"
+    # Write exactly one byte over the cap.
+    big_img.write_bytes(b"X" * (_vw._IN_MEMORY_BYTES + 1))
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        result = _upload_file(
+            "https://orch.example.com", "job-img-cap", "tok",
+            "huge.png", str(big_img),
+        )
+
+    assert result is True, f"expected permanent-skip True, got {result!r}"
+    mock_urlopen.assert_not_called()
+
+
+def test_upload_file_skips_video_exceeding_max_video_cap(tmp_path):
+    """A video file over _MAX_VIDEO_BYTES is skipped (True) without a network call."""
+    big_vid = tmp_path / "huge.mp4"
+    big_vid.write_bytes(b"V" * (_vw._MAX_VIDEO_BYTES + 1))
+
+    with patch("urllib.request.urlopen") as mock_urlopen:
+        result = _upload_file(
+            "https://orch.example.com", "job-vid-cap", "tok",
+            "huge.mp4", str(big_vid),
+        )
+
+    assert result is True, f"expected permanent-skip True, got {result!r}"
+    mock_urlopen.assert_not_called()
+
+
+def test_upload_file_image_within_cap_proceeds(tmp_path):
+    """An image at exactly _IN_MEMORY_BYTES is NOT skipped — a network call is made."""
+    ok_img = tmp_path / "ok.png"
+    ok_img.write_bytes(b"P" * _vw._IN_MEMORY_BYTES)  # exactly at cap, not over
+
+    with patch("urllib.request.urlopen", return_value=_fake_response(200)):
+        result = _upload_file(
+            "https://orch.example.com", "job-img-ok", "tok",
+            "ok.png", str(ok_img),
+        )
+
+    assert result is True
+
+
+def test_upload_file_file_grown_past_cap_after_stat_is_skipped(tmp_path):
+    """A file that grows past the cap between stat and read is permanently skipped.
+
+    The watcher does os.path.getsize() then f.read(cap+1). If the file grew
+    in the interim, len(file_data) > size_cap and the function returns True
+    (permanent skip) without uploading. This verifies the grow-sentinel logic.
+    """
+    img = tmp_path / "growing.png"
+    cap = _vw._IN_MEMORY_BYTES
+    # File initially at cap — stat OK.
+    img.write_bytes(b"X" * cap)
+
+    def _fake_getsize(path):
+        # First call: report at-cap size (passes the guard).
+        # Then the actual read below reads cap+1 bytes to trigger the sentinel.
+        return cap
+
+    with patch("os.path.getsize", side_effect=_fake_getsize), \
+         patch("urllib.request.urlopen") as mock_urlopen:
+        # Write one extra byte so f.read(cap+1) returns cap+1 bytes,
+        # triggering the grow-sentinel branch.
+        img.write_bytes(b"X" * (cap + 1))
+        result = _upload_file(
+            "https://orch.example.com", "job-grow", "tok",
+            "growing.png", str(img),
+        )
+
+    assert result is True, (
+        f"file grown past cap should be permanently skipped, got {result!r}"
+    )
+    mock_urlopen.assert_not_called()
+
+

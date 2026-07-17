@@ -2179,6 +2179,11 @@ _MAX_VIEWABLE_IMAGE_BYTES = 8 * 1024 * 1024  # 8 MiB (server caps images here)
 _MAX_VIEWABLE_VIDEO_BYTES = 512 * 1024 * 1024  # 512 MiB (server caps videos here)
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
 _FINAL_VIEWABLE_DRAIN_SECONDS = 10.0
+# Maximum total directory entries (files + dirs) inspected per scan cycle.
+# Without a cap, a task that writes thousands of non-viewable files (checkpoints,
+# logs) causes an unbounded os.walk on every 30-second heartbeat, blocking I/O
+# proportional to the directory size rather than the 25-file viewable budget.
+_VIEWABLE_SCAN_FILE_CAP = 10_000
 
 
 def _report_retry_sleep(attempt: int) -> float:
@@ -4138,11 +4143,17 @@ def _scan_viewable_files(artifact_dir: str) -> list:
     ):
         return []
     candidates: list = []
+    scanned = 0
     for root, dirs, names in os.walk(artifact_dir, followlinks=False):
         # Defense in depth: prune symlinked dirs so a swapped entry cannot leak
         # even if the platform's walk were to follow them.
         dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
         for name in names:
+            if scanned >= _VIEWABLE_SCAN_FILE_CAP:
+                # Return what we have rather than walking an unbounded directory.
+                candidates.sort(key=lambda c: c["relpath"])
+                return candidates
+            scanned += 1
             abspath = os.path.join(root, name)
             try:
                 if os.path.islink(abspath):
@@ -4467,6 +4478,13 @@ def _stream_viewable_files(
     failure (network blip, 4xx, 5xx) is swallowed and streaming continues, exactly
     like the interim ``running`` progress reports.
     """
+    # Reset per-scan skip counters so the omissions reported to the backend
+    # reflect THIS heartbeat's scan, not files skipped in earlier cycles that
+    # may have since been deleted or resized.  The *_logged guards remain
+    # persistent so each file emits at most one log line over the job lifetime.
+    state.oversize_relpaths = set()
+    state.count_cap_relpaths = set()
+
     try:
         candidates = _scan_viewable_files(artifact_dir)
     except Exception as exc:  # noqa: BLE001 — scanning is strictly best-effort

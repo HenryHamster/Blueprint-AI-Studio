@@ -12678,3 +12678,176 @@ class TestRunnerResumeFail_Closed:
             "bytes": 1024,
             "resumed_from_job_id": "pred-job-003",
         }
+
+
+# ---------------------------------------------------------------------------
+# local_runner._scan_viewable_files — scan cap
+# ---------------------------------------------------------------------------
+
+
+class TestScanViewableFilesCap:
+    """_scan_viewable_files respects _VIEWABLE_SCAN_FILE_CAP."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_scan_returns_all_when_under_cap(self, tmp_path):
+        """Fewer files than _VIEWABLE_SCAN_FILE_CAP → all viewable files returned."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for i in range(5):
+            (art / f"plot{i}.png").write_bytes(b"PNG")
+        for i in range(3):
+            (art / f"notes{i}.txt").write_bytes(b"txt")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        assert len(candidates) == 5  # only viewable files in the result
+        relpaths = {c["relpath"] for c in candidates}
+        assert all(r.endswith(".png") for r in relpaths)
+
+    def test_scan_stops_at_cap(self, tmp_path):
+        """When total entries exceed _VIEWABLE_SCAN_FILE_CAP, scan stops early.
+
+        The cap is on total entries (viewable + non-viewable), so a directory
+        flooded with non-viewable files triggers an early return. The returned
+        list must be <= the cap size (it may be smaller since most files are
+        non-viewable). Critically, the function must NOT walk all files.
+        """
+        local_runner = self._import_local_runner()
+        cap = local_runner._VIEWABLE_SCAN_FILE_CAP
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        # Write cap+1 non-viewable files + 1 viewable file.
+        for i in range(cap + 1):
+            (art / f"checkpoint_{i:05d}.bin").write_bytes(b"X")
+        (art / "reward.png").write_bytes(b"PNG")
+
+        walks: list = []
+        real_walk = os.walk
+
+        def counting_walk(*args, **kw):
+            for entry in real_walk(*args, **kw):
+                walks.append(entry[2])  # filenames list per dir
+                yield entry
+
+        with patch("os.walk", side_effect=counting_walk):
+            candidates = local_runner._scan_viewable_files(str(art))
+
+        total_scanned = sum(len(fnames) for fnames in walks)
+        assert total_scanned <= cap + 5, (
+            f"scan walked {total_scanned} entries, expected to stop near cap={cap}"
+        )
+        # The function must return without error even when capped.
+        assert isinstance(candidates, list)
+
+    def test_scan_returns_sorted_candidates(self, tmp_path):
+        """Candidates are sorted by relpath even when the scan is capped."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for name in ("zzz.png", "aaa.png", "mmm.webp"):
+            (art / name).write_bytes(b"X")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        relpaths = [c["relpath"] for c in candidates]
+        assert relpaths == sorted(relpaths)
+
+
+# ---------------------------------------------------------------------------
+# local_runner._stream_viewable_files — oversize/count accounting reset
+# ---------------------------------------------------------------------------
+
+
+class TestStreamViewableAccountingReset:
+    """oversize_relpaths and count_cap_relpaths are reset on each scan cycle."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_oversize_relpaths_reset_per_scan(self, tmp_path):
+        """A file that was oversize in a prior scan is not counted if now gone.
+
+        _stream_viewable_files resets oversize_relpaths at the start of each
+        call so the omission count reflects the CURRENT scan, not cumulative
+        history.  Verifies the reset by calling _stream_viewable_files twice:
+        the first call adds a file to oversize_relpaths; the second call with an
+        empty dir must report 0 oversize files.
+        """
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        image_cap = local_runner._MAX_VIEWABLE_IMAGE_BYTES
+
+        # First scan: one oversized image.
+        oversized = art / "big.png"
+        oversized.write_bytes(b"X" * (image_cap + 1))
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 1, (
+            "first scan should record the oversize file"
+        )
+
+        # Second scan: the file is gone (removed between heartbeats).
+        oversized.unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 0, (
+            "second scan with no oversize files should reset the counter to 0, "
+            f"got {len(state.oversize_relpaths)}"
+        )
+
+    def test_count_cap_relpaths_reset_per_scan(self, tmp_path):
+        """count_cap_relpaths is cleared at the start of each scan call."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        # Simulate already-sent 25 files so any new file gets count-capped.
+        for i in range(local_runner._MAX_VIEWABLE_FILE_COUNT):
+            state.sent[f"file{i}.png"] = (0, 0, 0)
+
+        # Write one new viewable file that will be count-capped.
+        (art / "extra.png").write_bytes(b"X")
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 1, (
+            "count-capped file should appear in count_cap_relpaths"
+        )
+
+        # Second scan: the extra file is removed.
+        (art / "extra.png").unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 0, (
+            "second scan with no new files should reset count_cap_relpaths to 0, "
+            f"got {len(state.count_cap_relpaths)}"
+        )

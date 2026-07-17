@@ -1,5 +1,6 @@
 """Agent-facing compute-job launch and polling endpoints."""
 
+import asyncio
 import base64
 import binascii
 import hmac
@@ -379,6 +380,152 @@ def _parse_progress_sample(body: bytes) -> tuple[str, float] | None:
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
 
 
+# ── Streaming multipart helpers for large (video) bodies ────────────────────
+# Mirror of runner.py's _FileRangeReader + _parse_multipart_form_stream: the
+# same streaming strategy is needed on the agent-facing viewable endpoint so
+# a multi-hundred-MiB video upload never materialises in the orchestrator heap.
+
+_MAX_MULTIPART_PARTS = 64
+_MAX_MULTIPART_FIELD_BYTES = 4 * 1024  # 4 KiB
+
+
+class _FileRangeReader:
+    """Bounded, forward-only reader over a byte range of a seekable file.
+
+    Presents ``[start, start + length)`` of ``fileobj`` as its own read stream
+    so the (potentially multi-hundred-MiB) file part of a spooled multipart
+    body can be streamed to GCS via ``blob.upload_from_file`` WITHOUT ever
+    buffering it in the orchestrator heap.
+    """
+
+    def __init__(self, fileobj, start: int, length: int):
+        self._f = fileobj
+        self._remaining = max(0, length)
+        self._f.seek(start)
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        want = (
+            self._remaining if size is None or size < 0 else min(size, self._remaining)
+        )
+        data = self._f.read(want)
+        self._remaining -= len(data)
+        return data
+
+
+def _parse_multipart_form_stream(
+    fileobj,
+    content_type: str,
+    *,
+    read_chunk: int = 1024 * 1024,
+    header_window: int = 64 * 1024,
+    max_parts: int = _MAX_MULTIPART_PARTS,
+    max_field_bytes: int = _MAX_MULTIPART_FIELD_BYTES,
+) -> tuple[dict, dict | None]:
+    """Memory-bounded multipart parse over a SEEKABLE binary file.
+
+    The streaming counterpart of :func:`_parse_multipart_form`: locates each
+    part by scanning the file for boundary delimiters in a bounded sliding
+    window so the large file part is never loaded into memory. Scalar fields
+    are read into memory as bytes; the single file part is returned as a
+    byte-range descriptor ``{"name", "filename", "start", "length"}`` the
+    caller streams via :class:`_FileRangeReader`.
+
+    Returns ``(fields, file_part)`` where ``file_part`` is ``None`` when no
+    file part is present.
+    """
+    fields: dict[str, bytes] = {}
+    file_part: dict | None = None
+
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return fields, None
+
+    delimiter = b"--" + boundary.encode("latin-1")
+    dlen = len(delimiter)
+
+    positions: list[int] = []
+    fileobj.seek(0)
+    overlap = dlen - 1
+    carry = b""
+    base = 0
+    while True:
+        chunk = fileobj.read(read_chunk)
+        if not chunk:
+            break
+        buf = carry + chunk
+        search_from = 0
+        while True:
+            idx = buf.find(delimiter, search_from)
+            if idx == -1:
+                break
+            positions.append(base + idx)
+            if len(positions) > max_parts:
+                raise ValueError(
+                    f"multipart body contains more than {max_parts} boundary markers"
+                )
+            search_from = idx + dlen
+        keep = min(len(buf), overlap)
+        base += len(buf) - keep
+        carry = buf[len(buf) - keep:] if keep else b""
+
+    for i in range(len(positions) - 1):
+        seg_start = positions[i] + dlen
+        seg_end = positions[i + 1]
+        if seg_start >= seg_end:
+            continue
+        fileobj.seek(seg_start)
+        window = fileobj.read(min(header_window, seg_end - seg_start))
+        if window.startswith(b"--"):
+            continue
+        header_off = 2 if window.startswith(b"\r\n") else 0
+        header_rel = window.find(b"\r\n\r\n", header_off)
+        if header_rel == -1:
+            continue
+        header_block = window[header_off:header_rel].decode("latin-1", "replace")
+        content_start = seg_start + header_rel + 4
+        content_end = seg_end
+        if content_end - content_start >= 2:
+            content_end -= 2
+
+        name = None
+        filename = None
+        for hline in header_block.split("\r\n"):
+            if hline.lower().startswith("content-disposition:"):
+                for param in hline.split(";")[1:]:
+                    param = param.strip()
+                    if param.startswith("name="):
+                        name = param[len("name="):].strip().strip('"')
+                    elif param.startswith("filename="):
+                        filename = param[len("filename="):].strip().strip('"')
+        if name is None:
+            continue
+        length = max(0, content_end - content_start)
+        if filename is not None:
+            if file_part is None:
+                file_part = {
+                    "name": name,
+                    "filename": filename,
+                    "start": content_start,
+                    "length": length,
+                }
+        else:
+            if length > max_field_bytes:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {max_field_bytes} byte limit"
+                )
+            fileobj.seek(content_start)
+            fields[name] = fileobj.read(length)
+
+    return fields, file_part
+
+
 def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
     """Parse a ``multipart/form-data`` body without requiring ``python-multipart``.
 
@@ -483,9 +630,9 @@ async def upload_compute_job_viewable(
     # multipart framing overhead.
     max_body_bytes = _MAX_VIEWABLE_VIDEO_BYTES + _MULTIPART_BODY_MARGIN
     spool_threshold = _MAX_VIEWABLE_FILE_BYTES + _MULTIPART_BODY_MARGIN
-    spool = tempfile.SpooledTemporaryFile(max_size=spool_threshold)
-    try:
+    with tempfile.SpooledTemporaryFile(max_size=spool_threshold) as spool:
         received = 0
+        chunk_count = 0
         async for chunk in request.stream():
             received += len(chunk)
             if received > max_body_bytes:
@@ -494,18 +641,45 @@ async def upload_compute_job_viewable(
                     detail="viewable file body exceeds upload cap",
                 )
             spool.write(chunk)
+            chunk_count += 1
+            # Yield the event loop every 64 chunks so a large video upload
+            # cannot monopolize it during body ingestion.
+            if chunk_count % 64 == 0:
+                await asyncio.sleep(0)
 
-        spool.seek(0)
-        raw = spool.read()
-        fields, files = _parse_multipart_form(
-            raw, request.headers.get("content-type") or "",
-        )
-        file_bytes = files.get("file")
-        if file_bytes is None:
-            raise HTTPException(
-                status_code=400, detail="missing 'file' field in multipart form"
-            )
-        file_length = len(file_bytes)
+        req_content_type = request.headers.get("content-type") or ""
+
+        # At/below the spool threshold the whole body is still in memory:
+        # reuse the in-memory parser and upload seam (fast path for images).
+        # Above it the body rolled to disk: parse and upload by STREAMING the
+        # file part so its bytes never re-enter the heap.
+        stream_upload = received > spool_threshold
+        file_part: dict | None = None
+        try:
+            if stream_upload:
+                fields, file_part = await asyncio.to_thread(
+                    _parse_multipart_form_stream, spool, req_content_type
+                )
+                if file_part is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="missing 'file' field in multipart form",
+                    )
+                file_bytes = None
+                file_length = file_part["length"]
+            else:
+                spool.seek(0)
+                raw = spool.read()
+                fields, files = _parse_multipart_form(raw, req_content_type)
+                file_bytes = files.get("file")
+                if file_bytes is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="missing 'file' field in multipart form",
+                    )
+                file_length = len(file_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         if file_length == 0:
             raise HTTPException(
                 status_code=400, detail="empty viewable file body"
@@ -588,9 +762,21 @@ async def upload_compute_job_viewable(
             )
 
         # ── Upload to GCS ───────────────────────────────────────────────
-        uploaded_uri = await storage.upload_compute_job_viewable_file(
-            job_id, safe_name, file_bytes, content_type,
-        )
+        # Large bodies (videos that rolled to disk) are STREAMED so their bytes
+        # never re-enter the orchestrator heap. In-memory bodies use the simpler
+        # bytes-based seam.
+        if stream_upload and file_part is not None:
+            uploaded_uri = await storage.upload_compute_job_viewable_stream(
+                job_id,
+                safe_name,
+                _FileRangeReader(spool, file_part["start"], file_length),
+                content_type,
+                size=file_length,
+            )
+        else:
+            uploaded_uri = await storage.upload_compute_job_viewable_file(
+                job_id, safe_name, file_bytes, content_type,
+            )
         if uploaded_uri is None:
             logger.warning(
                 "[AGENT_JOBS] GCS upload failed for viewable file %r on "
@@ -602,9 +788,6 @@ async def upload_compute_job_viewable(
                 status_code=502,
                 detail="viewable file upload to storage failed",
             )
-
-    finally:
-        spool.close()
 
     # ── Re-read with row lock — re-check terminal + count cap ──────────
     result = await session.execute(
