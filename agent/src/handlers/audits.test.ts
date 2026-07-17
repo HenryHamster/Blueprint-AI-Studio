@@ -1130,6 +1130,172 @@ describe('handleReleaseAudit — pinned candidate + diff-range pre-flight', () =
   });
 });
 
+// ── handleReleaseAudit — reviewed_paths per-path verdicts ────────────────────
+describe('handleReleaseAudit — reviewed_paths per-path verdicts', () => {
+  const CANDIDATE_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+  const RELEASE_PAYLOAD = { base_branch: 'main', candidate_sha: CANDIDATE_SHA };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(git).mockReturnValue('');
+  });
+
+  it('all changed paths are "clean" when findings list is empty', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/foo.py\nA\tbackend/app/bar.py\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as { reviewed_paths: Record<string, string> };
+    expect(report.reviewed_paths).toEqual({
+      'backend/app/foo.py': 'clean',
+      'backend/app/bar.py': 'clean',
+    });
+  });
+
+  it('path matching a finding file is marked "finding"; other changed paths remain "clean"', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/auth.py\nM\tbackend/app/models.py\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 0.5,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [{ severity: 'high', summary: 'SQL injection', file: 'backend/app/auth.py', verification_note: 'line 42' }],
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as { reviewed_paths: Record<string, string> };
+    expect(report.reviewed_paths['backend/app/auth.py']).toBe('finding');
+    expect(report.reviewed_paths['backend/app/models.py']).toBe('clean');
+  });
+
+  it('a finding whose file is not in changed_paths is absent from reviewed_paths', async () => {
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/foo.py\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 0.5,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      // Cross-cutting finding with empty file — must not pollute reviewed_paths
+      findings: [{ severity: 'medium', summary: 'cross-cutting concern', file: '' }],
+    });
+
+    await handleReleaseAudit(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as { reviewed_paths: Record<string, string> };
+    expect(Object.keys(report.reviewed_paths)).toEqual(['backend/app/foo.py']);
+    expect(report.reviewed_paths['backend/app/foo.py']).toBe('clean');
+  });
+
+  it('incremental run: reviewed_paths keys match audit_scope.changed_paths (two-dot scope)', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tagent/src/handlers/audits.ts\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { ...RELEASE_PAYLOAD, audit_base_sha: auditBaseSha }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as {
+      reviewed_paths: Record<string, string>;
+      audit_scope: { mode: string; changed_paths: string[] };
+    };
+    expect(report.audit_scope.mode).toBe('incremental');
+    expect(Object.keys(report.reviewed_paths).sort()).toEqual([...report.audit_scope.changed_paths].sort());
+  });
+
+  it('fallback: fallback_reason carries "ancestor_check_failed:" prefix on merge-base failure', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'merge-base') throw new Error('not an ancestor');
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\nM\tbackend/app/auth.py\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { ...RELEASE_PAYLOAD, audit_base_sha: auditBaseSha }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as {
+      audit_scope: { mode: string; fallback_reason: string; changed_paths: string[] };
+      reviewed_paths: Record<string, string>;
+    };
+    expect(report.audit_scope.mode).toBe('full');
+    expect(report.audit_scope.fallback_reason).toContain('ancestor_check_failed:');
+    expect(report.audit_scope.fallback_reason).toContain('not an ancestor');
+    // reviewed_paths must cover the full changed set for this fallback run
+    expect(Object.keys(report.reviewed_paths).sort()).toEqual([...report.audit_scope.changed_paths].sort());
+  });
+
+  it('fallback: fallback_reason carries "cat_file_failed:" prefix on cat-file failure', async () => {
+    const auditBaseSha = '0123456789abcdef0123456789abcdef01234567';
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (a[0] === 'cat-file') throw new Error('bad object a1b2c3');
+      if (a[0] === 'diff' && a[1] === '--name-status') return 'M\tbackend/app/main.py\n';
+      if (a[0] === 'diff') return '';
+      return Buffer.from('');
+    });
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      audit_score: 1,
+      test_erosion: { deleted_test_files: [], assertion_delta: 0, test_count_delta: 0 },
+      findings: [],
+    });
+
+    await handleReleaseAudit(
+      TASK_ID, { ...RELEASE_PAYLOAD, audit_base_sha: auditBaseSha }, BASE_TASK,
+      GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+    );
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls.at(-1)?.[1];
+    const report = JSON.parse(call?.logs as string) as {
+      audit_scope: { fallback_reason: string };
+    };
+    expect(report.audit_scope.fallback_reason).toContain('cat_file_failed:');
+    expect(report.audit_scope.fallback_reason).toContain('bad object a1b2c3');
+  });
+});
+
 // ── resolveCandidateSha — payload/context SHA resolution + validation ─────────
 describe('resolveCandidateSha', () => {
   const FULL_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
