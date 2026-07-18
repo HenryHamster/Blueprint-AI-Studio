@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
-from app.models import ProjectMessage, TaskStatus
+from app.models import Task, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.resident_agent_rate_limits import (
@@ -49,7 +49,11 @@ from app.strategic_resident_agent_binding import (
     ResidentAgentTaskNotFound,
     load_live_resident_agent_task_locked,
 )
-from app.strategic_resident_capabilities import CapabilityMode, capability_for
+from app.strategic_resident_capabilities import (
+    INVOKABLE_CAPABILITY_IDS,
+    CapabilityMode,
+    capability_for,
+)
 from app.strategic_resident_capability_invocation import (
     CapabilityEvidenceRef,
     ResidentCapabilityInvocation,
@@ -96,18 +100,20 @@ from app.strategic_resident_task_inspection import (
 
 router = APIRouter(prefix="/api/agent/resident-turn", tags=["agent"])
 
-_INSPECTION_OPERATION_KINDS = frozenset(INSPECTION_CAPABILITY_KINDS.values())
-
-
 def _build_receipt_evidence_set(
     receipts: Iterable[StrategicOperationReceipt],
+    *,
+    expected_context_hash: str,
 ) -> frozenset[EvidenceKey]:
     """Return the set of (kind, source_id, revision, checksum) tuples from this turn's receipts."""
     entries: set[EvidenceKey] = set()
     for receipt in receipts:
         if (
-            str(receipt.operation_kind) not in _INSPECTION_OPERATION_KINDS
+            INSPECTION_CAPABILITY_KINDS.get(str(receipt.capability))
+            != str(receipt.operation_kind)
             or str(receipt.status) not in SUCCESSFUL_INSPECTION_STATUSES
+            or str((receipt.expected_revisions or {}).get("context_hash") or "")
+            != expected_context_hash
         ):
             continue
         body = receipt.receipt or {}
@@ -141,6 +147,20 @@ async def _check_evidence_refs_against_receipts(
     if not evidence:
         return
     try:
+        turn_context = await session.scalar(
+            select(Task.context).where(
+                Task.id == binding.task_id,
+                Task.project_id == binding.project_id,
+            )
+        )
+        context_hash = str(
+            (turn_context or {}).get(TURN_CONTEXT_HASH_KEY) or ""
+        )
+        if not context_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Resident turn context is not frozen for evidence use",
+            )
         rows = (
             await session.execute(
                 select(StrategicOperationReceipt).where(
@@ -149,7 +169,10 @@ async def _check_evidence_refs_against_receipts(
                 )
             )
         ).scalars().all()
-        trusted = _build_receipt_evidence_set(rows)
+        trusted = _build_receipt_evidence_set(
+            rows,
+            expected_context_hash=context_hash,
+        )
         for ref in evidence:
             if (ref.kind, ref.source_id, ref.revision, ref.checksum) not in trusted:
                 raise HTTPException(
@@ -161,6 +184,73 @@ async def _check_evidence_refs_against_receipts(
 
 MAX_CAPABILITY_REQUESTS_PER_TURN = 8
 _CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY = "_strategic_resident_capability_requests"
+_MAX_PROJECTED_UNKNOWN_EFFECTS = 50
+
+
+def _completion_projection(
+    receipt: StrategicOperationReceipt,
+    *,
+    capability_id: str,
+) -> dict[str, Any]:
+    """Return a bounded final-result projection backed by the durable receipt."""
+
+    receipt_id = str(receipt.id)
+    operation_id = str(receipt.operation_id)
+    receipt_status = str(receipt.status)
+    operation_status = (
+        receipt_status
+        if receipt_status in {"applied", "reconciled", "failed"}
+        else "applying"
+    )
+    unknown_effects: list[dict[str, str]] = []
+    unknown_sources = getattr(receipt, "unknown_effects", None) or []
+    for raw in list(unknown_sources)[:_MAX_PROJECTED_UNKNOWN_EFFECTS]:
+        identity = (
+            raw.get("effect_id", raw.get("id"))
+            if isinstance(raw, Mapping)
+            else raw
+        )
+        if identity is None:
+            continue
+        effect_id = str(identity)
+        if not effect_id or len(effect_id) > 512:
+            continue
+        unknown_effects.append(
+            {
+                "effect_id": effect_id,
+                "operation_id": operation_id,
+                "receipt_id": receipt_id,
+                "summary": "The external effect outcome is unknown and requires reconciliation.",
+                "reconciliation_status": "requires_attention",
+            }
+        )
+    required_attention = []
+    if unknown_effects:
+        required_attention.append(
+            {
+                "attention_id": f"unknown-effect:{receipt_id}",
+                "severity": "critical",
+                "summary": "Reconcile the uncertain external effect before retrying.",
+                "evidence_ids": [],
+                "receipt_ids": [receipt_id],
+            }
+        )
+    return {
+        "operation": {
+            "operation_id": operation_id,
+            "capability": capability_id,
+            "status": operation_status,
+            "summary": "Server-authorized Resident operation.",
+        },
+        "receipt": {
+            "operation_id": operation_id,
+            "receipt_id": receipt_id,
+            "status": receipt_status,
+            "summary": "Durable server operation receipt.",
+        },
+        "unknown_effects": unknown_effects,
+        "required_attention": required_attention,
+    }
 
 _TASK_INSPECTION_KINDS = {
     "task.inspect": "task",
@@ -238,39 +328,6 @@ def _register_capability_request(
 _capability_rate_key = resident_task_token_rate_key
 
 
-async def _validate_approval_ref(
-    session: AsyncSession,
-    approval_ref: str | None,
-    project_id: uuid.UUID,
-) -> None:
-    """Reject mutations whose approval_ref is missing, foreign, or agent-authored."""
-
-    if not approval_ref:
-        raise HTTPException(
-            status_code=403,
-            detail="capability requires an explicit operator approval_ref",
-        )
-    try:
-        approval_id = uuid.UUID(approval_ref)
-    except ValueError:
-        raise HTTPException(
-            status_code=403,
-            detail="approval_ref must be a valid UUID",
-        ) from None
-    result = await session.execute(
-        select(ProjectMessage).where(
-            ProjectMessage.id == approval_id,
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.from_type == "user",
-        ).limit(1)
-    )
-    if result.scalar_one_or_none() is None:
-        raise HTTPException(
-            status_code=403,
-            detail="approval_ref does not reference a valid human operator message for this project",
-        )
-
-
 @router.post("/capability")
 @limiter.limit("600/minute", key_func=resident_remote_rate_key)
 @limiter.limit("60/minute", key_func=_capability_rate_key)
@@ -294,6 +351,11 @@ async def invoke_resident_capability(
         raise HTTPException(
             status_code=501,
             detail="mutation capability is proposal-only until a fenced adapter exists",
+        )
+    if body.capability_id not in INVOKABLE_CAPABILITY_IDS:
+        raise HTTPException(
+            status_code=501,
+            detail="capability is proposal-only until a bounded adapter exists",
         )
     if spec.service != "resident_task_inspection":
         raise HTTPException(
@@ -393,6 +455,11 @@ async def invoke_resident_mutation(
     spec = capability_for(body.capability_id)
     if spec.mode is not CapabilityMode.mutate:
         raise HTTPException(status_code=400, detail="capability is not a mutation")
+    if body.capability_id not in INVOKABLE_CAPABILITY_IDS:
+        raise HTTPException(
+            status_code=501,
+            detail="mutation capability is proposal-only until a fenced adapter exists",
+        )
     # Resolve the fenced adapter: a DB-only Project-field / target-task mutation
     # (execute_fenced_db_operation), or an external-effect operation
     # (execute_external_effect_operation). External effects are gated by the
@@ -412,10 +479,22 @@ async def invoke_resident_mutation(
     lifecycle_kind = task_lifecycle_operation_kind(body.capability_id)
     if lifecycle_kind is not None:
         operation_kind = lifecycle_kind
+        raw_target = body.parameters.get("task_id")
+        if raw_target is None:
+            raise HTTPException(
+                status_code=400,
+                detail="task lifecycle mutation requires a task_id parameter",
+            )
+        target_task_id = uuid.UUID(str(raw_target))
         external_effect = build_task_lifecycle_effect(
             body.capability_id,
             project_id=binding.project_id,
             parameters=dict(body.parameters),
+            expected_target_updated_at=(
+                str(body.expected_revisions["target_task_updated_at"])
+                if body.expected_revisions.get("target_task_updated_at") is not None
+                else None
+            ),
         )
     elif spec.service in EXTERNAL_EFFECT_SERVICES:
         operation_kind = external_effect_operation_kind(body.capability_id)
@@ -451,14 +530,16 @@ async def invoke_resident_mutation(
             status_code=403,
             detail="mutation envelope does not match the turn token authority",
         )
+    # Validate decisive evidence before consuming a single-use operator
+    # approval. A fabricated/stale evidence envelope must not be able to burn a
+    # valid approval and then fail without performing its authorized effect.
+    await _check_evidence_refs_against_receipts(session, binding, body.evidence)
     # Explicit-approval capabilities require a durable operator approval scoped to
     # this exact operation (the key is derived from the parameters, so an approval
     # granted for one operation cannot authorise a different one). Consumed here
     # in the request transaction — idempotent per operation_id — before any effect.
-    # This durable-approval gate (migration 0632, keyed on capability+parameters)
-    # supersedes the earlier approval_ref-vs-ProjectMessage check on these same
-    # capabilities; the operator grant creates an approval record, not a message,
-    # so re-adding _validate_approval_ref here would 403 every real approval.
+    # This durable-approval gate is the complete approval identity: it is
+    # project-scoped, exact-parameter-bound, single-use, and TTL-bounded.
     if capability_requires_operator_approval(body.capability_id):
         try:
             await verify_and_consume_operation_approval(
@@ -484,13 +565,6 @@ async def invoke_resident_mutation(
         request_payload=dict(body.parameters),
         target_task_id=target_task_id,
     )
-    # Evidence refs supplied for a DB-fenced mutation must each be backed by a
-    # real inspection receipt from this turn. External-effect operations are
-    # governed by their own evidence preconditions + reconciliation-time trusted
-    # evidence index, and run on a session shape this read-then-rollback check
-    # does not apply to, so it is scoped to the fenced-DB path only.
-    if external_effect is None:
-        await _check_evidence_refs_against_receipts(session, binding, body.evidence)
     try:
         if external_effect is not None:
             receipt = await execute_external_effect_operation(
@@ -537,6 +611,10 @@ async def invoke_resident_mutation(
         "operation_id": receipt.operation_id,
         "status": receipt.status,
         "receipt_id": str(receipt.id),
+        "completion_projection": _completion_projection(
+            receipt,
+            capability_id=body.capability_id,
+        ),
     }
 
 

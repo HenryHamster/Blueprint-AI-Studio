@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.strategic_operation_authority_validation import RESIDENT_TURN_TASK_TYPE
+from app.strategic_operation_external_effect import ExternalEffectNotPerformed
 
 
 # capability_id -> (receipt operation_kind, PATCH-status the operator path applies).
@@ -42,6 +43,8 @@ def _lifecycle_effect(
     capability_id: str,
     project_id: uuid.UUID,
     parameters: dict[str, Any],
+    *,
+    expected_target_updated_at: str | None,
 ) -> Callable[[AsyncSession], Awaitable[dict[str, Any]]]:
     _kind, new_status = _TASK_LIFECYCLE_OPS[capability_id]
     target_task_id = uuid.UUID(str(parameters["task_id"]))
@@ -66,6 +69,13 @@ def _lifecycle_effect(
             str((task.first_payload or {}).get("type") or "") == RESIDENT_TURN_TASK_TYPE
         ):
             raise ValueError("cannot lifecycle-mutate a Resident turn task")
+        observed_updated_at = (
+            task.updated_at.isoformat() if task.updated_at is not None else None
+        )
+        if observed_updated_at != expected_target_updated_at:
+            raise ExternalEffectNotPerformed(
+                "target task changed after the lifecycle operation was authorized"
+            )
 
         background_tasks = BackgroundTasks()
         result = await modify_task_apply(
@@ -83,11 +93,17 @@ def build_task_lifecycle_effect(
     *,
     project_id: uuid.UUID,
     parameters: dict[str, Any],
+    expected_target_updated_at: str | None = None,
 ) -> Callable[[AsyncSession], Awaitable[dict[str, Any]]] | None:
     """Return the perform coroutine for a task-lifecycle capability, or None."""
 
     if capability_id in _TASK_LIFECYCLE_OPS:
-        return _lifecycle_effect(capability_id, project_id, parameters)
+        return _lifecycle_effect(
+            capability_id,
+            project_id,
+            parameters,
+            expected_target_updated_at=expected_target_updated_at,
+        )
     return None
 
 

@@ -80,6 +80,7 @@ class ResidentReceipt(_StrictResultModel):
     operation_id: Identifier = Field(min_length=1, max_length=200)
     receipt_id: str = Field(min_length=1, max_length=200)
     status: Literal[
+        "pending",
         "applying",
         "applied",
         "reconciling",
@@ -91,7 +92,9 @@ class ResidentReceipt(_StrictResultModel):
 
 
 class ResidentUnknownEffect(_StrictResultModel):
-    effect_id: Identifier = Field(min_length=1, max_length=120)
+    # External effect ids combine a bounded operation kind and operation id.
+    # Keep the completion contract bounded while admitting the full durable id.
+    effect_id: Identifier = Field(min_length=1, max_length=512)
     operation_id: Identifier = Field(min_length=1, max_length=200)
     receipt_id: str = Field(min_length=1, max_length=200)
     summary: str = Field(min_length=1, max_length=4_000)

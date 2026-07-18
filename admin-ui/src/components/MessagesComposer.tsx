@@ -22,8 +22,11 @@ export interface ComposerArtifactRef {
   artifact_ref_id?: string;
   kind?: string;
   title?: string;
+  label?: string;
   revision?: number | string;
 }
+
+export type ComposerSourceRef = ComposerArtifactRef;
 
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
@@ -47,6 +50,7 @@ export interface MessagesComposerProps {
   disabledReason?: string | null;
   pendingAttachments?: PendingAttachment[];
   retainedAttachmentCount?: number;
+  sourceRefs?: ComposerSourceRef[];
   artifactRefs?: ComposerArtifactRef[];
   uploading?: boolean;
   onPickStarterPrompt?: (value: string) => void;
@@ -96,6 +100,7 @@ export const MessagesComposer = memo(function MessagesComposer({
   disabledReason,
   pendingAttachments,
   retainedAttachmentCount = 0,
+  sourceRefs = [],
   artifactRefs = [],
   uploading,
   onOpenStrategicContext,
@@ -148,6 +153,14 @@ export const MessagesComposer = memo(function MessagesComposer({
         : sendState === 'accepted'
           ? 'Message accepted.'
           : null;
+
+  const displayedSourceRefs = [
+    ...sourceRefs,
+    ...artifactRefs.filter(artifact => {
+      const identity = String(artifact.artifact_ref_id || artifact.id || '');
+      return !identity || !sourceRefs.some(source => String(source.artifact_ref_id || source.id || '') === identity);
+    }),
+  ];
   const hasAttachments = (pendingAttachments?.length ?? 0) > 0 || retainedAttachmentCount > 0;
 
   // The pending attachment whose full-size preview is open (if any). If it was
@@ -354,11 +367,14 @@ export const MessagesComposer = memo(function MessagesComposer({
         </div>
       )}
 
-      {artifactRefs.length > 0 && (
+      {displayedSourceRefs.length > 0 && (
         <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached Resident sources" role="list">
-          {artifactRefs.map((ref, index) => {
-            const identity = String(ref.artifact_ref_id || ref.id || `artifact-${index}`);
-            const kind = ref.title || (ref.kind === 'whiteboard' ? 'Whiteboard' : ref.kind === 'notes' ? 'Notes' : 'Artifact');
+          {displayedSourceRefs.map((ref, index) => {
+            const identity = String(ref.artifact_ref_id || ref.id || `source-${index}`);
+            const fallbackKind = ref.kind ? ref.kind.replace(/_/g, ' ') : 'Source';
+            const kind = ref.title
+              || ref.label
+              || (ref.kind === 'whiteboard' ? 'Whiteboard' : ref.kind === 'notes' ? 'Notes' : fallbackKind);
             const revision = ref.revision == null ? '' : ` revision ${String(ref.revision)}`;
             const label = `${kind}${revision}`;
             return (

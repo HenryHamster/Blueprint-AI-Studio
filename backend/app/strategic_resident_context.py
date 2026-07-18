@@ -41,6 +41,17 @@ TARGET_INPUT_TOKENS_MIN = 24_000
 TARGET_INPUT_TOKENS_MAX = 40_000
 HARD_INPUT_TOKEN_PROXY = 40_000
 HARD_INPUT_BYTES = HARD_INPUT_TOKEN_PROXY * 4
+# The provider may perform up to eight bounded capability requests after the
+# initial context is frozen. Reserve their complete aggregate plus prompt
+# instructions/wrappers up front so a useful inspection never turns a valid
+# context into a >160 KB provider call.
+CAPABILITY_RESULTS_HARD_BYTES = 48_000
+PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES = 8_000
+PROVIDER_INPUT_FIT_BYTES = (
+    HARD_INPUT_BYTES
+    - CAPABILITY_RESULTS_HARD_BYTES
+    - PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES
+)
 MAX_CONVERSATION_MESSAGES = 48
 MAX_MESSAGE_CONTENT_BYTES = 12_000
 MAX_REPLY_EXCERPT_BYTES = 2_000
@@ -480,7 +491,7 @@ async def _preemption_projection(
 
 
 def _fit_provider_input(value: dict[str, Any]) -> dict[str, Any]:
-    fit_limit = HARD_INPUT_BYTES - 1_024
+    fit_limit = PROVIDER_INPUT_FIT_BYTES
     lane_context = value["lane_context"]
     messages = lane_context.get("recent_conversation") or []
     window = lane_context["conversation_window"]
@@ -753,6 +764,11 @@ async def reconstruct_authoritative_turn_input(
             "target_tokens_max": TARGET_INPUT_TOKENS_MAX,
             "hard_token_proxy": HARD_INPUT_TOKEN_PROXY,
             "hard_bytes": HARD_INPUT_BYTES,
+            "provider_input_fit_bytes": PROVIDER_INPUT_FIT_BYTES,
+            "capability_results_hard_bytes": CAPABILITY_RESULTS_HARD_BYTES,
+            "provider_prompt_overhead_reserve_bytes": (
+                PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES
+            ),
             "encoded_bytes": 0,
             "estimated_tokens": 0,
         },
@@ -795,7 +811,7 @@ async def reconstruct_authoritative_turn_input(
     final_bytes = len(_canonical_json(result))
     result["limits"]["encoded_bytes"] = final_bytes
     result["limits"]["estimated_tokens"] = math.ceil(final_bytes / 4)
-    if len(_canonical_json(result)) > HARD_INPUT_BYTES:
+    if len(_canonical_json(result)) > PROVIDER_INPUT_FIT_BYTES:
         raise InactiveTurnAuthority(
             "Resident provider input exceeds the final hard context budget"
         )
@@ -803,8 +819,11 @@ async def reconstruct_authoritative_turn_input(
 
 
 __all__ = [
+    "CAPABILITY_RESULTS_HARD_BYTES",
     "HARD_INPUT_BYTES",
     "HARD_INPUT_TOKEN_PROXY",
+    "PROVIDER_INPUT_FIT_BYTES",
+    "PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES",
     "STABLE_INSTRUCTIONS_VERSION",
     "TARGET_INPUT_TOKENS_MAX",
     "TARGET_INPUT_TOKENS_MIN",

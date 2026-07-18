@@ -5,6 +5,7 @@ import {
   executeStrategicWorkSessionCommand,
   fetchStrategicStateWithRevision,
   fetchStrategicConversation,
+  fetchResidentEngineHealth,
   findStrategicMessageByClientIdentity,
   deleteMessageAttachmentUpload,
   getMessageAttachmentUploadUrl,
@@ -95,6 +96,18 @@ describe('fetchStrategicConversation', () => {
     );
   });
 
+  test('sends a bounded conversation search independently from pagination', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ items: [], limit: 100, has_more: false }));
+    await fetchStrategicConversation('proj-1', { search: 'merge decision', limit: 100 });
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/strategic-conversation?limit=100&search=merge+decision',
+      undefined,
+      2,
+      30000,
+      undefined,
+    );
+  });
+
   test('identity recovery adopts only an exact canonical match', async () => {
     apiFetchMock.mockResolvedValueOnce(jsonResponse({
       items: [{ id: 'fallback', idempotency_key: 'send-1' }],
@@ -129,6 +142,23 @@ describe('fetchStrategicConversation', () => {
       });
     },
   );
+});
+
+describe('fetchResidentEngineHealth', () => {
+  beforeEach(() => apiFetchMock.mockReset());
+
+  test('fetches the owner rollout projection without waking the Resident', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ project_id: 'proj-1', resident_initialized: true }));
+    await expect(fetchResidentEngineHealth('proj-1')).resolves.toMatchObject({ resident_initialized: true });
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/proj-1/resident-engine/health', undefined, 1, 15000, undefined,
+    );
+  });
+
+  test.each([403, 404])('quietly omits the owner-only projection on %s', async status => {
+    apiFetchMock.mockResolvedValue(new Response(null, { status }));
+    await expect(fetchResidentEngineHealth('proj-1')).resolves.toBeNull();
+  });
 });
 
 describe('message attachment download URL cache', () => {

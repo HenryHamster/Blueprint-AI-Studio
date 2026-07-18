@@ -85,7 +85,10 @@ async def test_lifecycle_effect_calls_operator_modify_path(
     monkeypatch.setattr(admin_task_mutations, "modify_task_apply", _fake_modify)
 
     perform = build_task_lifecycle_effect(
-        capability, project_id=project.id, parameters={"task_id": str(task.id)}
+        capability,
+        project_id=project.id,
+        parameters={"task_id": str(task.id)},
+        expected_target_updated_at=task.updated_at.isoformat(),
     )
     result = await perform(db)
     # It ran the operator path with the correct status transition on the target.
@@ -103,7 +106,10 @@ async def test_lifecycle_effect_refuses_a_resident_turn_target(db, monkeypatch):
     monkeypatch.setattr(admin_task_mutations, "modify_task_apply", modify)
 
     perform = build_task_lifecycle_effect(
-        "task.cancel", project_id=project.id, parameters={"task_id": str(turn.id)}
+        "task.cancel",
+        project_id=project.id,
+        parameters={"task_id": str(turn.id)},
+        expected_target_updated_at=turn.updated_at.isoformat(),
     )
     with pytest.raises(ValueError, match="Resident turn task"):
         await perform(db)
@@ -120,8 +126,37 @@ async def test_lifecycle_effect_refuses_a_cross_project_target(db, monkeypatch):
 
     # A different project id cannot reach this project's task.
     perform = build_task_lifecycle_effect(
-        "task.cancel", project_id=uuid.uuid4(), parameters={"task_id": str(task.id)}
+        "task.cancel",
+        project_id=uuid.uuid4(),
+        parameters={"task_id": str(task.id)},
+        expected_target_updated_at=task.updated_at.isoformat(),
     )
     with pytest.raises(ValueError, match="not found in project"):
+        await perform(db)
+    modify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_effect_rejects_target_changed_after_authorization(
+    db, monkeypatch
+):
+    from app import admin_task_mutations
+    from app.strategic_operation_external_effect import ExternalEffectNotPerformed
+
+    project, task = await _project_and_task(db)
+    expected = task.updated_at.isoformat()
+    task.title = "changed concurrently"
+    db.add(task)
+    await db.commit()
+    modify = AsyncMock()
+    monkeypatch.setattr(admin_task_mutations, "modify_task_apply", modify)
+
+    perform = build_task_lifecycle_effect(
+        "task.cancel",
+        project_id=project.id,
+        parameters={"task_id": str(task.id)},
+        expected_target_updated_at=expected,
+    )
+    with pytest.raises(ExternalEffectNotPerformed, match="changed"):
         await perform(db)
     modify.assert_not_awaited()

@@ -40,6 +40,154 @@ describe('resident conversation pagination', () => {
     expect(merged[0]).toBe(existing[0]);
   });
 
+  test('reconciles a canonical message by client identity without duplicating its optimistic predecessor', () => {
+    const optimistic = { ...message(1), id: 'optimistic:send-1', idempotency_key: 'send-1' };
+    const canonical = { ...message(2), id: 'canonical-1', client_idempotency_key: 'send-1' };
+    const merged = mergeResidentConversationPages([optimistic], [canonical]);
+    expect(merged).toEqual([canonical]);
+  });
+
+  test('renders a canonical realtime projection immediately, then fills from the prior sequence', async () => {
+    vi.useFakeTimers();
+    let messages = [message(100)];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [message(101)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useResidentConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    rerender({ realtimeMessage: message(102) });
+    expect(messages.map(item => item.sequence)).toEqual([100, 102]);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({ afterSequence: 100 });
+    expect(messages.map(item => item.sequence)).toEqual([100, 101, 102]);
+    vi.useRealTimers();
+  });
+
+  test('preserves a full older row until a truncated realtime update is refetched by id', async () => {
+    vi.useFakeTimers();
+    let messages = [{ ...message(50), content: 'full durable content' }, message(100)];
+    const canonicalUpdate = { ...message(50), content: 'canonical updated content' };
+    fetchStrategicConversation
+      .mockResolvedValueOnce({
+        conversation: { limit: 1, has_more: false, next_before_sequence: null, items: [canonicalUpdate] },
+      })
+      .mockResolvedValueOnce({
+        conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+      });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage, requiresRefetch }) => useResidentConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        realtimeMessageRequiresCanonicalRefetch: requiresRefetch,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null, requiresRefetch: false } },
+    );
+
+    rerender({
+      realtimeMessage: { ...message(50), content: '', context: { projection_truncated: true } },
+      requiresRefetch: true,
+    });
+    expect(messages.find(item => item.sequence === 50)?.content).toBe('full durable content');
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      includeMessageId: 'message-50',
+      limit: 1,
+    });
+    expect(fetchStrategicConversation.mock.calls[1][1]).toMatchObject({ afterSequence: 100 });
+    expect(messages.find(item => item.sequence === 50)?.content).toBe('canonical updated content');
+    vi.useRealTimers();
+  });
+
+  test('debounces search and replaces the transcript with only server matches', async () => {
+    vi.useFakeTimers();
+    let messages = [message(1)];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [message(7)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { rerender } = renderHook(
+      ({ searchQuery }) => useResidentConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        searchQuery,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { searchQuery: '' } },
+    );
+
+    rerender({ searchQuery: 'deployment decision' });
+    expect(fetchStrategicConversation).not.toHaveBeenCalled();
+    await act(async () => { await vi.advanceTimersByTimeAsync(251); });
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({ search: 'deployment decision' });
+    expect(messages.map(item => item.sequence)).toEqual([7]);
+    vi.useRealTimers();
+  });
+
+  test('targeted navigation takes priority over an active search selector', async () => {
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [message(7)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const onTargetFetched = vi.fn();
+    const { result } = renderHook(() => useResidentConversation({
+      enabled: true,
+      projectId: 'project-1',
+      actorUserId: 'actor-1',
+      includeMessageId: 'message-7',
+      searchQuery: 'deployment decision',
+      getMessages: () => messages,
+      setMessages,
+      onLoadingChange: vi.fn(),
+      onError: vi.fn(),
+      onTargetFetched,
+    }));
+
+    await act(async () => { await result.current.refresh(); });
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      includeMessageId: 'message-7',
+      limit: 100,
+    });
+    expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('search');
+    expect(onTargetFetched).toHaveBeenCalledWith('message-7');
+    expect(messages.map(item => item.id)).toEqual(['message-7']);
+  });
+
   test('fetches a target once, then resumes the live tail', async () => {
     let messages: ProjectMessage[] = [];
     fetchStrategicConversation

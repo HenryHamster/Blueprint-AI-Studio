@@ -61,6 +61,18 @@ describe('MessagesComposer — clickable pending image preview', () => {
     expect(onRemoveArtifactRef).toHaveBeenCalledWith('tool-ref-7');
   });
 
+  test('renders every message-scoped source ref, not only tool artifacts', () => {
+    const onRemoveArtifactRef = vi.fn();
+    renderComposer({
+      sourceRefs: [{ id: 'task-7', kind: 'task', label: 'Runner investigation', revision: 7 }],
+      onRemoveArtifactRef,
+    });
+
+    expect(screen.getByText('Runner investigation revision 7')).toBeTruthy();
+    fireEvent.click(screen.getByLabelText('Remove Runner investigation revision 7'));
+    expect(onRemoveArtifactRef).toHaveBeenCalledWith('task-7');
+  });
+
   test('renders an open-preview button for a pending image with a preview url', () => {
     renderComposer({ pendingAttachments: [imageAttachment()] });
     expect(screen.getByLabelText('Open shot.png preview')).toBeTruthy();

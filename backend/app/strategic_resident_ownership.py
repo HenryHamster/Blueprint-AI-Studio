@@ -132,7 +132,7 @@ async def _current_checkpoint(
     return checkpoint
 
 
-def _assert_pointer_lineage(
+def assert_resident_pointer_lineage(
     resident: StrategicResident,
     tasks: list[Task],
     *,
@@ -340,7 +340,7 @@ async def cutover_to_strategic_resident(
         previous_owner = _enum_value(resident.engine_owner)
         previous_engine_version = str(resident.engine_version)
         previous_generation = int(resident.authority_generation)
-        _assert_pointer_lineage(
+        assert_resident_pointer_lineage(
             resident,
             tasks,
             owner=previous_owner,
@@ -525,7 +525,7 @@ async def rollback_to_legacy_resident(
         checkpoint = await _current_checkpoint(session, resident)
         previous_owner = _enum_value(resident.engine_owner)
         previous_generation = int(resident.authority_generation)
-        _assert_pointer_lineage(
+        assert_resident_pointer_lineage(
             resident,
             tasks,
             owner=previous_owner,
@@ -683,6 +683,7 @@ __all__ = [
     "ResidentOwnershipTransition",
     "ResidentOwnershipTransitionError",
     "UnreconciledResidentOperations",
+    "assert_resident_pointer_lineage",
     "cutover_to_strategic_resident",
     "rollback_to_legacy_resident",
 ]

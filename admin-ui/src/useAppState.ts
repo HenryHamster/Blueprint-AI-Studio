@@ -2,6 +2,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
+import type { ProjectMessage } from './types/messages';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api/core';
 import { useToasts } from './components/Toasts';
 import { usePersistedState } from './hooks/usePersistedState';
@@ -41,7 +42,7 @@ export type { DeployState } from './types/settings';
  */
 interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
-  refreshMessagesRef?: MutableRefObject<() => void>;
+  refreshMessagesRef?: MutableRefObject<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>;
   refreshFleetRunnersRef?: MutableRefObject<() => void>;
 }
 

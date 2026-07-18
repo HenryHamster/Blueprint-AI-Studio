@@ -163,6 +163,68 @@ describe('useLogViewer strategist events', () => {
     expect(refreshMessages).toHaveBeenCalledTimes(1);
   });
 
+  it('reconciles a canonical message projection immediately instead of waiting for the debounce', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshMessages.mockClear();
+    const canonical = {
+      id: 'msg-2', project_id: 'proj-live', message_type: 'NOTE', from_type: 'strategic',
+      from_task_id: null, content: 'durable reply', context: {}, status: 'open',
+      resolution: null, resolved_at: null, created_at: '2026-07-18T00:00:00Z',
+      sequence: 2, surface: 'conversation', client_idempotency_key: 'send-2',
+    };
+
+    act(() => { ws.emit({ event: 'message_created', data: { project_id: 'proj-live', message: canonical } }); });
+
+    expect(refreshMessages).toHaveBeenCalledTimes(1);
+    expect(refreshMessages).toHaveBeenCalledWith(canonical, false);
+  });
+
+  it('marks a truncated realtime message projection for canonical refetch', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshMessages.mockClear();
+    const canonical = {
+      id: 'msg-old', project_id: 'proj-live', message_type: 'NOTE', from_type: 'strategic',
+      from_task_id: null, content: '', context: { projection_truncated: true }, status: 'open',
+      resolution: null, resolved_at: null, created_at: '2026-07-18T00:00:00Z',
+      sequence: 2, surface: 'conversation', projection_truncated: true,
+    };
+
+    act(() => {
+      ws.emit({
+        event: 'message_updated',
+        data: { project_id: 'proj-live', canonical_refetch_required: true, message: canonical },
+      });
+    });
+
+    expect(refreshMessages).toHaveBeenCalledWith(canonical, true);
+  });
+
+  it('refreshes the conversation on websocket connect to close missed sequence gaps', async () => {
+    const { result } = setup();
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    expect(refreshMessages).not.toHaveBeenCalled();
+
+    await connect(result);
+
+    expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
   it('routes pipeline refetch envelopes to the task refresh path', async () => {
     const { result } = setup({ selectedProjectId: 'proj-live' });
     await act(async () => {

@@ -11,6 +11,7 @@ one bad proposal is rejected without failing the turn.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 from sqlalchemy import select
@@ -34,6 +35,43 @@ from app.time_utils import _utcnow
 # Bound the number of pending proposals a single reconciliation drains, so a
 # flood of worker proposals cannot unbound the turn transaction.
 _MAX_DRAIN = 50
+
+
+async def pending_worker_proposal_cursor(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+) -> dict[str, str]:
+    """Return a bounded fingerprint that advances after every partial drain.
+
+    The fingerprint covers the next drain window, rather than the lifetime row
+    count.  When a turn resolves the first ``_MAX_DRAIN`` rows from a larger
+    backlog, the next window changes and therefore schedules a successor instead
+    of treating the still-pending project as already handled.
+    """
+
+    pending_ids = list(
+        (
+            await session.execute(
+                select(StrategicWorkerMemoryProposal.id)
+                .where(
+                    StrategicWorkerMemoryProposal.project_id == project_id,
+                    StrategicWorkerMemoryProposal.status == "pending",
+                )
+                .order_by(
+                    StrategicWorkerMemoryProposal.created_at.asc(),
+                    StrategicWorkerMemoryProposal.id.asc(),
+                )
+                .limit(_MAX_DRAIN + 1)
+            )
+        ).scalars()
+    )
+    if not pending_ids:
+        return {}
+    encoded = ":".join(str(item) for item in pending_ids).encode("utf-8")
+    return {
+        "worker_proposal_pending_window": hashlib.sha256(encoded).hexdigest()
+    }
 
 
 async def submit_worker_memory_proposal(
@@ -146,5 +184,6 @@ async def drain_worker_memory_proposals(
 
 __all__ = [
     "drain_worker_memory_proposals",
+    "pending_worker_proposal_cursor",
     "submit_worker_memory_proposal",
 ]

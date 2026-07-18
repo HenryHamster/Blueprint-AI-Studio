@@ -40,6 +40,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.models import StrategicOperationReceipt
 from app.strategic_operation_authority_validation import (
+    RESIDENT_TURN_TASK_TYPE,
+    AuthorityBoundaryMutation,
     FencedOperationRequest,
     InactiveTurnAuthority,
     OperationIdentityCollision,
@@ -63,6 +65,11 @@ _UNSETTLED = "applying"
 # that finds the receipt already in this state does not re-perform.
 _CLAIMED = "reconciling"
 _TERMINAL = frozenset({"applied", "reconciled", "failed"})
+_REQUIRES_RECONCILIATION = frozenset({_CLAIMED, "unknown_effect"})
+
+
+class ExternalEffectNotPerformed(RuntimeError):
+    """A proven pre-effect failure that is safe to settle as ``failed``."""
 
 # Redact anything that looks like a GitHub/OAuth token from a settled error body
 # so a client-exception string can never persist a secret in the receipt JSONB.
@@ -123,7 +130,7 @@ async def execute_external_effect_operation(
                 )
             if existing.status in _TERMINAL:
                 return existing
-            if existing.status == _CLAIMED:
+            if existing.status in _REQUIRES_RECONCILIATION:
                 # Another worker owns the in-flight perform (or crashed mid-perform);
                 # surface the unsettled receipt rather than re-performing.
                 return existing
@@ -175,6 +182,41 @@ async def execute_external_effect_operation(
             observed = await _observed_revisions(
                 session, project_row, resident, turn_task, request.expected_revisions
             )
+            if request.target_task_id is not None:
+                if request.target_task_id == request.turn_task_id:
+                    raise AuthorityBoundaryMutation(
+                        "operation cannot target its own Resident turn task"
+                    )
+                _require_expected_revision_keys(
+                    request.expected_revisions,
+                    {"target_task_updated_at"},
+                    reason="target-task external operation",
+                )
+                target_task = (
+                    await session.execute(
+                        select(Task)
+                        .where(
+                            Task.id == request.target_task_id,
+                            Task.project_id == request.project_id,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if target_task is None:
+                    raise InactiveTurnAuthority("target task not found in project")
+                if (
+                    str((target_task.first_payload or {}).get("type") or "")
+                    == RESIDENT_TURN_TASK_TYPE
+                ):
+                    raise AuthorityBoundaryMutation(
+                        "operation cannot target a Resident turn task"
+                    )
+                observed["target_task_updated_at"] = (
+                    target_task.updated_at.isoformat()
+                    if target_task.updated_at
+                    else None
+                )
             _validate_frozen_turn_lineage(
                 turn_task,
                 project_id=request.project_id,
@@ -221,7 +263,10 @@ async def execute_external_effect_operation(
                 .with_for_update()
             )
         ).scalar_one()
-        if receipt.status in _TERMINAL or receipt.status == _CLAIMED:
+        if (
+            receipt.status in _TERMINAL
+            or receipt.status in _REQUIRES_RECONCILIATION
+        ):
             # Already settled, or another worker owns the in-flight perform.
             return receipt
         receipt.status = _CLAIMED
@@ -234,8 +279,13 @@ async def execute_external_effect_operation(
             result = await perform(effect_session)
             outcome = "reconciled"
             body: dict[str, Any] = {"external_effect": result}
-        except Exception as exc:  # noqa: BLE001 - settle the receipt, never leak
+        except ExternalEffectNotPerformed as exc:
             outcome = "failed"
+            body = {"error": _scrub_effect_error(exc)}
+        except Exception as exc:  # noqa: BLE001 - unknown post-effect boundary
+            # A client exception cannot prove the service did not apply the
+            # effect before its response was lost. Require reconciliation.
+            outcome = "unknown_effect"
             body = {"error": _scrub_effect_error(exc)}
 
     # --- Phase 3: settle the receipt (re-lock; a concurrent retry may win) ---
@@ -251,12 +301,17 @@ async def execute_external_effect_operation(
             return receipt
         receipt.status = outcome
         receipt.receipt = {"schema_version": 1, "structured_result": body}
-        if outcome == "reconciled":
+        if outcome in {"reconciled", "failed"}:
             receipt.unknown_effects = []
-        receipt.completed_at = _utcnow()
-        receipt.updated_at = receipt.completed_at
+        settled_at = _utcnow()
+        receipt.completed_at = settled_at if outcome in _TERMINAL else None
+        receipt.updated_at = settled_at
         session.add(receipt)
     return receipt
 
 
-__all__ = ["ExternalEffect", "execute_external_effect_operation"]
+__all__ = [
+    "ExternalEffect",
+    "ExternalEffectNotPerformed",
+    "execute_external_effect_operation",
+]

@@ -3,6 +3,7 @@ import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
 import type { FailingTaskTypeEntry, FailingTaskTypes } from '../types/diagnostics';
+import type { ProjectMessage } from '../types/messages';
 import {
   workbenchMessageMatchesProject,
   workbenchRefetchSurfacesFromMessage,
@@ -14,7 +15,7 @@ interface UseLogViewerDeps {
   setDeployState: (ds: DeployState) => void;
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
   refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
-  refreshMessagesRef?: React.MutableRefObject<() => void>;
+  refreshMessagesRef?: React.MutableRefObject<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>;
   fetchAlertsRef?: React.MutableRefObject<() => void>;
   refreshFleetRunnersRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
@@ -100,6 +101,24 @@ function isKnownTaskStatus(status: unknown): status is TaskStatus {
 
 function isLogStreamTaskStatus(status: unknown): status is TaskStatus {
   return typeof status === 'string' && LOG_STREAM_TASK_STATUSES.has(status as TaskStatus);
+}
+
+function canonicalProjectMessage(value: unknown): ProjectMessage | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<ProjectMessage>;
+  if (
+    typeof candidate.id !== 'string'
+    || typeof candidate.project_id !== 'string'
+    || typeof candidate.message_type !== 'string'
+    || typeof candidate.from_type !== 'string'
+    || typeof candidate.content !== 'string'
+    || typeof candidate.status !== 'string'
+    || candidate.surface !== 'conversation'
+    || !candidate.context
+    || typeof candidate.context !== 'object'
+    || !Number.isFinite(candidate.sequence)
+  ) return null;
+  return candidate as ProjectMessage;
 }
 
 const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
@@ -492,7 +511,14 @@ export function useLogViewer({
         || msg.event === 'messages_superseded'
         || refetchSurfaces.has('messages')
       )) {
-        refreshMessages();
+        const canonicalMessage = (msg.event === 'message_created' || msg.event === 'message_updated')
+          ? canonicalProjectMessage(msg.data?.message)
+          : null;
+        const canonicalRefetchRequired = msg.data?.canonical_refetch_required === true
+          || msg.data?.message?.projection_truncated === true
+          || msg.data?.message?.context?.projection_truncated === true;
+        if (canonicalMessage) refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
+        else refreshMessages();
       }
       if (projectEventApplies && (
         msg.event === 'alert_created'
@@ -566,7 +592,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts, refreshFleetRunnersRef]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshMessagesRef, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (hasActiveWsForProject(projectId)) return;
@@ -651,9 +677,12 @@ export function useLogViewer({
         }, 30000);
         wsPingIntervalRef.current = pingInterval;
 
-        // Refresh task list to catch up on any missed state changes during disconnect
-        setLogLines(prev => [...prev, '[Refreshing task list after reconnect]']);
+        // Close both task and conversation gaps after every (re)connect. Message
+        // refresh uses the transcript's last durable sequence, so missed frames
+        // are fetched canonically instead of waiting for another WS event.
+        setLogLines(prev => [...prev, '[Refreshing project state after reconnect]']);
         fetchTasksRef.current();
+        refreshMessagesRef?.current?.();
         void refreshGatedTaskTypes();
       };
 
@@ -709,7 +738,7 @@ export function useLogViewer({
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes, refreshMessagesRef]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);

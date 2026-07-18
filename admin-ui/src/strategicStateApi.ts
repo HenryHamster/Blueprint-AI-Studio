@@ -834,6 +834,55 @@ export interface StrategicConversationQuery {
   limit?: number;
   includeMessageId?: string | null;
   idempotencyKey?: string | null;
+  search?: string | null;
+}
+
+export interface ResidentEngineTurnHealth {
+  task_id: string;
+  status: string;
+  updated_at: string | null;
+}
+
+export interface ResidentEngineHealth {
+  project_id: string;
+  observed_at: string;
+  resident_initialized: boolean;
+  engine_owner?: 'legacy' | 'strategic_resident' | string;
+  engine_version?: string | null;
+  background_policy?: 'active' | 'paused' | string;
+  authority_generation?: number;
+  health_status?: string | null;
+  last_healthy_at?: string | null;
+  last_error_at?: string | null;
+  checkpoint?: { checkpoint_id: string; version: number; content_hash: string } | null;
+  turns?: {
+    active: ResidentEngineTurnHealth | null;
+    interactive_successor: ResidentEngineTurnHealth | null;
+    background_successor: ResidentEngineTurnHealth | null;
+  };
+  conversation?: {
+    handled_sequence: number;
+    shadow_handled_sequence: number;
+    latest_unhandled_user_sequence: number | null;
+  };
+  operations?: { unsettled_receipt_count: number };
+  shadow?: {
+    state: string | null;
+    last_completed_at: string | null;
+    last_projection_latency_ms: number | null;
+    last_comparison: Record<string, unknown> | null;
+  };
+  soak?: {
+    cutover_completed_at: string | null;
+    observed_seconds: number;
+    required_seconds: number;
+    rollback_rehearsed_at: string | null;
+  };
+  cutover_ready: boolean;
+  rollback_ready: boolean;
+  legacy_retirement_ready: boolean;
+  blockers: string[];
+  retirement_blockers?: string[];
 }
 
 /**
@@ -1358,6 +1407,7 @@ export async function fetchStrategicConversation(
   if (queryOptions.limit != null) params.set('limit', String(queryOptions.limit));
   if (queryOptions.includeMessageId) params.set('include_message_id', queryOptions.includeMessageId);
   if (queryOptions.idempotencyKey) params.set('idempotency_key', queryOptions.idempotencyKey);
+  if (queryOptions.search) params.set('search', queryOptions.search);
   const query = params.toString();
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
@@ -1386,6 +1436,24 @@ export async function fetchStrategicConversation(
     ...(wakeupState !== undefined ? { wakeup_state: wakeupState } : {}),
     ...(responseEtag ? { etag: responseEtag } : {}),
   };
+}
+
+export async function fetchResidentEngineHealth(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ResidentEngineHealth | null> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/resident-engine/health`,
+    undefined,
+    1,
+    15000,
+    signal,
+  );
+  // The rollout surface is owner-only and may not exist during a staged deploy.
+  // Both cases intentionally degrade to the legacy activity projection.
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw new Error(`Failed to fetch Resident engine health: ${res.status}`);
+  return res.json() as Promise<ResidentEngineHealth>;
 }
 
 export interface StrategicMessageIdentityReceipt {

@@ -34,6 +34,8 @@ import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
 import { compareResidentMessages, useResidentConversation } from '../hooks/useResidentConversation';
+import { useResidentEngineHealth } from '../hooks/useResidentEngineHealth';
+import { ResidentEngineHealthChip } from './ResidentEngineHealthChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
@@ -390,6 +392,10 @@ export interface MessagesPanelProps {
   focusComposerSignal?: number;
   /** Incrementing signal from realtime events to refresh messages immediately. */
   realtimeRefreshSignal?: number;
+  /** Canonical message projection received over realtime, reconciled immediately by sequence/client identity. */
+  realtimeCanonicalMessage?: ProjectMessage | null;
+  /** The realtime projection was transport-truncated and must be fetched by canonical message id. */
+  realtimeCanonicalRefetchRequired?: boolean;
   /** Increments when the strategic-state poll completes with new data.
    *  When set, the conversation refresh piggybacks on the strategic-state
    *  poll cadence instead of running its own independent timer. */
@@ -494,7 +500,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -504,6 +510,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const usesStrategicReadModel = currentStrategicState != null;
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
+  const residentEngineHealth = useResidentEngineHealth({
+    enabled: conversationMode,
+    projectId: selectedProjectId,
+    refreshKey: `${strategicPollEpoch ?? 0}:${realtimeRefreshSignal ?? 0}`,
+  });
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicAttentionRef = useRef(strategicAttention);
   // eslint-disable-next-line react-hooks/refs
@@ -661,10 +672,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setNewContent(''); setDraftSourceRefs([]); setDraftArtifactRefs([]); setReplyTo(null);
   }, [updateComposerIntent]);
   const captureCurrentDraftRefs = useCallback(() => {
-    const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
-    const sourceRefs = Array.isArray(workbenchContext?.selected_refs)
-      ? workbenchContext.selected_refs as Array<Record<string, unknown>>
-      : [];
+    // Context belongs to the message draft, never to whichever workbench surface
+    // happens to be visible. Keep the exact explicit chips already in the
+    // composer; merely viewing/selecting a workbench surface attaches nothing.
+    const sourceRefs = composerIntentRef.current.source_refs;
     const explicitToolRefs = composerIntentRef.current.artifact_refs.filter(
       ref => typeof ref.artifact_ref_id === 'string',
     );
@@ -675,7 +686,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         explicitToolRefs,
       ),
     };
-  }, [currentStrategicState, strategicWorkbenchState]);
+  }, []);
   const persistComposerEnvelope = useCallback((overrides: {
     content?: string;
     type?: string;
@@ -994,7 +1005,10 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     projectId: selectedProjectId,
     actorUserId: currentActorUserId,
     includeMessageId: conversationIncludeMessageId,
+    searchQuery,
     realtimeRefreshSignal,
+    realtimeMessage: realtimeCanonicalMessage,
+    realtimeMessageRequiresCanonicalRefetch: realtimeCanonicalRefetchRequired,
     strategicPollEpoch,
     getMessages: getCurrentMessages,
     setMessages,
@@ -1365,6 +1379,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
     lastStrategicSessionTargetFetchRef.current = null;
   }, [selectedProjectId, targetMessageId]);
+  useEffect(() => {
+    if (conversationMode && targetMessageId && searchQuery.trim()) setSearchQuery('');
+  }, [conversationMode, searchQuery, setSearchQuery, targetMessageId]);
   useEffect(() => {
     if (!targetMessageId) return;
     if (!conversationMode) {
@@ -1883,14 +1900,15 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         ? (isRetry ? optimisticSend.key : conversationSend.ensureIdentity(generateIdempotencyKey))
         : (idempotencyKeyRef.current ?? generateIdempotencyKey());
       if (!conversationMode) idempotencyKeyRef.current = sendIdentity;
-      const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
+      // The continuous Resident conversation no longer inherits hidden
+      // Chat/Workday workbench state. Activity-inbox writes retain the legacy
+      // workbench snapshot until that surface is retired.
+      const workbenchContext = conversationMode
+        ? null
+        : buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
       const initialSourceRefs = isRetry
         ? (optimisticSend?.payload?.source_refs ?? [])
-        : (draftSourceRefs.length > 0
-            ? draftSourceRefs
-            : Array.isArray(workbenchContext?.selected_refs)
-              ? workbenchContext.selected_refs as Array<Record<string, unknown>>
-              : []);
+        : draftSourceRefs;
       const initialArtifactRefs = isRetry
         ? (optimisticSend?.payload?.artifact_refs ?? [])
         : (draftArtifactRefs.length > 0
@@ -2094,6 +2112,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
             recoveredWakeup === 'paused' || recoveredWakeup === 'waiting_for_capacity' ? 'waiting' : 'accepted',
             recoveredWakeup,
           );
+          clearSubmittedComposerDraft(submitActorUserId, submitProjectId, pendingSend.draft_write_id);
+          if (submitActorUserId) {
+            void clearStoredPendingAttachments(submitActorUserId, submitProjectId, sendIdentity)
+              .catch(() => undefined);
+          }
           return;
         }
         setMessages(previous => mergeCanonicalConversationMessage(previous, canonicalMessage));
@@ -2723,6 +2746,22 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         filterChrome={resolvedFilterChrome}
       />
 
+      {conversationMode && (
+        <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-2 md:px-4">
+          <div className="mx-auto flex w-full max-w-[940px] items-center gap-2">
+            <input
+              aria-label="Search Resident conversation"
+              type="search"
+              value={searchQuery}
+              onChange={event => setSearchQuery(event.target.value)}
+              placeholder="Search conversation"
+              className="min-h-[36px] min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-100 placeholder:text-neutral-500 focus:border-indigo-500 focus:outline-none"
+            />
+            {residentEngineHealth && <ResidentEngineHealthChip health={residentEngineHealth} />}
+          </div>
+        </div>
+      )}
+
       {/* Inline alerts — replaces the separate AlertsPopover bell-triggered surface */}
       {alerts && alerts.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
@@ -3062,7 +3101,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         onLoadOlderConversationMessages={() => loadOlderConversation()}
         conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
-        operationItem={residentActivity ? (
+        operationItem={residentActivity && residentEngineHealth?.engine_owner !== 'strategic_resident' ? (
           <StrategicResidentActivityWidget state={residentActivity} onOpenActivity={onOpenActivityFeed} />
         ) : null}
         scrollRef={scrollRef}
@@ -3185,6 +3224,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               Array.isArray(optimisticSend?.context?.attachments) ? optimisticSend.context.attachments.length : 0,
             )
           : 0}
+        sourceRefs={draftSourceRefs}
         artifactRefs={draftArtifactRefs}
         uploading={uploading}
         onAddAttachment={handleAddAttachment}

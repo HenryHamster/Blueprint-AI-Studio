@@ -2,12 +2,14 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, 2b, 3, and 4 merged; Milestone 5 (rollout, legacy
-retirement, release audit) remains — its exit criteria (seven-day soak, live
-per-project production engine flip, legacy-handler retirement after soak) are
-operator- and calendar-gated by design.
+**Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 has merged foundations,
+but a 2026-07-18 requirement-by-requirement audit reopened completion: the Agent
+mutation loop, exact evidence/approval execution, production cadence, and the
+invokable adapter set must converge before M4 is complete. M5 is in progress;
+live pilot rollout, rollback rehearsal, the seven-day soak, and legacy retirement
+remain operator- and calendar-gated after the code/test gates pass.
 
-**Last refreshed:** 2026-07-17. M2a merged through PR `#15292` at merge commit
+**Last refreshed:** 2026-07-18. M2a merged through PR `#15292` at merge commit
 `7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
 migration, locking, latency, provider-boundary, and affected-suite review/fix
 loops converged. M3 adds typed operations and revision-safe human-tool handoff;
@@ -223,7 +225,7 @@ Post-rebase evidence:
   upstream handler preservation, provider isolation, lock/FK compatibility,
   stale identity/session routing, workbench autoflush, and SAVEPOINT recovery.
 
-### M3 — Typed operations and human-tool compatibility — in progress
+### M3 — Typed operations and human-tool compatibility — merged
 
 - Project-scoped inspection and mutation capabilities with declared scope, risk,
   evidence, approval, idempotency, reconciliation, and receipt shapes.
@@ -310,7 +312,7 @@ Pre-rebase evidence:
   maintainability review/fix iterations converged with no actionable findings;
   scoped Ruff, TypeScript, ESLint, Terraform formatting, and diff checks are clean.
 
-### M4 — Fenced operations, strategic memory, and cadence — merged
+### M4 — Fenced operations, strategic memory, and cadence — in progress
 
 - Route authorized mutations through operation IDs, expected revisions, authority
   generations, evidence preconditions, approvals, durable receipts, and explicit
@@ -351,15 +353,34 @@ Implementation checklist:
   through the operator `modify_task_apply` path; real single-use/TTL operator
   approval verification (`StrategicOperationApproval`) with the owner-gated grant
   endpoint; `pr.merge` (sha-guarded) and `pr.create` external-effect adapters off
-  their 501 stubs; managed-Task escalation adapters.
-- The remaining catalog entries left `propose_only` — `pr.inspect` and the
-  higher-stakes `deployment.deploy`/`deployment.rollback` — are an **intentional
-  product decision, not a gap**: the Resident proposes them and an operator
-  actually invokes them. This keeps the highest-blast-radius actions human-driven
-  while every evidence/authority/receipt fence around them is already built and
-  tested, so promoting one later is a catalog flip, not new machinery.
+  their 501 stubs; and managed-Task escalation catalog/proposal entries. The
+  audit below deliberately reclassifies adapters that cannot yet satisfy their
+  evidence contract as `propose_only` instead of treating catalog presence as
+  executable completion.
+- [x] Publish the 2026-07-18 correctness hardening: make the Agent call only
+  genuinely invokable mutations, bind all mutation evidence to exact
+  server-authored inspection receipts, keep uncertain external effects unsettled,
+  preserve task lifecycle CAS, and prevent partial proposal drains from stranding
+  their tail. Structured completion projections now cover every durable receipt
+  status, including crash-boundary `pending` and unknown external effects.
+- [ ] Implement and prove the remaining plan-required inspection and operation
+  adapters. Catalog entries with no bounded adapter remain truthfully
+  `propose_only`; that is a safe intermediate state, not M4 completion.
+- [ ] Wire meaningful StrategicCycle, task/pipeline, qualification, deployment,
+  and worker-proposal changes to the coalesced project-change lane while retaining
+  zero model calls for unchanged cursors.
+- [ ] Add managed-Task escalation for code editing, large review, open-ended
+  debugging, and repeated CI repair; keep human-tool writes fail-closed until the
+  exact revision/operation authority path exists.
 
-### M5 — Rollout, legacy retirement, and release audit
+Current hardening evidence: the combined backend gate is green (`204 passed`,
+`5 skipped`); the seven-status completion projection matrix is green (`44`
+focused capability tests); Agent Resident-turn tests are green (`13 passed`) with
+typecheck clean; the combined message/health UI gate is green (`448 passed`) with
+typecheck clean and zero scoped ESLint errors. Scoped Ruff, size, and diff checks
+are clean, and independent backend/Agent plus UI/health review/fix loops converged.
+
+### M5 — Rollout, legacy retirement, and release audit — in progress
 
 - Complete shadow comparisons and rollout health surfaces, then atomically flip
   per-project engine ownership at a checkpoint boundary.
@@ -382,6 +403,9 @@ Implementation checklist:
   v1 checkpoint first (idempotent) so the switch works on any project; both are
   idempotent, reversible, and map every `ResidentOwnershipTransitionError` to a
   409. This is the reversible one-shot the rollout/rollback rehearsals drive.
+- [x] Publish the bounded owner-facing rollout-health/readiness projection and
+  authoritative UI surface, including current shadow/checkpoint proof, rollback
+  blockers, UTC timestamps, and an error-free seven-day retirement gate.
 - [ ] Complete shadow comparisons and rollout health surfaces (soak evidence).
 - [ ] Legacy-handler retirement after the soak and rollback evidence converge.
 - [ ] Adversarial-authority, noise, crash-boundary, and seven-day soak suites.

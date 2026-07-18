@@ -1229,7 +1229,9 @@ async def test_generation_increment_race_fences_stale_worker(db_session):
 
 
 @pytest.mark.asyncio
-async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db):
+async def test_mutation_endpoint_applies_running_update_end_to_end(
+    authority_db,
+):
     """The /mutate endpoint drives a real fenced DB-only mutation to `applied`."""
     from datetime import datetime, timezone
 
@@ -1238,8 +1240,14 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
         CapabilityEvidenceRef,
         ResidentCapabilityInvocation,
     )
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
 
     project, task, _resident = await _authority_rows(authority_db)
+    context_hash = "ctx-running-update-e2e"
+    task.context = {**dict(task.context or {}), TURN_CONTEXT_HASH_KEY: context_hash}
+    authority_db.add(task)
+    await authority_db.commit()
+    await authority_db.refresh(task)
     running_update_revision = hashlib.sha256(b"steady state").hexdigest()
     invocation = ResidentCapabilityInvocation.model_validate(
         {
@@ -1271,6 +1279,35 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
             ),
         }
     )
+    authority_db.add(
+        StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=task.id,
+            authority_generation=3,
+            operation_id="inspect-running-update-task",
+            operation_kind="inspect_task",
+            capability="task.inspect",
+            risk_level="low",
+            request_hash="a" * 64,
+            expected_revisions={"context_hash": context_hash},
+            status="applied",
+            receipt={
+                "schema_version": 1,
+                "structured_result": {
+                    "evidence": [
+                        {
+                            "kind": ref.kind,
+                            "source_id": ref.source_id,
+                            "revision": ref.revision,
+                            "checksum": ref.checksum,
+                        }
+                        for ref in invocation.evidence
+                    ]
+                },
+            },
+        )
+    )
+    await authority_db.commit()
     token = {
         "sub": str(task.id),
         "project_id": str(project.id),
@@ -1288,7 +1325,13 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
     await authority_db.refresh(project)
     assert project.running_update == "advanced via endpoint"
 
-    receipt = (await authority_db.execute(select(StrategicOperationReceipt))).scalar_one()
+    receipt = (
+        await authority_db.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.operation_id == "endpoint-op-1"
+            )
+        )
+    ).scalar_one()
     assert receipt.operation_kind == "set_running_update"
     assert receipt.capability == "strategy.running_update.set"
     assert receipt.risk_level == "low"
@@ -1304,7 +1347,7 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
     all_receipts = (
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
-    assert len(all_receipts) == 1
+    assert len(all_receipts) == 2
 
 
 @pytest.mark.asyncio
@@ -1345,6 +1388,8 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
     )
     # Response evidence kind is mapped into the trust taxonomy (logs -> task_log).
     assert result["evidence"]["kind"] == "task_log"
+    assert result["evidence"]["inspected_at"]
+    assert "observed_at" not in result["evidence"]
 
     receipt = (
         await authority_db.execute(select(StrategicOperationReceipt))
@@ -1363,6 +1408,91 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
     assert len(receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_real_inspect_response_can_authorize_real_mutation(authority_db):
+    """The exact inspection wire identity passes the later receipt evidence gate."""
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_capability_invocation import ResidentCapabilityInvocation
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    context_hash = "ctx-real-inspect-mutate"
+    turn_task.vm_instance_id = "vm-1"
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: context_hash,
+        "_strategic_resident_claim_nonce": "nonce-1",
+    }
+    target = Task(
+        project_id=project.id,
+        title="real inspect target",
+        payloads=[{"type": "plan"}],
+        priority=50,
+    )
+    authority_db.add_all([turn_task, target])
+    await authority_db.commit()
+    await authority_db.refresh(turn_task)
+    await authority_db.refresh(target)
+    token = _turn_token(project, turn_task)
+
+    inspected = await capability_router.invoke_resident_capability(
+        None,
+        ResidentCapabilityRequest(
+            capability_id="task.inspect",
+            parameters={"task_id": str(target.id)},
+        ),
+        session=authority_db,
+        token=token,
+    )
+    evidence = inspected["evidence"]
+    assert evidence["inspected_at"]
+    assert "observed_at" not in evidence
+    await authority_db.refresh(turn_task)
+    await authority_db.refresh(target)
+    payload = turn_task.first_payload
+    invocation = ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "task.reprioritize",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"task_id": str(target.id), "priority": 90},
+            "operation_id": "inspect-then-reprioritize",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+                "target_task_updated_at": target.updated_at.isoformat(),
+            },
+            "evidence": [
+                {
+                    key: evidence[key]
+                    for key in (
+                        "kind",
+                        "project_id",
+                        "source_id",
+                        "revision",
+                        "checksum",
+                        "inspected_at",
+                    )
+                }
+            ],
+        }
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=authority_db,
+        token=token,
+    )
+    assert result["status"] == "applied"
+    await authority_db.refresh(target)
+    assert target.priority == 90
 
 
 def _reprioritize_invocation(project, turn_task, target_task, priority, *, op="rp-1"):
@@ -1441,6 +1571,9 @@ def _task_cancel_invocation(project, turn_task, target):
                 "current_checkpoint_id": payload.get("checkpoint_id"),
                 "resident_checkpoint_version": payload.get("checkpoint_version"),
                 "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+                "target_task_updated_at": (
+                    target.updated_at.isoformat() if target.updated_at else None
+                ),
             },
             "evidence": (
                 CapabilityEvidenceRef(
@@ -1467,7 +1600,11 @@ async def test_task_cancel_runs_the_operator_path_end_to_end(authority_db, monke
         return None
 
     monkeypatch.setattr(admin_task_mutations, "broadcast_to_project", _noop_broadcast)
-
+    monkeypatch.setattr(
+        capability_router,
+        "_check_evidence_refs_against_receipts",
+        AsyncMock(),
+    )
     project, turn_task, _resident = await _authority_rows(authority_db)
     target = Task(
         project_id=project.id,
@@ -1493,18 +1630,59 @@ async def test_task_cancel_runs_the_operator_path_end_to_end(authority_db, monke
 
 
 @pytest.mark.asyncio
-async def test_reprioritize_endpoint_mutates_target_task_with_cas(authority_db):
+async def test_reprioritize_endpoint_mutates_target_task_with_cas(
+    authority_db,
+):
     from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
 
     project, turn_task, _resident = await _authority_rows(authority_db)
+    context_hash = "ctx-reprioritize-e2e"
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: context_hash,
+    }
+    authority_db.add(turn_task)
     target = Task(project_id=project.id, title="worker", payloads=[{"type": "plan"}], priority=50)
     authority_db.add(target)
     await authority_db.commit()
+    await authority_db.refresh(turn_task)
     await authority_db.refresh(target)
+
+    invocation = _reprioritize_invocation(project, turn_task, target, 90)
+    authority_db.add(
+        StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=turn_task.id,
+            authority_generation=3,
+            operation_id="inspect-reprioritize-target",
+            operation_kind="inspect_task",
+            capability="task.inspect",
+            risk_level="low",
+            request_hash="b" * 64,
+            expected_revisions={"context_hash": context_hash},
+            status="applied",
+            receipt={
+                "schema_version": 1,
+                "structured_result": {
+                    "evidence": [
+                        {
+                            "kind": ref.kind,
+                            "source_id": ref.source_id,
+                            "revision": ref.revision,
+                            "checksum": ref.checksum,
+                        }
+                        for ref in invocation.evidence
+                    ]
+                },
+            },
+        )
+    )
+    await authority_db.commit()
 
     result = await capability_router.invoke_resident_mutation(
         None,
-        _reprioritize_invocation(project, turn_task, target, 90),
+        invocation,
         session=authority_db,
         token=_turn_token(project, turn_task),
     )
@@ -1548,7 +1726,6 @@ def _pr_merge_invocation(project, turn_task, *, pr_number=42, head="abc1234"):
                 "resident_checkpoint_version": payload.get("checkpoint_version"),
                 "resident_checkpoint_hash": payload.get("checkpoint_hash"),
             },
-            "approval_ref": "operator-approved",
             "evidence": tuple(
                 CapabilityEvidenceRef(
                     kind=kind,
@@ -1558,9 +1735,7 @@ def _pr_merge_invocation(project, turn_task, *, pr_number=42, head="abc1234"):
                     checksum=str(index) * 64,
                     inspected_at=datetime.now(timezone.utc),
                 )
-                for index, kind in enumerate(
-                    ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability")
-                )
+                for index, kind in enumerate(("pr", "pr_diff", "pr_check"))
             ),
         }
     )
@@ -1574,9 +1749,12 @@ async def test_pr_merge_requires_a_matching_operator_approval(authority_db, monk
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
     )
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     project, turn_task, _resident = await _authority_rows(authority_db)
 
-    # No approval granted -> 403, and the external effect never runs.
+    # PR inspection adapters do not exist yet, so merge remains proposal-only.
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(
             None,
@@ -1584,7 +1762,7 @@ async def test_pr_merge_requires_a_matching_operator_approval(authority_db, monk
             session=authority_db,
             token=_turn_token(project, turn_task),
         )
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 501
     external.assert_not_awaited()
 
 
@@ -1604,6 +1782,9 @@ async def test_pr_merge_dispatches_with_a_matching_approval(authority_db, monkey
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
     )
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     project, turn_task, _resident = await _authority_rows(authority_db)
     # An operator grants approval for THIS exact merge (pr 42 @ abc1234).
     await grant_operation_approval(
@@ -1618,22 +1799,155 @@ async def test_pr_merge_dispatches_with_a_matching_approval(authority_db, monkey
     )
     await authority_db.commit()
 
-    result = await capability_router.invoke_resident_mutation(
-        None,
-        _pr_merge_invocation(project, turn_task),
-        session=authority_db,
-        token=_turn_token(project, turn_task),
-    )
-    assert result["status"] == "reconciled"
-    external.assert_awaited_once()
-    fenced_request = external.await_args.args[1]
-    assert fenced_request.capability == "pr.merge"
-    assert fenced_request.operation_kind == "merge_pull_request"
-    # The approval was consumed by this operation.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+    # Proposal-only rejection happens before consuming a durable approval.
     approval = (
         await authority_db.execute(select(StrategicOperationApproval))
     ).scalar_one()
-    assert approval.consumed_operation_id == "merge-1"
+    assert approval.consumed_operation_id is None
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_real_executor_accepts_exact_evidence_and_approval(
+    authority_db, monkeypatch
+):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    context_hash = "ctx-real-approved-merge"
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: context_hash,
+    }
+    authority_db.add(turn_task)
+    invocation = _pr_merge_invocation(project, turn_task)
+    authority_db.add(
+        StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=turn_task.id,
+            authority_generation=3,
+            operation_id="inspect-pr-for-merge",
+            operation_kind="inspect_pr",
+            capability="pr.inspect",
+            risk_level="low",
+            request_hash="f" * 64,
+            expected_revisions={"context_hash": context_hash},
+            status="applied",
+            receipt={
+                "schema_version": 1,
+                "structured_result": {
+                    "evidence": [
+                        {
+                            "kind": ref.kind,
+                            "source_id": ref.source_id,
+                            "revision": ref.revision,
+                            "checksum": ref.checksum,
+                        }
+                        for ref in invocation.evidence
+                    ]
+                },
+            },
+        )
+    )
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 42, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    async def perform(_session):
+        return {"merged": True, "pr_number": 42, "sha": "abc1234"}
+
+    monkeypatch.setattr(
+        capability_router,
+        "build_external_effect",
+        lambda *_args, **_kwargs: perform,
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 501
+    assert (
+        await authority_db.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.operation_id == "merge-1"
+            )
+        )
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_untrusted_evidence_does_not_consume_approval(
+    authority_db, monkeypatch
+):
+    from app.models import StrategicOperationApproval
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: "ctx-approved-merge",
+    }
+    authority_db.add(turn_task)
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 42, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    # Proposal-only rejection precedes evidence and approval handling.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+    approval = (
+        await authority_db.execute(select(StrategicOperationApproval))
+    ).scalar_one()
+    assert approval.consumed_at is None
+    assert approval.consumed_operation_id is None
 
 
 @pytest.mark.asyncio
@@ -1648,8 +1962,11 @@ async def test_pr_merge_approval_for_a_different_pr_is_rejected(authority_db, mo
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
     )
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     project, turn_task, _resident = await _authority_rows(authority_db)
-    # Operator approved PR 7, but the Resident attempts to merge PR 42.
+    # Even an unrelated approval is untouched while merge is proposal-only.
     await grant_operation_approval(
         authority_db,
         project_id=project.id,
@@ -1669,7 +1986,7 @@ async def test_pr_merge_approval_for_a_different_pr_is_rejected(authority_db, mo
             session=authority_db,
             token=_turn_token(project, turn_task),
         )
-    assert exc.value.status_code == 403
+    assert exc.value.status_code == 501
     external.assert_not_awaited()
 
 
@@ -1767,9 +2084,14 @@ def test_request_fingerprint_binds_target_task_id():
 
 
 @pytest.mark.asyncio
-async def test_reprioritize_operation_id_reuse_across_targets_collides(authority_db):
+async def test_reprioritize_operation_id_reuse_across_targets_collides(
+    authority_db, monkeypatch
+):
     """Same operation_id with a different target task must 409, not mis-adopt."""
     from app.routers import agent_resident_capabilities as capability_router
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
 
     project, turn_task, _resident = await _authority_rows(authority_db)
     first = Task(project_id=project.id, title="a", payloads=[{"type": "plan"}], priority=50)
