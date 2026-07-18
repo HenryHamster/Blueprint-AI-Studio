@@ -45,7 +45,14 @@ from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
 from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
-from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
+from app.models import (
+    ComputeImageBuildStatus,
+    ComputeJob,
+    ComputeJobStatus,
+    Project,
+    ProjectComputeImage,
+    ProjectComputeImageBuild,
+)
 from app.vm_lifecycle import _ensure_vm_deleted
 
 # Domain-separation prefix for the compute-job heartbeat secret (see
@@ -105,6 +112,21 @@ _HEARTBEAT_BODY_B64 = base64.b64encode(
 ).decode("ascii")
 _VIEWABLE_WATCH_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "viewable_watch.py").read_bytes()
+).decode("ascii")
+
+# The image builder embeds the ORCHESTRATOR'S OWN copy of the trusted, stdlib-only
+# build tool — ``compute_image_build.py``, the exact module the standalone
+# ``scripts/build_compute_image.py`` CLI loads and the one imported below as
+# ``compute_image_build`` — base64-encoded and run verbatim on the builder VM.
+# The untrusted project repo can therefore NEVER substitute its own credential
+# scanner or drop the ``--network=none`` confinement, both of which live INSIDE
+# this tool (which carries its own ``if __name__ == "__main__"`` entrypoint). It
+# is a sibling of this module (backend/app/), so the path resolves in any deploy
+# layout — unlike the repo-root ``scripts/`` dir, which is NOT copied into the
+# backend image. Loaded at import time so a missing file fails fast at startup,
+# not during live provisioning. See CLAUDE.md's base64-blob cross-language rule.
+_BUILD_TOOL_B64 = base64.b64encode(
+    (Path(__file__).parent / "compute_image_build.py").read_bytes()
 ).decode("ascii")
 
 logger = logging.getLogger(__name__)
@@ -4082,6 +4104,30 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
             raise RuntimeError(f"git checkout {ref} failed: {(co.stderr or '')[-500:]}")
 
 
+@dataclass(slots=True)
+class AsyncImageBuildDispatch:
+    """Returned by :func:`build_project_compute_image` when a REAL build was
+    handed to the off-orchestrator builder VM rather than run inline.
+
+    The build is NOT finished: the reaper poll sweep
+    (:func:`app.reaper_sweeps.sweep_poll_image_builds`) drives the reserved
+    :class:`ProjectComputeImageBuild` row to a terminal state and records the
+    ``ProjectComputeImage`` pin. Callers MUST treat this as "accepted, in
+    progress" (the admin endpoint returns HTTP 202; the auto-refresh sweep
+    reports ``status="dispatched"``) and NOT as a :class:`BuildResult`.
+
+    ``adopted`` is True when an in-flight build for the same ``(project, dep_hash)``
+    already existed and this trigger re-used it instead of provisioning a second
+    builder VM.
+    """
+
+    build_id: uuid.UUID
+    dep_hash: str
+    builder_vm_id: str | None
+    status: str
+    adopted: bool = False
+
+
 async def build_project_compute_image(
     project: "Project",
     *,
@@ -4094,8 +4140,10 @@ async def build_project_compute_image(
     _token_fn=None,
     _clone_fn=None,
     _build_fn=None,
+    _reserve_fn=None,
+    _backend=None,
 ) -> Any:
-    """Bake (or reuse) the project's compute image, returning a ``BuildResult``.
+    """Bake (or reuse) the project's compute image.
 
     Clones the project repo at *ref* into a temp dir, then delegates to
     ``scripts/build_compute_image.build_and_push`` which content-hashes the
@@ -4103,24 +4151,51 @@ async def build_project_compute_image(
     for platform credentials, and otherwise builds + pushes a digest-pinned
     image. Returns the build script's ``BuildResult`` (carries ``pinned_ref``).
 
+    **Off-orchestrator dispatch (config-gated).** Cloud Run has no docker daemon,
+    so the untrusted ``docker build`` cannot run inline on the deployed engine.
+    When :func:`image_builder_backend_enabled` is on and a REAL build is needed,
+    only the daemon-free work runs in-process here — clone + content-hash + the
+    source-input credential scan + the registry presence/digest check + the
+    ``dry_run`` early return — and the actual build is handed to the configured
+    :class:`ImageBuilderBackend`: a :class:`ProjectComputeImageBuild` row is
+    reserved, the builder VM is started, and this returns an
+    :class:`AsyncImageBuildDispatch` WITHOUT blocking on the build. The reaper
+    poll sweep finalizes it. An already-present image (or a ``dry_run`` request)
+    still returns a :class:`BuildResult` inline. When the flag is off the whole
+    build runs inline exactly as before (the fallback path, kept until the VM
+    lane is proven).
+
     *build_config* is the dict from :func:`resolve_project_compute_image_build`.
-    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``) exist for tests; production
-    resolves an installation token and uses git + the real build script.
+    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``/``_reserve_fn``/``_backend``)
+    exist for tests; production resolves an installation token and uses git + the
+    real build script / builder backend.
     """
     import tempfile as _tempfile
 
-    # Server-side builds must always use the isolated builder.  The local
-    # docker implementation is reserved for its standalone CLI; a partial or
-    # mistyped production configuration must fail closed.
+    # The async lane only makes sense for a REAL build — a dry_run is a pure
+    # daemon-free hash/scan and must stay inline (it is what the drift check and
+    # presence probe rely on).
+    async_dispatch = image_builder_backend_enabled() and not dry_run
     build_fn = _build_fn
     if build_fn is None:
-        if not compute_image_remote_build._remote_build_configured():
-            raise RuntimeError(
-                "Remote compute-image build is not configured: set "
-                "COMPUTE_IMAGE_BUILDER_SA, COMPUTE_IMAGE_BUILD_LOCATION, and "
-                "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
-            )
-        build_fn = compute_image_remote_build.remote_build_and_push
+        if async_dispatch:
+            # The async lane calls build_fn ONLY as a daemon-free dry_run probe
+            # (content hash + source-credential scan + registry presence/digest
+            # check, never a docker build); the real build is handed to the
+            # builder VM. The local hash implementation is the probe.
+            build_fn = compute_image_build.build_and_push
+        else:
+            # Inline server-side builds must always use the isolated remote
+            # builder. The local docker implementation is reserved for its
+            # standalone CLI; a partial or mistyped production configuration
+            # must fail closed.
+            if not compute_image_remote_build._remote_build_configured():
+                raise RuntimeError(
+                    "Remote compute-image build is not configured: set "
+                    "COMPUTE_IMAGE_BUILDER_SA, COMPUTE_IMAGE_BUILD_LOCATION, and "
+                    "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
+                )
+            build_fn = compute_image_remote_build.remote_build_and_push
 
     owner = (getattr(project, "github_owner", None) or "").strip()
     repo = (getattr(project, "github_repo", None) or "").strip()
@@ -4131,15 +4206,22 @@ async def build_project_compute_image(
         ref or getattr(project, "promotion_target", None) or "main"
     )
     image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+    dockerfile = build_config.get("dockerfile") or ".blueprint/Dockerfile.compute"
+    build_args = dict(build_config.get("build_args") or {})
+    parent = build_config.get("parent")
 
     with _tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
         repo_dir = os.path.join(tmp, "repo")
 
         # Resolve a short-lived read token and clone (unless a hook overrides).
+        # The token is hoisted so the off-orchestrator dispatch can hand it to the
+        # builder VM for its own clone.
+        token = None
         if _clone_fn is not None:
             await asyncio.to_thread(_clone_fn, owner, repo, resolved_ref, repo_dir)
+            if _token_fn is not None:
+                token = await _token_fn(project)
         else:
-            token = None
             if _token_fn is not None:
                 token = await _token_fn(project)
             else:
@@ -4165,19 +4247,202 @@ async def build_project_compute_image(
             else (explicit_deps if explicit_deps else _discover_dep_files(repo_dir))
         )
 
+        if async_dispatch:
+            # Daemon-free probe: content-hash + source credential scan + registry
+            # presence/digest check, with NO docker build. An already-present
+            # image (or a scan finding, which raises) returns inline; anything
+            # that would actually build is dispatched to the builder VM.
+            probe = await asyncio.to_thread(
+                build_fn,
+                repo_dir=repo_dir,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                parent=parent,
+                build_args=dict(build_args),
+                dry_run=True,
+            )
+            if getattr(probe, "already_present", False):
+                return probe
+            return await _dispatch_async_image_build(
+                project=project,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dep_hash=getattr(probe, "dep_hash", "") or "",
+                owner=owner,
+                repo=repo,
+                ref=resolved_ref,
+                repo_token=token or "",
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                build_args=build_args,
+                parent=parent,
+                _reserve_fn=_reserve_fn,
+                _backend=_backend,
+            )
+
         result = await asyncio.to_thread(
             build_fn,
             repo_dir=repo_dir,
             registry_repo=registry_repo,
             image_name=image_name,
-            dockerfile=build_config.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            dockerfile=dockerfile,
             dep_files=resolved_dep_files,
-            parent=build_config.get("parent"),
-            build_args=dict(build_config.get("build_args") or {}),
+            parent=parent,
+            build_args=dict(build_args),
             dry_run=dry_run,
             cancel_event=cancel_event,
         )
     return result
+
+
+async def reserve_project_compute_image_build(
+    session: Any,
+    *,
+    project_id: uuid.UUID,
+    dep_hash: str,
+    registry_repo: str,
+    image_name: str,
+    deadline_at: datetime | None = None,
+) -> ProjectComputeImageBuild:
+    """Reserve (or adopt) a :class:`ProjectComputeImageBuild` tracking row.
+
+    Idempotent on ``(project_id, dep_hash)``: a re-trigger for the same
+    dependency hash while a build is still ``PENDING``/``BUILDING`` returns the
+    existing row rather than inserting a duplicate — a duplicate would provision
+    a second builder VM (double-spend) and produce two poll-sweep finalizers for
+    one image. A fresh reservation is inserted ``PENDING``; the caller flips it to
+    ``BUILDING`` once the VM is started. Commits the session.
+    """
+    from sqlalchemy import select
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImageBuild)
+            .where(
+                ProjectComputeImageBuild.project_id == project_id,
+                ProjectComputeImageBuild.dep_hash == dep_hash,
+                ProjectComputeImageBuild.status.in_(
+                    [
+                        ComputeImageBuildStatus.PENDING,
+                        ComputeImageBuildStatus.BUILDING,
+                    ]
+                ),
+            )
+            .order_by(ProjectComputeImageBuild.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    row = ProjectComputeImageBuild(
+        project_id=project_id,
+        dep_hash=dep_hash,
+        registry_repo=registry_repo,
+        image_name=image_name,
+        status=ComputeImageBuildStatus.PENDING,
+        deadline_at=deadline_at,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def _dispatch_async_image_build(
+    *,
+    project: "Project",
+    registry_repo: str,
+    image_name: str,
+    dep_hash: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    repo_token: str,
+    dockerfile: str,
+    dep_files: Sequence[str],
+    build_args: dict[str, str],
+    parent: str | None,
+    _reserve_fn=None,
+    _backend=None,
+) -> AsyncImageBuildDispatch:
+    """Reserve a tracking row, start the builder VM, and return without blocking.
+
+    On :meth:`ImageBuilderBackend.start` failure the reserved row is marked
+    ``FAILED`` (so it never lingers ``PENDING``) and a ``RuntimeError`` is raised
+    — the admin endpoint surfaces it as a 422 and the auto-refresh sweep isolates
+    it. The reaper poll sweep is what finalizes a successfully-started build.
+    """
+    from app.database import AsyncSessionLocal
+
+    reserve_fn = _reserve_fn or reserve_project_compute_image_build
+    backend = _backend if _backend is not None else get_image_builder_backend()
+    deadline_at = _utcnow() + timedelta(seconds=_IMAGE_BUILDER_DEADLINE_SECONDS)
+
+    async with AsyncSessionLocal() as session:
+        build_row = await reserve_fn(
+            session,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            deadline_at=deadline_at,
+        )
+        # Adopt an already-dispatched in-flight build instead of starting a
+        # second VM for the same dependency hash.
+        if (
+            build_row.status == ComputeImageBuildStatus.BUILDING
+            and build_row.builder_vm_id
+        ):
+            return AsyncImageBuildDispatch(
+                build_id=build_row.id,
+                dep_hash=dep_hash,
+                builder_vm_id=build_row.builder_vm_id,
+                status=ComputeImageBuildStatus.BUILDING.value,
+                adopted=True,
+            )
+
+        request = ImageBuildRequest(
+            build_id=build_row.id,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            repo_clone={"owner": owner, "repo": repo, "ref": ref},
+            repo_token=repo_token,
+            dockerfile=dockerfile,
+            dep_files=tuple(dep_files),
+            build_args=dict(build_args or {}),
+            parent=parent,
+            deadline_at=deadline_at,
+        )
+        try:
+            handle = await backend.start(request)
+        except Exception as e:  # noqa: BLE001 — record the failure, don't leak PENDING
+            build_row.status = ComputeImageBuildStatus.FAILED
+            build_row.error_reason = f"builder start failed: {e}"[:2000]
+            build_row.updated_at = _utcnow()
+            session.add(build_row)
+            with contextlib.suppress(Exception):
+                await session.commit()
+            raise RuntimeError(f"image-builder dispatch failed: {e}") from e
+
+        build_row.status = ComputeImageBuildStatus.BUILDING
+        build_row.builder_vm_id = handle.external_id
+        build_row.zone = handle.zone
+        build_row.started_at = handle.started_at
+        build_row.deadline_at = deadline_at
+        build_row.updated_at = _utcnow()
+        session.add(build_row)
+        await session.commit()
+        return AsyncImageBuildDispatch(
+            build_id=build_row.id,
+            dep_hash=dep_hash,
+            builder_vm_id=handle.external_id,
+            status=ComputeImageBuildStatus.BUILDING.value,
+        )
 
 
 def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
@@ -4477,16 +4742,6 @@ async def refresh_project_compute_image(
     # Use Docker-free tag / digest checks when the remote builder is configured
     # so the fast-path no-op (unchanged manifest) never needs a local docker daemon.
     _remote_ok = compute_image_remote_build._remote_build_configured()
-    if (
-        not _remote_ok
-        and _tag_exists_fn is None
-        and _resolve_digest_fn is None
-        and _build_fn is None
-    ):
-        return {
-            "status": "error",
-            "error": "Remote compute-image build is not configured",
-        }
     if _tag_exists_fn is not None:
         tag_exists_fn = _tag_exists_fn
     elif _remote_ok:
@@ -4521,6 +4776,24 @@ async def refresh_project_compute_image(
         token = await token_fn(owner, repo)
         if not token:
             return {"status": "no_config", "reason": "no installation read token"}
+
+        # Fail closed on a genuinely buildable project (repo + build section +
+        # token) when no build backend is available: neither the isolated remote
+        # builder nor the off-orchestrator VM builder is configured and no test
+        # hook supplied a build/registry function. Placed AFTER the no_config
+        # short-circuits so a project with nothing to build still resolves to
+        # no_config rather than a misleading error.
+        if (
+            not _remote_ok
+            and not image_builder_backend_enabled()
+            and _tag_exists_fn is None
+            and _resolve_digest_fn is None
+            and _build_fn is None
+        ):
+            return {
+                "status": "error",
+                "error": "Remote compute-image build is not configured",
+            }
 
         default_branch = await default_branch_fn(token, owner, repo)
         project_id_str = str(project_id or "")
@@ -4742,6 +5015,27 @@ async def refresh_project_compute_image(
         finally:
             if acquired:
                 build_semaphore.release()
+
+        # Off-orchestrator dispatch: the real build was handed to a builder VM and
+        # is NOT finished — there is nothing to record yet. The reaper poll sweep
+        # (sweep_poll_image_builds) drives the reserved row to terminal and records
+        # the pin. Report the dispatch so the sweep can count it.
+        if isinstance(result, AsyncImageBuildDispatch):
+            logger.info(
+                "[COMPUTE-IMAGE] auto-refresh dispatched async build for "
+                "project=%s dep_hash=%s build_id=%s (adopted=%s)",
+                project_id,
+                dep_hash,
+                result.build_id,
+                result.adopted,
+            )
+            return {
+                "status": "dispatched",
+                "dep_hash": dep_hash,
+                "build_id": str(result.build_id),
+                "builder_vm_id": result.builder_vm_id,
+                "adopted": result.adopted,
+            }
 
         result = await _preserve_existing_digest_pin_cb(session, project_id, result)
         row = await record_fn(
@@ -5080,3 +5374,517 @@ def resolve_compute_image_registry_repo() -> str:
     region = os.environ.get("COMPUTE_IMAGE_REGION", "us").strip() or "us"
     project = storage.GCP_PROJECT_ID
     return f"{region}-docker.pkg.dev/{project}/compute-images"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Off-orchestrator compute-image builder (DARK — gated OFF by config)
+#
+# Cloud Run's request process has no docker daemon and a 60-minute request cap,
+# so the untrusted, repo-controlled ``docker build`` cannot run inline on the
+# orchestrator. This backend moves that build onto a THROWAWAY GCE VM that runs
+# under the leaf ``image-builder-sa`` identity (push/pull on the images repo and
+# nothing else), reusing the existing compute-job substrate (provision + serial
+# markers + signed-GCS + poll) rather than inventing new machinery.
+#
+# The build is confined by the TRUSTED release copy of ``build_compute_image.py``
+# (base64-embedded, never the repo's copy): ``docker build --network=none``, the
+# layer-credential scan, then ``docker push``. This module only ADDS the
+# machinery; it is selectable by config and is NOT wired into any trigger or
+# sweep yet. See ``sweep_poll_image_builds`` for the polling half.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+IMAGE_BUILDER_BACKEND_NAME = "gcp-ephemeral-vm"
+
+# Serial markers the builder VM emits (siblings of the compute-job markers). The
+# result payload is base64 so the machine-readable ``RESULT_JSON`` object never
+# has to survive a serial/escape pass — see CLAUDE.md's cross-language rule.
+_SERIAL_BUILD_RESULT_PREFIX = "BLUEPRINT_BUILD_RESULT="
+_SERIAL_BUILD_STATUS_PREFIX = "BLUEPRINT_BUILD_STATUS="
+_SERIAL_BUILD_EXIT_PREFIX = "BLUEPRINT_BUILD_EXIT="
+
+# Default builder VM shape: a CPU VM with enough room for a docker build context
+# and image layers. Env-overridable so the operator can size it per project.
+_IMAGE_BUILDER_MACHINE_TYPE = os.getenv(
+    "COMPUTE_IMAGE_BUILDER_MACHINE_TYPE", "e2-standard-4"
+)
+# Wall-clock ceiling for a single build (provision → build → push → terminal).
+# The poll sweep deletes the VM and marks TIMED_OUT once this elapses.
+_IMAGE_BUILDER_DEADLINE_SECONDS = _positive_int_env(
+    "COMPUTE_IMAGE_BUILDER_DEADLINE_SECONDS", 45 * 60
+)
+# Defensive ceiling on the decoded serial ``RESULT_JSON`` payload — the object is
+# small (a pinned ref + digest + a short findings list), so anything larger is
+# treated as absent rather than parsed.
+_MAX_BUILD_RESULT_DECODED_BYTES = 65536
+
+# On-VM paths for the builder startup script.
+_BUILDER_REPO_DIR = "/tmp/blueprint_build_repo"
+_BUILDER_TOOL_FILE = "/tmp/blueprint_build_tool.py"
+_BUILDER_RESULT_FILE = "/tmp/blueprint_build_result.json"
+_BUILDER_STDOUT_FILE = "/tmp/blueprint_build_stdout.log"
+_BUILDER_TERMINAL_FILE = "/tmp/blueprint_build_terminal.json"
+_BUILDER_CLONE_ERR = "/tmp/blueprint_build_clone.err"
+
+
+def image_builder_backend_enabled() -> bool:
+    """Whether the off-orchestrator image builder is enabled (dark by default).
+
+    Ships OFF: nothing in this module runs until an operator flips
+    ``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED`` to a truthy value. The trigger
+    endpoint and auto-refresh sweep are unchanged and keep using the inline path
+    until this backend is proven.
+    """
+    return os.getenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _image_builder_vm_name(project_id: object, dep_hash: str) -> str:
+    """Deterministic builder-VM name derived from ``(project_id, dep_hash)``.
+
+    A re-trigger for the SAME project + dependency hash resolves to the SAME VM
+    name, so :meth:`GcpEphemeralVmImageBuilderBackend.start` ADOPTS the in-flight
+    build instead of provisioning a duplicate (and double-spending). The name is
+    a short sha256 over both fields so two projects that happen to share a
+    dep_hash still get distinct VMs, and the result is always a DNS-safe GCE
+    instance name (``[a-z]([-a-z0-9]*[a-z0-9])?``, ≤63 chars).
+    """
+    digest = hashlib.sha256(f"{project_id}:{dep_hash}".encode("utf-8")).hexdigest()
+    return f"img-build-{digest[:20]}"
+
+
+@dataclass(slots=True)
+class ImageBuildRequest:
+    """The inputs one off-orchestrator compute-image build needs.
+
+    Mirrors the ``ComputeLaunchSpec`` role for the builder lane: everything the
+    startup script embeds (repo + ref + short-lived token, registry target,
+    Dockerfile / dep files, build args) plus the row id it reports against.
+    """
+
+    build_id: uuid.UUID
+    project_id: uuid.UUID
+    dep_hash: str
+    registry_repo: str
+    image_name: str
+    repo_clone: dict[str, str]
+    repo_token: str
+    dockerfile: str = ".blueprint/Dockerfile.compute"
+    dep_files: Sequence[str] = ()
+    build_args: dict[str, str] | None = None
+    parent: str | None = None
+    machine_type: str = _IMAGE_BUILDER_MACHINE_TYPE
+    deadline_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ImageBuildHandle:
+    """Best-effort handle returned by ``start`` — the row is the source of truth."""
+
+    external_id: str
+    zone: str | None
+    started_at: datetime
+    message: str | None = None
+
+
+@dataclass(slots=True)
+class ImageBuildStatusResult:
+    """Outcome of a single ``poll`` — the parsed serial/terminal build state."""
+
+    status: ComputeImageBuildStatus
+    exit_code: int | None = None
+    # Parsed ``RESULT_JSON`` object from the trusted build tool (pinned_ref, tag,
+    # dep_hash, already_present, built, findings, digest). None when the build has
+    # not produced one (still building, or failed before emitting it).
+    result: dict[str, Any] | None = None
+    reason: str | None = None
+    finished_at: datetime | None = None
+
+
+class ImageBuilderBackend(Protocol):
+    """Pluggable backend for off-orchestrator compute-image builds.
+
+    Mirrors :class:`ComputeBackend`: callers depend only on this stable
+    start/poll/abort surface, and backend-specific VM/serial handling stays
+    encapsulated so a second builder lane can be added without touching the poll
+    sweep.
+    """
+
+    name: str
+
+    def external_id_for(self, request: ImageBuildRequest) -> str: ...
+
+    async def start(self, request: ImageBuildRequest) -> ImageBuildHandle: ...
+
+    async def poll(self, build: ProjectComputeImageBuild) -> ImageBuildStatusResult: ...
+
+    async def abort(self, build: ProjectComputeImageBuild, *, reason: str) -> bool: ...
+
+
+def _decode_build_result(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode the base64 ``RESULT_JSON`` serial payload; None on any problem.
+
+    Defensive: a missing, oversized, or garbled marker is treated as ABSENT
+    (None), never raised — a lost result must not crash the poll sweep.
+    """
+    if not raw_b64:
+        return None
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _MAX_BUILD_RESULT_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _parse_image_build_serial(serial_output: str) -> ImageBuildStatusResult | None:
+    """Parse the builder VM's terminal serial markers, or None if not terminal.
+
+    Returns None when no ``BLUEPRINT_BUILD_STATUS`` marker is present yet (the
+    build is still running); otherwise a terminal SUCCEEDED/FAILED result with
+    the decoded ``RESULT_JSON`` object attached when available.
+    """
+    status_line: str | None = None
+    exit_code: int | None = None
+    result_b64: str | None = None
+    for raw_line in serial_output.splitlines():
+        line = raw_line.strip()
+        if line.startswith(_SERIAL_BUILD_STATUS_PREFIX):
+            status_line = line[len(_SERIAL_BUILD_STATUS_PREFIX):]
+        elif line.startswith(_SERIAL_BUILD_EXIT_PREFIX):
+            try:
+                exit_code = int(line[len(_SERIAL_BUILD_EXIT_PREFIX):])
+            except ValueError:
+                exit_code = None
+        elif line.startswith(_SERIAL_BUILD_RESULT_PREFIX):
+            result_b64 = line[len(_SERIAL_BUILD_RESULT_PREFIX):]
+    if status_line is None:
+        return None
+    result = _decode_build_result(result_b64)
+    if status_line == "SUCCEEDED":
+        return ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=exit_code,
+            result=result,
+            reason="completed",
+            finished_at=_utcnow(),
+        )
+    return ImageBuildStatusResult(
+        status=ComputeImageBuildStatus.FAILED,
+        exit_code=exit_code,
+        result=result,
+        reason=f"build_failed_exit_{exit_code}" if exit_code is not None else "build_failed",
+        finished_at=_utcnow(),
+    )
+
+
+def _terminal_record_to_status(record: dict[str, Any]) -> ImageBuildStatusResult | None:
+    """Map a durable ``terminal.json`` record back to a poll result, or None."""
+    status_raw = str(record.get("status") or "").upper()
+    if status_raw not in ("SUCCEEDED", "FAILED"):
+        return None
+    exit_code = record.get("exit_code")
+    try:
+        exit_code = int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        exit_code = None
+    result = _decode_build_result(record.get("result_b64"))
+    status = (
+        ComputeImageBuildStatus.SUCCEEDED
+        if status_raw == "SUCCEEDED"
+        else ComputeImageBuildStatus.FAILED
+    )
+    return ImageBuildStatusResult(
+        status=status,
+        exit_code=exit_code,
+        result=result,
+        reason=str(record.get("reason") or "") or None,
+        finished_at=_utcnow(),
+    )
+
+
+def _build_image_builder_startup_script(
+    request: ImageBuildRequest, *, terminal_upload_url: str
+) -> str:
+    """Render the throwaway builder VM's bash startup script.
+
+    The script clones the untrusted repo at ``ref`` (short-lived token embedded
+    in the clone URL, scrubbed from any error before it reaches the artifact or
+    serial console), lays down the ORCHESTRATOR'S OWN copy of the trusted build
+    tool (base64 blobs, never the repo's copy), runs it — the tool itself does
+    ``docker build --network=none`` + the layer-credential scan + ``docker push``
+    — then emits BLUEPRINT_BUILD_{RESULT,STATUS,EXIT} serial markers AND uploads a
+    durable ``terminal.json`` to the per-build signed GCS URL before poweroff.
+
+    Per CLAUDE.md's cross-language rule the embedded Python is delivered ONLY as
+    base64 blobs decoded on-VM; every other line is single-statement bash with no
+    nested-language heredoc, and ``terminal.json`` is assembled with a single
+    ``printf`` over base64-safe values.
+    """
+    ref = str(request.repo_clone.get("ref") or "main")
+    owner = str(request.repo_clone.get("owner") or "")
+    repo = str(request.repo_clone.get("repo") or "")
+    clone_url = f"https://x-access-token:{request.repo_token}@github.com/{owner}/{repo}.git"
+
+    registry_host = request.registry_repo.split("/", 1)[0]
+
+    # Assemble the trusted-build-tool invocation. All values are shlex-quoted so a
+    # crafted image name / dep path / build arg can't break out of the argv.
+    build_argv = [
+        "python3",
+        shlex.quote(_BUILDER_TOOL_FILE),
+        "--repo-dir",
+        shlex.quote(_BUILDER_REPO_DIR),
+        "--registry",
+        shlex.quote(request.registry_repo),
+        "--image-name",
+        shlex.quote(request.image_name),
+        "--dockerfile",
+        shlex.quote(request.dockerfile),
+    ]
+    for dep_file in request.dep_files or ():
+        build_argv.extend(["--dep-file", shlex.quote(str(dep_file))])
+    if request.parent:
+        build_argv.extend(["--parent", shlex.quote(str(request.parent))])
+    for key, value in sorted((request.build_args or {}).items()):
+        build_argv.extend(["--build-arg", shlex.quote(f"{key}={value}")])
+    build_cmd = " ".join(build_argv)
+
+    q_repo_dir = shlex.quote(_BUILDER_REPO_DIR)
+    q_result = shlex.quote(_BUILDER_RESULT_FILE)
+    q_stdout = shlex.quote(_BUILDER_STDOUT_FILE)
+    q_terminal = shlex.quote(_BUILDER_TERMINAL_FILE)
+    q_clone_err = shlex.quote(_BUILDER_CLONE_ERR)
+    q_tool = shlex.quote(_BUILDER_TOOL_FILE)
+    q_upload = shlex.quote(terminal_upload_url)
+    q_host = shlex.quote(registry_host)
+    q_ref = shlex.quote(ref)
+    q_clone_url = shlex.quote(clone_url)
+
+    return f"""#!/bin/bash
+set -u -o pipefail
+
+BUILD_STATUS=FAILED
+BUILD_EXIT=1
+REASON=unknown
+RESULT_B64=""
+: > {q_result}
+: > {q_stdout}
+
+# Emit the durable terminal.json (uploaded to the per-build signed URL) AND the
+# serial markers the poll sweep reads. terminal.json is built with one printf
+# over base64-safe values (RESULT_B64 is base64; the rest are controlled) so no
+# character has to survive an escape pass.
+emit_terminal() {{
+  if [ -s {q_result} ]; then
+    RESULT_B64=$(base64 -w0 < {q_result} 2>/dev/null || true)
+  fi
+  printf '{{"schema_version":1,"status":"%s","exit_code":%s,"reason":"%s","result_b64":"%s"}}' \
+    "$BUILD_STATUS" "$BUILD_EXIT" "$REASON" "$RESULT_B64" > {q_terminal} 2>/dev/null || true
+  if command -v curl >/dev/null 2>&1; then
+    timeout 120 curl --fail --silent --show-error --request PUT \
+      --upload-file {q_terminal} \
+      --header "Content-Type: application/json" \
+      {q_upload} >/dev/null 2>&1 || true
+  fi
+  echo "{_SERIAL_BUILD_RESULT_PREFIX}$RESULT_B64"
+  echo "{_SERIAL_BUILD_STATUS_PREFIX}$BUILD_STATUS"
+  echo "{_SERIAL_BUILD_EXIT_PREFIX}$BUILD_EXIT"
+}}
+
+# Lay down the ORCHESTRATOR'S OWN trusted, stdlib-only build tool (never the
+# repo's copy). It runs docker build --network=none + the layer-credential scan
+# + docker push all from THIS file.
+echo '{_BUILD_TOOL_B64}' | base64 -d > {q_tool}
+
+# Clone the UNTRUSTED project repo at ref. On failure scrub the token from the
+# captured stderr, emit a typed reason, and power off — the token never reaches
+# the serial console (stderr is redirected to a file, then redacted).
+rm -rf {q_repo_dir}
+if ! git clone --depth 1 --branch {q_ref} {q_clone_url} {q_repo_dir} >/dev/null 2>{q_clone_err}; then
+  sed -i -E 's#x-access-token:[^@]*@#x-access-token:REDACTED@#g; s#gh[a-z]_[A-Za-z0-9]{{20,}}#REDACTED#g' {q_clone_err} 2>/dev/null || true
+  BUILD_STATUS=FAILED
+  BUILD_EXIT=1
+  REASON=repo_clone_failed
+  emit_terminal
+  poweroff || shutdown -h now || true
+  exit 1
+fi
+
+# Authenticate docker to Artifact Registry via the attached image-builder SA
+# (best-effort; the tool's push surfaces a real auth failure as exit 1).
+gcloud auth configure-docker {q_host} --quiet >/dev/null 2>&1 || true
+
+# Run the trusted build tool: docker build --network=none + layer-credential
+# scan + docker push all live INSIDE it, sourced from the release copy above,
+# NEVER the repo's copy. Capture stdout to extract its RESULT_JSON line.
+{build_cmd} > {q_stdout} 2>&1
+BUILD_EXIT=$?
+if [ "$BUILD_EXIT" -eq 0 ]; then
+  BUILD_STATUS=SUCCEEDED
+  REASON=completed
+else
+  BUILD_STATUS=FAILED
+  REASON=build_failed
+fi
+RJSON=$(grep '^RESULT_JSON:' {q_stdout} 2>/dev/null | tail -n1 | sed 's/^RESULT_JSON://' || true)
+if [ -n "$RJSON" ]; then
+  printf '%s' "$RJSON" > {q_result} 2>/dev/null || true
+fi
+emit_terminal
+poweroff || shutdown -h now || true
+exit "$BUILD_EXIT"
+"""
+
+
+class GcpEphemeralVmImageBuilderBackend:
+    """Runs an untrusted compute-image build on a throwaway GCE VM.
+
+    Reuses the compute-job substrate: :func:`compute.provision_ephemeral_vm`
+    (with the leaf image-builder SA attached), a deterministic dep-hash VM name
+    for idempotent adoption, serial markers for status, and a per-build signed
+    GCS object for the durable terminal record.
+    """
+
+    name = IMAGE_BUILDER_BACKEND_NAME
+
+    def external_id_for(self, request: ImageBuildRequest) -> str:
+        return _image_builder_vm_name(request.project_id, request.dep_hash)
+
+    async def start(self, request: ImageBuildRequest) -> ImageBuildHandle:
+        external_id = self.external_id_for(request)
+        # Idempotent re-trigger: adopt the in-flight VM for the same dep hash
+        # instead of provisioning (and paying for) a second builder.
+        existing_zone = await asyncio.to_thread(compute.find_vm_zone, external_id)
+        if existing_zone:
+            started_at = await asyncio.to_thread(
+                compute.get_vm_created_at, external_id, existing_zone
+            )
+            return ImageBuildHandle(
+                external_id=external_id,
+                zone=existing_zone,
+                started_at=started_at or _utcnow(),
+                message="adopted in-flight image-builder VM",
+            )
+        expiry = _artifact_upload_expiry(request.deadline_at)
+        terminal_upload_url = (
+            await storage.generate_compute_job_artifact_upload_signed_url(
+                request.build_id, expires_at=expiry
+            )
+        )
+        startup_script = _build_image_builder_startup_script(
+            request, terminal_upload_url=terminal_upload_url
+        )
+        ok = await compute.provision_ephemeral_vm(
+            external_id,
+            startup_script=startup_script,
+            machine_type=request.machine_type,
+            service_account_email=compute.IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL,
+        )
+        if not ok:
+            raise RuntimeError("image-builder VM provisioning failed")
+        zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
+        return ImageBuildHandle(
+            external_id=external_id,
+            zone=zone if zone and zone != "unknown" else None,
+            started_at=_utcnow(),
+            message="provisioned image-builder VM",
+        )
+
+    async def _read_terminal_record(
+        self, build: ProjectComputeImageBuild
+    ) -> ImageBuildStatusResult | None:
+        """Best-effort durable-terminal fallback when the serial marker is lost.
+
+        The builder VM uploaded ``terminal.json`` to the per-build signed object
+        before poweroff; read it back so a job whose serial marker was lost to
+        the poweroff-vs-serial-read race can still be reconciled. Any failure
+        (object absent, unreadable, garbled) yields None — never raises.
+        """
+        try:
+            raw = await storage.download_compute_job_artifact_bundle(build.id)
+        except Exception:  # noqa: BLE001 — durable fallback is best-effort
+            return None
+        if not raw or len(raw) > _MAX_BUILD_RESULT_DECODED_BYTES:
+            return None
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        return _terminal_record_to_status(record)
+
+    async def poll(self, build: ProjectComputeImageBuild) -> ImageBuildStatusResult:
+        external_id = build.builder_vm_id or ""
+        serial = await asyncio.to_thread(
+            compute.get_vm_serial_output, external_id, build.zone
+        )
+        parsed = _parse_image_build_serial(serial or "")
+        if parsed is not None:
+            return parsed
+        durable = await self._read_terminal_record(build)
+        if durable is not None:
+            return durable
+        # No terminal marker anywhere: if the VM is gone it died without writing a
+        # result (fail-closed); otherwise it is still building.
+        still_zone = await asyncio.to_thread(compute.find_vm_zone, external_id)
+        if still_zone is None:
+            return ImageBuildStatusResult(
+                status=ComputeImageBuildStatus.FAILED,
+                reason="builder_vm_gone_without_result",
+                finished_at=_utcnow(),
+            )
+        return ImageBuildStatusResult(status=ComputeImageBuildStatus.BUILDING)
+
+    async def abort(self, build: ProjectComputeImageBuild, *, reason: str) -> bool:
+        external_id = build.builder_vm_id
+        if not external_id:
+            return True
+        try:
+            await compute.delete_agent_vm(external_id)
+        except Exception:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "[IMAGE-BUILDER] failed to delete builder VM %s (%s)",
+                external_id,
+                reason,
+                exc_info=True,
+            )
+            return False
+        return True
+
+
+# Process-wide singleton (stateless — the row is the source of truth).
+_GCP_IMAGE_BUILDER_BACKEND = GcpEphemeralVmImageBuilderBackend()
+
+
+def get_image_builder_backend() -> ImageBuilderBackend:
+    """Return the configured image-builder backend (only the GCP lane today)."""
+    return _GCP_IMAGE_BUILDER_BACKEND
+
+
+def build_result_from_serial_payload(
+    result: dict[str, Any], *, dep_hash: str
+) -> "compute_image_build.BuildResult":
+    """Reconstruct a ``BuildResult`` from the builder's parsed ``RESULT_JSON``.
+
+    Used by the poll sweep to feed :func:`record_project_compute_image_build`
+    (via the digest-preservation guard) exactly as the inline build path does.
+    Falls back to the row's ``dep_hash`` when the payload omits it.
+    """
+    return compute_image_build.BuildResult(
+        pinned_ref=str(result.get("pinned_ref") or ""),
+        tag=str(result.get("tag") or ""),
+        dep_hash=str(result.get("dep_hash") or "") or dep_hash,
+        already_present=bool(result.get("already_present")),
+        built=bool(result.get("built")),
+        findings=list(result.get("findings") or []),
+        digest=result.get("digest") or None,
+    )

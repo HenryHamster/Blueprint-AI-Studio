@@ -134,6 +134,25 @@ resource "google_service_account_iam_member" "orchestrator_act_as_agent" {
 }
 
 # ------------------------------------------------------------------------------
+# Image Builder Service Account — leaf identity for off-orchestrator docker builds
+# Only capability: push/pull on the compute-images Artifact Registry repo.
+# No orchestrator, GitHub, LLM, or runner credentials are reachable from this SA.
+# ------------------------------------------------------------------------------
+resource "google_service_account" "image_builder_sa" {
+  account_id   = "image-builder-sa"
+  display_name = "Image Builder SA (throwaway builder VM identity)"
+  description  = "Leaf SA for off-orchestrator compute-image builds. Holds only AR writer+reader on compute-images repo."
+}
+
+# Grant Orchestrator SA permission to attach image_builder_sa to throwaway builder VMs.
+# Mirrors orchestrator_act_as_agent above; no new project-level roles are granted.
+resource "google_service_account_iam_member" "orchestrator_act_as_image_builder" {
+  service_account_id = google_service_account.image_builder_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# ------------------------------------------------------------------------------
 # Artifact Bucket (payloads, credentials, screenshots)
 # ------------------------------------------------------------------------------
 resource "google_storage_bucket" "artifacts" {

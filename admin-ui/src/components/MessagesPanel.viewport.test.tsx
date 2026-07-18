@@ -30,6 +30,11 @@ vi.mock('../api', () => ({
   API_BASE_URL: 'http://localhost:8000',
   MESSAGE_CONTENT_MAX: 20000,
   authHeaders: vi.fn(async () => ({ 'Authorization': 'Bearer test', 'Content-Type': 'application/json' })),
+  // MessagesPanel statically imports the pending-confirmation actions; browser-mode
+  // ESM requires the mock factory to expose every named export the subtree imports
+  // or the linker fails at import time with "does not provide an export named '…'".
+  acceptPendingConfirmation: vi.fn(async () => ({ status: 'accepted' })),
+  dismissPendingConfirmation: vi.fn(async () => ({ status: 'dismissed' })),
 }));
 
 function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {

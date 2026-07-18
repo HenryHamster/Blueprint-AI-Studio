@@ -1828,21 +1828,6 @@ export function parseOperatorDecision(resultText: string): string | null {
 
 export type OperatorDecisionReviewResolution = 'no-decision' | 'unresolved';
 
-export function parseOperatorDecisionReview(
-  resultText: string,
-): OperatorDecisionReviewResolution | null {
-  if (typeof resultText !== 'string') return null;
-  const lines = resultText.split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const m = /^\s*OPERATOR-DECISION-REVIEW:\s*(NO-DECISION|UNRESOLVED)\b/i.exec(
-      stripMarkerDecoration(lines[i]),
-    );
-    if (!m) continue;
-    return m[1].toLowerCase() as OperatorDecisionReviewResolution;
-  }
-  return null;
-}
-
 export interface OperatorDecisionReviewOutcome {
   kind: 'recovered' | 'no-decision' | 'pending';
   note?: string;

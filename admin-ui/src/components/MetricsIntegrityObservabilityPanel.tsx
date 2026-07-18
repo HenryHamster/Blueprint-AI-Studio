@@ -124,7 +124,11 @@ export function MetricsIntegrityObservabilityPanel({
               {recentFlags.length > 0 && (
                 <div>
                   <p className="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2">Recent Flags</p>
-                  <div className="overflow-x-auto">
+                  {/* Six-column drift table: horizontal scroll is the intended
+                      mobile affordance (it cannot reflow readably at 375px), so
+                      the scroll container opts out of the viewport overflow gate
+                      — mirrors LaneDiagPanel / RemediationFunnelSection. */}
+                  <div className="overflow-x-auto" data-viewport-allow-overflow data-viewport-allow-truncation>
                     <table className="w-full text-xs">
                       <thead>
                         <tr className="text-left text-ui-sm text-neutral-500 border-b border-neutral-800">

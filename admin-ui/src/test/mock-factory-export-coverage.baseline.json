@@ -1,4 +1,12 @@
 {
+  "api/projectTools.residentArtifact.test.ts": {
+    "./core": [
+      "COST_PER_VM_HR",
+      "MESSAGE_CONTENT_MAX",
+      "authGet",
+      "authHeaders"
+    ]
+  },
   "components/KanbanBoard.test.tsx": {
     "./TaskCard": [
       "ResearchFindings",
@@ -33,37 +41,35 @@
       "useElapsedTime"
     ]
   },
-  "components/MessageAttachments.test.tsx": {
-    "../strategicStateApi": [
-      "STRATEGIC_CONVERSATION_NOT_MODIFIED",
-      "STRATEGIC_STATE_NOT_MODIFIED",
-      "StrategicSessionMessageCreateError",
-      "checkInStrategicSession",
-      "createStrategicSessionMessage",
-      "deleteMessageAttachmentUpload",
-      "executeStrategicWorkSessionCommand",
-      "fetchStrategicConversation",
-      "fetchStrategicLiveness",
-      "fetchStrategicSession",
-      "fetchStrategicState",
-      "fetchStrategicStateWithRevision",
-      "fetchStrategicWorkbenchState",
-      "findStrategicMessageByClientIdentity",
-      "getMessageAttachmentUploadUrl",
-      "isStrategicConversationNotModified",
-      "isStrategicStateNotModified",
-      "startStrategicSession",
-      "stopStrategicSession",
-      "updateStrategicWorkbenchState"
+  "components/NotesTool.test.tsx": {
+    "../utils/residentToolHandoff": [
+      "RESIDENT_TOOL_HANDOFF_EVENT",
+      "acknowledgeQueuedResidentToolHandoffs",
+      "enqueueResidentToolHandoff",
+      "isResidentToolHandoffEvent",
+      "isResidentToolHandoffQueueStorageKey",
+      "loadQueuedResidentToolHandoffEntries",
+      "loadQueuedResidentToolHandoffs"
     ]
   },
-  "hooks/useStrategicReadModel.test.tsx": {
-    "../strategicStateApi": [
-      "StrategicSessionMessageCreateError",
-      "deleteMessageAttachmentUpload",
-      "findStrategicMessageByClientIdentity",
-      "getMessageAttachmentDownloadUrl",
-      "invalidateMessageAttachmentDownloadUrl"
+  "components/WhiteboardTool.test.tsx": {
+    "../firebase": [
+      "getIdTokenAfterAuthRestore",
+      "onAuthChange",
+      "signInWithGoogle",
+      "signOut"
+    ],
+    "../utils/conversationAttachmentUpload": [
+      "ConversationAttachmentUploadError"
+    ],
+    "../utils/residentToolHandoff": [
+      "RESIDENT_TOOL_HANDOFF_EVENT",
+      "acknowledgeQueuedResidentToolHandoffs",
+      "enqueueResidentToolHandoff",
+      "isResidentToolHandoffEvent",
+      "isResidentToolHandoffQueueStorageKey",
+      "loadQueuedResidentToolHandoffEntries",
+      "loadQueuedResidentToolHandoffs"
     ]
   }
 }

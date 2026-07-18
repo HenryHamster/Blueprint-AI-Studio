@@ -42,7 +42,7 @@ function requireResult(texts: string[]): Record<string, unknown> {
 
 function capabilityRequests(texts: string[]): ResidentCapabilityRequest[] | null {
   for (const text of texts) {
-    const parsed = extractJsonObjectDetailed<Record<string, unknown>>(text, 'capability_requests');
+    const parsed = extractJsonObjectDetailed(text, 'capability_requests');
     if (!parsed.ok) continue;
     if (!Array.isArray(parsed.value.capability_requests)) {
       throw new Error('Resident capability_requests must be an array');

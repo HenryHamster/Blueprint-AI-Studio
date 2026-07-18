@@ -39,7 +39,9 @@ import pytest
 from app import compute
 from app.compute_backends import (
     ComputeLaunchSpec,
+    ImageBuildRequest,
     _build_gcp_startup_script,
+    _build_image_builder_startup_script,
     _build_local_wrapper_command,
 )
 from app.compute_startup_script import (
@@ -202,6 +204,32 @@ def _render_local_wrapper_command_full() -> str:
     )
 
 
+def _render_image_builder_startup_script() -> str:
+    """Render the off-orchestrator compute-image builder VM startup script.
+
+    Exercises the clone block, its token-scrub sed, the base64 build-tool
+    decode, the trusted-tool invocation, and the emit_terminal function so a
+    typo in any of them fails `bash -n` here instead of on a live builder VM.
+    """
+    request = ImageBuildRequest(
+        build_id=uuid.UUID("00000000-0000-0000-0000-000000000010"),
+        project_id=uuid.UUID("00000000-0000-0000-0000-000000000011"),
+        dep_hash="deadbeefcafef00d",
+        registry_repo="us-docker.pkg.dev/proj/compute-images",
+        image_name="widget-compute",
+        repo_clone={"owner": "acme", "repo": "demo", "ref": "main"},
+        repo_token="ghs_placeholder_token",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt", "poetry.lock"],
+        build_args={"PARENT_IMAGE": "python:3.11-slim"},
+        parent="python:3.11-slim",
+    )
+    return _build_image_builder_startup_script(
+        request,
+        terminal_upload_url="https://storage.example.com/upload?sig=placeholder",
+    )
+
+
 GENERATORS: list[ShellGenerator] = [
     ShellGenerator(
         name="compute.startup_script",
@@ -238,6 +266,10 @@ GENERATORS: list[ShellGenerator] = [
         name="compute.local_wrapper_command.full",
         render=_render_local_wrapper_command_full,
         expected_shebang="",
+    ),
+    ShellGenerator(
+        name="compute.image_builder_startup_script",
+        render=_render_image_builder_startup_script,
     ),
     # Future entries: append here. Each renderer returns rendered bash.
 ]

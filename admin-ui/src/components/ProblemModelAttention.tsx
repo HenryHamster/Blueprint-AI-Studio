@@ -62,11 +62,14 @@ function PendingItemRow({
 
   return (
     <div className="border-l-2 border-amber-500/40 pl-3">
-      <div className="flex items-center gap-2 min-h-[44px]">
+      <div className="flex items-center gap-2 min-h-[44px] min-w-0">
         <span className="text-neutral-400 shrink-0" title={`${label} — id: ${pending.id}`}>
           <PendingTypeIcon type={pending.type} />
         </span>
-        <span className="text-xs text-neutral-400 shrink-0">{label}</span>
+        {/* Type label yields space (shrink + truncate) so a narrow rail row of
+            icon + label + proposal + timestamp + action buttons never forces
+            horizontal overflow; the icon title keeps the full type discoverable. */}
+        <span className="text-xs text-neutral-400 shrink truncate min-w-0 max-w-[45%]" title={label}>{label}</span>
         <span className="text-neutral-700 shrink-0 select-none">—</span>
         <p className="text-xs text-neutral-200 flex-1 truncate min-w-0" title={pending.proposal}>
           {pending.proposal}

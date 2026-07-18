@@ -212,8 +212,15 @@ class ResidentCapabilityInvocation(BaseModel):
                     "missing evidence preconditions: "
                     + ", ".join(sorted(absent_evidence))
                 )
-            if spec.approval_policy == "explicit" and not self.approval_ref:
-                raise ValueError("capability requires explicit approval_ref")
+            if spec.approval_policy == "explicit":
+                if not self.approval_ref:
+                    raise ValueError("capability requires explicit approval_ref")
+                try:
+                    uuid.UUID(self.approval_ref)
+                except ValueError:
+                    raise ValueError(
+                        "approval_ref must be a valid ProjectMessage UUID"
+                    ) from None
         return self
 
 

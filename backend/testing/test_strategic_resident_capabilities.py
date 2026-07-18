@@ -1,13 +1,13 @@
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.models import Project, Task, TaskStatus
+from app.models import Project, ProjectMessage, Task, TaskStatus
 from app.strategic_operation_authority_validation import OperationPayloadTooLarge
 from app.strategic_resident_capabilities import (
     CapabilityMode,
@@ -145,7 +145,7 @@ def test_mutation_invocation_requires_authority_evidence_and_approval():
                     "pr_mergeability",
                 )
             ),
-            "approval_ref": "approval-message-42",
+            "approval_ref": str(uuid.uuid4()),
         }
     )
     assert valid.capability_id == "pr.merge"
@@ -761,6 +761,9 @@ async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     )
     executor = AsyncMock(return_value=receipt)
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
 
     result = await capability_router.invoke_resident_mutation(
         None,
@@ -961,6 +964,9 @@ async def test_mutation_route_maps_authority_errors(
     error_cls = getattr(authority, error_name)
     executor = AsyncMock(side_effect=error_cls("fenced rejection"))
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(
             None,
@@ -969,6 +975,119 @@ async def test_mutation_route_maps_authority_errors(
             token=_mutation_token(project_id, turn_id),
         )
     assert exc.value.status_code == expected_status
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_rejects_evidence_ref_not_backed_by_inspection(monkeypatch):
+    """Evidence refs not matching any inspection receipt for this turn are rejected 403."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    # Session returns no receipts — evidence ref has no backing real inspection.
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = []
+    session = AsyncMock()
+    session.execute.return_value = execute_result
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, turn_id),
+            session=session,
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 403
+    assert "evidence ref" in exc.value.detail
+    executor.assert_not_awaited()
+    session.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_accepts_evidence_refs_matching_inspection_receipts(monkeypatch):
+    """Evidence refs whose (kind, source_id, revision, checksum) appear in a real
+    inspection receipt for this turn are accepted and the mutation proceeds."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+
+    invocation = _mutation_invocation(project_id, turn_id)
+    ref = invocation.evidence[0]
+
+    # Build a SimpleNamespace receipt that backs the evidence ref above.
+    receipt_row = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="applied",
+        receipt={
+            "structured_result": {
+                "evidence": [
+                    {
+                        "kind": ref.kind,
+                        "source_id": ref.source_id,
+                        "revision": ref.revision,
+                        "checksum": ref.checksum,
+                    }
+                ]
+            }
+        },
+    )
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = [receipt_row]
+    session = AsyncMock()
+    session.execute.return_value = execute_result
+
+    db_receipt = SimpleNamespace(operation_id="op-strategy-1", status="applied", id=uuid.uuid4())
+    executor = AsyncMock(return_value=db_receipt)
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=session,
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "applied"
+    executor.assert_awaited_once()
+    session.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_receipt_evidence_set_extracts_only_successful_inspection_receipts():
+    """_build_receipt_evidence_set only trusts applied/reconciled inspection receipts."""
+    from app.routers.agent_resident_capabilities import _build_receipt_evidence_set
+
+    valid_key = ("task", "task-id-1", "v1", "a" * 64)
+    valid_receipt = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="applied",
+        receipt={
+            "structured_result": {
+                "evidence": [
+                    {"kind": "task", "source_id": "task-id-1", "revision": "v1", "checksum": "a" * 64}
+                ]
+            }
+        },
+    )
+    # Pending receipt: should be excluded.
+    pending_receipt = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="pending",
+        receipt={"structured_result": {"evidence": [
+            {"kind": "task", "source_id": "task-id-2", "revision": "v2", "checksum": "b" * 64}
+        ]}},
+    )
+    # Wrong operation_kind (mutation, not inspection): should be excluded.
+    mutate_receipt = SimpleNamespace(
+        operation_kind="set_running_update",
+        status="applied",
+        receipt={"structured_result": {"evidence": [
+            {"kind": "task", "source_id": "task-id-3", "revision": "v3", "checksum": "c" * 64}
+        ]}},
+    )
+    result = _build_receipt_evidence_set([valid_receipt, pending_receipt, mutate_receipt])
+    assert valid_key in result
+    assert ("task", "task-id-2", "v2", "b" * 64) not in result
+    assert ("task", "task-id-3", "v3", "c" * 64) not in result
 
 
 @pytest.mark.asyncio
@@ -1002,3 +1121,102 @@ async def test_lineage_inspection_stays_in_project_and_is_stable(db_session):
     )
     assert [item["title"] for item in evidence.data["tasks"]] == ["parent", "child"]
     assert "foreign" not in str(evidence.data)
+
+
+def test_approval_ref_model_validator_rejects_non_uuid_for_explicit_policy():
+    """_matches_declaration must reject non-UUID approval_ref for explicit-policy capabilities."""
+    project_id = uuid.uuid4()
+    base = {
+        "capability_id": "pr.merge",
+        "project_id": project_id,
+        "turn_task_id": uuid.uuid4(),
+        "authority_generation": 1,
+        "operation_id": "merge-op",
+        "parameters": {"pr_number": 42, "expected_head_sha": "abc1234"},
+        "expected_revisions": {"pr_version": 1},
+        "evidence": tuple(
+            {
+                "kind": kind,
+                "project_id": project_id,
+                "source_id": "pr:42",
+                "revision": "abc1234",
+                "checksum": "a" * 64,
+                "inspected_at": "2026-07-17T12:00:00Z",
+            }
+            for kind in ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability")
+        ),
+    }
+    # Valid UUID approval_ref must pass model validation.
+    valid_ref = str(uuid.uuid4())
+    invocation = ResidentCapabilityInvocation.model_validate(
+        {**base, "approval_ref": valid_ref}
+    )
+    assert invocation.approval_ref == valid_ref
+
+    # Non-UUID approval_ref must be rejected at the model layer.
+    with pytest.raises(ValidationError, match="ProjectMessage UUID"):
+        ResidentCapabilityInvocation.model_validate(
+            {**base, "approval_ref": "approval-message-42"}
+        )
+
+    # Missing approval_ref must still be rejected.
+    with pytest.raises(ValidationError, match="explicit approval_ref"):
+        ResidentCapabilityInvocation.model_validate(base)
+
+
+@pytest.mark.asyncio
+async def test_validate_approval_ref_rejects_missing_foreign_and_agent_messages(db_session):
+    """_validate_approval_ref must 403 on absent, wrong-project, or non-user messages."""
+    from app.routers.agent_resident_capabilities import _validate_approval_ref
+
+    project = Project(name="approval project", user_id="u")
+    other = Project(name="other project", user_id="u")
+    db_session.add_all([project, other])
+    await db_session.flush()
+
+    human_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        content="operator approval granted",
+    )
+    agent_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="agent",
+        content="agent cannot approve",
+    )
+    foreign_msg = ProjectMessage(
+        project_id=other.id,
+        from_type="user",
+        content="wrong project",
+    )
+    db_session.add_all([human_msg, agent_msg, foreign_msg])
+    await db_session.commit()
+
+    # Valid: human user message in the right project.
+    await _validate_approval_ref(db_session, str(human_msg.id), project.id)
+
+    # Missing approval_ref raises 403.
+    with pytest.raises(HTTPException) as exc:
+        await _validate_approval_ref(db_session, None, project.id)
+    assert exc.value.status_code == 403
+
+    # Non-UUID string raises 403.
+    with pytest.raises(HTTPException) as exc:
+        await _validate_approval_ref(db_session, "not-a-uuid", project.id)
+    assert exc.value.status_code == 403
+
+    # Agent-authored message is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await _validate_approval_ref(db_session, str(agent_msg.id), project.id)
+    assert exc.value.status_code == 403
+    assert "human operator" in exc.value.detail
+
+    # Message belonging to a different project is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await _validate_approval_ref(db_session, str(foreign_msg.id), project.id)
+    assert exc.value.status_code == 403
+
+    # Entirely unknown UUID is rejected.
+    with pytest.raises(HTTPException) as exc:
+        await _validate_approval_ref(db_session, str(uuid.uuid4()), project.id)
+    assert exc.value.status_code == 403

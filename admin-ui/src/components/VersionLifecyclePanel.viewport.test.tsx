@@ -34,6 +34,10 @@ vi.mock('../api', () => ({
   attestAcceptanceCriterion: vi.fn(async () => ({ status: 'attested', criterion_key: 'k', coverage: 'covered' })),
   linkCriteriaToDirection: vi.fn(async () => ({ status: 'ok', direction_key: 'd', criterion_keys: [] })),
   reinstateAcceptanceCriterion: vi.fn(async () => ({ status: 'reinstated', criterion_key: 'k' })),
+  // Hotfix-promote UI added getHotfixPreview/triggerHotfixPromote as static imports;
+  // both must be present in the mock or browser-mode ESM link fails at import time.
+  getHotfixPreview: vi.fn(async () => ({})),
+  triggerHotfixPromote: vi.fn(async () => ({ status: 'ok' })),
 }));
 
 const QUALIFYING_DATA: VersionLifecycleResponse = {

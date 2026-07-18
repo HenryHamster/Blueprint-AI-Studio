@@ -66,10 +66,34 @@ def _pr_merge_effect(
     parameters: dict[str, Any],
 ) -> Callable[[AsyncSession], Awaitable[dict[str, Any]]]:
     async def perform(session: AsyncSession) -> dict[str, Any]:
-        from app.github_pulls import merge_pull_request
+        from app.github_pulls import get_pull_request, merge_pull_request
         from app.github_token_resolver import get_github_token_for_task
+        from app.rollup_migration_validation import enforce_premerge_migration_guard
 
         token, owner, repo = await get_github_token_for_task(turn_task_id, session)
+        pr_number = int(parameters["pr_number"])
+        # Pre-merge dual-head Alembic guard. An autonomous resident merge can
+        # carry a migration onto an integration/promotion branch; merging a PR
+        # that creates two Alembic heads / a duplicate revision id wedges
+        # `alembic upgrade head` on that branch. Run the same combined-chain
+        # guard the operator-approval and CI-completion merge paths use and fail
+        # closed on a block-or-defer verdict (`block` = invalid combined chain;
+        # `defer` = GitHub metadata unavailable so migration safety is unknown).
+        pr = await get_pull_request(token, owner, repo, pr_number)
+        target_branch = (pr.get("base") or {}).get("ref")
+        _ok_to_merge, _hold_reason = await enforce_premerge_migration_guard(
+            token,
+            owner,
+            repo,
+            pr_number,
+            target_branch,
+        )
+        if not _ok_to_merge:
+            raise RuntimeError(
+                "pre-merge migration guard blocked "
+                f"PR #{pr_number}: "
+                f"{_hold_reason or 'combined Alembic chain would create a dual head'}"
+            )
         # Fail closed on CHANGES_REQUESTED (merge_pull_request checks the review
         # decision before the PUT) and on a head that advanced past the approved
         # sha (expected_head_sha -> GitHub's merge `sha` guard). Never override
@@ -78,7 +102,7 @@ def _pr_merge_effect(
             token,
             owner,
             repo,
-            int(parameters["pr_number"]),
+            pr_number,
             project_id=str(request_project_id),
             expected_head_sha=str(parameters["expected_head_sha"]),
         )
