@@ -68,6 +68,10 @@ from app.strategic_resident_models import (  # noqa: F401
 from app.strategic_resident_sweep_models import (  # noqa: F401
     StrategicResidentSweepState,
 )
+from app.strategic_resident_task_terminal_events import (  # noqa: F401
+    StrategicResidentTaskTerminalEvent,
+    register_sqlite_terminal_event_listener,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -1245,6 +1249,19 @@ class Task(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
+    strategic_operation_receipt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey(
+                "strategicoperationreceipt.id",
+                name="fk_task_strategic_operation_receipt",
+                ondelete="SET NULL",
+                use_alter=True,
+            ),
+            nullable=True,
+        ),
+    )
     requires_approval: bool = Field(default=False)
     spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
 
@@ -1605,6 +1622,12 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
+        Index(
+            "ix_task_strategic_operation_receipt_id",
+            "strategic_operation_receipt_id",
+            postgresql_where=text("strategic_operation_receipt_id IS NOT NULL"),
+            sqlite_where=text("strategic_operation_receipt_id IS NOT NULL"),
+        ),
         Index(
             "ix_task_project_status_completed", "project_id", "status", "completed_at"
         ),
@@ -2836,6 +2859,9 @@ class TaskHistory(SQLModel, table=True):
     __table_args__ = (
         Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
     )
+
+
+register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
 
 
 # Auto-append to status_log whenever latest_status_message is set

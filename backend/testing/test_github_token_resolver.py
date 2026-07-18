@@ -310,6 +310,113 @@ async def test_app_discovery_token_is_not_double_cached_by_resolver(
     assert resolver._project_repo_index[str(project.id)] == ("acme", "widget")
 
 
+@pytest.mark.asyncio
+async def test_dedicated_resolver_session_releases_connection_before_external_io(
+    db_session, monkeypatch
+):
+    """Resident inspections must not pin a DB connection during token discovery."""
+    import app.github as github
+    from app.github_token_resolver import get_github_token_for_task
+
+    _, task = await _make_task(
+        db_session, owner="acme", repo="detached", user_id="u-detached"
+    )
+
+    async def resolve_after_release(owner, repo):
+        assert (owner, repo) == ("acme", "detached")
+        assert not db_session.in_transaction()
+        return "ghs_detached"
+
+    monkeypatch.setattr(github, "get_repo_installation_token", resolve_after_release)
+
+    token, owner, repo = await get_github_token_for_task(
+        task.id,
+        db_session,
+        release_dedicated_session_before_io=True,
+    )
+
+    assert (token, owner, repo) == ("ghs_detached", "acme", "detached")
+
+
+@pytest.mark.asyncio
+async def test_dedicated_resolver_rejects_pending_state_before_any_query(
+    db_session, monkeypatch
+):
+    """Release mode must fail before autoflush can hide caller-owned writes."""
+    from unittest.mock import AsyncMock
+
+    import app.github_token_resolver as resolver
+
+    pending = UserIntegration(user_id="u-pending-detached")
+    db_session.add(pending)
+    execute = AsyncMock(side_effect=AssertionError("resolver executed SQL"))
+    monkeypatch.setattr(db_session, "execute", execute)
+
+    with pytest.raises(RuntimeError, match="clean dedicated session"):
+        await resolver.get_github_token_for_task(
+            "00000000-0000-0000-0000-000000000001",
+            db_session,
+            release_dedicated_session_before_io=True,
+        )
+
+    execute.assert_not_awaited()
+    assert pending in db_session.new
+
+
+@pytest.mark.asyncio
+async def test_dedicated_resolver_releases_before_fallback_mint(
+    db_session, monkeypatch
+):
+    """Stored-installation fallback also runs after the read transaction ends."""
+    import app.github as github
+    import app.github_token_resolver as resolver
+
+    project, task = await _make_task(
+        db_session,
+        owner="acme",
+        repo="fallback-detached",
+        user_id="u-fallback-detached",
+        integration=UserIntegration(
+            user_id="u-fallback-detached",
+            github_installation_id="installation-7",
+        ),
+    )
+
+    async def unavailable_app_token(owner, repo):
+        assert not db_session.in_transaction()
+        return None
+
+    async def mint_after_release(installation_id, *, repositories):
+        assert installation_id == "installation-7"
+        assert repositories == ["fallback-detached"]
+        assert not db_session.in_transaction()
+        return "ghs_fallback_detached"
+
+    monkeypatch.setattr(github, "get_repo_installation_token", unavailable_app_token)
+    monkeypatch.setattr(
+        resolver,
+        "generate_installation_access_token",
+        mint_after_release,
+    )
+
+    try:
+        token, owner, repo = await resolver.get_github_token_for_task(
+            task.id,
+            db_session,
+            release_dedicated_session_before_io=True,
+        )
+
+        assert (token, owner, repo) == (
+            "ghs_fallback_detached",
+            "acme",
+            "fallback-detached",
+        )
+    finally:
+        project_id = str(project.id)
+        resolver._github_token_cache.pop(project_id, None)
+        resolver.forget_project_repo(project_id)
+
+
 # ---------------------------------------------------------------------------
 # Mint budget: the shared 5,000/hr installation-token bucket
 # ---------------------------------------------------------------------------

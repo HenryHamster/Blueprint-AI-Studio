@@ -301,6 +301,7 @@ INVOKABLE_CAPABILITY_IDS = frozenset(
         "task.provider.inspect",
         "runner.inspect",
         "runner.list",
+        "pr.inspect",
         "strategy.running_update.set",
         "task.reprioritize",
         "task.retry",

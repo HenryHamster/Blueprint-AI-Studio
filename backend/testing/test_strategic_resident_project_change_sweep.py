@@ -15,9 +15,12 @@ from app.models import (
     QualificationVerdict,
     ReleaseVersion,
     StrategicCycle,
+    StrategicOperationReceipt,
     StrategicResident,
     StrategicResidentSweepState,
+    StrategicResidentTaskTerminalEvent,
     Task,
+    TaskStatus,
 )
 from app import strategic_resident_project_change_sweep as sweep_module
 from app.strategic_resident_checkpointing import initialize_strategic_resident
@@ -386,3 +389,273 @@ async def test_wake_budget_stays_at_32_while_scanning_200_projects(db_session):
     )
     assert state is not None
     assert state.after_project_id == projects[-1].id
+
+
+def _managed_context_and_receipt(
+    project_id: uuid.UUID,
+) -> tuple[dict, StrategicOperationReceipt]:
+    turn_task_id = uuid.uuid4()
+    receipt = StrategicOperationReceipt(
+        project_id=project_id,
+        turn_task_id=turn_task_id,
+        authority_generation=2,
+        operation_id=f"managed-test-{uuid.uuid4()}",
+        operation_kind="create_managed_task",
+        capability="task.code_change.create",
+        risk_level="medium",
+        request_hash="a" * 64,
+        expected_revisions={"context_hash": "a" * 64},
+        status="applied",
+    )
+    return {
+        "_resident_managed_task": {
+            "receipt_id": str(receipt.id),
+            "capability_id": "task.code_change.create",
+            "source_turn_task_id": str(turn_task_id),
+            "context_hash": "a" * 64,
+        }
+    }, receipt
+
+
+def _managed_terminal_task(
+    project_id: uuid.UUID,
+    *,
+    status: TaskStatus,
+    title: str,
+) -> tuple[StrategicOperationReceipt, Task]:
+    context, receipt = _managed_context_and_receipt(project_id)
+    return receipt, Task(
+        project_id=project_id,
+        title=title,
+        payloads=[{"type": "fix"}],
+        context=context,
+        status=status,
+        strategic_operation_receipt_id=receipt.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_managed_terminal_events_are_ordered_and_exclude_unmanaged_tasks(
+    db_session, monkeypatch
+):
+    now = _utcnow()
+    project, _resident = await _authoritative_project(
+        db_session, name="Terminal Task outcomes"
+    )
+    managed_pairs = [
+        _managed_terminal_task(
+            project.id,
+            status=status,
+            title=status.value,
+        )
+        for status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+    ]
+    managed_tasks = [task for _receipt, task in managed_pairs]
+    resident_turn = Task(
+        project_id=project.id,
+        title="Must not feed itself",
+        payloads=[{"type": "strategic_resident_turn"}],
+        status=TaskStatus.COMPLETED,
+    )
+    unrelated = Task(
+        project_id=project.id,
+        title="Unrelated system Task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+    )
+    spoofed = Task(
+        project_id=project.id,
+        title="Spoofed marker",
+        payloads=[{"type": "fix"}],
+        context={"_resident_managed_task": {"source_turn_task_id": "turn"}},
+        status=TaskStatus.FAILED,
+    )
+    db_session.add_all(
+        [item for pair in managed_pairs for item in pair]
+        + [resident_turn, unrelated, spoofed]
+    )
+    await db_session.commit()
+    events = list(
+        (
+            await db_session.execute(
+                select(StrategicResidentTaskTerminalEvent).order_by(
+                    StrategicResidentTaskTerminalEvent.sequence
+                )
+            )
+        ).scalars()
+    )
+    assert len(events) == 3
+    assert [event.event_kind for event in events] == [
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+    ]
+    assert [event.sequence for event in events] == sorted(
+        event.sequence for event in events
+    )
+    assert {event.task_id for event in events} == {task.id for task in managed_tasks}
+    latest = events[-1]
+    signal = AsyncMock(return_value=uuid.uuid4())
+    monkeypatch.setattr(sweep_module, "signal_project_change", signal)
+
+    assert await sweep_durable_project_change_wakeups(
+        session_factory=_factory(db_session), now=now
+    ) == 1
+    cursor = signal.await_args.kwargs["project_change_cursor"]
+    assert set(cursor) == {"managed_task_terminal"}
+    value = cursor["managed_task_terminal"]
+    assert value == (
+        f"v2:{latest.sequence:020d}:{latest.task_id}:{latest.event_kind}"
+    )
+    assert str(resident_turn.id) not in value
+    assert str(unrelated.id) not in value
+    assert str(spoofed.id) not in value
+
+
+@pytest.mark.asyncio
+async def test_managed_task_revive_before_first_sweep_is_not_lost(
+    db_session, monkeypatch
+):
+    now = _utcnow()
+    project, resident = await _authoritative_project(
+        db_session, name="Terminal Task revival"
+    )
+    receipt, revived = _managed_terminal_task(
+        project.id,
+        status=TaskStatus.FAILED,
+        title="Revived failure",
+    )
+    db_session.add_all([receipt, revived])
+    await db_session.commit()
+
+    # The Task is revived before the producer ever scans it. Current-state
+    # polling would lose the failure here; the append-only event must survive.
+    revived.status = TaskStatus.QUEUED
+    await db_session.commit()
+    signal = AsyncMock(return_value=uuid.uuid4())
+    monkeypatch.setattr(sweep_module, "signal_project_change", signal)
+    assert await sweep_durable_project_change_wakeups(
+        session_factory=_factory(db_session), now=now
+    ) == 1
+    first_cursor = signal.await_args.kwargs["project_change_cursor"]
+    first_value = first_cursor["managed_task_terminal"]
+    assert str(revived.id) in first_value
+    assert first_value.endswith(":FAILED")
+    resident.handled_project_change_cursor = first_cursor
+    db_session.add(resident)
+    await db_session.commit()
+
+    # A genuine later terminal transition on the same Task is a new event.
+    signal.reset_mock()
+    revived.status = TaskStatus.FAILED
+    await db_session.commit()
+    assert await sweep_durable_project_change_wakeups(
+        session_factory=_factory(db_session), now=now
+    ) == 1
+    advanced = signal.await_args.kwargs["project_change_cursor"][
+        "managed_task_terminal"
+    ]
+    assert str(revived.id) in advanced
+    assert advanced.endswith(":FAILED")
+    assert advanced > first_value
+
+
+@pytest.mark.asyncio
+async def test_paused_resident_discovers_managed_terminal_event_after_activation(
+    db_session, monkeypatch
+):
+    now = _utcnow()
+    project, resident = await _authoritative_project(
+        db_session, name="Paused managed outcome", paused=True
+    )
+    receipt, task = _managed_terminal_task(
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="Completed while paused",
+    )
+    db_session.add_all([receipt, task])
+    await db_session.commit()
+    signal = AsyncMock(return_value=uuid.uuid4())
+    monkeypatch.setattr(sweep_module, "signal_project_change", signal)
+
+    assert await sweep_durable_project_change_wakeups(
+        session_factory=_factory(db_session), now=now
+    ) == 0
+    signal.assert_not_awaited()
+    resident.background_policy = "active"
+    db_session.add(resident)
+    await db_session.commit()
+    assert await sweep_durable_project_change_wakeups(
+        session_factory=_factory(db_session), now=now
+    ) == 1
+    assert signal.await_args.kwargs["project_change_cursor"][
+        "managed_task_terminal"
+    ].endswith(":COMPLETED")
+
+
+@pytest.mark.asyncio
+async def test_rolled_back_terminal_transition_emits_no_durable_event(db_session):
+    project, _resident = await _authoritative_project(
+        db_session, name="Rolled back managed outcome"
+    )
+    await db_session.commit()
+    receipt, task = _managed_terminal_task(
+        project.id,
+        status=TaskStatus.FAILED,
+        title="Rolled back failure",
+    )
+    db_session.add_all([receipt, task])
+    await db_session.flush()
+    assert (
+        await db_session.execute(select(StrategicResidentTaskTerminalEvent))
+    ).scalar_one()
+    await db_session.rollback()
+    assert (
+        await db_session.execute(select(StrategicResidentTaskTerminalEvent))
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_context_marker_cannot_bind_another_projects_receipt(db_session):
+    project, _resident = await _authoritative_project(
+        db_session, name="Receipt-bound project"
+    )
+    foreign = Project(name="Foreign receipt project", user_id="operator")
+    db_session.add(foreign)
+    await db_session.flush()
+    context, receipt = _managed_context_and_receipt(foreign.id)
+    forged = Task(
+        project_id=project.id,
+        title="Cross-project forged lineage",
+        payloads=[{"type": "fix"}],
+        context=context,
+        status=TaskStatus.FAILED,
+        strategic_operation_receipt_id=receipt.id,
+    )
+    db_session.add_all([receipt, forged])
+    await db_session.commit()
+    assert (
+        await db_session.execute(select(StrategicResidentTaskTerminalEvent))
+    ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_context_marker_must_match_receipt_frozen_context_hash(db_session):
+    project, _resident = await _authoritative_project(
+        db_session, name="Receipt-bound frozen context"
+    )
+    context, receipt = _managed_context_and_receipt(project.id)
+    context["_resident_managed_task"]["context_hash"] = "b" * 64
+    forged = Task(
+        project_id=project.id,
+        title="Same-project forged context hash",
+        payloads=[{"type": "fix"}],
+        context=context,
+        status=TaskStatus.FAILED,
+        strategic_operation_receipt_id=receipt.id,
+    )
+    db_session.add_all([receipt, forged])
+    await db_session.commit()
+    assert (
+        await db_session.execute(select(StrategicResidentTaskTerminalEvent))
+    ).scalar_one_or_none() is None
