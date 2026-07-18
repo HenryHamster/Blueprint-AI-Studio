@@ -62,6 +62,7 @@ from app.strategic_resident_models import (  # noqa: F401
     StrategicOperationReceipt,
     StrategicResident,
     StrategicResidentCheckpoint,
+    StrategicWorkerMemoryProposal,
 )
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (

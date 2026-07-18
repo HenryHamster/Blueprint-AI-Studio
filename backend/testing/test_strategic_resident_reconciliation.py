@@ -22,6 +22,7 @@ from app.models import (
     StrategicOperationReceipt,
     StrategicResident,
     StrategicResidentCheckpoint,
+    StrategicWorkerMemoryProposal,
     Task,
     TaskStatus,
 )
@@ -1362,6 +1363,243 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         ),
     )
     assert outcome.checkpoint_version == 2
+
+
+def _worker_proposal_row(project_id, checkpoint, *, proposal_id="wp-1", version=1):
+    return StrategicWorkerMemoryProposal(
+        project_id=project_id,
+        proposal_id=proposal_id,
+        layer="working_strategy",
+        updates={"priorities": {"worker_priority": "from_cycle"}},
+        rationale="A completed cycle recommends this priority.",
+        evidence=[
+            {
+                "evidence_id": "wp-e1",
+                "kind": "ci_run",
+                "source_id": "run-from-receipt",
+                "revision": "sha-from-receipt",
+                "checksum": "7" * 64,
+            }
+        ],
+        target_checkpoint_version=version,
+        target_checkpoint_hash=checkpoint.content_hash,
+        status="pending",
+        source_cycle_id="cycle-42",
+    )
+
+
+async def _seed_trusted_ci_receipt(db_session, project, task):
+    context_hash = task.context["_test_provider_context_hash"]
+    db_session.add(
+        StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=task.id,
+            authority_generation=7,
+            operation_id="op-inspection",
+            operation_kind="inspect_ci",
+            capability="ci.run.inspect",
+            risk_level="low",
+            request_hash="8" * 64,
+            expected_revisions={"context_hash": context_hash},
+            receipt={
+                "schema_version": 1,
+                "structured_result": {
+                    "evidence": [
+                        {
+                            "kind": "ci_run",
+                            "source_id": "run-from-receipt",
+                            "revision": "sha-from-receipt",
+                            "checksum": "7" * 64,
+                        }
+                    ]
+                },
+            },
+            status="reconciled",
+        )
+    )
+
+
+def _evidence_free_turn_result():
+    result = _turn_result()
+    result["facts"] = []
+    result["evidence"] = []
+    result["operations"] = []
+    result["receipts"] = []
+    result["strategic_implications"] = []
+    result["proposed_memory"] = []
+    return result
+
+
+@pytest.mark.asyncio
+async def test_submit_worker_memory_proposal_records_pending_row(db_session):
+    from app.strategic_resident_worker_proposal import WorkerMemoryProposal
+    from app.strategic_resident_worker_proposal_intake import (
+        submit_worker_memory_proposal,
+    )
+
+    project, _resident, _task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    proposal = WorkerMemoryProposal(
+        proposal_id="wp-submit",
+        layer="charter",
+        updates={"purpose": "Ship safely and cheaply"},
+        rationale="Cycle outcome supports the charter refinement.",
+        target_checkpoint_version=1,
+        target_checkpoint_hash=checkpoint.content_hash,
+        evidence=(
+            {
+                "evidence_id": "e1",
+                "kind": "task",
+                "source_id": "task-9",
+                "revision": "task:v3",
+                "checksum": "d" * 64,
+            },
+        ),
+    )
+    row = await submit_worker_memory_proposal(
+        db_session, project_id=project.id, proposal=proposal, source_cycle_id="c-9"
+    )
+    assert row.status == "pending"
+    assert row.source_cycle_id == "c-9"
+    assert row.target_checkpoint_hash == checkpoint.content_hash
+    assert row.evidence[0]["kind"] == "task"
+
+
+@pytest.mark.asyncio
+async def test_pending_worker_proposal_is_admitted_through_reconciliation(db_session):
+    project, _resident, task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    await _seed_trusted_ci_receipt(db_session, project, task)
+    db_session.add(_worker_proposal_row(project.id, checkpoint))
+    await db_session.commit()
+
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(
+            project,
+            task,
+            checkpoint,
+            result=_evidence_free_turn_result(),
+            accepted_memory_proposal_ids=(),
+            accepted_implication_ids=(),
+            accepted_open_loop_ids=(),
+        ),
+    )
+    assert outcome.checkpoint_version == 2
+
+    async with _factory(db_session)() as verify:
+        new_checkpoint = (
+            await verify.execute(
+                select(StrategicResidentCheckpoint).where(
+                    StrategicResidentCheckpoint.project_id == project.id,
+                    StrategicResidentCheckpoint.version == 2,
+                )
+            )
+        ).scalar_one()
+        # The worker's memory change was applied through the checkpoint-CAS path.
+        assert (
+            new_checkpoint.checkpoint["working_strategy"]["priorities"][
+                "worker_priority"
+            ]
+            == "from_cycle"
+        )
+        proposal = (
+            await verify.execute(
+                select(StrategicWorkerMemoryProposal).where(
+                    StrategicWorkerMemoryProposal.project_id == project.id
+                )
+            )
+        ).scalar_one()
+        assert proposal.status == "admitted"
+        assert proposal.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_stale_worker_proposal_is_rejected_without_failing_the_turn(db_session):
+    project, _resident, task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    await _seed_trusted_ci_receipt(db_session, project, task)
+    # Revision-link targets a checkpoint version that is not current (2, not 1).
+    db_session.add(
+        _worker_proposal_row(project.id, checkpoint, proposal_id="stale", version=2)
+    )
+    await db_session.commit()
+
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(
+            project,
+            task,
+            checkpoint,
+            result=_evidence_free_turn_result(),
+            accepted_memory_proposal_ids=(),
+            accepted_implication_ids=(),
+            accepted_open_loop_ids=(),
+        ),
+    )
+    # The turn still reconciles (a bad worker proposal never fails the turn).
+    assert outcome.checkpoint_version == 2
+
+    async with _factory(db_session)() as verify:
+        new_checkpoint = (
+            await verify.execute(
+                select(StrategicResidentCheckpoint).where(
+                    StrategicResidentCheckpoint.project_id == project.id,
+                    StrategicResidentCheckpoint.version == 2,
+                )
+            )
+        ).scalar_one()
+        # The stale proposal's update was NOT applied.
+        assert (
+            "worker_priority"
+            not in new_checkpoint.checkpoint["working_strategy"]["priorities"]
+        )
+        proposal = (
+            await verify.execute(
+                select(StrategicWorkerMemoryProposal).where(
+                    StrategicWorkerMemoryProposal.project_id == project.id
+                )
+            )
+        ).scalar_one()
+        assert proposal.status == "rejected"
+        assert "revision-link is stale" in (proposal.rejection_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_worker_proposal_with_untrusted_evidence_is_rejected(db_session):
+    project, _resident, task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    # No inspection receipt seeded → the cited evidence is not trusted.
+    db_session.add(_worker_proposal_row(project.id, checkpoint))
+    await db_session.commit()
+
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(
+            project,
+            task,
+            checkpoint,
+            result=_evidence_free_turn_result(),
+            accepted_memory_proposal_ids=(),
+            accepted_implication_ids=(),
+            accepted_open_loop_ids=(),
+        ),
+    )
+    assert outcome.checkpoint_version == 2
+
+    async with _factory(db_session)() as verify:
+        proposal = (
+            await verify.execute(
+                select(StrategicWorkerMemoryProposal).where(
+                    StrategicWorkerMemoryProposal.project_id == project.id
+                )
+            )
+        ).scalar_one()
+        assert proposal.status == "rejected"
 
 
 @pytest.mark.asyncio
