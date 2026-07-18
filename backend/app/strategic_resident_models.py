@@ -503,3 +503,47 @@ class StrategicWorkerMemoryProposal(SQLModel, table=True):
             "created_at",
         ),
     )
+
+
+class StrategicOperationApproval(SQLModel, table=True):
+    """A durable operator approval for one explicit-approval Resident operation.
+
+    An operator grants an approval scoped to a project, a capability, and an
+    ``approval_key`` DERIVED from the exact operation parameters (e.g. the PR
+    number + head sha for ``pr.merge``). The Resident cannot redirect an approval
+    to a different operation because the router re-derives the key from the
+    invocation it is actually executing. Single-use: consumed by exactly one
+    fenced operation id (idempotent for that id's retries).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("strategicresident.project_id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    capability: str = Field(sa_column=Column(String(120), nullable=False))
+    approval_key: str = Field(sa_column=Column(String(400), nullable=False))
+    granted_by: str = Field(sa_column=Column(String(255), nullable=False))
+    granted_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    expires_at: datetime = Field(sa_column=Column(NaiveUTCDateTime, nullable=False))
+    consumed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    consumed_operation_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_strategicoperationapproval_lookup",
+            "project_id",
+            "capability",
+            "approval_key",
+        ),
+    )

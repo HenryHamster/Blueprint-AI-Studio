@@ -845,15 +845,13 @@ async def test_external_effect_unwired_capability_stays_501(monkeypatch):
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
     )
+    # pr.update is a github_pulls capability with no wired adapter yet.
     invocation = _mutation_invocation(
         project_id,
         turn_id,
-        capability_id="pr.merge",
-        parameters={"pr_number": 5, "expected_head_sha": "abc1234"},
-        approval_ref="approved-by-operator",
-        evidence=_evidence_of_kinds(
-            project_id, "pr_diff", "pr_checks", "pr_reviews", "pr_mergeability"
-        ),
+        capability_id="pr.update",
+        parameters={"pr_number": 5},
+        evidence=_evidence_of_kinds(project_id, "pr"),
     )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(

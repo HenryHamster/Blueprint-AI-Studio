@@ -57,6 +57,12 @@ from app.strategic_resident_inspection_receipt import (
     build_inspection_receipt,
     citable_inspection_evidence,
 )
+from app.strategic_resident_operation_approval import (
+    OperatorApprovalRequired,
+    capability_requires_operator_approval,
+    derive_approval_key,
+    verify_and_consume_operation_approval,
+)
 from app.strategic_resident_project_field_mutation import (
     PROJECT_FIELD_MUTATION_SERVICE,
     project_field_mutation_callback,
@@ -322,6 +328,23 @@ async def invoke_resident_mutation(
             status_code=403,
             detail="mutation envelope does not match the turn token authority",
         )
+    # Explicit-approval capabilities require a durable operator approval scoped to
+    # this exact operation (the key is derived from the parameters, so an approval
+    # granted for one operation cannot authorise a different one). Consumed here
+    # in the request transaction — idempotent per operation_id — before any effect.
+    if capability_requires_operator_approval(body.capability_id):
+        try:
+            await verify_and_consume_operation_approval(
+                session,
+                project_id=binding.project_id,
+                capability=body.capability_id,
+                approval_key=derive_approval_key(body.capability_id, body.parameters),
+                operation_id=str(body.operation_id),
+            )
+            await session.commit()
+        except OperatorApprovalRequired as exc:
+            await session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     fenced_request = FencedOperationRequest(
         project_id=binding.project_id,
         turn_task_id=binding.task_id,
