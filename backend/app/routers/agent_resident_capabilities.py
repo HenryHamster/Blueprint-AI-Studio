@@ -55,6 +55,11 @@ from app.strategic_resident_project_field_mutation import (
     project_field_mutation_callback,
     project_field_mutation_operation_kind,
 )
+from app.strategic_resident_task_mutation import (
+    TASK_MUTATION_SERVICE,
+    task_mutation_callback,
+    task_mutation_operation_kind,
+)
 from app.strategic_resident_task_inspection import (
     ResidentTaskNotFound,
     inspect_project_task,
@@ -265,13 +270,27 @@ async def invoke_resident_mutation(
     spec = capability_for(body.capability_id)
     if spec.mode is not CapabilityMode.mutate:
         raise HTTPException(status_code=400, detail="capability is not a mutation")
-    callback = project_field_mutation_callback(body.capability_id)
-    operation_kind = project_field_mutation_operation_kind(body.capability_id)
-    if (
-        spec.service != PROJECT_FIELD_MUTATION_SERVICE
-        or callback is None
-        or operation_kind is None
-    ):
+    # Resolve the fenced adapter: a Project-field mutation, or a bounded
+    # target-task mutation (which carries a target_task_id from its params).
+    target_task_id: uuid.UUID | None = None
+    if spec.service == PROJECT_FIELD_MUTATION_SERVICE:
+        callback = project_field_mutation_callback(body.capability_id)
+        operation_kind = project_field_mutation_operation_kind(body.capability_id)
+    elif spec.service == TASK_MUTATION_SERVICE:
+        callback = task_mutation_callback(body.capability_id)
+        operation_kind = task_mutation_operation_kind(body.capability_id)
+        if callback is not None:
+            raw_target = body.parameters.get("task_id")
+            if raw_target is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="task mutation requires a task_id parameter",
+                )
+            target_task_id = uuid.UUID(str(raw_target))
+    else:
+        callback = None
+        operation_kind = None
+    if callback is None or operation_kind is None:
         raise HTTPException(
             status_code=501,
             detail="mutation capability is proposal-only until a fenced adapter exists",
@@ -292,6 +311,7 @@ async def invoke_resident_mutation(
         risk=spec.risk.value,
         expected_revisions=dict(body.expected_revisions),
         request_payload=dict(body.parameters),
+        target_task_id=target_task_id,
     )
     try:
         receipt = await execute_fenced_db_operation(session, fenced_request, callback)

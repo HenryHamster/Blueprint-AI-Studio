@@ -26,6 +26,7 @@ from app.strategic_operation_authority_validation import (
     FencedOperationContext,
     FencedOperationRequest,
     FencedOperationUsageError,
+    FencedTaskWriter,
     InactiveTurnAuthority,
     MutationCallback,
     OperationIdentityCollision,
@@ -203,6 +204,43 @@ async def execute_fenced_db_operation(
             turn_task,
             request.expected_revisions,
         )
+        # Optional bounded mutation of one non-turn target task, CAS'd on its
+        # ``updated_at`` (advances on every write; ``version`` is forensic-only).
+        # Loaded and locked here so its state is stable through the apply.
+        target_task: Task | None = None
+        if request.target_task_id is not None:
+            if request.target_task_id == request.turn_task_id:
+                raise AuthorityBoundaryMutation(
+                    "operation cannot target its own Resident turn task"
+                )
+            _require_expected_revision_keys(
+                request.expected_revisions,
+                {"target_task_updated_at"},
+                reason="target-task operation",
+            )
+            target_task = (
+                await session.execute(
+                    select(Task)
+                    .where(
+                        Task.id == request.target_task_id,
+                        Task.project_id == request.project_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if target_task is None:
+                raise InactiveTurnAuthority("target task not found in project")
+            if (
+                str((target_task.first_payload or {}).get("type") or "")
+                == RESIDENT_TURN_TASK_TYPE
+            ):
+                raise AuthorityBoundaryMutation(
+                    "operation cannot target a Resident turn task"
+                )
+            observed["target_task_updated_at"] = (
+                target_task.updated_at.isoformat() if target_task.updated_at else None
+            )
         _validate_frozen_turn_lineage(
             turn_task,
             project_id=request.project_id,
@@ -232,6 +270,7 @@ async def execute_fenced_db_operation(
         await session.flush()
 
         writer = FencedMutationWriter({})
+        task_writer = FencedTaskWriter({}) if target_task is not None else None
         context = FencedOperationContext(
             project_id=project.id,
             turn_task_id=turn_task.id,
@@ -240,6 +279,7 @@ async def execute_fenced_db_operation(
             request_payload=_freeze_json(request_payload),
             observed_revisions=MappingProxyType(deepcopy(observed)),
             writer=writer,
+            task_writer=task_writer,
         )
         authority_snapshot = (
             resident.project_id,
@@ -382,6 +422,9 @@ async def execute_fenced_db_operation(
                 expected_revisions=request.expected_revisions,
             )
             session.add(project)
+            if target_task is not None and task_writer is not None:
+                task_writer._apply(target_task)
+                session.add(target_task)
             await session.flush()
         except BaseException:
             session.sync_session.expunge_all()
@@ -390,13 +433,18 @@ async def execute_fenced_db_operation(
             "schema_version": 1,
             "structured_result": structured_result,
         }
-        receipt.observed_revisions_after = await _observed_revisions(
+        revisions_after = await _observed_revisions(
             session,
             project,
             resident,
             turn_task,
             request.expected_revisions,
         )
+        if target_task is not None:
+            revisions_after["target_task_updated_at"] = (
+                target_task.updated_at.isoformat() if target_task.updated_at else None
+            )
+        receipt.observed_revisions_after = revisions_after
         receipt.status = "applied"
         receipt.completed_at = _utcnow()
         receipt.updated_at = receipt.completed_at
