@@ -2564,32 +2564,29 @@ def test_probe_key_continuity_fails_closed_for_incompatible_key(monkeypatch):
     """probe_key_continuity must raise RuntimeError when the configured key is wrong.
 
     Finding e2 claim: the boot-time continuity probe (probe_key_continuity) decrypts
-    a canonical reference ciphertext with the CURRENT key; if the key has been rotated
-    without re-encrypting at-rest data, InvalidToken fires and a RuntimeError is raised
-    so the service fails closed rather than silently serving the wrong plaintexts.
+    a per-environment reference ciphertext with the CURRENT key; if the key has been
+    rotated without re-encrypting at-rest data, InvalidToken fires and a RuntimeError
+    is raised so the service fails closed rather than silently serving the wrong
+    plaintexts.
 
-    The reference ciphertext is KEY-SPECIFIC (source-hardcoding it with a CI key
-    would crash every production boot), so we supply it at test time via monkeypatch
-    of the module-level CONTINUITY_REFERENCE_CIPHERTEXT constant — the same pattern
-    that test_field_encryption.py uses for the TestProbeKeyContinuity suite.
+    Mint a reference with key_a, then verify with key_b (wrong key).
     """
     from cryptography.fernet import Fernet
     import pytest
     from app import field_encryption
 
-    # key_a is the "old" key that encrypted the reference; key_b is the "wrong"
-    # (current) key that cannot decrypt the reference.
     key_a = Fernet.generate_key()
     reference_ciphertext = Fernet(key_a).encrypt(
         field_encryption.CONTINUITY_REFERENCE_PLAINTEXT.encode()
     ).decode()
-    monkeypatch.setattr(field_encryption, "CONTINUITY_REFERENCE_CIPHERTEXT", reference_ciphertext)
 
-    wrong_key = Fernet.generate_key()
-    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", wrong_key.decode())
+    key_b = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key_b)
 
     with pytest.raises(RuntimeError, match="continuity"):
-        field_encryption.probe_key_continuity("test-context")
+        field_encryption.probe_key_continuity(
+            "test-context", reference_ciphertext=reference_ciphertext
+        )
 
 
 # e3 — assert_plaintext_or_raise raises for wrong-key ciphertext
@@ -2821,7 +2818,7 @@ def test_scratch_subprocess_injects_ephemeral_fernet_key():
     )
 
 
-# e20 — _looks_like_keyless_encryption_artifact three-signal guard
+# e20 — _looks_like_keyless_encryption_artifact two-signal guard
 # --------------------------------------------------------------------------- #
 
 
@@ -2848,12 +2845,17 @@ def test_looks_like_keyless_encryption_artifact_classifier():
         "and the env-var name appear on the same line"
     )
 
-    # Migration-number-agnostic: matches any encryption migration failure — not just 0609
-    other_migration = f"RuntimeError: {_ENCRYPTION_KEY_ENV_VAR} is required. Some other migration failed."
-    assert _looks_like_keyless_encryption_artifact(other_migration) is True, (
-        "_looks_like_keyless_encryption_artifact must return True for any migration "
-        "that emits RuntimeError + env-var name on the same line — "
-        "the classifier is migration-number-agnostic (covers 0609, 0621, future migrations)"
+    # Env-var name on a DIFFERENT line than RuntimeError → False
+    # (prevents false positives from accumulated chain stderr where earlier
+    # no-op migrations emit the env-var name as a warning before an unrelated
+    # RuntimeError from a different step).
+    diff_line = (
+        f"WARNING: {_ENCRYPTION_KEY_ENV_VAR} is not set — field encryption is a no-op\n"
+        "RuntimeError: Some other migration failed (unrelated)."
+    )
+    assert _looks_like_keyless_encryption_artifact(diff_line) is False, (
+        "_looks_like_keyless_encryption_artifact must return False when the env-var "
+        f"name ({_ENCRYPTION_KEY_ENV_VAR}) is on a different line than RuntimeError"
     )
 
     # Missing env-var name → False
