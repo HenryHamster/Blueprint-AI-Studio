@@ -251,11 +251,18 @@ describe('StrategicContextArtifactSlot — viewport regression', () => {
         await act(async () => {
           r.render(<StrategicContextArtifactSlot contextPackage={pkg} />);
         });
-        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
-        // Badge is present on the mid-run live image.
+        // Assert the LIVE badge at render time, before the descriptor's
+        // synthetic (non-loadable) image URL fires onError and flips the slot to
+        // the "preview unavailable" state. The badge is a render-time concern —
+        // in production the mid-run frame loads and the badge persists — so
+        // racing the headless browser's image-load failure (which only reliably
+        // wins once another viewport file has warmed the shared browser context)
+        // would be testing image loading, not the badge. See
+        // useFreshMediaUrl.onMediaError.
         expect(host.querySelector('[data-testid="live-badge"]')).not.toBeNull();
         expect(host.textContent).toContain('LIVE');
         expect(host.textContent).toContain('Live training frame');
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
       },
       { waitMs: 40 },
     );
