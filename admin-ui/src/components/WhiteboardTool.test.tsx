@@ -6,6 +6,10 @@ import { registerToolKind } from '../toolRegistry';
 vi.mock('../firebase', () => ({
   auth: { currentUser: { uid: 'operator-a', email: 'operator@example.com' } },
   getIdToken: vi.fn().mockResolvedValue('token'),
+  getIdTokenAfterAuthRestore: vi.fn().mockResolvedValue('token'),
+  onAuthChange: vi.fn(),
+  signInWithGoogle: vi.fn(),
+  signOut: vi.fn(),
 }));
 
 vi.mock('../api/projectTools', async () => {
@@ -25,15 +29,22 @@ vi.mock('../strategicStateApi', async () => {
 
 vi.mock('../utils/conversationAttachmentUpload', () => ({
   uploadConversationAttachments: vi.fn(),
+  ConversationAttachmentUploadError: class ConversationAttachmentUploadError extends Error {},
 }));
 
 vi.mock('../utils/renderWhiteboardArtifact', () => ({
   renderWhiteboardArtifact: vi.fn(),
 }));
 
-vi.mock('../utils/residentToolHandoff', () => ({
-  dispatchResidentToolHandoff: vi.fn(),
-}));
+vi.mock('../utils/residentToolHandoff', async () => {
+  const actual = await vi.importActual<typeof import('../utils/residentToolHandoff')>(
+    '../utils/residentToolHandoff',
+  );
+  return {
+    ...actual,
+    dispatchResidentToolHandoff: vi.fn(),
+  };
+});
 
 import {
   createResidentToolArtifactRef,
