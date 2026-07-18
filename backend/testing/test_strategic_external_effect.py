@@ -321,3 +321,40 @@ async def test_stale_generation_fails_closed_without_performing(db):
         )
     assert ran == []  # never performed the external effect
     assert (await db.execute(select(StrategicOperationReceipt))).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_adapter_forwards_the_approved_head_sha(monkeypatch):
+    """The pr.merge perform must pin the approved head sha at merge time.
+
+    Guards the approve-then-push TOCTOU: without this, a head that advanced after
+    the operator's approval would be merged (unreviewed code lands on trunk).
+    """
+    import uuid as _uuid
+
+    from app import github_pulls, github_token_resolver
+    from app.strategic_resident_external_effect_adapters import build_external_effect
+
+    captured = {}
+
+    async def _fake_token(task_id, session):
+        return ("ghs_token", "owner", "repo")
+
+    async def _fake_merge(token, owner, repo, pr_number, **kwargs):
+        captured["pr_number"] = pr_number
+        captured["expected_head_sha"] = kwargs.get("expected_head_sha")
+        return {"merged": True, "sha": kwargs.get("expected_head_sha")}
+
+    monkeypatch.setattr(github_token_resolver, "get_github_token_for_task", _fake_token)
+    monkeypatch.setattr(github_pulls, "merge_pull_request", _fake_merge)
+
+    perform = build_external_effect(
+        "pr.merge",
+        project_id=_uuid.uuid4(),
+        turn_task_id=_uuid.uuid4(),
+        parameters={"pr_number": 42, "expected_head_sha": "abc1234"},
+    )
+    result = await perform(None)
+    assert captured["pr_number"] == 42
+    assert captured["expected_head_sha"] == "abc1234"  # the approved sha is pinned
+    assert result["merged"] is True

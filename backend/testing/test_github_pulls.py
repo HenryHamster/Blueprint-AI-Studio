@@ -263,6 +263,33 @@ async def test_merge_pr_secondary_rate_limit_429_raises_retryable_503(mocker):
 
 
 @pytest.mark.asyncio
+async def test_merge_pr_forwards_expected_head_sha_as_merge_guard(mocker):
+    """expected_head_sha must be sent as GitHub's merge `sha` guard so a head
+    that advanced after authorisation fails closed (409) instead of merging."""
+    from app import github_pulls
+
+    ok = HtmlBodyResponse(200, text='{"merged": true}')
+    request = mocker.AsyncMock(return_value=ok)
+    mocker.patch("app.github._github_request", new=request)
+
+    await github_pulls.merge_pull_request(
+        "ghs_token", "owner", "repo", 42,
+        allow_changes_requested=True,
+        expected_head_sha="abc1234",
+    )
+    body = request.await_args.kwargs["json"]
+    assert body["sha"] == "abc1234"
+
+    # Without an expected sha, no guard is sent (unchanged behaviour).
+    request2 = mocker.AsyncMock(return_value=HtmlBodyResponse(200, text='{"merged": true}'))
+    mocker.patch("app.github._github_request", new=request2)
+    await github_pulls.merge_pull_request(
+        "ghs_token", "owner", "repo", 42, allow_changes_requested=True
+    )
+    assert "sha" not in request2.await_args.kwargs["json"]
+
+
+@pytest.mark.asyncio
 async def test_merge_pr_html_5xx_body_does_not_raise_jsondecodeerror(mocker):
     """An HTML 5xx body must surface as a normal HTTPException, NOT a raw
     JSONDecodeError.

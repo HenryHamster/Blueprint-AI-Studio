@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -59,6 +59,17 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
+from app.strategic_resident_capabilities import capability_for
+from app.strategic_resident_capability_invocation import (
+    validated_capability_parameters,
+)
+from app.strategic_resident_operation_approval import (
+    MAX_APPROVAL_TTL_SECONDS,
+    OperatorApprovalRequired,
+    capability_requires_operator_approval,
+    derive_approval_key,
+    grant_operation_approval,
+)
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
@@ -3612,6 +3623,67 @@ async def start_project_strategic_resident_session(
         runner_id=data.runner_id,
     )
     return {"project_id": str(project_id), "enabled": True, "session": snapshot}
+
+
+class ResidentOperationApprovalGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=3, max_length=120)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=3600, ge=1, le=MAX_APPROVAL_TTL_SECONDS)
+
+
+@router.post("/projects/{project_id}/resident-operation-approvals")
+@limiter.limit("30/minute")
+async def grant_resident_operation_approval(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentOperationApprovalGrant,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator-grant an approval for one explicit-approval Resident operation.
+
+    The operator names the capability and its exact parameters (e.g. the PR
+    number + head sha for ``pr.merge``); the server derives the approval key from
+    them and records a single-use, time-bounded approval. Because the Resident's
+    invocation re-derives the same key from the operation it actually executes,
+    the approval authorises that operation and no other.
+    """
+
+    # Authorizing an autonomous trunk merge / deploy is at least as consequential
+    # as a human doing it, so require ``owner`` — matching admin_hotfix_promote and
+    # every other trunk-affecting operator action in this codebase.
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    if not capability_requires_operator_approval(payload.capability):
+        raise HTTPException(
+            status_code=400,
+            detail="capability does not require an explicit operator approval",
+        )
+    try:
+        spec = capability_for(payload.capability)
+        parameters = validated_capability_parameters(spec, payload.parameters)
+    except (ValueError, OperatorApprovalRequired) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    approval_key = derive_approval_key(payload.capability, parameters)
+    approval = await grant_operation_approval(
+        session,
+        project_id=project.id,
+        capability=payload.capability,
+        approval_key=approval_key,
+        granted_by=current_user["user_id"],
+        ttl_seconds=payload.ttl_seconds,
+    )
+    await session.commit()
+    return {
+        "project_id": str(project_id),
+        "capability": payload.capability,
+        "approval_id": str(approval.id),
+        "approval_key": approval_key,
+        "expires_at": approval.expires_at.isoformat(),
+    }
 
 
 @router.post("/projects/{project_id}/strategic-session/stop")

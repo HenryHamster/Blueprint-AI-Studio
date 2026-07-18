@@ -7,6 +7,8 @@ import inspect
 import asyncio
 import os
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -1440,6 +1442,155 @@ async def test_reprioritize_endpoint_mutates_target_task_with_cas(authority_db):
     assert receipt.operation_kind == "reprioritize_task"
     assert receipt.capability == "task.reprioritize"
     assert receipt.observed_revisions_before["target_task_updated_at"] is not None
+
+
+def _pr_merge_invocation(project, turn_task, *, pr_number=42, head="abc1234"):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "pr.merge",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"pr_number": pr_number, "expected_head_sha": head},
+            "operation_id": "merge-1",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+            },
+            "approval_ref": "operator-approved",
+            "evidence": tuple(
+                CapabilityEvidenceRef(
+                    kind=kind,
+                    project_id=project.id,
+                    source_id=f"pr:{pr_number}",
+                    revision=head,
+                    checksum=str(index) * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                )
+                for index, kind in enumerate(
+                    ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability")
+                )
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_requires_a_matching_operator_approval(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+
+    # No approval granted -> 403, and the external effect never runs.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 403
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_dispatches_with_a_matching_approval(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.models import StrategicOperationApproval
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    receipt = SimpleNamespace(
+        operation_id="merge-1", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # An operator grants approval for THIS exact merge (pr 42 @ abc1234).
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 42, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _pr_merge_invocation(project, turn_task),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == "pr.merge"
+    assert fenced_request.operation_kind == "merge_pull_request"
+    # The approval was consumed by this operation.
+    approval = (
+        await authority_db.execute(select(StrategicOperationApproval))
+    ).scalar_one()
+    assert approval.consumed_operation_id == "merge-1"
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_approval_for_a_different_pr_is_rejected(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Operator approved PR 7, but the Resident attempts to merge PR 42.
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 7, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task, pr_number=42),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 403
+    external.assert_not_awaited()
 
 
 @pytest.mark.asyncio

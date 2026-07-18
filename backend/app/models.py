@@ -59,6 +59,7 @@ from app.release_models import (  # noqa: F401
     VersionAcceptanceCriterion,
 )
 from app.strategic_resident_models import (  # noqa: F401
+    StrategicOperationApproval,
     StrategicOperationReceipt,
     StrategicResident,
     StrategicResidentCheckpoint,

@@ -19,11 +19,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # Capabilities whose service performs an external side effect through this module.
 EXTERNAL_EFFECT_SERVICES = frozenset({"github_pulls"})
 
-# capability_id -> receipt operation_kind. Only the low-risk, reversible,
-# already-idempotent pr.create is wired; pr.merge/deployment.* (critical, explicit
-# approval) remain proposal-only until real approval verification exists.
+# capability_id -> receipt operation_kind. pr.create is medium-risk and
+# self-gated; pr.merge is critical and additionally gated by a real, per-operation
+# operator approval verified in the router. deployment.* stay proposal-only until
+# safe programmatic deploy primitives exist.
 _OPERATION_KINDS = {
     "pr.create": "create_pull_request",
+    "pr.merge": "merge_pull_request",
 }
 
 
@@ -58,6 +60,37 @@ def _pr_create_effect(
     return perform
 
 
+def _pr_merge_effect(
+    request_project_id: uuid.UUID,
+    turn_task_id: uuid.UUID,
+    parameters: dict[str, Any],
+) -> Callable[[AsyncSession], Awaitable[dict[str, Any]]]:
+    async def perform(session: AsyncSession) -> dict[str, Any]:
+        from app.github_pulls import merge_pull_request
+        from app.github_token_resolver import get_github_token_for_task
+
+        token, owner, repo = await get_github_token_for_task(turn_task_id, session)
+        # Fail closed on CHANGES_REQUESTED (merge_pull_request checks the review
+        # decision before the PUT) and on a head that advanced past the approved
+        # sha (expected_head_sha -> GitHub's merge `sha` guard). Never override
+        # with allow_changes_requested.
+        result = await merge_pull_request(
+            token,
+            owner,
+            repo,
+            int(parameters["pr_number"]),
+            project_id=str(request_project_id),
+            expected_head_sha=str(parameters["expected_head_sha"]),
+        )
+        return {
+            "merged": bool(result.get("merged")),
+            "pr_number": int(parameters["pr_number"]),
+            "sha": result.get("sha"),
+        }
+
+    return perform
+
+
 def external_effect_operation_kind(capability_id: str) -> str | None:
     """Return the receipt operation_kind for a wired external capability, or None."""
 
@@ -75,6 +108,8 @@ def build_external_effect(
 
     if capability_id == "pr.create":
         return _pr_create_effect(project_id, turn_task_id, parameters)
+    if capability_id == "pr.merge":
+        return _pr_merge_effect(project_id, turn_task_id, parameters)
     return None
 
 
