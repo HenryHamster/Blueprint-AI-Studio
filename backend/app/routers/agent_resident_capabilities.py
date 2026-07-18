@@ -7,6 +7,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
@@ -17,7 +18,15 @@ from app.resident_agent_rate_limits import (
     resident_remote_rate_key,
     resident_task_token_rate_key,
 )
+from app.shared_state import runtime_config
 from app.strategic_operation_authority import execute_fenced_db_operation
+from app.strategic_operation_external_effect import execute_external_effect_operation
+from app.strategic_resident_external_effect_adapters import (
+    EXTERNAL_EFFECT_SERVICES,
+    build_external_effect,
+    external_effect_capability_is_armed,
+    external_effect_operation_kind,
+)
 from app.strategic_operation_authority_validation import (
     AuthorityBoundaryMutation,
     AuthorityGenerationMismatch,
@@ -270,10 +279,27 @@ async def invoke_resident_mutation(
     spec = capability_for(body.capability_id)
     if spec.mode is not CapabilityMode.mutate:
         raise HTTPException(status_code=400, detail="capability is not a mutation")
-    # Resolve the fenced adapter: a Project-field mutation, or a bounded
-    # target-task mutation (which carries a target_task_id from its params).
+    # Resolve the fenced adapter: a DB-only Project-field / target-task mutation
+    # (execute_fenced_db_operation), or an external-effect operation gated behind
+    # a default-empty operator allowlist (execute_external_effect_operation).
     target_task_id: uuid.UUID | None = None
-    if spec.service == PROJECT_FIELD_MUTATION_SERVICE:
+    callback = None
+    operation_kind = None
+    external_effect = None
+    if spec.service in EXTERNAL_EFFECT_SERVICES:
+        operation_kind = external_effect_operation_kind(body.capability_id)
+        armed = external_effect_capability_is_armed(
+            body.capability_id,
+            runtime_config.get("resident_external_effect_capability_allowlist", []),
+        )
+        if operation_kind is not None and armed:
+            external_effect = build_external_effect(
+                body.capability_id,
+                project_id=binding.project_id,
+                turn_task_id=binding.task_id,
+                parameters=dict(body.parameters),
+            )
+    elif spec.service == PROJECT_FIELD_MUTATION_SERVICE:
         callback = project_field_mutation_callback(body.capability_id)
         operation_kind = project_field_mutation_operation_kind(body.capability_id)
     elif spec.service == TASK_MUTATION_SERVICE:
@@ -287,10 +313,7 @@ async def invoke_resident_mutation(
                     detail="task mutation requires a task_id parameter",
                 )
             target_task_id = uuid.UUID(str(raw_target))
-    else:
-        callback = None
-        operation_kind = None
-    if callback is None or operation_kind is None:
+    if operation_kind is None or (callback is None and external_effect is None):
         raise HTTPException(
             status_code=501,
             detail="mutation capability is proposal-only until a fenced adapter exists",
@@ -314,9 +337,25 @@ async def invoke_resident_mutation(
         target_task_id=target_task_id,
     )
     try:
-        receipt = await execute_fenced_db_operation(session, fenced_request, callback)
+        if external_effect is not None:
+            receipt = await execute_external_effect_operation(
+                session,
+                fenced_request,
+                perform=external_effect,
+                effect_kind=operation_kind,
+            )
+        else:
+            receipt = await execute_fenced_db_operation(
+                session, fenced_request, callback
+            )
     except OperationIdentityCollision as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        # A concurrent invocation with the same operation_id won the unique
+        # (project_id, operation_id) insert first — the loser retries as a 409.
+        raise HTTPException(
+            status_code=409, detail="operation is already in progress"
+        ) from exc
     except (
         AuthorityGenerationMismatch,
         ResidentEngineOwnerMismatch,
