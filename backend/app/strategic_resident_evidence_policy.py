@@ -54,6 +54,20 @@ INSPECTION_CAPABILITY_KINDS = {
 }
 SUCCESSFUL_INSPECTION_STATUSES = frozenset({"applied", "reconciled"})
 
+# Maps a ``ResidentTaskEvidence.kind`` (the inspection taxonomy) to the trust
+# ``EVIDENCE_KINDS`` taxonomy used by ``evidence_key``/``build_trusted_evidence_index``.
+# All task-derived inspections collapse to ``task`` except logs -> ``task_log``;
+# source_id + revision + checksum still distinguish the specific evidence (e.g. a
+# failure vs a provider inspection of the same task differ by checksum), so the
+# collapse never conflates distinct evidence.
+INSPECTION_EVIDENCE_KIND_MAP = {
+    "task": "task",
+    "lineage": "task",
+    "logs": "task_log",
+    "failure": "task",
+    "provider": "task",
+}
+
 
 def _bounded_identity(value: Any, *, max_bytes: int) -> str | None:
     if not isinstance(value, str) or not value:

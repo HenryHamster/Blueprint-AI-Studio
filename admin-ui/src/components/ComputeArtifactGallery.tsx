@@ -11,7 +11,8 @@ const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
 type PreviewResolution =
   | { state: 'resolving' }
   | { state: 'resolved'; url: string; resolvedAt: number }
-  | { state: 'error' };
+  | { state: 'error' }
+  | { state: 'expired' };
 
 const artifactCacheKey = (storageUri: string, revision: string | null | undefined) =>
   revision ? `${storageUri}@${revision}` : storageUri;
@@ -37,6 +38,12 @@ export function ComputeArtifactGallery({
   const [expanded, setExpanded] = useState(false);
   const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const previewRequestIds = useRef<Record<string, number>>({});
+  // Stable ref for the job's artifact retention expiry so callbacks can read
+  // the latest value without being recreated on every render.
+  const expiresAtRef = useRef<string | null | undefined>(job.artifact_expires_at);
+  useEffect(() => {
+    expiresAtRef.current = job.artifact_expires_at;
+  }, [job.artifact_expires_at]);
 
   const artifacts = computeJobViewableArtifacts(job);
 
@@ -54,7 +61,10 @@ export function ComputeArtifactGallery({
         return url;
       } catch {
         if (previewRequestIds.current[key] === requestId) {
-          setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+          // Check if the artifact has permanently expired (GCS lifecycle reap).
+          const expiresAt = expiresAtRef.current;
+          const expired = expiresAt ? new Date(expiresAt).getTime() < Date.now() : false;
+          setPreviewUrls((prev) => ({ ...prev, [key]: { state: expired ? 'expired' : 'error' } }));
         }
         return null;
       }
@@ -63,7 +73,9 @@ export function ComputeArtifactGallery({
   );
 
   const markPreviewError = useCallback((key: string) => {
-    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
+    const expiresAt = expiresAtRef.current;
+    const expired = expiresAt ? new Date(expiresAt).getTime() < Date.now() : false;
+    setPreviewUrls((prev) => ({ ...prev, [key]: { state: expired ? 'expired' : 'error' } }));
   }, []);
 
   // Resolve pending non-PDF artifacts eagerly when the gallery is expanded, and
@@ -209,18 +221,20 @@ export function ComputeArtifactGallery({
                 <button
                   type="button"
                   onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                  disabled={resolution?.state === 'resolving'}
+                  disabled={resolution?.state === 'resolving' || resolution?.state === 'expired'}
                   title={`Open ${art.name} in a new tab`}
                   className="flex h-24 w-32 flex-col items-center justify-center gap-1 rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-400 hover:border-sky-500/50 disabled:opacity-70"
-                  data-testid={`${testIdPrefix}-artifact-pdf`}
+                  data-testid={resolution?.state === 'expired' ? `${testIdPrefix}-artifact-expired` : `${testIdPrefix}-artifact-pdf`}
                 >
                   <FileText className="h-8 w-8 text-sky-400" />
                   <span>
                     {resolution?.state === 'resolving'
                       ? 'opening…'
-                      : resolution?.state === 'error'
-                        ? 'open failed — retry'
-                        : 'Open PDF'}
+                      : resolution?.state === 'expired'
+                        ? 'preview expired'
+                        : resolution?.state === 'error'
+                          ? 'open failed — retry'
+                          : 'Open PDF'}
                   </span>
                 </button>
               );
@@ -269,15 +283,17 @@ export function ComputeArtifactGallery({
               <button
                 type="button"
                 onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
-                disabled={resolution?.state === 'resolving'}
+                disabled={resolution?.state === 'resolving' || resolution?.state === 'expired'}
                 className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                data-testid={`${testIdPrefix}-artifact-placeholder`}
+                data-testid={resolution?.state === 'expired' ? `${testIdPrefix}-artifact-expired` : `${testIdPrefix}-artifact-placeholder`}
               >
                 {resolution?.state === 'resolving'
                   ? 'resolving…'
-                  : resolution?.state === 'error'
-                    ? 'preview unavailable — retry'
-                    : 'load preview'}
+                  : resolution?.state === 'expired'
+                    ? 'preview expired (retention lapsed)'
+                    : resolution?.state === 'error'
+                      ? 'preview unavailable — retry'
+                      : 'load preview'}
               </button>
             );
             return (
