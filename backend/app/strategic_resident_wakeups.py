@@ -99,7 +99,45 @@ async def sweep_due_authoritative_resident_wakeups(
     return queued
 
 
+async def signal_project_change(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    project_id: uuid.UUID,
+    project_change_cursor: dict[str, Any],
+    now: datetime | None = None,
+) -> uuid.UUID | None:
+    """Wake the background Resident on a MEANINGFUL project change.
+
+    The production entrypoint for the ``project_change`` coalescing lane (the
+    deadline/follow_up lanes are driven by ``sweep_due_authoritative_resident_wakeups``).
+    A trigger — a completed StrategicCycle, a direction/pipeline transition, any
+    non-conversational project mutation — calls this with a bounded cursor of the
+    changed high-waters. Coalescing guarantees:
+
+    * an unchanged project (cursor does not advance the resident's handled cursor)
+      makes ZERO Tasks and ZERO model calls — this returns ``None`` cheaply;
+    * a paused background policy is respected inside the coalescer;
+    * rapid changes coalesce into at most one active turn plus one successor.
+
+    Returns the enqueued/coalesced turn task id, or ``None`` when nothing was due.
+    Owns its own transaction so a caller's session/lock is never held across it.
+    """
+
+    async with session_factory() as session, session.begin():
+        wake = await coalesce_meaningful_background_wakeup(
+            session,
+            project_id=project_id,
+            trigger_kind="project_change",
+            now=now,
+            project_change_cursor=project_change_cursor,
+        )
+    if wake is None:
+        return None
+    return wake.task_id
+
+
 __all__ = [
     "coalesce_meaningful_background_wakeup",
+    "signal_project_change",
     "sweep_due_authoritative_resident_wakeups",
 ]
