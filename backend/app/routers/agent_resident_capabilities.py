@@ -3,15 +3,17 @@
 import hashlib
 import json
 import uuid
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
-from app.models import TaskStatus
+from app.models import ProjectMessage, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.resident_agent_rate_limits import (
@@ -49,14 +51,22 @@ from app.strategic_resident_agent_binding import (
 )
 from app.strategic_resident_capabilities import CapabilityMode, capability_for
 from app.strategic_resident_capability_invocation import (
+    CapabilityEvidenceRef,
     ResidentCapabilityInvocation,
     validated_capability_parameters,
+)
+from app.strategic_resident_evidence_policy import (
+    INSPECTION_CAPABILITY_KINDS,
+    SUCCESSFUL_INSPECTION_STATUSES,
+    EvidenceKey,
+    evidence_key,
 )
 from app.strategic_resident_inspection_receipt import (
     TURN_CONTEXT_HASH_KEY,
     build_inspection_receipt,
     citable_inspection_evidence,
 )
+from app.strategic_resident_models import StrategicOperationReceipt
 from app.strategic_resident_operation_approval import (
     OperatorApprovalRequired,
     capability_requires_operator_approval,
@@ -85,6 +95,69 @@ from app.strategic_resident_task_inspection import (
 
 
 router = APIRouter(prefix="/api/agent/resident-turn", tags=["agent"])
+
+_INSPECTION_OPERATION_KINDS = frozenset(INSPECTION_CAPABILITY_KINDS.values())
+
+
+def _build_receipt_evidence_set(
+    receipts: Iterable[StrategicOperationReceipt],
+) -> frozenset[EvidenceKey]:
+    """Return the set of (kind, source_id, revision, checksum) tuples from this turn's receipts."""
+    entries: set[EvidenceKey] = set()
+    for receipt in receipts:
+        if (
+            str(receipt.operation_kind) not in _INSPECTION_OPERATION_KINDS
+            or str(receipt.status) not in SUCCESSFUL_INSPECTION_STATUSES
+        ):
+            continue
+        body = receipt.receipt or {}
+        if not isinstance(body, Mapping):
+            continue
+        structured_result = body.get("structured_result")
+        if not isinstance(structured_result, Mapping):
+            continue
+        receipt_evidence = structured_result.get("evidence")
+        if not isinstance(receipt_evidence, list):
+            continue
+        for item in receipt_evidence:
+            if not isinstance(item, Mapping):
+                continue
+            key = evidence_key(item, allow_source_aliases=False)
+            if key is not None:
+                entries.add(key)
+    return frozenset(entries)
+
+
+async def _check_evidence_refs_against_receipts(
+    session: AsyncSession,
+    binding: ResidentAgentBinding,
+    evidence: tuple[CapabilityEvidenceRef, ...],
+) -> None:
+    """Reject any evidence ref not backed by a real inspection receipt for this turn.
+
+    Rolls back the session on exit so the caller's session is clean for
+    execute_fenced_db_operation, which opens its own independent transaction.
+    """
+    if not evidence:
+        return
+    try:
+        rows = (
+            await session.execute(
+                select(StrategicOperationReceipt).where(
+                    StrategicOperationReceipt.project_id == binding.project_id,
+                    StrategicOperationReceipt.turn_task_id == binding.task_id,
+                )
+            )
+        ).scalars().all()
+        trusted = _build_receipt_evidence_set(rows)
+        for ref in evidence:
+            if (ref.kind, ref.source_id, ref.revision, ref.checksum) not in trusted:
+                raise HTTPException(
+                    status_code=403,
+                    detail="capability evidence ref is not backed by a real inspection for this turn",
+                )
+    finally:
+        await session.rollback()
 
 MAX_CAPABILITY_REQUESTS_PER_TURN = 8
 _CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY = "_strategic_resident_capability_requests"
@@ -163,6 +236,39 @@ def _register_capability_request(
 
 
 _capability_rate_key = resident_task_token_rate_key
+
+
+async def _validate_approval_ref(
+    session: AsyncSession,
+    approval_ref: str | None,
+    project_id: uuid.UUID,
+) -> None:
+    """Reject mutations whose approval_ref is missing, foreign, or agent-authored."""
+
+    if not approval_ref:
+        raise HTTPException(
+            status_code=403,
+            detail="capability requires an explicit operator approval_ref",
+        )
+    try:
+        approval_id = uuid.UUID(approval_ref)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="approval_ref must be a valid UUID",
+        ) from None
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.id == approval_id,
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type == "user",
+        ).limit(1)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=403,
+            detail="approval_ref does not reference a valid human operator message for this project",
+        )
 
 
 @router.post("/capability")
@@ -349,6 +455,10 @@ async def invoke_resident_mutation(
     # this exact operation (the key is derived from the parameters, so an approval
     # granted for one operation cannot authorise a different one). Consumed here
     # in the request transaction — idempotent per operation_id — before any effect.
+    # This durable-approval gate (migration 0632, keyed on capability+parameters)
+    # supersedes the earlier approval_ref-vs-ProjectMessage check on these same
+    # capabilities; the operator grant creates an approval record, not a message,
+    # so re-adding _validate_approval_ref here would 403 every real approval.
     if capability_requires_operator_approval(body.capability_id):
         try:
             await verify_and_consume_operation_approval(
@@ -374,6 +484,13 @@ async def invoke_resident_mutation(
         request_payload=dict(body.parameters),
         target_task_id=target_task_id,
     )
+    # Evidence refs supplied for a DB-fenced mutation must each be backed by a
+    # real inspection receipt from this turn. External-effect operations are
+    # governed by their own evidence preconditions + reconciliation-time trusted
+    # evidence index, and run on a session shape this read-then-rollback check
+    # does not apply to, so it is scoped to the fenced-DB path only.
+    if external_effect is None:
+        await _check_evidence_refs_against_receipts(session, binding, body.evidence)
     try:
         if external_effect is not None:
             receipt = await execute_external_effect_operation(
