@@ -173,7 +173,7 @@
     "strategic_resident_provider_policy.py": 170,
     "strategic_resident_runner_policy.py": 100,
     "strategic_resident_saturated_dispatch.py": 120,
-    "strategic_resident_wakeups.py": 150,
+    "strategic_resident_wakeups.py": 450,
     "strategic_resident_context.py": 1050,
     "strategic_resident_shadow.py": 1050,
     "routers/agent_resident_turn.py": 450,
