@@ -124,6 +124,26 @@ Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-14 — docs/capability-proof-earn-path.md design document exists
   cp-15 — record_capability_named_test_execution_proof mints proven tier; enroll_capability_proof_trial exists
 
+Findings covered here (16-finding capability-proof salvage bundle, 2026-07-18):
+  cq-0  — spawn-gate absorbs alias bypass closed: working_capability_proof_status registers
+           agent-declared absorbs aliases as "unproven" so capability_need_blocked_by_proof_gate
+           cannot treat a None/absent entry as a free pass (finding #1, fixed in a81408a)
+  cq-1  — MetricsIntegrityFlag uses real backend contract (already pinned by cp-1)
+  cq-2  — capability_proof_trial_stall is registered as a health check (already pinned by cp-2)
+  cq-3  — ingestion treats could_not_run as non-green without demoting (already pinned by cp-3)
+  cq-4  — ledger_corroborated_proof_status applies freshness and alias-aware retry (already pinned by cp-4)
+  cq-5  — settings API exposes proof trial fields (already pinned by cp-5)
+  cq-6  — revoke_stale_execution_proof exists; trial dedup guard present (already pinned by cp-6)
+  cq-7  — event_driven_unblock_on_capability_proof called after green proof committed (already pinned by cp-7)
+  cq-8  — plan_completion enforces capability prerequisites (already pinned by cp-8)
+  cq-9  — trial receipt validates against enrollment (already pinned by cp-9)
+  cq-10 — compute_fleet_proof_coverage uses ledger-corroborating path (already pinned by cp-10)
+  cq-11 — check_capability_proof_gate_gap self-healing check is registered (already pinned by cp-11)
+  cq-12 — compute_trial_eligibility_projection exists (already pinned by cp-12)
+  cq-13 — E2E lifecycle test exists in test_blocked_need_resolution (already pinned by cp-13)
+  cq-14 — design doc referenced in source (already pinned by cp-14)
+  cq-15 — automated earn path: record_capability_named_test_execution_proof + enroll_capability_proof_trial (already pinned by cp-15)
+
 Findings covered here (7-finding creation-path fail-closed audience salvage bundle, 2026-07-17):
   p1 — design: fail-closed audience contract — design for Alert/message construction fail-closed
   p2 — fix: research_direction_state + research_completion Alert constructors stamp event_type
@@ -3566,3 +3586,89 @@ def test_strategist_internal_alert_event_types_are_registered():
             f"_EVENT_AUDIENCE_REGISTRY['{event_type}'] must be '{expected_audience}'; "
             f"got '{actual}' — internal research bookkeeping must never reach the operator badge"
         )
+
+
+# --------------------------------------------------------------------------- #
+# Finding #1 (cq-0) — spawn-gate absorbs alias bypass is closed                #
+# --------------------------------------------------------------------------- #
+
+
+def test_cq0_working_capability_proof_status_registers_absorbs_aliases_as_unproven():
+    """cq-0: working_capability_proof_status includes agent-declared absorbs aliases
+    as 'unproven', closing the spawn-gate bypass where None/absent was a free pass.
+
+    Finding #1 identified that a problem-model author could declare a working
+    capability that absorbs an arbitrary old name; spawn-time resolvers recognised
+    that raw alias as an existing capability (via working_capability_names /
+    working_capability_proof_status), while the proof map silently omitted the
+    alias entry so capability_need_blocked_by_proof_gate treated the missing key
+    as permission to proceed — clearing enforce mode with zero verification.
+
+    The fix (commit a81408a): when iterating capabilities, every alias in
+    ``absorbs`` that has no platform-forwarding-marker entry is registered as
+    ``"unproven"`` in the output map, so the enforcement path sees an unproven
+    claim rather than an absent (None) one and correctly blocks.
+    """
+    from app.capability_registry import working_capability_proof_status
+
+    # Build a problem_model where 'new-cap' absorbs 'old-alias'.
+    problem_model = {
+        "capabilities": [
+            {
+                "name": "new-cap",
+                "status": "working",
+                "absorbs": ["old-alias"],
+                "evidence_refs": [],
+            }
+        ]
+    }
+
+    proof_map = working_capability_proof_status(problem_model)
+
+    # The survivor name must be in the map (working cap).
+    assert "new-cap" in proof_map, (
+        "working_capability_proof_status must include the survivor capability 'new-cap'"
+    )
+
+    # The absorbed alias must also be in the map — NOT absent / None.
+    assert "old-alias" in proof_map, (
+        "working_capability_proof_status must include the absorbed alias 'old-alias' "
+        "in the output map; an absent key is treated as None → free pass at the "
+        "enforce gate (capability_need_blocked_by_proof_gate)"
+    )
+
+    # The alias must be registered as 'unproven', not 'proven' or 'partial'.
+    alias_status = proof_map["old-alias"]
+    assert alias_status == "unproven", (
+        f"absorbed alias 'old-alias' must be registered as 'unproven' in the proof map "
+        f"(got {alias_status!r}); the alias has no machine-verified proof and must "
+        "block the enforce gate, not pass through as a free-pass None entry"
+    )
+
+    # Guard: the `if alias not in out` check prevents the absorbs loop from
+    # overwriting an alias that was already mapped with richer evidence by its
+    # own capability entry processed EARLIER in the list.  Build a model where
+    # 'tracked-alias' appears FIRST (so its own evidence_refs run first), then
+    # verify the absorbs loop does not regress it.
+    problem_model_order = {
+        "capabilities": [
+            {
+                "name": "tracked-alias",
+                "status": "working",
+                "evidence_refs": [{"kind": "named_test", "proven": True}],
+            },
+            {
+                "name": "new-cap",
+                "status": "working",
+                "absorbs": ["tracked-alias"],
+                "evidence_refs": [],
+            },
+        ]
+    }
+    proof_map_order = working_capability_proof_status(problem_model_order)
+    # tracked-alias processed its own evidence_refs first; absorbs loop must not
+    # regress it to "unproven" because `if alias not in out` short-circuits.
+    assert proof_map_order.get("tracked-alias") != "unproven", (
+        "absorbs loop must not overwrite 'tracked-alias' when it was already "
+        "mapped by its own evidence_refs entry ('if alias not in out' guard honoured)"
+    )
