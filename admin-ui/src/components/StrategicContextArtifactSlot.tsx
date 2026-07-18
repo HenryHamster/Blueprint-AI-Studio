@@ -98,6 +98,11 @@ interface FreshMedia {
   /** True when a storage_uri + projectId is available to re-mint a fresh signed URL.
    *  False for baked-only media — retry() cannot produce a different URL in that case. */
   canRetry: boolean;
+  /** True when a fresh signed URL was successfully re-minted (or the retention window
+   *  explicitly lapsed) but the media element still failed to load — indicates the GCS
+   *  object was deleted (7-day lifecycle reap) rather than a stale signed URL that a
+   *  re-mint would fix. Drives the truthful "media deleted" vs "URL expired" copy. */
+  reaped: boolean;
   /** Re-mint the signed URL. Only meaningful when canRetry is true. */
   retry: () => void;
   /** Call from the media element's `onError` when the loaded URL turns out to be dead. */
@@ -234,7 +239,12 @@ function useFreshMediaUrl(
   // should not appear.  `permanentlyExpired` is set inside async callbacks
   // (never during render) so it satisfies all React 19 purity rules.
   const retryWouldHelp = !permanentlyExpired && (!loadError || outcome?.failed === true);
-  return { url, status, canRetry: canResolve && retryWouldHelp, retry, onMediaError };
+  // The object is gone (not just a stale URL) when re-minting cannot help on
+  // re-mintable media: a fresh signed URL was obtained yet the element still
+  // failed, or the backend-stamped retention window explicitly lapsed. This
+  // drives the truthful "media deleted" copy instead of "URL expired".
+  const reaped = canResolve && !retryWouldHelp;
+  return { url, status, canRetry: canResolve && retryWouldHelp, reaped, retry, onMediaError };
 }
 
 /** Pulsing "LIVE" badge for mid-run viewable previews. Renders a small overlay
@@ -362,12 +372,12 @@ function ResolvedImage({
   live?: boolean | null;
   expiresAt?: string | null;
 }) {
-  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
+  const { url, status, canRetry, reaped, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
       ? <MediaRetry label="Image preview unavailable" onRetry={retry} />
-      : <MediaExpired label="Image preview unavailable" />;
+      : <MediaExpired label="Image preview unavailable" reaped={reaped} />;
   }
   return (
     <button
@@ -409,12 +419,12 @@ function ResolvedVideo({
   live?: boolean | null;
   expiresAt?: string | null;
 }) {
-  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
+  const { url, status, canRetry, reaped, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
       ? <MediaRetry label="Video preview unavailable" onRetry={retry} />
-      : <MediaExpired label="Video preview unavailable" />;
+      : <MediaExpired label="Video preview unavailable" reaped={reaped} />;
   }
   // Bind the URL directly to <video src> (not a nested <source>) so `onError`
   // fires reliably when the signed URL is dead — matching ComputeJobsPanel.
@@ -457,12 +467,12 @@ function ResolvedPdf({
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
   // new tab so the browser renders it in its own sandboxed viewer on the storage
   // origin.
-  const { url, status, canRetry, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
+  const { url, status, canRetry, reaped, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
       ? <MediaRetry label="PDF preview unavailable" onRetry={retry} />
-      : <MediaExpired label="PDF preview unavailable" />;
+      : <MediaExpired label="PDF preview unavailable" reaped={reaped} />;
   }
   const button = (
     <button
