@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
@@ -99,6 +100,67 @@ async def sweep_due_authoritative_resident_wakeups(
     return queued
 
 
+async def sweep_pending_worker_proposal_wakeups(
+    *,
+    session_factory: async_sessionmaker[AsyncSession],
+    now: datetime | None = None,
+    batch_size: int = 32,
+) -> int:
+    """Wake the background Resident for projects with pending worker proposals.
+
+    A concrete production trigger for the ``project_change`` lane: when a bounded
+    worker has submitted a strategic-memory proposal (see
+    ``strategic_resident_worker_proposal_intake``), the owning Resident should wake
+    and reconcile it. The cursor is the monotonic count of ALL proposals for the
+    project, so it advances on every new submission (no same-timestamp stranding)
+    and, once the woken turn reconciles/drains them, an unchanged count is a
+    zero-model no-op via the coalescer's unchanged-cursor guard.
+    """
+
+    from app.models import StrategicResident as _Resident
+    from app.models import StrategicWorkerMemoryProposal as _Proposal
+
+    async with session_factory() as scan:
+        project_ids = list(
+            (
+                await scan.execute(
+                    select(_Proposal.project_id)
+                    .join(
+                        _Resident,
+                        _Resident.project_id == _Proposal.project_id,
+                    )
+                    .where(
+                        _Proposal.status == "pending",
+                        _Resident.engine_owner == "strategic_resident",
+                        _Resident.background_policy == "active",
+                    )
+                    .group_by(_Proposal.project_id)
+                    .limit(max(1, min(batch_size, 200)))
+                )
+            ).scalars()
+        )
+    queued = 0
+    for project_id in project_ids:
+        async with session_factory() as count_session:
+            total = (
+                await count_session.execute(
+                    select(func.count())
+                    .select_from(_Proposal)
+                    .where(_Proposal.project_id == project_id)
+                )
+            ).scalar_one()
+        cursor = {"worker_proposal_count": int(total)}
+        wake = await signal_project_change(
+            session_factory,
+            project_id=project_id,
+            project_change_cursor=cursor,
+            now=now,
+        )
+        if wake is not None:
+            queued += 1
+    return queued
+
+
 async def signal_project_change(
     session_factory: async_sessionmaker[AsyncSession],
     *,
@@ -140,4 +202,5 @@ __all__ = [
     "coalesce_meaningful_background_wakeup",
     "signal_project_change",
     "sweep_due_authoritative_resident_wakeups",
+    "sweep_pending_worker_proposal_wakeups",
 ]

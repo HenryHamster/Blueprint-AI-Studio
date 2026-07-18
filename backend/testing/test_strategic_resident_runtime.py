@@ -780,6 +780,63 @@ async def test_signal_project_change_wakes_only_on_an_advancing_cursor(db_sessio
 
 
 @pytest.mark.asyncio
+async def test_pending_worker_proposal_sweep_wakes_then_is_idle(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlmodel import select as _select
+
+    from app.models import StrategicWorkerMemoryProposal
+    from app.strategic_resident_wakeups import (
+        sweep_pending_worker_proposal_wakeups,
+    )
+
+    project, resident = await _authoritative_project(db_session)
+    resident.background_policy = "active"
+    db_session.add(resident)
+    db_session.add(
+        StrategicWorkerMemoryProposal(
+            project_id=project.id,
+            proposal_id="wp-sweep",
+            layer="working_strategy",
+            updates={"priorities": {"x": 1}},
+            rationale="cycle recommends",
+            evidence=[],
+            target_checkpoint_version=1,
+            target_checkpoint_hash="a" * 64,
+            status="pending",
+        )
+    )
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    # A pending proposal wakes the background lane.
+    assert await sweep_pending_worker_proposal_wakeups(session_factory=factory) == 1
+    await db_session.rollback()
+    tasks = (await db_session.execute(_select(Task))).scalars().all()
+    assert len(tasks) == 1
+
+    # Repeated sweeps while the proposal is still pending coalesce onto the same
+    # lane (bounded to one active turn plus one successor — never unbounded).
+    await sweep_pending_worker_proposal_wakeups(session_factory=factory)
+    await sweep_pending_worker_proposal_wakeups(session_factory=factory)
+    await db_session.rollback()
+    tasks = (await db_session.execute(_select(Task))).scalars().all()
+    assert len(tasks) <= 2
+
+    # Once the turn drains the proposal (no longer pending), the scan skips the
+    # project entirely — an unchanged project performs zero model calls.
+    async with factory() as drain:
+        row = (
+            await drain.execute(_select(StrategicWorkerMemoryProposal))
+        ).scalar_one()
+        row.status = "admitted"
+        drain.add(row)
+        await drain.commit()
+    assert await sweep_pending_worker_proposal_wakeups(session_factory=factory) == 0
+
+
+@pytest.mark.asyncio
 async def test_signal_project_change_is_zero_call_when_cursor_already_handled(db_session):
     from sqlalchemy.ext.asyncio import async_sessionmaker
     from sqlmodel import select as _select
