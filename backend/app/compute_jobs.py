@@ -2436,13 +2436,11 @@ async def referenced_compute_image_digests(
 
 
 _COMPUTE_JOB_BATCH_SIZE = 50
-_COMPUTE_JOB_POLL_CONCURRENCY = 10
 
 
 async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
     last_created_at = None
     last_id = None
-    _sem = asyncio.Semaphore(_COMPUTE_JOB_POLL_CONCURRENCY)
 
     while True:
         async with session_factory() as session:
@@ -2473,22 +2471,30 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         # the (irreversible) task-terminal VM kill is decided. Deliberately NOT
         # batch-prefetching the tasks: a prefetched task snapshot would be exactly
         # the stale input the kill must never be decided on.
+        #
+        # Jobs are processed SERIALLY, in the batch's (created_at, id) order — NOT
+        # concurrently. The per-job re-read only guarantees the (irreversible)
+        # task-terminal VM kill sees an intra-tick task restore if every earlier
+        # job has already fully processed (and committed) by the time a later
+        # job's kill is decided. Running the batch under asyncio.gather defeats
+        # that ordering: a later job's re-read can execute BEFORE an earlier
+        # job's poll commits the restore, killing the VM of a task that is alive
+        # again. Serial processing is the invariant the mid-tick re-read relies
+        # on; do not reintroduce concurrency here without moving the terminal-kill
+        # decision behind an ordering that preserves it.
 
         if not jobs:
             break
 
-        async def _run_job(job):
-            async with _sem:
-                try:
-                    await _process_single_compute_job(job, session_factory=session_factory)
-                except Exception as exc:
-                    logger.exception(
-                        "[COMPUTE_JOB] monitor failed for job=%s: %s",
-                        job.id,
-                        exc,
-                    )
-
-        await asyncio.gather(*[_run_job(job) for job in jobs])
+        for job in jobs:
+            try:
+                await _process_single_compute_job(job, session_factory=session_factory)
+            except Exception as exc:
+                logger.exception(
+                    "[COMPUTE_JOB] monitor failed for job=%s: %s",
+                    job.id,
+                    exc,
+                )
 
         if len(jobs) < _COMPUTE_JOB_BATCH_SIZE:
             break
