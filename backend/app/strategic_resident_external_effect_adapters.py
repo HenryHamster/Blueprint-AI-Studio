@@ -78,18 +78,8 @@ def build_external_effect(
     return None
 
 
-def external_effect_capability_is_armed(
-    capability_id: str,
-    allowlist: Any,
-) -> bool:
-    """True only if an operator has explicitly armed this capability id."""
-
-    return isinstance(allowlist, (list, tuple, set)) and capability_id in set(allowlist)
-
-
 __all__ = [
     "EXTERNAL_EFFECT_SERVICES",
     "build_external_effect",
-    "external_effect_capability_is_armed",
     "external_effect_operation_kind",
 ]

@@ -18,13 +18,11 @@ from app.resident_agent_rate_limits import (
     resident_remote_rate_key,
     resident_task_token_rate_key,
 )
-from app.shared_state import runtime_config
 from app.strategic_operation_authority import execute_fenced_db_operation
 from app.strategic_operation_external_effect import execute_external_effect_operation
 from app.strategic_resident_external_effect_adapters import (
     EXTERNAL_EFFECT_SERVICES,
     build_external_effect,
-    external_effect_capability_is_armed,
     external_effect_operation_kind,
 )
 from app.strategic_operation_authority_validation import (
@@ -280,19 +278,19 @@ async def invoke_resident_mutation(
     if spec.mode is not CapabilityMode.mutate:
         raise HTTPException(status_code=400, detail="capability is not a mutation")
     # Resolve the fenced adapter: a DB-only Project-field / target-task mutation
-    # (execute_fenced_db_operation), or an external-effect operation gated behind
-    # a default-empty operator allowlist (execute_external_effect_operation).
+    # (execute_fenced_db_operation), or an external-effect operation
+    # (execute_external_effect_operation). External effects are gated by the
+    # plan's own mechanisms — a wired adapter, evidence preconditions, authority
+    # fencing, and (for explicit-approval capabilities) approval — plus the
+    # master gate that nothing runs until an operator flips a project's engine
+    # ownership to the Resident. A capability with no wired adapter stays 501.
     target_task_id: uuid.UUID | None = None
     callback = None
     operation_kind = None
     external_effect = None
     if spec.service in EXTERNAL_EFFECT_SERVICES:
         operation_kind = external_effect_operation_kind(body.capability_id)
-        armed = external_effect_capability_is_armed(
-            body.capability_id,
-            runtime_config.get("resident_external_effect_capability_allowlist", []),
-        )
-        if operation_kind is not None and armed:
+        if operation_kind is not None:
             external_effect = build_external_effect(
                 body.capability_id,
                 project_id=binding.project_id,

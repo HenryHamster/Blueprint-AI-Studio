@@ -799,79 +799,12 @@ async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_external_effect_501_when_gate_disabled_by_default(monkeypatch):
-    """pr.create must stay proposal-only (501) until an operator arms it."""
-    project_id = uuid.uuid4()
-    turn_id = uuid.uuid4()
-    external = AsyncMock()
-    monkeypatch.setattr(
-        capability_router, "execute_external_effect_operation", external
-    )
-    # Default runtime_config: the allowlist is empty -> capability disarmed.
-    monkeypatch.setattr(
-        capability_router, "runtime_config", {}
-    )
-    invocation = _mutation_invocation(
-        project_id,
-        turn_id,
-        capability_id="pr.create",
-        parameters={"head": "feature", "base": "main", "title": "PR"},
-        evidence=_evidence_of_kinds(project_id, "branch"),
-    )
-    with pytest.raises(HTTPException) as exc:
-        await capability_router.invoke_resident_mutation(
-            None,
-            invocation,
-            session=SimpleNamespace(),
-            token=_mutation_token(project_id, turn_id),
-        )
-    assert exc.value.status_code == 501
-    external.assert_not_awaited()
+async def test_external_effect_pr_create_dispatches(monkeypatch):
+    """A wired external effect (pr.create) routes to the external executor.
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "allowlist_config",
-    [
-        {},  # key absent
-        {"resident_external_effect_capability_allowlist": None},  # None value
-        {"resident_external_effect_capability_allowlist": "pr.create"},  # bare string
-        {"resident_external_effect_capability_allowlist": {"pr.create": True}},  # dict
-        {"resident_external_effect_capability_allowlist": 1},  # int
-    ],
-)
-async def test_external_effect_gate_fails_closed_on_malformed_allowlist(
-    monkeypatch, allowlist_config
-):
-    """A malformed/None/wrong-typed allowlist must keep pr.create at 501."""
-    project_id = uuid.uuid4()
-    turn_id = uuid.uuid4()
-    external = AsyncMock()
-    monkeypatch.setattr(
-        capability_router, "execute_external_effect_operation", external
-    )
-    monkeypatch.setattr(capability_router, "runtime_config", allowlist_config)
-    invocation = _mutation_invocation(
-        project_id,
-        turn_id,
-        capability_id="pr.create",
-        parameters={"head": "feature", "base": "main", "title": "PR"},
-        evidence=_evidence_of_kinds(project_id, "branch"),
-    )
-    with pytest.raises(HTTPException) as exc:
-        await capability_router.invoke_resident_mutation(
-            None,
-            invocation,
-            session=SimpleNamespace(),
-            token=_mutation_token(project_id, turn_id),
-        )
-    assert exc.value.status_code == 501
-    external.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_external_effect_dispatches_when_capability_armed(monkeypatch):
-    """When an operator arms pr.create, /mutate routes to the external executor."""
+    No arming gate: usability is governed by the plan's own gates (a wired
+    adapter + evidence + authority + the operator engine-ownership flip).
+    """
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     receipt = SimpleNamespace(
@@ -880,11 +813,6 @@ async def test_external_effect_dispatches_when_capability_armed(monkeypatch):
     external = AsyncMock(return_value=receipt)
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
-    )
-    monkeypatch.setattr(
-        capability_router,
-        "runtime_config",
-        {"resident_external_effect_capability_allowlist": ["pr.create"]},
     )
     invocation = _mutation_invocation(
         project_id,
@@ -909,18 +837,13 @@ async def test_external_effect_dispatches_when_capability_armed(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_external_effect_critical_capability_stays_501_even_if_listed(monkeypatch):
-    """pr.merge has no wired adapter, so it 501s even if named in the allowlist."""
+async def test_external_effect_unwired_capability_stays_501(monkeypatch):
+    """pr.merge has no wired adapter yet, so it stays proposal-only (501)."""
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     external = AsyncMock()
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
-    )
-    monkeypatch.setattr(
-        capability_router,
-        "runtime_config",
-        {"resident_external_effect_capability_allowlist": ["pr.merge"]},
     )
     invocation = _mutation_invocation(
         project_id,

@@ -1038,13 +1038,6 @@ runtime_config: Dict = {
     # only read-only (non-merging) task types are accepted.
     # Set via /api/admin/settings.
     "cloud_run_task_type_allowlist": [],
-    # Per-capability arming for Strategic Resident EXTERNAL-EFFECT mutations
-    # (pr.create/pr.merge/deployment.*/qualification.run/audit.run). Default
-    # EMPTY, so every external-effect capability stays proposal-only (HTTP 501)
-    # until an operator explicitly adds its capability_id here — the two-phase
-    # external-effect executor ships completely inert. Read by the /mutate router
-    # (resident_external_effect_allowlist); set via /api/admin/settings.
-    "resident_external_effect_capability_allowlist": [],
     # Operator-approved, audited Alembic migration-divergence exemptions. Each
     # entry is a dict carrying the AuthorizedDivergence match fields (revision,
     # parent_revision, deployed_identity, integration_identity, created_table,
@@ -2463,23 +2456,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set(
                             "cloud_run_task_type_allowlist",
                             sorted({str(t).strip() for t in raw_allow if str(t).strip()}),
-                        )
-                if "resident_external_effect_capability_allowlist" in config_json:
-                    # Per-capability arming for external-effect Resident mutations.
-                    # Normalize to a sorted, de-duplicated list of capability-id
-                    # strings so every instance agrees and the arming survives
-                    # restarts. Default/empty keeps every external effect at 501.
-                    raw_external = config_json[
-                        "resident_external_effect_capability_allowlist"
-                    ]
-                    if isinstance(raw_external, str):
-                        raw_external = raw_external.split(",")
-                    if isinstance(raw_external, (list, tuple, set)):
-                        _set(
-                            "resident_external_effect_capability_allowlist",
-                            sorted(
-                                {str(t).strip() for t in raw_external if str(t).strip()}
-                            ),
                         )
                 if "migration_divergence_exemptions" in config_json:
                     # Persisted operator-approved Alembic migration-divergence
