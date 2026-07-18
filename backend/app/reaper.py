@@ -322,6 +322,9 @@ from app.reaper_sweeps import (
 from app.acceptance_gate import backfill_acceptance_verdicts
 from app.strategic_resident_shadow import sweep_shadow_resident_turns
 from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
+from app.strategic_resident_project_change_sweep import (
+    sweep_durable_project_change_wakeups,
+)
 from app.strategic_resident_wakeups import (
     sweep_due_authoritative_resident_wakeups,
     sweep_pending_worker_proposal_wakeups,
@@ -2821,6 +2824,19 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Resident worker-proposal wakeup sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                try:
+                    await sweep_durable_project_change_wakeups(
+                        session_factory=AsyncSessionLocal,
+                        now=now,
+                        batch_size=32,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Resident durable project-change wakeup sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

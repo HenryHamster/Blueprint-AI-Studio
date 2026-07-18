@@ -1202,3 +1202,41 @@ describe('REVIEW_GATED_TASK_TYPES contract', () => {
     expect([...REVIEW_GATED_TASK_TYPES].sort()).toEqual(backendTypes.sort());
   });
 });
+
+describe('Resident managed Task source revisions', () => {
+  it('surfaces every exact immutable ArtifactRef grant and retrieval path', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{ type: 'create', prompt: 'Implement the shared revision.' }],
+      context: {
+        _resident_managed_task: {
+          artifact_refs: [
+            {
+              artifact_ref_id: '11111111-1111-1111-1111-111111111111',
+              kind: 'notes',
+              revision: 7,
+              checksum: 'a'.repeat(64),
+              retrieval: {
+                href: '/api/agent/resident-turn/artifact?artifact_ref_id=11111111-1111-1111-1111-111111111111',
+              },
+            },
+          ],
+          evidence: [
+            {
+              kind: 'task',
+              source_id: '22222222-2222-2222-2222-222222222222',
+              revision: 'task-revision-3',
+              checksum: 'b'.repeat(64),
+              inspected_at: '2026-07-18T00:00:00Z',
+            },
+          ],
+        },
+      },
+    });
+    expect(prefix).toContain('## Resident Source Revisions');
+    expect(prefix).toContain('revision 7');
+    expect(prefix).toContain('a'.repeat(64));
+    expect(prefix).toContain('/api/agent/resident-turn/artifact?artifact_ref_id=');
+    expect(prefix).toContain('evidence task 22222222-2222-2222-2222-222222222222');
+    expect(prefix).toContain('task-revision-3');
+  });
+});

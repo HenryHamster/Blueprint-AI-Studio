@@ -122,6 +122,8 @@ def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
     }
     assert capability_for("task.inspect").service == "resident_task_inspection"
     assert next(item for item in catalog if item["id"] == "task.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "runner.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "runner.list")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "propose_only"
     assert next(item for item in catalog if item["id"] == "pr.merge")["availability"] == "propose_only"
 
@@ -439,7 +441,19 @@ async def test_task_bound_capability_route_invokes_only_implemented_inspection(
     monkeypatch.setattr(
         capability_router,
         "load_live_resident_agent_task_locked",
-        AsyncMock(return_value=SimpleNamespace(project_id=project_id, context={})),
+        AsyncMock(
+            return_value=SimpleNamespace(
+                id=turn_id,
+                project_id=project_id,
+                first_payload={"authority_generation": 3},
+                context={"_resident_turn_context_hash": "ctx-route"},
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        capability_router,
+        "build_inspection_receipt",
+        MagicMock(return_value=None),
     )
     evidence = ResidentTaskEvidence(
         kind="task",
@@ -506,7 +520,12 @@ async def test_capability_route_enforces_durable_unique_budget_and_retry(
 ):
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
-    turn = SimpleNamespace(project_id=project_id, context={})
+    turn = SimpleNamespace(
+        id=turn_id,
+        project_id=project_id,
+        first_payload={"authority_generation": 3},
+        context={"_resident_turn_context_hash": "ctx-budget"},
+    )
     load = AsyncMock(return_value=turn)
     monkeypatch.setattr(
         capability_router,
@@ -524,6 +543,27 @@ async def test_capability_route_enforces_durable_unique_budget_and_retry(
     )
     inspect = AsyncMock(return_value=evidence)
     monkeypatch.setattr(capability_router, "inspect_project_task", inspect)
+    monkeypatch.setattr(
+        capability_router,
+        "build_inspection_receipt",
+        MagicMock(return_value=None),
+    )
+    canonical_replay = AsyncMock(
+        return_value={
+            "kind": "task",
+            "project_id": str(project_id),
+            "source_id": "task",
+            "revision": "task:v1",
+            "checksum": "a" * 64,
+            "inspected_at": datetime.now(timezone.utc).isoformat(),
+            "data": {},
+        }
+    )
+    monkeypatch.setattr(
+        capability_router,
+        "_canonical_inspection_replay",
+        canonical_replay,
+    )
     token = {
         "sub": str(turn_id),
         "project_id": str(project_id),
@@ -553,7 +593,8 @@ async def test_capability_route_enforces_durable_unique_budget_and_retry(
     with pytest.raises(HTTPException) as exhausted:
         await invoke(targets[8])
     assert exhausted.value.status_code == 429
-    assert inspect.await_count == 9
+    assert inspect.await_count == 8
+    canonical_replay.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -584,6 +625,42 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
         )
     assert invalid.value.status_code == 400
     load.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_inspection_requires_frozen_context_before_budget_or_adapter(
+    db_session, monkeypatch
+):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    turn = SimpleNamespace(id=turn_id, project_id=project_id, context={})
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        AsyncMock(return_value=turn),
+    )
+    inspect = AsyncMock()
+    monkeypatch.setattr(capability_router, "inspect_project_task", inspect)
+
+    with pytest.raises(HTTPException) as missing_context:
+        await capability_router.invoke_resident_capability(
+            None,
+            ResidentCapabilityRequest(
+                capability_id="task.inspect",
+                parameters={"task_id": str(uuid.uuid4())},
+            ),
+            db_session,
+            {
+                "sub": str(turn_id),
+                "project_id": str(project_id),
+                "vm_instance_id": "vm-1",
+                "task_type": "strategic_resident_turn",
+                "claim_nonce": "nonce-1",
+            },
+        )
+    assert missing_context.value.status_code == 409
+    assert "_strategic_resident_capability_requests" not in turn.context
+    inspect.assert_not_awaited()
 
 
 def test_inspection_receipt_maps_kind_and_is_trusted():
@@ -659,7 +736,8 @@ def test_inspection_receipt_requires_context_hash_and_mapped_capability():
     turn_task = SimpleNamespace(
         id=uuid.uuid4(), project_id=uuid.uuid4(), first_payload={}, context={}
     )
-    # No persisted context_hash -> no receipt (inspection still returns evidence).
+    # The low-level builder cannot bind a receipt without a persisted context
+    # hash. The route rejects this state before consuming budget or inspecting.
     assert (
         build_inspection_receipt(
             capability_id="task.inspect",

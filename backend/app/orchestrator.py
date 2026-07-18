@@ -909,6 +909,7 @@ async def _filter_project_resource_dispatch_eligible(
     project_cache: dict[uuid.UUID, Project | None] = {}
     spend_cache: dict[uuid.UUID, tuple[float, float, int]] = {}
     filtered: list[uuid.UUID] = []
+    project_pause_mutated = False
 
     for task_id in eligible_ids:
         task = task_by_id.get(task_id)
@@ -969,26 +970,43 @@ async def _filter_project_resource_dispatch_eligible(
             # project until an operator manually unpauses.  Guard on
             # project.paused to avoid re-firing every cycle.
             _project = project_cache.get(_pid)
-            if _project is not None and resolve_project_pause_on_ceiling_exceeded(_project):
-                if not _project.paused:
-                    _project.paused = True
-                    session.add(_project)
-                    logger.info(
-                        "[ORCHESTRATOR] Hard-pausing project %s — "
-                        "spend ceiling exceeded and pause_on_ceiling_exceeded is set",
+            if (
+                _project is not None
+                and resolve_project_pause_on_ceiling_exceeded(_project)
+                and not _project.paused
+            ):
+                _project.paused = True
+                project_pause_mutated = True
+                session.add(_project)
+                # Project pause is the operator-visible source of truth.
+                # Keep an authoritative Resident's background policy in
+                # the same transaction so the spend guard cannot leave
+                # autonomous Resident wakeups running behind a paused UI.
+                from app.strategic_resident_wakeups import (
+                    sync_resident_background_policy,
+                )
+
+                await sync_resident_background_policy(
+                    session,
+                    project_id=_project.id,
+                    paused=True,
+                )
+                logger.info(
+                    "[ORCHESTRATOR] Hard-pausing project %s — "
+                    "spend ceiling exceeded and pause_on_ceiling_exceeded is set",
+                    _pid,
+                )
+                try:
+                    await broadcast_to_project(
+                        str(_pid),
+                        "project_spend_ceiling_exceeded",
+                        {"project_id": str(_pid)},
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Failed to broadcast spend_ceiling_exceeded for %s",
                         _pid,
                     )
-                    try:
-                        await broadcast_to_project(
-                            str(_pid),
-                            "project_spend_ceiling_exceeded",
-                            {"project_id": str(_pid)},
-                        )
-                    except Exception:
-                        logger.exception(
-                            "[ORCHESTRATOR] Failed to broadcast spend_ceiling_exceeded for %s",
-                            _pid,
-                        )
     _prev = _shared_state.project_ceiling_deferred_ids
     for _pid in _current_ceiling_deferred - _prev:
         try:
@@ -1032,7 +1050,10 @@ async def _filter_project_resource_dispatch_eligible(
             )
     _shared_state.monthly_budget_deferred_project_ids = _current_monthly_deferred
 
-    if session.dirty:
+    # A SELECT in Resident policy sync can autoflush the Project UPDATE and
+    # empty session.dirty before this transaction boundary. Retain the explicit
+    # mutation bit so projects without a Resident are still durably paused.
+    if session.dirty or project_pause_mutated:
         await session.commit()
     return filtered
 

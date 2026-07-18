@@ -465,6 +465,15 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    resident = await initialize_strategic_resident(
+        db_session,
+        project.id,
+        locked_project=project,
+    )
+    await db_session.commit()
+
     task = make_task(
         project_id=project.id,
         status=TaskStatus.QUEUED,
@@ -511,6 +520,8 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
         "project must be hard-paused when pause_on_ceiling_exceeded=True "
         "and spend ceiling is breached"
     )
+    await db_session.refresh(resident)
+    assert resident.background_policy == "paused"
 
     # broadcast_to_project must have been called with project_spend_ceiling_exceeded.
     broadcast_calls = [
@@ -521,6 +532,60 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
     assert "project_spend_ceiling_exceeded" in broadcast_calls, (
         f"expected project_spend_ceiling_exceeded broadcast; calls={broadcast_calls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_commits_without_resident(db_session, mocker):
+    """Resident lookup autoflush must not make the Project pause look clean."""
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    _shared_state.project_ceiling_deferred_ids = set()
+    project = make_project(
+        name="hard-pause-no-resident",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "hard-pause without Resident"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        AsyncMock(),
+    )
+    assert task.id not in result
+    await db_session.rollback()
+    await db_session.refresh(project)
+    assert project.paused is True
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,10 @@ from app.strategic_operation_authority_validation import (
 )
 from app.strategic_operation_result_bounds import bounded_result
 from app.time_utils import _utcnow
+from app.strategic_resident_managed_task import (
+    ManagedTaskCreateWriter,
+    materialize_managed_task,
+)
 
 
 async def _terminal_receipt_fast_path(
@@ -243,14 +247,20 @@ async def execute_fenced_db_operation(
 
         writer = FencedMutationWriter({})
         task_writer = FencedTaskWriter({}) if target_task is not None else None
+        managed_task_writer = ManagedTaskCreateWriter(
+            receipt.id,
+            authorized_capability=receipt.capability,
+        )
         context = FencedOperationContext(
             project_id=project.id,
             turn_task_id=turn_task.id,
             receipt_id=receipt.id,
+            operation_id=receipt.operation_id,
             authority_generation=int(resident.authority_generation),
             request_payload=_freeze_json(request_payload),
             observed_revisions=MappingProxyType(deepcopy(observed)),
             writer=writer,
+            managed_task_writer=managed_task_writer,
             task_writer=task_writer,
         )
         authority_snapshot = (
@@ -394,9 +404,24 @@ async def execute_fenced_db_operation(
                 expected_revisions=request.expected_revisions,
             )
             session.add(project)
+            managed_task_plan = managed_task_writer.validated_plan()
             if target_task is not None and task_writer is not None:
-                task_writer._apply(target_task)
-                session.add(target_task)
+                if task_writer.has_changes():
+                    task_writer._apply(target_task)
+                    session.add(target_task)
+                elif managed_task_plan is None:
+                    # Preserve the existing fail-closed contract for ordinary
+                    # target-task mutations. Managed debug creation is the one
+                    # CAS-only target lock: it reads a stable source Task but
+                    # deliberately does not mutate it.
+                    task_writer._apply(target_task)
+            if managed_task_plan is not None:
+                await materialize_managed_task(
+                    session,
+                    plan=managed_task_plan,
+                    turn_task=turn_task,
+                    receipt=receipt,
+                )
             await session.flush()
         except BaseException:
             session.sync_session.expunge_all()

@@ -9,7 +9,7 @@ from sqlmodel import select
 
 from app.artifact_refs import resident_artifact_ref_grants
 from app.database import get_session
-from app.models import ArtifactRef, TaskStatus
+from app.models import ArtifactRef, Task, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.resident_agent_rate_limits import (
     resident_remote_rate_key,
@@ -24,6 +24,8 @@ from app.strategic_resident_agent_binding import (
     ResidentAgentTaskNotFound,
     load_live_resident_agent_task_locked,
 )
+from app.strategic_resident_managed_task import MANAGED_TASK_CONTEXT_KEY
+from app.strategic_resident_models import StrategicOperationReceipt
 
 
 router = APIRouter(prefix="/api/agent/resident-turn", tags=["agent"])
@@ -64,6 +66,70 @@ def _agent_binding(token: dict[str, Any]) -> ResidentAgentBinding:
         ) from None
 
 
+async def _load_artifact_bound_task(
+    session: AsyncSession,
+    binding: ResidentAgentBinding,
+) -> Task:
+    """Load either the live Resident turn or its receipt-bound managed Task."""
+
+    if binding.task_type == "strategic_resident_turn":
+        return await load_live_resident_agent_task_locked(
+            session,
+            binding,
+            allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
+        )
+    task = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.id == binding.task_id,
+                Task.project_id == binding.project_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise ResidentAgentTaskNotFound("managed Task not found")
+    payload = task.first_payload or {}
+    marker = (task.context or {}).get(MANAGED_TASK_CONTEXT_KEY)
+    if (
+        task.status != TaskStatus.IN_PROGRESS
+        or task.created_by != "STRATEGIC_AGENT"
+        or task.parent_task_id is not None
+        or not binding.vm_instance_id
+        or task.vm_instance_id != binding.vm_instance_id
+        or payload.get("type") != binding.task_type
+        or binding.task_type not in {"create", "debug"}
+        or not isinstance(marker, dict)
+        or marker.get("capability_id")
+        not in {"task.code_change.create", "task.debug.create"}
+    ):
+        raise ResidentAgentBindingError("receipt-bound managed Task scope required")
+    try:
+        receipt_id = uuid.UUID(str(marker.get("receipt_id")))
+        source_turn_id = uuid.UUID(str(marker.get("source_turn_task_id")))
+    except (TypeError, ValueError):
+        raise ResidentAgentBindingError("managed Task receipt lineage is invalid") from None
+    receipt = (
+        await session.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.id == receipt_id,
+                StrategicOperationReceipt.project_id == task.project_id,
+                StrategicOperationReceipt.turn_task_id == source_turn_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        receipt is None
+        or receipt.status not in {"applied", "reconciled"}
+        or receipt.operation_id != marker.get("operation_id")
+        or receipt.capability != marker.get("capability_id")
+        or receipt.authority_generation != marker.get("authority_generation")
+    ):
+        raise ResidentAgentBindingError("managed Task receipt authority is invalid")
+    return task
+
+
 @router.get("/artifact")
 @limiter.limit("600/minute", key_func=resident_remote_rate_key)
 @limiter.limit("60/minute", key_func=resident_task_token_rate_key)
@@ -77,11 +143,7 @@ async def get_resident_turn_artifact(
 
     binding = _agent_binding(token)
     try:
-        task = await load_live_resident_agent_task_locked(
-            session,
-            binding,
-            allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
-        )
+        task = await _load_artifact_bound_task(session, binding)
     except ResidentAgentTaskNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ResidentAgentAuthorityError as exc:

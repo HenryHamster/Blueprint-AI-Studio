@@ -69,6 +69,7 @@ from app.strategic_resident_inspection_receipt import (
     TURN_CONTEXT_HASH_KEY,
     build_inspection_receipt,
     citable_inspection_evidence,
+    inspection_operation_id,
 )
 from app.strategic_resident_models import StrategicOperationReceipt
 from app.strategic_resident_operation_approval import (
@@ -82,10 +83,20 @@ from app.strategic_resident_project_field_mutation import (
     project_field_mutation_callback,
     project_field_mutation_operation_kind,
 )
+from app.strategic_resident_runner_inspection import (
+    ResidentRunnerNotFound,
+    inspect_project_runner,
+    inspect_project_runners,
+)
 from app.strategic_resident_task_mutation import (
     TASK_MUTATION_SERVICE,
     task_mutation_callback,
     task_mutation_operation_kind,
+)
+from app.strategic_resident_managed_task import (
+    MANAGED_TASK_CREATE_SERVICE,
+    managed_task_create_callback,
+    managed_task_create_operation_kind,
 )
 from app.strategic_resident_task_lifecycle import (
     build_task_lifecycle_effect,
@@ -132,6 +143,56 @@ def _build_receipt_evidence_set(
             if key is not None:
                 entries.add(key)
     return frozenset(entries)
+
+
+async def _canonical_inspection_replay(
+    session: AsyncSession,
+    *,
+    task: Task,
+    capability_id: str,
+    request_hash: str,
+    context_hash: str,
+) -> dict[str, Any]:
+    """Load the one receipt-backed snapshot for an idempotent inspection retry."""
+
+    operation_kind = INSPECTION_CAPABILITY_KINDS.get(capability_id)
+    receipt = (
+        await session.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.project_id == task.project_id,
+                StrategicOperationReceipt.turn_task_id == task.id,
+                StrategicOperationReceipt.operation_id
+                == inspection_operation_id(task.id, request_hash),
+            )
+        )
+    ).scalar_one_or_none()
+    if (
+        receipt is None
+        or not context_hash
+        or receipt.capability != capability_id
+        or receipt.operation_kind != operation_kind
+        or receipt.request_hash != request_hash
+        or receipt.status not in SUCCESSFUL_INSPECTION_STATUSES
+        or str((receipt.expected_revisions or {}).get("context_hash") or "")
+        != context_hash
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="canonical inspection receipt is unavailable or inconsistent",
+        )
+    body = receipt.receipt if isinstance(receipt.receipt, Mapping) else {}
+    structured = body.get("structured_result")
+    evidence = structured.get("evidence") if isinstance(structured, Mapping) else None
+    if (
+        not isinstance(evidence, list)
+        or len(evidence) != 1
+        or not isinstance(evidence[0], Mapping)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="canonical inspection receipt evidence is invalid",
+        )
+    return dict(evidence[0])
 
 
 async def _check_evidence_refs_against_receipts(
@@ -235,12 +296,21 @@ def _completion_projection(
                 "receipt_ids": [receipt_id],
             }
         )
+    operation_summary = "Server-authorized Resident operation."
+    receipt_body = getattr(receipt, "receipt", None)
+    if isinstance(receipt_body, Mapping):
+        structured = receipt_body.get("structured_result")
+        operations = structured.get("operations") if isinstance(structured, Mapping) else None
+        first_operation = operations[0] if isinstance(operations, list) and operations else None
+        candidate = first_operation.get("summary") if isinstance(first_operation, Mapping) else None
+        if isinstance(candidate, str) and 0 < len(candidate) <= 4_000:
+            operation_summary = candidate
     return {
         "operation": {
             "operation_id": operation_id,
             "capability": capability_id,
             "status": operation_status,
-            "summary": "Server-authorized Resident operation.",
+            "summary": operation_summary,
         },
         "receipt": {
             "operation_id": operation_id,
@@ -357,10 +427,10 @@ async def invoke_resident_capability(
             status_code=501,
             detail="capability is proposal-only until a bounded adapter exists",
         )
-    if spec.service != "resident_task_inspection":
+    if spec.service not in {"resident_task_inspection", "admin_runners"}:
         raise HTTPException(
             status_code=501,
-            detail="capability is declared but has no task-bound adapter",
+            detail="capability is declared but has no bounded adapter",
         )
 
     try:
@@ -378,9 +448,16 @@ async def invoke_resident_capability(
     except ResidentAgentBindingError as exc:
         await session.rollback()
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    target_task_id = uuid.UUID(parameters["task_id"])
     fingerprint = _request_fingerprint(body.capability_id, parameters)
     try:
+        context_hash = str(
+            (task.context or {}).get(TURN_CONTEXT_HASH_KEY) or ""
+        )
+        if not context_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="Resident turn context is not frozen for inspection",
+            )
         request_registered = _register_capability_request(
             task,
             fingerprint=fingerprint,
@@ -390,17 +467,41 @@ async def invoke_resident_capability(
             # inspecting the turn Task itself, so returned revision evidence is
             # not stale immediately after commit.
             await session.flush()
-        if body.capability_id == "task.lineage.inspect":
+        else:
+            evidence_json = await _canonical_inspection_replay(
+                session,
+                task=task,
+                capability_id=body.capability_id,
+                request_hash=fingerprint,
+                context_hash=context_hash,
+            )
+            await session.commit()
+            return {
+                "capability_id": body.capability_id,
+                "evidence": evidence_json,
+            }
+        if body.capability_id == "runner.inspect":
+            evidence = await inspect_project_runner(
+                session,
+                project_id=task.project_id,
+                runner_id=str(parameters["runner_id"]),
+            )
+        elif body.capability_id == "runner.list":
+            evidence = await inspect_project_runners(
+                session,
+                project_id=task.project_id,
+            )
+        elif body.capability_id == "task.lineage.inspect":
             evidence = await inspect_project_task_lineage(
                 session,
                 project_id=task.project_id,
-                task_id=target_task_id,
+                task_id=uuid.UUID(parameters["task_id"]),
             )
         else:
             evidence = await inspect_project_task(
                 session,
                 project_id=task.project_id,
-                task_id=target_task_id,
+                task_id=uuid.UUID(parameters["task_id"]),
                 kind=_TASK_INSPECTION_KINDS[body.capability_id],
             )
         evidence_json = evidence.model_dump(mode="json")
@@ -412,14 +513,14 @@ async def invoke_resident_capability(
             receipt = build_inspection_receipt(
                 capability_id=body.capability_id,
                 turn_task=task,
-                context_hash=str((task.context or {}).get(TURN_CONTEXT_HASH_KEY) or ""),
+                context_hash=context_hash,
                 request_hash=fingerprint,
                 evidence_json=evidence_json,
             )
             if receipt is not None:
                 session.add(receipt)
         await session.commit()
-    except ResidentTaskNotFound as exc:
+    except (ResidentTaskNotFound, ResidentRunnerNotFound) as exc:
         await session.rollback()
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except HTTPException:
@@ -519,6 +620,11 @@ async def invoke_resident_mutation(
                     detail="task mutation requires a task_id parameter",
                 )
             target_task_id = uuid.UUID(str(raw_target))
+    elif spec.service == MANAGED_TASK_CREATE_SERVICE:
+        callback = managed_task_create_callback(body.capability_id)
+        operation_kind = managed_task_create_operation_kind(body.capability_id)
+        if body.capability_id == "task.debug.create":
+            target_task_id = uuid.UUID(str(body.parameters["task_id"]))
     if operation_kind is None or (callback is None and external_effect is None):
         raise HTTPException(
             status_code=501,
@@ -553,6 +659,11 @@ async def invoke_resident_mutation(
         except OperatorApprovalRequired as exc:
             await session.rollback()
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+    fenced_payload = dict(body.parameters)
+    if spec.service == MANAGED_TASK_CREATE_SERVICE:
+        fenced_payload["_source_evidence"] = [
+            item.model_dump(mode="json") for item in body.evidence
+        ]
     fenced_request = FencedOperationRequest(
         project_id=binding.project_id,
         turn_task_id=binding.task_id,
@@ -562,7 +673,7 @@ async def invoke_resident_mutation(
         capability=body.capability_id,
         risk=spec.risk.value,
         expected_revisions=dict(body.expected_revisions),
-        request_payload=dict(body.parameters),
+        request_payload=fenced_payload,
         target_task_id=target_task_id,
     )
     try:

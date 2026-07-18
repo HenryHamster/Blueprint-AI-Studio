@@ -3615,6 +3615,42 @@ class TestAutonomousMode:
         assert project.paused is False
 
     @pytest.mark.asyncio
+    async def test_project_pause_syncs_resident_policy_and_restores_deadline(
+        self, client: AsyncClient, db_session
+    ):
+        from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+        project = await _make_project(db_session)
+        resident = await initialize_strategic_resident(
+            db_session,
+            project.id,
+            locked_project=project,
+        )
+        deadline = _utcnow() + timedelta(hours=2)
+        resident.scheduling_state = {"deadline_at": deadline.isoformat()}
+        resident.next_wakeup_at = deadline
+        db_session.add(resident)
+        await db_session.commit()
+
+        paused = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": True},
+        )
+        assert paused.status_code == 200
+        await db_session.refresh(resident)
+        assert resident.background_policy == "paused"
+        assert resident.next_wakeup_at is None
+
+        resumed = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": False},
+        )
+        assert resumed.status_code == 200
+        await db_session.refresh(resident)
+        assert resident.background_policy == "active"
+        assert resident.next_wakeup_at == deadline
+
+    @pytest.mark.asyncio
     async def test_pause_project_missing_field_returns_400(
         self, client: AsyncClient, db_session
     ):

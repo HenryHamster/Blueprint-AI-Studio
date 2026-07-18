@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -38,6 +39,9 @@ INPUT_FROZEN_CONTEXT_KEY = "_resident_input_frozen"
 
 Lane = Literal["interactive", "background"]
 
+_MONOTONIC_PROJECT_CURSOR_KEYS = frozenset(
+    {"strategic_cycle_terminal", "qualification_verdict"}
+)
 _TERMINAL_TASK_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
@@ -104,12 +108,57 @@ def _merge_project_change_cursor(
                 merged[key] = max(prior, value) if isinstance(prior, int) else value
             elif isinstance(value, str):
                 if len(value) <= 160:
-                    # String cursors are opaque revisions/hashes. The incoming
-                    # trigger is newer than the stored successor input.
-                    merged[key] = value
+                    prior = merged.get(key)
+                    if key in _MONOTONIC_PROJECT_CURSOR_KEYS and isinstance(
+                        prior, str
+                    ):
+                        merged[key] = _newer_durable_cursor(prior, value)
+                    else:
+                        # Other string cursors are opaque revisions/hashes. Their
+                        # producers serialize arrival order under the Resident lock.
+                        merged[key] = value
             else:
                 merged[key] = None
     return dict(sorted(merged.items())[:16])
+
+
+def _durable_cursor_order(value: str) -> tuple[int, str] | None:
+    """Parse current v2 or legacy ISO durable-event cursors for comparison."""
+
+    if value.startswith("v2:"):
+        parts = value.split(":", 3)
+        if len(parts) == 4 and parts[1].isdigit():
+            return int(parts[1]), f"{parts[2]}:{parts[3]}"
+        return None
+    # Legacy cursor: ``<ISO timestamp>:<row id>:<outcome>``. Naive DB timestamps
+    # use either seconds precision (19 chars) or microseconds (26 chars).
+    timestamp_size = 26 if len(value) > 19 and value[19] == "." else 19
+    if len(value) <= timestamp_size or value[timestamp_size] != ":":
+        return None
+    try:
+        observed_at = datetime.fromisoformat(value[:timestamp_size])
+    except ValueError:
+        return None
+    if observed_at.tzinfo is not None:
+        observed_at = observed_at.astimezone(timezone.utc).replace(tzinfo=None)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+    elapsed = observed_at - epoch
+    micros = (
+        elapsed.days * 86_400_000_000
+        + elapsed.seconds * 1_000_000
+        + elapsed.microseconds
+    )
+    return micros, value[timestamp_size + 1 :]
+
+
+def _newer_durable_cursor(current: str, incoming: str) -> str:
+    current_order = _durable_cursor_order(current)
+    incoming_order = _durable_cursor_order(incoming)
+    if incoming_order is None:
+        return current
+    if current_order is None:
+        return incoming
+    return incoming if incoming_order > current_order else current
 
 
 def _bounded_public_value(

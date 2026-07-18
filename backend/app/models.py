@@ -65,6 +65,9 @@ from app.strategic_resident_models import (  # noqa: F401
     StrategicResidentCheckpoint,
     StrategicWorkerMemoryProposal,
 )
+from app.strategic_resident_sweep_models import (  # noqa: F401
+    StrategicResidentSweepState,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -3345,6 +3348,26 @@ class StrategicCycle(SQLModel, table=True):
             "project_id",
             "outcome",
             "phase1_started_at",
+        ),
+        # Exact latest-terminal Resident wakeup lookup. ``outcome`` is a
+        # multi-value predicate, so placing it before updated_at would force a
+        # merge/sort across outcome ranges instead of serving ORDER BY + LIMIT
+        # directly from this partial index.
+        Index(
+            "ix_strategiccycle_project_terminal_updated",
+            "project_id",
+            "updated_at",
+            "id",
+            postgresql_where=text(
+                "outcome IN ('completed','failed_phase1','failed_phase2',"
+                "'failed_phase2_spawn','stalled_phase1','stalled_phase2',"
+                "'thinker_artifacts_missing')"
+            ),
+            sqlite_where=text(
+                "outcome IN ('completed','failed_phase1','failed_phase2',"
+                "'failed_phase2_spawn','stalled_phase1','stalled_phase2',"
+                "'thinker_artifacts_missing')"
+            ),
         ),
         # Covers the stalled-cycle reaper cross-project scan:
         # WHERE outcome IN (...) ORDER BY phase1_started_at LIMIT N.

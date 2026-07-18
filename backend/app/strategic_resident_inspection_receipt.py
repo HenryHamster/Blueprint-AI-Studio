@@ -23,6 +23,12 @@ TURN_CONTEXT_HASH_KEY = "_resident_turn_context_hash"
 _MAX_OPERATION_ID = 128
 
 
+def inspection_operation_id(turn_task_id: object, request_hash: str) -> str:
+    """Return the deterministic identity for one turn-bound inspection."""
+
+    return f"inspect:{turn_task_id}:{request_hash}"[:_MAX_OPERATION_ID]
+
+
 def citable_inspection_evidence(evidence_json: dict[str, Any]) -> dict[str, Any]:
     """Return mutation-ready evidence in the trust taxonomy.
 
@@ -74,7 +80,7 @@ def build_inspection_receipt(
     citable = citable_inspection_evidence(evidence_json)
     # Deterministic per (turn, capability, params) so the ledger's one-write-per
     # -fingerprint guarantee keeps the (project_id, operation_id) unique.
-    operation_id = f"inspect:{turn_task.id}:{request_hash}"[:_MAX_OPERATION_ID]
+    operation_id = inspection_operation_id(turn_task.id, request_hash)
     return StrategicOperationReceipt(
         project_id=turn_task.project_id,
         turn_task_id=turn_task.id,
@@ -99,4 +105,5 @@ __all__ = [
     "TURN_CONTEXT_HASH_KEY",
     "build_inspection_receipt",
     "citable_inspection_evidence",
+    "inspection_operation_id",
 ]
