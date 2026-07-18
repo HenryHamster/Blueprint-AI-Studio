@@ -788,12 +788,12 @@ async def test_mutation_route_501_for_capability_without_fenced_adapter(monkeypa
     turn_id = uuid.uuid4()
     executor = AsyncMock()
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
-    # task.reprioritize is a real mutate capability but has no project-field adapter.
+    # task.park is a real mutate capability but has no fenced adapter yet.
     invocation = _mutation_invocation(
         project_id,
         turn_id,
-        capability_id="task.reprioritize",
-        parameters={"task_id": str(uuid.uuid4()), "priority": 5},
+        capability_id="task.park",
+        parameters={"task_id": str(uuid.uuid4()), "reason": "held for review"},
     )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(

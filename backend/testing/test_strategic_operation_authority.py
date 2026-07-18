@@ -10,6 +10,7 @@ import uuid
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -1354,3 +1355,228 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
     assert len(receipts) == 1
+
+
+def _reprioritize_invocation(project, turn_task, target_task, priority, *, op="rp-1"):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "task.reprioritize",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"task_id": str(target_task.id), "priority": priority},
+            "operation_id": op,
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+                "target_task_updated_at": (
+                    target_task.updated_at.isoformat()
+                    if target_task.updated_at
+                    else None
+                ),
+            },
+            "evidence": (
+                CapabilityEvidenceRef(
+                    kind="task",
+                    project_id=project.id,
+                    source_id=str(target_task.id),
+                    revision="task:v1",
+                    checksum="d" * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                ),
+            ),
+        }
+    )
+
+
+def _turn_token(project, turn_task):
+    return {
+        "sub": str(turn_task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_endpoint_mutates_target_task_with_cas(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(project_id=project.id, title="worker", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _reprioritize_invocation(project, turn_task, target, 90),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] == "applied"
+    await authority_db.refresh(target)
+    assert target.priority == 90
+
+    receipt = (
+        await authority_db.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.operation_id == "rp-1"
+            )
+        )
+    ).scalar_one()
+    assert receipt.operation_kind == "reprioritize_task"
+    assert receipt.capability == "task.reprioritize"
+    assert receipt.observed_revisions_before["target_task_updated_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_stale_target_version_fails_closed(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(project_id=project.id, title="worker", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+    invocation = _reprioritize_invocation(project, turn_task, target, 90)
+    # Concurrent bump: the target task advances after the agent read its version.
+    target.title = "worker-moved"
+    authority_db.add(target)
+    await authority_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None, invocation, session=authority_db, token=_turn_token(project, turn_task)
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(target)
+    assert target.priority == 50  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_cannot_target_a_resident_turn(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Another resident-turn task in the same project must never be a mutation target.
+    other_turn = Task(
+        project_id=project.id,
+        title="other turn",
+        payloads=[{"type": "strategic_resident_turn"}],
+        priority=50,
+    )
+    authority_db.add(other_turn)
+    await authority_db.commit()
+    await authority_db.refresh(other_turn)
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _reprioritize_invocation(project, turn_task, other_turn, 90),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(other_turn)
+    assert other_turn.priority == 50
+
+
+def test_request_fingerprint_binds_target_task_id():
+    """Two requests identical except target_task_id hash differently.
+
+    Guards the explicit target_task_id fingerprint binding for a future
+    task-mutation capability whose params do NOT echo the target id (unlike
+    task.reprioritize, whose request_payload already differs by task_id).
+    """
+    from app.strategic_operation_authority_validation import _request_fingerprint
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    common = {
+        "project_id": project_id,
+        "turn_task_id": turn_id,
+        "authority_generation": 3,
+        "operation_id": "op-x",
+        "operation_kind": "reprioritize_task",
+        "capability": "task.reprioritize",
+        "risk": "low",
+        "expected_revisions": {"target_task_updated_at": "2026-07-17T00:00:00"},
+    }
+    # Identical request_payload on purpose, so only target_task_id differs.
+    payload = {"note": "same payload"}
+    a = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=uuid.uuid4()
+    )
+    b = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=uuid.uuid4()
+    )
+    assert _request_fingerprint(a, request_payload=payload) != _request_fingerprint(
+        b, request_payload=payload
+    )
+    # A None target (Project-field op) hashes stably to itself.
+    c = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=None
+    )
+    assert _request_fingerprint(c, request_payload=payload) == _request_fingerprint(
+        c, request_payload=payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_operation_id_reuse_across_targets_collides(authority_db):
+    """Same operation_id with a different target task must 409, not mis-adopt."""
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    first = Task(project_id=project.id, title="a", payloads=[{"type": "plan"}], priority=50)
+    second = Task(project_id=project.id, title="b", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add_all([first, second])
+    await authority_db.commit()
+    await authority_db.refresh(first)
+    await authority_db.refresh(second)
+
+    token = _turn_token(project, turn_task)
+    await capability_router.invoke_resident_mutation(
+        None,
+        _reprioritize_invocation(project, turn_task, first, 90, op="dup-op"),
+        session=authority_db,
+        token=token,
+    )
+    # Reusing op="dup-op" but pointing at a DIFFERENT target task must collide,
+    # because target_task_id is bound into the request fingerprint.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _reprioritize_invocation(project, turn_task, second, 90, op="dup-op"),
+            session=authority_db,
+            token=token,
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(second)
+    assert second.priority == 50  # the second target was never mutated
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_cannot_target_own_turn_task(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    invocation = _reprioritize_invocation(project, turn_task, turn_task, 90)
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None, invocation, session=authority_db, token=_turn_token(project, turn_task)
+        )
+    assert exc.value.status_code == 409
