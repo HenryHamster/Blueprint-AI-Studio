@@ -25697,74 +25697,107 @@ def test_compute_image_builder_least_privilege_contract():
 
 
 # ── Remote build path (compute_image_remote_build) ─────────────────────────
+#
+# This module talks to Google APIs directly (Artifact Registry, Cloud Build,
+# Storage) and has NEVER shelled out to gcloud, so the historical ``_run`` seam
+# these tests passed was silently discarded (**_ignored) — and the placeholder
+# ``reg/repo/img`` ref is not a valid Artifact Registry image reference, so the
+# real parser correctly rejected it, hiding the mis-mock. The helpers below stub
+# the *real* boundary: the AR / Cloud Build clients, with a valid AR ref.
+
+# A valid Artifact Registry image ref: LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE
+_AR_FULL_REPO = "us-central1-docker.pkg.dev/proj/repo/img"
 
 
-def test_remote_registry_tag_exists_present(monkeypatch):
-    """remote_registry_tag_exists returns True when gcloud finds the tag."""
+class _FakeDockerImage:
+    """Stand-in for an artifactregistry_v1.DockerImage carrying one tag."""
+
+    def __init__(self, tag, digest="sha256:" + "de" * 32):
+        self.name = (
+            "projects/proj/locations/us-central1/repositories/repo/"
+            f"dockerImages/img@{digest}"
+        )
+        self.tags = [tag]
+
+
+class _FakeArtifactRegistryClient:
+    def __init__(self, images):
+        self._images = list(images)
+
+    def list_docker_images(self, request):
+        return list(self._images)
+
+
+class _RaisingArtifactRegistryClient:
+    def list_docker_images(self, request):
+        raise RuntimeError("artifact registry unreachable")
+
+
+def _fake_cb_operation(build_id="build-12345"):
+    """A Cloud Build create_build() operation whose metadata.build carries an id."""
+    op = MagicMock()
+    op.metadata.build.id = build_id
+    op.metadata.build.log_url = "https://cloudbuild.example/log"
+    return op
+
+
+def _fake_cb_build(status_name, detail=""):
+    """A Cloud Build get_build() result with a named status and failure detail."""
+    build = MagicMock()
+    build.status.name = status_name
+    build.failure_info.detail = detail
+    return build
+
+
+def test_remote_registry_tag_exists_present():
+    """remote_registry_tag_exists returns True when the AR client finds the tag."""
     from app.compute_image_remote_build import remote_registry_tag_exists
 
-    def fake_run(cmd, **kw):
-        class P:
-            returncode = 0
-            stdout = '[{"tag": "abc123", "version": "sha256:deadbeef"}]'
-            stderr = ""
-        return P()
-
-    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is True
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("abc123")])
+    assert remote_registry_tag_exists(_AR_FULL_REPO, "abc123", _client=client) is True
 
 
-def test_remote_registry_tag_exists_absent(monkeypatch):
-    """remote_registry_tag_exists returns False when gcloud finds no match."""
+def test_remote_registry_tag_exists_absent():
+    """remote_registry_tag_exists returns False when the AR client has no match."""
     from app.compute_image_remote_build import remote_registry_tag_exists
 
-    def fake_run(cmd, **kw):
-        class P:
-            returncode = 0
-            stdout = "[]"
-            stderr = ""
-        return P()
-
-    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is False
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("some-other-tag")])
+    assert remote_registry_tag_exists(_AR_FULL_REPO, "abc123", _client=client) is False
 
 
-def test_remote_registry_tag_exists_fail_open_on_error(monkeypatch):
+def test_remote_registry_tag_exists_fail_open_on_error():
     """remote_registry_tag_exists returns False (not-so-present) on any error."""
     from app.compute_image_remote_build import remote_registry_tag_exists
 
-    def fake_run(cmd, **kw):
-        raise OSError("gcloud not found")
+    # Fail-open: a registry error is treated as "not present" so the caller
+    # falls through to a build.
+    assert (
+        remote_registry_tag_exists(
+            _AR_FULL_REPO, "abc123", _client=_RaisingArtifactRegistryClient()
+        )
+        is False
+    )
 
-    # Fail-open: treat as "not present" so caller falls through to a build.
-    assert remote_registry_tag_exists("reg/repo/img", "abc123", _run=fake_run) is False
 
-
-def test_remote_resolve_digest_from_api(monkeypatch):
-    """_resolve_registry_digest_from_api returns the digest from gcloud output."""
+def test_remote_resolve_digest_from_api():
+    """_resolve_registry_digest_from_api returns the digest from the AR client."""
     from app.compute_image_remote_build import _resolve_registry_digest_from_api
 
-    def fake_run(cmd, **kw):
-        class P:
-            returncode = 0
-            stdout = '[{"tag": "abc123", "version": "sha256:baadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00dbaadf00d"}]'
-            stderr = ""
-        return P()
-
-    digest = _resolve_registry_digest_from_api("reg/repo/img", "abc123", _run=fake_run)
-    assert digest is not None and digest.startswith("sha256:")
+    digest = "sha256:" + "ba" * 32
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("abc123", digest=digest)])
+    resolved = _resolve_registry_digest_from_api(_AR_FULL_REPO, "abc123", _client=client)
+    assert resolved == digest and resolved.startswith("sha256:")
 
 
-def test_remote_resolve_digest_from_api_not_found(monkeypatch):
+def test_remote_resolve_digest_from_api_not_found():
     """_resolve_registry_digest_from_api returns None when tag is absent."""
     from app.compute_image_remote_build import _resolve_registry_digest_from_api
 
-    def fake_run(cmd, **kw):
-        class P:
-            returncode = 0
-            stdout = "[]"
-            stderr = ""
-        return P()
-
-    assert _resolve_registry_digest_from_api("reg/repo/img", "nonexistent", _run=fake_run) is None
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("some-other-tag")])
+    assert (
+        _resolve_registry_digest_from_api(_AR_FULL_REPO, "nonexistent", _client=client)
+        is None
+    )
 
 
 def test_remote_build_and_push_fast_path_skips_when_tag_exists(tmp_path, monkeypatch):
@@ -25876,8 +25909,14 @@ def test_remote_build_and_push_dry_run_does_not_submit(tmp_path, monkeypatch):
 
 
 def test_remote_build_and_push_cancellation_reaches_cloud_build(tmp_path, monkeypatch):
-    """When BuildControl is aborted, the Cloud Build is cancelled."""
-    from app.compute_image_remote_build import remote_build_and_push
+    """When BuildControl is aborted, the Cloud Build is cancelled.
+
+    Only the GCP clients (Cloud Build + Storage) are stubbed; the real
+    _submit_cloud_build -> _poll_cloud_build -> abort-detect -> _cancel_cloud_build
+    path runs against the fake client, so the assertion proves the cancellation
+    reached the Cloud Build API rather than a mock of the cancellation logic.
+    """
+    from app import compute_image_remote_build as crb
     from app.compute_image_build import BuildControl, BuildAborted, set_build_control
 
     monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
@@ -25886,75 +25925,73 @@ def test_remote_build_and_push_cancellation_reaches_cloud_build(tmp_path, monkey
     monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
 
     repo = _write_repo(tmp_path)
-    run_calls = []
 
-    # Simulate a Cloud Build that stays WORKING (never finishes).
-    poll_count = [0]
+    class _FakeCloudBuildClient:
+        """Stays WORKING, fires control.abort() after a few polls, then reports
+        CANCELLED once cancel_build has been requested."""
 
-    def fake_run(cmd, **kw):
-        cmd_str = " ".join(cmd)
-        run_calls.append(cmd_str)
+        def __init__(self):
+            self.create_calls = []
+            self.cancel_calls = []
+            self.get_count = 0
 
-        class P:
-            returncode = 0
-            stderr = ""
+        def create_build(self, request):
+            self.create_calls.append(request)
+            return _fake_cb_operation("build-12345")
 
-        if "builds submit" in cmd_str:
-            # Return a build ID.
-            P.stdout = '{"id": "build-12345", "logUrl": "https://..."}'
-            P.returncode = 0
-        elif "builds describe" in cmd_str:
-            # Stay WORKING until we trigger cancellation.
-            poll_count[0] += 1
-            if poll_count[0] >= 3:
-                # After a few polls, signal cancellation via BuildControl.
-                # (In real life the admin endpoint's timeout fires control.abort().)
+        def get_build(self, request):
+            self.get_count += 1
+            if self.cancel_calls:
+                # Terminal after cancellation so _wait_for_cloud_build_terminal
+                # returns immediately instead of busy-polling.
+                return _fake_cb_build("CANCELLED")
+            if self.get_count >= 3:
+                # In real life the admin endpoint's timeout fires control.abort().
                 control = _bci.current_build_control()
                 if control is not None:
                     control.abort()
-            P.stdout = '{"id": "build-12345", "status": "WORKING"}'
-            P.returncode = 0
-        elif "builds cancel" in cmd_str:
-            # Cancellation was requested — good.
-            P.stdout = "{}"
-            P.returncode = 0
-        elif "builds" in cmd_str:
-            P.stdout = "[]"
-            P.returncode = 0
-        else:
-            P.stdout = ""
-            P.returncode = 0
-        return P()
+            return _fake_cb_build("WORKING")
+
+        def cancel_build(self, request):
+            self.cancel_calls.append(request)
+
+    fake_cb = _FakeCloudBuildClient()
+    monkeypatch.setattr(crb, "_cloud_build_client", lambda region=None: fake_cb)
+    monkeypatch.setattr(crb, "_REMOTE_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr("google.cloud.storage.Client", lambda *a, **k: MagicMock())
 
     control = BuildControl()
     token = set_build_control(control)
     try:
         with pytest.raises(BuildAborted, match="cancelled"):
-            remote_build_and_push(
+            crb.remote_build_and_push(
                 repo_dir=repo,
                 registry_repo="reg/repo",
                 image_name="img",
                 dockerfile=".blueprint/Dockerfile.compute",
                 dep_files=["requirements.txt"],
-                _run=fake_run,
                 _tag_exists_fn=lambda *a, **k: False,
             )
     finally:
         _bci.reset_build_control(token)
 
     # The cancellation reached the Cloud Build job.
-    cancel_calls = [c for c in run_calls if "builds cancel" in c]
-    assert len(cancel_calls) >= 1, f"Expected 'gcloud builds cancel' call, got: {run_calls}"
+    assert len(fake_cb.cancel_calls) >= 1, (
+        "Expected a Cloud Build cancel_build call, got "
+        f"create={fake_cb.create_calls} cancel={fake_cb.cancel_calls}"
+    )
 
 
 def test_remote_build_and_push_succeeds_without_local_docker(tmp_path, monkeypatch):
     """Remote build succeeds even when docker is unavailable locally.
 
-    This is the key acceptance test: the remote path never calls docker,
-    only gcloud.  The runner proves a changed image succeeds with the local
-    Docker runner unavailable.
+    This is the key acceptance test: the remote path never touches a local
+    docker daemon — it talks only to the Cloud Build / Storage / Artifact
+    Registry APIs. Those clients are stubbed; the real remote_build_and_push
+    flow (hash -> scan -> package -> submit -> poll SUCCESS -> resolve digest)
+    runs end to end, proving a changed image publishes with no local Docker.
     """
-    from app.compute_image_remote_build import remote_build_and_push
+    from app import compute_image_remote_build as crb
 
     monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
     monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
@@ -25962,51 +25999,40 @@ def test_remote_build_and_push_succeeds_without_local_docker(tmp_path, monkeypat
     monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
 
     repo = _write_repo(tmp_path)
-    run_calls = []
 
-    # Simulate: tag does NOT exist, submit succeeds, poll returns SUCCESS.
-    call_seq = iter(["tag_check", "submit", "poll", "poll_success", "digest"])
+    class _FakeCloudBuildClient:
+        def __init__(self):
+            self.create_calls = []
 
-    def fake_run(cmd, **kw):
-        cmd_str = " ".join(cmd)
-        run_calls.append(cmd_str)
-        kind = next(call_seq, "extra")
+        def create_build(self, request):
+            self.create_calls.append(request)
+            return _fake_cb_operation("build-abc")
 
-        class P:
-            returncode = 0
-            stderr = ""
+        def get_build(self, request):
+            return _fake_cb_build("SUCCESS")
 
-        if kind == "tag_check":
-            P.stdout = "[]"
-        elif kind == "submit":
-            P.stdout = '{"id": "build-abc", "logUrl": "https://..."}'
-        elif kind == "poll":
-            P.stdout = '{"id": "build-abc", "status": "WORKING"}'
-        elif kind == "poll_success":
-            P.stdout = '{"id": "build-abc", "status": "SUCCESS"}'
-        elif kind == "digest":
-            P.stdout = '[{"tag": "abc123", "version": "sha256:ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"}]'
-        else:
-            P.stdout = "[]"
-        return P()
+    fake_cb = _FakeCloudBuildClient()
+    monkeypatch.setattr(crb, "_cloud_build_client", lambda region=None: fake_cb)
+    monkeypatch.setattr(crb, "_REMOTE_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr("google.cloud.storage.Client", lambda *a, **k: MagicMock())
 
-    result = remote_build_and_push(
+    digest = "sha256:" + "ff" * 32
+    result = crb.remote_build_and_push(
         repo_dir=repo,
         registry_repo="reg/repo",
         image_name="img",
         dockerfile=".blueprint/Dockerfile.compute",
         dep_files=["requirements.txt"],
-        _run=fake_run,
         _tag_exists_fn=lambda *a, **k: False,
+        _resolve_digest_fn=lambda full_repo, tag: digest,
     )
 
     assert result.built is True
     assert result.already_present is False
+    assert result.pinned_ref == f"reg/repo/img@{digest}"
     assert result.pinned_ref.startswith("reg/repo/img@sha256:")
-    # Docker was never invoked.
-    assert not any("docker " in c for c in run_calls), f"docker called: {run_calls}"
-    # Cloud Build was submitted.
-    assert any("builds submit" in c for c in run_calls)
+    # The remote path ran: exactly one Cloud Build was submitted (no local docker).
+    assert len(fake_cb.create_calls) == 1
 
 
 def test_remote_build_and_push_not_configured_raises(tmp_path, monkeypatch):
