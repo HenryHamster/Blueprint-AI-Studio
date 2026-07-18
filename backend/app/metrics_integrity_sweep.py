@@ -83,13 +83,18 @@ configured thresholds; disabled by default — operators must opt in via
 ``capability_proof_trial`` tasks whose ``capability_proof_trial_contradiction``
 stamp shows ALL recent outcomes were non-green — could_not_run / red / skipped;
 flags stalled (project, cap) pairs, distinguishing infrastructure failure
-(could_not_run) from definitive failure (red), without altering any gate decision).
+(could_not_run) from definitive failure (red), without altering any gate decision),
+and ``operator_inbox_needs_action_liveness`` (per-project check that every open
+operator-visible ProjectMessage is genuinely needs-action per derive_needs_action();
+flags projects where internal-only chatter is leaking into the operator inbox —
+measuring the direction's headline success criterion that zero non-actionable notices
+reach the operator).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
 * ``metrics_integrity_sweep_mode``            — ``off`` / ``observe`` / ``enforce``
 * ``metrics_integrity_sweep_interval_minutes``— cadence gate (default 60)
-* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 30)
+* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 50)
 * ``metrics_integrity_sweep_max_projects``    — projects scanned per check (25)
 * ``metrics_integrity_sweep_sample_limit``    — rows sampled per DB check (200)
 """
@@ -133,7 +138,7 @@ CAPABILITY_PROOF_RESEARCH_PROVENANCE = "capability_proof_research"
 
 DEFAULT_MODE = "observe"
 DEFAULT_INTERVAL_MINUTES = 60
-DEFAULT_MAX_CHECKS_PER_TICK = 30
+DEFAULT_MAX_CHECKS_PER_TICK = 50
 DEFAULT_MAX_PROJECTS_PER_CHECK = 25
 DEFAULT_SAMPLE_LIMIT = 200
 #: How far back a windowed check looks when recomputing ground truth. Keeps the
@@ -5618,6 +5623,115 @@ async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[Che
                 detail="no directions with persistent quality grader failures in recent cycles",
             )
         )
+
+    return results
+
+
+@register_check(
+    "operator_inbox_needs_action_liveness",
+    "Sample open operator-visible ProjectMessage rows per project and flag any "
+    "project where the open operator-visible set contains messages that "
+    "derive_needs_action() marks non-actionable — internal chatter leaking into "
+    "the operator inbox.",
+)
+async def check_operator_inbox_needs_action_liveness(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: every open, operator-visible ProjectMessage should have
+    ``derive_needs_action() == True``.  A message that is open and operator-visible
+    but not genuinely needs-action is internal chatter reaching the operator
+    inbox — the ``size-cap / salvage / dedup / lifecycle`` notices the direction's
+    success evidence says must reach zero.
+
+    self_reported = total open operator-visible count per project.
+    ground_truth  = subset where ``derive_needs_action()`` is True.
+    delta         = non-actionable messages leaking into the operator inbox.
+
+    Bounded to ``max_projects`` projects; within each, at most ``sample_limit``
+    open operator-visible rows.  Returns SKIPPED when a project has no open
+    operator-visible messages.  Pure recompute — never writes to ProjectMessage.
+    """
+    from app.message_audience import operator_visible_audience_filter
+    from app.message_convergence import OPEN_STATUS, derive_needs_action
+    from app.models import Project, ProjectMessage
+
+    project_ids = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not project_ids:
+        return [
+            CheckResult(
+                check="operator_inbox_needs_action_liveness",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in project_ids:
+        pid = str(project_id)
+        messages = (
+            await ctx.session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type != "user",
+                    operator_visible_audience_filter(ProjectMessage.context),
+                )
+                .order_by(ProjectMessage.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not messages:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open operator-visible messages",
+                )
+            )
+            continue
+
+        total = len(messages)
+        actionable = sum(1 for m in messages if derive_needs_action(m))
+        non_actionable = total - actionable
+
+        if non_actionable > 0:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total,
+                    ground_truth=actionable,
+                    delta=non_actionable,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{non_actionable}/{total} open operator-visible "
+                        "message(s) are not genuinely needs-action "
+                        "(internal chatter in operator inbox)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.OK,
+                    self_reported=total,
+                    ground_truth=total,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {total} open operator-visible message(s) are "
+                        "genuinely needs-action"
+                    ),
+                )
+            )
 
     return results
 

@@ -187,6 +187,7 @@ def test_registry_contains_initial_checks():
         "research_quality_grader_pass_rate",
         "encrypted_field_plaintext_detector",
         "audience_routing_attestation",
+        "operator_inbox_needs_action_liveness",
     } <= names
 
 
@@ -7506,3 +7507,155 @@ async def test_audience_routing_attestation_enforce_enrolls_finding(db):
     assert any(
         "audience_routing_attestation" in r.finding_key for r in rows
     )
+
+
+# --- Check: operator_inbox_needs_action_liveness ---------------------------
+
+
+def _inbox_message(
+    db,
+    project,
+    *,
+    message_type: MessageType = MessageType.NOTE,
+    audience: str | None = "operator-fyi",
+    status: str = "open",
+    from_type: str = "agent",
+) -> ProjectMessage:
+    """Insert an open operator-visible ProjectMessage for inbox liveness tests."""
+    ctx: dict = {}
+    if audience is not None:
+        ctx["audience"] = audience
+    msg = ProjectMessage(
+        project_id=project.id,
+        context=ctx,
+        message_type=message_type,
+        status=status,
+        from_type=from_type,
+    )
+    db.add(msg)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_ok_when_all_actionable(db):
+    """Open operator-visible QUESTION and BLOCKER messages are all needs-action → OK."""
+    project = await _project(db)
+    _inbox_message(db, project, message_type=MessageType.QUESTION, audience="operator-fyi")
+    _inbox_message(db, project, message_type=MessageType.BLOCKER, audience="operator-action-needed")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    pid = str(project.id)
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1
+    r = project_results[0]
+    assert r.status == CheckStatus.OK
+    assert r.self_reported == 2
+    assert r.ground_truth == 2
+    assert r.delta == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_flags_nonactionable_notice(db):
+    """An open NOTE (non-actionable) in the operator inbox triggers FLAGGED with delta=1."""
+    project = await _project(db)
+    # NOTE is non-actionable (not in NEEDS_ACTION_MESSAGE_TYPES, audience != operator-action-needed)
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected FLAGGED, got {results}"
+    f = flagged[0]
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+    assert f.delta == 1
+    assert "non-actionable" in f.detail or "not genuinely needs-action" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_skipped_when_no_messages(db):
+    """No open operator-visible messages → SKIPPED per project."""
+    await _project(db)
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    assert any(r.status == CheckStatus.SKIPPED for r in results)
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_ignores_resolved(db):
+    """Resolved messages are excluded and do not cause a flag."""
+    project = await _project(db)
+    # Resolved NOTE — should not count as open
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi",
+                   status="resolved")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    # No open messages → SKIPPED (resolved messages are not open)
+    assert all(r.status == CheckStatus.SKIPPED for r in results)
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_ignores_user_messages(db):
+    """User-authored messages are excluded from the operator inbox check."""
+    project = await _project(db)
+    # User-authored message should not be counted (from_type == "user")
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi",
+                   from_type="user")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    # User messages filtered out → SKIPPED
+    assert all(r.status == CheckStatus.SKIPPED for r in results)
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_needs_action_liveness_enforce_enrolls_finding(db):
+    """In enforce mode, a non-actionable open message enrolls an EvergreenBacklogItem."""
+    _rc["metrics_integrity_sweep_mode"] = "enforce"
+    project = await _project(db)
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    await db.commit()
+
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+
+    assert tick is not None
+    inbox_flags = [f for f in tick["flags"] if f["check"] == "operator_inbox_needs_action_liveness"]
+    assert len(inbox_flags) >= 1, f"expected inbox liveness flag, got {tick['flags']}"
+    assert tick["enrolled"] >= 1
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert any(
+        "operator_inbox_needs_action_liveness" in r.finding_key for r in rows
+    )
+
+
+def test_registry_contains_operator_inbox_check():
+    """operator_inbox_needs_action_liveness is registered in the check registry."""
+    names = {c.name for c in registered_checks()}
+    assert "operator_inbox_needs_action_liveness" in names

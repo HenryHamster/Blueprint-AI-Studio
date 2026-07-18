@@ -30748,8 +30748,11 @@ class TestRecordFindingResolutionViaStrategicOp:
 
 # ── Strategic op inventory parity test ────────────────────────────────────────
 # Asserts that every op in STRATEGIC_AGENT_OPS has a real elif handler in
-# admin_agent_ops.py. This is a standalone (no-DB) test so it can run in the
-# fast standalone suite.
+# admin_agent_ops.py AND that every handler (except known internal-only ops)
+# is listed in the inventory. This is a standalone (no-DB) test so it can run
+# in the fast standalone suite.
+
+
 
 def _parse_strategic_op_handlers() -> set[str]:
     """Return the set of payload.op strings that have elif branches in strategic_operation."""
@@ -30779,19 +30782,51 @@ def _parse_strategic_op_handlers() -> set[str]:
     return ops
 
 
-def test_strategic_agent_ops_all_have_real_handlers():
-    """STRATEGIC_AGENT_OPS is a subset of the actual elif handlers in strategic_operation.
+def _load_internal_only_ops() -> set[str]:
+    """Return the set of ops in strategic_ops_manifest.json that are
+    intentionally internal-only (non-null ``internal_reason``).
 
-    Fails when an op is listed in STRATEGIC_AGENT_OPS but has no elif branch in the
-    handler — i.e., the inventory and backend dispatch have diverged.
+    These ops have live handlers in strategic_operation but are deliberately
+    excluded from the surfaced STRATEGIC_AGENT_OPS inventory because they are
+    invoked programmatically (never by the agent CLI).
+    """
+    manifest_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "app",
+        "strategic_ops_manifest.json",
+    )
+    with open(manifest_path) as f:
+        entries = json.load(f)
+    return {e["op"] for e in entries if e.get("internal_reason")}
+
+
+def test_strategic_agent_ops_all_have_real_handlers():
+    """Bidirectional parity: STRATEGIC_AGENT_OPS ↔ strategic_operation handlers.
+
+    Forward direction: every op in the inventory has a real elif handler.
+    Reverse direction: every handler (except known internal-only ops, declared
+    with non-null ``internal_reason`` in strategic_ops_manifest.json) is listed
+    in the inventory.
     """
     from app.routers.admin_agent_ops import STRATEGIC_AGENT_OPS
 
     real_handlers = _parse_strategic_op_handlers()
+    internal_only = _load_internal_only_ops()
+
+    # Forward: ops in inventory but missing handler
     missing = STRATEGIC_AGENT_OPS - real_handlers
     assert not missing, (
         f"STRATEGIC_AGENT_OPS lists ops with no elif handler in strategic_operation: {sorted(missing)}. "
         "Add the handler or remove the op from STRATEGIC_AGENT_OPS."
+    )
+
+    # Reverse: handlers not in inventory and not intentionally internal-only
+    orphans = real_handlers - STRATEGIC_AGENT_OPS - internal_only
+    assert not orphans, (
+        f"Handlers in strategic_operation missing from STRATEGIC_AGENT_OPS: {sorted(orphans)}. "
+        "Add each op to the STRATEGIC_AGENT_OPS frozenset, or mark it as internal-only "
+        "in strategic_ops_manifest.json with a non-null internal_reason."
     )
 
 
