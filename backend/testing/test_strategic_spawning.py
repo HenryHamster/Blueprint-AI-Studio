@@ -482,6 +482,10 @@ async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
         db_session.add(resident)
         await db_session.commit()
 
+    # _spawn_research_task rolls back (owner flipped away from legacy), which
+    # expires `project`; capture the id first so the assertion queries below do
+    # not lazy-load an expired attribute (MissingGreenlet on Postgres/NullPool).
+    project_id = project.id
     old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
     _shared_state.runtime_config["architecture_review_frequency"] = 3
     try:
@@ -490,12 +494,12 @@ async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
         _shared_state.runtime_config["architecture_review_frequency"] = old
 
     all_tasks = (
-        await db_session.execute(select(Task).where(Task.project_id == project.id))
+        await db_session.execute(select(Task).where(Task.project_id == project_id))
     ).scalars().all()
     assert all_tasks == []
     cycles = (
         await db_session.execute(
-            select(StrategicCycle).where(StrategicCycle.project_id == project.id)
+            select(StrategicCycle).where(StrategicCycle.project_id == project_id)
         )
     ).scalars().all()
     assert cycles == []

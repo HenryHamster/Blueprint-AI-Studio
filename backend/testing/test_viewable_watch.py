@@ -43,8 +43,11 @@ main = _vw.main
 
 
 def test_viewable_files_yields_matching_extensions(tmp_path):
-    """png/jpg/jpeg/webp/gif/mp4/webm are included; txt and svg are not.
+    """png/jpg/jpeg/webp/gif/mp4/webm/svg are included; txt is not.
 
+    svg IS watched now — #15522 added ``.svg`` to the watcher allowlist because
+    SVGs are sanitized server-side on receipt (``storage.sanitize_svg_bytes``),
+    so the VM watcher may upload raw svg safely.
     pdf is excluded from the VM watcher (mid-run live previews only) but IS
     accepted by the endpoint for bundle-completion uploads.
     """
@@ -59,9 +62,9 @@ def test_viewable_files_yields_matching_extensions(tmp_path):
     assert "plot.png" in found
     assert "clip.mp4" in found
     assert "frame.webp" in found
+    assert "figure.svg" in found
     assert "notes.txt" not in found
     assert "report.pdf" not in found
-    assert "figure.svg" not in found
 
 
 def test_viewable_files_empty_dir_yields_nothing(tmp_path):

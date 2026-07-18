@@ -470,11 +470,21 @@ async def test_svg_is_previewable_via_signed_url(db_session, monkeypatch):
         f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
         f"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/artifacts/viewable/diagram.svg"
     )
+    # The artifact's own object is the opaque compute bundle; the previewable
+    # svg lives INSIDE it via the viewable_files manifest. Keeping the bundle
+    # storage_uri non-viewable isolates the manifest-signing path this test
+    # targets — otherwise (since #15522 made .svg directly viewable) an svg
+    # storage_uri would ALSO be signed by _resolve_viewable_previews' direct
+    # path, double-counting the sign for the same object.
+    bundle_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/artifacts/bundle.tar.gz"
+    )
     db_session.add(
         Artifact(
             task_id=task.id,
             artifact_type=ArtifactType.SCREENSHOT,
-            storage_uri=svg_uri,
+            storage_uri=bundle_uri,
             logs=json.dumps(
                 {
                     "viewable_files": [
@@ -764,7 +774,11 @@ def test_artifact_renderable_kind_video():
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "output.mp4"}) == "video"
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "demo.webm"}) == "video"
     assert _artifact_renderable_kind({"kind": "video", "label": "result"}) == "video"
-    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "video"
+    # .mov is intentionally NOT an inline-video format: #15576 ("fix .mov drift")
+    # dropped .mov from the renderable-video tokens to match the viewable
+    # allowlist (only .mp4/.webm play inline), so a .mov falls back to a
+    # download-style resource_detail rather than an inline player.
+    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "resource_detail"
 
 
 def test_artifact_renderable_kind_fallback():

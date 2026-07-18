@@ -66,6 +66,7 @@ def test_evaluation_declarations_match_expected_assignment():
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
+        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",

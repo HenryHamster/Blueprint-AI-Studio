@@ -1970,6 +1970,14 @@ async def _spawn_research_task_inner(
                     expected_legacy_generation=legacy_generation,
                 )
 
+    # A strategic-branch rollback above (e.g. a mid-spawn authority-generation
+    # flip) expires `project`; the tactical guards below read its columns through
+    # the SYNC project_parallelism_cap(), whose lazy-load would open a connection
+    # outside the greenlet on PostgreSQL/asyncpg (MissingGreenlet). Re-load the
+    # row here so those reads never lazy-load — mirrors the refreshes the
+    # strategic paths above already perform after commit_legacy_authorized.
+    await session.refresh(project)
+
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
     max_parallel = project_parallelism_cap(
