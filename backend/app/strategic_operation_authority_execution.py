@@ -15,13 +15,10 @@ from app.models import (
     Project,
     StrategicOperationReceipt,
     Task,
-    TaskStatus,
 )
 from app.strategic_operation_authority_validation import (
-    RESIDENT_ENGINE_OWNER,
     RESIDENT_TURN_TASK_TYPE,
     AuthorityBoundaryMutation,
-    AuthorityGenerationMismatch,
     FencedMutationWriter,
     FencedOperationContext,
     FencedOperationRequest,
@@ -30,7 +27,7 @@ from app.strategic_operation_authority_validation import (
     InactiveTurnAuthority,
     MutationCallback,
     OperationIdentityCollision,
-    ResidentEngineOwnerMismatch,
+    assert_locked_turn_mutation_authority,
     _REQUIRED_AUTHORITY_REVISIONS,
     _TERMINAL_RECEIPT_STATUSES,
     _enum_value,
@@ -38,7 +35,6 @@ from app.strategic_operation_authority_validation import (
     _observed_revisions,
     _request_fingerprint,
     _require_expected_revision_keys,
-    _task_is_mutation_authorized,
     _validate_expected_revisions,
     _validate_frozen_turn_lineage,
     _validate_frozen_turn_lineage_values,
@@ -169,33 +165,9 @@ async def execute_fenced_db_operation(
                 )
             return existing
 
-        if _enum_value(getattr(resident, "engine_owner", "")) != RESIDENT_ENGINE_OWNER:
-            raise ResidentEngineOwnerMismatch(
-                "Strategic Resident does not own the project engine",
-                observed_owner=_enum_value(getattr(resident, "engine_owner", "")),
-            )
-        observed_generation = int(getattr(resident, "authority_generation", 0))
-        if observed_generation != int(request.authority_generation):
-            raise AuthorityGenerationMismatch(
-                "Resident authority generation is stale",
-                expected=request.authority_generation,
-                observed=observed_generation,
-            )
-        if turn_task is None:
-            raise InactiveTurnAuthority("active turn task not found")
-        if turn_task.project_id != request.project_id:
-            raise InactiveTurnAuthority("turn task belongs to another project")
-        if getattr(resident, "active_turn_task_id", None) != request.turn_task_id:
-            raise InactiveTurnAuthority("turn task is not the Resident active turn")
-        if (
-            str((turn_task.first_payload or {}).get("type") or "")
-            != RESIDENT_TURN_TASK_TYPE
-        ):
-            raise InactiveTurnAuthority("task is not a strategic_resident_turn")
-        if _enum_value(turn_task.status) != _enum_value(TaskStatus.IN_PROGRESS):
-            raise InactiveTurnAuthority("turn task is not in progress")
-        if not _task_is_mutation_authorized(turn_task):
-            raise InactiveTurnAuthority("turn task is not mutation-authorized")
+        observed_generation = assert_locked_turn_mutation_authority(
+            resident, turn_task, request
+        )
 
         observed = await _observed_revisions(
             session,

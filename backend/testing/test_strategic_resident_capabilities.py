@@ -736,6 +736,22 @@ def _mutation_token(project_id, turn_task_id):
     }
 
 
+def _evidence_of_kinds(project_id, *kinds):
+    from app.strategic_resident_capability_invocation import CapabilityEvidenceRef
+
+    return tuple(
+        CapabilityEvidenceRef(
+            kind=kind,
+            project_id=project_id,
+            source_id=f"{kind}-{index}",
+            revision=f"{kind}:v1",
+            checksum=str(index) * 64,
+            inspected_at=datetime.now(timezone.utc),
+        )
+        for index, kind in enumerate(kinds)
+    )
+
+
 @pytest.mark.asyncio
 async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     project_id = uuid.uuid4()
@@ -780,6 +796,151 @@ async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypa
         )
     assert exc.value.status_code == 403
     executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_effect_501_when_gate_disabled_by_default(monkeypatch):
+    """pr.create must stay proposal-only (501) until an operator arms it."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    # Default runtime_config: the allowlist is empty -> capability disarmed.
+    monkeypatch.setattr(
+        capability_router, "runtime_config", {}
+    )
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.create",
+        parameters={"head": "feature", "base": "main", "title": "PR"},
+        evidence=_evidence_of_kinds(project_id, "branch"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "allowlist_config",
+    [
+        {},  # key absent
+        {"resident_external_effect_capability_allowlist": None},  # None value
+        {"resident_external_effect_capability_allowlist": "pr.create"},  # bare string
+        {"resident_external_effect_capability_allowlist": {"pr.create": True}},  # dict
+        {"resident_external_effect_capability_allowlist": 1},  # int
+    ],
+)
+async def test_external_effect_gate_fails_closed_on_malformed_allowlist(
+    monkeypatch, allowlist_config
+):
+    """A malformed/None/wrong-typed allowlist must keep pr.create at 501."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    monkeypatch.setattr(capability_router, "runtime_config", allowlist_config)
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.create",
+        parameters={"head": "feature", "base": "main", "title": "PR"},
+        evidence=_evidence_of_kinds(project_id, "branch"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_effect_dispatches_when_capability_armed(monkeypatch):
+    """When an operator arms pr.create, /mutate routes to the external executor."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-ext", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    monkeypatch.setattr(
+        capability_router,
+        "runtime_config",
+        {"resident_external_effect_capability_allowlist": ["pr.create"]},
+    )
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.create",
+        parameters={"head": "feature", "base": "main", "title": "PR"},
+        evidence=_evidence_of_kinds(project_id, "branch"),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    # The fenced request is built from the token authority + declared kind.
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == "pr.create"
+    assert fenced_request.operation_kind == "create_pull_request"
+    assert fenced_request.project_id == project_id
+
+
+@pytest.mark.asyncio
+async def test_external_effect_critical_capability_stays_501_even_if_listed(monkeypatch):
+    """pr.merge has no wired adapter, so it 501s even if named in the allowlist."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    monkeypatch.setattr(
+        capability_router,
+        "runtime_config",
+        {"resident_external_effect_capability_allowlist": ["pr.merge"]},
+    )
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.merge",
+        parameters={"pr_number": 5, "expected_head_sha": "abc1234"},
+        approval_ref="approved-by-operator",
+        evidence=_evidence_of_kinds(
+            project_id, "pr_diff", "pr_checks", "pr_reviews", "pr_mergeability"
+        ),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
 
 
 @pytest.mark.asyncio

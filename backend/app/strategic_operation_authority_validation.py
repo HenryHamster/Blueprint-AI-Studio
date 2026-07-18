@@ -609,6 +609,52 @@ def _task_is_mutation_authorized(task: Task) -> bool:
     return bool(context.get(_MUTATION_AUTHORIZED_CONTEXT_KEY) is True)
 
 
+def assert_locked_turn_mutation_authority(
+    resident: Any,
+    turn_task: Any,
+    request: FencedOperationRequest,
+) -> int:
+    """Fail closed unless the locked rows still authorize this operation.
+
+    Pure check sequence over already-locked ``resident``/``turn_task`` rows,
+    shared by the DB-only and external-effect executors so both fence identically:
+    Resident owns the engine, generation matches, the turn is this Resident's
+    active in-progress mutation-authorized ``strategic_resident_turn`` in the
+    request's project. Returns the observed authority generation.
+    """
+
+    from app.models import TaskStatus
+
+    if _enum_value(getattr(resident, "engine_owner", "")) != RESIDENT_ENGINE_OWNER:
+        raise ResidentEngineOwnerMismatch(
+            "Strategic Resident does not own the project engine",
+            observed_owner=_enum_value(getattr(resident, "engine_owner", "")),
+        )
+    observed_generation = int(getattr(resident, "authority_generation", 0))
+    if observed_generation != int(request.authority_generation):
+        raise AuthorityGenerationMismatch(
+            "Resident authority generation is stale",
+            expected=request.authority_generation,
+            observed=observed_generation,
+        )
+    if turn_task is None:
+        raise InactiveTurnAuthority("active turn task not found")
+    if turn_task.project_id != request.project_id:
+        raise InactiveTurnAuthority("turn task belongs to another project")
+    if getattr(resident, "active_turn_task_id", None) != request.turn_task_id:
+        raise InactiveTurnAuthority("turn task is not the Resident active turn")
+    if (
+        str((turn_task.first_payload or {}).get("type") or "")
+        != RESIDENT_TURN_TASK_TYPE
+    ):
+        raise InactiveTurnAuthority("task is not a strategic_resident_turn")
+    if _enum_value(turn_task.status) != _enum_value(TaskStatus.IN_PROGRESS):
+        raise InactiveTurnAuthority("turn task is not in progress")
+    if not _task_is_mutation_authorized(turn_task):
+        raise InactiveTurnAuthority("turn task is not mutation-authorized")
+    return observed_generation
+
+
 def _validate_frozen_turn_lineage_values(
     payload: Mapping[str, Any],
     context: Mapping[str, Any],
