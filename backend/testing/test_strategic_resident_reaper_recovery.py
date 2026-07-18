@@ -22,6 +22,7 @@ from app.strategic_resident_agent_binding import (
 from app.strategic_resident_failure_recovery import (
     reap_authoritative_resident_turn,
 )
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 def _turn(
@@ -138,7 +139,13 @@ async def test_reaper_blocks_retry_when_turn_receipt_is_unsettled(
         status=receipt_status,
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # The receipt-insert fence only admits a receipt backed by a live authorized
+    # turn + current checkpoint; this fixture seeds an unsettled prior-turn
+    # receipt directly (the reaper behaviour, not receipt creation, is under
+    # test). Relax enforcement for this setup insert only (no-op on SQLite); the
+    # reaper action below runs with the fence ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
 
     outcome = await reap_authoritative_resident_turn(
         db_session,

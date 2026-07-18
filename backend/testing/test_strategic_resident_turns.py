@@ -31,6 +31,7 @@ from app.strategic_resident_turns import (
 from app.time_utils import _utcnow
 from app.database import AsyncSessionLocal
 from app.orchestrator import _lock_dispatchable_task_for_mutation
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 def test_pre_split_projection_imports_remain_compatible():
@@ -253,10 +254,15 @@ async def test_pointer_repair_discards_cross_project_and_terminal_tasks(db_sessi
         trigger_kind="project_change",
     )
     resident = await db_session.get(StrategicResident, project.id)
-    resident.active_turn_task_id = foreign_task.id
-    resident.active_turn_lane = "background"
-    db_session.add(resident)
-    await db_session.flush()
+    # Deliberately corrupt the pointer to a foreign-project task to exercise the
+    # repair path. The project-links fence forbids this in production, so seed
+    # the impossible state with enforcement relaxed (no-op on SQLite); the
+    # coalesce/repair action below runs with the fence ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        resident.active_turn_task_id = foreign_task.id
+        resident.active_turn_lane = "background"
+        db_session.add(resident)
+        await db_session.flush()
 
     wake = await coalesce_shadow_resident_turn(
         db_session,
@@ -374,9 +380,15 @@ async def test_shadow_sweep_does_not_run_after_engine_flip(db_session):
         trigger_kind="project_change",
     )
     resident = await db_session.get(StrategicResident, project.id)
-    resident.engine_owner = "strategic_resident"
-    db_session.add(resident)
-    await db_session.commit()
+    # Flip ownership to strategic_resident without advancing the generation (a
+    # real cutover advances it, but this test only needs the post-flip owner to
+    # assert the shadow sweep goes idle). The authority-monotonic fence forbids
+    # that flip, so seed it with enforcement relaxed (no-op on SQLite); the sweep
+    # action below runs with the fence ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        resident.engine_owner = "strategic_resident"
+        db_session.add(resident)
+        await db_session.commit()
     assert (
         await sweep_shadow_resident_turns(
             session_factory=AsyncSessionLocal,
@@ -587,11 +599,17 @@ async def test_final_orchestrator_claim_fence_rejects_backend_managed_task(db_se
     db_session.add(agent_task)
     db_session.add(backend_task)
     await db_session.commit()
+    # Capture ids before the rollback below: rollback expires these instances,
+    # and reading an expired attribute in the arg position (a sync context) would
+    # lazy-load on a fresh Postgres/NullPool connection outside the greenlet
+    # (MissingGreenlet). The ids are what the fence is exercised with.
+    agent_task_id = agent_task.id
+    backend_task_id = backend_task.id
 
     assert (
-        await _lock_dispatchable_task_for_mutation(db_session, agent_task.id)
-    ).id == agent_task.id
+        await _lock_dispatchable_task_for_mutation(db_session, agent_task_id)
+    ).id == agent_task_id
     await db_session.rollback()
     assert (
-        await _lock_dispatchable_task_for_mutation(db_session, backend_task.id) is None
+        await _lock_dispatchable_task_for_mutation(db_session, backend_task_id) is None
     )

@@ -602,9 +602,13 @@ async def reconcile_strategic_resident_turn(
             "reconciliation_id": reconciliation_id,
             "unsettled_operation_receipt_ids": list(unsettled_receipt_ids),
         }
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = _utcnow()
-        task.latest_status_message = "Resident turn reconciled into checkpoint"
+        # NOTE: the turn task is completed AFTER the checkpoint rotation below is
+        # flushed (see the second flush) — never in the same flush. The
+        # checkpoint-insert and checkpoint-rotation fences authorize a rotation
+        # only while its turn task is still IN_PROGRESS; completing it in the
+        # same flush lets the task->COMPLETED UPDATE land before the resident
+        # rotation UPDATE, so the fence sees a COMPLETED turn and rejects the
+        # (legitimate) rotation with 42501 on PostgreSQL.
         task_context = dict(task.context or {})
         task_context[INPUT_FROZEN_CONTEXT_KEY] = True
         task.context = task_context
@@ -662,6 +666,15 @@ async def reconcile_strategic_resident_turn(
             source_turn_task_id=request.turn_task_id,
         )
         session.add(next_checkpoint)
+        # Insert the new checkpoint BEFORE the resident rotation below. The
+        # resident<->checkpoint FK cycle is expressed as raw columns (no ORM
+        # relationship), so the unit of work does not order the checkpoint INSERT
+        # ahead of the resident UPDATE on its own. If the rotation UPDATE flushed
+        # first, the rotation fence would look up NEW.current_checkpoint_id (this
+        # not-yet-inserted row), find nothing, and reject the rotation as
+        # unauthorized (42501) on PostgreSQL. The turn task is still IN_PROGRESS
+        # here, so the checkpoint-insert fence authorizes this row.
+        await session.flush()
         resident.previous_checkpoint_id = checkpoint.id
         resident.current_checkpoint_id = checkpoint_id
         resident.handled_message_sequence = message_cursor
@@ -696,6 +709,15 @@ async def reconcile_strategic_resident_turn(
                 )
         resident.updated_at = now
         session.add(resident)
+        # Flush the checkpoint insert + resident rotation while the turn task is
+        # still IN_PROGRESS so the rotation/checkpoint fences authorize it.
+        await session.flush()
+        # Only now complete the turn: its result is durably checkpointed, and
+        # the rotation it authorized has already been fenced-in.
+        task.status = TaskStatus.COMPLETED
+        task.completed_at = _utcnow()
+        task.latest_status_message = "Resident turn reconciled into checkpoint"
+        session.add(task)
         await session.flush()
         return StrategicResidentReconcileOutcome(
             checkpoint_id=checkpoint_id,

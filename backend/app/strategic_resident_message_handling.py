@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -66,11 +67,26 @@ async def respond_to_represented_user_messages(
             raise ReconciliationCursorError(
                 "represented user message is owned by another Task"
             )
-        message.handling_state = MessageHandlingState.RESPONDED
         message.handled_by_task_id = turn_task_id
         message.updated_at = now
         session.add(message)
         responded_ids.append(message.id)
+    if responded_ids:
+        # Persist the ownership pointer first, then set handling_state in a
+        # SEPARATE UPDATE that touches no column watched by the projectmessage
+        # 0567-compat trigger (which fires BEFORE UPDATE OF handled_by_task_id and
+        # unconditionally re-derives handling_state — 'pending' for user
+        # conversation rows). Writing handling_state in the same UPDATE as
+        # handled_by_task_id would let that trigger clobber the response back to
+        # 'pending' on PostgreSQL (SQLite has no such trigger). synchronize_session
+        # keeps the loaded ORM rows consistent for the caller's projections.
+        await session.flush()
+        await session.execute(
+            update(ProjectMessage)
+            .where(ProjectMessage.id.in_(responded_ids))
+            .values(handling_state=MessageHandlingState.RESPONDED)
+            .execution_options(synchronize_session="fetch")
+        )
     return tuple(responded_ids)
 
 

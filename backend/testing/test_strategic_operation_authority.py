@@ -41,6 +41,7 @@ from app.strategic_operation_authority import (
     UnsupportedRevisionKey,
     execute_fenced_db_operation,
 )
+from testing._resident_seed import seed_without_authority_enforcement
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -111,6 +112,14 @@ async def _authority_rows(
     )
     session.add(task)
     await session.commit()
+    # The checkpoint/resident pair forms a circular non-deferrable FK on the real
+    # migrated schema and the resident/checkpoint fences reject seeding this
+    # already-authoritative starting state directly. Relax enforcement for the
+    # seed ONLY (no-op on SQLite); the tested action below runs with fences live.
+    # The helper's replica-mode GUC is connection-scoped and does not survive an
+    # intermediate commit (NullPool), so build all three rows and commit ONCE.
+    # StrategicResidentCheckpoint.id is a client-side uuid4, so the pointer and
+    # the task-payload lineage are known before the flush.
     checkpoint_body = {"schema_version": 1}
     checkpoint = StrategicResidentCheckpoint(
         project_id=project.id,
@@ -120,8 +129,6 @@ async def _authority_rows(
         authority_generation=generation,
         source_turn_task_id=None,
     )
-    session.add(checkpoint)
-    await session.commit()
     turn_payload = dict(task.first_payload)
     turn_payload.update(
         {
@@ -131,9 +138,6 @@ async def _authority_rows(
         }
     )
     task.payloads = [turn_payload]
-    session.add(task)
-    await session.commit()
-    await session.refresh(task)
     resident = StrategicResident(
         project_id=project.id,
         engine_owner=owner,
@@ -143,8 +147,10 @@ async def _authority_rows(
         active_turn_lane="interactive",
         current_checkpoint_id=checkpoint.id,
     )
-    session.add(resident)
-    await session.commit()
+    async with seed_without_authority_enforcement(session):
+        session.add_all([checkpoint, task, resident])
+        await session.commit()
+    await session.refresh(task)
     return project, task, resident
 
 

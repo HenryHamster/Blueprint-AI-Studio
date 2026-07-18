@@ -49,6 +49,7 @@ from app.strategic_resident_agent_binding import (
 from app.strategic_resident_turn_results import ResidentEvidenceInspection
 from app.strategic_resident_turns import SHADOW_CONTEXT_KEY
 from app.time_utils import _utcnow
+from testing._resident_seed import seed_without_authority_enforcement
 def _canonical(value) -> bytes:
     return json.dumps(
         value,
@@ -203,16 +204,22 @@ async def _resident_turn_rows(
         session.add(successor)
         await session.commit()
         await session.refresh(successor)
-    resident.current_checkpoint_id = checkpoint.id
-    resident.active_turn_task_id = task.id
-    resident.active_turn_lane = "interactive"
-    if successor_lane == "interactive":
-        resident.interactive_successor_task_id = successor.id
-    elif successor_lane == "background":
-        resident.background_successor_task_id = successor.id
-    session.add(resident)
-    await session.commit()
-    await session.refresh(resident)
+    # Pointing an already-strategic_resident-owned Resident at its current
+    # checkpoint + active turn is a rotation the fence only authorises via a
+    # matching live turn task; seed that authoritative starting state with
+    # enforcement relaxed (no-op on SQLite). The reconcile action under test
+    # below runs with the rotation/checkpoint fences ACTIVE.
+    async with seed_without_authority_enforcement(session):
+        resident.current_checkpoint_id = checkpoint.id
+        resident.active_turn_task_id = task.id
+        resident.active_turn_lane = "interactive"
+        if successor_lane == "interactive":
+            resident.interactive_successor_task_id = successor.id
+        elif successor_lane == "background":
+            resident.background_successor_task_id = successor.id
+        session.add(resident)
+        await session.commit()
+        await session.refresh(resident)
     provider_input = await reconstruct_authoritative_turn_input(
         session,
         project_id=project.id,
@@ -899,7 +906,12 @@ async def test_reconciliation_owns_all_unresolved_messages_in_represented_range(
     db_session.add_all(
         [task, second_message, already_responded, activity, system_message]
     )
-    await db_session.commit()
+    # Seed the explicit sequences + handling_states with the projectmessage
+    # 0567-compat trigger relaxed — otherwise it re-allocates sequences (causing
+    # a unique-key collision) and rewrites handling_state. The reconcile action
+    # runs with the trigger ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     provider_input = await reconstruct_authoritative_turn_input(
         db_session,
         project_id=project.id,
@@ -955,7 +967,11 @@ async def test_reconciliation_rejects_foreign_unresolved_message_owner(db_sessio
     message.handling_state = MessageHandlingState.CLAIMED
     message.handled_by_task_id = foreign_handler.id
     db_session.add(message)
-    await db_session.commit()
+    # Seed the CLAIMED foreign-owned state with the projectmessage 0567-compat
+    # trigger relaxed — otherwise it re-derives handling_state to 'pending' on
+    # this UPDATE. The reconcile action runs with the trigger ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     provider_input = await reconstruct_authoritative_turn_input(
         db_session,
         project_id=project.id,
@@ -1278,7 +1294,11 @@ async def test_matching_durable_operation_receipt_is_accepted(db_session):
         status="reconciled",
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["operations"] = [_operation("op-1", "task.cancel", "reconciled")]
     result["receipts"] = [
@@ -1330,7 +1350,11 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         status="reconciled",
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["evidence"][0].update(
         source_id="run-from-receipt",
@@ -1417,6 +1441,11 @@ async def _seed_trusted_ci_receipt(db_session, project, task):
             status="reconciled",
         )
     )
+    # Insert the durable receipt fixture with the receipt-insert fence relaxed
+    # (setup only); the caller commits it alongside its own rows and the
+    # reconcile action under test runs with the fence ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.flush()
 
 
 def _evidence_free_turn_result():
@@ -1667,7 +1696,11 @@ async def test_inspection_receipt_spoofs_cannot_supply_evidence(
         status=status,
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     from app.strategic_resident_evidence_policy import INSPECTION_CAPABILITY_KINDS
 
     result = _turn_result()
@@ -1730,7 +1763,10 @@ async def test_turn_with_unclaimed_inspection_receipt_reconciles(db_session):
             status="applied",
         )
     )
-    await db_session.commit()
+    # Durable prior-operation receipt fixture — seed with the receipt-insert
+    # fence relaxed (setup only); the reconcile action runs with it ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
 
     # The turn result claims NO operations/receipts (the agent never saw the id).
     result = _turn_result()
@@ -1790,7 +1826,11 @@ async def test_operation_capability_must_match_durable_receipt(db_session):
         status="reconciled",
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["operations"] = [
         _operation("op-mismatch", "deployment.execute", "reconciled")
@@ -1858,7 +1898,10 @@ async def test_omitted_settled_durable_receipt_is_rejected(db_session):
             status="reconciled",
         )
     )
-    await db_session.commit()
+    # Durable prior-operation receipt fixture — seed with the receipt-insert
+    # fence relaxed (setup only); the reconcile action runs with it ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
 
     with pytest.raises(ReconciliationResultInvalid, match="every durable"):
         await reconcile_strategic_resident_turn(
@@ -1895,7 +1938,11 @@ async def test_unknown_operation_effect_is_admitted_once_and_fences_promotion(
         unknown_effects=[{"effect_id": "effect-1", "summary": "Commit uncertain"}],
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["operations"] = [
         _operation("op-unknown", "deployment.execute", "applying")
@@ -1998,7 +2045,11 @@ async def test_omitted_unsettled_durable_receipt_rolls_back_reconciliation(db_se
         unknown_effects=[{"effect_id": "effect-omitted"}],
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
 
     with pytest.raises(ReconciliationResultInvalid, match="omitted unsettled"):
         await reconcile_strategic_resident_turn(
@@ -2035,7 +2086,11 @@ async def test_receipt_only_unsettled_status_cannot_complete_turn(db_session, st
         unknown_effects=[{"effect_id": "effect-receipt-only"}],
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["receipts"] = [
         {
@@ -2095,7 +2150,11 @@ async def test_checkpoint_corruption_after_context_fetch_rolls_back_atomically(
                     source_turn_task_id=task.id,
                 )
             )
-        await session.flush()
+        # Force the corruption past the checkpoint-immutability / insert fences
+        # (which exist precisely to PREVENT this) so the reconcile's independent
+        # post-fetch integrity check is what has to catch it — defence in depth.
+        async with seed_without_authority_enforcement(session):
+            await session.flush()
         return provider_input
 
     monkeypatch.setattr(
@@ -2351,7 +2410,11 @@ async def test_operation_and_receipt_statuses_match_durable_ledger_exactly(
         status="reconciled",
     )
     db_session.add(receipt)
-    await db_session.commit()
+    # A durable prior-operation receipt fixture: in production the fenced
+    # mutation path writes these; here we seed one directly so the reconcile
+    # action (which runs with the receipt-insert fence ACTIVE) can validate it.
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
     result = _turn_result()
     result["operations"] = [
         _operation("op-status-mismatch", "task.cancel", operation_status)

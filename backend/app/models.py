@@ -3836,7 +3836,16 @@ class ProjectMessageAttachmentUpload(SQLModel, table=True):
         default=None,
         sa_column=Column(
             GUID(),
-            ForeignKey("projectmessage.id", ondelete="SET NULL"),
+            # DEFERRABLE INITIALLY DEFERRED (migration 0634): the attachment
+            # receipt's message_id is staged before the referenced projectmessage
+            # row is INSERTed within the same create_operator_project_message
+            # transaction, so the FK must be validated at COMMIT, not per-statement.
+            ForeignKey(
+                "projectmessage.id",
+                ondelete="SET NULL",
+                deferrable=True,
+                initially="DEFERRED",
+            ),
             nullable=True,
         ),
     )
