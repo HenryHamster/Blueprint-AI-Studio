@@ -11,8 +11,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from sqlalchemy import select
+
 from app.database import get_session
-from app.models import TaskStatus
+from app.models import ProjectMessage, TaskStatus
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.resident_agent_rate_limits import (
@@ -211,6 +213,39 @@ def _register_capability_request(
 _capability_rate_key = resident_task_token_rate_key
 
 
+async def _validate_approval_ref(
+    session: AsyncSession,
+    approval_ref: str | None,
+    project_id: uuid.UUID,
+) -> None:
+    """Reject mutations whose approval_ref is missing, foreign, or agent-authored."""
+
+    if not approval_ref:
+        raise HTTPException(
+            status_code=403,
+            detail="capability requires an explicit operator approval_ref",
+        )
+    try:
+        approval_id = uuid.UUID(approval_ref)
+    except ValueError:
+        raise HTTPException(
+            status_code=403,
+            detail="approval_ref must be a valid UUID",
+        ) from None
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.id == approval_id,
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type == "user",
+        ).limit(1)
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=403,
+            detail="approval_ref does not reference a valid human operator message for this project",
+        )
+
+
 @router.post("/capability")
 @limiter.limit("600/minute", key_func=resident_remote_rate_key)
 @limiter.limit("60/minute", key_func=_capability_rate_key)
@@ -335,6 +370,8 @@ async def invoke_resident_mutation(
             status_code=403,
             detail="mutation envelope does not match the turn token authority",
         )
+    if spec.approval_policy == "explicit":
+        await _validate_approval_ref(session, body.approval_ref, binding.project_id)
     fenced_request = FencedOperationRequest(
         project_id=binding.project_id,
         turn_task_id=binding.task_id,
