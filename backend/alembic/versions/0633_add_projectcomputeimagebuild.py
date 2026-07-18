@@ -8,8 +8,8 @@ the ``ComputeJob`` table's column/typing conventions.
 Additive: brand-new table, no existing data to migrate, no existing model or
 API shape changes.
 
-Revision ID: 0628
-Revises: 0627
+Revision ID: 0633
+Revises: 0632
 Create Date: 2026-07-17 00:00:00.000000
 
 """
@@ -17,8 +17,8 @@ Create Date: 2026-07-17 00:00:00.000000
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0631"
-down_revision = "0630"
+revision = "0633"
+down_revision = "0632"
 branch_labels = None
 depends_on = None
 

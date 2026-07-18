@@ -780,7 +780,7 @@ async def lifespan(app):
     # Validate encryption configuration — fail fast in production if the
     # encryption key is missing; warn in development if neither key nor
     # the ALLOW_PLAINTEXT_CREDENTIALS opt-in flag is set.
-    _verify_encryption_config()
+    await _verify_encryption_config()
 
     # Verify schema version matches expected migration
     await _verify_schema_version()

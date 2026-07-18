@@ -43,6 +43,9 @@ from app.strategic_resident_checkpoint_validation import (
 )
 from app.strategic_resident_context import reconstruct_authoritative_turn_input
 from app.strategic_resident_evidence_validation import build_trusted_evidence_index
+from app.strategic_resident_worker_proposal_intake import (
+    drain_worker_memory_proposals,
+)
 from app.strategic_resident_agent_binding import (
     ResidentAgentBinding,
     ResidentAgentBindingError,
@@ -532,7 +535,21 @@ async def reconcile_strategic_resident_turn(
                 "current checkpoint integrity validation failed"
             ) from exc
         body = verified_checkpoint.mutable_body()
-        _apply_memory_proposals(body, accepted_proposals)
+        # Admit any pending worker (StrategicCycle) memory proposals through the
+        # SAME checkpoint-CAS apply path — the only channel by which a bounded
+        # worker's proposal changes strategic memory. Revision-linked to this
+        # exact checkpoint and evidence-gated; stale/untrusted ones are rejected
+        # in-place without failing the turn.
+        admitted_worker_proposals = await drain_worker_memory_proposals(
+            session,
+            project_id=request.project_id,
+            current_checkpoint_version=int(checkpoint.version),
+            current_checkpoint_hash=str(checkpoint.content_hash),
+            trusted_evidence=trusted_evidence,
+        )
+        _apply_memory_proposals(
+            body, [*accepted_proposals, *admitted_worker_proposals]
+        )
         _apply_open_loops(body, result, request)
         now = _utcnow()
         _record_unknown_effect_recovery(

@@ -736,6 +736,22 @@ def _mutation_token(project_id, turn_task_id):
     }
 
 
+def _evidence_of_kinds(project_id, *kinds):
+    from app.strategic_resident_capability_invocation import CapabilityEvidenceRef
+
+    return tuple(
+        CapabilityEvidenceRef(
+            kind=kind,
+            project_id=project_id,
+            source_id=f"{kind}-{index}",
+            revision=f"{kind}:v1",
+            checksum=str(index) * 64,
+            inspected_at=datetime.now(timezone.utc),
+        )
+        for index, kind in enumerate(kinds)
+    )
+
+
 @pytest.mark.asyncio
 async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     project_id = uuid.uuid4()
@@ -783,17 +799,135 @@ async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "expected_kind"),
+    [
+        ("task.cancel", "cancel_task"),
+        ("task.requeue", "requeue_task"),
+        ("task.retry", "retry_task"),
+        ("task.unblock", "unblock_task"),
+    ],
+)
+async def test_task_lifecycle_routes_through_the_external_executor(
+    monkeypatch, capability, expected_kind
+):
+    """cancel/requeue/retry/unblock run the operator modify path via the executor."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-life", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    evidence_kind = {
+        "task.cancel": "task",
+        "task.requeue": "task",
+        "task.retry": "task_failure",
+        "task.unblock": "task_blocker",
+    }[capability]
+    params = {"task_id": str(uuid.uuid4())}
+    if capability == "task.cancel":
+        params["reason"] = "held by strategy"
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id=capability,
+        parameters=params,
+        evidence=_evidence_of_kinds(project_id, evidence_kind),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == capability
+    assert fenced_request.operation_kind == expected_kind
+
+
+@pytest.mark.asyncio
+async def test_external_effect_pr_create_dispatches(monkeypatch):
+    """A wired external effect (pr.create) routes to the external executor.
+
+    No arming gate: usability is governed by the plan's own gates (a wired
+    adapter + evidence + authority + the operator engine-ownership flip).
+    """
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-ext", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.create",
+        parameters={"head": "feature", "base": "main", "title": "PR"},
+        evidence=_evidence_of_kinds(project_id, "branch"),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    # The fenced request is built from the token authority + declared kind.
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == "pr.create"
+    assert fenced_request.operation_kind == "create_pull_request"
+    assert fenced_request.project_id == project_id
+
+
+@pytest.mark.asyncio
+async def test_external_effect_unwired_capability_stays_501(monkeypatch):
+    """pr.merge has no wired adapter yet, so it stays proposal-only (501)."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    # pr.update is a github_pulls capability with no wired adapter yet.
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.update",
+        parameters={"pr_number": 5},
+        evidence=_evidence_of_kinds(project_id, "pr"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_mutation_route_501_for_capability_without_fenced_adapter(monkeypatch):
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     executor = AsyncMock()
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
-    # task.reprioritize is a real mutate capability but has no project-field adapter.
+    # task.park is a real mutate capability but has no fenced adapter yet.
     invocation = _mutation_invocation(
         project_id,
         turn_id,
-        capability_id="task.reprioritize",
-        parameters={"task_id": str(uuid.uuid4()), "priority": 5},
+        capability_id="task.park",
+        parameters={"task_id": str(uuid.uuid4()), "reason": "held for review"},
     )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(

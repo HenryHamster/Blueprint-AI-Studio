@@ -5904,6 +5904,114 @@ class TestRecordCapabilityNamedTestExecutionProof:
         assert "related-tests" in project.capability_proof_records
         assert "related_tests" not in project.capability_proof_records
 
+    def test_env_fingerprint_stored_when_supplied(self):
+        """env_fingerprint is persisted in the proof_entry when non-empty."""
+        cap_name = "gpu-compute"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_gpu.py"], head_sha="sha1",
+                env_fingerprint="runner-image-v42",
+            )
+        assert result is True
+        e = project.capability_proof_records[cap_name][0]
+        assert e["env_fingerprint"] == "runner-image-v42"
+        # Also present on the appended EvidenceRef
+        ref = project.problem_model["capabilities"][0]["evidence_refs"][0]
+        assert ref["env_fingerprint"] == "runner-image-v42"
+
+    def test_env_fingerprint_absent_when_omitted(self):
+        """Omitting env_fingerprint leaves the entry without that field."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1"
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+    def test_env_fingerprint_absent_when_empty_string(self):
+        """An empty string env_fingerprint is treated as absent (not stored)."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1",
+                env_fingerprint="",
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+
+class TestFreshExecutedProofEnvFingerprint:
+    """_fresh_executed_proof_covers_head env-fingerprint binding behaviour."""
+
+    def _base_entry(self, sha: str = "sha1", env_fp: str | None = None) -> dict:
+        from datetime import datetime
+        entry: dict = {
+            "task_id": "named_test_exec:gpu-compute",
+            "proved_at": datetime(2026, 1, 1).isoformat(),
+            "recorded_at": datetime(2026, 1, 1).isoformat(),
+            "proof_kind": "named_test",
+            "commit_sha": sha,
+            "executed": True,
+        }
+        if env_fp:
+            entry["env_fingerprint"] = env_fp
+        return entry
+
+    def _project_with_entry(self, entry: dict):
+        project = MagicMock()
+        project.capability_proof_records = {"gpu-compute": [entry]}
+        return project
+
+    def test_matching_env_fingerprint_returns_true(self):
+        """Proof is fresh when commit_sha AND env_fingerprint both match."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v1"
+        )
+
+    def test_mismatched_env_fingerprint_returns_false(self):
+        """Proof is stale when commit_sha matches but env_fingerprint differs."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert not _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_stored_ignores_env_binding(self):
+        """Proof with no stored env_fingerprint is fresh on commit_sha+TTL alone."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1"))
+        # Caller supplies a fingerprint but stored proof has none → not env-bound
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_supplied_ignores_env_binding(self):
+        """Caller omitting env_fingerprint doesn't trigger env-binding check."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        # Stored proof has a fingerprint but caller doesn't supply one
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now
+        )
+
 
 class TestResolveHeadAccess:
     """_resolve_head_access: route HEAD validation through the GitHub reader.

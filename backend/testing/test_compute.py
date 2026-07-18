@@ -21553,7 +21553,7 @@ def test_collect_viewable_candidates_keeps_multi_arm_same_basename_from_dir(tmp_
     # A root-level file keeps its bare name alongside the nested ones.
     (tmp_path / "summary.png").write_bytes(_VIEW_PNG_BYTES + b"-root")
 
-    cands, _size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+    cands, _size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
         str(tmp_path)
     )
     names = sorted(c.filename for c in cands)
@@ -21577,7 +21577,7 @@ def test_collect_viewable_candidates_from_dir_streams_large_video(tmp_path):
     (tmp_path / "rollout.mp4").write_bytes(big_video)
     (tmp_path / "frame.png").write_bytes(_VIEW_PNG_BYTES)
 
-    cands, _size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+    cands, _size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
         str(tmp_path)
     )
     by_name = {c.filename: c for c in cands}
@@ -21673,7 +21673,7 @@ def test_collect_viewable_candidates_from_dir_collects_beyond_cap(tmp_path):
     """Dir walker collects ALL qualifying files (count cap removed from inner loop)."""
     for i in range(_MAX_COUNT + 3):
         (tmp_path / f"file{i:03d}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
-    cands, size_dropped = compute_backends_module._collect_viewable_candidates_from_dir(
+    cands, size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
         str(tmp_path)
     )
     assert len(cands) == _MAX_COUNT + 3
@@ -21698,7 +21698,7 @@ async def test_collect_viewable_artifact_candidates_sorts_and_caps(tmp_path):
         "_MAX_VIEWABLE_FILE_COUNT",
         7,
     ):
-        selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+        selected, dropped, _svg_count = await compute_backends_module._collect_viewable_artifact_candidates(job)
 
     # 10 total, cap=7 → 3 dropped
     assert len(selected) == 7
@@ -21720,7 +21720,7 @@ async def test_collect_viewable_artifact_candidates_no_drop_when_within_cap(tmp_
     job.polling_metadata = {"artifact_dir": str(tmp_path)}
     job.external_compute_id = None
 
-    selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+    selected, dropped, _svg_count = await compute_backends_module._collect_viewable_artifact_candidates(job)
     assert len(selected) == 3
     assert dropped == 0
 

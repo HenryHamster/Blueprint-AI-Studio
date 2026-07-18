@@ -1312,7 +1312,9 @@ async def test_repeatable_candidate_migration_failure_blocks(monkeypatch):
 
     apply_call_count = 0
 
-    async def _deterministic_defect_apply(scratch_engine, candidate_sources):
+    async def _deterministic_defect_apply(
+        scratch_engine, candidate_sources, *, timeout_code=None
+    ):
         nonlocal apply_call_count
         apply_call_count += 1
         raise gate_mod._DeterministicMigrationDefect(
