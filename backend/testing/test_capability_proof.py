@@ -2356,6 +2356,160 @@ class TestBackingPathTieringInEnforceGate:
         assert proof["paths-field-cap"] == "partial"
 
 
+# ── Spawn-gate: raw agent-writable absorbs alias bypass is closed ─────────────
+
+
+class TestSpawnGateAbsorbsAliasBypassClosed:
+    """ACCEPTANCE EVIDENCE. Pin the closure of the spawn-time enforce-gate bypass
+    where a raw agent-writable ``absorbs`` alias with no platform forwarding marker
+    cleared the enforce gate because ``capability_need_proof_status`` returned
+    ``None`` (no-match) for the alias — and ``capability_need_blocked_by_proof_gate``
+    treats ``None`` as "not a registry capability, skip the gate" (a free pass).
+
+    The fix: ``working_capability_proof_status`` now registers every agent-declared
+    absorbs alias that has no platform forwarding marker as ``"unproven"`` so the
+    alias appears in the proof map with a non-None status.  The gate then correctly
+    blocks it in enforce mode (``unproven != "proven"``).
+    """
+
+    def _absorbs_model(self, survivor_name="Unified harness", alias_name="Old harness name"):
+        """A problem model with one working capability that declares an absorbs alias."""
+        from app.problem_model import Capability, ProblemModel
+
+        return ProblemModel(
+            capabilities=[
+                Capability(
+                    name=survivor_name,
+                    status="working",
+                    absorbs=[alias_name],
+                    # No evidence_refs → the survivor itself is unproven.
+                )
+            ]
+        )
+
+    def _forwarding_marker(self, *, absorbed="old-harness-name", survivor="unified-harness"):
+        """Minimal platform ledger that records a genuine consolidation marker."""
+        return {
+            absorbed: [
+                {
+                    "task_id": f"absorbed_into:{absorbed}",
+                    "proof_kind": "absorbed_into",
+                    "survivor": survivor,
+                    "absorbed": absorbed,
+                }
+            ]
+        }
+
+    def test_absorbs_alias_without_marker_is_unproven_in_proof_map(self):
+        """SECURITY: an agent-declared ``absorbs`` without a platform forwarding marker
+        must appear in the proof map as ``"unproven"`` — NOT as absent (None).
+
+        Absent → None → capability_need_blocked_by_proof_gate returns False → free
+        pass in enforce mode. ``"unproven"`` → gate evaluates and correctly blocks."""
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+
+        assert "old-harness-name" in proof, (
+            "absorbs alias must appear in the proof map so the enforce gate can "
+            "evaluate it — an absent entry reads as None (free pass)"
+        )
+        assert proof["old-harness-name"] == "unproven", (
+            "absorbs alias with no platform marker must be 'unproven', not any "
+            "stronger tier"
+        )
+
+    def test_absorbs_alias_without_marker_blocks_in_enforce_mode(self):
+        """ACCEPTANCE EVIDENCE. A need naming an agent-declared absorbs alias with no
+        platform forwarding marker must be BLOCKED in enforce mode, not cleared.
+
+        Before the fix, spawn_capability_gate_disposition returned ("ok", None)
+        because the alias was absent from the proof map; the enforce gate was bypassed
+        with zero verification."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="enforce"
+        )
+        assert disposition == "block", (
+            "an absorbs-declared alias with no platform marker must be BLOCKED in "
+            f"enforce mode — got disposition={disposition!r}, proof_status={proof_status!r}"
+        )
+        assert proof_status == "unproven"
+
+    def test_absorbs_alias_without_marker_surfaces_in_observe_mode(self):
+        """Observe mode surfaces the unproven alias but does NOT block."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="observe"
+        )
+        assert disposition == "surface", (
+            "observe mode must surface an unproven alias, not block — "
+            f"got disposition={disposition!r}"
+        )
+        assert proof_status == "unproven"
+
+    def test_genuine_consolidation_with_platform_marker_clears_enforce_gate(self):
+        """A GENUINE consolidation (platform forwarding marker present + survivor
+        proven in ledger) still clears the enforce gate. Positive regression guard:
+        the fix must not break legitimate platform-recorded alias resolution."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        # Survivor has a machine-verified proof entry (recent timestamp — within TTL).
+        proof_records = {
+            "unified-harness": [
+                {
+                    "task_id": str(uuid.uuid4()),
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_foo.py::test_ok",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                }
+            ],
+            **self._forwarding_marker(),
+        }
+        model = self._absorbs_model()
+
+        # The alias should carry the survivor's proof status via the platform marker.
+        # (The ledger upgrade wires the forwarded name to the survivor's proof.)
+        from app.capability_registry import consumer_gate_proof_status
+
+        gate_proof = consumer_gate_proof_status(model, proof_records)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, gate_proof, mode="enforce"
+        )
+        assert disposition == "ok", (
+            "a genuinely consolidated alias with a platform marker + survivor proof "
+            f"must CLEAR the enforce gate — got disposition={disposition!r}, "
+            f"proof_status={proof_status!r}"
+        )
+
+    def test_unrelated_non_registry_capability_still_returns_ok_none(self):
+        """A need that names a capability absent from the working registry entirely
+        (not an absorbs alias, not a real capability) still returns ("ok", None).
+        The fix must not fabricate a block for unrecognized capability names."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "completely-unknown-cap"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="enforce"
+        )
+        assert disposition == "ok"
+        assert proof_status is None
+
+
 # ── Earn loop is not flag-only: proof is written, not just computed ───────────
 
 
@@ -5749,6 +5903,114 @@ class TestRecordCapabilityNamedTestExecutionProof:
         assert result is True
         assert "related-tests" in project.capability_proof_records
         assert "related_tests" not in project.capability_proof_records
+
+    def test_env_fingerprint_stored_when_supplied(self):
+        """env_fingerprint is persisted in the proof_entry when non-empty."""
+        cap_name = "gpu-compute"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_gpu.py"], head_sha="sha1",
+                env_fingerprint="runner-image-v42",
+            )
+        assert result is True
+        e = project.capability_proof_records[cap_name][0]
+        assert e["env_fingerprint"] == "runner-image-v42"
+        # Also present on the appended EvidenceRef
+        ref = project.problem_model["capabilities"][0]["evidence_refs"][0]
+        assert ref["env_fingerprint"] == "runner-image-v42"
+
+    def test_env_fingerprint_absent_when_omitted(self):
+        """Omitting env_fingerprint leaves the entry without that field."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1"
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+    def test_env_fingerprint_absent_when_empty_string(self):
+        """An empty string env_fingerprint is treated as absent (not stored)."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1",
+                env_fingerprint="",
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+
+class TestFreshExecutedProofEnvFingerprint:
+    """_fresh_executed_proof_covers_head env-fingerprint binding behaviour."""
+
+    def _base_entry(self, sha: str = "sha1", env_fp: str | None = None) -> dict:
+        from datetime import datetime
+        entry: dict = {
+            "task_id": "named_test_exec:gpu-compute",
+            "proved_at": datetime(2026, 1, 1).isoformat(),
+            "recorded_at": datetime(2026, 1, 1).isoformat(),
+            "proof_kind": "named_test",
+            "commit_sha": sha,
+            "executed": True,
+        }
+        if env_fp:
+            entry["env_fingerprint"] = env_fp
+        return entry
+
+    def _project_with_entry(self, entry: dict):
+        project = MagicMock()
+        project.capability_proof_records = {"gpu-compute": [entry]}
+        return project
+
+    def test_matching_env_fingerprint_returns_true(self):
+        """Proof is fresh when commit_sha AND env_fingerprint both match."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v1"
+        )
+
+    def test_mismatched_env_fingerprint_returns_false(self):
+        """Proof is stale when commit_sha matches but env_fingerprint differs."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert not _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_stored_ignores_env_binding(self):
+        """Proof with no stored env_fingerprint is fresh on commit_sha+TTL alone."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1"))
+        # Caller supplies a fingerprint but stored proof has none → not env-bound
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_supplied_ignores_env_binding(self):
+        """Caller omitting env_fingerprint doesn't trigger env-binding check."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        # Stored proof has a fingerprint but caller doesn't supply one
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now
+        )
 
 
 class TestResolveHeadAccess:

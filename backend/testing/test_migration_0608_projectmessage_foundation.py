@@ -407,7 +407,12 @@ def test_production_message_writers_use_canonical_sequence_builder():
     )
 
 
-def test_message_mutation_sources_follow_counter_first_lock_order():
+def test_message_mutation_sources_follow_project_first_lock_order():
+    # Deadlock-safe canonical order is PARENT-first: lock the Project row, then
+    # reserve the message counter, then lock the Task (parent → counter → child).
+    # A consistent parent-first hierarchy across every mutation source is what
+    # prevents ABBA deadlocks; the message-counter helper itself locks the
+    # project before the counter.
     app_dir = Path(__file__).resolve().parents[1] / "app"
     agent_source = (
         app_dir / "routers" / "admin_agent_ops.py"
@@ -416,7 +421,7 @@ def test_message_mutation_sources_follow_counter_first_lock_order():
     preallocate = strategic.index("preallocated_message_sequence")
     project_lock = strategic.index("_lock_project_or_429")
     task_lock_position = strategic.index("async with task_lock")
-    assert preallocate < project_lock < task_lock_position
+    assert project_lock < preallocate < task_lock_position
 
     operator_source = (
         app_dir / "routers" / "admin_notifications.py"
@@ -425,7 +430,7 @@ def test_message_mutation_sources_follow_counter_first_lock_order():
     counter = resolve.index("lock_project_and_next_message_sequence")
     project_row = resolve.index("select(Project.id)")
     reply_row = resolve.index("select(ProjectMessage)")
-    assert counter < project_row < reply_row
+    assert project_row < counter < reply_row
 
     migration_source = (
         Path(__file__).resolve().parents[1]

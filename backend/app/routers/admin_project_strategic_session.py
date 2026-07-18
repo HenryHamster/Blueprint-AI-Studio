@@ -14,7 +14,7 @@ import logging
 import re
 import time
 from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -59,6 +59,23 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
+from app.strategic_resident_capabilities import capability_for
+from app.strategic_resident_capability_invocation import (
+    validated_capability_parameters,
+)
+from app.strategic_resident_operation_approval import (
+    MAX_APPROVAL_TTL_SECONDS,
+    OperatorApprovalRequired,
+    capability_requires_operator_approval,
+    derive_approval_key,
+    grant_operation_approval,
+)
+from app.strategic_resident_ownership import (
+    ResidentOwnershipTransition,
+    ResidentOwnershipTransitionError,
+    cutover_to_strategic_resident,
+    rollback_to_legacy_resident,
+)
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
@@ -3612,6 +3629,153 @@ async def start_project_strategic_resident_session(
         runner_id=data.runner_id,
     )
     return {"project_id": str(project_id), "enabled": True, "session": snapshot}
+
+
+class ResidentOperationApprovalGrant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    capability: str = Field(min_length=3, max_length=120)
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    ttl_seconds: int = Field(default=3600, ge=1, le=MAX_APPROVAL_TTL_SECONDS)
+
+
+@router.post("/projects/{project_id}/resident-operation-approvals")
+@limiter.limit("30/minute")
+async def grant_resident_operation_approval(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: ResidentOperationApprovalGrant,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator-grant an approval for one explicit-approval Resident operation.
+
+    The operator names the capability and its exact parameters (e.g. the PR
+    number + head sha for ``pr.merge``); the server derives the approval key from
+    them and records a single-use, time-bounded approval. Because the Resident's
+    invocation re-derives the same key from the operation it actually executes,
+    the approval authorises that operation and no other.
+    """
+
+    # Authorizing an autonomous trunk merge / deploy is at least as consequential
+    # as a human doing it, so require ``owner`` — matching admin_hotfix_promote and
+    # every other trunk-affecting operator action in this codebase.
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    if not capability_requires_operator_approval(payload.capability):
+        raise HTTPException(
+            status_code=400,
+            detail="capability does not require an explicit operator approval",
+        )
+    try:
+        spec = capability_for(payload.capability)
+        parameters = validated_capability_parameters(spec, payload.parameters)
+    except (ValueError, OperatorApprovalRequired) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    approval_key = derive_approval_key(payload.capability, parameters)
+    approval = await grant_operation_approval(
+        session,
+        project_id=project.id,
+        capability=payload.capability,
+        approval_key=approval_key,
+        granted_by=current_user["user_id"],
+        ttl_seconds=payload.ttl_seconds,
+    )
+    await session.commit()
+    return {
+        "project_id": str(project_id),
+        "capability": payload.capability,
+        "approval_id": str(approval.id),
+        "approval_key": approval_key,
+        "expires_at": approval.expires_at.isoformat(),
+    }
+
+
+def _resident_ownership_transition_response(
+    project_id: uuid.UUID, transition: ResidentOwnershipTransition
+) -> Dict[str, Any]:
+    """Serialize an ownership transition into the operator-facing switch result."""
+
+    return {
+        "project_id": str(project_id),
+        "previous_owner": transition.previous_owner,
+        "new_owner": transition.new_owner,
+        "previous_generation": transition.previous_generation,
+        "new_generation": transition.new_generation,
+        "checkpoint_id": str(transition.checkpoint_id),
+        "checkpoint_version": transition.checkpoint_version,
+        "checkpoint_hash": transition.checkpoint_hash,
+        "cancelled_task_ids": [str(task_id) for task_id in transition.cancelled_task_ids],
+        "already_owned": transition.already_owned,
+        "legacy_projection_applied": transition.legacy_projection_applied,
+    }
+
+
+@router.post("/projects/{project_id}/resident-engine/cutover")
+@limiter.limit("10/minute")
+async def cutover_project_resident_engine(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Flip a project's strategy engine to the Strategic Resident (owner-gated).
+
+    This is the M5 per-project rollout switch. It atomically fences any legacy
+    shadow work at the current checkpoint boundary and grants the Resident engine
+    authority in one idempotent transition (a second call returns
+    ``already_owned=True`` without stranding shadow turns). The Resident row and
+    its v1 checkpoint are provisioned first if the project never had one, so the
+    flip is a clean one-shot on any project. Reversible via the rollback switch.
+
+    Handing an autonomous engine ownership of a project's strategy is at least as
+    consequential as any other trunk-affecting operator action, so it requires the
+    ``owner`` role — matching the operation-approval grant and hotfix-promote.
+    """
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    # Provision the Resident + deterministic v1 checkpoint if this project never
+    # had one, so the switch works on any project. Idempotent (no-op when present);
+    # the helper takes the canonical Project row lock itself. Committed in its own
+    # transaction before the cutover, which re-locks under its own sessionmaker.
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    await initialize_strategic_resident(session, project.id)
+    await session.commit()
+    try:
+        transition = await cutover_to_strategic_resident(AsyncSessionLocal, project_id)
+    except ResidentOwnershipTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _resident_ownership_transition_response(project_id, transition)
+
+
+@router.post("/projects/{project_id}/resident-engine/rollback")
+@limiter.limit("10/minute")
+async def rollback_project_resident_engine(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Roll a project's strategy engine back to the legacy cadence (owner-gated).
+
+    The reverse of the cutover switch: it fences the current Resident generation
+    and restores the bounded legacy strategic inputs in one idempotent transition
+    (a second call returns ``already_owned=True``). A project that was never cut
+    over has no Resident to roll back, which surfaces as a 409.
+    """
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    try:
+        transition = await rollback_to_legacy_resident(AsyncSessionLocal, project_id)
+    except ResidentOwnershipTransitionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _resident_ownership_transition_response(project_id, transition)
 
 
 @router.post("/projects/{project_id}/strategic-session/stop")

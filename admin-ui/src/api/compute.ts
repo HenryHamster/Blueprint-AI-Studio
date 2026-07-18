@@ -915,6 +915,11 @@ export interface ComputeJob {
     size_cap?: number | null;
     count_cap?: number | null;
   } | null;
+  /** When viewable artifacts for this job are expected to expire from GCS
+   *  (the artifacts bucket has a ~7-day lifecycle DELETE). After this
+   *  timestamp, signed preview URLs will 404 — the artifact is permanently
+   *  gone and retries are futile. ISO-8601 string. */
+  artifact_expires_at?: string | null;
   /** Bounded time-series of intermediate progress samples emitted during the
    *  job. `t` is runner-authored presentation time; `received_at` is the
    *  authenticated server clock used for watchdog enforcement. */

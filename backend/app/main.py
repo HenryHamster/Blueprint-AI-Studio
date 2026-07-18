@@ -115,7 +115,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0630"
+EXPECTED_SCHEMA_REVISION = "0632"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -178,7 +178,7 @@ _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 # Webhook dedup state moved to app.routers.github
 
 
-def _verify_encryption_config():
+async def _verify_encryption_config():
     """Validate encryption configuration at startup.
 
     On Cloud Run (``K_REVISION`` is set): require ``GITHUB_PAT_ENCRYPTION_KEY``
@@ -188,6 +188,13 @@ def _verify_encryption_config():
     In development/test (``K_REVISION`` not set): warn when both the encryption
     key and ``ALLOW_PLAINTEXT_CREDENTIALS`` are absent, so developers know to
     either configure a key or set the opt-in flag.
+
+    **Key-continuity probe** (when encryption is active):
+    A per-environment continuity reference ciphertext is persisted in
+    ``DeploymentState.runtime_config_json["encryption_continuity_reference"]``.
+    On first boot the reference is minted with the current key and stored; on
+    subsequent boots the stored reference is verified against the current key
+    and boot fails closed on mismatch (wrong-key rotation / misconfiguration).
     """
     from app.field_encryption import (
         ENCRYPTION_KEY_ENV,
@@ -204,7 +211,32 @@ def _verify_encryption_config():
     _verify_required_env()
 
     if is_encryption_active():
-        probe_key_continuity("startup")
+        from app.database import AsyncSessionLocal
+        from app.models import DeploymentState
+
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            stored_ref: str | None = None
+            if state is not None and state.runtime_config_json:
+                stored_ref = state.runtime_config_json.get(
+                    "encryption_continuity_reference"
+                )
+
+            if stored_ref is not None:
+                # Verify existing reference — raises RuntimeError on wrong key.
+                probe_key_continuity("startup", reference_ciphertext=stored_ref)
+            else:
+                # First boot with encryption — mint and persist a continuity
+                # reference so subsequent boots can detect wrong-key rotation.
+                new_ref = probe_key_continuity("startup")
+                if new_ref is not None:
+                    if state is None:
+                        state = DeploymentState(id=1)
+                    if state.runtime_config_json is None:
+                        state.runtime_config_json = {}
+                    state.runtime_config_json["encryption_continuity_reference"] = new_ref
+                    session.add(state)
+                    await session.commit()
         return
 
     on_cloud_run = bool(os.getenv("K_REVISION"))

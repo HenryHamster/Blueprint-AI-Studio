@@ -93,6 +93,9 @@ export function useMessagesPanelFilters(selectedProjectId: string | null) {
   const [openKebabId, setOpenKebabId] = useState<string | null>(null);
   const kebabRef = useRef<HTMLDivElement>(null);
   const [showOnlyNew, setShowOnlyNew] = useState(false);
+  // Needs-action-first mode: when true, the message list shows only server-flagged
+  // needs_operator items. Defaults true so the inbox leads with what needs action.
+  const [needsActionOnly, setNeedsActionOnly] = useState(true);
 
   // Reset per-project filter state and sync from server on project switch
   useEffect(() => {
@@ -104,6 +107,7 @@ export function useMessagesPanelFilters(selectedProjectId: string | null) {
     setMuteWindow(loadMuteWindow(email, selectedProjectId));
     setSavedViews(loadSavedViews(email, selectedProjectId));
     setActiveViewId(DEFAULT_VIEW_ID);
+    setNeedsActionOnly(true);
     setOpenKebabId(null);
     if (selectedProjectId) {
       // Prefer server noise prefs over localStorage — picks up prefs set on another device.
@@ -247,6 +251,7 @@ export function useMessagesPanelFilters(selectedProjectId: string | null) {
       setShowResolved(false);
       setRoutineExpanded(false);
       setShowOnlyNew(false);
+      setNeedsActionOnly(true);
       return;
     }
     const view = savedViews.find(v => v.id === viewId);
@@ -359,6 +364,7 @@ export function useMessagesPanelFilters(selectedProjectId: string | null) {
     openKebabId, setOpenKebabId,
     kebabRef,
     showOnlyNew, setShowOnlyNew,
+    needsActionOnly, setNeedsActionOnly,
     activeView,
     activeTabModified,
     setMuteWindowPersisted,

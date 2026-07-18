@@ -49,6 +49,7 @@ _SUPPORTED_EXPECTED_REVISIONS = frozenset(
         "vision_revision",
         "problem_model_revision",
         "design_doc_revision",
+        "target_task_updated_at",
     }
 )
 _REQUIRED_AUTHORITY_REVISIONS = frozenset(
@@ -145,6 +146,11 @@ class FencedOperationRequest:
     risk: str
     expected_revisions: Mapping[str, Any]
     request_payload: Mapping[str, Any]
+    # Optional: a non-turn task (same project) this operation mutates through the
+    # bounded ``FencedTaskWriter``, CAS'd on ``expected_revisions.target_task_updated_at``
+    # (``updated_at`` advances on every write; ``version`` is a forensic counter
+    # only). ``None`` keeps the Project-field-only mutation path unchanged.
+    target_task_id: uuid.UUID | None = None
 
 
 @dataclass
@@ -221,6 +227,46 @@ class FencedMutationWriter:
             setattr(project, field, deepcopy(value))
 
 
+_TASK_PRIORITY_MIN = 0
+_TASK_PRIORITY_MAX = 100
+
+
+@dataclass
+class FencedTaskWriter:
+    """Detached plan for a bounded mutation of one non-turn target Task.
+
+    Like ``FencedMutationWriter``, the callback only records intent here; the
+    executor applies it to the locked target task after the authority-identity
+    snapshot check, so the callback can never touch any row directly.
+    """
+
+    __changes: dict[str, Any]
+
+    def set_priority(self, value: int) -> None:
+        if type(value) is not int:
+            raise FencedOperationUsageError("priority must be an integer")
+        if not _TASK_PRIORITY_MIN <= value <= _TASK_PRIORITY_MAX:
+            raise FencedOperationUsageError(
+                f"priority must be within [{_TASK_PRIORITY_MIN}, {_TASK_PRIORITY_MAX}]"
+            )
+        self.__changes["priority"] = value
+
+    def _validated_changes(self) -> dict[str, Any]:
+        allowed = {"priority"}
+        unknown = set(self.__changes) - allowed
+        if unknown:
+            raise FencedOperationUsageError(
+                f"task mutation plan contains unsupported fields: {sorted(unknown)}"
+            )
+        if not self.__changes:
+            raise FencedOperationUsageError("task mutation plan is empty")
+        return dict(self.__changes)
+
+    def _apply(self, task: Task) -> None:
+        for field, value in self._validated_changes().items():
+            setattr(task, field, value)
+
+
 @dataclass(frozen=True)
 class FencedOperationContext:
     project_id: uuid.UUID
@@ -230,6 +276,8 @@ class FencedOperationContext:
     request_payload: Mapping[str, Any]
     observed_revisions: Mapping[str, Any]
     writer: FencedMutationWriter
+    # Present only when the request declares a ``target_task_id``.
+    task_writer: FencedTaskWriter | None = None
 
 
 MutationCallback = Callable[
@@ -372,6 +420,14 @@ def _request_fingerprint(
             "risk": risk,
             "expected_revisions": expected_revisions,
             "request_payload": request_payload,
+            # Bind the mutation target explicitly so an operation_id replay with a
+            # different target task collides (409) rather than being under-specified,
+            # even for a future capability whose params don't echo the target id.
+            "target_task_id": (
+                str(request.target_task_id)
+                if request.target_task_id is not None
+                else None
+            ),
         }
     )
     if len(encoded) > _REQUEST_MAX_BYTES:
@@ -551,6 +607,52 @@ def _validated_mutation_mapping(
 def _task_is_mutation_authorized(task: Task) -> bool:
     context = task.context if isinstance(task.context, dict) else {}
     return bool(context.get(_MUTATION_AUTHORIZED_CONTEXT_KEY) is True)
+
+
+def assert_locked_turn_mutation_authority(
+    resident: Any,
+    turn_task: Any,
+    request: FencedOperationRequest,
+) -> int:
+    """Fail closed unless the locked rows still authorize this operation.
+
+    Pure check sequence over already-locked ``resident``/``turn_task`` rows,
+    shared by the DB-only and external-effect executors so both fence identically:
+    Resident owns the engine, generation matches, the turn is this Resident's
+    active in-progress mutation-authorized ``strategic_resident_turn`` in the
+    request's project. Returns the observed authority generation.
+    """
+
+    from app.models import TaskStatus
+
+    if _enum_value(getattr(resident, "engine_owner", "")) != RESIDENT_ENGINE_OWNER:
+        raise ResidentEngineOwnerMismatch(
+            "Strategic Resident does not own the project engine",
+            observed_owner=_enum_value(getattr(resident, "engine_owner", "")),
+        )
+    observed_generation = int(getattr(resident, "authority_generation", 0))
+    if observed_generation != int(request.authority_generation):
+        raise AuthorityGenerationMismatch(
+            "Resident authority generation is stale",
+            expected=request.authority_generation,
+            observed=observed_generation,
+        )
+    if turn_task is None:
+        raise InactiveTurnAuthority("active turn task not found")
+    if turn_task.project_id != request.project_id:
+        raise InactiveTurnAuthority("turn task belongs to another project")
+    if getattr(resident, "active_turn_task_id", None) != request.turn_task_id:
+        raise InactiveTurnAuthority("turn task is not the Resident active turn")
+    if (
+        str((turn_task.first_payload or {}).get("type") or "")
+        != RESIDENT_TURN_TASK_TYPE
+    ):
+        raise InactiveTurnAuthority("task is not a strategic_resident_turn")
+    if _enum_value(turn_task.status) != _enum_value(TaskStatus.IN_PROGRESS):
+        raise InactiveTurnAuthority("turn task is not in progress")
+    if not _task_is_mutation_authorized(turn_task):
+        raise InactiveTurnAuthority("turn task is not mutation-authorized")
+    return observed_generation
 
 
 def _validate_frozen_turn_lineage_values(

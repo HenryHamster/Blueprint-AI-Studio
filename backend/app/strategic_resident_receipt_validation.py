@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import StrategicOperationReceipt
+from app.strategic_resident_evidence_policy import INSPECTION_CAPABILITY_KINDS
 from app.strategic_resident_reconciliation_validation import (
     ReconcileAcceptance,
     ReconciliationResultInvalid,
@@ -100,6 +101,16 @@ async def validate_operation_receipts(
         .all()
     )
     by_id = {row.id: row for row in rows}
+    # Inspection receipts are server-authored, read-only evidence records: the
+    # agent is never handed their ids and must not claim them as operations.
+    # Exclude them from the "claim every receipt" and "operations map 1:1"
+    # invariants, but still return them (below) so build_trusted_evidence_index
+    # can trust the evidence they vouch for.
+    inspection_capabilities = frozenset(INSPECTION_CAPABILITY_KINDS)
+    mutation_rows = [
+        row for row in rows if row.capability not in inspection_capabilities
+    ]
+    mutation_by_id = {row.id: row for row in mutation_rows}
     referenced_ids = set(claimed_ids + [identity for identity, _item in unknown])
     missing_ids = referenced_ids - set(by_id)
     if missing_ids:
@@ -128,8 +139,8 @@ async def validate_operation_receipts(
         raise ReconciliationResultInvalid(
             "operation result omitted unsettled durable receipts: " + ", ".join(omitted)
         )
-    if set(claimed_ids) != set(by_id):
-        omitted = sorted(map(str, set(by_id) - set(claimed_ids)))
+    if set(claimed_ids) != set(mutation_by_id):
+        omitted = sorted(map(str, set(mutation_by_id) - set(claimed_ids)))
         raise ReconciliationResultInvalid(
             "operation result must claim every durable turn receipt exactly once: "
             + ", ".join(omitted)
@@ -182,8 +193,8 @@ async def validate_operation_receipts(
         for item in result.operations
         if item.status != "proposed"
     }
-    durable_by_operation = {row.operation_id: row for row in rows}
-    if len(durable_by_operation) != len(rows):
+    durable_by_operation = {row.operation_id: row for row in mutation_rows}
+    if len(durable_by_operation) != len(mutation_rows):
         raise ReconciliationResultInvalid("a durable operation is claimed twice")
     if set(operations) != set(durable_by_operation):
         raise ReconciliationResultInvalid(

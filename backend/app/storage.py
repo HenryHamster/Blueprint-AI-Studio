@@ -36,6 +36,28 @@ ARTIFACT_REF_CLEANUP_BATCH_SIZE = 8
 ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS = 2
 ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS = 3
 
+# The GCS artifacts bucket has a lifecycle rule that deletes every object after
+# ~7 days from its creation date (see infra/terraform/iam.tf).  Viewable
+# compute-job artifacts (png/jpg/webp/gif/mp4/webm) at
+# compute-jobs/<job_uuid>/artifacts/viewable/ share the per-job object prefix
+# with the durable bundle tarball, so a prefix-based retention carve-out cannot
+# selectively spare them.  Once reaped, signed preview URLs for these objects
+# 404 permanently — the frontend uses this constant to distinguish a transient
+# preview failure from permanent expiry.
+VIEWABLE_ARTIFACT_RETENTION_DAYS = 7
+
+
+def artifact_expires_at(ts: datetime.datetime | None) -> str | None:
+    """Return the ISO-8601 timestamp when viewable artifacts are expected to
+    expire under the GCS bucket's lifecycle policy.
+
+    Computes ``ts + VIEWABLE_ARTIFACT_RETENTION_DAYS`` and returns the result
+    as an ISO string.  Returns ``None`` when *ts* is ``None``.
+    """
+    if ts is None:
+        return None
+    return (ts + datetime.timedelta(days=VIEWABLE_ARTIFACT_RETENTION_DAYS)).isoformat()
+
 # Merged helpers from both sides:
 # A gs:// URI is gs://<bucket>/<object>. Buckets allow lowercase letters,
 # digits, dots, dashes and underscores; object names are far more permissive

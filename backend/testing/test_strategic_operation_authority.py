@@ -7,9 +7,12 @@ import inspect
 import asyncio
 import os
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from sqlalchemy import event, update
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -1296,3 +1299,509 @@ async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db)
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
     assert len(all_receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypatch):
+    """A /capability inspection persists a context-bound, idempotent receipt."""
+    from unittest.mock import AsyncMock
+
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Simulate the frozen context_hash persisted at context-serve time.
+    turn_task.context = {**turn_task.context, TURN_CONTEXT_HASH_KEY: "ctx-hash-1"}
+    target = Task(project_id=project.id, title="target", payloads=[{"type": "plan"}])
+    authority_db.add_all([turn_task, target])
+    await authority_db.commit()
+
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        AsyncMock(return_value=turn_task),
+    )
+    token = {
+        "sub": str(turn_task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+    body = ResidentCapabilityRequest(
+        capability_id="task.logs.inspect",
+        parameters={"task_id": str(target.id)},
+    )
+
+    result = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    # Response evidence kind is mapped into the trust taxonomy (logs -> task_log).
+    assert result["evidence"]["kind"] == "task_log"
+
+    receipt = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalar_one()
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.capability == "task.logs.inspect"
+    assert receipt.status == "applied"
+    assert receipt.expected_revisions == {"context_hash": "ctx-hash-1"}
+    assert receipt.receipt["structured_result"]["evidence"][0]["kind"] == "task_log"
+
+    # Idempotent: the per-turn ledger dedups the same inspection -> one receipt.
+    await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    receipts = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalars().all()
+    assert len(receipts) == 1
+
+
+def _reprioritize_invocation(project, turn_task, target_task, priority, *, op="rp-1"):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "task.reprioritize",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"task_id": str(target_task.id), "priority": priority},
+            "operation_id": op,
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+                "target_task_updated_at": (
+                    target_task.updated_at.isoformat()
+                    if target_task.updated_at
+                    else None
+                ),
+            },
+            "evidence": (
+                CapabilityEvidenceRef(
+                    kind="task",
+                    project_id=project.id,
+                    source_id=str(target_task.id),
+                    revision="task:v1",
+                    checksum="d" * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                ),
+            ),
+        }
+    )
+
+
+def _turn_token(project, turn_task):
+    return {
+        "sub": str(turn_task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+
+
+def _task_cancel_invocation(project, turn_task, target):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "task.cancel",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"task_id": str(target.id), "reason": "held by strategy"},
+            "operation_id": "cancel-1",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+            },
+            "evidence": (
+                CapabilityEvidenceRef(
+                    kind="task",
+                    project_id=project.id,
+                    source_id=str(target.id),
+                    revision="task:v1",
+                    checksum="e" * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                ),
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_runs_the_operator_path_end_to_end(authority_db, monkeypatch):
+    """task.cancel actually cancels the target task through modify_task_apply."""
+    from app.routers import agent_resident_capabilities as capability_router
+    from app import admin_task_mutations
+
+    # Neutralize only the out-of-process broadcast; the real status transition runs.
+    async def _noop_broadcast(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(admin_task_mutations, "broadcast_to_project", _noop_broadcast)
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(
+        project_id=project.id,
+        title="worker",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "plan"}],
+    )
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _task_cancel_invocation(project, turn_task, target),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] in ("reconciled", "failed")
+
+    await authority_db.refresh(target)
+    # The operator modify path actually cancelled the target task.
+    assert target.status == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_endpoint_mutates_target_task_with_cas(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(project_id=project.id, title="worker", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _reprioritize_invocation(project, turn_task, target, 90),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] == "applied"
+    await authority_db.refresh(target)
+    assert target.priority == 90
+
+    receipt = (
+        await authority_db.execute(
+            select(StrategicOperationReceipt).where(
+                StrategicOperationReceipt.operation_id == "rp-1"
+            )
+        )
+    ).scalar_one()
+    assert receipt.operation_kind == "reprioritize_task"
+    assert receipt.capability == "task.reprioritize"
+    assert receipt.observed_revisions_before["target_task_updated_at"] is not None
+
+
+def _pr_merge_invocation(project, turn_task, *, pr_number=42, head="abc1234"):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "pr.merge",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"pr_number": pr_number, "expected_head_sha": head},
+            "operation_id": "merge-1",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+            },
+            "approval_ref": "operator-approved",
+            "evidence": tuple(
+                CapabilityEvidenceRef(
+                    kind=kind,
+                    project_id=project.id,
+                    source_id=f"pr:{pr_number}",
+                    revision=head,
+                    checksum=str(index) * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                )
+                for index, kind in enumerate(
+                    ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability")
+                )
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_requires_a_matching_operator_approval(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+
+    # No approval granted -> 403, and the external effect never runs.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 403
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_dispatches_with_a_matching_approval(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.models import StrategicOperationApproval
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    receipt = SimpleNamespace(
+        operation_id="merge-1", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # An operator grants approval for THIS exact merge (pr 42 @ abc1234).
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 42, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _pr_merge_invocation(project, turn_task),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == "pr.merge"
+    assert fenced_request.operation_kind == "merge_pull_request"
+    # The approval was consumed by this operation.
+    approval = (
+        await authority_db.execute(select(StrategicOperationApproval))
+    ).scalar_one()
+    assert approval.consumed_operation_id == "merge-1"
+
+
+@pytest.mark.asyncio
+async def test_pr_merge_approval_for_a_different_pr_is_rejected(authority_db, monkeypatch):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_operation_approval import (
+        derive_approval_key,
+        grant_operation_approval,
+    )
+
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Operator approved PR 7, but the Resident attempts to merge PR 42.
+    await grant_operation_approval(
+        authority_db,
+        project_id=project.id,
+        capability="pr.merge",
+        approval_key=derive_approval_key(
+            "pr.merge", {"pr_number": 7, "expected_head_sha": "abc1234"}
+        ),
+        granted_by="operator-1",
+        ttl_seconds=600,
+    )
+    await authority_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _pr_merge_invocation(project, turn_task, pr_number=42),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 403
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_stale_target_version_fails_closed(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(project_id=project.id, title="worker", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+    invocation = _reprioritize_invocation(project, turn_task, target, 90)
+    # Concurrent bump: the target task advances after the agent read its version.
+    target.title = "worker-moved"
+    authority_db.add(target)
+    await authority_db.commit()
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None, invocation, session=authority_db, token=_turn_token(project, turn_task)
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(target)
+    assert target.priority == 50  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_cannot_target_a_resident_turn(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Another resident-turn task in the same project must never be a mutation target.
+    other_turn = Task(
+        project_id=project.id,
+        title="other turn",
+        payloads=[{"type": "strategic_resident_turn"}],
+        priority=50,
+    )
+    authority_db.add(other_turn)
+    await authority_db.commit()
+    await authority_db.refresh(other_turn)
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _reprioritize_invocation(project, turn_task, other_turn, 90),
+            session=authority_db,
+            token=_turn_token(project, turn_task),
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(other_turn)
+    assert other_turn.priority == 50
+
+
+def test_request_fingerprint_binds_target_task_id():
+    """Two requests identical except target_task_id hash differently.
+
+    Guards the explicit target_task_id fingerprint binding for a future
+    task-mutation capability whose params do NOT echo the target id (unlike
+    task.reprioritize, whose request_payload already differs by task_id).
+    """
+    from app.strategic_operation_authority_validation import _request_fingerprint
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    common = {
+        "project_id": project_id,
+        "turn_task_id": turn_id,
+        "authority_generation": 3,
+        "operation_id": "op-x",
+        "operation_kind": "reprioritize_task",
+        "capability": "task.reprioritize",
+        "risk": "low",
+        "expected_revisions": {"target_task_updated_at": "2026-07-17T00:00:00"},
+    }
+    # Identical request_payload on purpose, so only target_task_id differs.
+    payload = {"note": "same payload"}
+    a = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=uuid.uuid4()
+    )
+    b = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=uuid.uuid4()
+    )
+    assert _request_fingerprint(a, request_payload=payload) != _request_fingerprint(
+        b, request_payload=payload
+    )
+    # A None target (Project-field op) hashes stably to itself.
+    c = FencedOperationRequest(
+        **common, request_payload=payload, target_task_id=None
+    )
+    assert _request_fingerprint(c, request_payload=payload) == _request_fingerprint(
+        c, request_payload=payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_operation_id_reuse_across_targets_collides(authority_db):
+    """Same operation_id with a different target task must 409, not mis-adopt."""
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    first = Task(project_id=project.id, title="a", payloads=[{"type": "plan"}], priority=50)
+    second = Task(project_id=project.id, title="b", payloads=[{"type": "plan"}], priority=50)
+    authority_db.add_all([first, second])
+    await authority_db.commit()
+    await authority_db.refresh(first)
+    await authority_db.refresh(second)
+
+    token = _turn_token(project, turn_task)
+    await capability_router.invoke_resident_mutation(
+        None,
+        _reprioritize_invocation(project, turn_task, first, 90, op="dup-op"),
+        session=authority_db,
+        token=token,
+    )
+    # Reusing op="dup-op" but pointing at a DIFFERENT target task must collide,
+    # because target_task_id is bound into the request fingerprint.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _reprioritize_invocation(project, turn_task, second, 90, op="dup-op"),
+            session=authority_db,
+            token=token,
+        )
+    assert exc.value.status_code == 409
+    await authority_db.refresh(second)
+    assert second.priority == 50  # the second target was never mutated
+
+
+@pytest.mark.asyncio
+async def test_reprioritize_cannot_target_own_turn_task(authority_db):
+    from app.routers import agent_resident_capabilities as capability_router
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    invocation = _reprioritize_invocation(project, turn_task, turn_task, 90)
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None, invocation, session=authority_db, token=_turn_token(project, turn_task)
+        )
+    assert exc.value.status_code == 409

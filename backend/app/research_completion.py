@@ -1047,6 +1047,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             Alert(
                 project_id=task.project_id,
                 severity=AlertSeverity.INFO,
+                event_type="research.direction_auto_completed",
                 title="Direction auto-completed",
                 message=(
                     f"Direction '{info['text'][:80]}' was auto-completed: "

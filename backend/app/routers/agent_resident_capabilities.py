@@ -9,9 +9,8 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-
-from sqlalchemy import select
 
 from app.database import get_session
 from app.models import ProjectMessage, TaskStatus
@@ -22,6 +21,12 @@ from app.resident_agent_rate_limits import (
     resident_task_token_rate_key,
 )
 from app.strategic_operation_authority import execute_fenced_db_operation
+from app.strategic_operation_external_effect import execute_external_effect_operation
+from app.strategic_resident_external_effect_adapters import (
+    EXTERNAL_EFFECT_SERVICES,
+    build_external_effect,
+    external_effect_operation_kind,
+)
 from app.strategic_operation_authority_validation import (
     AuthorityBoundaryMutation,
     AuthorityGenerationMismatch,
@@ -56,11 +61,31 @@ from app.strategic_resident_evidence_policy import (
     EvidenceKey,
     evidence_key,
 )
+from app.strategic_resident_inspection_receipt import (
+    TURN_CONTEXT_HASH_KEY,
+    build_inspection_receipt,
+    citable_inspection_evidence,
+)
 from app.strategic_resident_models import StrategicOperationReceipt
+from app.strategic_resident_operation_approval import (
+    OperatorApprovalRequired,
+    capability_requires_operator_approval,
+    derive_approval_key,
+    verify_and_consume_operation_approval,
+)
 from app.strategic_resident_project_field_mutation import (
     PROJECT_FIELD_MUTATION_SERVICE,
     project_field_mutation_callback,
     project_field_mutation_operation_kind,
+)
+from app.strategic_resident_task_mutation import (
+    TASK_MUTATION_SERVICE,
+    task_mutation_callback,
+    task_mutation_operation_kind,
+)
+from app.strategic_resident_task_lifecycle import (
+    build_task_lifecycle_effect,
+    task_lifecycle_operation_kind,
 )
 from app.strategic_resident_task_inspection import (
     ResidentTaskNotFound,
@@ -316,6 +341,21 @@ async def invoke_resident_capability(
                 task_id=target_task_id,
                 kind=_TASK_INSPECTION_KINDS[body.capability_id],
             )
+        evidence_json = evidence.model_dump(mode="json")
+        # First time this inspection is registered this turn, persist a
+        # server-authored receipt so the Resident may cite the evidence. The
+        # ledger's one-write-per-fingerprint guarantee keeps operation_id unique;
+        # the receipt row does not advance the turn task's updated_at.
+        if request_registered:
+            receipt = build_inspection_receipt(
+                capability_id=body.capability_id,
+                turn_task=task,
+                context_hash=str((task.context or {}).get(TURN_CONTEXT_HASH_KEY) or ""),
+                request_hash=fingerprint,
+                evidence_json=evidence_json,
+            )
+            if receipt is not None:
+                session.add(receipt)
         await session.commit()
     except ResidentTaskNotFound as exc:
         await session.rollback()
@@ -328,7 +368,7 @@ async def invoke_resident_capability(
         raise
     return {
         "capability_id": body.capability_id,
-        "evidence": evidence.model_dump(mode="json"),
+        "evidence": citable_inspection_evidence(evidence_json),
     }
 
 
@@ -353,13 +393,54 @@ async def invoke_resident_mutation(
     spec = capability_for(body.capability_id)
     if spec.mode is not CapabilityMode.mutate:
         raise HTTPException(status_code=400, detail="capability is not a mutation")
-    callback = project_field_mutation_callback(body.capability_id)
-    operation_kind = project_field_mutation_operation_kind(body.capability_id)
-    if (
-        spec.service != PROJECT_FIELD_MUTATION_SERVICE
-        or callback is None
-        or operation_kind is None
-    ):
+    # Resolve the fenced adapter: a DB-only Project-field / target-task mutation
+    # (execute_fenced_db_operation), or an external-effect operation
+    # (execute_external_effect_operation). External effects are gated by the
+    # plan's own mechanisms — a wired adapter, evidence preconditions, authority
+    # fencing, and (for explicit-approval capabilities) approval — plus the
+    # master gate that nothing runs until an operator flips a project's engine
+    # ownership to the Resident. A capability with no wired adapter stays 501.
+    target_task_id: uuid.UUID | None = None
+    callback = None
+    operation_kind = None
+    external_effect = None
+    # Task-lifecycle mutations (cancel/requeue/retry/unblock) run the operator's
+    # own modify_task_apply path inside the two-phase executor's perform phase —
+    # so all the cascade (child cancellation, slot release, VM teardown) is reused
+    # rather than re-implemented. Checked first because these span two declared
+    # services but share one execution path.
+    lifecycle_kind = task_lifecycle_operation_kind(body.capability_id)
+    if lifecycle_kind is not None:
+        operation_kind = lifecycle_kind
+        external_effect = build_task_lifecycle_effect(
+            body.capability_id,
+            project_id=binding.project_id,
+            parameters=dict(body.parameters),
+        )
+    elif spec.service in EXTERNAL_EFFECT_SERVICES:
+        operation_kind = external_effect_operation_kind(body.capability_id)
+        if operation_kind is not None:
+            external_effect = build_external_effect(
+                body.capability_id,
+                project_id=binding.project_id,
+                turn_task_id=binding.task_id,
+                parameters=dict(body.parameters),
+            )
+    elif spec.service == PROJECT_FIELD_MUTATION_SERVICE:
+        callback = project_field_mutation_callback(body.capability_id)
+        operation_kind = project_field_mutation_operation_kind(body.capability_id)
+    elif spec.service == TASK_MUTATION_SERVICE:
+        callback = task_mutation_callback(body.capability_id)
+        operation_kind = task_mutation_operation_kind(body.capability_id)
+        if callback is not None:
+            raw_target = body.parameters.get("task_id")
+            if raw_target is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="task mutation requires a task_id parameter",
+                )
+            target_task_id = uuid.UUID(str(raw_target))
+    if operation_kind is None or (callback is None and external_effect is None):
         raise HTTPException(
             status_code=501,
             detail="mutation capability is proposal-only until a fenced adapter exists",
@@ -370,8 +451,27 @@ async def invoke_resident_mutation(
             status_code=403,
             detail="mutation envelope does not match the turn token authority",
         )
-    if spec.approval_policy == "explicit":
-        await _validate_approval_ref(session, body.approval_ref, binding.project_id)
+    # Explicit-approval capabilities require a durable operator approval scoped to
+    # this exact operation (the key is derived from the parameters, so an approval
+    # granted for one operation cannot authorise a different one). Consumed here
+    # in the request transaction — idempotent per operation_id — before any effect.
+    # This durable-approval gate (migration 0632, keyed on capability+parameters)
+    # supersedes the earlier approval_ref-vs-ProjectMessage check on these same
+    # capabilities; the operator grant creates an approval record, not a message,
+    # so re-adding _validate_approval_ref here would 403 every real approval.
+    if capability_requires_operator_approval(body.capability_id):
+        try:
+            await verify_and_consume_operation_approval(
+                session,
+                project_id=binding.project_id,
+                capability=body.capability_id,
+                approval_key=derive_approval_key(body.capability_id, body.parameters),
+                operation_id=str(body.operation_id),
+            )
+            await session.commit()
+        except OperatorApprovalRequired as exc:
+            await session.rollback()
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
     fenced_request = FencedOperationRequest(
         project_id=binding.project_id,
         turn_task_id=binding.task_id,
@@ -382,12 +482,35 @@ async def invoke_resident_mutation(
         risk=spec.risk.value,
         expected_revisions=dict(body.expected_revisions),
         request_payload=dict(body.parameters),
+        target_task_id=target_task_id,
     )
-    await _check_evidence_refs_against_receipts(session, binding, body.evidence)
+    # Evidence refs supplied for a DB-fenced mutation must each be backed by a
+    # real inspection receipt from this turn. External-effect operations are
+    # governed by their own evidence preconditions + reconciliation-time trusted
+    # evidence index, and run on a session shape this read-then-rollback check
+    # does not apply to, so it is scoped to the fenced-DB path only.
+    if external_effect is None:
+        await _check_evidence_refs_against_receipts(session, binding, body.evidence)
     try:
-        receipt = await execute_fenced_db_operation(session, fenced_request, callback)
+        if external_effect is not None:
+            receipt = await execute_external_effect_operation(
+                session,
+                fenced_request,
+                perform=external_effect,
+                effect_kind=operation_kind,
+            )
+        else:
+            receipt = await execute_fenced_db_operation(
+                session, fenced_request, callback
+            )
     except OperationIdentityCollision as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IntegrityError as exc:
+        # A concurrent invocation with the same operation_id won the unique
+        # (project_id, operation_id) insert first — the loser retries as a 409.
+        raise HTTPException(
+            status_code=409, detail="operation is already in progress"
+        ) from exc
     except (
         AuthorityGenerationMismatch,
         ResidentEngineOwnerMismatch,

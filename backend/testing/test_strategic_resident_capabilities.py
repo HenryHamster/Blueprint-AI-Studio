@@ -579,6 +579,103 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
     load.assert_not_awaited()
 
 
+def test_inspection_receipt_maps_kind_and_is_trusted():
+    """An inspection receipt makes its evidence citable via the trusted index."""
+    from app.strategic_resident_evidence_validation import (
+        _canonical_hash,
+        build_trusted_evidence_index,
+    )
+    from app.strategic_resident_inspection_receipt import (
+        build_inspection_receipt,
+        citable_inspection_evidence,
+    )
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    source_id = str(uuid.uuid4())
+    evidence_json = {
+        "kind": "logs",
+        "project_id": str(project_id),
+        "source_id": source_id,
+        "revision": "task:v1",
+        "checksum": "e" * 64,
+        "observed_at": "2026-07-17T00:00:00+00:00",
+        "data": {"task_id": source_id},
+    }
+    # A logs inspection maps into the task_log trust kind.
+    assert citable_inspection_evidence(evidence_json)["kind"] == "task_log"
+
+    turn_task = SimpleNamespace(
+        id=turn_id,
+        project_id=project_id,
+        first_payload={"authority_generation": 3},
+        context={},
+    )
+    receipt = build_inspection_receipt(
+        capability_id="task.logs.inspect",
+        turn_task=turn_task,
+        context_hash="ctx-123",
+        request_hash="f" * 64,
+        evidence_json=evidence_json,
+    )
+    assert receipt is not None
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.status == "applied"
+    assert receipt.risk_level == "low"
+    assert receipt.expected_revisions == {"context_hash": "ctx-123"}
+
+    provider_input = {
+        "lineage": {"context_hash": "ctx-123", "evidence_hash": _canonical_hash([])},
+        "evidence": [],
+    }
+    index = build_trusted_evidence_index(
+        provider_input, [receipt], expected_context_hash="ctx-123"
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) in index.entries
+
+    # The context_hash binding is meaningful: the SAME receipt is NOT trusted in a
+    # turn with a different context_hash (its evidence is dropped from the index).
+    other = build_trusted_evidence_index(
+        {
+            "lineage": {"context_hash": "ctx-other", "evidence_hash": _canonical_hash([])},
+            "evidence": [],
+        },
+        [receipt],
+        expected_context_hash="ctx-other",
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) not in other.entries
+
+
+def test_inspection_receipt_requires_context_hash_and_mapped_capability():
+    from app.strategic_resident_inspection_receipt import build_inspection_receipt
+
+    turn_task = SimpleNamespace(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), first_payload={}, context={}
+    )
+    # No persisted context_hash -> no receipt (inspection still returns evidence).
+    assert (
+        build_inspection_receipt(
+            capability_id="task.inspect",
+            turn_task=turn_task,
+            context_hash="",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+    # A capability with no inspection-kind mapping is not receipted.
+    assert (
+        build_inspection_receipt(
+            capability_id="pr.merge",
+            turn_task=turn_task,
+            context_hash="ctx",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+
+
 def test_all_resident_capability_routes_are_token_allowlisted():
     """Every capability route must be in the resident-token allowlist.
 
@@ -639,6 +736,22 @@ def _mutation_token(project_id, turn_task_id):
     }
 
 
+def _evidence_of_kinds(project_id, *kinds):
+    from app.strategic_resident_capability_invocation import CapabilityEvidenceRef
+
+    return tuple(
+        CapabilityEvidenceRef(
+            kind=kind,
+            project_id=project_id,
+            source_id=f"{kind}-{index}",
+            revision=f"{kind}:v1",
+            checksum=str(index) * 64,
+            inspected_at=datetime.now(timezone.utc),
+        )
+        for index, kind in enumerate(kinds)
+    )
+
+
 @pytest.mark.asyncio
 async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     project_id = uuid.uuid4()
@@ -689,17 +802,135 @@ async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "expected_kind"),
+    [
+        ("task.cancel", "cancel_task"),
+        ("task.requeue", "requeue_task"),
+        ("task.retry", "retry_task"),
+        ("task.unblock", "unblock_task"),
+    ],
+)
+async def test_task_lifecycle_routes_through_the_external_executor(
+    monkeypatch, capability, expected_kind
+):
+    """cancel/requeue/retry/unblock run the operator modify path via the executor."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-life", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    evidence_kind = {
+        "task.cancel": "task",
+        "task.requeue": "task",
+        "task.retry": "task_failure",
+        "task.unblock": "task_blocker",
+    }[capability]
+    params = {"task_id": str(uuid.uuid4())}
+    if capability == "task.cancel":
+        params["reason"] = "held by strategy"
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id=capability,
+        parameters=params,
+        evidence=_evidence_of_kinds(project_id, evidence_kind),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == capability
+    assert fenced_request.operation_kind == expected_kind
+
+
+@pytest.mark.asyncio
+async def test_external_effect_pr_create_dispatches(monkeypatch):
+    """A wired external effect (pr.create) routes to the external executor.
+
+    No arming gate: usability is governed by the plan's own gates (a wired
+    adapter + evidence + authority + the operator engine-ownership flip).
+    """
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-ext", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.create",
+        parameters={"head": "feature", "base": "main", "title": "PR"},
+        evidence=_evidence_of_kinds(project_id, "branch"),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    # The fenced request is built from the token authority + declared kind.
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == "pr.create"
+    assert fenced_request.operation_kind == "create_pull_request"
+    assert fenced_request.project_id == project_id
+
+
+@pytest.mark.asyncio
+async def test_external_effect_unwired_capability_stays_501(monkeypatch):
+    """pr.merge has no wired adapter yet, so it stays proposal-only (501)."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    external = AsyncMock()
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    # pr.update is a github_pulls capability with no wired adapter yet.
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="pr.update",
+        parameters={"pr_number": 5},
+        evidence=_evidence_of_kinds(project_id, "pr"),
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    external.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_mutation_route_501_for_capability_without_fenced_adapter(monkeypatch):
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     executor = AsyncMock()
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
-    # task.reprioritize is a real mutate capability but has no project-field adapter.
+    # task.park is a real mutate capability but has no fenced adapter yet.
     invocation = _mutation_invocation(
         project_id,
         turn_id,
-        capability_id="task.reprioritize",
-        parameters={"task_id": str(uuid.uuid4()), "priority": 5},
+        capability_id="task.park",
+        parameters={"task_id": str(uuid.uuid4()), "reason": "held for review"},
     )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(

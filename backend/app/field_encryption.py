@@ -29,28 +29,11 @@ ALLOW_PLAINTEXT_CREDENTIALS_ENV = "ALLOW_PLAINTEXT_CREDENTIALS"
 # string is almost certainly Fernet ciphertext, not plaintext.
 FERNET_CIPHERTEXT_PREFIX = "gAAAAA"
 
-# Boot-time key-continuity probe.
-#
-# CONTINUITY_REFERENCE_CIPHERTEXT holds a Fernet token that probe_key_continuity()
-# decrypts with the CURRENT configured key.  An InvalidToken means the active key
-# does not match the key that encrypted existing at-rest data.
-#
-# IMPORTANT: the reference ciphertext is KEY-SPECIFIC.  A source-hardcoded token
-# encrypted with the CI/authoring key cannot be decrypted by the production key
-# and will crash every Cloud Run boot.  The constant is intentionally left empty
-# here; the probe is a no-op when neither this constant nor the
-# ENCRYPTION_KEY_CONTINUITY_REFERENCE env var is set.
-#
-# To enable the continuity probe in an environment:
-#   1. Generate the reference at key-setup time:
-#        python -c "from cryptography.fernet import Fernet; k=b'<YOUR_KEY>'; \
-#                   print(Fernet(k).encrypt(b'blueprint-field-encryption-continuity-v1').decode())"
-#   2. Set ENCRYPTION_KEY_CONTINUITY_REFERENCE to that output alongside
-#      GITHUB_PAT_ENCRYPTION_KEY in the same secret manager entry.
-#   3. Update both values together whenever the encryption key is rotated.
+# Plaintext sentinel used to mint per-environment continuity reference tokens.
+# probe_key_continuity() encrypts this with the CURRENT Fernet key on first boot
+# and stores the result; on subsequent boots it decrypts the stored reference
+# and fails closed on InvalidToken (wrong-key rotation / misconfiguration).
 CONTINUITY_REFERENCE_PLAINTEXT = "blueprint-field-encryption-continuity-v1"
-CONTINUITY_REFERENCE_ENV = "ENCRYPTION_KEY_CONTINUITY_REFERENCE"
-CONTINUITY_REFERENCE_CIPHERTEXT = ""  # empty = probe skipped; set via CONTINUITY_REFERENCE_ENV
 
 
 def is_encryption_active() -> bool:
@@ -185,41 +168,48 @@ def assert_plaintext_or_raise(value: str | None) -> None:
         )
 
 
-def probe_key_continuity(context: str) -> None:
-    """Fail fast if the configured key cannot decrypt the continuity reference.
+def probe_key_continuity(
+    context: str,
+    reference_ciphertext: str | None = None,
+) -> str | None:
+    """Verify or mint a per-environment continuity reference ciphertext.
 
-    Raises ``RuntimeError`` when the active Fernet key is different from the
-    canonical key used to produce the reference ciphertext — which means
-    credentials encrypted under the old key are now unreadable.
+    **When *reference_ciphertext* is provided** — verify that the currently
+    configured Fernet key can decrypt it.  Raises ``RuntimeError`` on
+    ``InvalidToken``, meaning the key was rotated without re-encrypting
+    at-rest data (or the wrong key is configured), and any backfill re-run
+    would silently store plaintext.
 
-    The reference ciphertext is resolved in order:
-    1. The ``ENCRYPTION_KEY_CONTINUITY_REFERENCE`` env var (preferred for
-       production — set it alongside ``GITHUB_PAT_ENCRYPTION_KEY``).
-    2. The module-level ``CONTINUITY_REFERENCE_CIPHERTEXT`` constant (overridable
-       by tests via monkeypatch).
-    3. If neither is set (both empty/absent), the probe is a no-op.
+    **When *reference_ciphertext* is ``None``** — mint a new continuity
+    reference ciphertext with the currently configured key and return it.
+    The caller should persist the returned value so it can be passed back
+    on subsequent boots.
 
-    Does nothing when no encryption key is configured (encryption inactive);
-    callers that require encryption should call ``require_encryption_active``
-    separately.
+    Returns ``None`` when no key is configured (encryption inactive);
+    callers that require encryption should call
+    ``require_encryption_active`` separately.
     """
-    ciphertext = os.getenv(CONTINUITY_REFERENCE_ENV) or CONTINUITY_REFERENCE_CIPHERTEXT
-    if not ciphertext:
-        return  # no reference configured — skip probe
     f = _get_fernet()
     if f is None:
-        return
-    try:
-        f.decrypt(ciphertext.encode())
-    except InvalidToken as exc:
-        raise RuntimeError(
-            f"{context}: {ENCRYPTION_KEY_ENV} is set but cannot decrypt the "
-            "continuity reference token — the configured key does not match the "
-            "canonical encryption key used for existing at-rest ciphertext. "
-            "A wrong-key rotation will leave encrypted columns unreadable. "
-            f"Restore the correct key or update {CONTINUITY_REFERENCE_ENV} to "
-            "a token encrypted with the new key after re-encrypting all data."
-        ) from exc
+        return None
+
+    if reference_ciphertext is not None:
+        # Verify an existing reference — fail closed on wrong key.
+        try:
+            f.decrypt(reference_ciphertext.encode())
+        except InvalidToken as exc:
+            raise RuntimeError(
+                f"{context}: {ENCRYPTION_KEY_ENV} is set but cannot decrypt the "
+                "persisted continuity reference token — the configured key does not "
+                "match the canonical encryption key used for existing at-rest "
+                "ciphertext. A wrong-key rotation will leave encrypted columns "
+                "unreadable. Restore the correct key or re-encrypt all data before "
+                "deploying."
+            ) from exc
+        return None
+    else:
+        # First boot — mint a continuity reference with the current key.
+        return f.encrypt(CONTINUITY_REFERENCE_PLAINTEXT.encode()).decode()
 
 
 def decrypt_field(value: str | None) -> str | None:

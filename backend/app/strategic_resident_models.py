@@ -427,3 +427,123 @@ class StrategicOperationReceipt(SQLModel, table=True):
             "started_at",
         ),
     )
+
+
+class StrategicWorkerMemoryProposal(SQLModel, table=True):
+    """A bounded worker's proposed strategic-memory change, awaiting admission.
+
+    A worker (e.g. a completed StrategicCycle) inserts a ``pending`` row; Resident
+    reconciliation drains it, admits it only while its revision-link
+    (``target_checkpoint_version``/``hash``) is still current and its evidence is
+    trusted, and marks it ``admitted`` or ``rejected``. Workers never mutate
+    strategic memory directly — this table is the only intake, and admission runs
+    exclusively inside the checkpoint-CAS reconciliation transaction.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("strategicresident.project_id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    proposal_id: str = Field(sa_column=Column(String(120), nullable=False))
+    layer: str = Field(sa_column=Column(String(32), nullable=False))
+    updates: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    rationale: str = Field(sa_column=Column(String(4000), nullable=False))
+    evidence: list[Any] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    target_checkpoint_version: int = Field(
+        sa_column=Column(BigInteger, nullable=False)
+    )
+    target_checkpoint_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    status: str = Field(
+        default="pending",
+        sa_column=Column(String(16), nullable=False, server_default=text("'pending'")),
+    )
+    rejection_reason: str | None = Field(
+        default=None, sa_column=Column(String(500), nullable=True)
+    )
+    # Not a FK: a StrategicCycle may be pruned, but the proposal provenance stays.
+    source_cycle_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    resolved_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "proposal_id",
+            name="uq_strategicworkermemoryproposal_project_proposal",
+        ),
+        CheckConstraint(
+            "layer IN ('charter','working_strategy')",
+            name="chk_strategicworkermemoryproposal_layer",
+        ),
+        CheckConstraint(
+            "status IN ('pending','admitted','rejected')",
+            name="chk_strategicworkermemoryproposal_status",
+        ),
+        Index(
+            "ix_strategicworkermemoryproposal_project_status",
+            "project_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+
+class StrategicOperationApproval(SQLModel, table=True):
+    """A durable operator approval for one explicit-approval Resident operation.
+
+    An operator grants an approval scoped to a project, a capability, and an
+    ``approval_key`` DERIVED from the exact operation parameters (e.g. the PR
+    number + head sha for ``pr.merge``). The Resident cannot redirect an approval
+    to a different operation because the router re-derives the key from the
+    invocation it is actually executing. Single-use: consumed by exactly one
+    fenced operation id (idempotent for that id's retries).
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("strategicresident.project_id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    capability: str = Field(sa_column=Column(String(120), nullable=False))
+    approval_key: str = Field(sa_column=Column(String(400), nullable=False))
+    granted_by: str = Field(sa_column=Column(String(255), nullable=False))
+    granted_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    expires_at: datetime = Field(sa_column=Column(NaiveUTCDateTime, nullable=False))
+    consumed_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    consumed_operation_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_strategicoperationapproval_lookup",
+            "project_id",
+            "capability",
+            "approval_key",
+        ),
+    )

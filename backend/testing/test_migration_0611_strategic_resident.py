@@ -313,7 +313,12 @@ def _exercise_staged_cutover_checkpoint(
         "source_turn_task_id": stored_source_id,
     }
     # A cutover-shaped row without the private, locked Resident marker is forged.
-    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+    with pytest.raises(
+        # The checkpoint authority fence RAISEs SQLSTATE 42501 → asyncpg
+        # InsufficientPrivilegeError → sqlalchemy ProgrammingError on Postgres;
+        # SQLite surfaces the same rejection as IntegrityError (RAISE(ABORT)).
+        (sa.exc.IntegrityError, sa.exc.ProgrammingError)
+    ), connection.begin_nested():
         connection.execute(checkpoint.insert().values(**checkpoint_values))
 
     authorization = {
@@ -342,7 +347,12 @@ def _exercise_staged_cutover_checkpoint(
     )
     # Possessing the private key is insufficient: every marker field must bind
     # exactly to the candidate checkpoint and its immutable lineage.
-    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+    with pytest.raises(
+        # The checkpoint authority fence RAISEs SQLSTATE 42501 → asyncpg
+        # InsufficientPrivilegeError → sqlalchemy ProgrammingError on Postgres;
+        # SQLite surfaces the same rejection as IntegrityError (RAISE(ABORT)).
+        (sa.exc.IntegrityError, sa.exc.ProgrammingError)
+    ), connection.begin_nested():
         connection.execute(checkpoint.insert().values(**checkpoint_values))
 
     connection.execute(
@@ -1261,7 +1271,10 @@ async def test_postgres_upgrade_installs_and_exercises_authority_triggers():
                     )
                 )
                 with (
-                    pytest.raises(sa.exc.IntegrityError),
+                    # The authority fence RAISEs SQLSTATE 42501 → asyncpg
+                    # InsufficientPrivilegeError → sqlalchemy ProgrammingError on
+                    # Postgres (SQLite surfaces the same rejection as IntegrityError).
+                    pytest.raises((sa.exc.IntegrityError, sa.exc.ProgrammingError)),
                     connection.begin_nested(),
                 ):
                     connection.execute(
