@@ -345,10 +345,19 @@ Implementation checklist:
 - [x] Add `signal_project_change`, the production entrypoint for the background
   `project_change` coalescing lane with the zero-model unchanged guarantee
   (PR `#15656`).
-- Follow-on wires (bounded slices deferred, not blocking M4): critical
-  external effects (`pr.merge`/`deployment.*`) stay 501 pending real approval
-  verification; the worker-proposal storage/drain and the `signal_project_change`
-  trigger call sites connect their producers in M5-adjacent work.
+- [x] Follow-on wires (were bounded slices deferred at M4 close, now landed):
+  worker-proposal storage + reconciliation drain; `signal_project_change`
+  production triggers; the remaining DB-only `task.*` lifecycle adapters routed
+  through the operator `modify_task_apply` path; real single-use/TTL operator
+  approval verification (`StrategicOperationApproval`) with the owner-gated grant
+  endpoint; `pr.merge` (sha-guarded) and `pr.create` external-effect adapters off
+  their 501 stubs; managed-Task escalation adapters.
+- The remaining catalog entries left `propose_only` — `pr.inspect` and the
+  higher-stakes `deployment.deploy`/`deployment.rollback` — are an **intentional
+  product decision, not a gap**: the Resident proposes them and an operator
+  actually invokes them. This keeps the highest-blast-radius actions human-driven
+  while every evidence/authority/receipt fence around them is already built and
+  tested, so promoting one later is a catalog flip, not new machinery.
 
 ### M5 — Rollout, legacy retirement, and release audit
 
@@ -363,6 +372,30 @@ Implementation checklist:
 - Failover, context rotation, 10,000-event noise, crash-boundary, prompt-injection,
   migration/rollback, and seven-day soak coverage.
 - Requirement-by-requirement evidence audit before removing rollback projections.
+
+Implementation checklist:
+
+- [x] Make the per-project engine flip operator-invokable: owner-gated
+  `POST /api/admin/projects/{id}/resident-engine/cutover` and `.../rollback`
+  wrap the tested `cutover_to_strategic_resident` /
+  `rollback_to_legacy_resident` transitions. Cutover provisions the Resident +
+  v1 checkpoint first (idempotent) so the switch works on any project; both are
+  idempotent, reversible, and map every `ResidentOwnershipTransitionError` to a
+  409. This is the reversible one-shot the rollout/rollback rehearsals drive.
+- [ ] Complete shadow comparisons and rollout health surfaces (soak evidence).
+- [ ] Legacy-handler retirement after the soak and rollback evidence converge.
+- [ ] Adversarial-authority, noise, crash-boundary, and seven-day soak suites.
+
+Rollout runbook (per pilot project):
+
+1. `POST /api/admin/projects/{project_id}/resident-engine/cutover` (owner token)
+   — response shows `previous_owner: "legacy"` → `new_owner: "strategic_resident"`
+   and the advanced `new_generation`. Idempotent: a repeat returns
+   `already_owned: true` without advancing the generation.
+2. Observe one project through a strategy turn; the Resident now owns the engine
+   with low-latency chat and the always-on background lane.
+3. Widen to more projects, or `POST .../resident-engine/rollback` to fence the
+   generation and restore legacy inputs if anything looks off.
 
 ## Latency and ergonomics budget
 
