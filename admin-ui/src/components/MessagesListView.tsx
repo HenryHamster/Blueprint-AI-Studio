@@ -1037,7 +1037,7 @@ function ConversationVirtualList({
   ]);
 
   return (
-    <div className="relative flex-1 overflow-hidden bg-workbench-base" data-testid="strategic-conversation-column">
+    <div className="relative mx-auto w-full max-w-[940px] flex-1 overflow-hidden bg-workbench-base" data-testid="strategic-conversation-column">
       <List
         rowCount={rows.length}
         rowComponent={ConversationRowView}
