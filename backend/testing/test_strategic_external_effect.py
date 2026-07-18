@@ -332,7 +332,7 @@ async def test_pr_merge_adapter_forwards_the_approved_head_sha(monkeypatch):
     """
     import uuid as _uuid
 
-    from app import github_pulls, github_token_resolver
+    from app import github_pulls, github_token_resolver, rollup_migration_validation
     from app.strategic_resident_external_effect_adapters import build_external_effect
 
     captured = {}
@@ -345,8 +345,19 @@ async def test_pr_merge_adapter_forwards_the_approved_head_sha(monkeypatch):
         captured["expected_head_sha"] = kwargs.get("expected_head_sha")
         return {"merged": True, "sha": kwargs.get("expected_head_sha")}
 
+    async def _fake_get_pr(token, owner, repo, pr_number, **kwargs):
+        return {"base": {"ref": "automain"}}
+
+    async def _fake_guard(token, owner, repo, pr_number, target_branch, **kwargs):
+        captured["guard_target_branch"] = target_branch
+        return (True, None)  # ok verdict -> merge proceeds
+
     monkeypatch.setattr(github_token_resolver, "get_github_token_for_task", _fake_token)
+    monkeypatch.setattr(github_pulls, "get_pull_request", _fake_get_pr)
     monkeypatch.setattr(github_pulls, "merge_pull_request", _fake_merge)
+    monkeypatch.setattr(
+        rollup_migration_validation, "enforce_premerge_migration_guard", _fake_guard
+    )
 
     perform = build_external_effect(
         "pr.merge",
@@ -357,4 +368,50 @@ async def test_pr_merge_adapter_forwards_the_approved_head_sha(monkeypatch):
     result = await perform(None)
     assert captured["pr_number"] == 42
     assert captured["expected_head_sha"] == "abc1234"  # the approved sha is pinned
+    assert captured["guard_target_branch"] == "automain"  # PR base fed to the guard
     assert result["merged"] is True
+
+
+async def test_pr_merge_adapter_fails_closed_when_migration_guard_blocks(monkeypatch):
+    """A block/defer verdict from the pre-merge dual-head guard must abort the merge.
+
+    Without the guard an autonomous resident merge could land a migration-colliding
+    PR onto an integration/promotion branch and wedge ``alembic upgrade head``.
+    The merge primitive must never be reached on a non-``ok`` verdict.
+    """
+    import uuid as _uuid
+
+    from app import github_pulls, github_token_resolver, rollup_migration_validation
+    from app.strategic_resident_external_effect_adapters import build_external_effect
+
+    merge_attempted = {"value": False}
+
+    async def _fake_token(task_id, session):
+        return ("ghs_token", "owner", "repo")
+
+    async def _fake_get_pr(token, owner, repo, pr_number, **kwargs):
+        return {"base": {"ref": "automain"}}
+
+    async def _fake_merge(token, owner, repo, pr_number, **kwargs):
+        merge_attempted["value"] = True
+        return {"merged": True}
+
+    async def _fake_guard(token, owner, repo, pr_number, target_branch, **kwargs):
+        return (False, "duplicate revision id 0631 — combined chain has two heads")
+
+    monkeypatch.setattr(github_token_resolver, "get_github_token_for_task", _fake_token)
+    monkeypatch.setattr(github_pulls, "get_pull_request", _fake_get_pr)
+    monkeypatch.setattr(github_pulls, "merge_pull_request", _fake_merge)
+    monkeypatch.setattr(
+        rollup_migration_validation, "enforce_premerge_migration_guard", _fake_guard
+    )
+
+    perform = build_external_effect(
+        "pr.merge",
+        project_id=_uuid.uuid4(),
+        turn_task_id=_uuid.uuid4(),
+        parameters={"pr_number": 42, "expected_head_sha": "abc1234"},
+    )
+    with pytest.raises(RuntimeError, match="migration guard blocked"):
+        await perform(None)
+    assert merge_attempted["value"] is False  # merge primitive never reached
