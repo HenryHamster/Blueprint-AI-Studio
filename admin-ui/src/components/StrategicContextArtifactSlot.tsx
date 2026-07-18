@@ -315,14 +315,14 @@ function MediaSkeleton({ className }: { className: string }) {
   );
 }
 
-function MediaExpired({ label }: { label: string }) {
+function MediaExpired({ label, reaped }: { label: string; reaped?: boolean }) {
   return (
     <div
       className="flex w-full items-center justify-center gap-1.5 px-2 py-2 text-xs text-neutral-500"
       data-testid="strategic-artifact-expired"
     >
       <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-      {label} — URL expired
+      {label} — {reaped ? 'media deleted' : 'URL expired'}
     </div>
   );
 }

@@ -254,10 +254,13 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
 
     // Second error (auto-retry already consumed, fresh signed URL also failed) —
-    // the GCS object is reaped; show 'expired' state, not a futile retry button.
+    // the GCS object is reaped; show 'media deleted', not 'URL expired' or a retry button.
     const img2 = host!.querySelector('img');
     await act(async () => { img2!.dispatchEvent(new Event('error')); });
-    expect(host!.querySelector('[data-testid="strategic-artifact-expired"]')).not.toBeNull();
+    const expired = host!.querySelector('[data-testid="strategic-artifact-expired"]');
+    expect(expired).not.toBeNull();
+    expect(expired!.textContent).toContain('media deleted');
+    expect(expired!.textContent).not.toContain('URL expired');
     expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
     expect(host!.querySelector('img')).toBeNull();
     // No further re-mint attempts — the object is gone.
@@ -323,10 +326,13 @@ describe('StrategicContextArtifactSlot — lazy signed-URL resolution', () => {
     expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
 
     // Second error (auto-retry already consumed, fresh signed URL also failed) —
-    // the GCS object is reaped; show 'expired' state, not a futile retry button.
+    // the GCS object is reaped; show 'media deleted', not 'URL expired' or a retry button.
     const video2 = host!.querySelector('[data-testid="strategic-artifact-video"]');
     await act(async () => { video2!.dispatchEvent(new Event('error')); });
-    expect(host!.querySelector('[data-testid="strategic-artifact-expired"]')).not.toBeNull();
+    const expired = host!.querySelector('[data-testid="strategic-artifact-expired"]');
+    expect(expired).not.toBeNull();
+    expect(expired!.textContent).toContain('media deleted');
+    expect(expired!.textContent).not.toContain('URL expired');
     expect(host!.querySelector('[data-testid="strategic-artifact-retry"]')).toBeNull();
     expect(host!.querySelector('[data-testid="strategic-artifact-video"]')).toBeNull();
     // No further re-mint attempts — the object is gone.
