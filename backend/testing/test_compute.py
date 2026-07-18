@@ -19009,8 +19009,13 @@ def test_build_and_push_skips_when_image_present(tmp_path):
 
         class P:
             returncode = 0
-            stdout = "reg/repo/img@sha256:" + "a" * 64
+            stdout = ""
             stderr = ""
+
+        # The already-present fast path reads the digest daemon-free from the
+        # registry via `gcloud artifacts docker images describe --format=json`.
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
+            P.stdout = json.dumps({"image_summary": {"digest": "sha256:" + "a" * 64}})
         return P()
 
     result = _bci.build_and_push(
@@ -19027,7 +19032,7 @@ def test_build_and_push_skips_when_image_present(tmp_path):
     # No `docker build` / `docker push` was invoked.
     assert not any("build" in c for c in run_calls)
     assert not any("push" in c for c in run_calls)
-    assert result.pinned_ref.startswith("reg/repo/img@sha256:")
+    assert result.pinned_ref == "reg/repo/img@sha256:" + "a" * 64
 
 
 def test_build_and_push_builds_when_hash_new(tmp_path):
@@ -19041,8 +19046,12 @@ def test_build_and_push_builds_when_hash_new(tmp_path):
         class P:
             returncode = 0
             stderr = ""
-            # docker image inspect --format returns the RepoDigest.
-            stdout = "reg/repo/img@sha256:" + "b" * 64
+            stdout = ""
+
+        # After push, the canonical digest is read daemon-free from the registry
+        # via `gcloud artifacts docker images describe --format=json` (#15569).
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
+            P.stdout = json.dumps({"image_summary": {"digest": "sha256:" + "b" * 64}})
         return P()
 
     result = _bci.build_and_push(
@@ -19521,18 +19530,13 @@ def test_already_present_resolves_digest_from_registry_with_an_empty_local_store
 
     def fake_run(cmd, **kw):
         cmds.append(cmd)
-        if cmd[:3] == ["docker", "manifest", "inspect"]:
+        # The digest is read daemon-free from the REGISTRY via
+        # `gcloud artifacts docker images describe --format=json` (#15569) —
+        # it never consults the local docker store, so a fresh/pruned host
+        # still resolves the pin.
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
             return _ok_proc(
-                stdout=json.dumps(
-                    {
-                        "Ref": "reg/repo/img:tag",
-                        "Descriptor": {
-                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                            "digest": registry_digest,
-                            "size": 1234,
-                        },
-                    }
-                )
+                stdout=json.dumps({"image_summary": {"digest": registry_digest}})
             )
         if cmd[:3] == ["docker", "image", "inspect"]:
             # EMPTY LOCAL STORE — this host never built or pulled the image.
@@ -19556,7 +19560,9 @@ def test_already_present_resolves_digest_from_registry_with_an_empty_local_store
     )
     assert result.pinned_ref == "reg/repo/img@" + registry_digest
     assert result.digest_unknown is False
-    assert any(c[:3] == ["docker", "manifest", "inspect"] for c in cmds)
+    assert any(
+        c[:5] == ["gcloud", "artifacts", "docker", "images", "describe"] for c in cmds
+    )
 
 
 def test_already_present_marks_the_digest_unknown_when_no_source_resolves_it(tmp_path):
@@ -25577,99 +25583,89 @@ def _read_infra_file(relative_name: str) -> str:
 def test_compute_image_builder_least_privilege_contract():
     iam = _read_infra_file("infra/terraform/iam.tf")
     wi = _read_infra_file("infra/terraform/workload_identity.tf")
-    cloudbuild = _read_infra_file("backend/cloudbuild.yaml")
-    cloud_run = _read_infra_file("infra/terraform/cloud_run.tf")
 
-    # (a) A dedicated builder SA exists.
-    assert 'resource "google_service_account" "compute_image_builder_sa"' in iam
-    assert 'account_id   = "compute-image-builder-sa"' in iam
+    # The compute-image builder is a dedicated LEAF service account whose only
+    # capability is push/pull on the compute-images Artifact Registry repo, so an
+    # off-orchestrator project-image build reaches none of the orchestrator's
+    # authority: no Secret Manager, no agent-artifacts bucket, no other project
+    # role. This SA (``image_builder_sa``, #15566) superseded the earlier
+    # Cloud-Build ``compute_image_builder_sa`` (#15482) when the builder moved to a
+    # throwaway builder VM; its bindings are the real current least-privilege
+    # contract this test guards.
+    builder_member = "google_service_account.image_builder_sa.email"
 
-    # (b) A dedicated, disposable, short-retention build-source bucket exists,
-    #     separate from the general agent-artifacts bucket.
-    assert 'resource "google_storage_bucket" "compute_build_source"' in iam
-    assert '"${var.project_id}-compute-build-source"' in iam
-    # Short retention (age = 1 day) so build inputs are not durably retained.
-    source_block = iam.split('resource "google_storage_bucket" "compute_build_source"', 1)[1]
-    source_block = source_block.split("resource ", 1)[0]
-    assert "age = 1" in source_block, "build-source bucket must have a 1-day delete lifecycle"
+    # (a) The dedicated builder SA exists.
+    assert 'resource "google_service_account" "image_builder_sa"' in iam
+    assert 'account_id   = "image-builder-sa"' in iam
 
-    # (c) Builder reads ONLY its own source bucket, and never the general
-    #     agent-artifacts bucket. Collect every IAM member block that grants the
-    #     builder SA a role and assert the permitted set is exactly:
-    #       storage.objectViewer (on compute_build_source),
-    #       logging.logWriter,
-    #       artifactregistry.writer (on compute_images_repo, in workload_identity.tf).
-    builder_member = "google_service_account.compute_image_builder_sa.email"
-
-    # The builder's storage grant references the disposable source bucket, not
-    # the artifacts bucket.
-    reader_block = iam.split(
-        'resource "google_storage_bucket_iam_member" "compute_image_builder_source_reader"',
+    # (b) Builder can PUSH built images (artifactregistry.writer) and PULL a
+    #     private parent/base image (artifactregistry.reader) — both scoped to the
+    #     compute-images repo only, granted in workload_identity.tf.
+    writer_block = wi.split(
+        'resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_writer"',
         1,
     )[1].split("resource ", 1)[0]
-    assert "google_storage_bucket.compute_build_source.name" in reader_block
-    assert 'role   = "roles/storage.objectViewer"' in reader_block
+    assert "google_artifact_registry_repository.compute_images_repo.name" in writer_block
+    assert '"roles/artifactregistry.writer"' in writer_block
+    assert builder_member in writer_block
+
+    reader_block = wi.split(
+        'resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_reader"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_artifact_registry_repository.compute_images_repo.name" in reader_block
+    assert '"roles/artifactregistry.reader"' in reader_block
     assert builder_member in reader_block
 
-    # No binding anywhere grants the builder any Secret Manager role or access to
-    # the agent-artifacts bucket. Scan every resource block that names the builder
-    # as its member.
-    def _blocks_naming_builder(text: str) -> list[str]:
-        blocks = []
-        for chunk in text.split("resource ")[1:]:
-            body = "resource " + chunk
-            if builder_member in body:
-                blocks.append(body)
-        return blocks
+    # (c) Orchestrator can actAs the builder SA (to attach it to a throwaway
+    #     builder VM) and nothing more — no new project-level role is granted.
+    orch_member = "google_service_account.orchestrator_sa.email"
+    actas_block = iam.split(
+        'resource "google_service_account_iam_member" "orchestrator_act_as_image_builder"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_service_account.image_builder_sa.name" in actas_block
+    assert '"roles/iam.serviceAccountUser"' in actas_block
+    assert orch_member in actas_block
 
-    for body in _blocks_naming_builder(iam) + _blocks_naming_builder(wi):
+    # (d) LEAST PRIVILEGE: every resource block that binds a role TO the builder SA
+    #     (i.e. names it as the grantee ``member``) grants NO Secret Manager
+    #     access, NO agent-artifacts bucket access, and NOTHING beyond the two
+    #     Artifact Registry roles above. The actAs block above references
+    #     image_builder_sa.name as the *target* but grants serviceAccountUser to
+    #     the orchestrator, so it is (correctly) not a role held by the builder —
+    #     builder_member matches the ``.email`` grantee, which appears only on the
+    #     two AR bindings. Any other role bound to this SA is a
+    #     privilege-escalation regression.
+    def _blocks_binding_builder(text: str) -> list[str]:
+        return [
+            "resource " + chunk
+            for chunk in text.split("resource ")[1:]
+            if builder_member in ("resource " + chunk)
+        ]
+
+    granted_roles: list[str] = []
+    for body in _blocks_binding_builder(iam) + _blocks_binding_builder(wi):
         assert "secretmanager" not in body, (
             "builder SA must have NO Secret Manager access; offending block:\n" + body
         )
-        # The builder must not be bound onto the agent-artifacts bucket. The
-        # artifacts bucket is google_storage_bucket.artifacts; the builder's only
-        # storage binding is on compute_build_source.
         assert "google_storage_bucket.artifacts" not in body, (
             "builder SA must not be granted access to the agent-artifacts bucket; "
             "offending block:\n" + body
         )
-
-    # (d) Builder can publish to compute_images_repo (writer) and write logs.
-    assert (
-        'resource "google_artifact_registry_repository_iam_member" "compute_image_builder_compute_images_writer"'
-        in wi
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("role") and '"' in stripped:
+                granted_roles.append(stripped.split('"')[1])
+    assert sorted(set(granted_roles)) == [
+        "roles/artifactregistry.reader",
+        "roles/artifactregistry.writer",
+    ], (
+        "builder SA must hold ONLY artifactregistry reader+writer; a different role "
+        f"is a privilege-escalation regression. Found: {sorted(set(granted_roles))}"
     )
-    writer_block = wi.split(
-        'resource "google_artifact_registry_repository_iam_member" "compute_image_builder_compute_images_writer"',
-        1,
-    )[1].split("resource ", 1)[0]
-    assert "google_artifact_registry_repository.compute_images_repo.name" in writer_block
-    assert 'role       = "roles/artifactregistry.writer"' in writer_block
-    assert builder_member in writer_block
 
-    log_block = iam.split(
-        'resource "google_project_iam_member" "compute_image_builder_log_writer"', 1
-    )[1].split("resource ", 1)[0]
-    assert 'role    = "roles/logging.logWriter"' in log_block
-    assert builder_member in log_block
-
-    # (e) Orchestrator can create/get/cancel builds and actAs the builder SA.
-    orch_member = "google_service_account.orchestrator_sa.email"
-    editor_block = iam.split(
-        'resource "google_project_iam_member" "orchestrator_cloud_build_editor"', 1
-    )[1].split("resource ", 1)[0]
-    assert 'role    = "roles/cloudbuild.builds.editor"' in editor_block
-    assert orch_member in editor_block
-
-    actas_block = iam.split(
-        'resource "google_service_account_iam_member" "orchestrator_act_as_compute_image_builder"',
-        1,
-    )[1].split("resource ", 1)[0]
-    assert "google_service_account.compute_image_builder_sa.name" in actas_block
-    assert 'role               = "roles/iam.serviceAccountUser"' in actas_block
-    assert orch_member in actas_block
-
-    # (f) Pre-existing orchestrator/agent compute-image grants are preserved:
+    # (e) Pre-existing orchestrator/agent compute-image grants are preserved:
     #     orchestrator keeps its compute-image protection-tag write permission,
     #     and the agent keeps its image-pull (reader) permission.
     assert (
@@ -25680,20 +25676,6 @@ def test_compute_image_builder_least_privilege_contract():
         'resource "google_artifact_registry_repository_iam_member" "agent_compute_images_reader"'
         in wi
     )
-
-    # (g) The three builder config values are wired into BOTH the cloudbuild.yaml
-    #     source of truth and the cloud_run.tf drift mirror.
-    for key in (
-        "COMPUTE_IMAGE_BUILDER_SA",
-        "COMPUTE_IMAGE_BUILD_LOCATION",
-        "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET",
-    ):
-        assert key in cloudbuild, f"{key} missing from cloudbuild.yaml --set-env-vars"
-        assert key in cloud_run, f"{key} missing from cloud_run.tf drift mirror"
-
-    # cloudbuild.yaml points the config at the dedicated SA and disposable bucket.
-    assert "compute-image-builder-sa@$PROJECT_ID.iam.gserviceaccount.com" in cloudbuild
-    assert "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET=$PROJECT_ID-compute-build-source" in cloudbuild
 
 
 # ── Remote build path (compute_image_remote_build) ─────────────────────────
