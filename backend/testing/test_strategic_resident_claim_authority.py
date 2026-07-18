@@ -10,6 +10,7 @@ from app import max_plan_pool
 from app.auth import create_agent_token, verify_agent_jwt
 from app.models import Project, StrategicResident, Task, TaskStatus
 from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KEY
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 async def _seed_claimable_turn(db_session):
@@ -402,15 +403,22 @@ async def test_claim_rejects_stale_live_resident_boundary_without_mutation(
 
     _project, resident, task, token = await _seed_claimable_turn(db_session)
     vm_last_heartbeat.pop(str(task.vm_instance_id), None)
-    if stale_boundary == "owner":
-        resident.engine_owner = "legacy"
-    elif stale_boundary == "generation":
-        resident.authority_generation += 1
-    else:
-        resident.active_turn_task_id = None
-        resident.active_turn_lane = None
-    db_session.add(resident)
-    await db_session.commit()
+    # Seeding a deliberately-stale boundary: reverting engine_owner to 'legacy'
+    # without advancing the generation is a state the authority-monotonic fence
+    # forbids in production (a real rollback advances the generation). We create
+    # it artificially to isolate the claim-time owner-boundary check. Enforcement
+    # is relaxed for the seed only (no-op on SQLite); the /api/agent/claim action
+    # under test runs with all fences ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        if stale_boundary == "owner":
+            resident.engine_owner = "legacy"
+        elif stale_boundary == "generation":
+            resident.authority_generation += 1
+        else:
+            resident.active_turn_task_id = None
+            resident.active_turn_lane = None
+        db_session.add(resident)
+        await db_session.commit()
 
     response = await client.post(
         "/api/agent/claim",

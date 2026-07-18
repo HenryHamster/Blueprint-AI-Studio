@@ -36,6 +36,7 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
+from testing._resident_seed import seed_without_authority_enforcement
 from app.workbench_state import (
     SESSION_IDLE_TTL_SECONDS,
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -468,10 +469,18 @@ async def test_owner_flip_rolls_back_whole_legacy_cycle_spawn(
     db_session.add(project)
     await db_session.commit()
     resident = await initialize_strategic_resident(db_session, project.id)
-    resident.engine_owner = "strategic_resident"
-    resident.authority_generation += 1
-    db_session.add(resident)
-    await db_session.commit()
+    # initialize_strategic_resident leaves a pending current_checkpoint_id on a
+    # legacy gen-1 resident; flipping owner + generation in the same commit sets
+    # the checkpoint pointer while the generation changes, which the rotation
+    # fence rejects ("checkpoint rotation cannot change authority generation").
+    # This authoritative starting state is seeded with enforcement relaxed
+    # (no-op on SQLite); the _spawn_research_task action below runs with all
+    # fences ACTIVE and must still roll back the whole legacy-cycle spawn.
+    async with seed_without_authority_enforcement(db_session):
+        resident.engine_owner = "strategic_resident"
+        resident.authority_generation += 1
+        db_session.add(resident)
+        await db_session.commit()
 
     old = _shared_state.runtime_config.get("architecture_review_frequency", 3)
     _shared_state.runtime_config["architecture_review_frequency"] = 3

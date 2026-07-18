@@ -39,20 +39,29 @@ from app.strategic_resident_failure_recovery import _merge_interactive_range
 from app.strategic_resident_message_tail import ensure_message_tail_successor
 from app.strategic_resident_wakeups import coalesce_meaningful_background_wakeup
 from app.time_utils import _utcnow
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 async def _authoritative_project(db_session):
     project = Project(name="Authoritative Resident", user_id="operator")
     db_session.add(project)
     await db_session.flush()
-    resident = await initialize_strategic_resident(
-        db_session, project.id, locked_project=project
-    )
-    resident.engine_owner = "strategic_resident"
-    resident.engine_version = "strategic-resident-v1"
-    resident.authority_generation = 2
-    db_session.add(resident)
-    await db_session.flush()
+    # initialize_strategic_resident seeds a legacy resident (gen 1) with a v1
+    # checkpoint pointer pending; flipping ownership + generation while setting
+    # current_checkpoint_id in one UPDATE trips the rotation fence ("checkpoint
+    # rotation cannot change authority generation"). This is a valid
+    # authoritative starting state that the fences only permit via a real turn,
+    # so seed it with enforcement relaxed (no-op on SQLite). Every asserted
+    # action below runs with fences ACTIVE.
+    async with seed_without_authority_enforcement(db_session):
+        resident = await initialize_strategic_resident(
+            db_session, project.id, locked_project=project
+        )
+        resident.engine_owner = "strategic_resident"
+        resident.engine_version = "strategic-resident-v1"
+        resident.authority_generation = 2
+        db_session.add(resident)
+        await db_session.flush()
     return project, resident
 
 
