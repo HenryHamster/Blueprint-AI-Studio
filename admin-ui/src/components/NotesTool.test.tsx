@@ -13,9 +13,15 @@ vi.mock('../api/projectTools', async () => {
   };
 });
 
-vi.mock('../utils/residentToolHandoff', () => ({
-  dispatchResidentToolHandoff: vi.fn(),
-}));
+vi.mock('../utils/residentToolHandoff', async () => {
+  const actual = await vi.importActual<typeof import('../utils/residentToolHandoff')>(
+    '../utils/residentToolHandoff',
+  );
+  return {
+    ...actual,
+    dispatchResidentToolHandoff: vi.fn(),
+  };
+});
 
 import {
   createResidentToolArtifactRef,

@@ -3,6 +3,10 @@ import { beforeEach, describe, expect, test, vi } from 'vitest';
 vi.mock('./core', () => ({
   API_BASE_URL: '',
   apiFetch: vi.fn(),
+  COST_PER_VM_HR: 0.067,
+  MESSAGE_CONTENT_MAX: 20000,
+  authGet: vi.fn(),
+  authHeaders: vi.fn(),
 }));
 
 import { apiFetch } from './core';

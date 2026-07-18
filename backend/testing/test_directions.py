@@ -9224,10 +9224,15 @@ async def test_strategic_cycle_endpoint_uses_integration_branch(
     assert resp.status_code == 200, resp.text
 
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    tasks = result.scalars().all()
-    assert tasks, "expected a strategic task to be created"
-    for t in tasks:
-        assert t.first_payload.get("type") == expected_type
+    strategic_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == expected_type
+    ]
+    assert len(strategic_tasks) == 1, (
+        f"expected exactly one {expected_type} task to be created"
+    )
+    for t in strategic_tasks:
         assert t.first_payload.get("base_branch") == "automain", (
             f"manual /strategic-cycle ({phase}) bypassed the integration_branch column"
         )
@@ -9247,10 +9252,19 @@ async def test_strategic_cycle_endpoint_defaults_to_main(
     )
     assert resp.status_code == 200, resp.text
 
+    expected_type = (
+        "design_doc_update" if phase == "design_doc" else "strategic_review"
+    )
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
-    tasks = result.scalars().all()
-    assert tasks, "expected a strategic task to be created"
-    for t in tasks:
+    strategic_tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == expected_type
+    ]
+    assert len(strategic_tasks) == 1, (
+        f"expected exactly one {expected_type} task to be created"
+    )
+    for t in strategic_tasks:
         assert t.first_payload.get("base_branch") == "main"
 
 
