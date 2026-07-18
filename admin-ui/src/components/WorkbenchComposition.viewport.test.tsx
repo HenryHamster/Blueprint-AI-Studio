@@ -14,6 +14,11 @@ vi.mock('../api', () => ({
   API_BASE_URL: 'http://localhost:8000',
   MESSAGE_CONTENT_MAX: 20000,
   authHeaders: vi.fn(async () => ({ Authorization: 'Bearer test', 'Content-Type': 'application/json' })),
+  // MessagesPanel (rendered here) statically imports the pending-confirmation
+  // actions; browser-mode ESM requires the mock to expose every named export the
+  // subtree imports or the linker fails at import time.
+  acceptPendingConfirmation: vi.fn(async () => ({ status: 'accepted' })),
+  dismissPendingConfirmation: vi.fn(async () => ({ status: 'dismissed' })),
 }));
 
 vi.mock('../firebase', () => ({
