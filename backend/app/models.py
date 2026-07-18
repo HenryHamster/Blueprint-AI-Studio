@@ -2325,6 +2325,77 @@ class ProjectComputeImage(SQLModel, table=True):
     )
 
 
+class ComputeImageBuildStatus(str, Enum):
+    PENDING = "PENDING"
+    BUILDING = "BUILDING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+
+
+class ProjectComputeImageBuild(SQLModel, table=True):
+    """Durable async-tracking row for an off-orchestrator compute-image build.
+
+    Cloud Run's 60-minute request cap forbids the current inline synchronous
+    ``docker build`` path. This row drives the provision -> poll -> terminal ->
+    reap lifecycle for builds dispatched to an isolated builder VM, mirroring
+    the ``ComputeJob`` table's column/typing conventions.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    dep_hash: str = Field(sa_column=Column(String(255), nullable=False))
+    registry_repo: str = Field(sa_column=Column(String(512), nullable=False))
+    image_name: str = Field(sa_column=Column(String(255), nullable=False))
+    builder_vm_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    zone: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    status: ComputeImageBuildStatus = Field(
+        default=ComputeImageBuildStatus.PENDING,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=ComputeImageBuildStatus.PENDING.value,
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    deadline_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    result_json: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    error_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        Index("ix_projectcomputeimagebuild_project_id_status", "project_id", "status"),
+        Index("ix_projectcomputeimagebuild_project_dep_hash", "project_id", "dep_hash"),
+        Index("ix_projectcomputeimagebuild_status", "status"),
+        Index("ix_projectcomputeimagebuild_deadline_at", "deadline_at"),
+        Index("ix_projectcomputeimagebuild_created_at", "created_at"),
+    )
+
+
 class ComputeJob(SQLModel, table=True):
     """Durable compute-job record for budgeted work decoupled from ``Task``.
 

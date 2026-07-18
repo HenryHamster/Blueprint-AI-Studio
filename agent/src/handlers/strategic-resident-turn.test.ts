@@ -145,11 +145,11 @@ describe('strategic Resident turn handler', () => {
           },
         }),
       });
-    mocks.apiPost.mockImplementation(async (path: string) => {
+    mocks.apiPost.mockImplementation((path: string) => {
       if (path === '/api/agent/resident-turn/capability') {
-        return { capability_id: 'task.inspect', evidence: { checksum: 'a'.repeat(64) } };
+        return Promise.resolve({ capability_id: 'task.inspect', evidence: { checksum: 'a'.repeat(64) } });
       }
-      return {};
+      return Promise.resolve({});
     });
 
     await handleStrategicResidentTurn(

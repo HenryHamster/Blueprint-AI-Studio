@@ -19586,24 +19586,18 @@ def test_already_present_marks_the_digest_unknown_when_no_source_resolves_it(tmp
 
 
 def test_resolve_registry_digest_handles_a_multi_arch_manifest_list():
-    """`docker manifest inspect -v` emits a LIST for multi-arch images."""
+    """``gcloud artifacts docker images describe`` returns image_summary.digest."""
     digest = "sha256:" + "f" * 64
 
     def fake_run(cmd, **kw):
-        return _ok_proc(
-            stdout=json.dumps(
-                [
-                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": digest}},
-                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": "sha256:" + "9" * 64}},
-                ]
-            )
-        )
+        assert "gcloud" in cmd and "describe" in cmd, f"Expected gcloud describe, got {cmd}"
+        return _ok_proc(stdout=json.dumps({"image_summary": {"digest": digest}}))
 
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) == digest
 
 
 def test_resolve_registry_digest_returns_none_on_garbage():
-    """A non-JSON / error response resolves to None rather than a bogus digest."""
+    """A non-JSON / error / missing-key response resolves to None rather than a bogus digest."""
 
     def fake_run(cmd, **kw):
         return _ok_proc(stdout="not json at all")
@@ -19611,9 +19605,72 @@ def test_resolve_registry_digest_returns_none_on_garbage():
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) is None
 
     def failing_run(cmd, **kw):
-        raise OSError("docker not installed")
+        raise OSError("gcloud not installed")
 
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=failing_run) is None
+
+    def missing_key_run(cmd, **kw):
+        return _ok_proc(stdout=json.dumps({"image_summary": {}}))
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=missing_key_run) is None
+
+
+def test_registry_tag_exists_uses_gcloud_describe():
+    """registry_tag_exists shells to gcloud (not docker), fail-open on errors."""
+    commands_seen = []
+
+    def capture(cmd, **kw):
+        commands_seen.append(cmd)
+        return _ok_proc()
+
+    result = _bci.registry_tag_exists("reg/repo/img", "mytag", _run=capture)
+    assert result is True
+    assert any("gcloud" in c and "describe" in c for c in commands_seen), commands_seen
+    assert any("reg/repo/img:mytag" in " ".join(c) for c in commands_seen), commands_seen
+
+    # Non-zero exit → absent (not an exception)
+    def not_found(cmd, **kw):
+        class _Proc:
+            returncode = 1
+            stdout = stderr = ""
+        return _Proc()
+
+    assert _bci.registry_tag_exists("reg/repo/img", "missing", _run=not_found) is False
+
+    # OSError → absent (fail-open)
+    def broken(cmd, **kw):
+        raise OSError("no gcloud")
+
+    assert _bci.registry_tag_exists("reg/repo/img", "missing", _run=broken) is False
+
+
+def test_resolve_registry_digest_uses_gcloud_describe():
+    """resolve_registry_digest shells to gcloud and parses image_summary.digest."""
+    digest = "sha256:" + "a" * 64
+    commands_seen = []
+
+    def capture(cmd, **kw):
+        commands_seen.append(cmd)
+        return _ok_proc(stdout=json.dumps({"image_summary": {"digest": digest}}))
+
+    result = _bci.resolve_registry_digest("reg/repo/img", "v1", _run=capture)
+    assert result == digest
+    assert any("gcloud" in c and "describe" in c for c in commands_seen), commands_seen
+
+    # Non-zero exit → None
+    def not_found(cmd, **kw):
+        class _Proc:
+            returncode = 1
+            stdout = stderr = ""
+        return _Proc()
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "v1", _run=not_found) is None
+
+    # OSError → None (fail-open)
+    def broken(cmd, **kw):
+        raise OSError("no gcloud")
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "v1", _run=broken) is None
 
 
 # ---------------------------------------------------------------------------
@@ -25375,21 +25432,20 @@ def test_compute_image_registry_iam(monkeypatch, tmp_path):
 
         return _OkProc()
 
-    # ── registry_tag_exists — docker manifest inspect against AR ──────────────
+    # ── registry_tag_exists — gcloud artifacts docker images describe against AR ──
     # This is the first read operation against the AR repo (requires reader).
     cib.registry_tag_exists(ar_repo, "test-tag", _run=_capture_run)
     assert any(
-        "docker" in c and "manifest" in c and "inspect" in c
+        "gcloud" in c and "describe" in c
         for c in commands_run
-    ), "Expected docker manifest inspect for AR tag existence check"
+    ), "Expected gcloud artifacts docker images describe for AR tag existence check"
     assert any(
         ar_repo in str(c) for c in commands_run
-    ), f"Expected docker manifest inspect to target AR repo {ar_repo}"
+    ), f"Expected gcloud describe to target AR repo {ar_repo}"
     commands_run.clear()
 
-    # ── build_and_push (fast-path: tag exists) — docker manifest inspect ──────
+    # ── build_and_push (fast-path: tag exists) ──────────────────────────────────
     # Simulates the fast path where the dependency-hash tag already exists.
-    # The orchestrator checks the AR repo via docker manifest inspect (reader).
     result = cib.build_and_push(
         repo_dir=str(dockerfile_dir),
         registry_repo=ar_repo,

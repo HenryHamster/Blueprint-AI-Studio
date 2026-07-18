@@ -62,10 +62,12 @@ from app.compute_jobs import (
 from app.database import AsyncSessionLocal
 from app.models import (
     ArtifactRefPromotionIntent,
+    ComputeImageBuildStatus,
     ComputeJob,
     ComputeJobFile,
     ComputeJobStatus,
     LocalRunner,
+    ProjectComputeImageBuild,
     ProjectMessageAttachmentUpload,
     Task,
     TaskStatus,
@@ -2825,6 +2827,7 @@ async def sweep_refresh_project_compute_images(
         return {
             "projects": 0,
             "rebuilt": 0,
+            "dispatched": 0,
             "unchanged": 0,
             "no_config": 0,
             "deferred": 0,
@@ -2872,6 +2875,7 @@ async def sweep_refresh_project_compute_images(
     summary = {
         "projects": 0,
         "rebuilt": 0,
+        "dispatched": 0,
         "unchanged": 0,
         "no_config": 0,
         "deferred": 0,
@@ -2928,6 +2932,13 @@ async def sweep_refresh_project_compute_images(
                     project_id,
                     exc_info=True,
                 )
+        elif status == "dispatched":
+            # Off-orchestrator async build kicked off; it counts against the
+            # per-cycle build budget. The reaper poll sweep records the pin (and
+            # any drift alert fires once the pinned_ref is known), so nothing to
+            # record here.
+            summary["dispatched"] += 1
+            builds_done += 1
         elif status == "unchanged":
             summary["unchanged"] += 1
         elif status == "no_config":
@@ -2937,16 +2948,182 @@ async def sweep_refresh_project_compute_images(
         else:  # "error" or an unrecognized status
             summary["errors"] += 1
 
-    if summary["rebuilt"] or summary["deferred"] or summary["errors"]:
+    if (
+        summary["rebuilt"]
+        or summary["dispatched"]
+        or summary["deferred"]
+        or summary["errors"]
+    ):
         logger.info(
-            "[REAPER] compute-image auto-refresh: rebuilt=%d unchanged=%d "
-            "deferred=%d no_config=%d errors=%d (of %d project(s))",
+            "[REAPER] compute-image auto-refresh: rebuilt=%d dispatched=%d "
+            "unchanged=%d deferred=%d no_config=%d errors=%d (of %d project(s))",
             summary["rebuilt"],
+            summary["dispatched"],
             summary["unchanged"],
             summary["deferred"],
             summary["no_config"],
             summary["errors"],
             summary["projects"],
+        )
+    return summary
+
+
+# ── Off-orchestrator image-build poll monitor (DARK — not wired into the loop) ──
+#
+# Sibling of the compute-job monitor: it drives BUILDING ProjectComputeImageBuild
+# rows to a terminal state by polling the throwaway builder VM's serial marker /
+# durable terminal.json, then records the pinned image (through the same
+# digest-preservation guard the inline path uses) and reaps the VM. Past its
+# deadline a build's VM is deleted and the row is marked TIMED_OUT.
+#
+# This sweep is NOT registered in the reaper cycle and NOT called by the trigger
+# endpoint — the whole builder lane ships dark, selectable by config. It exists
+# so the machinery is testable and ready to wire up once proven.
+_IMAGE_BUILD_POLL_MAX_ROWS = 25
+
+
+async def sweep_poll_image_builds(
+    session,
+    now=None,
+    *,
+    _backend=None,
+    _record_fn=None,
+    _preserve_fn=None,
+    _reap_fn=None,
+    max_builds: int = _IMAGE_BUILD_POLL_MAX_ROWS,
+) -> dict[str, int]:
+    """Poll BUILDING off-orchestrator compute-image builds to a terminal state.
+
+    For each ``BUILDING`` :class:`ProjectComputeImageBuild` row (bounded to
+    ``max_builds``):
+
+    * **Past deadline** — delete the builder VM and mark the row ``TIMED_OUT``
+      (a build that ran past its wall-clock ceiling never completes on its own).
+    * **SUCCEEDED** — reconstruct a ``BuildResult`` from the tool's parsed
+      ``RESULT_JSON``, run it through the digest-preservation guard, UPSERT the
+      ``ProjectComputeImage`` pin, persist ``result_json``, mark ``SUCCEEDED``,
+      and reap the VM.
+    * **FAILED** — persist the reason, mark ``FAILED``, and reap the VM.
+    * **still BUILDING** — leave the row untouched for the next pass.
+
+    All VM/serial/registry calls go through the injected ``_backend`` /
+    ``_record_fn`` / ``_preserve_fn`` / ``_reap_fn`` seams so the state machine is
+    testable with no cloud I/O. A per-row failure is isolated — it never aborts
+    the sweep. Returns a summary dict of per-outcome counts. The reaper (once this
+    is wired) wraps it so a raised error can never crash the cycle.
+    """
+    from app import compute_backends as _cb
+
+    _now = now or _utcnow()
+    backend = _backend if _backend is not None else _cb.get_image_builder_backend()
+    record_fn = _record_fn if _record_fn is not None else _cb.record_project_compute_image_build
+    preserve_fn = (
+        _preserve_fn if _preserve_fn is not None else _cb._preserve_existing_digest_pin_cb
+    )
+
+    async def _default_reap(build: ProjectComputeImageBuild) -> bool:
+        return await backend.abort(build, reason="reap_after_terminal")
+
+    reap_fn = _reap_fn if _reap_fn is not None else _default_reap
+
+    rows = (
+        (
+            await session.execute(
+                select(ProjectComputeImageBuild)
+                .where(
+                    ProjectComputeImageBuild.status == ComputeImageBuildStatus.BUILDING
+                )
+                .order_by(ProjectComputeImageBuild.created_at)
+                .limit(max_builds)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    summary = {
+        "polled": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "timed_out": 0,
+        "still_building": 0,
+        "errors": 0,
+    }
+    for build in rows:
+        summary["polled"] += 1
+        try:
+            # Deadline first: a build past its wall-clock ceiling is reaped and
+            # marked TIMED_OUT without trusting a (possibly never-coming) marker.
+            if build.deadline_at is not None and _now >= build.deadline_at:
+                await reap_fn(build)
+                build.status = ComputeImageBuildStatus.TIMED_OUT
+                build.error_reason = "build exceeded its wall-clock deadline"
+                build.updated_at = _now
+                session.add(build)
+                await session.commit()
+                summary["timed_out"] += 1
+                continue
+
+            status = await backend.poll(build)
+            if status.status == ComputeImageBuildStatus.BUILDING:
+                summary["still_building"] += 1
+                continue
+
+            if status.status == ComputeImageBuildStatus.SUCCEEDED:
+                result_payload = status.result or {}
+                build_result = _cb.build_result_from_serial_payload(
+                    result_payload, dep_hash=build.dep_hash
+                )
+                # Never let a digest-less result NULL an already-stored pin.
+                build_result = await preserve_fn(
+                    session, build.project_id, build_result
+                )
+                await record_fn(
+                    session,
+                    build.project_id,
+                    build.registry_repo,
+                    build.image_name,
+                    build_result,
+                )
+                build.status = ComputeImageBuildStatus.SUCCEEDED
+                build.result_json = build_result.to_json()
+                build.error_reason = None
+                build.updated_at = _now
+                session.add(build)
+                await session.commit()
+                await reap_fn(build)
+                summary["succeeded"] += 1
+                continue
+
+            # FAILED (or any non-BUILDING/SUCCEEDED terminal state).
+            build.status = ComputeImageBuildStatus.FAILED
+            build.error_reason = status.reason or "image build failed"
+            build.updated_at = _now
+            session.add(build)
+            await session.commit()
+            await reap_fn(build)
+            summary["failed"] += 1
+        except Exception:  # noqa: BLE001 — isolate a per-row failure
+            logger.warning(
+                "[REAPER] image-build poll raised for build %s",
+                getattr(build, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            summary["errors"] += 1
+            continue
+
+    if summary["succeeded"] or summary["failed"] or summary["timed_out"] or summary["errors"]:
+        logger.info(
+            "[REAPER] image-build poll: succeeded=%d failed=%d timed_out=%d "
+            "still_building=%d errors=%d (of %d row(s))",
+            summary["succeeded"],
+            summary["failed"],
+            summary["timed_out"],
+            summary["still_building"],
+            summary["errors"],
+            summary["polled"],
         )
     return summary
 
