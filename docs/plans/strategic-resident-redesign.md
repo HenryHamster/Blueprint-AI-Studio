@@ -2,7 +2,10 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, and 2b merged; Milestone 3 converged and publishing.
+**Status:** Milestones 1, 2a, 2b, 3, and 4 merged; Milestone 5 (rollout, legacy
+retirement, release audit) remains — its exit criteria (seven-day soak, live
+per-project production engine flip, legacy-handler retirement after soak) are
+operator- and calendar-gated by design.
 
 **Last refreshed:** 2026-07-17. M2a merged through PR `#15292` at merge commit
 `7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
@@ -307,7 +310,7 @@ Pre-rebase evidence:
   maintainability review/fix iterations converged with no actionable findings;
   scoped Ruff, TypeScript, ESLint, Terraform formatting, and diff checks are clean.
 
-### M4 — Fenced operations, strategic memory, and cadence
+### M4 — Fenced operations, strategic memory, and cadence — merged
 
 - Route authorized mutations through operation IDs, expected revisions, authority
   generations, evidence preconditions, approvals, durable receipts, and explicit
@@ -320,6 +323,32 @@ Pre-rebase evidence:
   charter, decisions, rationales, commitments, and open loops across rotations.
 - Coalesce meaningful wakeups, make unchanged checks zero-model-call, preempt
   background work safely, and reconcile revision-linked StrategicCycle proposals.
+
+Implementation checklist:
+
+- [x] Correct `INSPECTION_CAPABILITY_KINDS` to real capability ids so inspection
+  evidence is trusted once receipts are written (PR `#15622`).
+- [x] Lift the first fenced mutation off its 501 stub — `strategy.running_update.set`
+  through the DB-only `execute_fenced_db_operation`, authority from the signed
+  token, generation/CAS fenced (PR `#15630`).
+- [x] Write server-authored, context-hash-bound, idempotent inspection receipts so
+  mid-turn inspection evidence is citable; exclude them from the operation-claim
+  invariants (PR `#15643`).
+- [x] Extend the fence to a bounded target task — `task.reprioritize`, CAS on
+  `updated_at`, fail-closed against targeting any Resident turn (PR `#15649`).
+- [x] Add the two-phase external-effect executor (durable `applying` intent →
+  single-owner claim → perform → settle `reconciled`/`failed`); wire `pr.create`
+  behind a default-off operator allowlist so it ships inert (PR `#15654`).
+- [x] Add the worker memory-proposal admission contract: revision-linked +
+  evidence-gated + fail-closed, returning reconciliation-native proposals
+  (PR `#15655`).
+- [x] Add `signal_project_change`, the production entrypoint for the background
+  `project_change` coalescing lane with the zero-model unchanged guarantee
+  (PR `#15656`).
+- Follow-on wires (bounded slices deferred, not blocking M4): critical
+  external effects (`pr.merge`/`deployment.*`) stay 501 pending real approval
+  verification; the worker-proposal storage/drain and the `signal_project_change`
+  trigger call sites connect their producers in M5-adjacent work.
 
 ### M5 — Rollout, legacy retirement, and release audit
 
