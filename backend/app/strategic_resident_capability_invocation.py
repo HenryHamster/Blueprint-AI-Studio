@@ -187,7 +187,6 @@ class ResidentCapabilityInvocation(BaseModel):
     operation_id: str | None = Field(default=None, min_length=1, max_length=128)
     expected_revisions: dict[str, StrictInt | StrictStr] = Field(default_factory=dict)
     evidence: tuple[CapabilityEvidenceRef, ...] = Field(default=(), max_length=50)
-    approval_ref: str | None = Field(default=None, min_length=1, max_length=200)
 
     @model_validator(mode="after")
     def _matches_declaration(self) -> ResidentCapabilityInvocation:
@@ -212,15 +211,6 @@ class ResidentCapabilityInvocation(BaseModel):
                     "missing evidence preconditions: "
                     + ", ".join(sorted(absent_evidence))
                 )
-            if spec.approval_policy == "explicit":
-                if not self.approval_ref:
-                    raise ValueError("capability requires explicit approval_ref")
-                try:
-                    uuid.UUID(self.approval_ref)
-                except ValueError:
-                    raise ValueError(
-                        "approval_ref must be a valid ProjectMessage UUID"
-                    ) from None
         return self
 
 

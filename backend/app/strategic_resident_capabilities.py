@@ -255,9 +255,9 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _mutate("task.dispatch", "orchestrator_runner_dispatch", CapabilityRisk.medium, ("task_id",), ("task", "runner_capacity")),
     _mutate("task.redirect", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id", "runner_id"), ("task", "runner")),
     _mutate("task.reprioritize", "task_lifecycle", CapabilityRisk.low, ("task_id", "priority"), ("task",)),
-    _mutate("task.retry", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id",), ("task_failure",)),
+    _mutate("task.retry", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id",), ("task",)),
     _mutate("task.requeue", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id",), ("task",)),
-    _mutate("task.unblock", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id",), ("task_blocker",)),
+    _mutate("task.unblock", "task_lifecycle_requeue", CapabilityRisk.medium, ("task_id",), ("task",)),
     _mutate("task.park", "task_lifecycle", CapabilityRisk.low, ("task_id", "reason"), ("task",)),
     _mutate("task.cancel", "task_lifecycle", CapabilityRisk.high, ("task_id", "reason"), ("task",)),
     _mutate("task.salvage", "task_lifecycle", CapabilityRisk.high, ("task_id",), ("task", "branch")),
@@ -265,7 +265,7 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _mutate("task.review_fix_loop", "review_pipeline", CapabilityRisk.medium, ("task_id",), ("task", "pr_checks")),
     _mutate("pr.create", "github_pulls", CapabilityRisk.medium, ("head", "base", "title"), ("branch",), reconciliation="external_effect_probe"),
     _mutate("pr.update", "github_pulls", CapabilityRisk.medium, ("pr_number",), ("pr",), reconciliation="external_effect_probe"),
-    _mutate("pr.merge", "github_pulls", CapabilityRisk.critical, ("pr_number", "expected_head_sha"), ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability"), approval="explicit", reconciliation="external_effect_probe"),
+    _mutate("pr.merge", "github_pulls", CapabilityRisk.critical, ("pr_number", "expected_head_sha"), ("pr", "pr_diff", "pr_check"), approval="explicit", reconciliation="external_effect_probe"),
     _mutate("qualification.run", "qualification_triggers", CapabilityRisk.high, ("version_id",), ("qualification_state",), reconciliation="external_effect_probe"),
     _mutate("audit.run", "qualification_triggers", CapabilityRisk.high, ("version_id", "audit_kind"), ("qualification_state",), reconciliation="external_effect_probe"),
     _mutate("deployment.deploy", "deploy", CapabilityRisk.critical, ("revision",), ("qualification", "revision"), approval="explicit", reconciliation="external_effect_probe"),
@@ -281,6 +281,25 @@ for _spec in RESIDENT_CAPABILITIES:  # pragma: no branch - import invariant
         raise RuntimeError(
             f"Strategic Resident capability parameter schema mismatch: {_spec.capability_id}"
         )
+
+# One source of truth for what the Agent may actually invoke. An entry belongs
+# here only when its route adapter exists and every declared evidence kind can
+# be supplied by server-authored turn context or an inspection receipt.
+INVOKABLE_CAPABILITY_IDS = frozenset(
+    {
+        "task.inspect",
+        "task.lineage.inspect",
+        "task.logs.inspect",
+        "task.failure.inspect",
+        "task.provider.inspect",
+        "strategy.running_update.set",
+        "task.reprioritize",
+        "task.retry",
+        "task.requeue",
+        "task.unblock",
+        "task.cancel",
+    }
+)
 
 
 def capability_for(capability_id: str) -> CapabilitySpec:
@@ -302,8 +321,7 @@ def compact_capability_catalog() -> list[dict[str, Any]]:
             "approval": spec.approval_policy,
             "availability": (
                 "invoke"
-                if spec.mode is CapabilityMode.inspect
-                and spec.service == "resident_task_inspection"
+                if spec.capability_id in INVOKABLE_CAPABILITY_IDS
                 else "propose_only"
             ),
         }
@@ -312,6 +330,7 @@ def compact_capability_catalog() -> list[dict[str, Any]]:
 
 
 __all__ = [
+    "INVOKABLE_CAPABILITY_IDS",
     "RESIDENT_CAPABILITIES",
     "CapabilityMode",
     "CapabilityParameterKind",

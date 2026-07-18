@@ -27,6 +27,13 @@ const providerInput = {
     checkpoint_hash: 'a'.repeat(64),
     context_hash: 'b'.repeat(64),
   },
+  capabilities: {
+    catalog: [
+      { id: 'task.inspect', mode: 'inspect', availability: 'invoke' },
+      { id: 'task.reprioritize', mode: 'mutate', availability: 'invoke' },
+      { id: 'task.cancel', mode: 'mutate', availability: 'propose_only' },
+    ],
+  },
 };
 
 describe('strategic Resident turn handler', () => {
@@ -168,6 +175,264 @@ describe('strategic Resident turn handler', () => {
       'Server-validated capability evidence',
     );
     expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+  });
+
+  it('posts a mutation with server-owned authority revisions and returns its receipt to the provider', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          mutation_requests: [{
+            capability_id: 'task.reprioritize',
+            parameters: {
+              task_id: '33333333-3333-3333-3333-333333333333',
+              priority: 50,
+            },
+            operation_id: 'reprioritize:33333333',
+            expected_revisions: {
+              target_task_updated_at: '2026-07-18T00:00:00Z',
+            },
+            evidence: [{
+              kind: 'task',
+              project_id: providerInput.identity.project_id,
+              source_id: '33333333-3333-3333-3333-333333333333',
+              revision: 'task:v1',
+              checksum: 'c'.repeat(64),
+              inspected_at: '2026-07-18T00:00:00Z',
+            }],
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Reprioritized', facts: [], evidence: [], operations: [], receipts: [],
+          unknown_effects: [], strategic_implications: [], proposed_memory: [],
+          follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string) => {
+      if (path === '/api/agent/resident-turn/mutate') {
+        return Promise.resolve({
+          capability_id: 'task.reprioritize',
+          operation_id: 'reprioritize:33333333',
+          status: 'applied',
+          receipt_id: '44444444-4444-4444-4444-444444444444',
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    const [path, bodyRaw] = mocks.apiPost.mock.calls[0] as unknown[];
+    expect(path).toBe('/api/agent/resident-turn/mutate');
+    expect(bodyRaw).toMatchObject({
+      capability_id: 'task.reprioritize',
+      project_id: providerInput.identity.project_id,
+      turn_task_id: 'task-id',
+      authority_generation: 7,
+      operation_id: 'reprioritize:33333333',
+      expected_revisions: {
+        authority_generation: 7,
+        active_turn_task_version: 9,
+        current_checkpoint_id: providerInput.lineage.checkpoint_id,
+        resident_checkpoint_version: providerInput.lineage.checkpoint_version,
+        resident_checkpoint_hash: providerInput.lineage.checkpoint_hash,
+        context_hash: providerInput.lineage.context_hash,
+        target_task_updated_at: '2026-07-18T00:00:00Z',
+      },
+    });
+    expect(String(mocks.runClaudeCode.mock.calls[1][0])).toContain(
+      'reprioritize:33333333',
+    );
+    expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+  });
+
+  it('carries a durable unknown-effect projection into an admissible completion', async () => {
+    const completionProjection = {
+      operation: {
+        operation_id: 'reprioritize:unknown',
+        capability: 'task.reprioritize',
+        status: 'applying',
+        summary: 'Server-authorized Resident operation.',
+      },
+      receipt: {
+        operation_id: 'reprioritize:unknown',
+        receipt_id: '44444444-4444-4444-4444-444444444444',
+        status: 'unknown_effect',
+        summary: 'Durable server operation receipt.',
+      },
+      unknown_effects: [{
+        effect_id: 'reprioritize_task:reprioritize:unknown',
+        operation_id: 'reprioritize:unknown',
+        receipt_id: '44444444-4444-4444-4444-444444444444',
+        summary: 'The external effect outcome is unknown and requires reconciliation.',
+        reconciliation_status: 'requires_attention',
+      }],
+      required_attention: [{
+        attention_id: 'unknown-effect:44444444-4444-4444-4444-444444444444',
+        severity: 'critical',
+        summary: 'Reconcile the uncertain external effect before retrying.',
+        evidence_ids: [],
+        receipt_ids: ['44444444-4444-4444-4444-444444444444'],
+      }],
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          mutation_requests: [{
+            capability_id: 'task.reprioritize',
+            parameters: {
+              task_id: '33333333-3333-3333-3333-333333333333',
+              priority: 50,
+            },
+            operation_id: 'reprioritize:unknown',
+            expected_revisions: {
+              target_task_updated_at: '2026-07-18T00:00:00Z',
+            },
+            evidence: [],
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'The operation outcome needs reconciliation.',
+          facts: [], evidence: [],
+          operations: [completionProjection.operation],
+          receipts: [completionProjection.receipt],
+          unknown_effects: completionProjection.unknown_effects,
+          strategic_implications: [], proposed_memory: [], follow_up: null,
+          required_attention: completionProjection.required_attention,
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string) => {
+      if (path === '/api/agent/resident-turn/mutate') {
+        return Promise.resolve({
+          capability_id: 'task.reprioritize',
+          operation_id: 'reprioritize:unknown',
+          status: 'unknown_effect',
+          receipt_id: '44444444-4444-4444-4444-444444444444',
+          completion_projection: completionProjection,
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    const secondPrompt = String(mocks.runClaudeCode.mock.calls[1][0]);
+    expect(secondPrompt).toContain('completion_projection');
+    expect(secondPrompt).toContain('unknown_effect');
+    const completeBody = mocks.apiPost.mock.calls[1][1] as Record<string, unknown>;
+    expect(completeBody.result).toMatchObject({
+      operations: [completionProjection.operation],
+      receipts: [completionProjection.receipt],
+      unknown_effects: completionProjection.unknown_effects,
+      required_attention: completionProjection.required_attention,
+    });
+  });
+
+  it('rejects propose-only mutations before calling the backend', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        mutation_requests: [{
+          capability_id: 'task.cancel',
+          parameters: {
+            task_id: '33333333-3333-3333-3333-333333333333',
+            reason: 'stop',
+          },
+          operation_id: 'cancel:33333333',
+          expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+          evidence: [],
+        }],
+      }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('non-invokable mutate capability');
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it('rejects provider attempts to override server-owned mutation revisions', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        mutation_requests: [{
+          capability_id: 'task.reprioritize',
+          parameters: {
+            task_id: '33333333-3333-3333-3333-333333333333',
+            priority: 50,
+          },
+          operation_id: 'reprioritize:33333333',
+          expected_revisions: { authority_generation: 999 },
+          evidence: [],
+        }],
+      }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('server-owned revision');
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when capability results exceed the aggregate byte budget', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        capability_requests: [{
+          capability_id: 'task.inspect',
+          parameters: { task_id: '33333333-3333-3333-3333-333333333333' },
+        }],
+      }),
+    });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect',
+      evidence: { oversized: 'x'.repeat(48_000) },
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('capability results exceed the hard byte budget');
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(1);
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed before provider launch when the assembled prompt exceeds 160 KB', async () => {
+    mocks.apiGet.mockResolvedValue({
+      provider_input: { ...providerInput, oversized: 'x'.repeat(160_000) },
+      turn_task_version: 9,
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('prompt exceeds the hard byte budget');
+    expect(mocks.runClaudeCode).not.toHaveBeenCalled();
+    expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 
   it('fails closed when the provider repeats an identical capability request', async () => {

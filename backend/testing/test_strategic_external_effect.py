@@ -28,7 +28,10 @@ from app.strategic_operation_authority_validation import (
     InactiveTurnAuthority,
     OperationIdentityCollision,
 )
-from app.strategic_operation_external_effect import execute_external_effect_operation
+from app.strategic_operation_external_effect import (
+    ExternalEffectNotPerformed,
+    execute_external_effect_operation,
+)
 
 
 @pytest_asyncio.fixture()
@@ -140,7 +143,7 @@ async def test_success_settles_to_reconciled(db):
 
 
 @pytest.mark.asyncio
-async def test_perform_error_settles_to_failed(db):
+async def test_perform_error_requires_unknown_effect_reconciliation(db):
     project, task, checkpoint = await _rows(db)
 
     async def perform(_session):
@@ -149,10 +152,43 @@ async def test_perform_error_settles_to_failed(db):
     receipt = await execute_external_effect_operation(
         db, _request(project, task, checkpoint), perform=perform, effect_kind="create_pull_request"
     )
-    assert receipt.status == "failed"
+    assert receipt.status == "unknown_effect"
     assert "github 503" in receipt.receipt["structured_result"]["error"]
-    # A failed external effect is terminal and carries its seeded unknown-effect.
+    assert receipt.completed_at is None
     assert receipt.unknown_effects and receipt.unknown_effects[0]["effect_id"]
+
+    calls = []
+
+    async def must_not_repeat(_session):
+        calls.append(1)
+        return {}
+
+    replay = await execute_external_effect_operation(
+        db,
+        _request(project, task, checkpoint),
+        perform=must_not_repeat,
+        effect_kind="create_pull_request",
+    )
+    assert replay.status == "unknown_effect"
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_proven_pre_effect_failure_is_terminal_and_clears_unknown(db):
+    project, task, checkpoint = await _rows(db)
+
+    async def perform(_session):
+        raise ExternalEffectNotPerformed("target revision changed")
+
+    receipt = await execute_external_effect_operation(
+        db,
+        _request(project, task, checkpoint),
+        perform=perform,
+        effect_kind="create_pull_request",
+    )
+    assert receipt.status == "failed"
+    assert receipt.completed_at is not None
+    assert receipt.unknown_effects == []
 
 
 @pytest.mark.asyncio
@@ -278,11 +314,27 @@ async def test_failed_error_body_scrubs_secrets(db):
     receipt = await execute_external_effect_operation(
         db, _request(project, task, checkpoint), perform=perform, effect_kind="create_pull_request"
     )
-    assert receipt.status == "failed"
+    assert receipt.status == "unknown_effect"
     error = receipt.receipt["structured_result"]["error"]
     assert "ghp_" not in error
     assert "Bearer ghp" not in error
     assert "[redacted]" in error
+
+
+@pytest.mark.asyncio
+async def test_critical_risk_external_operation_reaches_the_executor(db):
+    project, task, checkpoint = await _rows(db)
+    request = _request(project, task, checkpoint)
+    request = FencedOperationRequest(**{**request.__dict__, "risk": "critical"})
+
+    async def perform(_session):
+        return {"merged": True}
+
+    receipt = await execute_external_effect_operation(
+        db, request, perform=perform, effect_kind="merge_pull_request"
+    )
+    assert receipt.status == "reconciled"
+    assert receipt.risk_level == "critical"
 
 
 @pytest.mark.asyncio

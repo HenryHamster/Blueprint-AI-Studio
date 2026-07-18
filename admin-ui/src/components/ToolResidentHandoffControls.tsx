@@ -31,7 +31,7 @@ export function ToolResidentHandoffControls({
     setStatus(`${intent === 'ask' ? 'Attaching for Resident review' : 'Attaching for Resident context'}…`);
     try {
       await onHandoff(intent, laneOwner.trim() || undefined);
-      setStatus(`${toolLabel} revision attached to the Resident conversation.`);
+      setStatus(`${toolLabel} revision queued in your Resident message draft. Review and send it to share.`);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : `Could not share ${toolLabel}`);
       setStatus('');

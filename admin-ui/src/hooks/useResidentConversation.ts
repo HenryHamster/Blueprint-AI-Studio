@@ -5,6 +5,7 @@ import {
 } from '../strategicStateApi';
 import type { ProjectMessage } from '../types/messages';
 import { parseTimestamp } from '../utils/time';
+import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 
 export function compareResidentMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
@@ -24,6 +25,14 @@ export function mergeResidentConversationPages(
   if (incoming.length === 0) return existing;
   const mergedById = new Map(existing.map(message => [message.id, message]));
   for (const message of incoming) {
+    const identity = message.client_idempotency_key ?? message.idempotency_key ?? null;
+    if (identity) {
+      for (const [existingId, existingMessage] of mergedById) {
+        if (existingId !== message.id && messageHasClientIdentity(existingMessage, identity)) {
+          mergedById.delete(existingId);
+        }
+      }
+    }
     const current = mergedById.get(message.id);
     mergedById.set(message.id, current && residentMessagesEqual(current, message) ? current : message);
   }
@@ -61,7 +70,10 @@ interface UseResidentConversationOptions {
   projectId: string | null;
   actorUserId: string | null;
   includeMessageId: string | null;
+  searchQuery?: string;
   realtimeRefreshSignal?: number;
+  realtimeMessage?: ProjectMessage | null;
+  realtimeMessageRequiresCanonicalRefetch?: boolean;
   /** Increments when the strategic-state poll completes with new data.
    *  When set, the conversation refresh piggybacks on the strategic-state
    *  poll cadence instead of running its own independent timer. */
@@ -78,7 +90,10 @@ export function useResidentConversation({
   projectId,
   actorUserId,
   includeMessageId,
+  searchQuery = '',
   realtimeRefreshSignal,
+  realtimeMessage,
+  realtimeMessageRequiresCanonicalRefetch = false,
   strategicPollEpoch,
   getMessages,
   setMessages,
@@ -91,14 +106,16 @@ export function useResidentConversation({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const etagRef = useRef<string | null>(null);
   const requestSequenceRef = useRef(0);
-  const activeScopeRef = useRef(`${actorUserId ?? ''}:${projectId ?? ''}`);
+  const trimmedSearch = searchQuery.trim();
+  const normalizedSearch = trimmedSearch.length >= 2 ? trimmedSearch : '';
+  const activeScopeRef = useRef(`${actorUserId ?? ''}:${projectId ?? ''}:${normalizedSearch}`);
   const fetchedTargetKeyRef = useRef<string | null>(null);
   const gapContinuationRef = useRef<() => void>(() => {});
   const refreshAbortRef = useRef<AbortController | null>(null);
   const olderAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    activeScopeRef.current = `${actorUserId ?? ''}:${projectId ?? ''}`;
+    activeScopeRef.current = `${actorUserId ?? ''}:${projectId ?? ''}:${normalizedSearch}`;
     fetchedTargetKeyRef.current = null;
     etagRef.current = null;
     requestSequenceRef.current += 1;
@@ -109,15 +126,15 @@ export function useResidentConversation({
     setHasMore(false);
     setNextBeforeSequence(null);
     setLoadingOlder(false);
-  }, [actorUserId, projectId, includeMessageId]);
+  }, [actorUserId, projectId, includeMessageId, normalizedSearch]);
 
-  const refresh = useCallback(async (fillSequenceGap = false) => {
+  const refresh = useCallback(async (fillSequenceGap = false, explicitForwardFrom?: number | null) => {
     if (!enabled || !projectId || !actorUserId) return;
     refreshAbortRef.current?.abort();
     const controller = new AbortController();
     refreshAbortRef.current = controller;
     const requestSequence = ++requestSequenceRef.current;
-    const requestScope = `${actorUserId}:${projectId}`;
+    const requestScope = `${actorUserId}:${projectId}:${normalizedSearch}`;
     const isCurrentRequest = () => (
       !controller.signal.aborted
       && activeScopeRef.current === requestScope
@@ -132,11 +149,17 @@ export function useResidentConversation({
       .filter(message => message.sequence != null)
       .map(message => message.sequence as number);
     const priorMax = priorSequences.length ? Math.max(...priorSequences) : null;
-    const forwardFrom = fillSequenceGap && requestedTargetId == null ? priorMax : null;
+    const forwardFrom = fillSequenceGap && requestedTargetId == null && !normalizedSearch
+      ? (explicitForwardFrom === undefined ? priorMax : explicitForwardFrom)
+      : null;
     try {
       const result = await fetchStrategicConversation(
         projectId,
-        forwardFrom != null
+        requestedTargetId
+          ? { includeMessageId: requestedTargetId, limit: 100 }
+          : normalizedSearch
+          ? { search: normalizedSearch, limit: 100 }
+          : forwardFrom != null
           ? { afterSequence: forwardFrom, limit: 100 }
           : { includeMessageId: requestedTargetId, limit: 100 },
         controller.signal,
@@ -177,11 +200,11 @@ export function useResidentConversation({
         gapPages += 1;
       }
       if (!isCurrentRequest()) return;
-      const merged = mergeResidentConversationPages(existing, page);
+      const merged = normalizedSearch ? page.slice().sort(compareResidentMessages) : mergeResidentConversationPages(existing, page);
       setMessages(merged);
       if (forwardFrom == null) {
-        setHasMore(pageHasMore);
-        setNextBeforeSequence(cursor);
+        setHasMore(normalizedSearch ? false : pageHasMore);
+        setNextBeforeSequence(normalizedSearch ? null : cursor);
       }
       if (forwardFrom != null && pageHasMore) {
         window.setTimeout(() => gapContinuationRef.current(), 0);
@@ -194,18 +217,18 @@ export function useResidentConversation({
       if (isCurrentRequest()) onLoadingChange(false);
       if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
     }
-  }, [actorUserId, enabled, getMessages, includeMessageId, onError, onLoadingChange, onTargetFetched, projectId, setMessages]);
+  }, [actorUserId, enabled, getMessages, includeMessageId, normalizedSearch, onError, onLoadingChange, onTargetFetched, projectId, setMessages]);
 
   useEffect(() => {
     gapContinuationRef.current = () => { void refresh(true); };
   }, [refresh]);
 
   const loadOlder = useCallback(async () => {
-    if (!enabled || !projectId || !actorUserId || loadingOlder || !hasMore || nextBeforeSequence == null) return;
+    if (!enabled || !projectId || !actorUserId || normalizedSearch || loadingOlder || !hasMore || nextBeforeSequence == null) return;
     olderAbortRef.current?.abort();
     const controller = new AbortController();
     olderAbortRef.current = controller;
-    const requestScope = `${actorUserId}:${projectId}`;
+    const requestScope = `${actorUserId}:${projectId}:${normalizedSearch}`;
     const isCurrentRequest = () => (
       !controller.signal.aborted
       && activeScopeRef.current === requestScope
@@ -228,7 +251,68 @@ export function useResidentConversation({
       if (isCurrentRequest()) setLoadingOlder(false);
       if (olderAbortRef.current === controller) olderAbortRef.current = null;
     }
-  }, [actorUserId, enabled, hasMore, loadingOlder, nextBeforeSequence, onError, projectId, setMessages]);
+  }, [actorUserId, enabled, hasMore, loadingOlder, nextBeforeSequence, normalizedSearch, onError, projectId, setMessages]);
+
+  const refetchCanonicalMessage = useCallback(async (messageId: string) => {
+    if (!enabled || !projectId || !actorUserId) return;
+    refreshAbortRef.current?.abort();
+    const controller = new AbortController();
+    refreshAbortRef.current = controller;
+    const requestSequence = ++requestSequenceRef.current;
+    const requestScope = `${actorUserId}:${projectId}:${normalizedSearch}`;
+    const isCurrentRequest = () => (
+      !controller.signal.aborted
+      && activeScopeRef.current === requestScope
+      && requestSequence === requestSequenceRef.current
+    );
+    try {
+      const result = await fetchStrategicConversation(
+        projectId,
+        { includeMessageId: messageId, limit: 1 },
+        controller.signal,
+      );
+      if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
+      const canonical = (result.conversation.items ?? []).find(message => message.id === messageId);
+      if (canonical) {
+        setMessages(previous => mergeResidentConversationPages(previous, [canonical]));
+      }
+    } catch (error) {
+      if (isCurrentRequest() && !(error instanceof DOMException && error.name === 'AbortError')) {
+        onError('Failed to reconcile a realtime message');
+      }
+    } finally {
+      if (refreshAbortRef.current === controller) refreshAbortRef.current = null;
+    }
+  }, [actorUserId, enabled, normalizedSearch, onError, projectId, setMessages]);
+
+  const previousSearchRef = useRef(normalizedSearch);
+  useEffect(() => {
+    if (!enabled || previousSearchRef.current === normalizedSearch) return;
+    previousSearchRef.current = normalizedSearch;
+    const timer = window.setTimeout(() => { void refresh(false); }, 250);
+    return () => window.clearTimeout(timer);
+  }, [enabled, normalizedSearch, refresh]);
+
+  useEffect(() => {
+    if (!enabled || !projectId || !realtimeMessage || realtimeMessage.project_id !== projectId || realtimeMessage.surface !== 'conversation') return;
+    if (normalizedSearch) {
+      const timer = window.setTimeout(() => { void refresh(false); }, 100);
+      return () => window.clearTimeout(timer);
+    }
+    const existing = getMessages().filter(message => message.project_id === projectId);
+    const sequences = existing.flatMap(message => message.sequence == null ? [] : [message.sequence]);
+    const priorMax = sequences.length ? Math.max(...sequences) : null;
+    if (realtimeMessageRequiresCanonicalRefetch) {
+      const timer = window.setTimeout(() => {
+        void refetchCanonicalMessage(realtimeMessage.id)
+          .then(() => refresh(priorMax != null, priorMax));
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    setMessages(previous => mergeResidentConversationPages(previous, [realtimeMessage]));
+    const timer = window.setTimeout(() => { void refresh(priorMax != null, priorMax); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [enabled, getMessages, normalizedSearch, projectId, realtimeMessage, realtimeMessageRequiresCanonicalRefetch, refetchCanonicalMessage, refresh, setMessages]);
 
   useEffect(() => {
     if (!enabled || !realtimeRefreshSignal) return;

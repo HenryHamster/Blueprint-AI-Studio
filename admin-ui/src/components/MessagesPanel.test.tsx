@@ -104,6 +104,9 @@ function _setupApiFetchMock(opts: {
         },
       }), { status: 200 });
     }
+    if (/\/api\/admin\/projects\/[^/]+\/resident-engine\/health$/.test(urlStr) && method === 'GET') {
+      return new Response('', { status: 403 });
+    }
     if (/\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr) && method === 'POST') {
       const body = JSON.parse(String(initObj?.body ?? '{}')) as Record<string, unknown>;
       return new Response(JSON.stringify({
@@ -7403,34 +7406,12 @@ describe('MessagesPanel composer draft persistence', () => {
     expect(postedBodies[0]).toMatchObject({
       message_type: 'FEEDBACK',
       content: 'use the clean chat path',
-      workbench_context: {
-        version: 1,
-        interaction_mode: 'continuous',
-        active_surface: 'strategic',
-        preferred_runner_id: null,
-        selected_refs: [
-          { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
-        ],
-        selected_ref_descriptors: [
-          {
-            kind: 'artifact',
-            id: 'artifact:latest-context',
-            label: 'Latest context report',
-            summary: 'Short pointer summary.',
-            status: 'active',
-          },
-        ],
-        session_started_at: sessionStartedAt,
-        context_package_id: 'strategic-context:proj-draft',
-        context_package_descriptor: {
-          id: 'strategic-context:proj-draft',
-          title: 'Draft workbench context',
-          status: 'ready',
-          summary: 'Pointer-safe package summary.',
-        },
-      },
+      source_refs: [],
+      artifact_refs: [],
     });
+    expect(postedBodies[0]).not.toHaveProperty('workbench_context');
     expect(JSON.stringify(postedBodies[0])).not.toContain('Heavy canvas node');
+    expect(JSON.stringify(postedBodies[0])).not.toContain('artifact:latest-context');
     expect(postedBodies[0]).not.toHaveProperty('project_id');
   });
 
@@ -8477,7 +8458,84 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
     );
     await waitFor(() => expect((container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('draft with durable context'));
     expect(container.textContent).toContain('Replying to Strategic: Which runner?');
+    expect(container.querySelector('[aria-label="Remove task revision 7"]')).not.toBeNull();
     await waitFor(() => expect(sessionStorage.getItem('conversationDraftSend:test-user%40example.com:proj-envelope')).toBe('draft-attachment-key'));
+  });
+
+  test('minimal chat exposes independent server-backed conversation search', async () => {
+    _setupConvMock([]);
+    const { container: el } = render(
+      <MessagesPanel selectedProjectId="proj-search" addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    const input = el.querySelector('[aria-label="Search Resident conversation"]') as HTMLInputElement | null;
+    expect(input).not.toBeNull();
+    if (!input) return;
+    fireEvent.change(input, { target: { value: 'deployment decision' } });
+    await waitFor(() => expect(_strategicSessionGetCalls().some(call => (
+      String(call[0]).includes('search=deployment+decision')
+    ))).toBe(true), { timeout: 1000 });
+  });
+
+  test('sends exactly the visible draft source chips and never inherits workbench refs', async () => {
+    const projectId = 'proj-explicit-sources';
+    const explicitRef = { kind: 'task', id: 'task-explicit', label: 'Explicit task', revision: 7 };
+    localStorage.setItem(`messages_composer_draft:test-user@example.com:${projectId}`, JSON.stringify({
+      version: 2,
+      actor_user_id: 'test-user@example.com',
+      project_id: projectId,
+      type: 'FEEDBACK',
+      content: 'Use only the visible source.',
+      reply_to: null,
+      source_refs: [explicitRef],
+      artifact_refs: [],
+      attachment_send_key: null,
+    }));
+    let posted: Record<string, unknown> | null = null;
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') {
+        posted = JSON.parse(String((init as RequestInit).body));
+        return new Response(JSON.stringify({
+          message: makeMsg({
+            id: 'accepted-explicit-source', project_id: projectId, from_type: 'user',
+            content: 'Use only the visible source.', handling_state: 'pending',
+            idempotency_key: String(posted?.idempotency_key),
+          }),
+          wakeup_state: 'queued',
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 20, has_more: false, items: [] } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', projectId);
+    const view = render(
+      <MessagesPanel
+        selectedProjectId={projectId}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicWorkbenchState={{
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'pipeline',
+          selected_refs: [{ kind: 'task', id: 'task-hidden', label: 'Hidden workbench task' }],
+          session_started_at: new Date().toISOString(),
+          last_interaction_at: new Date().toISOString(),
+        }}
+      />,
+    );
+    await waitFor(() => expect(view.container.querySelector('[aria-label="Remove Explicit task revision 7"]')).not.toBeNull());
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(posted).not.toBeNull());
+    expect(posted).toMatchObject({ source_refs: [explicitRef], artifact_refs: [] });
+    expect(posted).not.toHaveProperty('workbench_context');
+    expect(JSON.stringify(posted)).not.toContain('task-hidden');
   });
 
   test('switching actors on the same project replaces rather than leaks composer state', async () => {
@@ -9210,6 +9268,64 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
       write_id: newerWrite,
       content: 'newer tab edit',
     }));
+  });
+
+  test('acceptance after a project switch clears only the old submitted draft', async () => {
+    const oldProjectId = 'proj-old-scope-acceptance';
+    const currentProjectId = 'proj-current-scope-draft';
+    let finishPost!: (response: Response) => void;
+    const postResponse = new Promise<Response>(resolve => { finishPost = resolve; });
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes('/strategic-session/messages') && method === 'POST') return postResponse;
+      if (urlStr.includes('/strategic-conversation') && method === 'GET') {
+        return new Response(JSON.stringify({ conversation: { limit: 100, has_more: false, items: [] } }), { status: 200 });
+      }
+      if (urlStr.includes('/resident-engine/health') && method === 'GET') {
+        return new Response('', { status: 403 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    _suppressSinceLastVisit('test-user@example.com', oldProjectId);
+    _suppressSinceLastVisit('test-user@example.com', currentProjectId);
+    saveComposerDraft('test-user@example.com', currentProjectId, {
+      type: 'FEEDBACK', content: 'current project draft', reply_to: null,
+      source_refs: [], artifact_refs: [], attachment_send_key: null,
+    });
+    const view = render(
+      <MessagesPanel selectedProjectId={oldProjectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    let textarea = await waitFor(() => view.container.querySelector('textarea') as HTMLTextAreaElement);
+    fireEvent.change(textarea, { target: { value: 'submitted on old project' } });
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', oldProjectId)?.content)
+      .toBe('submitted on old project'));
+    fireEvent.click(view.container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement);
+    await waitFor(() => expect(view.container.querySelector('[data-send-state="sending"]')).not.toBeNull());
+
+    view.rerender(
+      <MessagesPanel selectedProjectId={currentProjectId} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+    );
+    textarea = await waitFor(() => view.container.querySelector('textarea') as HTMLTextAreaElement);
+    await waitFor(() => expect(textarea.value).toBe('current project draft'));
+
+    await act(async () => {
+      finishPost(new Response(JSON.stringify({
+        message: makeMsg({
+          id: 'accepted-after-switch', project_id: oldProjectId, from_type: 'user',
+          content: 'submitted on old project', handling_state: 'pending',
+        }),
+        wakeup_state: 'queued',
+      }), { status: 200 }));
+      await postResponse;
+    });
+
+    await waitFor(() => expect(loadComposerDraft('test-user@example.com', oldProjectId)).toBeNull());
+    expect(loadComposerDraft('test-user@example.com', currentProjectId)?.content).toBe('current project draft');
+    expect((view.container.querySelector('textarea') as HTMLTextAreaElement).value).toBe('current project draft');
   });
 
   test('an old reply cannot detach the next attachment draft from lost-response recovery', async () => {

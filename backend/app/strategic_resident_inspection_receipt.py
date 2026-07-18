@@ -24,17 +24,22 @@ _MAX_OPERATION_ID = 128
 
 
 def citable_inspection_evidence(evidence_json: dict[str, Any]) -> dict[str, Any]:
-    """Return the evidence dict with its ``kind`` mapped into the trust taxonomy.
+    """Return mutation-ready evidence in the trust taxonomy.
 
-    Only ``kind`` changes; source_id/revision/checksum are untouched and remain
-    the distinguishing identity, so distinct inspections of one task never
-    conflate despite collapsing to the same trust kind.
+    Task inspection models call the timestamp ``observed_at`` while the mutation
+    envelope deliberately calls it ``inspected_at``. Translate that wire field
+    here, at the server-authored boundary, so the response can be copied exactly
+    into a later mutation without provider-side schema invention.
     """
 
     trust_kind = INSPECTION_EVIDENCE_KIND_MAP.get(str(evidence_json.get("kind")))
-    if trust_kind is None:
-        return evidence_json
-    return {**evidence_json, "kind": trust_kind}
+    result = dict(evidence_json)
+    if trust_kind is not None:
+        result["kind"] = trust_kind
+    observed_at = result.pop("observed_at", None)
+    if observed_at is not None:
+        result["inspected_at"] = observed_at
+    return result
 
 
 def build_inspection_receipt(

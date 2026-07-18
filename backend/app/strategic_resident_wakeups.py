@@ -119,6 +119,9 @@ async def sweep_pending_worker_proposal_wakeups(
 
     from app.models import StrategicResident as _Resident
     from app.models import StrategicWorkerMemoryProposal as _Proposal
+    from app.strategic_resident_worker_proposal_intake import (
+        pending_worker_proposal_cursor,
+    )
 
     async with session_factory() as scan:
         project_ids = list(
@@ -149,7 +152,14 @@ async def sweep_pending_worker_proposal_wakeups(
                     .where(_Proposal.project_id == project_id)
                 )
             ).scalar_one()
-        cursor = {"worker_proposal_count": int(total)}
+            pending_cursor = await pending_worker_proposal_cursor(
+                count_session,
+                project_id=project_id,
+            )
+        cursor = {
+            "worker_proposal_count": int(total),
+            **pending_cursor,
+        }
         wake = await signal_project_change(
             session_factory,
             project_id=project_id,

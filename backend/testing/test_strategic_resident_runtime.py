@@ -31,7 +31,10 @@ from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KE
 from app.strategic_resident_checkpointing import initialize_strategic_resident
 from app.strategic_resident_capabilities import compact_capability_catalog
 from app.strategic_resident_context import (
+    CAPABILITY_RESULTS_HARD_BYTES,
     HARD_INPUT_BYTES,
+    PROVIDER_INPUT_FIT_BYTES,
+    PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES,
     reconstruct_authoritative_turn_input,
 )
 from app.strategic_resident_runtime import coalesce_authoritative_resident_turn
@@ -173,7 +176,13 @@ async def test_authoritative_turn_reconstructs_visible_context_and_is_bounded(
         "shell",
     ):
         assert forbidden not in catalog_json
-    assert provider_input["limits"]["encoded_bytes"] <= HARD_INPUT_BYTES
+    assert provider_input["limits"]["encoded_bytes"] <= PROVIDER_INPUT_FIT_BYTES
+    assert (
+        provider_input["limits"]["provider_input_fit_bytes"]
+        + CAPABILITY_RESULTS_HARD_BYTES
+        + PROVIDER_PROMPT_OVERHEAD_RESERVE_BYTES
+        == HARD_INPUT_BYTES
+    )
     actual_bytes = len(
         json.dumps(
             provider_input,
@@ -183,7 +192,7 @@ async def test_authoritative_turn_reconstructs_visible_context_and_is_bounded(
             default=str,
         ).encode("utf-8")
     )
-    assert actual_bytes <= HARD_INPUT_BYTES
+    assert actual_bytes <= PROVIDER_INPUT_FIT_BYTES
     assert provider_input["limits"]["encoded_bytes"] == actual_bytes
     assert len(provider_input["lineage"]["context_hash"]) == 64
     expected_evidence_hash = hashlib.sha256(
@@ -843,6 +852,74 @@ async def test_pending_worker_proposal_sweep_wakes_then_is_idle(db_session):
         drain.add(row)
         await drain.commit()
     assert await sweep_pending_worker_proposal_wakeups(session_factory=factory) == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_proposal_cursor_advances_after_bounded_partial_drain(
+    db_session,
+):
+    from sqlmodel import select as _select
+
+    from app.models import StrategicWorkerMemoryProposal
+    from app.strategic_resident_worker_proposal_intake import (
+        pending_worker_proposal_cursor,
+    )
+
+    project, _resident = await _authoritative_project(db_session)
+    rows = [
+        StrategicWorkerMemoryProposal(
+            project_id=project.id,
+            proposal_id=f"backlog-{index:03d}",
+            layer="working_strategy",
+            updates={"priorities": {f"p{index}": index}},
+            rationale="bounded backlog",
+            evidence=[],
+            target_checkpoint_version=1,
+            target_checkpoint_hash="a" * 64,
+            status="pending",
+        )
+        for index in range(51)
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    first = await pending_worker_proposal_cursor(
+        db_session,
+        project_id=project.id,
+    )
+    ordered = (
+        (
+            await db_session.execute(
+                _select(StrategicWorkerMemoryProposal)
+                .where(StrategicWorkerMemoryProposal.project_id == project.id)
+                .order_by(
+                    StrategicWorkerMemoryProposal.created_at.asc(),
+                    StrategicWorkerMemoryProposal.id.asc(),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in ordered[:50]:
+        row.status = "admitted"
+        db_session.add(row)
+    await db_session.commit()
+
+    second = await pending_worker_proposal_cursor(
+        db_session,
+        project_id=project.id,
+    )
+    assert second
+    assert second != first
+
+    ordered[-1].status = "admitted"
+    db_session.add(ordered[-1])
+    await db_session.commit()
+    assert not await pending_worker_proposal_cursor(
+        db_session,
+        project_id=project.id,
+    )
 
 
 @pytest.mark.asyncio

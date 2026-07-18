@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app.models import Project, ProjectMessage, Task, TaskStatus
+from app.models import Project, Task, TaskStatus
 from app.strategic_operation_authority_validation import OperationPayloadTooLarge
 from app.strategic_resident_capabilities import (
     CapabilityMode,
@@ -57,6 +57,18 @@ def test_inspection_capability_kinds_match_real_capabilities():
     # operation_kind values are the receipt contract — they must be distinct.
     kinds = list(INSPECTION_CAPABILITY_KINDS.values())
     assert len(kinds) == len(set(kinds)), "duplicate operation_kind in the map"
+
+
+def test_wired_task_lifecycle_preconditions_are_produced_by_task_inspection():
+    """Every invoked lifecycle adapter can cite canonical inspection evidence."""
+
+    for capability_id in (
+        "task.cancel",
+        "task.requeue",
+        "task.retry",
+        "task.unblock",
+    ):
+        assert capability_for(capability_id).evidence_preconditions == ("task",)
 
 
 def test_capability_registry_declares_complete_safety_contracts():
@@ -111,9 +123,10 @@ def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
     assert capability_for("task.inspect").service == "resident_task_inspection"
     assert next(item for item in catalog if item["id"] == "task.inspect")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "propose_only"
+    assert next(item for item in catalog if item["id"] == "pr.merge")["availability"] == "propose_only"
 
 
-def test_mutation_invocation_requires_authority_evidence_and_approval():
+def test_mutation_invocation_requires_authority_and_evidence():
     base = {
         "capability_id": "pr.merge",
         "project_id": uuid.uuid4(),
@@ -138,14 +151,8 @@ def test_mutation_invocation_requires_authority_evidence_and_approval():
                     "checksum": "a" * 64,
                     "inspected_at": "2026-07-17T12:00:00Z",
                 }
-                for kind in (
-                    "pr_diff",
-                    "pr_checks",
-                    "pr_reviews",
-                    "pr_mergeability",
-                )
+                for kind in ("pr", "pr_diff", "pr_check")
             ),
-            "approval_ref": str(uuid.uuid4()),
         }
     )
     assert valid.capability_id == "pr.merge"
@@ -154,7 +161,7 @@ def test_mutation_invocation_requires_authority_evidence_and_approval():
     with pytest.raises(ValidationError):
         ResidentCapabilityInvocation.model_validate(bool_revision)
     excessive_evidence = valid.model_dump()
-    excessive_evidence["evidence"] = excessive_evidence["evidence"] * 13
+    excessive_evidence["evidence"] = excessive_evidence["evidence"] * 17
     with pytest.raises(ValidationError):
         ResidentCapabilityInvocation.model_validate(excessive_evidence)
     with pytest.raises(ValidationError, match="credential scope"):
@@ -783,6 +790,78 @@ async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     assert fenced_request.risk == "low"
 
 
+@pytest.mark.parametrize(
+    "receipt_status",
+    [
+        "pending",
+        "applying",
+        "applied",
+        "reconciling",
+        "reconciled",
+        "failed",
+        "unknown_effect",
+    ],
+)
+def test_completion_projection_is_admissible_for_every_durable_status(
+    receipt_status,
+):
+    from app.strategic_resident_turn_results import StrategicResidentTurnResult
+
+    receipt_id = uuid.uuid4()
+    unsettled = receipt_status in {
+        "pending",
+        "applying",
+        "reconciling",
+        "unknown_effect",
+    }
+    projection = capability_router._completion_projection(
+        SimpleNamespace(
+            id=receipt_id,
+            operation_id="retry:worker-1",
+            status=receipt_status,
+            unknown_effects=(
+                [
+                    {
+                        "effect_id": "requeue_task:retry:worker-1",
+                        "kind": "requeue_task",
+                    }
+                ]
+                if unsettled
+                else []
+            ),
+        ),
+        capability_id="task.retry",
+    )
+    assert projection["operation"]["status"] == (
+        "applying" if unsettled else receipt_status
+    )
+    assert projection["receipt"]["status"] == receipt_status
+    if unsettled:
+        assert projection["unknown_effects"] == [
+            {
+                "effect_id": "requeue_task:retry:worker-1",
+                "operation_id": "retry:worker-1",
+                "receipt_id": str(receipt_id),
+                "summary": "The external effect outcome is unknown and requires reconciliation.",
+                "reconciliation_status": "requires_attention",
+            }
+        ]
+        assert projection["required_attention"][0]["receipt_ids"] == [
+            str(receipt_id)
+        ]
+    else:
+        assert projection["unknown_effects"] == []
+        assert projection["required_attention"] == []
+    StrategicResidentTurnResult.model_validate(
+        {
+            "operations": [projection["operation"]],
+            "receipts": [projection["receipt"]],
+            "unknown_effects": projection["unknown_effects"],
+            "required_attention": projection["required_attention"],
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypatch):
     project_id = uuid.uuid4()
@@ -824,11 +903,14 @@ async def test_task_lifecycle_routes_through_the_external_executor(
     monkeypatch.setattr(
         capability_router, "execute_external_effect_operation", external
     )
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     evidence_kind = {
         "task.cancel": "task",
         "task.requeue": "task",
-        "task.retry": "task_failure",
-        "task.unblock": "task_blocker",
+        "task.retry": "task",
+        "task.unblock": "task",
     }[capability]
     params = {"task_id": str(uuid.uuid4())}
     if capability == "task.cancel":
@@ -839,6 +921,9 @@ async def test_task_lifecycle_routes_through_the_external_executor(
         capability_id=capability,
         parameters=params,
         evidence=_evidence_of_kinds(project_id, evidence_kind),
+    )
+    invocation.expected_revisions["target_task_updated_at"] = (
+        "2026-07-18T00:00:00"
     )
     result = await capability_router.invoke_resident_mutation(
         None,
@@ -854,12 +939,8 @@ async def test_task_lifecycle_routes_through_the_external_executor(
 
 
 @pytest.mark.asyncio
-async def test_external_effect_pr_create_dispatches(monkeypatch):
-    """A wired external effect (pr.create) routes to the external executor.
-
-    No arming gate: usability is governed by the plan's own gates (a wired
-    adapter + evidence + authority + the operator engine-ownership flip).
-    """
+async def test_external_effect_pr_create_stays_proposal_only(monkeypatch):
+    """A partial adapter never makes an evidence-unreachable capability invokable."""
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     receipt = SimpleNamespace(
@@ -876,24 +957,20 @@ async def test_external_effect_pr_create_dispatches(monkeypatch):
         parameters={"head": "feature", "base": "main", "title": "PR"},
         evidence=_evidence_of_kinds(project_id, "branch"),
     )
-    result = await capability_router.invoke_resident_mutation(
-        None,
-        invocation,
-        session=SimpleNamespace(),
-        token=_mutation_token(project_id, turn_id),
-    )
-    assert result["status"] == "reconciled"
-    external.assert_awaited_once()
-    # The fenced request is built from the token authority + declared kind.
-    fenced_request = external.await_args.args[1]
-    assert fenced_request.capability == "pr.create"
-    assert fenced_request.operation_kind == "create_pull_request"
-    assert fenced_request.project_id == project_id
+    with pytest.raises(HTTPException) as exc_info:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc_info.value.status_code == 501
+    external.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_external_effect_unwired_capability_stays_501(monkeypatch):
-    """pr.merge has no wired adapter yet, so it stays proposal-only (501)."""
+    """An unwired declared mutation stays proposal-only (501)."""
     project_id = uuid.uuid4()
     turn_id = uuid.uuid4()
     external = AsyncMock()
@@ -989,6 +1066,7 @@ async def test_mutation_route_rejects_evidence_ref_not_backed_by_inspection(monk
     execute_result = MagicMock()
     execute_result.scalars.return_value.all.return_value = []
     session = AsyncMock()
+    session.scalar.return_value = {"_resident_turn_context_hash": "ctx-hash"}
     session.execute.return_value = execute_result
 
     with pytest.raises(HTTPException) as exc:
@@ -1016,8 +1094,10 @@ async def test_mutation_route_accepts_evidence_refs_matching_inspection_receipts
 
     # Build a SimpleNamespace receipt that backs the evidence ref above.
     receipt_row = SimpleNamespace(
+        capability="task.inspect",
         operation_kind="inspect_task",
         status="applied",
+        expected_revisions={"context_hash": "ctx-hash"},
         receipt={
             "structured_result": {
                 "evidence": [
@@ -1034,6 +1114,7 @@ async def test_mutation_route_accepts_evidence_refs_matching_inspection_receipts
     execute_result = MagicMock()
     execute_result.scalars.return_value.all.return_value = [receipt_row]
     session = AsyncMock()
+    session.scalar.return_value = {"_resident_turn_context_hash": "ctx-hash"}
     session.execute.return_value = execute_result
 
     db_receipt = SimpleNamespace(operation_id="op-strategy-1", status="applied", id=uuid.uuid4())
@@ -1058,8 +1139,10 @@ async def test_build_receipt_evidence_set_extracts_only_successful_inspection_re
 
     valid_key = ("task", "task-id-1", "v1", "a" * 64)
     valid_receipt = SimpleNamespace(
+        capability="task.inspect",
         operation_kind="inspect_task",
         status="applied",
+        expected_revisions={"context_hash": "ctx-hash"},
         receipt={
             "structured_result": {
                 "evidence": [
@@ -1070,21 +1153,28 @@ async def test_build_receipt_evidence_set_extracts_only_successful_inspection_re
     )
     # Pending receipt: should be excluded.
     pending_receipt = SimpleNamespace(
+        capability="task.inspect",
         operation_kind="inspect_task",
         status="pending",
+        expected_revisions={"context_hash": "ctx-hash"},
         receipt={"structured_result": {"evidence": [
             {"kind": "task", "source_id": "task-id-2", "revision": "v2", "checksum": "b" * 64}
         ]}},
     )
     # Wrong operation_kind (mutation, not inspection): should be excluded.
     mutate_receipt = SimpleNamespace(
+        capability="strategy.running_update.set",
         operation_kind="set_running_update",
         status="applied",
+        expected_revisions={"context_hash": "ctx-hash"},
         receipt={"structured_result": {"evidence": [
             {"kind": "task", "source_id": "task-id-3", "revision": "v3", "checksum": "c" * 64}
         ]}},
     )
-    result = _build_receipt_evidence_set([valid_receipt, pending_receipt, mutate_receipt])
+    result = _build_receipt_evidence_set(
+        [valid_receipt, pending_receipt, mutate_receipt],
+        expected_context_hash="ctx-hash",
+    )
     assert valid_key in result
     assert ("task", "task-id-2", "v2", "b" * 64) not in result
     assert ("task", "task-id-3", "v3", "c" * 64) not in result
@@ -1123,8 +1213,8 @@ async def test_lineage_inspection_stays_in_project_and_is_stable(db_session):
     assert "foreign" not in str(evidence.data)
 
 
-def test_approval_ref_model_validator_rejects_non_uuid_for_explicit_policy():
-    """_matches_declaration must reject non-UUID approval_ref for explicit-policy capabilities."""
+def test_explicit_policy_invocation_uses_durable_approval_not_message_ref():
+    """The exact durable approval is verified by the mutation route."""
     project_id = uuid.uuid4()
     base = {
         "capability_id": "pr.merge",
@@ -1143,80 +1233,9 @@ def test_approval_ref_model_validator_rejects_non_uuid_for_explicit_policy():
                 "checksum": "a" * 64,
                 "inspected_at": "2026-07-17T12:00:00Z",
             }
-            for kind in ("pr_diff", "pr_checks", "pr_reviews", "pr_mergeability")
+                for kind in ("pr", "pr_diff", "pr_check")
         ),
     }
-    # Valid UUID approval_ref must pass model validation.
-    valid_ref = str(uuid.uuid4())
-    invocation = ResidentCapabilityInvocation.model_validate(
-        {**base, "approval_ref": valid_ref}
-    )
-    assert invocation.approval_ref == valid_ref
-
-    # Non-UUID approval_ref must be rejected at the model layer.
-    with pytest.raises(ValidationError, match="ProjectMessage UUID"):
-        ResidentCapabilityInvocation.model_validate(
-            {**base, "approval_ref": "approval-message-42"}
-        )
-
-    # Missing approval_ref must still be rejected.
-    with pytest.raises(ValidationError, match="explicit approval_ref"):
-        ResidentCapabilityInvocation.model_validate(base)
-
-
-@pytest.mark.asyncio
-async def test_validate_approval_ref_rejects_missing_foreign_and_agent_messages(db_session):
-    """_validate_approval_ref must 403 on absent, wrong-project, or non-user messages."""
-    from app.routers.agent_resident_capabilities import _validate_approval_ref
-
-    project = Project(name="approval project", user_id="u")
-    other = Project(name="other project", user_id="u")
-    db_session.add_all([project, other])
-    await db_session.flush()
-
-    human_msg = ProjectMessage(
-        project_id=project.id,
-        from_type="user",
-        content="operator approval granted",
-    )
-    agent_msg = ProjectMessage(
-        project_id=project.id,
-        from_type="agent",
-        content="agent cannot approve",
-    )
-    foreign_msg = ProjectMessage(
-        project_id=other.id,
-        from_type="user",
-        content="wrong project",
-    )
-    db_session.add_all([human_msg, agent_msg, foreign_msg])
-    await db_session.commit()
-
-    # Valid: human user message in the right project.
-    await _validate_approval_ref(db_session, str(human_msg.id), project.id)
-
-    # Missing approval_ref raises 403.
-    with pytest.raises(HTTPException) as exc:
-        await _validate_approval_ref(db_session, None, project.id)
-    assert exc.value.status_code == 403
-
-    # Non-UUID string raises 403.
-    with pytest.raises(HTTPException) as exc:
-        await _validate_approval_ref(db_session, "not-a-uuid", project.id)
-    assert exc.value.status_code == 403
-
-    # Agent-authored message is rejected.
-    with pytest.raises(HTTPException) as exc:
-        await _validate_approval_ref(db_session, str(agent_msg.id), project.id)
-    assert exc.value.status_code == 403
-    assert "human operator" in exc.value.detail
-
-    # Message belonging to a different project is rejected.
-    with pytest.raises(HTTPException) as exc:
-        await _validate_approval_ref(db_session, str(foreign_msg.id), project.id)
-    assert exc.value.status_code == 403
-
-    # Entirely unknown UUID is rejected.
-    with pytest.raises(HTTPException) as exc:
-        await _validate_approval_ref(db_session, str(uuid.uuid4()), project.id)
-    assert exc.value.status_code == 403
+    invocation = ResidentCapabilityInvocation.model_validate(base)
+    assert invocation.capability_id == "pr.merge"
+    assert not hasattr(invocation, "approval_ref")

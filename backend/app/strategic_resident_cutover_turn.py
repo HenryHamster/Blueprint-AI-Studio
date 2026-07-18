@@ -48,10 +48,9 @@ async def seed_cutover_conversation_turn(
         project_change_cursor=None,
         input_frozen=True,
         # A cutover conversation turn is the first authoritative turn after
-        # ownership flips; it hands off no historical artifact-ref grants (the
-        # checkpoint content carries the state). `_create_authoritative_turn`
-        # made `artifact_ref_grants` a required keyword-only arg in 99f32846c
-        # and updated the two runtime callers but missed this one.
+        # ownership flips. Context reconstruction replaces this bootstrap set
+        # with only the exact ArtifactRefs represented after bounded fitting;
+        # starting empty avoids granting refs from an omitted conversation tail.
         artifact_ref_grants=frozenset(),
     )
     payload = dict(_task_payload(task))

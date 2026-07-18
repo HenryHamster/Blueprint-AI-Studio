@@ -53,6 +53,7 @@ const NullBranchDiagnosticsPanel = lazy(() => import('./components/NullBranchDia
 import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
+import type { ProjectMessage } from './types/messages';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
 const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
@@ -154,10 +155,17 @@ function BoardDataReadyReporter({ activeTab, initialLoading, refreshing, fetchEp
 
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
-  const refreshMessagesRef = useRef<() => void>(() => {});
+  const refreshMessagesRef = useRef<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>(() => {});
   const refreshFleetRunnersRef = useRef<() => void>(() => {});
   const [messageRealtimeRefreshSignal, setMessageRealtimeRefreshSignal] = useState(0);
-  refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
+  const [realtimeCanonicalProjection, setRealtimeCanonicalProjection] = useState<{
+    message: ProjectMessage;
+    canonicalRefetchRequired: boolean;
+  } | null>(null);
+  refreshMessagesRef.current = (message, canonicalRefetchRequired = false) => {
+    if (message) setRealtimeCanonicalProjection({ message, canonicalRefetchRequired });
+    else setMessageRealtimeRefreshSignal(value => value + 1);
+  };
   const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
@@ -1406,6 +1414,8 @@ export default function App() {
                 strategicSessionTranscript={s.strategicSessionTranscript}
                 focusComposerSignal={strategicComposerFocusSignal}
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
+                realtimeCanonicalMessage={realtimeCanonicalProjection?.message ?? null}
+                realtimeCanonicalRefetchRequired={realtimeCanonicalProjection?.canonicalRefetchRequired ?? false}
                 strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}

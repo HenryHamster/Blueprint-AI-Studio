@@ -387,8 +387,10 @@ def _request_fingerprint(
         raise FencedOperationUsageError("capability must be 1-64 characters")
     if not operation_kind or len(operation_kind) > 64:
         raise FencedOperationUsageError("operation_kind must be 1-64 characters")
-    if risk not in {"low", "medium", "high"}:
-        raise FencedOperationUsageError("risk must be low, medium, or high")
+    if risk not in {"low", "medium", "high", "critical"}:
+        raise FencedOperationUsageError(
+            "risk must be low, medium, high, or critical"
+        )
     if int(request.authority_generation) < 1:
         raise FencedOperationUsageError("authority_generation must be positive")
     expected_revisions = dict(request.expected_revisions or {})

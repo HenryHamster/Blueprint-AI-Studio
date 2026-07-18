@@ -14,11 +14,26 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlmodel import select
 
+import app.routers.admin_project_strategic_session as strategic_session_router
 from app.models import Project, ProjectMember, StrategicResident
 
 TEST_USER_ID = "test-user-123"
+
+
+@pytest.fixture(autouse=True)
+def _bind_engine_transition_session_factory(db_session, monkeypatch):
+    """Keep the route's fresh transaction on this test's SQLite database.
+
+    Production intentionally performs ownership transitions through a dedicated
+    ``AsyncSessionLocal`` transaction. The SQLite harness uses an isolated
+    in-memory engine, so the route-local binding must be redirected to the same
+    engine while preserving the independent-session behavior being tested.
+    """
+    factory = async_sessionmaker(db_session.bind, expire_on_commit=False)
+    monkeypatch.setattr(strategic_session_router, "AsyncSessionLocal", factory)
 
 
 async def _project_with_role(
