@@ -67,6 +67,10 @@ from app.strategic_resident_task_mutation import (
     task_mutation_callback,
     task_mutation_operation_kind,
 )
+from app.strategic_resident_task_lifecycle import (
+    build_task_lifecycle_effect,
+    task_lifecycle_operation_kind,
+)
 from app.strategic_resident_task_inspection import (
     ResidentTaskNotFound,
     inspect_project_task,
@@ -288,7 +292,20 @@ async def invoke_resident_mutation(
     callback = None
     operation_kind = None
     external_effect = None
-    if spec.service in EXTERNAL_EFFECT_SERVICES:
+    # Task-lifecycle mutations (cancel/requeue/retry/unblock) run the operator's
+    # own modify_task_apply path inside the two-phase executor's perform phase —
+    # so all the cascade (child cancellation, slot release, VM teardown) is reused
+    # rather than re-implemented. Checked first because these span two declared
+    # services but share one execution path.
+    lifecycle_kind = task_lifecycle_operation_kind(body.capability_id)
+    if lifecycle_kind is not None:
+        operation_kind = lifecycle_kind
+        external_effect = build_task_lifecycle_effect(
+            body.capability_id,
+            project_id=binding.project_id,
+            parameters=dict(body.parameters),
+        )
+    elif spec.service in EXTERNAL_EFFECT_SERVICES:
         operation_kind = external_effect_operation_kind(body.capability_id)
         if operation_kind is not None:
             external_effect = build_external_effect(
