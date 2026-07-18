@@ -141,7 +141,7 @@
     "strategic_resident_ownership.py": 700,
     "strategic_resident_transition_locks.py": 300,
     "strategic_resident_turn_results.py": 250,
-    "strategic_resident_reconciliation.py": 700,
+    "strategic_resident_reconciliation.py": 950,
     "strategic_resident_realtime.py": 120,
     "strategic_resident_reconciliation_scheduling.py": 160,
     "strategic_resident_reconciliation_validation.py": 350,

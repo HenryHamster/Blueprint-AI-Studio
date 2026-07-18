@@ -427,3 +427,79 @@ class StrategicOperationReceipt(SQLModel, table=True):
             "started_at",
         ),
     )
+
+
+class StrategicWorkerMemoryProposal(SQLModel, table=True):
+    """A bounded worker's proposed strategic-memory change, awaiting admission.
+
+    A worker (e.g. a completed StrategicCycle) inserts a ``pending`` row; Resident
+    reconciliation drains it, admits it only while its revision-link
+    (``target_checkpoint_version``/``hash``) is still current and its evidence is
+    trusted, and marks it ``admitted`` or ``rejected``. Workers never mutate
+    strategic memory directly — this table is the only intake, and admission runs
+    exclusively inside the checkpoint-CAS reconciliation transaction.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("strategicresident.project_id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    proposal_id: str = Field(sa_column=Column(String(120), nullable=False))
+    layer: str = Field(sa_column=Column(String(32), nullable=False))
+    updates: dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    rationale: str = Field(sa_column=Column(String(4000), nullable=False))
+    evidence: list[Any] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+    target_checkpoint_version: int = Field(
+        sa_column=Column(BigInteger, nullable=False)
+    )
+    target_checkpoint_hash: str = Field(sa_column=Column(String(64), nullable=False))
+    status: str = Field(
+        default="pending",
+        sa_column=Column(String(16), nullable=False, server_default=text("'pending'")),
+    )
+    rejection_reason: str | None = Field(
+        default=None, sa_column=Column(String(500), nullable=True)
+    )
+    # Not a FK: a StrategicCycle may be pruned, but the proposal provenance stays.
+    source_cycle_id: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    resolved_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "proposal_id",
+            name="uq_strategicworkermemoryproposal_project_proposal",
+        ),
+        CheckConstraint(
+            "layer IN ('charter','working_strategy')",
+            name="chk_strategicworkermemoryproposal_layer",
+        ),
+        CheckConstraint(
+            "status IN ('pending','admitted','rejected')",
+            name="chk_strategicworkermemoryproposal_status",
+        ),
+        Index(
+            "ix_strategicworkermemoryproposal_project_status",
+            "project_id",
+            "status",
+            "created_at",
+        ),
+    )
