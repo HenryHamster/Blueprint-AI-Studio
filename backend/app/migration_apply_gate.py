@@ -463,25 +463,20 @@ def _looks_like_serving_only_import(exc: ImportError) -> bool:
 
 def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
     """Return True when *detail* describes the deliberate keyless fail-closed
-    of migration 0609 in the secret-free scratch subprocess.
+    of an encryption migration in the secret-free scratch subprocess.
 
-    Requires all three signals on the same line to prevent false positives:
+    Requires both signals on the same line to prevent false positives:
       1. "RuntimeError" — the exception type
-      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name
-      3. "0609" — migration identifier (anchor to the specific migration)
+      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name (e.g.
+         ``GITHUB_PAT_ENCRYPTION_KEY``)
 
-    The three-signal check rejects:
-    - Accumulated chain stderr where earlier no-op migrations emit the
-      env-var name as a warning before an unrelated RuntimeError fires.
-    - Non-RuntimeError exceptions that happen to mention both key and revision.
-    - RuntimeErrors from other migrations that mention the key but not 0609.
+    The two-signal check is migration-number-agnostic — it covers any
+    encryption migration (0609, 0621, and future migrations) without needing
+    per-migration updates. It rejects accumulated chain stderr where the
+    env-var name appears on a different line than RuntimeError.
     """
     for line in detail.splitlines():
-        if (
-            "RuntimeError" in line
-            and _ENCRYPTION_KEY_ENV_VAR in line
-            and "0609" in line
-        ):
+        if "RuntimeError" in line and _ENCRYPTION_KEY_ENV_VAR in line:
             return True
     return False
 
