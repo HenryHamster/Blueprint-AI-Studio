@@ -703,6 +703,7 @@ def record_capability_named_test_execution_proof(
     head_sha: str | None = None,
     *,
     suite_verifying: bool = True,
+    env_fingerprint: str | None = None,
 ) -> bool:
     """Record a bounded GENUINE ``named_test``-tier (``proven``) proof from an
     actual test EXECUTION.
@@ -793,6 +794,9 @@ def record_capability_named_test_execution_proof(
         "executed": True,
         "commit_sha": commit_sha,
     }
+    _env_fp = env_fingerprint if isinstance(env_fingerprint, str) and env_fingerprint else None
+    if _env_fp:
+        proof_entry["env_fingerprint"] = _env_fp
 
     try:
         if not isinstance(getattr(project, "capability_proof_records", None), dict):
@@ -830,18 +834,21 @@ def record_capability_named_test_execution_proof(
         commit_sha,
     )
 
+    _ref_entry: dict[str, Any] = {
+        "kind": _PROOF_KIND_NAMED_TEST,
+        "ref": proof_ref,
+        "proven": True,
+        "source_id": dedup_task_id,
+        "recorded_at": proved_at,
+        "executed": True,
+        "commit_sha": commit_sha,
+    }
+    if _env_fp:
+        _ref_entry["env_fingerprint"] = _env_fp
     _append_evidence_refs_to_capabilities(
         project,
         [norm],
-        {
-            "kind": _PROOF_KIND_NAMED_TEST,
-            "ref": proof_ref,
-            "proven": True,
-            "source_id": dedup_task_id,
-            "recorded_at": proved_at,
-            "executed": True,
-            "commit_sha": commit_sha,
-        },
+        _ref_entry,
         replace=True,
     )
     return True
@@ -981,6 +988,8 @@ def _fresh_executed_proof_covers_head(
     cap_name: str,
     head_sha: str | None,
     now: Any = None,
+    *,
+    env_fingerprint: str | None = None,
 ) -> bool:
     """Whether a GREEN *executed* named_test proof for ``cap_name`` already covers
     the current HEAD.
@@ -1032,6 +1041,19 @@ def _fresh_executed_proof_covers_head(
         if _ref_is_expired(entry, _now, PROOF_FRESHNESS_TTL):
             # Aged past the TTL — the genuine re-verification loop.
             continue
+        # Environment-binding check: when both the stored proof and the caller
+        # supply a non-empty fingerprint, a mismatch means the hardware or
+        # container image changed — force re-verification even if the code tree
+        # and TTL are unchanged.
+        stored_fp = entry.get("env_fingerprint")
+        if (
+            stored_fp
+            and isinstance(stored_fp, str)
+            and env_fingerprint
+            and isinstance(env_fingerprint, str)
+            and stored_fp != env_fingerprint
+        ):
+            continue
         return True
     return False
 
@@ -1045,6 +1067,7 @@ async def _maybe_enroll_proof_trial(
     *,
     read_head_sha: Any = None,
     now: Any = None,
+    env_fingerprint: str | None = None,
 ) -> str | None:
     """Decide whether a discovered-covered capability enrolls a proof trial.
 
@@ -1078,11 +1101,14 @@ async def _maybe_enroll_proof_trial(
         except Exception:  # noqa: BLE001 — HEAD resolution failure is non-fatal
             head_sha = None
 
-        if _fresh_executed_proof_covers_head(project, canonical, head_sha, now=now):
+        if _fresh_executed_proof_covers_head(
+            project, canonical, head_sha, now=now, env_fingerprint=env_fingerprint
+        ):
             return "fresh"
 
         task = await enroll_capability_proof_trial(
-            session, project, raw_name or canonical, test_refs, head_sha=head_sha
+            session, project, raw_name or canonical, test_refs,
+            head_sha=head_sha, env_fingerprint=env_fingerprint,
         )
         return "enrolled" if task is not None else None
     except Exception:  # noqa: BLE001 — enrollment decision must degrade, never raise
@@ -1100,6 +1126,7 @@ async def enroll_capability_proof_trial(
     cap_name: str,
     test_refs: list[str],
     head_sha: str | None = None,
+    env_fingerprint: str | None = None,
 ) -> Any:
     """Create + persist a ``capability_proof_trial`` Task for one capability.
 
@@ -1202,6 +1229,9 @@ async def enroll_capability_proof_trial(
                 exc_info=True,
             )
 
+        _enroll_fp = (
+            env_fingerprint if isinstance(env_fingerprint, str) and env_fingerprint else None
+        )
         payload: dict[str, Any] = {
             "type": "capability_proof_trial",
             "cap": norm,
@@ -1210,6 +1240,8 @@ async def enroll_capability_proof_trial(
             "max_test_files": MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
             "wall_clock_seconds": CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS,
         }
+        if _enroll_fp:
+            payload["env_fingerprint"] = _enroll_fp
         task = Task(
             project_id=getattr(project, "id", None),
             title=f"Capability proof trial: {norm}",
