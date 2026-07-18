@@ -327,6 +327,7 @@ async def _maybe_autocomplete_exhausted_direction(
         Alert(
             project_id=task.project_id,
             severity=AlertSeverity.INFO,
+            event_type="research.direction_auto_completed",
             title="Direction auto-completed",
             message=(
                 f"Direction '{d.get('text', did)[:80]}' was auto-completed: {reason}."
@@ -791,6 +792,7 @@ async def apply_post_spawn_state(
                             _deadlock_alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.WARNING,
+                                event_type="research.dedup_deadlock",
                                 title="Dedup deadlock detected",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
@@ -904,6 +906,7 @@ async def apply_post_spawn_state(
                             _af_alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.WARNING,
+                                event_type="research.already_fixed_deadlock",
                                 title="Already-fixed deadlock detected",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
@@ -1033,6 +1036,7 @@ async def apply_post_spawn_state(
                             alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.INFO,
+                                event_type="research.direction_auto_completed",
                                 title="Direction auto-completed",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' was auto-completed: "

@@ -33,6 +33,7 @@ from app.models import (
     Task,
 )
 from app.storage import (
+    artifact_expires_at,
     generate_download_signed_url,
     verify_artifact_project_ownership,
     viewable_content_type_for_filename,
@@ -986,6 +987,10 @@ async def _running_job_preview_items(
         dropped = pm.get("viewable_files_dropped")
         if isinstance(dropped, int) and dropped > 0:
             item["viewable_files_dropped"] = dropped
+        # Artifact retention expiry: computed from the job's creation timestamp
+        # (fallback for running jobs where completed_at is not yet set).
+        if job.created_at:
+            item["artifact_expires_at"] = artifact_expires_at(job.created_at)
         # Stamp progress_series from polling_metadata so the strategic canvas can
         # render a real time-series chart (e.g. eval-reward over env-steps) for
         # running jobs while the operator watches mid-run evidence accrue.
@@ -1215,6 +1220,12 @@ async def load_strategic_context_evidence(
                         item["viewable_files_dropped"] = dropped
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
+        # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+        # lifecycle DELETE.  Compute from the artifact's creation timestamp
+        # (which is close to when the compute-job completed and GCS objects
+        # were created).
+        if artifact.created_at:
+            item["artifact_expires_at"] = artifact_expires_at(artifact.created_at)
         artifact_items.append(item)
 
     # Stamp run provenance + earned evidence tier onto compute_experiment
@@ -1706,6 +1717,13 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     viewable_files_dropped = artifact.get("viewable_files_dropped")
     if isinstance(viewable_files_dropped, int) and viewable_files_dropped > 0:
         descriptor["viewable_files_dropped"] = viewable_files_dropped
+    # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+    # lifecycle DELETE.  Stamped on the artifact item by the builder paths;
+    # pass through to the descriptor so the frontend can distinguish a
+    # transient preview failure from permanent GCS lifecycle expiry.
+    expires_at = artifact.get("artifact_expires_at")
+    if isinstance(expires_at, str) and expires_at:
+        descriptor["artifact_expires_at"] = expires_at
     image_previews = [p for p in previews if p.get("kind") == "image"]
     video_previews = [p for p in previews if p.get("kind") == "video"]
     pdf_previews = [p for p in previews if p.get("kind") == "pdf"]

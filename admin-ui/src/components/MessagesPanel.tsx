@@ -859,6 +859,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     openKebabId, setOpenKebabId,
     kebabRef,
     showOnlyNew, setShowOnlyNew,
+    needsActionOnly, setNeedsActionOnly,
     activeTabModified,
     updatePref,
     addTemporaryMute,
@@ -1131,6 +1132,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     showOnlyNew,
     dividerTime,
     needsOperatorIds: needsOperatorMessageIds,
+    // Gate needs-action filter on strategic read model availability: the filter
+    // narrows to needsOperatorIds, which is only populated from that model.
+    needsActionOnly: needsActionOnly && usesStrategicReadModel,
   });
   // Legacy fallback when the canonical strategic attention read model is unavailable.
   const highSignalCount = useMemo(
@@ -3004,6 +3008,33 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               })}
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Needs-action filter toggle — visible in triage mode when the canonical
+          attention read model is available so the inbox defaults to action-first. */}
+      {!conversationMode && usesStrategicReadModel && (
+        <div className="shrink-0 flex items-center gap-1 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="needs-action-filter-bar">
+          {/* eslint-disable-next-line viewport/min-touch-target */}
+          <button
+            type="button"
+            data-testid="needs-action-filter-needs-action"
+            onClick={() => setNeedsActionOnly(true)}
+            aria-pressed={needsActionOnly}
+            className={`inline-flex items-center rounded px-2 py-0.5 text-ui-sm font-medium transition-colors ${needsActionOnly ? 'bg-amber-800/60 text-amber-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+          >
+            Needs action
+          </button>
+          {/* eslint-disable-next-line viewport/min-touch-target */}
+          <button
+            type="button"
+            data-testid="needs-action-filter-show-all"
+            onClick={() => setNeedsActionOnly(false)}
+            aria-pressed={!needsActionOnly}
+            className={`inline-flex items-center rounded px-2 py-0.5 text-ui-sm font-medium transition-colors ${!needsActionOnly ? 'bg-neutral-700/60 text-neutral-200' : 'text-neutral-500 hover:text-neutral-300'}`}
+          >
+            Show all
+          </button>
         </div>
       )}
 

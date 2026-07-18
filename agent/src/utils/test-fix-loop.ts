@@ -576,7 +576,7 @@ export async function testFixLoop(
   relatedFiles?: string[],
   analysisContext?: string,
   options: TestFixLoopOptions = {},
-): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number; changed_lines_coverage_pct?: number }> {
+): Promise<{ passed: boolean; testFailuresDetected: boolean; setupFailed?: boolean; partialSetupFailed?: boolean; timedOut?: boolean; failureSummary?: string; noTestsExecuted?: boolean; noTestsReason?: 'all_skipped' | 'no_real_tests'; coverage?: { passed: number; skipped: number; total: number }; line_coverage_pct?: number; changed_lines_coverage_pct?: number }> {
   let runners = options.runnersOverride ?? detectTestRunners(buildConfig);
   const targetPytestSelectors = Array.from(new Set(options.targetPytestSelectors ?? []));
 
@@ -663,6 +663,13 @@ export async function testFixLoop(
     // claim tests passed — the result must propagate as a setup failure
     // so the caller doesn't push unverified code.
     const setupErrors: Array<{ label: string; message: string }> = [];
+    // Wall-clock timeouts / SIGTERM-kills are tracked SEPARATELY from setup
+    // errors. A runner that blows the wall clock ran an unbounded/oversized suite
+    // — retrying it just times out again (it is NOT a transient infra blip). When
+    // a timeout is the ONLY reason nothing ran, the caller must degrade to a
+    // non-blocking "gate could not run" fall-open (timedOut), NOT the retried
+    // setupFailed path that wedges the merge gate.
+    const timeoutErrors: Array<{ label: string; message: string }> = [];
     let ranAnyRunner = false;
     // Accumulate each runner's raw combined output (pass output + real-failure
     // output) so a best-effort pass/skip/total coverage summary can be parsed
@@ -837,18 +844,21 @@ export async function testFixLoop(
         const errno = testErr instanceof Error
           ? (testErr as NodeJS.ErrnoException).code
           : undefined;
-        // If the runner timed out (killed by the process-group SIGTERM/SIGKILL
-        // chain in execFileAsync) treat as a setup error — a Docker build
-        // timeout is not a fixable code failure, but we also can't claim tests
-        // passed.
-        const isRunnerTimeout = testErr instanceof Error && (
-          (testErr as Error & { killed?: boolean }).killed === true ||
-          errno === 'ETIMEDOUT'
-        );
+        // Route a TRUE wall-clock kill to the bounded fall-open (timedOut) lane.
+        // Narrow to errno==='ETIMEDOUT' ONLY — execFileAsync sets that code
+        // whenever its wall-clock termTimer fired (even when it escalates
+        // SIGTERM→SIGKILL: the `timedOut` branch wins over the SIGKILL/EOOM one),
+        // so a genuine timeout ALWAYS carries ETIMEDOUT. `killed` alone is too
+        // broad: execFileAsync sets killed=true for ANY signal-terminated process
+        // — an OOM kill (code 'EOOM'/SIGKILL), a native SIGSEGV/SIGABRT crash, or
+        // an external SIGTERM. Those are NOT wall-clock timeouts and must stay on
+        // the fail-closed setupErrors lane (retryable) rather than falling open as
+        // timedOut and merging unverified/broken code.
+        const isRunnerTimeout = errno === 'ETIMEDOUT';
         if (isRunnerTimeout) {
           const msg = testErr instanceof Error ? testErr.message : String(testErr);
-          sendLog(ws, `WARNING: Test runner [${runner.label}] timed out — skipping.\n`);
-          setupErrors.push({ label: runner.label, message: `runner timeout: ${msg}` });
+          sendLog(ws, `WARNING: Test runner [${runner.label}] hit the wall clock — the suite is unbounded/oversized; recording a timeout (not a transient setup failure to retry).\n`);
+          timeoutErrors.push({ label: runner.label, message: `runner timeout: ${msg}` });
           continue;
         }
         const msg = testErr instanceof Error ? testErr.message : String(testErr);
@@ -920,8 +930,13 @@ export async function testFixLoop(
     // not report an unqualified clean pass. setupSummary carries the broken
     // runners' errors; setupNote appends them to the test-failure summary on the
     // real-failure exits so they are surfaced alongside genuine failures.
-    const partialSetupFailed = ranAnyRunner && setupErrors.length > 0;
-    const setupSummary = setupErrors.length > 0 ? formatSetupErrors(setupErrors) : '';
+    // A runner that never executed its suite — because of a genuine
+    // environment/setup error OR a wall-clock timeout — is a "blocked" runner.
+    // Both count toward the partial-setup signal (a sibling ran clean, but this
+    // one produced no verdict, so we must not report an unqualified pass).
+    const blockedRunnerErrors = [...setupErrors, ...timeoutErrors];
+    const partialSetupFailed = ranAnyRunner && blockedRunnerErrors.length > 0;
+    const setupSummary = blockedRunnerErrors.length > 0 ? formatSetupErrors(blockedRunnerErrors) : '';
     const setupNote = setupSummary
       ? `\n\nPartial setup failure — the following runner(s) never executed (environment/setup error); their suites are UNVERIFIED:\n${setupSummary}`
       : '';
@@ -940,7 +955,16 @@ export async function testFixLoop(
       // there's nothing for Claude to fix. Surface as a distinct
       // setupFailed state so the caller fails the task with an infra
       // category instead of merging unverified code.
-      if (!ranAnyRunner && setupErrors.length > 0) {
+      if (!ranAnyRunner && blockedRunnerErrors.length > 0) {
+        // A WALL-CLOCK kill of the whole suite is not a transient setup blip:
+        // retrying re-times-out and wedges the merge gate. When the ONLY reason
+        // nothing ran was a timeout (no genuine environment/setup error), surface
+        // a distinct ``timedOut`` state so the caller degrades to a non-blocking
+        // "gate could not run" fall-open instead of the retried setupFailed path.
+        if (setupErrors.length === 0 && timeoutErrors.length > 0) {
+          sendLog(ws, `Tests could not run — the suite exceeded the wall clock (no environment/setup error). Reporting a bounded "gate could not run" state (no retry).\n${setupSummary}\n`);
+          return { passed: false, testFailuresDetected: false, timedOut: true, failureSummary: setupSummary };
+        }
         sendLog(ws, `Tests could not run — setup failed for all runners. Not invoking fix loop.\n${setupSummary}\n`);
         return { passed: false, testFailuresDetected: false, setupFailed: true, failureSummary: setupSummary };
       }
@@ -951,7 +975,7 @@ export async function testFixLoop(
       // caller drives the same bounded setup-retry the all-failed case uses and,
       // once exhausted, fails the gate closed rather than falling open.
       if (partialSetupFailed) {
-        sendLog(ws, `Tests passed on the runners that ran, but ${setupErrors.length} runner(s) failed setup — not reporting a clean pass.\n${setupSummary}\n`);
+        sendLog(ws, `Tests passed on the runners that ran, but ${blockedRunnerErrors.length} runner(s) never executed (setup error / wall-clock timeout) — not reporting a clean pass.\n${setupSummary}\n`);
         return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
       }
       if (!anyRealTestExecuted && placeholderFailures.length > 0) {
@@ -1014,7 +1038,7 @@ export async function testFixLoop(
         // ...but if a sibling runner failed setup, a suite never ran — surface
         // the partial-setup signal instead of an unqualified clean pass.
         if (partialSetupFailed) {
-          sendLog(ws, `However, ${setupErrors.length} runner(s) failed setup and never executed — reporting partial setup failure.\n${setupSummary}\n`);
+          sendLog(ws, `However, ${blockedRunnerErrors.length} runner(s) never executed (setup error / wall-clock timeout) — reporting partial setup failure.\n${setupSummary}\n`);
           return { passed: false, testFailuresDetected: false, partialSetupFailed: true, failureSummary: setupSummary };
         }
         return { passed: true, testFailuresDetected: false };

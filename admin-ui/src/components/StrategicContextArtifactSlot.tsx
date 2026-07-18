@@ -121,6 +121,7 @@ function useFreshMediaUrl(
   storageUri: string | null | undefined,
   revision: string | null | undefined,
   bakedUrl: string | null | undefined,
+  expiresAt?: string | null | undefined,
 ): FreshMedia {
   const generation = storageUri ? (revision ? `${storageUri}@${revision}` : storageUri) : null;
   // Key the resolved URL by the storage generation, so a stale resolution
@@ -133,6 +134,10 @@ function useFreshMediaUrl(
   const [outcome, setOutcome] = useState<{ attempt: number; failed: boolean } | null>(null);
   // Set when the rendered media element itself fails to load its URL.
   const [loadError, setLoadError] = useState(false);
+  // Set when the artifact's GCS retention window has lapsed (signed URL
+  // resolution failure is permanent — no point retrying).  Updated inside
+  // the async fetch callback (not during render) to satisfy the purity rule.
+  const [permanentlyExpired, setPermanentlyExpired] = useState(false);
   // Bumped by retry() to force the resolver effect to re-run for the same ref.
   const [attempt, setAttempt] = useState(0);
   // Ref holding the generation value for which an automatic error-retry has
@@ -157,14 +162,22 @@ function useFreshMediaUrl(
         // A fresh URL supersedes any prior element-load failure.
         setLoadError(false);
         setOutcome({ attempt: thisAttempt, failed: false });
+        // A freshly minted signed URL means the sign endpoint is reachable;
+        // reset any prior permanent-expiry flag so retry can be offered again.
+        setPermanentlyExpired(false);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
         if (e instanceof Error && e.name === 'AbortError') return;
+        // Check if the artifact has permanently expired (GCS lifecycle reap).
+        // Date.now() is safe here because this is an async callback, not render.
+        if (expiresAt && new Date(expiresAt).getTime() < Date.now()) {
+          setPermanentlyExpired(true);
+        }
         setOutcome({ attempt: thisAttempt, failed: true });
       });
     return () => { cancelled = true; controller.abort(); };
-  }, [projectId, storageUri, generation, attempt]);
+  }, [projectId, storageUri, generation, attempt, expiresAt]);
 
   const fresh = resolved && generation && resolved.generation === generation ? resolved.url : null;
   const url = safeImageUrl(fresh) ?? safeImageUrl(bakedUrl);
@@ -188,6 +201,7 @@ function useFreshMediaUrl(
 
   const retry = useCallback(() => {
     setLoadError(false);
+    setPermanentlyExpired(false);
     if (canResolve) {
       setAttempt(a => a + 1);
     }
@@ -201,15 +215,25 @@ function useFreshMediaUrl(
       autoRetriedForGenerationRef.current = generation;
       setAttempt(a => a + 1);
     } else {
+      // Auto-retry consumed or unavailable. Check if the artifact has
+      // permanently expired (GCS lifecycle reap) — if so, the retry button
+      // should not appear. Date.now() is safe in this async callback.
+      if (expiresAt && new Date(expiresAt).getTime() < Date.now()) {
+        setPermanentlyExpired(true);
+      }
       setLoadError(true);
     }
-  }, [canResolve, generation]);
+  }, [canResolve, generation, expiresAt]);
 
   // After a fresh signed URL is successfully re-minted (auto-retry) but the
   // media element still fails, the underlying GCS object is gone (7-day
   // lifecycle reap) — re-minting another URL would be futile.  Only offer
   // retry when signing itself failed (which may recover) or no load error yet.
-  const retryWouldHelp = !loadError || outcome?.failed === true;
+  // Additionally, if the backend stamped an explicit artifact_expires_at that
+  // is in the past, the GCS object is permanently gone — the retry button
+  // should not appear.  `permanentlyExpired` is set inside async callbacks
+  // (never during render) so it satisfies all React 19 purity rules.
+  const retryWouldHelp = !permanentlyExpired && (!loadError || outcome?.failed === true);
   return { url, status, canRetry: canResolve && retryWouldHelp, retry, onMediaError };
 }
 
@@ -326,6 +350,7 @@ function ResolvedImage({
   className,
   onExpand,
   live,
+  expiresAt,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -335,8 +360,9 @@ function ResolvedImage({
   className: string;
   onExpand: (url: string, alt: string) => void;
   live?: boolean | null;
+  expiresAt?: string | null;
 }) {
-  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
@@ -372,6 +398,7 @@ function ResolvedVideo({
   ariaLabel,
   className,
   live,
+  expiresAt,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -380,8 +407,9 @@ function ResolvedVideo({
   ariaLabel: string;
   className: string;
   live?: boolean | null;
+  expiresAt?: string | null;
 }) {
-  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry, onMediaError } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
@@ -414,6 +442,7 @@ function ResolvedPdf({
   label,
   className,
   live,
+  expiresAt,
 }: {
   projectId?: string | null;
   storageUri?: string | null;
@@ -422,12 +451,13 @@ function ResolvedPdf({
   label: string;
   className: string;
   live?: boolean | null;
+  expiresAt?: string | null;
 }) {
   // PDFs are never embedded inline on the app origin. Resolve a fresh signed URL
   // (re-minted from storage_uri, falling back to the baked url) and open it in a
   // new tab so the browser renders it in its own sandboxed viewer on the storage
   // origin.
-  const { url, status, canRetry, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl);
+  const { url, status, canRetry, retry } = useFreshMediaUrl(projectId, storageUri, revision, bakedUrl, expiresAt);
   if (status === 'loading') return <MediaSkeleton className={className} />;
   if (status === 'error' || !url) {
     return canRetry
@@ -473,10 +503,12 @@ export function ArtifactViewablePreviews({
   previews,
   projectId,
   label,
+  expiresAt,
 }: {
   previews?: StrategicContextArtifactViewablePreview[] | null;
   projectId?: string | null;
   label?: string | null;
+  expiresAt?: string | null;
 }) {
   const [lightbox, setLightbox] = useState<{ url: string; alt: string } | null>(null);
   const onExpand = useCallback((url: string, alt: string) => setLightbox({ url, alt }), []);
@@ -509,6 +541,7 @@ export function ArtifactViewablePreviews({
               ariaLabel={alt}
               className="h-20 w-auto flex-shrink-0"
               live={preview.live}
+              expiresAt={expiresAt}
             />
           );
         }
@@ -523,6 +556,7 @@ export function ArtifactViewablePreviews({
               label={alt}
               className="flex h-20 w-32 flex-shrink-0 flex-col items-center justify-center gap-1 rounded border border-neutral-700 bg-neutral-900 p-1 text-xs text-neutral-300 hover:text-sky-300"
               live={preview.live}
+              expiresAt={expiresAt}
             />
           );
         }
@@ -537,6 +571,7 @@ export function ArtifactViewablePreviews({
             className="h-20 w-auto flex-shrink-0 object-contain"
             onExpand={onExpand}
             live={preview.live}
+            expiresAt={expiresAt}
           />
         );
       })}
@@ -585,6 +620,7 @@ function ImageDescriptorBlock({
               className="h-40 w-auto flex-shrink-0 object-contain"
               onExpand={onExpand}
               live={img.live}
+              expiresAt={descriptor.artifact_expires_at}
             />
           ))}
         </div>
@@ -598,6 +634,7 @@ function ImageDescriptorBlock({
           className="max-h-80 w-full object-contain"
           onExpand={onExpand}
           live={items[0].live}
+          expiresAt={descriptor.artifact_expires_at}
         />
       ) : (
         <div className="px-2 py-2 text-xs text-neutral-500">
@@ -639,6 +676,7 @@ function VideoDescriptorBlock({
               ariaLabel={v.alt || v.filename || `${descriptor.title} ${i + 1}`}
               className="h-40 w-auto flex-shrink-0"
               live={v.live}
+              expiresAt={descriptor.artifact_expires_at}
             />
           ))}
         </div>
@@ -651,6 +689,7 @@ function VideoDescriptorBlock({
           ariaLabel={descriptor.video?.alt || items[0].alt || descriptor.title}
           className="max-h-80 w-full"
           live={items[0].live}
+          expiresAt={descriptor.artifact_expires_at}
         />
       ) : (
         <div className="px-2 py-2 text-xs text-neutral-500">
@@ -879,6 +918,7 @@ function DescriptorCard({
                     label={doc.alt || doc.filename || (items.length > 1 ? `${descriptor.title} ${i + 1}` : descriptor.title)}
                     className="flex min-h-11 w-full items-center gap-2 rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-left text-sm text-neutral-200 transition-colors hover:border-sky-500/50 hover:bg-neutral-900"
                     live={doc.live}
+                    expiresAt={descriptor.artifact_expires_at}
                   />
                 ))}
               </div>

@@ -37,7 +37,9 @@ from app.models import (
     CriterionEvidence,
     Direction,
     EvergreenBacklogItem,
+    MessageType,
     Project,
+    ProjectMessage,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -184,6 +186,7 @@ def test_registry_contains_initial_checks():
         "unmapped_acceptance_criteria",
         "research_quality_grader_pass_rate",
         "encrypted_field_plaintext_detector",
+        "audience_routing_attestation",
     } <= names
 
 
@@ -7324,3 +7327,182 @@ async def test_plaintext_in_encrypted_column_is_flagged(db):
     cf = claude_flagged[0]
     assert cf.delta >= 1  # at least one row in that column is plaintext
     assert "plaintext" in cf.detail
+
+
+# --- Check: audience_routing_attestation ----------------------------------
+
+
+def _message(db, project, *, event_type: str, audience: str | None = None) -> ProjectMessage:
+    """Insert a ProjectMessage with the given event_type and audience in context."""
+    ctx: dict = {"event_type": event_type}
+    if audience is not None:
+        ctx["audience"] = audience
+    msg = ProjectMessage(
+        project_id=project.id,
+        context=ctx,
+        message_type=MessageType.NOTE,
+    )
+    db.add(msg)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_ok_when_stamps_match(db):
+    """Messages whose stamped audience matches route_event() produce OK."""
+    project = await _project(db)
+    from app.message_audience import route_event
+
+    for et in ("pr_merged", "auto_fix_escalated", "failure_alert"):
+        canonical = route_event(et)
+        _message(db, project, event_type=et, audience=canonical)
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    ok_results = [r for r in results if r.subject == pid]
+    assert len(ok_results) == 1, f"expected 1 result for project, got {results}"
+    r = ok_results[0]
+    assert r.status == CheckStatus.OK, f"expected OK, got {r.status}"
+    assert r.self_reported == 3
+    assert r.ground_truth == 3
+    assert r.delta == 0
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_flags_mismatched_stamp(db):
+    """Messages with a stamped audience != route_event() produce FLAGGED."""
+    project = await _project(db)
+    _message(db, project, event_type="pr_merged", audience="operator-action-needed")
+    _message(db, project, event_type="auto_fix_escalated", audience="strategist-internal")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 FLAGGED for project, got {results}"
+    f = flagged[0]
+    assert f.self_reported == 0  # neither message is correctly stamped
+    assert f.ground_truth == 2   # both had a known event_type
+    assert f.delta == 2
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_flags_null_audience(db):
+    """Messages with a NULL audience (legacy pass-through) are FLAGGED."""
+    project = await _project(db)
+    # pr_merged -> strategist-internal, but NULL audience means the read-side
+    # filter retains it as operator-visible — a latent leak.
+    _message(db, project, event_type="pr_merged", audience=None)
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    flagged = [r for r in results if r.flagged and r.subject == pid]
+    assert len(flagged) == 1, f"expected 1 FLAGGED for project, got {results}"
+    f = flagged[0]
+    assert f.self_reported == 0  # NULL != canonical audience
+    assert f.ground_truth == 1
+    assert f.delta == 1
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_skipped_when_no_messages(db):
+    """When no ProjectMessage rows exist, the check returns SKIPPED."""
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert results[0].subject == "global"
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_skipped_when_no_event_types(db):
+    """Messages exist but none carry an event_type => SKIPPED."""
+    project = await _project(db)
+    _message(db, project, event_type="", audience="strategist-internal")
+    _message(db, project, event_type="pr_merged", audience="strategist-internal")
+    # The second message has an event_type, so it IS counted. Rewrite without
+    # an event_type key at all for a proper skip.
+    await db.commit()
+
+    # Overwrite context to remove event_type entirely.
+    from app.models import ProjectMessage as PM
+    rows = (await db.execute(select(PM))).scalars().all()
+    for r in rows:
+        r.context = {"audience": "strategist-internal"}
+    flag_modified(rows[-1], "context")
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "no ProjectMessage rows with a known event_type" in results[0].detail
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_bounded_sample(db):
+    """More messages than sample_limit => only sample_limit are processed."""
+    project = await _project(db)
+    from app.message_audience import route_event
+
+    # Insert more than sample_limit messages with known event_type+audience.
+    limit = 200
+    over = limit + 10
+    for i in range(over):
+        _message(db, project, event_type="pr_merged", audience=route_event("pr_merged"))
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=limit, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    ok_results = [r for r in results if r.subject == pid]
+    assert len(ok_results) == 1
+    r = ok_results[0]
+    assert r.status == CheckStatus.OK
+    assert r.ground_truth == limit  # capped by sample_limit, not total
+    assert r.self_reported == limit
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_enforce_enrolls_finding(db):
+    """In enforce mode, a mismatched audience enrolls an EvergreenBacklogItem."""
+    _rc["metrics_integrity_sweep_mode"] = "enforce"
+    project = await _project(db)
+    _message(db, project, event_type="pr_merged", audience="operator-fyi")
+    await db.commit()
+
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+
+    assert tick is not None
+    # Find the audience_routing_attestation flag in the tick flags.
+    attestations = [f for f in tick["flags"] if f["check"] == "audience_routing_attestation"]
+    assert len(attestations) == 1, f"expected 1 flag, got {tick['flags']}"
+    assert tick["enrolled"] >= 1
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert any(
+        "audience_routing_attestation" in r.finding_key for r in rows
+    )

@@ -3414,7 +3414,11 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
-async def test_step6_ignores_backend_managed_resident_turns(reaper_db):
+async def test_step6_agent_managed_resident_turn_triggers_queued_age_alert(reaper_db):
+    """An agent-managed (non-backend) resident turn queued beyond the alert
+    threshold fires a queued-age alert.  ``strategic_resident_turn`` has
+    ``execution_owner="agent"``, so it is NOT excluded by the
+    ``BACKEND_MANAGED_TASK_TYPES`` filter — the alert fires as expected."""
     project = await _make_project(reaper_db)
     reaper_db.add(
         Task(
@@ -3433,7 +3437,7 @@ async def test_step6_ignores_backend_managed_resident_turns(reaper_db):
         _utcnow(),
         runtime_config={"queued_age_alert_hours": 2},
     )
-    assert alerted == 0
+    assert alerted == 1
 
 
 @pytest.mark.asyncio
@@ -17360,6 +17364,78 @@ async def test_sweep_unblock_per_row_commit_releases_lock_between_tasks(
         f"expected at least 2 per-row commits for 2 tasks, got {commit_count[0]}; "
         "the per-row lock is not being released between tasks"
     )
+
+
+# ── Message supersession mode defaults to enforce ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_message_supersession_defaults_to_enforce_mode(reaper_db):
+    """The message supersession mode defaults to 'enforce', so stale messages
+    from a prior version are auto-resolved even when no runtime config override
+    is set. This is the acceptance test for the observe->enforce graduation."""
+    from app.message_supersession import supersede_stale_messages_on_version_close
+    from app.models import MessageType, ProjectMessage
+    from app.shared_state import runtime_config as _rc
+
+    NOW = _utcnow()
+    V1_OPENED = NOW - timedelta(days=180)
+    V2_OPENED = NOW - timedelta(days=150)
+    # Message in v1's window (created before V2_OPENED) and older than 14d.
+    MSG_TIME = NOW - timedelta(days=165)
+
+    saved = _rc.pop("message_supersession_mode", None)
+    try:
+        project = await _make_project(reaper_db)
+
+        reaper_db.add(ReleaseVersion(
+            project_id=project.id, version_number=1,
+            status="open", opened_at=V1_OPENED,
+        ))
+        reaper_db.add(ReleaseVersion(
+            project_id=project.id, version_number=2,
+            status="open", opened_at=V2_OPENED,
+        ))
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="stale status update",
+            status="open",
+            created_at=MSG_TIME,
+        )
+        reaper_db.add(msg)
+        await reaper_db.commit()
+        await reaper_db.refresh(msg)
+
+        summary = await supersede_stale_messages_on_version_close(
+            reaper_db,
+            project_id=project.id,
+            closed_version_number=2,
+            closed_version_opened_at=V2_OPENED,
+            terminal_status="promoted",
+            now=NOW,
+        )
+        await reaper_db.commit()
+
+        assert summary["mode"] == "enforce", (
+            "supersession mode should default to 'enforce'"
+        )
+        assert summary["acted"] is True, (
+            "supersession should act (resolve messages) by default"
+        )
+        assert summary["superseded"] == 1, (
+            "the stale v1 message should be superseded"
+        )
+        await reaper_db.refresh(msg)
+        assert msg.status == "resolved", (
+            "message should be resolved when mode defaults to enforce"
+        )
+    finally:
+        if saved is None:
+            _rc.pop("message_supersession_mode", None)
+        else:
+            _rc["message_supersession_mode"] = saved
 
 
 # ── Acceptance: extracted sweeps re-exported from reaper_sweeps ──────────────

@@ -463,21 +463,27 @@ def _looks_like_serving_only_import(exc: ImportError) -> bool:
 
 def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
     """Return True when *detail* describes the deliberate keyless fail-closed
-    of an encryption migration in the secret-free scratch subprocess.
+    of migration 0609 in the secret-free scratch subprocess.
 
-    Uses a single-line regex to require that the encryption env-var name
-    appears on the same line as the RuntimeError — this rejects accumulated
-    chain stderr where earlier no-op migrations (0531 etc.) emit the env-var
-    name as a warning on a prior line before an unrelated RuntimeError.
-    Migration-number-agnostic: matches any encryption migration that
-    fail-closes with the same pattern (0609, 0621, future migrations).
+    Requires all three signals on the same line to prevent false positives:
+      1. "RuntimeError" — the exception type
+      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name
+      3. "0609" — migration identifier (anchor to the specific migration)
+
+    The three-signal check rejects:
+    - Accumulated chain stderr where earlier no-op migrations emit the
+      env-var name as a warning before an unrelated RuntimeError fires.
+    - Non-RuntimeError exceptions that happen to mention both key and revision.
+    - RuntimeErrors from other migrations that mention the key but not 0609.
     """
-    return bool(
-        re.search(
-            r"RuntimeError[^\n]*" + re.escape(_ENCRYPTION_KEY_ENV_VAR),
-            detail,
-        )
-    )
+    for line in detail.splitlines():
+        if (
+            "RuntimeError" in line
+            and _ENCRYPTION_KEY_ENV_VAR in line
+            and "0609" in line
+        ):
+            return True
+    return False
 
 
 class _ScratchDatabaseUnavailable(Exception):

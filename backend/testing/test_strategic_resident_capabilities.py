@@ -29,6 +29,36 @@ from app.strategic_resident_task_inspection import (
 )
 
 
+def test_inspection_capability_kinds_match_real_capabilities():
+    """Every INSPECTION_CAPABILITY_KINDS key must be a real inspect capability_id.
+
+    A stale/typo'd key silently drops that inspection's revisioned evidence from
+    the trusted-evidence index (fail-closed) the moment inspection receipts are
+    written, so guard the map against drift and duplicate operation_kinds.
+    """
+    from app.strategic_resident_evidence_policy import INSPECTION_CAPABILITY_KINDS
+
+    inspect_ids = {
+        item.capability_id
+        for item in RESIDENT_CAPABILITIES
+        if item.mode is CapabilityMode.inspect
+    }
+    unknown = set(INSPECTION_CAPABILITY_KINDS) - inspect_ids
+    assert not unknown, f"map references non-existent inspect capabilities: {sorted(unknown)}"
+    # The five task inspections that actually produce evidence today must be mapped.
+    invokable = {
+        "task.inspect",
+        "task.logs.inspect",
+        "task.failure.inspect",
+        "task.provider.inspect",
+        "task.lineage.inspect",
+    }
+    assert invokable <= set(INSPECTION_CAPABILITY_KINDS)
+    # operation_kind values are the receipt contract — they must be distinct.
+    kinds = list(INSPECTION_CAPABILITY_KINDS.values())
+    assert len(kinds) == len(set(kinds)), "duplicate operation_kind in the map"
+
+
 def test_capability_registry_declares_complete_safety_contracts():
     assert len({item.capability_id for item in RESIDENT_CAPABILITIES}) == len(
         RESIDENT_CAPABILITIES
@@ -547,6 +577,264 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
         )
     assert invalid.value.status_code == 400
     load.assert_not_awaited()
+
+
+def test_inspection_receipt_maps_kind_and_is_trusted():
+    """An inspection receipt makes its evidence citable via the trusted index."""
+    from app.strategic_resident_evidence_validation import (
+        _canonical_hash,
+        build_trusted_evidence_index,
+    )
+    from app.strategic_resident_inspection_receipt import (
+        build_inspection_receipt,
+        citable_inspection_evidence,
+    )
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    source_id = str(uuid.uuid4())
+    evidence_json = {
+        "kind": "logs",
+        "project_id": str(project_id),
+        "source_id": source_id,
+        "revision": "task:v1",
+        "checksum": "e" * 64,
+        "observed_at": "2026-07-17T00:00:00+00:00",
+        "data": {"task_id": source_id},
+    }
+    # A logs inspection maps into the task_log trust kind.
+    assert citable_inspection_evidence(evidence_json)["kind"] == "task_log"
+
+    turn_task = SimpleNamespace(
+        id=turn_id,
+        project_id=project_id,
+        first_payload={"authority_generation": 3},
+        context={},
+    )
+    receipt = build_inspection_receipt(
+        capability_id="task.logs.inspect",
+        turn_task=turn_task,
+        context_hash="ctx-123",
+        request_hash="f" * 64,
+        evidence_json=evidence_json,
+    )
+    assert receipt is not None
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.status == "applied"
+    assert receipt.risk_level == "low"
+    assert receipt.expected_revisions == {"context_hash": "ctx-123"}
+
+    provider_input = {
+        "lineage": {"context_hash": "ctx-123", "evidence_hash": _canonical_hash([])},
+        "evidence": [],
+    }
+    index = build_trusted_evidence_index(
+        provider_input, [receipt], expected_context_hash="ctx-123"
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) in index.entries
+
+    # The context_hash binding is meaningful: the SAME receipt is NOT trusted in a
+    # turn with a different context_hash (its evidence is dropped from the index).
+    other = build_trusted_evidence_index(
+        {
+            "lineage": {"context_hash": "ctx-other", "evidence_hash": _canonical_hash([])},
+            "evidence": [],
+        },
+        [receipt],
+        expected_context_hash="ctx-other",
+    )
+    assert ("task_log", source_id, "task:v1", "e" * 64) not in other.entries
+
+
+def test_inspection_receipt_requires_context_hash_and_mapped_capability():
+    from app.strategic_resident_inspection_receipt import build_inspection_receipt
+
+    turn_task = SimpleNamespace(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), first_payload={}, context={}
+    )
+    # No persisted context_hash -> no receipt (inspection still returns evidence).
+    assert (
+        build_inspection_receipt(
+            capability_id="task.inspect",
+            turn_task=turn_task,
+            context_hash="",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+    # A capability with no inspection-kind mapping is not receipted.
+    assert (
+        build_inspection_receipt(
+            capability_id="pr.merge",
+            turn_task=turn_task,
+            context_hash="ctx",
+            request_hash="a" * 64,
+            evidence_json={"kind": "task"},
+        )
+        is None
+    )
+
+
+def test_all_resident_capability_routes_are_token_allowlisted():
+    """Every capability route must be in the resident-token allowlist.
+
+    ``verify_agent_token`` 403s any resident-turn token hitting a path outside
+    ``_RESIDENT_AGENT_ALLOWED_PATHS`` before the endpoint runs, so a new endpoint
+    that isn't allowlisted is dead-on-arrival for the only tokens that call it.
+    """
+    from app.routers.agent import _RESIDENT_AGENT_ALLOWED_PATHS
+
+    paths = {route.path for route in capability_router.router.routes}
+    # Sanity-check the extraction against a known-allowlisted route, then assert
+    # every route (including /mutate) is covered.
+    assert "/api/agent/resident-turn/capability" in paths
+    missing = paths - _RESIDENT_AGENT_ALLOWED_PATHS
+    assert not missing, f"resident capability routes not token-allowlisted: {sorted(missing)}"
+
+
+def _mutation_invocation(project_id, turn_task_id, **overrides):
+    from app.strategic_resident_capability_invocation import CapabilityEvidenceRef
+
+    payload = {
+        "capability_id": "strategy.running_update.set",
+        "project_id": project_id,
+        "turn_task_id": turn_task_id,
+        "authority_generation": 3,
+        "parameters": {"running_update": "grounded working update"},
+        "operation_id": "op-strategy-1",
+        "expected_revisions": {
+            "authority_generation": 3,
+            "active_turn_task_version": 1,
+            "current_checkpoint_id": str(uuid.uuid4()),
+            "resident_checkpoint_version": 1,
+            "resident_checkpoint_hash": "a" * 64,
+            "running_update_revision": "b" * 64,
+        },
+        "evidence": (
+            CapabilityEvidenceRef(
+                kind="task",
+                project_id=project_id,
+                source_id=str(uuid.uuid4()),
+                revision="task:v1",
+                checksum="c" * 64,
+                inspected_at=datetime.now(timezone.utc),
+            ),
+        ),
+    }
+    payload.update(overrides)
+    return ResidentCapabilityInvocation.model_validate(payload)
+
+
+def _mutation_token(project_id, turn_task_id):
+    return {
+        "sub": str(turn_task_id),
+        "project_id": str(project_id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-strategy-1", status="applied", id=uuid.uuid4()
+    )
+    executor = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _mutation_invocation(project_id, turn_id),
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "applied"
+    assert result["capability_id"] == "strategy.running_update.set"
+    assert result["operation_id"] == "op-strategy-1"
+    # The fenced request is built from the token authority + declared operation_kind.
+    fenced_request = executor.await_args.args[1]
+    assert fenced_request.project_id == project_id
+    assert fenced_request.turn_task_id == turn_id
+    assert fenced_request.operation_kind == "set_running_update"
+    assert fenced_request.capability == "strategy.running_update.set"
+    assert fenced_request.risk == "low"
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    # Body targets a different turn task than the signed token authorizes.
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, uuid.uuid4()),
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 403
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_501_for_capability_without_fenced_adapter(monkeypatch):
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    # task.reprioritize is a real mutate capability but has no project-field adapter.
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id="task.reprioritize",
+        parameters={"task_id": str(uuid.uuid4()), "priority": 5},
+    )
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            invocation,
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 501
+    executor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_name", "expected_status"),
+    [
+        ("OperationIdentityCollision", 409),
+        ("InactiveTurnAuthority", 409),
+        ("ExpectedRevisionMismatch", 409),
+        ("AuthorityGenerationMismatch", 409),
+        ("FencedOperationUsageError", 400),
+    ],
+)
+async def test_mutation_route_maps_authority_errors(
+    monkeypatch, error_name, expected_status
+):
+    from app import strategic_operation_authority_validation as authority
+
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    error_cls = getattr(authority, error_name)
+    executor = AsyncMock(side_effect=error_cls("fenced rejection"))
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, turn_id),
+            session=SimpleNamespace(),
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == expected_status
 
 
 @pytest.mark.asyncio

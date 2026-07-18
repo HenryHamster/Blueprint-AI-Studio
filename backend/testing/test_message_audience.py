@@ -133,6 +133,21 @@ def test_route_event_self_hosted_fleet_health_alert_types_are_operator_visible()
     assert route_event("runner.idle_gpu") == OPERATOR_FYI
 
 
+def test_route_event_size_breach_annotation_is_strategist_internal():
+    """size_breach annotations are internal pipeline bookkeeping — must never reach the operator.
+
+    Non-regression: other annotation types (comment/issue/vision) remain OPERATOR_FYI.
+    """
+    assert route_event("agent_annotation.size_breach") == STRATEGIST_INTERNAL
+    # Non-regression: other agent annotations remain operator-visible.
+    assert route_event("agent_annotation") == OPERATOR_FYI
+    # size_breach must appear in the non-operator exclusion set used by
+    # operator_visible_alert_filter, so Alert rows tagged with it are gated out.
+    non_operator = get_non_operator_event_types()
+    assert "agent_annotation.size_breach" in non_operator
+    assert "agent_annotation" not in non_operator
+
+
 def test_route_event_hotfix_backmerge_size_violation_is_strategist_internal():
     """Module size-overflow alerts are strategist-internal bookkeeping."""
     assert route_event("hotfix_backmerge.size_violation") == STRATEGIST_INTERNAL

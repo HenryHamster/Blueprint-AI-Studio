@@ -1244,7 +1244,7 @@ async def test_fabricated_operation_receipt_is_rejected(db_session):
         await _resident_turn_rows(db_session)
     )
     result = _turn_result()
-    result["operations"] = [_operation("op-1", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("op-1", "ci.run.inspect", "reconciled")]
     result["receipts"] = [
         {
             "operation_id": "op-1",
@@ -1270,8 +1270,8 @@ async def test_matching_durable_operation_receipt_is_accepted(db_session):
         turn_task_id=task.id,
         authority_generation=7,
         operation_id="op-1",
-        operation_kind="inspect_ci",
-        capability="ci.inspect",
+        operation_kind="cancel_task",
+        capability="task.cancel",
         risk_level="low",
         request_hash="a" * 64,
         status="reconciled",
@@ -1279,13 +1279,13 @@ async def test_matching_durable_operation_receipt_is_accepted(db_session):
     db_session.add(receipt)
     await db_session.commit()
     result = _turn_result()
-    result["operations"] = [_operation("op-1", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("op-1", "task.cancel", "reconciled")]
     result["receipts"] = [
         {
             "operation_id": "op-1",
             "receipt_id": str(receipt.id),
             "status": "reconciled",
-            "summary": "Durable inspection receipt.",
+            "summary": "Durable mutation receipt.",
         }
     ]
     outcome = await reconcile_strategic_resident_turn(
@@ -1309,7 +1309,7 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         authority_generation=7,
         operation_id="op-inspection",
         operation_kind="inspect_ci",
-        capability="ci.inspect",
+        capability="ci.run.inspect",
         risk_level="low",
         request_hash="8" * 64,
         expected_revisions={"context_hash": context_hash},
@@ -1336,17 +1336,12 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
         revision="sha-from-receipt",
         checksum="7" * 64,
     )
-    result["operations"] = [
-        _operation("op-inspection", "ci.inspect", "reconciled")
-    ]
-    result["receipts"] = [
-        {
-            "operation_id": "op-inspection",
-            "receipt_id": str(receipt.id),
-            "status": "reconciled",
-            "summary": "Typed inspection receipt.",
-        }
-    ]
+    # Inspection receipts are server-authored, read-only evidence: the agent is
+    # never handed their ids and does NOT claim them as operations. The evidence
+    # is still trusted (via build_trusted_evidence_index over the locked ledger),
+    # so the turn reconciles without claiming the inspection receipt.
+    result["operations"] = []
+    result["receipts"] = []
     inspection = ResidentEvidenceInspection(
         evidence_id="evidence-1",
         kind="ci_run",
@@ -1374,10 +1369,10 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
     ("capability", "operation_kind", "status", "evidence_item"),
     [
         ("evil.inspect", "inspect_ci", "reconciled", None),
-        ("ci.inspect", "deploy", "reconciled", None),
-        ("ci.inspect", "inspect_ci", "failed", None),
+        ("ci.run.inspect", "deploy", "reconciled", None),
+        ("ci.run.inspect", "inspect_ci", "failed", None),
         (
-            "ci.inspect",
+            "ci.run.inspect",
             "inspect_ci",
             "reconciled",
             {
@@ -1388,7 +1383,7 @@ async def test_context_bound_inspection_receipt_can_supply_decisive_evidence(
             },
         ),
         (
-            "ci.inspect",
+            "ci.run.inspect",
             "inspect_ci",
             "reconciled",
             {
@@ -1435,20 +1430,32 @@ async def test_inspection_receipt_spoofs_cannot_supply_evidence(
     )
     db_session.add(receipt)
     await db_session.commit()
+    from app.strategic_resident_evidence_policy import INSPECTION_CAPABILITY_KINDS
+
     result = _turn_result()
     result["evidence"][0].update(valid_evidence)
-    result_status = "failed" if status == "failed" else "reconciled"
-    result["operations"] = [
-        _operation("op-spoofed-inspection", capability, result_status)
-    ]
-    result["receipts"] = [
-        {
-            "operation_id": "op-spoofed-inspection",
-            "receipt_id": str(receipt.id),
-            "status": status,
-            "summary": "Spoofed typed inspection receipt.",
-        }
-    ]
+    # A real inspection capability's receipt is server-authored evidence, never
+    # claimed as an operation (excluded from the claim invariants); an unknown
+    # capability (evil.inspect) is treated as a mutation and must be claimed to
+    # pass receipt validation. Either way the spoof is rejected downstream because
+    # build_trusted_evidence_index refuses to trust a receipt with the wrong
+    # capability/operation_kind/status/evidence, so the cited evidence is not in
+    # the frozen trusted set.
+    if capability in INSPECTION_CAPABILITY_KINDS:
+        result["operations"] = []
+        result["receipts"] = []
+    else:
+        result["operations"] = [
+            _operation("op-spoofed-inspection", capability, "reconciled")
+        ]
+        result["receipts"] = [
+            {
+                "operation_id": "op-spoofed-inspection",
+                "receipt_id": str(receipt.id),
+                "status": status,
+                "summary": "Spoofed typed inspection receipt.",
+            }
+        ]
     with pytest.raises(DecisiveEvidenceRequired, match="frozen input"):
         await reconcile_strategic_resident_turn(
             _factory(db_session),
@@ -1457,12 +1464,54 @@ async def test_inspection_receipt_spoofs_cannot_supply_evidence(
 
 
 @pytest.mark.asyncio
+async def test_turn_with_unclaimed_inspection_receipt_reconciles(db_session):
+    """Regression: a turn that inspected a task (leaving a server-authored
+    inspection receipt in the ledger) reconciles WITHOUT claiming that receipt.
+
+    Before inspection receipts were excluded from the operation-claim invariants,
+    any inspect-then-complete turn failed reconciliation with 'must claim every
+    durable turn receipt' — the agent is never handed the receipt id to claim.
+    """
+    project, _resident, task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    context_hash = task.context["_test_provider_context_hash"]
+    # A server-authored inspection receipt, exactly as /capability writes one.
+    db_session.add(
+        StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=task.id,
+            authority_generation=7,
+            operation_id=f"inspect:{task.id}:{'a' * 64}",
+            operation_kind="inspect_task",
+            capability="task.inspect",
+            risk_level="low",
+            request_hash="a" * 64,
+            expected_revisions={"context_hash": context_hash},
+            receipt={"schema_version": 1, "structured_result": {"evidence": []}},
+            status="applied",
+        )
+    )
+    await db_session.commit()
+
+    # The turn result claims NO operations/receipts (the agent never saw the id).
+    result = _turn_result()
+    result["operations"] = []
+    result["receipts"] = []
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(project, task, checkpoint, result=result),
+    )
+    assert outcome.checkpoint_version == 2
+
+
+@pytest.mark.asyncio
 async def test_orphan_operation_is_rejected_when_ledger_is_empty(db_session):
     project, _resident, task, checkpoint, _message, _successor = (
         await _resident_turn_rows(db_session)
     )
     result = _turn_result()
-    result["operations"] = [_operation("orphan", "ci.inspect", "reconciled")]
+    result["operations"] = [_operation("orphan", "ci.run.inspect", "reconciled")]
     with pytest.raises(ReconciliationResultInvalid, match="map 1:1"):
         await reconcile_strategic_resident_turn(
             _factory(db_session),
@@ -1496,8 +1545,8 @@ async def test_operation_capability_must_match_durable_receipt(db_session):
         turn_task_id=task.id,
         authority_generation=7,
         operation_id="op-mismatch",
-        operation_kind="inspect_ci",
-        capability="ci.inspect",
+        operation_kind="cancel_task",
+        capability="task.cancel",
         risk_level="low",
         request_hash="9" * 64,
         status="reconciled",
@@ -1564,8 +1613,8 @@ async def test_omitted_settled_durable_receipt_is_rejected(db_session):
             turn_task_id=task.id,
             authority_generation=7,
             operation_id="op-omitted-settled",
-            operation_kind="inspect_ci",
-            capability="ci.inspect",
+            operation_kind="cancel_task",
+            capability="task.cancel",
             risk_level="low",
             request_hash="e" * 64,
             status="reconciled",
@@ -2057,8 +2106,8 @@ async def test_operation_and_receipt_statuses_match_durable_ledger_exactly(
         turn_task_id=task.id,
         authority_generation=7,
         operation_id="op-status-mismatch",
-        operation_kind="inspect_ci",
-        capability="ci.inspect",
+        operation_kind="cancel_task",
+        capability="task.cancel",
         risk_level="low",
         request_hash="5" * 64,
         status="reconciled",
@@ -2067,7 +2116,7 @@ async def test_operation_and_receipt_statuses_match_durable_ledger_exactly(
     await db_session.commit()
     result = _turn_result()
     result["operations"] = [
-        _operation("op-status-mismatch", "ci.inspect", operation_status)
+        _operation("op-status-mismatch", "task.cancel", operation_status)
     ]
     result["receipts"] = [
         {

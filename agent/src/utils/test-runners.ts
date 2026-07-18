@@ -236,6 +236,62 @@ export function runnerFromCommand(command: string, cwd: string): { cmd: string; 
 // prior helper name.
 export const runnerFromTestCmd = runnerFromCommand;
 
+// ── Diff-impacted scoping for an unbounded whole-suite pytest runner ─────────
+// A stored/auto-detected ``python3 -m pytest`` (or bare ``pytest``) with no
+// explicit test-target path or ``-k``/``-m`` selector runs the ENTIRE suite. On
+// a large repo that reaches pytest collection and then dies at the runner wall
+// clock — the exact shape that wedged the no-CI merge gate. The verify handler
+// scopes such a runner to the diff-impacted test files before running it (see
+// ``scopePytestRunnerToFiles``); this predicate identifies the eligible runners.
+//
+// True ONLY for a bare whole-suite pytest invocation — ``python``/``python3 -m
+// pytest`` or a bare ``pytest`` — where every remaining token is a flag (starts
+// with ``-``). ANY positional token (an explicit file/nodeid, or a ``-k``/``-m``
+// selector VALUE) means the command is ALREADY narrowed, so it is left untouched.
+// A ``bash -c`` / operator-configured shell command, and the bounded
+// ``scripts/test-backend.sh`` harness, never match.
+export function isUnscopedPytestRunner(runner: TestRunner): boolean {
+  let rest: string[];
+  if (
+    (runner.cmd === 'python3' || runner.cmd === 'python') &&
+    runner.args[0] === '-m' && runner.args[1] === 'pytest'
+  ) {
+    rest = runner.args.slice(2);
+  } else if (runner.cmd === 'pytest') {
+    rest = runner.args.slice(0);
+  } else {
+    return false;
+  }
+  // Any non-flag token = an explicit target or a selector value → already scoped.
+  return rest.every(a => a.startsWith('-'));
+}
+
+// Rewrite a whole-suite pytest runner to run ONLY the given diff-impacted test
+// files. ``repoRelFiles`` are repo-root-relative (e.g. ``backend/testing/
+// test_x.py``, as emitted by ``backend/testing/impacted_tests.py``); each is
+// re-based onto the runner's own working directory (a runner rooted at
+// ``<ws>/backend`` receives ``testing/test_x.py``), mirroring how the local
+// ``check`` impacted-test gate strips the ``backend/`` prefix before handing
+// files to the harness. Preserves the original flags and appends the targets.
+export function scopePytestRunnerToFiles(
+  runner: TestRunner, repoRelFiles: string[], workspaceRoot: string,
+): TestRunner {
+  const relDir = runner.cwd === workspaceRoot
+    ? ''
+    : runner.cwd.startsWith(workspaceRoot + '/')
+      ? runner.cwd.slice(workspaceRoot.length + 1)
+      : '';
+  const prefix = relDir ? relDir + '/' : '';
+  const targets = repoRelFiles.map(
+    f => (prefix && f.startsWith(prefix) ? f.slice(prefix.length) : f),
+  );
+  return {
+    ...runner,
+    args: [...runner.args, ...targets],
+    label: `${runner.label} (impacted: ${targets.length} file${targets.length === 1 ? '' : 's'})`,
+  };
+}
+
 export function detectTestRunners(buildConfig?: BuildConfig): TestRunner[] {
   const { existsSync, readFileSync, readdirSync } = fs;
   const runners: TestRunner[] = [];

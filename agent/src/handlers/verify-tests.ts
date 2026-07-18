@@ -27,6 +27,7 @@ import {
   discoverDocumentedCommands, runnerFromCommand, MAX_DOCUMENTED_COMMANDS,
   discoverNewlyDisabledTests, MAX_DISABLED_TEST_MARKERS,
   buildAcceptanceTestRunner, classifyAcceptanceTestRun, acceptanceTestRunPassed, matchesEnvironmentFailureSignature,
+  isUnscopedPytestRunner, scopePytestRunnerToFiles,
   type BuildConfig, type TestRunner, type AcceptanceProbe, type DocumentedCommand,
   type DeclaredAcceptanceTest,
 } from '../utils/test-runners.js';
@@ -472,6 +473,106 @@ async function attachDeclaredBuildProbe(
     note = `We ran your declared build command \`${probe.label}\` but it could not run — missing deps / unprovisioned setup; not blocking (unit suite passed).`;
   }
   return { ...base, probe, output: [base.output, note].filter(Boolean).join('\n') };
+}
+
+// ── Diff-impacted scoping for an unbounded whole-suite pytest runner ─────────
+// Mirrors the local ``./check`` impacted-test gate
+// (agent/src/prompts/check_impacted_test.sh): resolve the backend test files
+// IMPACTED by the PR diff via the committed reverse-dep resolver, cap the count,
+// and run ONLY those instead of the whole ~hundreds-of-file suite. The cap +
+// resolver wall clock mirror the check gate's IMPACTED_TEST_CAP (8) and
+// IMPACTED_RESOLVER_TIMEOUT_SECS (30s). This is what turns a bare
+// ``python3 -m pytest`` (which reaches collection then dies at the runner wall
+// clock) into a bounded, fast ``pytest <impacted files>`` run.
+const IMPACTED_TEST_CAP = 8;
+const IMPACTED_RESOLVER_TIMEOUT = 30_000;
+const IMPACTED_RESOLVER_SCRIPT = 'backend/testing/impacted_tests.py';
+
+// Whether the committed impacted-test resolver exists in the cloned workspace.
+// Defensive: a thrown fs error (or a test that stubs ``fs`` without existsSync)
+// means "unavailable" → scoping is a no-op and the runner runs as-is. Only
+// Blueprint(-like) repos carry the resolver, which is exactly where the wedging
+// bare ``python3 -m pytest`` full-suite command lives; external repos degrade to
+// the runner's own wall-clock fall-open.
+function impactedResolverAvailable(): boolean {
+  try {
+    return fs.existsSync(`${WORKSPACE}/${IMPACTED_RESOLVER_SCRIPT}`);
+  } catch {
+    return false;
+  }
+}
+
+// Resolve the diff-impacted backend test files via the committed reverse-dep
+// resolver, bounded by a wall clock. Changed paths are passed as positional args
+// (execFileAsync ignores stdin). Returns the impacted repo-relative test-file
+// paths (possibly empty) on success, or null when the resolver could not be run
+// (timeout / crash / spawn error) so the caller degrades to a fall-open rather
+// than an unbounded full run.
+async function resolveImpactedTestFiles(
+  ws: WebSocket | null,
+  changedFiles: string[],
+): Promise<string[] | null> {
+  try {
+    const out = await execFileAsync(
+      'python3',
+      [IMPACTED_RESOLVER_SCRIPT, '--limit', String(IMPACTED_TEST_CAP), ...changedFiles],
+      { cwd: WORKSPACE, timeoutMs: IMPACTED_RESOLVER_TIMEOUT },
+    );
+    return out.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  } catch (e) {
+    const first = e instanceof Error ? e.message.split('\n')[0] : String(e);
+    sendLog(ws, `Impacted-test resolver could not run (${first}) — cannot bound the suite; will fall open instead of an unbounded full run.\n`);
+    return null;
+  }
+}
+
+// Scope any unbounded whole-suite pytest runner to the diff-impacted test files
+// so a bare ``python3 -m pytest`` becomes a bounded ``pytest <impacted files>``
+// run. Non-pytest runners and already-scoped pytest runners pass through
+// unchanged. Returns ``{ runners, fallOpen, note }``: ``fallOpen`` is true ONLY
+// when an unbounded pytest runner could NOT be bounded (resolver failed) or had
+// NOTHING impacted to run AND no other runnable suite remains — the caller then
+// falls open (detected=false) rather than running an unbounded full suite or
+// reporting a vacuous pass over zero runners.
+async function scopeRunnersToImpacted(
+  ws: WebSocket | null,
+  runners: TestRunner[],
+  diff: PrDiff,
+): Promise<{ runners: TestRunner[]; fallOpen: boolean; note: string }> {
+  if (!runners.some(isUnscopedPytestRunner) || !impactedResolverAvailable()) {
+    return { runners, fallOpen: false, note: '' };
+  }
+  // Resolve once for the whole diff — every unbounded pytest runner shares it.
+  const impacted = await resolveImpactedTestFiles(ws, diff.changedFiles);
+  const out: TestRunner[] = [];
+  let droppedUnbounded = false;
+  let note = '';
+  for (const runner of runners) {
+    if (!isUnscopedPytestRunner(runner)) {
+      out.push(runner);
+      continue;
+    }
+    if (impacted === null) {
+      droppedUnbounded = true;
+      note = 'the impacted-test resolver could not run (timeout/crash)';
+      sendLog(ws, `Impacted scoping: dropping unbounded runner ${runner.label} — resolver unavailable, refusing an unbounded full-suite run.\n`);
+      continue;
+    }
+    if (impacted.length === 0) {
+      droppedUnbounded = true;
+      note = 'the PR diff impacts no backend test files';
+      sendLog(ws, `Impacted scoping: ${runner.label} has no diff-impacted test files — nothing bounded to run.\n`);
+      continue;
+    }
+    const scoped = scopePytestRunnerToFiles(runner, impacted, WORKSPACE);
+    out.push(scoped);
+    sendLog(ws, `Impacted scoping: ${runner.label} → running ${impacted.length} diff-impacted test file(s) instead of the whole suite: ${impacted.join(', ')}\n`);
+  }
+  // Fall open ONLY when we could not produce ANY runnable suite (every remaining
+  // runner was an unbounded pytest we had to drop). If a sibling stack still
+  // runs, proceed with it — the dropped pytest is covered by the promotion suite.
+  const fallOpen = droppedUnbounded && out.length === 0;
+  return { runners: out, fallOpen, note };
 }
 
 // ── Diff-aware documented / PR-introduced command probe ──────────────────────
@@ -1133,7 +1234,28 @@ export async function handleVerifyTests(
         'No configured test runner matches the authoritative PR diff; refusing to run unrelated stacks.', buildConfig);
       return;
     }
-    sendLog(ws, `Detected test runner(s): ${activeRunners.map(r => r.label).join(', ')}\n`);
+    // Scope any unbounded whole-suite pytest runner (a bare `python3 -m pytest`
+    // over the entire repo) down to the diff-impacted test files, so it becomes a
+    // bounded, fast `pytest <impacted files>` run instead of the whole
+    // hundreds-of-file suite that reaches collection then dies at the runner wall
+    // clock. When the resolver is unavailable (non-Blueprint repo) the runner is
+    // left untouched and the wall-clock fall-open below is the safety net; when
+    // scoping determines there is NOTHING impacted to run (or the resolver failed)
+    // AND no other runnable suite remains, degrade to a non-blocking fall-open
+    // rather than an unbounded full run or a vacuous pass over zero runners.
+    const scopedPlan = await scopeRunnersToImpacted(ws, activeRunners, earlyPrDiff);
+    if (scopedPlan.fallOpen) {
+      sendLog(ws, `\nNo bounded suite to run for this diff (${scopedPlan.note}) — falling open (detected=false, gate could not run) so the rollup proceeds UNVERIFIED; the sharded promotion suite is authoritative.\n`);
+      statusRef.value = 'Running cheap acceptance probe (no bounded suite for this diff)...';
+      result = await attachAcceptanceProbe(ws, buildConfig, {
+        detected: false,
+        passed: false,
+        tests: [],
+        output: `Merge gate had no bounded suite to run for this diff: ${scopedPlan.note}. Falling open (UNVERIFIED); the sharded promotion suite verifies authoritatively.`,
+      });
+    } else {
+    const runnersToRun = scopedPlan.runners;
+    sendLog(ws, `Detected test runner(s): ${runnersToRun.map(r => r.label).join(', ')}\n`);
     statusRef.value = 'Running detected test suite...';
     // Compute changed-line counts from the PR diff for diff-aware coverage
     // measurement.  Null-safe: without the diff, total-coverage is used.
@@ -1146,12 +1268,36 @@ export async function handleVerifyTests(
     // once and returns a verdict without ever invoking Claude to repair code.
     const loop = await runVerifyLoop(
       ws, statusRef, model, effort, buildConfig,
-      activeRunners,
+      runnersToRun,
       'detected suite',
       changedLineCounts,
     );
 
-    if (loop.setupFailed || loop.partialSetupFailed) {
+    if (loop.timedOut) {
+      // WALL-CLOCK kill of the WHOLE suite: the test command runs an
+      // unbounded/oversized suite that reaches pytest collection then dies at the
+      // runner wall clock (SIGTERM). This is NOT a transient setup blip to retry
+      // — re-running just times out again and wedges every rollup. Degrade to a
+      // non-blocking fall-open (detected=false, COMPLETED): the rollup proceeds
+      // UNVERIFIED and the AUTHORITATIVE sharded suite still runs at the
+      // automain→main promotion PR. A cheap acceptance probe still attaches via
+      // the shared completion path, so a CLEAR compile/build break can still
+      // block. Crucially, unlike the setupFailed path this posts COMPLETED (not
+      // FAILED) and carries no setupFailed/partialSetupFailed marker, so the
+      // orchestrator never re-spawns it into an infinite crash-retry loop.
+      const secs = Math.round(TEST_RUNNER_TIMEOUT / 1000);
+      sendLog(ws, `\nTest verification could not run the suite within the ${secs}s wall clock — the test command runs an unbounded suite. Falling open (detected=false, gate could not run) so the rollup proceeds UNVERIFIED; the sharded promotion suite is authoritative.\n`);
+      statusRef.value = 'Running cheap acceptance probe (suite exceeded the wall clock)...';
+      result = await attachAcceptanceProbe(ws, buildConfig, {
+        detected: false,
+        passed: false,
+        tests: [],
+        output: [
+          loop.failureSummary,
+          `Test suite exceeded the ${secs}s wall-clock budget and was killed before producing a verdict (the test command runs an unbounded/oversized suite). Merge gate could not run — falling open (UNVERIFIED); the sharded promotion suite verifies authoritatively.`,
+        ].filter(Boolean).join('\n\n').slice(-VERIFY_TESTS_OUTPUT_LIMIT),
+      });
+    } else if (loop.setupFailed || loop.partialSetupFailed) {
       // Setup still failing after the bounded retries. Either EVERY runner
       // failed setup (setupFailed) or SOME-but-not-all did (partialSetupFailed):
       // in both cases at least one suite genuinely could not run due to
@@ -1218,7 +1364,7 @@ export async function handleVerifyTests(
       result = {
         detected: true,
         passed,
-        tests: activeRunners.map(r => ({
+        tests: runnersToRun.map(r => ({
           name: r.label,
           status: passed ? 'pass' : 'fail',
           message: passed ? '' : message,
@@ -1243,6 +1389,7 @@ export async function handleVerifyTests(
         statusRef.value = 'Running declared build probe (suite passed)...';
         result = await attachDeclaredBuildProbe(ws, buildConfig, result);
       }
+    }
     }
   }
 

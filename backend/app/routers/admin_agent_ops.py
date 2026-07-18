@@ -902,7 +902,9 @@ async def agent_annotate(
             if warning:
                 ctx = {**ctx, "_provenance_warnings": warning}
 
-    ctx = stamp_message_audience(ctx, "agent_annotation")
+    ctx = stamp_message_audience(
+        ctx, "agent_annotation.size_breach" if is_size_breach else "agent_annotation"
+    )
     msg = await build_project_message(
         session,
         project_id=task.project_id,

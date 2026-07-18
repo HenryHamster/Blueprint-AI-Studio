@@ -213,10 +213,15 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # creation and visible in the conversation surface.
     "strategic_check_in": OPERATOR_FYI,
     # admin_agent_ops.agent_annotate: agent-authored annotations (comment, issue,
-    # vision, size_breach). Annotations are agent outputs that belong in the
-    # strategic context; they are operator-visible by default so the operator can
-    # see the agent's findings without needing a separate escalation channel.
+    # vision). Annotations are agent outputs that belong in the strategic context;
+    # they are operator-visible so the operator can see the agent's findings without
+    # needing a separate escalation channel.
     "agent_annotation": OPERATOR_FYI,
+    # admin_agent_ops.agent_annotate: size_breach annotations are programmatic
+    # signals from a test-invariant failure — the same class of internal pipeline
+    # bookkeeping as self_improvement.payload_too_large. They must NOT reach the
+    # operator channel; the strategist acts on them autonomously.
+    "agent_annotation.size_breach": STRATEGIST_INTERNAL,
     # admin_agent_ops.strategic_operation / strategic_completion: catch-all for
     # strategic messages whose event_type is unknown or missing. Unregistered types
     # already fail-closed to STRATEGIST_INTERNAL via route_event; this entry makes

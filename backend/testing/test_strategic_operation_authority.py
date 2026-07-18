@@ -245,7 +245,7 @@ async def test_operation_context_hash_is_derived_and_persisted(authority_db):
         **{
             **request.__dict__,
             "operation_kind": "inspect_ci",
-            "capability": "ci.inspect",
+            "capability": "ci.run.inspect",
         }
     )
 
@@ -932,7 +932,7 @@ async def test_callback_context_exposes_no_ambient_authority(authority_db):
         )
         # A raw transaction boundary cannot even be addressed: the private
         # fenced session/connection is not exposed to the callback.
-        getattr(context, "session").execute("COMMIT")
+        context.session.execute("COMMIT")
         return {}  # pragma: no cover
 
     with pytest.raises(AttributeError):
@@ -1217,3 +1217,140 @@ async def test_generation_increment_race_fences_stale_worker(db_session):
         timeout=15,
     )
     assert callback_called is False
+
+
+@pytest.mark.asyncio
+async def test_mutation_endpoint_applies_running_update_end_to_end(authority_db):
+    """The /mutate endpoint drives a real fenced DB-only mutation to `applied`."""
+    from datetime import datetime, timezone
+
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    project, task, _resident = await _authority_rows(authority_db)
+    running_update_revision = hashlib.sha256(b"steady state").hexdigest()
+    invocation = ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "strategy.running_update.set",
+            "project_id": project.id,
+            "turn_task_id": task.id,
+            "authority_generation": 3,
+            "parameters": {"running_update": "advanced via endpoint"},
+            "operation_id": "endpoint-op-1",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(task.version),
+                "current_checkpoint_id": task.first_payload.get("checkpoint_id"),
+                "resident_checkpoint_version": task.first_payload.get(
+                    "checkpoint_version"
+                ),
+                "resident_checkpoint_hash": task.first_payload.get("checkpoint_hash"),
+                "running_update_revision": running_update_revision,
+            },
+            "evidence": (
+                CapabilityEvidenceRef(
+                    kind="task",
+                    project_id=project.id,
+                    source_id=str(task.id),
+                    revision="task:v1",
+                    checksum="d" * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                ),
+            ),
+        }
+    )
+    token = {
+        "sub": str(task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+
+    result = await capability_router.invoke_resident_mutation(
+        None, invocation, session=authority_db, token=token
+    )
+    assert result["status"] == "applied"
+    assert result["capability_id"] == "strategy.running_update.set"
+
+    await authority_db.refresh(project)
+    assert project.running_update == "advanced via endpoint"
+
+    receipt = (await authority_db.execute(select(StrategicOperationReceipt))).scalar_one()
+    assert receipt.operation_kind == "set_running_update"
+    assert receipt.capability == "strategy.running_update.set"
+    assert receipt.risk_level == "low"
+    assert receipt.status == "applied"
+
+    # Idempotent replay of the same operation_id returns the same applied receipt
+    # without changing the (now-advanced) field.
+    replay = await capability_router.invoke_resident_mutation(
+        None, invocation, session=authority_db, token=token
+    )
+    assert replay["operation_id"] == "endpoint-op-1"
+    assert replay["status"] == "applied"
+    all_receipts = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalars().all()
+    assert len(all_receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypatch):
+    """A /capability inspection persists a context-bound, idempotent receipt."""
+    from unittest.mock import AsyncMock
+
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    # Simulate the frozen context_hash persisted at context-serve time.
+    turn_task.context = {**turn_task.context, TURN_CONTEXT_HASH_KEY: "ctx-hash-1"}
+    target = Task(project_id=project.id, title="target", payloads=[{"type": "plan"}])
+    authority_db.add_all([turn_task, target])
+    await authority_db.commit()
+
+    monkeypatch.setattr(
+        capability_router,
+        "load_live_resident_agent_task_locked",
+        AsyncMock(return_value=turn_task),
+    )
+    token = {
+        "sub": str(turn_task.id),
+        "project_id": str(project.id),
+        "vm_instance_id": "vm-1",
+        "task_type": "strategic_resident_turn",
+        "claim_nonce": "nonce-1",
+    }
+    body = ResidentCapabilityRequest(
+        capability_id="task.logs.inspect",
+        parameters={"task_id": str(target.id)},
+    )
+
+    result = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    # Response evidence kind is mapped into the trust taxonomy (logs -> task_log).
+    assert result["evidence"]["kind"] == "task_log"
+
+    receipt = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalar_one()
+    assert receipt.operation_kind == "inspect_task_log"
+    assert receipt.capability == "task.logs.inspect"
+    assert receipt.status == "applied"
+    assert receipt.expected_revisions == {"context_hash": "ctx-hash-1"}
+    assert receipt.receipt["structured_result"]["evidence"][0]["kind"] == "task_log"
+
+    # Idempotent: the per-turn ledger dedups the same inspection -> one receipt.
+    await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    receipts = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalars().all()
+    assert len(receipts) == 1

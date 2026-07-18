@@ -5290,7 +5290,7 @@ describe('MessagesPanel send arming receipt', () => {
     const onStrategicStateRefresh = vi.fn();
     const onStrategicInteraction = vi.fn();
     const el = await renderPanel(addToast, false, {
-      strategicState: makeStrategicState(),
+      strategicState: strategicStateForActionMessage('q-refresh'),
         strategicWorkbenchState: {
           version: 1,
           interaction_mode: 'continuous',
@@ -9330,5 +9330,124 @@ describe('MessagesPanel optimistic-send tab-switch persistence', () => {
 
     remounted.unmount();
     await pendingAttachmentStore.clearPendingAttachments('test-user@example.com', projectId, nextIdentity);
+  });
+});
+
+// ── MessagesPanel needs-action filter toggle ─────────────────────────────────
+
+describe('MessagesPanel needs-action filter', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    vi.clearAllMocks();
+  });
+  afterEach(() => { vi.clearAllMocks(); });
+
+  test('renders needs-action / show-all toggle when strategicState is provided', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([makeMsg({ id: 'msg-1', message_type: 'QUESTION', content: 'a question?' })]);
+
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-filter-bar"]')).not.toBeNull();
+    });
+
+    const needsActionBtn = container.querySelector('[data-testid="needs-action-filter-needs-action"]') as HTMLButtonElement | null;
+    const showAllBtn = container.querySelector('[data-testid="needs-action-filter-show-all"]') as HTMLButtonElement | null;
+    expect(needsActionBtn).not.toBeNull();
+    expect(showAllBtn).not.toBeNull();
+
+    // Default: needs-action mode is active (aria-pressed=true)
+    expect(needsActionBtn!.getAttribute('aria-pressed')).toBe('true');
+    expect(showAllBtn!.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  test('does not render needs-action filter bar without strategicState', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([]);
+
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+
+    // Wait for initial render to settle
+    await waitFor(() => expect(container.querySelector('div')).not.toBeNull());
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 30)); });
+
+    expect(container.querySelector('[data-testid="needs-action-filter-bar"]')).toBeNull();
+  });
+
+  test('clicking Show all switches toggle to show-all mode', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([makeMsg({ id: 'msg-1', message_type: 'QUESTION', content: 'a question?' })]);
+
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-filter-show-all"]')).not.toBeNull();
+    });
+
+    const showAllBtn = container.querySelector('[data-testid="needs-action-filter-show-all"]') as HTMLButtonElement;
+    fireEvent.click(showAllBtn);
+
+    await waitFor(() => {
+      const needsActionBtn = container.querySelector('[data-testid="needs-action-filter-needs-action"]') as HTMLButtonElement;
+      const showAll = container.querySelector('[data-testid="needs-action-filter-show-all"]') as HTMLButtonElement;
+      expect(needsActionBtn.getAttribute('aria-pressed')).toBe('false');
+      expect(showAll.getAttribute('aria-pressed')).toBe('true');
+    });
+  });
+
+  test('clicking Needs action after Show all switches back to needs-action mode', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([makeMsg({ id: 'msg-1', message_type: 'QUESTION', content: 'a question?' })]);
+
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-filter-show-all"]')).not.toBeNull();
+    });
+
+    // Switch to show-all
+    fireEvent.click(container.querySelector('[data-testid="needs-action-filter-show-all"]')!);
+
+    await waitFor(() => {
+      const needsActionBtn = container.querySelector('[data-testid="needs-action-filter-needs-action"]') as HTMLButtonElement;
+      expect(needsActionBtn.getAttribute('aria-pressed')).toBe('false');
+    });
+
+    // Switch back to needs-action
+    fireEvent.click(container.querySelector('[data-testid="needs-action-filter-needs-action"]')!);
+
+    await waitFor(() => {
+      const needsActionBtn = container.querySelector('[data-testid="needs-action-filter-needs-action"]') as HTMLButtonElement;
+      expect(needsActionBtn.getAttribute('aria-pressed')).toBe('true');
+    });
   });
 });

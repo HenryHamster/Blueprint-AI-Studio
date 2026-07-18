@@ -181,6 +181,11 @@ export interface StrategicContextRenderableDescriptor {
    *  (exceeds the cap of 25 files / 8 MiB each). Rendered as an amber
    *  "N file(s) omitted" note; absent/null for descriptors with no drops. */
   viewable_files_dropped?: number | null;
+  /** When viewable artifacts for this descriptor are expected to expire from
+   *  GCS (the artifacts bucket has a ~7-day lifecycle DELETE). After this
+   *  timestamp, signed preview URLs will 404 — the artifact is permanently
+   *  gone and retries are futile. ISO-8601 string. */
+  artifact_expires_at?: string | null;
   metrics?: StrategicContextDescriptorMetric[];
   columns?: StrategicContextDescriptorTableColumn[];
   rows?: StrategicContextDescriptorTableRow[];

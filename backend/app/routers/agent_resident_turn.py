@@ -25,6 +25,7 @@ from app.strategic_resident_agent_contracts import (
     ResidentTurnFailRequest,
 )
 from app.strategic_resident_context import reconstruct_authoritative_turn_input
+from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
 from app.strategic_resident_failure import fail_authoritative_resident_turn
 from app.strategic_resident_reconciliation import (
     StrategicResidentReconcileRequest,
@@ -105,6 +106,17 @@ async def get_resident_turn_context(
         )
     except StrategicAuthorityError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    # Persist the frozen context_hash on the turn task so mid-turn inspection
+    # receipts can bind to it cheaply without re-deriving the whole turn input.
+    # The input is frozen after claim, so this value is stable for the turn.
+    context_hash = str(
+        (provider_input.get("lineage") or {}).get("context_hash") or ""
+    )
+    if context_hash:
+        context = task.context if isinstance(task.context, dict) else {}
+        if context.get(TURN_CONTEXT_HASH_KEY) != context_hash:
+            task.context = {**context, TURN_CONTEXT_HASH_KEY: context_hash}
+            session.add(task)
     # Reconstruction narrows ArtifactRef authority to the exact post-fit
     # provider projection. Persist that freeze before returning context so the
     # agent's next, separately transacted retrieval request observes it.
