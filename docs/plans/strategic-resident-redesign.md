@@ -2,7 +2,10 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, and 2b merged; Milestone 3 converged and publishing.
+**Status:** Milestones 1, 2a, 2b, 3, and 4 merged; Milestone 5 (rollout, legacy
+retirement, release audit) remains — its exit criteria (seven-day soak, live
+per-project production engine flip, legacy-handler retirement after soak) are
+operator- and calendar-gated by design.
 
 **Last refreshed:** 2026-07-17. M2a merged through PR `#15292` at merge commit
 `7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
@@ -307,7 +310,7 @@ Pre-rebase evidence:
   maintainability review/fix iterations converged with no actionable findings;
   scoped Ruff, TypeScript, ESLint, Terraform formatting, and diff checks are clean.
 
-### M4 — Fenced operations, strategic memory, and cadence
+### M4 — Fenced operations, strategic memory, and cadence — merged
 
 - Route authorized mutations through operation IDs, expected revisions, authority
   generations, evidence preconditions, approvals, durable receipts, and explicit
@@ -320,6 +323,41 @@ Pre-rebase evidence:
   charter, decisions, rationales, commitments, and open loops across rotations.
 - Coalesce meaningful wakeups, make unchanged checks zero-model-call, preempt
   background work safely, and reconcile revision-linked StrategicCycle proposals.
+
+Implementation checklist:
+
+- [x] Correct `INSPECTION_CAPABILITY_KINDS` to real capability ids so inspection
+  evidence is trusted once receipts are written (PR `#15622`).
+- [x] Lift the first fenced mutation off its 501 stub — `strategy.running_update.set`
+  through the DB-only `execute_fenced_db_operation`, authority from the signed
+  token, generation/CAS fenced (PR `#15630`).
+- [x] Write server-authored, context-hash-bound, idempotent inspection receipts so
+  mid-turn inspection evidence is citable; exclude them from the operation-claim
+  invariants (PR `#15643`).
+- [x] Extend the fence to a bounded target task — `task.reprioritize`, CAS on
+  `updated_at`, fail-closed against targeting any Resident turn (PR `#15649`).
+- [x] Add the two-phase external-effect executor (durable `applying` intent →
+  single-owner claim → perform → settle `reconciled`/`failed`); wire `pr.create`
+  behind a default-off operator allowlist so it ships inert (PR `#15654`).
+- [x] Add the worker memory-proposal admission contract: revision-linked +
+  evidence-gated + fail-closed, returning reconciliation-native proposals
+  (PR `#15655`).
+- [x] Add `signal_project_change`, the production entrypoint for the background
+  `project_change` coalescing lane with the zero-model unchanged guarantee
+  (PR `#15656`).
+- [x] Follow-on wires (were bounded slices deferred at M4 close, now landed):
+  worker-proposal storage + reconciliation drain; `signal_project_change`
+  production triggers; the remaining DB-only `task.*` lifecycle adapters routed
+  through the operator `modify_task_apply` path; real single-use/TTL operator
+  approval verification (`StrategicOperationApproval`) with the owner-gated grant
+  endpoint; `pr.merge` (sha-guarded) and `pr.create` external-effect adapters off
+  their 501 stubs; managed-Task escalation adapters.
+- The remaining catalog entries left `propose_only` — `pr.inspect` and the
+  higher-stakes `deployment.deploy`/`deployment.rollback` — are an **intentional
+  product decision, not a gap**: the Resident proposes them and an operator
+  actually invokes them. This keeps the highest-blast-radius actions human-driven
+  while every evidence/authority/receipt fence around them is already built and
+  tested, so promoting one later is a catalog flip, not new machinery.
 
 ### M5 — Rollout, legacy retirement, and release audit
 
@@ -334,6 +372,30 @@ Pre-rebase evidence:
 - Failover, context rotation, 10,000-event noise, crash-boundary, prompt-injection,
   migration/rollback, and seven-day soak coverage.
 - Requirement-by-requirement evidence audit before removing rollback projections.
+
+Implementation checklist:
+
+- [x] Make the per-project engine flip operator-invokable: owner-gated
+  `POST /api/admin/projects/{id}/resident-engine/cutover` and `.../rollback`
+  wrap the tested `cutover_to_strategic_resident` /
+  `rollback_to_legacy_resident` transitions. Cutover provisions the Resident +
+  v1 checkpoint first (idempotent) so the switch works on any project; both are
+  idempotent, reversible, and map every `ResidentOwnershipTransitionError` to a
+  409. This is the reversible one-shot the rollout/rollback rehearsals drive.
+- [ ] Complete shadow comparisons and rollout health surfaces (soak evidence).
+- [ ] Legacy-handler retirement after the soak and rollback evidence converge.
+- [ ] Adversarial-authority, noise, crash-boundary, and seven-day soak suites.
+
+Rollout runbook (per pilot project):
+
+1. `POST /api/admin/projects/{project_id}/resident-engine/cutover` (owner token)
+   — response shows `previous_owner: "legacy"` → `new_owner: "strategic_resident"`
+   and the advanced `new_generation`. Idempotent: a repeat returns
+   `already_owned: true` without advancing the generation.
+2. Observe one project through a strategy turn; the Resident now owns the engine
+   with low-latency chat and the always-on background lane.
+3. Widen to more projects, or `POST .../resident-engine/rollback` to fence the
+   generation and restore legacy inputs if anything looks off.
 
 ## Latency and ergonomics budget
 

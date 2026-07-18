@@ -353,7 +353,11 @@ def scan_inputs_for_credentials(
             raise TypeError(f"input {name!r} must be bytes")
         content = bytes(content)
         findings.extend(_scan_content_patterns(name, content))
-        if name in dockerfile_set or name.lower().startswith("dockerfile"):
+        if (
+            name in dockerfile_set
+            or name == _FINGERPRINT_DOCKERFILE_KEY
+            or name.lower().startswith("dockerfile")
+        ):
             findings.extend(_scan_dockerfile_directives(name, content))
     return findings
 

@@ -2621,29 +2621,38 @@ async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
     # commit, which would make the second tick skip before reaching the race
     # window. Replace it with a lock-free eligibility read — the lifecycle is
     # not what's under test, the claim at INSERT time is.
-    async def _lockfree_lifecycle(prj, _session, busy_direction_ids, _now):
-        return [
+    #
+    # This eligibility read doubles as the rendezvous point: it is the last shared
+    # step BOTH ticks execute before the task INSERT. (M4 relocated
+    # check_anomaly_actions to AFTER the spawn/flush and wrapped the post-flush
+    # staging in a Project->Resident authority FOR UPDATE, so it can no longer be
+    # the pre-INSERT barrier: a tick that flushed first holds the idempotency-key
+    # index lock while waiting there, and the second tick blocks on the duplicate
+    # insert and never arrives — a deadlock.) Rendezvousing here forces both ticks
+    # to have read "direction is free" and then race to the INSERT, which is the
+    # exact TOCTOU interleaving from the incident.
+    barrier = asyncio.Barrier(2)
+
+    async def _lockfree_lifecycle(
+        prj, _session, busy_direction_ids, _now, *, expected_legacy_generation=None
+    ):
+        eligible = [
             d
             for d in (prj.directions or [])
             if d.get("status") == "active" and d.get("id") not in busy_direction_ids
         ]
+        await barrier.wait()
+        return eligible
 
     mocker.patch(
         "app.direction_lifecycle._process_direction_lifecycle",
         new=_lockfree_lifecycle,
     )
 
-    # Rendezvous AFTER the no-active-research read and BEFORE the task INSERT
-    # (check_anomaly_actions sits between the guards and the spawn loop):
-    # neither tick may insert until BOTH have read "direction is free" — the
-    # exact TOCTOU interleaving from the incident.
-    barrier = asyncio.Barrier(2)
-
-    async def _rendezvous(*_a, **_kw):
-        await barrier.wait()
+    async def _no_anomaly(*_a, **_kw):
         return {"action": "none"}
 
-    mocker.patch("app.anomaly_detection.check_anomaly_actions", new=_rendezvous)
+    mocker.patch("app.anomaly_detection.check_anomaly_actions", new=_no_anomaly)
 
     async def _tick():
         async with TestingSessionLocal() as session:
@@ -8252,8 +8261,14 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     # cycle) or strategic_review (strategy-only cycle).
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    assert len(tasks) == 1, "Expected one strategic task to be spawned after decay"
-    assert tasks[0].payloads[0].get("type") in ("design_doc_update", "strategic_review")
+    # M4 also spawns a background strategic_resident_turn shadow task alongside the
+    # legacy strategic task; filter to the strategic type under test before asserting.
+    strategic = [
+        t
+        for t in tasks
+        if t.first_payload.get("type") in ("design_doc_update", "strategic_review")
+    ]
+    assert len(strategic) == 1, "Expected one strategic task to be spawned after decay"
 
 
 @pytest.mark.asyncio

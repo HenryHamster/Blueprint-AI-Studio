@@ -3883,6 +3883,11 @@ async def _handle_capability_proof_trial_completion(
         head_sha_enrolled = (
             enrolled.get("head_sha") if isinstance(enrolled.get("head_sha"), str) else None
         )
+        env_fingerprint_enrolled = (
+            enrolled.get("env_fingerprint")
+            if isinstance(enrolled.get("env_fingerprint"), str) and enrolled.get("env_fingerprint")
+            else None
+        )
 
         # (1) Capability name must normalize-equal the enrolled name.
         cap_normalized = _norm_cap(cap)
@@ -3943,6 +3948,7 @@ async def _handle_capability_proof_trial_completion(
                 refs_enrolled,
                 commit_sha_to_record,
                 suite_verifying=True,
+                env_fingerprint=env_fingerprint_enrolled,
             )
             if recorded:
                 await session.commit()

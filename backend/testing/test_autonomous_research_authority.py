@@ -74,6 +74,10 @@ async def test_commit_legacy_authorized_commits_current_generation(db_session):
 @pytest.mark.asyncio
 async def test_commit_legacy_authorized_rolls_back_after_cutover(db_session):
     project = await _project_with_legacy_resident(db_session)
+    # The fence rolls the session back on the expiry path, which expires `project`;
+    # snapshot the PK first so the post-rollback read below does not lazy-load an
+    # expired instance (MissingGreenlet on Postgres).
+    project_id = project.id
     generation = await lock_and_validate_legacy_authority(db_session, project.id)
     await db_session.commit()
 
@@ -91,7 +95,7 @@ async def test_commit_legacy_authorized_rolls_back_after_cutover(db_session):
         await commit_legacy_authorized(db_session, project.id, generation)
 
     persisted = await db_session.scalar(
-        select(Project).where(Project.id == project.id)
+        select(Project).where(Project.id == project_id)
     )
     assert persisted is not None
     await db_session.refresh(persisted)
@@ -170,6 +174,10 @@ async def test_failed_fence_discards_then_restores_immediate_notification_dispat
     db_session, monkeypatch
 ):
     project = await _project_with_legacy_resident(db_session)
+    # The failed fence rolls back and expires `project`; snapshot the PK so the
+    # post-rollback notification read below does not lazy-load an expired instance
+    # (MissingGreenlet on Postgres).
+    project_id = project.id
     generation = await lock_and_validate_legacy_authority(db_session, project.id)
     await db_session.commit()
     scheduled = _capture_scheduled_notifications(monkeypatch)
@@ -188,7 +196,7 @@ async def test_failed_fence_discards_then_restores_immediate_notification_dispat
     assert scheduled == []
 
     notification_dispatch._schedule_external_notification(
-        db_session, project.id, "TEST_ORDINARY", {"phase": "ordinary"}
+        db_session, project_id, "TEST_ORDINARY", {"phase": "ordinary"}
     )
     assert len(scheduled) == 1
 

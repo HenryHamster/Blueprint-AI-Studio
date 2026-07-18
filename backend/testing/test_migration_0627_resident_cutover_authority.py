@@ -79,7 +79,12 @@ def _seed_projects(connection, project, count: int = 3) -> list[uuid.UUID]:
 
 
 def _expect_cutover_rejected(support, connection, resident, checkpoint, project_id):
-    with pytest.raises(sa.exc.IntegrityError), connection.begin_nested():
+    # The cutover authority fence RAISEs SQLSTATE 42501 → asyncpg
+    # InsufficientPrivilegeError → sqlalchemy ProgrammingError on Postgres
+    # (SQLite surfaces the same rejection as IntegrityError).
+    with pytest.raises(
+        (sa.exc.IntegrityError, sa.exc.ProgrammingError)
+    ), connection.begin_nested():
         support._exercise_staged_cutover_checkpoint(
             connection,
             resident=resident,

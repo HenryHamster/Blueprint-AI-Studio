@@ -63,7 +63,7 @@ class TestViewableSelectionPolicy:
             (art / name).write_bytes(b"x" * 16)
         selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
         assert size_dropped == 0
-        assert svg_count == 1  # chart.svg is excluded for security
+        assert svg_count == 0  # chart.svg is now viewable (sanitized before upload)
         by_name = {c.filename: c.kind for c in selected}
         assert by_name == {
             "plot.png": "image",
@@ -132,18 +132,19 @@ class TestViewableSelectionPolicy:
         assert size_dropped == 2
         assert svg_count == 0
 
-    def test_svg_files_counted_separately_not_as_dropped(self, tmp_path):
-        """SVG files are excluded for XSS security; they contribute to svg_count,
-        not size_dropped, so the omission signal is distinct and informative."""
+    def test_svg_files_included_as_viewable_images(self, tmp_path):
+        """SVG is now viewable (sanitized server-side before upload): svg files
+        appear as image candidates and are NOT counted as omissions."""
         art = tmp_path / "artifacts"
         art.mkdir()
         (art / "plot.png").write_bytes(b"\x89PNG" + b"x" * 16)
         (art / "chart.svg").write_bytes(b"<svg></svg>")
         (art / "diagram.SVG").write_bytes(b"<svg></svg>")
         selected, size_dropped, svg_count = _collect_viewable_candidates_from_dir(str(art))
-        assert [c.filename for c in selected] == ["plot.png"]
+        assert [c.filename for c in selected] == ["chart.svg", "diagram.SVG", "plot.png"]
+        assert all(c.kind == "image" for c in selected)
         assert size_dropped == 0
-        assert svg_count == 2  # both .svg and .SVG extensions counted
+        assert svg_count == 0
 
 
 class TestSymlinkExclusion:

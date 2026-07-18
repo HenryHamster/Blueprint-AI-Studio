@@ -467,13 +467,16 @@ def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
 
     Requires both signals on the same line to prevent false positives:
       1. "RuntimeError" — the exception type
-      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name (e.g.
-         ``GITHUB_PAT_ENCRYPTION_KEY``)
+      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name
 
-    The two-signal check is migration-number-agnostic — it covers any
-    encryption migration (0609, 0621, and future migrations) without needing
-    per-migration updates. It rejects accumulated chain stderr where the
-    env-var name appears on a different line than RuntimeError.
+    The two-signal check rejects:
+    - Accumulated chain stderr where earlier no-op migrations emit the
+      env-var name as a warning before an unrelated RuntimeError fires
+      (different lines, so the same-line anchor still holds).
+    - Non-RuntimeError exceptions that happen to mention the key name.
+
+    Migration-number-agnostic: covers 0609, 0621, 0628, and any future
+    encryption migrations without per-migration updates.
     """
     for line in detail.splitlines():
         if "RuntimeError" in line and _ENCRYPTION_KEY_ENV_VAR in line:

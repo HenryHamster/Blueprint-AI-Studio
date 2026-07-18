@@ -747,6 +747,122 @@ async def test_unchanged_background_check_is_zero_call_and_due_wakeup_coalesces(
 
 
 @pytest.mark.asyncio
+async def test_signal_project_change_wakes_only_on_an_advancing_cursor(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import signal_project_change
+
+    project, _resident = await _authoritative_project(db_session)
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    # An empty / non-advancing cursor makes zero Tasks and zero model calls.
+    assert (
+        await signal_project_change(
+            factory, project_id=project.id, project_change_cursor={}
+        )
+        is None
+    )
+    assert (await db_session.execute(_select(Task))).scalars().first() is None
+
+    # A genuinely advancing cursor wakes the background lane.
+    task_id = await signal_project_change(
+        factory, project_id=project.id, project_change_cursor={"revision": 5}
+    )
+    assert task_id is not None
+    await db_session.rollback()  # drop this session's stale snapshot
+    task = await db_session.get(Task, task_id)
+    assert task is not None
+    assert str((task.first_payload or {}).get("type")) == "strategic_resident_turn"
+
+
+@pytest.mark.asyncio
+async def test_pending_worker_proposal_sweep_wakes_then_is_idle(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlmodel import select as _select
+
+    from app.models import StrategicWorkerMemoryProposal
+    from app.strategic_resident_wakeups import (
+        sweep_pending_worker_proposal_wakeups,
+    )
+
+    project, resident = await _authoritative_project(db_session)
+    resident.background_policy = "active"
+    db_session.add(resident)
+    db_session.add(
+        StrategicWorkerMemoryProposal(
+            project_id=project.id,
+            proposal_id="wp-sweep",
+            layer="working_strategy",
+            updates={"priorities": {"x": 1}},
+            rationale="cycle recommends",
+            evidence=[],
+            target_checkpoint_version=1,
+            target_checkpoint_hash="a" * 64,
+            status="pending",
+        )
+    )
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    # A pending proposal wakes the background lane.
+    assert await sweep_pending_worker_proposal_wakeups(session_factory=factory) == 1
+    await db_session.rollback()
+    tasks = (await db_session.execute(_select(Task))).scalars().all()
+    assert len(tasks) == 1
+
+    # Repeated sweeps while the proposal is still pending coalesce onto the same
+    # lane (bounded to one active turn plus one successor — never unbounded).
+    await sweep_pending_worker_proposal_wakeups(session_factory=factory)
+    await sweep_pending_worker_proposal_wakeups(session_factory=factory)
+    await db_session.rollback()
+    tasks = (await db_session.execute(_select(Task))).scalars().all()
+    assert len(tasks) <= 2
+
+    # Once the turn drains the proposal (no longer pending), the scan skips the
+    # project entirely — an unchanged project performs zero model calls.
+    async with factory() as drain:
+        row = (
+            await drain.execute(_select(StrategicWorkerMemoryProposal))
+        ).scalar_one()
+        row.status = "admitted"
+        drain.add(row)
+        await drain.commit()
+    assert await sweep_pending_worker_proposal_wakeups(session_factory=factory) == 0
+
+
+@pytest.mark.asyncio
+async def test_signal_project_change_is_zero_call_when_cursor_already_handled(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import signal_project_change
+
+    project, resident = await _authoritative_project(db_session)
+    # The resident has already handled this high-water.
+    resident.handled_project_change_cursor = {"revision": 7}
+    db_session.add(resident)
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    # A cursor that does not advance the handled high-water is a no-op.
+    assert (
+        await signal_project_change(
+            factory, project_id=project.id, project_change_cursor={"revision": 7}
+        )
+        is None
+    )
+    assert (await db_session.execute(_select(Task))).scalars().first() is None
+
+
+@pytest.mark.asyncio
 async def test_required_offline_local_runner_returns_truthful_waiting_state(db_session):
     project, resident = await _authoritative_project(db_session)
     resident.runner_policy = {"require_local_runner": True}
