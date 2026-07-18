@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -648,6 +648,9 @@ async def test_mutation_route_dispatches_project_field_capability(monkeypatch):
     )
     executor = AsyncMock(return_value=receipt)
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
 
     result = await capability_router.invoke_resident_mutation(
         None,
@@ -730,6 +733,9 @@ async def test_mutation_route_maps_authority_errors(
     error_cls = getattr(authority, error_name)
     executor = AsyncMock(side_effect=error_cls("fenced rejection"))
     monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+    monkeypatch.setattr(
+        capability_router, "_check_evidence_refs_against_receipts", AsyncMock()
+    )
     with pytest.raises(HTTPException) as exc:
         await capability_router.invoke_resident_mutation(
             None,
@@ -738,6 +744,119 @@ async def test_mutation_route_maps_authority_errors(
             token=_mutation_token(project_id, turn_id),
         )
     assert exc.value.status_code == expected_status
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_rejects_evidence_ref_not_backed_by_inspection(monkeypatch):
+    """Evidence refs not matching any inspection receipt for this turn are rejected 403."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    executor = AsyncMock()
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    # Session returns no receipts — evidence ref has no backing real inspection.
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = []
+    session = AsyncMock()
+    session.execute.return_value = execute_result
+
+    with pytest.raises(HTTPException) as exc:
+        await capability_router.invoke_resident_mutation(
+            None,
+            _mutation_invocation(project_id, turn_id),
+            session=session,
+            token=_mutation_token(project_id, turn_id),
+        )
+    assert exc.value.status_code == 403
+    assert "evidence ref" in exc.value.detail
+    executor.assert_not_awaited()
+    session.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_mutation_route_accepts_evidence_refs_matching_inspection_receipts(monkeypatch):
+    """Evidence refs whose (kind, source_id, revision, checksum) appear in a real
+    inspection receipt for this turn are accepted and the mutation proceeds."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+
+    invocation = _mutation_invocation(project_id, turn_id)
+    ref = invocation.evidence[0]
+
+    # Build a SimpleNamespace receipt that backs the evidence ref above.
+    receipt_row = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="applied",
+        receipt={
+            "structured_result": {
+                "evidence": [
+                    {
+                        "kind": ref.kind,
+                        "source_id": ref.source_id,
+                        "revision": ref.revision,
+                        "checksum": ref.checksum,
+                    }
+                ]
+            }
+        },
+    )
+    execute_result = MagicMock()
+    execute_result.scalars.return_value.all.return_value = [receipt_row]
+    session = AsyncMock()
+    session.execute.return_value = execute_result
+
+    db_receipt = SimpleNamespace(operation_id="op-strategy-1", status="applied", id=uuid.uuid4())
+    executor = AsyncMock(return_value=db_receipt)
+    monkeypatch.setattr(capability_router, "execute_fenced_db_operation", executor)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=session,
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "applied"
+    executor.assert_awaited_once()
+    session.rollback.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_build_receipt_evidence_set_extracts_only_successful_inspection_receipts():
+    """_build_receipt_evidence_set only trusts applied/reconciled inspection receipts."""
+    from app.routers.agent_resident_capabilities import _build_receipt_evidence_set
+
+    valid_key = ("task", "task-id-1", "v1", "a" * 64)
+    valid_receipt = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="applied",
+        receipt={
+            "structured_result": {
+                "evidence": [
+                    {"kind": "task", "source_id": "task-id-1", "revision": "v1", "checksum": "a" * 64}
+                ]
+            }
+        },
+    )
+    # Pending receipt: should be excluded.
+    pending_receipt = SimpleNamespace(
+        operation_kind="inspect_task",
+        status="pending",
+        receipt={"structured_result": {"evidence": [
+            {"kind": "task", "source_id": "task-id-2", "revision": "v2", "checksum": "b" * 64}
+        ]}},
+    )
+    # Wrong operation_kind (mutation, not inspection): should be excluded.
+    mutate_receipt = SimpleNamespace(
+        operation_kind="set_running_update",
+        status="applied",
+        receipt={"structured_result": {"evidence": [
+            {"kind": "task", "source_id": "task-id-3", "revision": "v3", "checksum": "c" * 64}
+        ]}},
+    )
+    result = _build_receipt_evidence_set([valid_receipt, pending_receipt, mutate_receipt])
+    assert valid_key in result
+    assert ("task", "task-id-2", "v2", "b" * 64) not in result
+    assert ("task", "task-id-3", "v3", "c" * 64) not in result
 
 
 @pytest.mark.asyncio

@@ -3,10 +3,12 @@
 import hashlib
 import json
 import uuid
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
@@ -42,9 +44,17 @@ from app.strategic_resident_agent_binding import (
 )
 from app.strategic_resident_capabilities import CapabilityMode, capability_for
 from app.strategic_resident_capability_invocation import (
+    CapabilityEvidenceRef,
     ResidentCapabilityInvocation,
     validated_capability_parameters,
 )
+from app.strategic_resident_evidence_policy import (
+    INSPECTION_CAPABILITY_KINDS,
+    SUCCESSFUL_INSPECTION_STATUSES,
+    EvidenceKey,
+    evidence_key,
+)
+from app.strategic_resident_models import StrategicOperationReceipt
 from app.strategic_resident_project_field_mutation import (
     PROJECT_FIELD_MUTATION_SERVICE,
     project_field_mutation_callback,
@@ -58,6 +68,69 @@ from app.strategic_resident_task_inspection import (
 
 
 router = APIRouter(prefix="/api/agent/resident-turn", tags=["agent"])
+
+_INSPECTION_OPERATION_KINDS = frozenset(INSPECTION_CAPABILITY_KINDS.values())
+
+
+def _build_receipt_evidence_set(
+    receipts: Iterable[StrategicOperationReceipt],
+) -> frozenset[EvidenceKey]:
+    """Return the set of (kind, source_id, revision, checksum) tuples from this turn's receipts."""
+    entries: set[EvidenceKey] = set()
+    for receipt in receipts:
+        if (
+            str(receipt.operation_kind) not in _INSPECTION_OPERATION_KINDS
+            or str(receipt.status) not in SUCCESSFUL_INSPECTION_STATUSES
+        ):
+            continue
+        body = receipt.receipt or {}
+        if not isinstance(body, Mapping):
+            continue
+        structured_result = body.get("structured_result")
+        if not isinstance(structured_result, Mapping):
+            continue
+        receipt_evidence = structured_result.get("evidence")
+        if not isinstance(receipt_evidence, list):
+            continue
+        for item in receipt_evidence:
+            if not isinstance(item, Mapping):
+                continue
+            key = evidence_key(item, allow_source_aliases=False)
+            if key is not None:
+                entries.add(key)
+    return frozenset(entries)
+
+
+async def _check_evidence_refs_against_receipts(
+    session: AsyncSession,
+    binding: ResidentAgentBinding,
+    evidence: tuple[CapabilityEvidenceRef, ...],
+) -> None:
+    """Reject any evidence ref not backed by a real inspection receipt for this turn.
+
+    Rolls back the session on exit so the caller's session is clean for
+    execute_fenced_db_operation, which opens its own independent transaction.
+    """
+    if not evidence:
+        return
+    try:
+        rows = (
+            await session.execute(
+                select(StrategicOperationReceipt).where(
+                    StrategicOperationReceipt.project_id == binding.project_id,
+                    StrategicOperationReceipt.turn_task_id == binding.task_id,
+                )
+            )
+        ).scalars().all()
+        trusted = _build_receipt_evidence_set(rows)
+        for ref in evidence:
+            if (ref.kind, ref.source_id, ref.revision, ref.checksum) not in trusted:
+                raise HTTPException(
+                    status_code=403,
+                    detail="capability evidence ref is not backed by a real inspection for this turn",
+                )
+    finally:
+        await session.rollback()
 
 MAX_CAPABILITY_REQUESTS_PER_TURN = 8
 _CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY = "_strategic_resident_capability_requests"
@@ -273,6 +346,7 @@ async def invoke_resident_mutation(
         expected_revisions=dict(body.expected_revisions),
         request_payload=dict(body.parameters),
     )
+    await _check_evidence_refs_against_receipts(session, binding, body.evidence)
     try:
         receipt = await execute_fenced_db_operation(session, fenced_request, callback)
     except OperationIdentityCollision as exc:
