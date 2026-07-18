@@ -33,6 +33,7 @@ from app.strategic_resident_turns import (
     coalesce_shadow_resident_turn,
 )
 from app.time_utils import _utcnow
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 async def _resident_project(db_session):
@@ -147,17 +148,27 @@ async def test_owner_health_endpoint_is_bounded_and_role_gated(client, db_sessio
 @pytest.mark.asyncio
 async def test_shadow_uses_all_user_high_water_and_requires_current_proof(db_session):
     project, resident = await _resident_project(db_session)
-    db_session.add(
-        ProjectMessage(
-            project_id=project.id,
-            sequence=7,
-            surface="conversation",
-            handling_state="responded",
-            from_type="user",
-            content="Please decide this.",
+    # A *handled* user conversation message whose sequence sits beyond the
+    # shadow's covered high-water (7 vs. handled 6). On Postgres the 0608 BEFORE
+    # INSERT trigger both re-allocates the sequence (ignoring the literal 7) and
+    # forces a fresh user message to handling_state='pending'; SQLite has neither
+    # trigger and keeps the authored values. Seed through
+    # ``seed_without_authority_enforcement`` so this setup-only starting state
+    # lands as authored on both dialects. The assertion under test — shadow
+    # backlog detection on an already-handled conversation — runs afterwards with
+    # enforcement restored.
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                sequence=7,
+                surface="conversation",
+                handling_state="responded",
+                from_type="user",
+                content="Please decide this.",
+            )
         )
-    )
-    await db_session.commit()
+        await db_session.commit()
     await _record_shadow_proof(
         db_session, project, resident, handled_sequence=6
     )
@@ -253,6 +264,9 @@ async def test_readiness_reuses_transition_pointer_lineage_preflight(db_session)
     assert cutover["cutover_ready"] is False
 
     resident.engine_owner = "strategic_resident"
+    # Ownership flips must advance the authority generation (Postgres
+    # trg_strategicresident_authority_monotonic); SQLite lacks the trigger.
+    resident.authority_generation += 1
     db_session.add(resident)
     await db_session.commit()
     rollback = await build_resident_rollout_health(db_session, project.id)
@@ -308,6 +322,9 @@ async def test_retirement_requires_healthy_soak_and_rollback_rehearsal(db_sessio
     project, resident = await _resident_project(db_session)
     now = _utcnow()
     resident.engine_owner = "strategic_resident"
+    # Ownership flips must advance the authority generation (Postgres
+    # trg_strategicresident_authority_monotonic); SQLite lacks the trigger.
+    resident.authority_generation += 1
     resident.health_status = "healthy"
     resident.last_healthy_at = now
     resident.rollout_state = {
@@ -332,6 +349,9 @@ async def test_retirement_fails_closed_before_real_seven_day_window(db_session):
     project, resident = await _resident_project(db_session)
     now = _utcnow()
     resident.engine_owner = "strategic_resident"
+    # Ownership flips must advance the authority generation (Postgres
+    # trg_strategicresident_authority_monotonic); SQLite lacks the trigger.
+    resident.authority_generation += 1
     resident.health_status = "healthy"
     resident.last_healthy_at = now
     resident.rollout_state = {
@@ -365,7 +385,16 @@ async def test_checkpoint_hash_integrity_and_bounded_shadow_projection(db_sessio
     checkpoint = await db_session.get(
         StrategicResidentCheckpoint, resident.current_checkpoint_id
     )
-    checkpoint.content_hash = "0" * 64
+    # Checkpoints are immutable in production (0611
+    # trg_strategicresidentcheckpoint_immutability), so forcing a corrupted
+    # content_hash to exercise the integrity check is a setup-only mutation the
+    # schema legitimately rejects. Relax enforcement for that single write; the
+    # integrity assertions below run with the trigger restored. SQLite has no
+    # such trigger, so this is a no-op there.
+    async with seed_without_authority_enforcement(db_session):
+        checkpoint.content_hash = "0" * 64
+        db_session.add(checkpoint)
+        await db_session.commit()
     tampered = await build_resident_rollout_health(db_session, project.id)
     assert tampered["checkpoint"]["integrity_valid"] is False
     assert "checkpoint_integrity_invalid" in tampered["cutover_blockers"]
@@ -376,6 +405,9 @@ async def test_utc_normalization_does_not_overstate_seven_day_soak(db_session):
     project, resident = await _resident_project(db_session)
     now = datetime(2026, 7, 18, 12, tzinfo=timezone.utc)
     resident.engine_owner = "strategic_resident"
+    # Ownership flips must advance the authority generation (Postgres
+    # trg_strategicresident_authority_monotonic); SQLite lacks the trigger.
+    resident.authority_generation += 1
     resident.health_status = "healthy"
     resident.last_healthy_at = now.replace(tzinfo=None)
     resident.rollout_state = {
@@ -398,6 +430,9 @@ async def test_malformed_rehearsal_and_soak_failures_are_visible(db_session):
     now = _utcnow()
     cutover_at = now - timedelta(days=8)
     resident.engine_owner = "strategic_resident"
+    # Ownership flips must advance the authority generation (Postgres
+    # trg_strategicresident_authority_monotonic); SQLite lacks the trigger.
+    resident.authority_generation += 1
     resident.health_status = "healthy"
     resident.last_healthy_at = now
     resident.last_error_at = now - timedelta(hours=2)

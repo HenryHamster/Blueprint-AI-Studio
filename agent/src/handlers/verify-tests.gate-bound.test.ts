@@ -25,6 +25,10 @@ vi.mock('../index.js', async (importOriginal) => {
 
 vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
+  listWorkspaceTopDirs: vi.fn().mockReturnValue([]),
+  resolveReferenceRepo: vi.fn().mockReturnValue(null),
+  getLastWorkspacePrepOutcome: vi.fn().mockReturnValue(null),
+  resetWorkspacePrepOutcome: vi.fn(),
 }));
 
 vi.mock('../build-config.js', () => ({

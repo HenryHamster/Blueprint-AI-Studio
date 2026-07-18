@@ -33,6 +33,7 @@ vi.mock('../strategicStateApi', async () => {
   },
   fetchStrategicState: vi.fn(),
   fetchStrategicLiveness: vi.fn(),
+  fetchResidentEngineHealth: vi.fn(),
   };
 });
 

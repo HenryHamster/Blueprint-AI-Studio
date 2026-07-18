@@ -20,14 +20,14 @@ describe('ToolResidentHandoffControls', () => {
     }
   });
 
-  test('announces busy and durable attachment completion', async () => {
+  test('announces busy and draft-queue completion', async () => {
     const onHandoff = vi.fn().mockResolvedValue(undefined);
     render(<ToolResidentHandoffControls toolLabel="Whiteboard" onHandoff={onHandoff} />);
 
     fireEvent.click(screen.getByRole('button', { name: 'Ask Resident' }));
 
     await waitFor(() => expect(screen.getByRole('status').textContent)
-      .toBe('Whiteboard revision attached to the Resident conversation.'));
+      .toBe('Whiteboard revision queued in your Resident message draft. Review and send it to share.'));
     expect(onHandoff).toHaveBeenCalledWith('ask', undefined);
   });
 
