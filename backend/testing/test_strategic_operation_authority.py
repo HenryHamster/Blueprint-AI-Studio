@@ -1412,6 +1412,80 @@ def _turn_token(project, turn_task):
     }
 
 
+def _task_cancel_invocation(project, turn_task, target):
+    from datetime import datetime, timezone
+
+    from app.strategic_resident_capability_invocation import (
+        CapabilityEvidenceRef,
+        ResidentCapabilityInvocation,
+    )
+
+    payload = turn_task.first_payload
+    return ResidentCapabilityInvocation.model_validate(
+        {
+            "capability_id": "task.cancel",
+            "project_id": project.id,
+            "turn_task_id": turn_task.id,
+            "authority_generation": 3,
+            "parameters": {"task_id": str(target.id), "reason": "held by strategy"},
+            "operation_id": "cancel-1",
+            "expected_revisions": {
+                "authority_generation": 3,
+                "active_turn_task_version": int(turn_task.version),
+                "current_checkpoint_id": payload.get("checkpoint_id"),
+                "resident_checkpoint_version": payload.get("checkpoint_version"),
+                "resident_checkpoint_hash": payload.get("checkpoint_hash"),
+            },
+            "evidence": (
+                CapabilityEvidenceRef(
+                    kind="task",
+                    project_id=project.id,
+                    source_id=str(target.id),
+                    revision="task:v1",
+                    checksum="e" * 64,
+                    inspected_at=datetime.now(timezone.utc),
+                ),
+            ),
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_runs_the_operator_path_end_to_end(authority_db, monkeypatch):
+    """task.cancel actually cancels the target task through modify_task_apply."""
+    from app.routers import agent_resident_capabilities as capability_router
+    from app import admin_task_mutations
+
+    # Neutralize only the out-of-process broadcast; the real status transition runs.
+    async def _noop_broadcast(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(admin_task_mutations, "broadcast_to_project", _noop_broadcast)
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(
+        project_id=project.id,
+        title="worker",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "plan"}],
+    )
+    authority_db.add(target)
+    await authority_db.commit()
+    await authority_db.refresh(target)
+
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        _task_cancel_invocation(project, turn_task, target),
+        session=authority_db,
+        token=_turn_token(project, turn_task),
+    )
+    assert result["status"] in ("reconciled", "failed")
+
+    await authority_db.refresh(target)
+    # The operator modify path actually cancelled the target task.
+    assert target.status == TaskStatus.CANCELLED
+
+
 @pytest.mark.asyncio
 async def test_reprioritize_endpoint_mutates_target_task_with_cas(authority_db):
     from app.routers import agent_resident_capabilities as capability_router

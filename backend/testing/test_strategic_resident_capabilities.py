@@ -799,6 +799,58 @@ async def test_mutation_route_rejects_body_authority_not_matching_token(monkeypa
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability", "expected_kind"),
+    [
+        ("task.cancel", "cancel_task"),
+        ("task.requeue", "requeue_task"),
+        ("task.retry", "retry_task"),
+        ("task.unblock", "unblock_task"),
+    ],
+)
+async def test_task_lifecycle_routes_through_the_external_executor(
+    monkeypatch, capability, expected_kind
+):
+    """cancel/requeue/retry/unblock run the operator modify path via the executor."""
+    project_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    receipt = SimpleNamespace(
+        operation_id="op-life", status="reconciled", id=uuid.uuid4()
+    )
+    external = AsyncMock(return_value=receipt)
+    monkeypatch.setattr(
+        capability_router, "execute_external_effect_operation", external
+    )
+    evidence_kind = {
+        "task.cancel": "task",
+        "task.requeue": "task",
+        "task.retry": "task_failure",
+        "task.unblock": "task_blocker",
+    }[capability]
+    params = {"task_id": str(uuid.uuid4())}
+    if capability == "task.cancel":
+        params["reason"] = "held by strategy"
+    invocation = _mutation_invocation(
+        project_id,
+        turn_id,
+        capability_id=capability,
+        parameters=params,
+        evidence=_evidence_of_kinds(project_id, evidence_kind),
+    )
+    result = await capability_router.invoke_resident_mutation(
+        None,
+        invocation,
+        session=SimpleNamespace(),
+        token=_mutation_token(project_id, turn_id),
+    )
+    assert result["status"] == "reconciled"
+    external.assert_awaited_once()
+    fenced_request = external.await_args.args[1]
+    assert fenced_request.capability == capability
+    assert fenced_request.operation_kind == expected_kind
+
+
+@pytest.mark.asyncio
 async def test_external_effect_pr_create_dispatches(monkeypatch):
     """A wired external effect (pr.create) routes to the external executor.
 
