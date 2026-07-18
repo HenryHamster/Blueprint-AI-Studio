@@ -125,7 +125,7 @@ _PARAMETER_SPECS: dict[str, CapabilityParameterSpec] = {
     "task_id": CapabilityParameterSpec(name="task_id", kind=CapabilityParameterKind.uuid),
     "version_id": CapabilityParameterSpec(name="version_id", kind=CapabilityParameterKind.uuid),
     "runner_id": CapabilityParameterSpec(
-        name="runner_id", kind=CapabilityParameterKind.ref, min_length=1, max_length=160
+        name="runner_id", kind=CapabilityParameterKind.uuid
     ),
     "pr_number": CapabilityParameterSpec(
         name="pr_number", kind=CapabilityParameterKind.integer, minimum=1, maximum=2**31 - 1
@@ -147,6 +147,9 @@ _PARAMETER_SPECS: dict[str, CapabilityParameterSpec] = {
     ),
     "title": CapabilityParameterSpec(
         name="title", kind=CapabilityParameterKind.string, min_length=1, max_length=500
+    ),
+    "prompt": CapabilityParameterSpec(
+        name="prompt", kind=CapabilityParameterKind.string, min_length=1, max_length=8_000
     ),
     "audit_kind": CapabilityParameterSpec(
         name="audit_kind", kind=CapabilityParameterKind.string, min_length=1, max_length=80
@@ -263,6 +266,10 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _mutate("task.salvage", "task_lifecycle", CapabilityRisk.high, ("task_id",), ("task", "branch")),
     _mutate("task.cleanup", "task_lifecycle", CapabilityRisk.high, ("task_id",), ("task", "lineage")),
     _mutate("task.review_fix_loop", "review_pipeline", CapabilityRisk.medium, ("task_id",), ("task", "pr_checks")),
+    _mutate("task.code_change.create", "resident_managed_task_create", CapabilityRisk.medium, ("title", "prompt"), ("task",)),
+    _mutate("task.debug.create", "resident_managed_task_create", CapabilityRisk.medium, ("task_id", "title", "prompt"), ("task",)),
+    _mutate("task.large_review.create", "resident_managed_task_create", CapabilityRisk.medium, ("title", "prompt", "pr_number"), ("pr_diff", "pr_check")),
+    _mutate("task.ci_repair.create", "resident_managed_task_create", CapabilityRisk.high, ("title", "prompt", "pr_number"), ("pr_check", "ci_logs")),
     _mutate("pr.create", "github_pulls", CapabilityRisk.medium, ("head", "base", "title"), ("branch",), reconciliation="external_effect_probe"),
     _mutate("pr.update", "github_pulls", CapabilityRisk.medium, ("pr_number",), ("pr",), reconciliation="external_effect_probe"),
     _mutate("pr.merge", "github_pulls", CapabilityRisk.critical, ("pr_number", "expected_head_sha"), ("pr", "pr_diff", "pr_check"), approval="explicit", reconciliation="external_effect_probe"),
@@ -292,12 +299,16 @@ INVOKABLE_CAPABILITY_IDS = frozenset(
         "task.logs.inspect",
         "task.failure.inspect",
         "task.provider.inspect",
+        "runner.inspect",
+        "runner.list",
         "strategy.running_update.set",
         "task.reprioritize",
         "task.retry",
         "task.requeue",
         "task.unblock",
         "task.cancel",
+        "task.code_change.create",
+        "task.debug.create",
     }
 )
 

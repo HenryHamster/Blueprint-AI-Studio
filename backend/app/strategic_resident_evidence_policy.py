@@ -21,6 +21,8 @@ EVIDENCE_KINDS = frozenset(
     {
         "task",
         "task_log",
+        "runner",
+        "runner_capacity",
         "pr",
         "pr_diff",
         "pr_check",
@@ -46,6 +48,7 @@ INSPECTION_CAPABILITY_KINDS = {
     "task.provider.inspect": "inspect_provider",
     "task.lineage.inspect": "inspect_task_lineage",
     "runner.inspect": "inspect_runner",
+    "runner.list": "inspect_runner_capacity",
     "pipeline.inspect": "inspect_pipeline",
     "qualification.inspect": "inspect_qualification",
     "pr.inspect": "inspect_pr",
@@ -66,6 +69,8 @@ INSPECTION_EVIDENCE_KIND_MAP = {
     "logs": "task_log",
     "failure": "task",
     "provider": "task",
+    "runner": "runner",
+    "runner_capacity": "runner_capacity",
 }
 
 

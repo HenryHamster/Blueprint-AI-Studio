@@ -457,6 +457,49 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
 
   let prefix = '';
 
+  // Exact human-tool revisions explicitly shared with the Resident and copied
+  // into a receipt-bound managed Task. Presence-gated for every other Task.
+  const managedSource = taskContext?._resident_managed_task as Record<string, unknown> | undefined;
+  if (managedSource && typeof managedSource === 'object') {
+    const refs = Array.isArray(managedSource.artifact_refs)
+      ? managedSource.artifact_refs as Array<Record<string, unknown>>
+      : [];
+    const sourceLines: string[] = ['## Resident Source Revisions'];
+    sourceLines.push(
+      'These are immutable, explicitly shared revisions from the frozen Resident turn. Retrieve and inspect the exact revision before relying on it.',
+    );
+    for (const ref of refs) {
+      const id = strVal(ref.artifact_ref_id) || strVal(ref.id);
+      const kind = strVal(ref.kind);
+      const revision = typeof ref.revision === 'number'
+        ? String(ref.revision)
+        : strVal(ref.revision);
+      const checksum = strVal(ref.checksum);
+      const retrieval = ref.retrieval as Record<string, unknown> | undefined;
+      const href = retrieval ? strVal(retrieval.href) : '';
+      if (!id) continue;
+      sourceLines.push(
+        `- ${kind || 'artifact'} ${id} revision ${revision || '?'} checksum ${checksum || '?'}${href ? ` — GET ${href}` : ''}`,
+      );
+    }
+    const evidence = Array.isArray(managedSource.evidence)
+      ? managedSource.evidence.slice(0, 8) as Array<Record<string, unknown>>
+      : [];
+    for (const item of evidence) {
+      const kind = strVal(item.kind);
+      const sourceId = strVal(item.source_id);
+      const revision = strVal(item.revision);
+      const checksum = strVal(item.checksum);
+      const inspectedAt = strVal(item.inspected_at);
+      if (!sourceId) continue;
+      sourceLines.push(
+        `- evidence ${kind || 'source'} ${sourceId} revision ${revision || '?'} checksum ${checksum || '?'}${inspectedAt ? ` inspected ${inspectedAt}` : ''}`,
+      );
+    }
+    sourceLines.push('');
+    prefix += sourceLines.join('\n') + '\n';
+  }
+
   // Project Vision — strategic "why" set by the strategic research agent.
   // Surfaced first so tactical agents can align their work to it.
   prefix += formatProjectVision(task.vision as Record<string, unknown> | undefined);

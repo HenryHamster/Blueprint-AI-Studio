@@ -2,14 +2,18 @@
 
 **Target:** `automain`
 
-**Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 has merged foundations,
-but a 2026-07-18 requirement-by-requirement audit reopened completion: the Agent
-mutation loop, exact evidence/approval execution, production cadence, and the
-invokable adapter set must converge before M4 is complete. M5 is in progress;
-live pilot rollout, rollback rehearsal, the seven-day soak, and legacy retirement
-remain operator- and calendar-gated after the code/test gates pass.
+**Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 remains in progress after
+its 2026-07-18 requirement-by-requirement audit. The authority/message hardening
+is merged, and the current completion milestone adds bounded runner inspection,
+managed code/debug Tasks, durable cycle/qualification cadence, and truthful
+pause/resume scheduling. PR/CI/deployment adapters, terminal Task producers,
+large-review/CI-repair Task contracts, and the remaining operational surface are
+still open. M5 is in progress; live pilot rollout, rollback rehearsal, the
+seven-day soak, and legacy retirement remain operator- and calendar-gated after
+the code/test gates pass.
 
-**Last refreshed:** 2026-07-18. M2a merged through PR `#15292` at merge commit
+**Last refreshed:** 2026-07-18. Authority/message hardening merged through PR
+`#15672` at merge commit `0be99f70e`. M2a merged through PR `#15292` at merge commit
 `7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
 migration, locking, latency, provider-boundary, and affected-suite review/fix
 loops converged. M3 adds typed operations and revision-safe human-tool handoff;
@@ -362,23 +366,39 @@ Implementation checklist:
   server-authored inspection receipts, keep uncertain external effects unsettled,
   preserve task lifecycle CAS, and prevent partial proposal drains from stranding
   their tail. Structured completion projections now cover every durable receipt
-  status, including crash-boundary `pending` and unknown external effects.
+  status, including crash-boundary `pending` and unknown external effects (PR
+  `#15672`).
+- [x] Add bounded project-scoped `runner.inspect` / `runner.list` adapters. They
+  project only required runner scalars plus the latest indexed heartbeat snapshot,
+  never full capabilities JSONB, credentials, task IDs, or unbounded arrays;
+  missing snapshots remain explicitly unknown.
+- [x] Add fenced managed `task.code_change.create` and `task.debug.create` paths
+  with receipt-bound global idempotency, exact debug target CAS/evidence, compact
+  ArtifactRef/evidence handoff, canonical inspection replay, and capability-bound
+  Task materialization. Human-tool writes remain unavailable.
+- [x] Add durable terminal StrategicCycle and immutable QualificationVerdict
+  producers. The reaper uses a restart-durable round-robin scan high-water,
+  index-backed latest-event probes, monotonic cursors, in-flight deduplication,
+  a 200-project scan cap, and a 32-wakeup burst cap. Pause/resume retains pending
+  changes, deadlines, retries, and truthful recovery state.
 - [ ] Implement and prove the remaining plan-required inspection and operation
   adapters. Catalog entries with no bounded adapter remain truthfully
   `propose_only`; that is a safe intermediate state, not M4 completion.
-- [ ] Wire meaningful StrategicCycle, task/pipeline, qualification, deployment,
-  and worker-proposal changes to the coalesced project-change lane while retaining
-  zero model calls for unchanged cursors.
-- [ ] Add managed-Task escalation for code editing, large review, open-ended
-  debugging, and repeated CI repair; keep human-tool writes fail-closed until the
-  exact revision/operation authority path exists.
+- [ ] Extend the coalesced project-change lane to terminal managed/ordinary Tasks
+  and revision-linked deployment outcomes. StrategicCycle, qualification, and
+  worker-proposal sources are live; activity-message noise remains excluded.
+- [ ] Add bounded PR/branch/check/log inspection, then enable managed large-review
+  and repeated-CI-repair Tasks with review/fix-specific payload contracts. Code
+  editing and open-ended debugging are live; human-tool writes stay fail-closed.
 
-Current hardening evidence: the combined backend gate is green (`204 passed`,
-`5 skipped`); the seven-status completion projection matrix is green (`44`
-focused capability tests); Agent Resident-turn tests are green (`13 passed`) with
-typecheck clean; the combined message/health UI gate is green (`448 passed`) with
-typecheck clean and zero scoped ESLint errors. Scoped Ruff, size, and diff checks
-are clean, and independent backend/Agent plus UI/health review/fix loops converged.
+Current hardening evidence: the combined Resident backend gate is green (`287
+passed`, `3 skipped`); the post-review authority/managed gate is green (`123
+passed`, `3 skipped`); cadence/runtime/schema invariants are green (`38 passed`);
+the managed/runner focused gate is green (`15 passed`); and Agent prompt tests are
+green (`74 passed`) with typecheck clean. The combined message/health UI gate
+remains green (`448 passed`) with typecheck clean and zero scoped ESLint errors.
+Scoped Ruff, schema-chain, size, and diff checks are clean; independent
+review/fix loops converged before publication.
 
 ### M5 — Rollout, legacy retirement, and release audit — in progress
 

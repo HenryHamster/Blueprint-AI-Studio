@@ -1725,8 +1725,19 @@ async def set_project_paused(
 
     project.paused = bool(payload["paused"])
     session.add(project)
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    wake = await sync_resident_background_policy(
+        session,
+        project_id=project.id,
+        paused=project.paused,
+        now=_utcnow(),
+    )
     await session.commit()
-    return {"paused": project.paused}
+    return {
+        "paused": project.paused,
+        "resident_wakeup_state": wake.state if wake is not None else None,
+    }
 
 
 @router.get("/task-types")

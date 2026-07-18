@@ -14,6 +14,8 @@ Identifier = str
 EvidenceKind = Literal[
     "task",
     "task_log",
+    "runner",
+    "runner_capacity",
     "pr",
     "pr_diff",
     "pr_check",

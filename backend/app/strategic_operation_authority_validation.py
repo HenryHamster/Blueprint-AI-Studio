@@ -262,6 +262,9 @@ class FencedTaskWriter:
             raise FencedOperationUsageError("task mutation plan is empty")
         return dict(self.__changes)
 
+    def has_changes(self) -> bool:
+        return bool(self.__changes)
+
     def _apply(self, task: Task) -> None:
         for field, value in self._validated_changes().items():
             setattr(task, field, value)
@@ -272,10 +275,12 @@ class FencedOperationContext:
     project_id: uuid.UUID
     turn_task_id: uuid.UUID
     receipt_id: uuid.UUID
+    operation_id: str
     authority_generation: int
     request_payload: Mapping[str, Any]
     observed_revisions: Mapping[str, Any]
     writer: FencedMutationWriter
+    managed_task_writer: Any
     # Present only when the request declares a ``target_task_id``.
     task_writer: FencedTaskWriter | None = None
 

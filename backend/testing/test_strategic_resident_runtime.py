@@ -9,6 +9,7 @@ import pytest
 import hashlib
 import json
 from fastapi import HTTPException
+from sqlmodel import select
 
 from app.models import (
     ArtifactRef,
@@ -946,6 +947,307 @@ async def test_signal_project_change_is_zero_call_when_cursor_already_handled(db
         is None
     )
     assert (await db_session.execute(_select(Task))).scalars().first() is None
+
+
+@pytest.mark.asyncio
+async def test_paused_project_change_is_preserved_and_queued_on_resume(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    resident.background_policy = "paused"
+    db_session.add(resident)
+    await db_session.flush()
+
+    suppressed = await coalesce_meaningful_background_wakeup(
+        db_session,
+        project_id=project.id,
+        trigger_kind="project_change",
+        project_change_cursor={"qualification_verdict_id": "verdict-9"},
+    )
+    assert suppressed is not None
+    assert suppressed.state == "paused"
+    assert suppressed.task_id is None
+    assert resident.scheduling_state["pending_project_change_cursor"] == {
+        "qualification_verdict_id": "verdict-9"
+    }
+
+    resumed = await sync_resident_background_policy(
+        db_session,
+        project_id=project.id,
+        paused=False,
+    )
+    assert resumed is not None
+    assert resumed.state == "queued"
+    assert resumed.task_id is not None
+    task = await db_session.get(Task, resumed.task_id)
+    assert task is not None
+    assert task.payloads[0]["project_change_cursor"] == {
+        "qualification_verdict_id": "verdict-9"
+    }
+    assert "pending_project_change_cursor" not in resident.scheduling_state
+
+
+@pytest.mark.asyncio
+async def test_pending_change_on_resume_preserves_exact_commitment(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    commitment_at = now + timedelta(hours=2)
+    cursor = {"qualification_verdict_id": "verdict-with-commitment"}
+    resident.background_policy = "paused"
+    resident.next_wakeup_at = None
+    resident.scheduling_state = {
+        "pending_project_change_cursor": cursor,
+        "paused_next_wakeup_at": commitment_at.isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    resumed = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert resumed is not None
+    assert resumed.state == "queued"
+    assert resumed.task_id is not None
+    assert resident.next_wakeup_at == commitment_at
+    assert "paused_next_wakeup_at" not in resident.scheduling_state
+
+
+@pytest.mark.asyncio
+async def test_resume_restores_overdue_deadline_without_model_call(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    resident.background_policy = "paused"
+    resident.next_wakeup_at = None
+    resident.scheduling_state = {
+        "deadline_at": (now - timedelta(minutes=5)).isoformat(),
+        "deadline_reason": "overdue_commitment",
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session,
+        project_id=project.id,
+        paused=False,
+        now=now,
+    )
+    assert wake is None
+    assert resident.background_policy == "active"
+    assert resident.next_wakeup_at == now
+    assert resident.active_turn_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_pause_resume_preserves_recovery_retry_schedule(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    retry_at = now + timedelta(minutes=9)
+    resident.next_wakeup_at = retry_at
+    resident.recovery_state = {
+        "status": "retrying",
+        "failure_category": "provider_transient",
+        "failure_count": 1,
+        "retry_limit": 3,
+        "unknown_operation_receipt_ids": [],
+        "updated_at": now.isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=True, now=now
+    )
+    assert resident.next_wakeup_at is None
+    assert resident.scheduling_state["paused_next_wakeup_at"] == retry_at.isoformat()
+
+    await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert resident.next_wakeup_at == retry_at
+    assert "paused_next_wakeup_at" not in resident.scheduling_state
+
+
+@pytest.mark.asyncio
+async def test_resume_reconstructs_retry_without_stored_wakeup(db_session):
+    from app.strategic_resident_failure_state import failure_backoff_seconds
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    resident.background_policy = "paused"
+    resident.next_wakeup_at = None
+    resident.scheduling_state = {}
+    resident.recovery_state = {
+        "status": "retrying",
+        "failure_category": "provider_transient",
+        "failure_count": 1,
+        "retry_limit": 3,
+        "unknown_operation_receipt_ids": [],
+        "updated_at": now.isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert wake is None
+    assert resident.next_wakeup_at == now + timedelta(
+        seconds=failure_backoff_seconds("provider_transient", 1)
+    )
+
+
+@pytest.mark.asyncio
+async def test_failure_during_pause_resumes_due_retry_and_health(db_session):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.strategic_resident_wakeups import (
+        sweep_due_authoritative_resident_wakeups,
+        sync_resident_background_policy,
+    )
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    resident.background_policy = "paused"
+    resident.health_status = "blocked"
+    resident.next_wakeup_at = None
+    resident.recovery_state = {
+        "status": "retrying",
+        "failure_category": "provider_transient",
+        "failure_count": 1,
+        "retry_limit": 3,
+        "unknown_operation_receipt_ids": [],
+        "updated_at": (now - timedelta(minutes=10)).isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert wake is None
+    assert resident.next_wakeup_at == now
+    assert resident.health_status == "recovering"
+    await db_session.commit()
+
+    assert await sweep_due_authoritative_resident_wakeups(
+        session_factory=async_sessionmaker(
+            bind=db_session.bind, expire_on_commit=False, autoflush=False
+        ),
+        now=now,
+        batch_size=10,
+    ) == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_recovery_block_returns_waiting_and_preserves_pending(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    cursor = {"strategic_cycle_terminal": "v2:00000000000000000001:a:completed"}
+    resident.background_policy = "paused"
+    resident.health_status = "blocked"
+    resident.recovery_state = {"unknown_operation_receipt_ids": ["unknown"]}
+    resident.scheduling_state = {
+        "pending_project_change_cursor": cursor,
+        "paused_next_wakeup_at": (now + timedelta(hours=1)).isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert wake is not None
+    assert wake.state == "waiting_for_capacity"
+    assert wake.task_id is None
+    assert resident.scheduling_state["pending_project_change_cursor"] == cursor
+    assert resident.next_wakeup_at == now + timedelta(hours=1)
+    assert resident.health_status == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_handled_pending_cursor_does_not_skip_deadline_restore(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    now = _utcnow()
+    deadline = now + timedelta(hours=1)
+    cursor = {"qualification_verdict": "verdict-10"}
+    resident.background_policy = "paused"
+    resident.handled_project_change_cursor = cursor
+    resident.scheduling_state = {
+        "pending_project_change_cursor": cursor,
+        "deadline_at": deadline.isoformat(),
+    }
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert wake is None
+    assert resident.next_wakeup_at == deadline
+    assert "pending_project_change_cursor" not in resident.scheduling_state
+
+
+@pytest.mark.asyncio
+async def test_recovery_block_preserves_project_change_for_later_turn(db_session):
+    project, resident = await _authoritative_project(db_session)
+    resident.recovery_state = {"unknown_operation_receipt_ids": [str(uuid.uuid4())]}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await coalesce_meaningful_background_wakeup(
+        db_session,
+        project_id=project.id,
+        trigger_kind="project_change",
+        project_change_cursor={"strategic_cycle_terminal": "cycle-12"},
+    )
+    assert wake is not None
+    assert wake.state == "waiting_for_capacity"
+    assert wake.task_id is None
+    assert resident.scheduling_state["pending_project_change_cursor"] == {
+        "strategic_cycle_terminal": "cycle-12"
+    }
+
+
+@pytest.mark.asyncio
+async def test_out_of_order_durable_signal_retains_newer_inflight_cursor(db_session):
+    project, resident = await _authoritative_project(db_session)
+    newer = "v2:00000000000000000020:newer:completed"
+    older = "v2:00000000000000000010:older:completed"
+
+    first = await coalesce_meaningful_background_wakeup(
+        db_session,
+        project_id=project.id,
+        trigger_kind="project_change",
+        project_change_cursor={"strategic_cycle_terminal": newer},
+    )
+    second = await coalesce_meaningful_background_wakeup(
+        db_session,
+        project_id=project.id,
+        trigger_kind="project_change",
+        project_change_cursor={"strategic_cycle_terminal": older},
+    )
+
+    assert first is not None and first.task_id is not None
+    assert second is None
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert len(tasks) == 1
+    assert tasks[0].first_payload["project_change_cursor"] == {
+        "strategic_cycle_terminal": newer
+    }
+    assert resident.background_successor_task_id is None
 
 
 @pytest.mark.asyncio

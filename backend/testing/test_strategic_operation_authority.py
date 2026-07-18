@@ -20,6 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlmodel import SQLModel, select
 
 from app.models import (
+    ArtifactRef,
     Project,
     StrategicOperationReceipt,
     StrategicResident,
@@ -27,7 +28,9 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.artifact_refs import RESIDENT_ARTIFACT_REF_GRANTS_KEY
 from app.strategic_operation_authority import (
+    AuthorityBoundaryMutation,
     AuthorityGenerationMismatch,
     ExpectedRevisionMismatch,
     FencedOperationRequest,
@@ -41,6 +44,8 @@ from app.strategic_operation_authority import (
     UnsupportedRevisionKey,
     execute_fenced_db_operation,
 )
+from app.strategic_resident_inspection_receipt import TURN_CONTEXT_HASH_KEY
+from app.strategic_resident_managed_task import managed_task_create_callback
 from testing._resident_seed import seed_without_authority_enforcement
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
@@ -1371,6 +1376,8 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
         "load_live_resident_agent_task_locked",
         AsyncMock(return_value=turn_task),
     )
+    inspector = AsyncMock(wraps=capability_router.inspect_project_task)
+    monkeypatch.setattr(capability_router, "inspect_project_task", inspector)
     token = {
         "sub": str(turn_task.id),
         "project_id": str(project.id),
@@ -1401,9 +1408,14 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
     assert receipt.receipt["structured_result"]["evidence"][0]["kind"] == "task_log"
 
     # Idempotent: the per-turn ledger dedups the same inspection -> one receipt.
-    await capability_router.invoke_resident_capability(
+    target.title = "changed after canonical inspection"
+    authority_db.add(target)
+    await authority_db.commit()
+    replay = await capability_router.invoke_resident_capability(
         None, body, session=authority_db, token=token
     )
+    assert replay == result
+    inspector.assert_awaited_once()
     receipts = (
         await authority_db.execute(select(StrategicOperationReceipt))
     ).scalars().all()
@@ -2133,3 +2145,377 @@ async def test_reprioritize_cannot_target_own_turn_task(authority_db):
             None, invocation, session=authority_db, token=_turn_token(project, turn_task)
         )
     assert exc.value.status_code == 409
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability_id", "task_type"),
+    [
+        ("task.code_change.create", "create"),
+        ("task.debug.create", "debug"),
+    ],
+)
+async def test_managed_task_create_is_atomic_replay_safe_and_source_bound(
+    authority_db,
+    capability_id,
+    task_type,
+):
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    artifact = ArtifactRef(
+        project_id=project.id,
+        tool_id=uuid.uuid4(),
+        kind="notes",
+        revision=7,
+        checksum="a" * 64,
+        content_snapshot={"text": "frozen source"},
+        retrieval_metadata={"capability": "project_tool_revision"},
+    )
+    authority_db.add(artifact)
+    debug_target = None
+    if task_type == "debug":
+        debug_target = Task(
+            project_id=project.id,
+            title="Failed managed source",
+            payloads=[{"type": "create", "prompt": "Original work"}],
+        )
+        authority_db.add(debug_target)
+    await authority_db.flush()
+    turn_task.context = {
+        **(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: "b" * 64,
+        RESIDENT_ARTIFACT_REF_GRANTS_KEY: [str(artifact.id)],
+    }
+    await authority_db.commit()
+    await authority_db.refresh(turn_task)
+    request = _request(
+        project,
+        turn_task,
+        operation_id=f"managed-{task_type}",
+        payload={
+            **({"task_id": str(debug_target.id)} if debug_target else {}),
+            "title": f"Managed {task_type}",
+            "prompt": "Do bounded work.",
+        },
+        expected=(
+            {"target_task_updated_at": debug_target.updated_at.isoformat()}
+            if debug_target
+            else None
+        ),
+    )
+    request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "operation_kind": "create_managed_task",
+            "capability": capability_id,
+            "risk": "medium",
+            "request_payload": {
+                **({"task_id": str(debug_target.id)} if debug_target else {}),
+                "title": f"Managed {task_type}",
+                "prompt": "Do bounded work.",
+                "_source_evidence": [
+                    {
+                        "kind": "task",
+                        "project_id": str(project.id),
+                        "source_id": (
+                            str(debug_target.id)
+                            if debug_target
+                            else "task:source"
+                        ),
+                        "revision": "revision-1",
+                        "checksum": "c" * 64,
+                        "inspected_at": "2026-07-18T00:00:00Z",
+                    }
+                ],
+            },
+            "target_task_id": debug_target.id if debug_target else None,
+        }
+    )
+    callback_calls = 0
+    adapter = managed_task_create_callback(capability_id)
+    assert adapter is not None
+
+    def mutate(context):
+        nonlocal callback_calls
+        callback_calls += 1
+        return adapter(context)
+
+    first = await execute_fenced_db_operation(authority_db, request, mutate)
+    replay = await execute_fenced_db_operation(authority_db, request, mutate)
+    rows = (
+        await authority_db.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.created_by == "STRATEGIC_AGENT",
+                Task.id != turn_task.id,
+            )
+        )
+    ).scalars().all()
+
+    assert replay.id == first.id
+    assert callback_calls == 1
+    assert len(rows) == 1
+    child = rows[0]
+    assert child.status == TaskStatus.QUEUED
+    assert child.parent_task_id is None
+    assert child.first_payload["type"] == task_type
+    lineage = child.context["_resident_managed_task"]
+    assert lineage["source_turn_task_id"] == str(turn_task.id)
+    assert lineage["receipt_id"] == str(first.id)
+    assert lineage["context_hash"] == "b" * 64
+    assert lineage["artifact_refs"][0]["revision"] == 7
+    assert lineage["artifact_refs"][0]["checksum"] == "a" * 64
+    assert lineage["evidence"][0]["source_id"] == (
+        str(debug_target.id) if debug_target else "task:source"
+    )
+    assert set(lineage["artifact_refs"][0]) == {
+        "artifact_ref_id",
+        "tool_id",
+        "kind",
+        "revision",
+        "checksum",
+        "author",
+        "timestamp",
+        "retrieval",
+    }
+    assert lineage["target_task_id"] == (
+        str(debug_target.id) if debug_target else None
+    )
+    assert child.context[RESIDENT_ARTIFACT_REF_GRANTS_KEY] == [str(artifact.id)]
+    assert child.idempotency_key == f"resident-receipt:{first.id}"
+    if task_type == "debug":
+        assert child.first_payload["failure_context"] == "Do bounded work."
+    assert first.receipt["structured_result"]["facts"][0]["task_id"] == str(
+        child.id
+    )
+    changed_evidence_request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "request_payload": {
+                **dict(request.request_payload),
+                "_source_evidence": [
+                    {
+                        **dict(request.request_payload["_source_evidence"][0]),
+                        "checksum": "e" * 64,
+                    }
+                ],
+            },
+        }
+    )
+    with pytest.raises(OperationIdentityCollision):
+        await execute_fenced_db_operation(
+            authority_db, changed_evidence_request, mutate
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_task_callback_cannot_escape_receipt_capability(authority_db):
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    request = _request(
+        project,
+        turn_task,
+        operation_id="managed-capability-mismatch",
+        payload={"title": "Unauthorized child", "prompt": "Must not run."},
+    )
+
+    with pytest.raises(
+        FencedOperationUsageError,
+        match="not authorized by the receipt capability",
+    ):
+        await execute_fenced_db_operation(
+            authority_db,
+            request,
+            managed_task_create_callback("task.code_change.create"),
+        )
+
+    tasks = (await authority_db.execute(select(Task))).scalars().all()
+    assert [task.id for task in tasks] == [turn_task.id]
+    receipts = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalars().all()
+    assert receipts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target_kind", ["foreign_project", "resident_turn"])
+async def test_managed_debug_rejects_invalid_target_scope(authority_db, target_kind):
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    if target_kind == "resident_turn":
+        target = turn_task
+    else:
+        foreign = Project(name="Foreign", user_id="operator")
+        authority_db.add(foreign)
+        await authority_db.flush()
+        target = Task(
+            project_id=foreign.id,
+            title="Foreign task",
+            payloads=[{"type": "create", "prompt": "foreign"}],
+        )
+        authority_db.add(target)
+        await authority_db.commit()
+    request = _request(
+        project,
+        turn_task,
+        operation_id=f"managed-debug-{target_kind}",
+        payload={
+            "task_id": str(target.id),
+            "title": "Debug target",
+            "prompt": "Diagnose it.",
+        },
+        expected={"target_task_updated_at": target.updated_at.isoformat()},
+    )
+    request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "operation_kind": "create_managed_task",
+            "capability": "task.debug.create",
+            "risk": "medium",
+            "target_task_id": target.id,
+        }
+    )
+    expected_error = (
+        AuthorityBoundaryMutation
+        if target_kind == "resident_turn"
+        else InactiveTurnAuthority
+    )
+    with pytest.raises(expected_error):
+        await execute_fenced_db_operation(
+            authority_db,
+            request,
+            managed_task_create_callback("task.debug.create"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_debug_requires_target_updated_at_cas(authority_db):
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    target = Task(
+        project_id=project.id,
+        title="Debug source",
+        payloads=[{"type": "create", "prompt": "source"}],
+    )
+    authority_db.add(target)
+    await authority_db.commit()
+    request = _request(
+        project,
+        turn_task,
+        operation_id="managed-debug-missing-target-cas",
+        payload={
+            "task_id": str(target.id),
+            "title": "Debug source",
+            "prompt": "Diagnose it.",
+        },
+    )
+    request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "operation_kind": "create_managed_task",
+            "capability": "task.debug.create",
+            "risk": "medium",
+            "target_task_id": target.id,
+        }
+    )
+    with pytest.raises(ExpectedRevisionMismatch, match="target_task_updated_at"):
+        await execute_fenced_db_operation(
+            authority_db,
+            request,
+            managed_task_create_callback("task.debug.create"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_task_same_operation_id_is_isolated_across_projects(
+    authority_db,
+):
+    rows = []
+    for index in range(2):
+        project, turn_task, _resident = await _authority_rows(authority_db)
+        turn_task.context = {
+            **(turn_task.context or {}),
+            TURN_CONTEXT_HASH_KEY: f"project-{index}-context",
+        }
+        await authority_db.commit()
+        await authority_db.refresh(turn_task)
+        request = _request(
+            project,
+            turn_task,
+            operation_id="same-operation-id",
+            payload={
+                "title": f"Project {index} task",
+                "prompt": "Implement bounded work.",
+            },
+        )
+        request = FencedOperationRequest(
+            **{
+                **request.__dict__,
+                "operation_kind": "create_managed_task",
+                "capability": "task.code_change.create",
+                "risk": "medium",
+            }
+        )
+        receipt = await execute_fenced_db_operation(
+            authority_db,
+            request,
+            managed_task_create_callback("task.code_change.create"),
+        )
+        child = (
+            await authority_db.execute(
+                select(Task).where(
+                    Task.project_id == project.id,
+                    Task.created_by == "STRATEGIC_AGENT",
+                    Task.id != turn_task.id,
+                )
+            )
+        ).scalar_one()
+        rows.append((receipt, child))
+
+    assert rows[0][0].operation_id == rows[1][0].operation_id
+    assert rows[0][1].idempotency_key != rows[1][1].idempotency_key
+    assert rows[0][1].idempotency_key == f"resident-receipt:{rows[0][0].id}"
+    assert rows[1][1].idempotency_key == f"resident-receipt:{rows[1][0].id}"
+
+
+@pytest.mark.asyncio
+async def test_managed_task_rejects_oversized_artifact_handoff(authority_db):
+    from app.strategic_resident_managed_task import MAX_MANAGED_TASK_ARTIFACT_REFS
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    artifacts = [
+        ArtifactRef(
+            project_id=project.id,
+            tool_id=uuid.uuid4(),
+            kind="notes",
+            revision=index,
+            checksum=hashlib.sha256(f"artifact-{index}".encode()).hexdigest(),
+            content_snapshot={"text": f"source {index}"},
+        )
+        for index in range(MAX_MANAGED_TASK_ARTIFACT_REFS + 1)
+    ]
+    authority_db.add_all(artifacts)
+    await authority_db.flush()
+    turn_task.context = {
+        **(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: "oversized-artifact-context",
+        RESIDENT_ARTIFACT_REF_GRANTS_KEY: [str(item.id) for item in artifacts],
+    }
+    await authority_db.commit()
+    await authority_db.refresh(turn_task)
+    request = _request(
+        project,
+        turn_task,
+        operation_id="managed-artifact-overflow",
+        payload={"title": "Too many sources", "prompt": "Keep bounded."},
+    )
+    request = FencedOperationRequest(
+        **{
+            **request.__dict__,
+            "operation_kind": "create_managed_task",
+            "capability": "task.code_change.create",
+            "risk": "medium",
+        }
+    )
+    with pytest.raises(FencedOperationUsageError, match="bounded handoff limit"):
+        await execute_fenced_db_operation(
+            authority_db,
+            request,
+            managed_task_create_callback("task.code_change.create"),
+        )
