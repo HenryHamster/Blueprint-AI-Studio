@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import github, release_version
+from app import github, pause_clock, release_version
 from app.database import AsyncSessionLocal
 from app.models import (
     DeploymentState,
@@ -2832,7 +2832,6 @@ async def _reconcile_if_promotion_pending_timed_out(
             except (ValueError, TypeError):
                 return False
 
-            age_seconds = (_utcnow() - enabled_at).total_seconds()
             cap_seconds = _promotion_pending_timeout_seconds()
             # A bare promotion CLAIM (``claiming`` + no ``pr_number``) is only
             # ever alive for promote()'s 30-120s I/O window; if it has aged past
@@ -2843,7 +2842,26 @@ async def _reconcile_if_promotion_pending_timed_out(
                 "pr_number"
             )
             if _is_bare_claim:
+                # A bare claim is promote()'s crashed I/O window, not a promotion
+                # waiting on pipeline progress — it will NOT self-heal on resume,
+                # so GC it on RAW age even while paused.
                 cap_seconds = min(cap_seconds, _PROMOTION_CLAIM_TIMEOUT_SECONDS)
+                age_seconds = (_utcnow() - enabled_at).total_seconds()
+            else:
+                # PAUSE-AWARE: an armed promotion waiting on CI/merge makes no
+                # progress while the pipeline is PAUSED. Counting pause time toward
+                # the 24h cap would knock the version back to stabilize and re-fire
+                # the whole qualify→promote triple for the pause's entire duration
+                # (the qualifier churn observed while paused). Subtract pause time
+                # via the shared pause_clock (the promotion_pending dict is armed at
+                # several sites with no cleanly-stampable baseline, so the open pause
+                # window is excluded; an optional ``pause_baseline``, if a future arm
+                # site stamps one, upgrades this to exact across closed windows).
+                # deploy_state=None → raw (unchanged legacy/test path).
+                _deploy_state = await session.get(DeploymentState, 1)
+                age_seconds = pause_clock.active_elapsed_seconds(
+                    _deploy_state, enabled_at, pending.get("pause_baseline")
+                )
             if age_seconds < cap_seconds:
                 return False
 

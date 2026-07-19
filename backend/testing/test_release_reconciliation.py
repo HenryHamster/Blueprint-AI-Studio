@@ -1264,6 +1264,154 @@ async def test_reconcile_fresh_promotion_claim_is_left_alone(db_session):
     assert version.last_qualification["promotion_pending"]["claiming"] is True
 
 
+@pytest.mark.asyncio
+async def test_reconcile_promotion_pending_spared_while_pipeline_paused(db_session):
+    """PAUSE-AWARE 24h promotion_pending backstop: an open-PR promotion whose raw
+    age exceeds the cap is NOT force-failed when the excess is pipeline-pause
+    time. While PAUSED the promotion PR's CI/merge cannot progress, so failing it
+    back to stabilize — which re-fires the whole qualify→promote triple, timing
+    out again against the newest candidate for the pause's duration — is a false
+    positive."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    # Armed 25h ago (1h past the 24h cap), but the pipeline has been PAUSED for
+    # 24h of that → ~1h of ACTIVE age, under the cap.
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+    ).isoformat()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/acme/widget/pull/99",
+            "auto_merge_enabled": True,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow()
+            - timedelta(seconds=_promotion_pending_timeout_seconds()),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert timed_out is False
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 99
+
+
+@pytest.mark.asyncio
+async def test_reconcile_promotion_bare_claim_gc_even_while_paused(db_session):
+    """The bare-claim GC path is deliberately NOT pause-aware: a claim orphaned by
+    a crashed promote() will not self-heal on resume, so it is cleared on RAW age
+    against the short claim bound even while the pipeline is PAUSED — otherwise a
+    crashed promotion would wedge the version out of re-qualification for the
+    entire pause. A long open pause here WOULD spare it if the bare-claim path
+    were (wrongly) pause-aware; it must be GC'd regardless."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_PROMOTION_CLAIM_TIMEOUT_SECONDS + 60)
+    ).isoformat()
+    assert _promotion_pending_timeout_seconds() > _PROMOTION_CLAIM_TIMEOUT_SECONDS + 60
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "claiming": True,
+            "candidate_sha": "abcd" * 10,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(seconds=_PROMOTION_CLAIM_TIMEOUT_SECONDS),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_claim_abandoned"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_promotion_pending_times_out_despite_brief_pause(db_session):
+    """MUTATION-PROOF companion to the pause-spare test: the pause-aware promotion
+    backstop must not become a blanket disable. An open-PR promotion 25h past
+    arming with only a 30-min pause still has ~24.5h of ACTIVE age above the 24h
+    cap and IS failed back to stabilize."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+    ).isoformat()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/acme/widget/pull/99",
+            "auto_merge_enabled": True,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(minutes=30),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_pending_timeout"
+
+
 # ===========================================================================
 # Incident 2026-06-09: not_promoted/ci_unresolved reconciliation net.
 #
