@@ -25,8 +25,13 @@ from app.reaper_sweeps import (
     VIEWABLE_ARTIFACT_RETENTION_DAYS,
     sweep_retire_viewable_artifacts,
 )
+from app.time_utils import _utcnow
 
-_NOW = datetime(2026, 7, 17, 12, 0, 0)
+# Anchor to the sweep's own live clock so _RECENT stays the intended distance
+# inside the retention window regardless of the real calendar date. A hardcoded
+# _NOW was a wall-clock time-bomb: once real time advanced past it, _RECENT fell
+# before the sweep's live cutoff and "recent" jobs were wrongly retired.
+_NOW = _utcnow()
 _OLD = _NOW - timedelta(days=VIEWABLE_ARTIFACT_RETENTION_DAYS + 1)
 _RECENT = _NOW - timedelta(days=VIEWABLE_ARTIFACT_RETENTION_DAYS - 1)
 

@@ -30529,6 +30529,17 @@ async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, 
         "app.github.create_tag",
         new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
     )
+    # The full maybe_finalize_qualification wrapper fires post-promote hooks that
+    # make real GitHub calls; stub them so the test does not hang to the 30s
+    # timeout on the network-isolated shard.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     # A genuinely separate "caller" session with UNRELATED uncommitted work —
     # this stands in for the task-completion handler's open transaction.

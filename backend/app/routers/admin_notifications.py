@@ -287,6 +287,31 @@ def _operator_visible_audience():
     return operator_visible_audience_filter(ProjectMessage.context)
 
 
+def _operator_signal_predicate():
+    """Rows the operator Messages panel must surface regardless of ``surface``.
+
+    Mirrors the categories the 0608 BEFORE-INSERT trigger promotes onto the
+    'conversation' surface for operator reasons — user-authored messages,
+    bug-class messages (FEEDBACK/BLOCKER/BUG_REPORT), and system NOTEs whose
+    event_type is high-signal — so they are re-admitted to the operator feed
+    after the trigger moves them off 'activity', without widening the feed to
+    generic conversation rows (e.g. strategic replies, which are NOT in this
+    set). The activity feed on SQLite (no trigger) keeps every such row on
+    'activity', so this predicate is a no-op there.
+    """
+    return or_(
+        ProjectMessage.from_type == "user",
+        ProjectMessage.message_type.in_(["FEEDBACK", "BLOCKER", "BUG_REPORT"]),
+        and_(
+            ProjectMessage.message_type == MessageType.NOTE,
+            ProjectMessage.from_type == "system",
+            ProjectMessage.context["event_type"]
+            .as_string()
+            .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+        ),
+    )
+
+
 # Reserved keys within MessagesNoisePrefs.prefs for temp-mutes and mute-window.
 # Prefixed with underscore to avoid collision with event-type visibility keys.
 _TEMP_MUTES_KEY = "_temp_mutes"
@@ -704,7 +729,10 @@ async def list_messages(
     user_pids = _user_project_ids(current_user["user_id"])
     filters = [
         ProjectMessage.project_id.in_(user_pids),
-        ProjectMessage.surface == MessageSurface.ACTIVITY,
+        or_(
+            ProjectMessage.surface == MessageSurface.ACTIVITY,
+            _operator_signal_predicate(),
+        ),
         _operator_visible_audience(),
     ]
     if project_id:
@@ -774,23 +802,15 @@ async def list_messages(
         # high. Clients should treat the returned list as "up to 100 most recent" rather
         # than a guaranteed-complete set.
         _HS_LIMIT = 100
+        # High-signal / operator-signal rows must be guaranteed regardless of
+        # surface: the 0608 trigger promotes them to 'conversation' on Postgres,
+        # so a surface==ACTIVITY filter here would evict the very rows this
+        # safety net exists to protect. _operator_signal_predicate() re-admits
+        # exactly the operator categories the trigger promotes.
         hs_filters = [
             ProjectMessage.project_id.in_(user_pids),
-            ProjectMessage.surface == MessageSurface.ACTIVITY,
             ProjectMessage.status == "open",
-            or_(
-                ProjectMessage.from_type == "user",
-                ProjectMessage.message_type.in_(
-                    ["FEEDBACK", "BLOCKER", "BUG_REPORT"]
-                ),
-                and_(
-                    ProjectMessage.message_type == MessageType.NOTE,
-                    ProjectMessage.from_type == "system",
-                    ProjectMessage.context["event_type"]
-                    .as_string()
-                    .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
-                ),
-            ),
+            _operator_signal_predicate(),
             _operator_visible_audience(),
             *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
         ]

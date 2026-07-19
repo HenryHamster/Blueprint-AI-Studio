@@ -36,6 +36,7 @@ from app.strategic_resident_message_locking import (
 from app.strategic_resident_session import RESIDENT_SESSION_KEY
 from app.strategic_trigger import ARMING_NOT_ARMED, ARMING_RESIDENT_SESSION
 from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 async def _project_with_resident(
@@ -54,9 +55,14 @@ async def _project_with_resident(
     await session.commit()
     await session.refresh(project)
     resident = await initialize_strategic_resident(session, project.id)
-    resident.engine_owner = engine_owner
-    session.add(resident)
-    await session.commit()
+    if engine_owner != "legacy":
+        async with seed_without_authority_enforcement(session):
+            resident.engine_owner = engine_owner
+            resident.authority_generation += 1
+            session.add(resident)
+            await session.commit()
+    else:
+        await session.commit()
     await session.refresh(project)
     await session.refresh(resident)
     return project, resident
@@ -269,6 +275,9 @@ async def test_strategic_owner_prelock_failure_rejects_before_message_insert(db_
 
     assert exc_info.value.status_code == 503
     await db_session.rollback()
+    # Postgres expires ORM attributes on rollback (the conftest _expire no-op is
+    # SQLite-only), so re-load project before reading project.id in the count query.
+    await db_session.refresh(project)
     assert (
         await db_session.scalar(
             select(func.count())
@@ -316,8 +325,9 @@ async def test_strategic_owner_shadow_failure_rolls_back_all_message_effects(
         expected_size_bytes=12,
         expires_at=_utcnow() + timedelta(minutes=15),
     )
-    db_session.add_all([question, upload])
-    await db_session.commit()
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add_all([question, upload])
+        await db_session.commit()
     await db_session.refresh(question)
 
     context = {
@@ -367,6 +377,10 @@ async def test_strategic_owner_shadow_failure_rolls_back_all_message_effects(
     assert exc_info.value.status_code == 503
     assert "was not accepted" in str(exc_info.value.detail)
     await db_session.rollback()
+    # Postgres expires ORM attributes on rollback (SQLite-only _expire no-op),
+    # so re-load every object read below — including project (project.id is used
+    # in the count queries).
+    await db_session.refresh(project)
     await db_session.refresh(question)
     await db_session.refresh(upload)
     assert question.status == "open"

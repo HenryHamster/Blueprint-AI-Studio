@@ -3836,6 +3836,10 @@ async def test_strategic_resolve_question_commit_failure_is_atomic(
             },
         )
 
+    # Snapshot project.id before the rollback: on Postgres the rollback expires
+    # ORM attributes (the conftest _expire no-op is SQLite-only), so reading
+    # project.id afterward triggers a sync lazy-load -> MissingGreenlet.
+    project_id = project.id
     await db_session.rollback()
     await db_session.refresh(msg)
     assert msg.status == "open"
@@ -3843,7 +3847,7 @@ async def test_strategic_resolve_question_commit_failure_is_atomic(
     notes = (
         await db_session.execute(
             select(ProjectMessage).where(
-                ProjectMessage.project_id == project.id,
+                ProjectMessage.project_id == project_id,
                 ProjectMessage.message_type == MessageType.NOTE,
             )
         )

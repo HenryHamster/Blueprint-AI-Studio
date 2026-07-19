@@ -1204,7 +1204,10 @@ async def test_in_progress_no_tool_use_non_anthropic_provider_reaped(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert t.status == TaskStatus.TIMED_OUT
+    # A reaped zero-progress task with attempt_count=0 is requeued for retry,
+    # not moved to a terminal status (TaskStatus has no TIMED_OUT member).
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
 
 
 @pytest.mark.asyncio

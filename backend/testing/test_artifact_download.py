@@ -703,7 +703,7 @@ async def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch,
     job.id = uuid.uuid4()
     job.backend = compute_backends.GCP_BACKEND_NAME
 
-    selected, dropped = await compute_backends._collect_viewable_artifact_candidates(job)
+    selected, dropped, _svg_count = await compute_backends._collect_viewable_artifact_candidates(job)
     assert len(selected) == 2
     assert dropped == 3
 
