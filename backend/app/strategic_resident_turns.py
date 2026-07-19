@@ -40,7 +40,7 @@ INPUT_FROZEN_CONTEXT_KEY = "_resident_input_frozen"
 Lane = Literal["interactive", "background"]
 
 _MONOTONIC_PROJECT_CURSOR_KEYS = frozenset(
-    {"managed_task_terminal", "qualification_verdict", "strategic_cycle_terminal"}
+    {"managed_task_terminal", "ordinary_task_terminal", "qualification_verdict", "strategic_cycle_terminal"}
 )
 _TERMINAL_TASK_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}

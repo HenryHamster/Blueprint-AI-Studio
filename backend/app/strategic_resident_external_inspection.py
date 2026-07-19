@@ -9,6 +9,7 @@ read.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import uuid
@@ -50,7 +51,14 @@ from app.strategic_resident_task_inspection import MAX_EVIDENCE_RESPONSE_BYTES
 from app.time_utils import _utcnow
 
 
-EXTERNAL_INSPECTION_LEASE_SECONDS = 30
+# The wall-clock budget covers the complete adapter-owned perform phase, including
+# credential discovery and every bounded external read. Reclaim remains later
+# than that deadline so a legal in-flight attempt cannot be superseded merely
+# because its sequential reads outlive one request timeout.
+EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS = 60
+EXTERNAL_INSPECTION_LEASE_SECONDS = 90
+if EXTERNAL_INSPECTION_LEASE_SECONDS <= EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS:
+    raise RuntimeError("external inspection lease must exceed its total timeout")
 MAX_EXTERNAL_INSPECTION_PLAN_BYTES = 8_192
 INSPECTION_PLAN_HASH_KEY = "_inspection_plan_hash"
 
@@ -168,7 +176,9 @@ def _bind_plan_to_context(
     )
 
 
-def _citable_bounded_evidence(evidence: InspectionEvidence) -> tuple[dict[str, Any], dict[str, Any]]:
+def _citable_bounded_evidence(
+    evidence: InspectionEvidence,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     try:
         evidence_json = evidence.model_dump(mode="json")
         citable = citable_inspection_evidence(evidence_json)
@@ -384,9 +394,7 @@ async def execute_external_inspection(
         fingerprint = request_fingerprint(
             capability_id,
             parameters,
-            authority_scope_hash=str(
-                plan.expected_revisions[INSPECTION_PLAN_HASH_KEY]
-            ),
+            authority_scope_hash=str(plan.expected_revisions[INSPECTION_PLAN_HASH_KEY]),
         )
         request_registered = register_capability_request(
             task,
@@ -394,11 +402,13 @@ async def execute_external_inspection(
         )
         attempt = ""
         existing_receipt = await session.scalar(
-            select(StrategicOperationReceipt).where(
+            select(StrategicOperationReceipt)
+            .where(
                 StrategicOperationReceipt.project_id == task.project_id,
                 StrategicOperationReceipt.operation_id
                 == inspection_operation_id(task.id, fingerprint),
-            ).execution_options(populate_existing=True)
+            )
+            .execution_options(populate_existing=True)
         )
         if request_registered:
             if existing_receipt is not None:
@@ -469,7 +479,22 @@ async def execute_external_inspection(
 
     try:
         perform_plan = _detached_plan(plan)
-        evidence = await perform(perform_plan)
+        async with asyncio.timeout(EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS):
+            evidence = await perform(perform_plan)
+    except TimeoutError as exc:
+        await _release_failed_attempt(
+            session,
+            binding=binding,
+            capability_id=capability_id,
+            fingerprint=fingerprint,
+            context_hash=context_hash,
+            expected_revisions=plan.expected_revisions,
+            attempt_id=attempt,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="external inspection exceeded its total time limit",
+        ) from exc
     except Exception:
         await _release_failed_attempt(
             session,
@@ -603,6 +628,7 @@ async def execute_external_inspection(
 
 __all__ = [
     "EXTERNAL_INSPECTION_LEASE_SECONDS",
+    "EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS",
     "INSPECTION_PLAN_HASH_KEY",
     "MAX_EXTERNAL_INSPECTION_PLAN_BYTES",
     "ExternalInspectionPlan",

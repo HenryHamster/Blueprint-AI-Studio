@@ -38,7 +38,26 @@ def test_only_bounded_create_and_debug_managed_tasks_are_invokable():
             if capability_id == "task.debug.create"
             else ("title", "prompt")
         )
-        assert spec.evidence_preconditions == ("task",)
+        assert spec.evidence_preconditions == (
+            () if capability_id == "task.code_change.create" else ("task",)
+        )
+
+
+def test_fresh_code_change_uses_frozen_turn_lineage_without_fake_task_evidence():
+    import uuid
+
+    invocation = ResidentCapabilityInvocation(
+        capability_id="task.code_change.create",
+        project_id=uuid.uuid4(),
+        turn_task_id=uuid.uuid4(),
+        authority_generation=1,
+        parameters={"title": "Bounded change", "prompt": "Implement the request."},
+        operation_id="op-fresh-code-change",
+        expected_revisions={"context_hash": "a" * 64},
+        evidence=(),
+    )
+
+    assert invocation.evidence == ()
 
 
 def test_managed_task_writer_is_single_use_and_deterministic():

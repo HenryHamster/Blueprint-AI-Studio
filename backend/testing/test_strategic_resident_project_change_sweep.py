@@ -454,18 +454,21 @@ async def test_managed_terminal_events_are_ordered_and_exclude_unmanaged_tasks(
     resident_turn = Task(
         project_id=project.id,
         title="Must not feed itself",
+        created_by="ORCHESTRATOR",
         payloads=[{"type": "strategic_resident_turn"}],
         status=TaskStatus.COMPLETED,
     )
     unrelated = Task(
         project_id=project.id,
         title="Unrelated system Task",
+        created_by="ORCHESTRATOR",
         payloads=[{"type": "fix"}],
         status=TaskStatus.COMPLETED,
     )
     spoofed = Task(
         project_id=project.id,
         title="Spoofed marker",
+        created_by="ORCHESTRATOR",
         payloads=[{"type": "fix"}],
         context={"_resident_managed_task": {"source_turn_task_id": "turn"}},
         status=TaskStatus.FAILED,

@@ -14,6 +14,7 @@ from app.models import (
     QualificationVerdict,
     StrategicCycle,
     StrategicResident,
+    StrategicResidentOrdinaryTaskTerminalEvent,
     StrategicResidentSweepState,
     StrategicResidentTaskTerminalEvent,
 )
@@ -166,6 +167,35 @@ def _resident_event_statement() -> Any:
             ),
         )
     )
+    ordinary_filters = (
+        StrategicResidentOrdinaryTaskTerminalEvent.project_id
+        == StrategicResident.project_id,
+    )
+    ordinary_order = (
+        StrategicResidentOrdinaryTaskTerminalEvent.sequence.desc(),
+    )
+    columns.extend(
+        (
+            _latest_scalar(
+                StrategicResidentOrdinaryTaskTerminalEvent.sequence,
+                filters=ordinary_filters,
+                order_by=ordinary_order,
+                label="ordinary_task_terminal_sequence",
+            ),
+            _latest_scalar(
+                StrategicResidentOrdinaryTaskTerminalEvent.task_id,
+                filters=ordinary_filters,
+                order_by=ordinary_order,
+                label="ordinary_task_terminal_task_id",
+            ),
+            _latest_scalar(
+                StrategicResidentOrdinaryTaskTerminalEvent.event_kind,
+                filters=ordinary_filters,
+                order_by=ordinary_order,
+                label="ordinary_task_terminal_status",
+            ),
+        )
+    )
     return select(*columns).where(
         StrategicResident.engine_owner == "strategic_resident",
         StrategicResident.background_policy == "active",
@@ -266,8 +296,10 @@ async def sweep_durable_project_change_wakeups(
     their durable rows and are discovered after activation instead of losing the
     event. Managed Task terminal transitions come from an append-only,
     sequence-ordered ledger; its write-time lineage gate structurally excludes
-    Resident turn Tasks and unrelated pipeline work. At most 32 projects are
-    signalled per sweep even when every source is busy.
+    Resident turn Tasks and unrelated pipeline work. Ordinary Task outcomes
+    admit only operator-authored roots, excluding pipeline children and every
+    Resident-authored Task. At most 32 projects are signalled per sweep even
+    when every source is busy.
     """
 
     # This is a model-call capacity boundary, not only a caller default. Keep
@@ -318,6 +350,12 @@ async def sweep_durable_project_change_wakeups(
                 f"v2:{int(row.managed_task_terminal_sequence):020d}:"
                 f"{row.managed_task_terminal_task_id}:"
                 f"{row.managed_task_terminal_status}"
+            )
+        if row.ordinary_task_terminal_sequence is not None:
+            candidate_cursor["ordinary_task_terminal"] = (
+                f"v2:{int(row.ordinary_task_terminal_sequence):020d}:"
+                f"{row.ordinary_task_terminal_task_id}:"
+                f"{row.ordinary_task_terminal_status}"
             )
         represented = _merge_project_change_cursor({}, handled)
         advanced = _merge_project_change_cursor(represented, candidate_cursor)

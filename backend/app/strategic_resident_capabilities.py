@@ -172,6 +172,12 @@ _PARAMETER_SPECS: dict[str, CapabilityParameterSpec] = {
         min_length=7,
         max_length=64,
     ),
+    "head_sha": CapabilityParameterSpec(
+        name="head_sha",
+        kind=CapabilityParameterKind.ref,
+        min_length=40,
+        max_length=64,
+    ),
 }
 
 
@@ -238,7 +244,7 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _inspect("qualification.inspect", "qualification_state_resolver"),
     _inspect("pr.inspect", "github_pulls", "pr_number"),
     _inspect("pr.diff.inspect", "github_pulls", "pr_number"),
-    _inspect("pr.checks.inspect", "github_checks", "pr_number"),
+    _inspect("pr.checks.inspect", "github_checks", "pr_number", "head_sha"),
     _inspect("pr.reviews.inspect", "github_pulls", "pr_number"),
     _inspect("pr.comments.inspect", "github", "pr_number"),
     _inspect("pr.mergeability.inspect", "github_pulls", "pr_number"),
@@ -266,7 +272,10 @@ RESIDENT_CAPABILITIES: tuple[CapabilitySpec, ...] = (
     _mutate("task.salvage", "task_lifecycle", CapabilityRisk.high, ("task_id",), ("task", "branch")),
     _mutate("task.cleanup", "task_lifecycle", CapabilityRisk.high, ("task_id",), ("task", "lineage")),
     _mutate("task.review_fix_loop", "review_pipeline", CapabilityRisk.medium, ("task_id",), ("task", "pr_checks")),
-    _mutate("task.code_change.create", "resident_managed_task_create", CapabilityRisk.medium, ("title", "prompt"), ("task",)),
+    # A fresh code change may originate directly from the frozen operator turn
+    # and its revisioned ArtifactRefs; requiring an unrelated task inspection
+    # creates fake provenance. Authority/context/receipt lineage remains exact.
+    _mutate("task.code_change.create", "resident_managed_task_create", CapabilityRisk.medium, ("title", "prompt"), ()),
     _mutate("task.debug.create", "resident_managed_task_create", CapabilityRisk.medium, ("task_id", "title", "prompt"), ("task",)),
     _mutate("task.large_review.create", "resident_managed_task_create", CapabilityRisk.medium, ("title", "prompt", "pr_number"), ("pr_diff", "pr_check")),
     _mutate("task.ci_repair.create", "resident_managed_task_create", CapabilityRisk.high, ("title", "prompt", "pr_number"), ("pr_check", "ci_logs")),
@@ -302,6 +311,8 @@ INVOKABLE_CAPABILITY_IDS = frozenset(
         "runner.inspect",
         "runner.list",
         "pr.inspect",
+        "pr.diff.inspect",
+        "pr.checks.inspect",
         "strategy.running_update.set",
         "task.reprioritize",
         "task.retry",

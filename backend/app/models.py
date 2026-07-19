@@ -68,6 +68,10 @@ from app.strategic_resident_models import (  # noqa: F401
 from app.strategic_resident_sweep_models import (  # noqa: F401
     StrategicResidentSweepState,
 )
+from app.strategic_resident_ordinary_task_events import (  # noqa: F401
+    StrategicResidentOrdinaryTaskTerminalEvent,
+    register_sqlite_ordinary_task_terminal_listener,
+)
 from app.strategic_resident_task_terminal_events import (  # noqa: F401
     StrategicResidentTaskTerminalEvent,
     register_sqlite_terminal_event_listener,
@@ -2862,6 +2866,7 @@ class TaskHistory(SQLModel, table=True):
 
 
 register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
+register_sqlite_ordinary_task_terminal_listener(Task)
 
 
 # Auto-append to status_log whenever latest_status_message is set

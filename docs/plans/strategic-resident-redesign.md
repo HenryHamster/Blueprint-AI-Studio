@@ -4,18 +4,19 @@
 
 **Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 remains in progress after
 its 2026-07-18 requirement-by-requirement audit. Authority/message hardening and
-the runner/managed-Task/cadence milestone are merged. The current completion
-milestone adds receipt-backed terminal managed-Task wakeups and bounded,
-lock-free `pr.inspect`. Ordinary-Task/deployment outcome producers and the
-remaining PR/CI/deployment adapters,
-large-review/CI-repair Task contracts, and the remaining operational surface are
-still open. M5 is in progress; live pilot rollout, rollback rehearsal, the
+the runner/managed-Task/cadence milestone are merged. The terminal managed-Task
+outcome and lock-free `pr.inspect` milestone is also merged. M4 now closes on
+the launch-critical ordinary-Task outcome and its final gates/publication;
+broad native inspection and operator-action coverage is explicitly deferred to
+M4X. M5 is in progress; live pilot rollout, rollback rehearsal, the
 seven-day soak, and legacy retirement remain operator- and calendar-gated after
 the code/test gates pass.
 
 **Last refreshed:** 2026-07-18. Authority/message hardening merged through PR
 `#15672` at merge commit `0be99f70e`; the runner/managed-Task/cadence milestone
-merged through PR `#15676` at merge commit `892dfacc3`. M2a merged through PR
+merged through PR `#15676` at merge commit `892dfacc3`; terminal managed-Task
+outcomes and bounded `pr.inspect` merged through PR `#15678` at merge commit
+`87580957c`. M2a merged through PR
 `#15292` at merge commit `7b9b8c80b`. M2b merged through PR `#15486` at merge
 commit `3d3689e65` after
 migration, locking, latency, provider-boundary, and affected-suite review/fix
@@ -319,13 +320,14 @@ Pre-rebase evidence:
   maintainability review/fix iterations converged with no actionable findings;
   scoped Ruff, TypeScript, ESLint, Terraform formatting, and diff checks are clean.
 
-### M4 — Fenced operations, strategic memory, and cadence — in progress
+### M4 — Launch-critical operations, strategic memory, and cadence — in progress
 
 - Route authorized mutations through operation IDs, expected revisions, authority
   generations, evidence preconditions, approvals, durable receipts, and explicit
   unknown-effect reconciliation.
-- Add direct bounded adapters for safe operations and managed-Task escalation for
-  code editing, large review, open-ended debugging, and repeated CI repair.
+- Keep direct Resident actions deliberately narrow for launch. Reuse existing
+  operator services and managed code/debug Tasks; unavailable native actions stay
+  truthfully `propose_only` instead of blocking rollout.
 - Reconstruct interactive/background turns independently from charter, working
   strategy, active mission, conversation cursors, and retrieved evidence.
 - Admit worker memory proposals only through Resident reconciliation; preserve
@@ -384,9 +386,9 @@ Implementation checklist:
   index-backed latest-event probes, monotonic cursors, in-flight deduplication,
   a 200-project scan cap, and a 32-wakeup burst cap. Pause/resume retains pending
   changes, deadlines, retries, and truthful recovery state.
-- [ ] Implement and prove the remaining plan-required inspection and operation
-  adapters. Catalog entries with no bounded adapter remain truthfully
-  `propose_only`; that is a safe intermediate state, not M4 completion.
+- [x] Freeze unavailable native inspection and mutation adapters as truthful
+  `propose_only` entries. Full catalog coverage is no longer an M4 launch gate;
+  it moves to the explicitly deferred M4X milestone below.
 - [x] Extend the coalesced project-change lane to terminal Resident-managed Tasks.
   A receipt/project/turn/capability-fenced database trigger writes append-only,
   sequence-ordered outcomes in the Task transaction. The indexed sweep preserves
@@ -396,20 +398,19 @@ Implementation checklist:
   locks before GitHub I/O, then re-locks and revalidates the turn, repository, and
   attempt-owned receipt lease before settlement. Exact refs/SHAs/repository,
   canonical replay, crash reclaim, and 4.8/5.5KB evidence bounds are enforced.
-- [ ] Add carefully admission-filtered ordinary-Task and revision-linked
-  deployment outcome producers, plus the remaining bounded PR
-  diff/check/review/comment, branch, CI-run, and streamed-log inspections.
-  Then enable managed large-review (using the bounded panel-review handler) and
-  repeated-CI-repair Tasks with exact-head CAS, correlated evidence, and
-  return-to-Resident completion contracts. Code
-  editing and open-ended debugging are live; human-tool writes stay fail-closed.
+- [x] Close the launch tranche with carefully admission-filtered ordinary-Task
+  terminal outcomes, bounded PR diff/check inspections, and
+  converged independent review/fix and authority/migration/latency gates.
+  Managed code editing and open-ended debugging are live; human-tool writes and
+  high-impact operator actions stay fail-closed.
 
 Current hardening evidence: the prior combined Resident backend gate is green
 (`287 passed`, `3 skipped`). For the current milestone, the combined affected
-Resident gate is green (`269 passed`, `3 skipped`), the dedicated-credential and
-PR inspection gate is green (`48 passed`, `3 deselected`), and schema/model
-migration invariants are green (`3 passed`). The terminal outbox gate is green
-(`14 passed`) and its SQLite upgrade/downgrade smoke passed. Slow GitHub
+Resident gate is green (`273 passed`, `3 skipped`), the bounded PR
+diff/check gate is green (`39 passed`), and schema/model migration invariants
+are green (`3 passed`). The ordinary-Task terminal producer gates are green
+(`19 passed`, plus `6` final migration/rollback cases and `2` monotonic
+cursor regressions). Slow GitHub
 credential discovery releases the inspector's clean dedicated database session
 before App discovery, fallback minting, Secret Manager, or PR I/O. The prior
 post-review authority/managed
@@ -419,6 +420,24 @@ green (`74 passed`) with typecheck clean. The combined message/health UI gate
 remains green (`448 passed`) with typecheck clean and zero scoped ESLint errors.
 Scoped Ruff, schema-chain, size, and diff checks are clean; independent
 review/fix loops converged before publication.
+
+### M4X — Post-launch native capability expansion — deferred
+
+These are useful ergonomic improvements, not launch blockers. Until implemented,
+the Resident proposes the action, delegates bounded work through managed Tasks,
+or leaves execution to the existing operator surface. Deferral never grants
+ambient shell access, unrestricted credentials, or broader mutation authority.
+
+- Thin fenced wrappers around existing operator actions: dispatch, redirect,
+  park, salvage, cleanup, review/fix loops, PR create/update/merge, qualification,
+  audits, deploy, redeploy, and rollback.
+- Additional specialized reads: pipeline, qualification, PR
+  reviews/comments/mergeability, branch state, CI runs/streamed logs, and
+  deployment inspection.
+- Native managed `panel_review` and repeated CI-repair contracts with exact-head
+  CAS, correlated evidence, and return-to-Resident completion.
+- Revision-linked deployment outcome wakeups and any direct operational action
+  justified by real pilot usage rather than catalog completeness.
 
 ### M5 — Rollout, legacy retirement, and release audit — in progress
 

@@ -90,6 +90,14 @@ from app.strategic_resident_pr_inspection import (
     inspect_project_pr,
     invoke_pr_inspection,
 )
+from app.strategic_resident_pr_diff_inspection import (
+    inspect_project_pr_diff,
+    invoke_pr_diff_inspection,
+)
+from app.strategic_resident_pr_checks_inspection import (
+    inspect_project_pr_checks,
+    invoke_pr_checks_inspection,
+)
 from app.strategic_resident_runner_inspection import (
     ResidentRunnerNotFound,
     inspect_project_runner,
@@ -346,7 +354,24 @@ async def invoke_resident_capability(
             parameters=parameters,
             inspector=inspect_project_pr,
         )
-    if spec.service not in {"resident_task_inspection", "admin_runners"}:
+    if body.capability_id == "pr.diff.inspect":
+        return await invoke_pr_diff_inspection(
+            session,
+            binding=binding,
+            parameters=parameters,
+            inspector=inspect_project_pr_diff,
+        )
+    if body.capability_id == "pr.checks.inspect":
+        return await invoke_pr_checks_inspection(
+            session,
+            binding=binding,
+            parameters=parameters,
+            inspector=inspect_project_pr_checks,
+        )
+    if spec.service not in {
+        "resident_task_inspection",
+        "admin_runners",
+    }:
         raise HTTPException(
             status_code=501,
             detail="capability is declared but has no bounded adapter",
