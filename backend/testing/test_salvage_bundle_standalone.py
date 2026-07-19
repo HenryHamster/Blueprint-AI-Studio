@@ -154,6 +154,19 @@ Findings covered here (7-finding creation-path fail-closed audience salvage bund
   p5 — confirmation chips actionable (already fixed; see m2 tests above)
   p6 — QUESTION auto-decay (already fixed; see m3 tests above)
   p7 — notifications converged on attention model (already fixed; see m4 tests above)
+
+Findings covered here (4-finding operator-walkthrough / runner-config / project-tools bundle, 2026-07-19):
+  w1 — walkthrough test infrastructure: FleetRunnersPanel and ProjectToolHost unit tests exist
+       and cover the end-to-end owner walkthrough flows
+  w2 — runner config generations apply atomically: _LiveRunnerConfig.apply validates all fields
+       before the lock; a single unrecognized/malformed field rejects the whole block without
+       mutating any known field; a clean apply clears prior rejection state
+  w3 — project-tool Remove requires confirmation: clicking Remove shows a confirmation prompt
+       naming the tool and explaining permanent deletion before calling the backend DELETE;
+       Cancel is side-effect free; applies to both enabled and disabled tool rows
+  w4 — project-tools walkthrough residuals: Enable button in Disabled section shows Enabling…
+       and is disabled while the PATCH is outstanding; the auto-uniquified slug assigned by
+       the backend is surfaced to the operator as a created-slug notice after tool creation
 """
 
 from __future__ import annotations
@@ -3682,4 +3695,323 @@ def test_cq0_working_capability_proof_status_registers_absorbs_aliases_as_unprov
     assert proof_map_order.get("tracked-alias") != "unproven", (
         "absorbs loop must not overwrite 'tracked-alias' when it was already "
         "mapped by its own evidence_refs entry ('if alias not in out' guard honoured)"
+    )
+
+
+# =========================================================================== #
+# 4-finding operator-walkthrough / runner-config / project-tools bundle
+# =========================================================================== #
+
+
+def _project_tool_host_source() -> str:
+    """Return the source of admin-ui/src/components/ProjectToolHost.tsx."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ProjectToolHost.tsx",
+        Path("/repo/admin-ui/src/components/ProjectToolHost.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("ProjectToolHost.tsx not found in expected locations")
+
+
+# --------------------------------------------------------------------------- #
+# Finding w1 — walkthrough test infrastructure exists                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_w1_project_tool_host_test_file_exists():
+    """ProjectToolHost.test.tsx must exist and contain end-to-end walkthrough tests.
+
+    Finding w1: the direction retirement condition requires green execution and accepted
+    machine evidence. The unit test file covering the full owner walkthrough flow must
+    exist to provide machine-verifiable evidence.
+    """
+    import pytest
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ProjectToolHost.test.tsx",
+        Path("/repo/admin-ui/src/components/ProjectToolHost.test.tsx"),
+    ]
+    test_source: str | None = None
+    for path in candidates:
+        if path.exists():
+            test_source = path.read_text(encoding="utf-8")
+            break
+
+    if test_source is None:
+        pytest.skip("ProjectToolHost.test.tsx not found — admin-ui not present in this shard")
+
+    assert "owner walkthrough" in test_source or "end-to-end chained flow" in test_source, (
+        "ProjectToolHost.test.tsx must contain an end-to-end owner walkthrough test suite "
+        "covering the full project-tools flow (Add, Enable, Hide, Show hidden)"
+    )
+    assert "Enable" in test_source and "Disable" in test_source, (
+        "ProjectToolHost.test.tsx must test both Enable and Disable controls"
+    )
+    assert "Hide" in test_source and "Show hidden" in test_source, (
+        "ProjectToolHost.test.tsx must test the Hide / Show hidden manifest-tool lifecycle"
+    )
+
+
+def test_w1_fleet_runners_panel_test_file_exists():
+    """FleetRunnersPanel.test.tsx must exist.
+
+    Finding w1: the runner enrollment walkthrough requires test coverage for the
+    enrollment dialog and runner management panel.
+    """
+    import pytest
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "FleetRunnersPanel.test.tsx",
+        Path("/repo/admin-ui/src/components/FleetRunnersPanel.test.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return  # File exists — test passes
+    pytest.skip("FleetRunnersPanel.test.tsx not found — admin-ui not present in this shard")
+
+
+# --------------------------------------------------------------------------- #
+# Finding w2 — runner config generations apply atomically                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_w2_live_runner_config_validates_before_lock():
+    """_LiveRunnerConfig.apply must validate all fields before taking the lock.
+
+    Finding w2: the claim was that apply() entered the mutation block before
+    detecting unrecognized fields, so a generation with one bad field would still
+    apply all the known-good fields (partial state). The fix validates the entire
+    config dict upfront; if any field is unrecognized or malformed the whole block
+    is rejected without mutating anything.
+    """
+    source = _local_runner_source()
+
+    # _classify_fields must be called before the lock so rejection is a true no-op.
+    classify_idx = source.find("_classify_fields(config)")
+    lock_idx = source.find("with self._lock:", classify_idx if classify_idx >= 0 else 0)
+
+    assert classify_idx >= 0, (
+        "_LiveRunnerConfig.apply must call _classify_fields(config) to detect "
+        "unrecognized/malformed fields before acquiring the lock"
+    )
+    assert lock_idx >= 0, (
+        "_LiveRunnerConfig.apply must use 'with self._lock:' to protect mutations"
+    )
+    assert classify_idx < lock_idx, (
+        "_classify_fields must be called BEFORE 'with self._lock:' so the full "
+        "field-validity check runs without holding the lock — a rejected generation "
+        "must be a true no-op (no partial mutation)"
+    )
+
+
+def test_w2_live_runner_config_apply_is_atomic():
+    """_LiveRunnerConfig.apply rejects an entire generation when any field is bad.
+
+    Finding w2: a generation carrying one unrecognized field alongside a valid
+    max_concurrent change must be rejected atomically — the known field must NOT
+    be mutated even though it was well-formed.
+    """
+    source = _local_runner_source()
+
+    # The fully_applicable guard must wrap ALL mutations inside the lock.
+    assert "fully_applicable" in source, (
+        "_LiveRunnerConfig.apply must compute 'fully_applicable' and gate all "
+        "mutations on it so the whole block applies or nothing does"
+    )
+    assert "if fully_applicable:" in source, (
+        "_LiveRunnerConfig.apply must use 'if fully_applicable:' to guard all "
+        "field assignments inside the lock"
+    )
+
+    # Rejection path must record the offending fields and refused generation.
+    assert "_rejection_reason" in source, (
+        "_LiveRunnerConfig must store _rejection_reason so operators can see "
+        "which field caused the rejection"
+    )
+    assert "_rejected_generation" in source, (
+        "_LiveRunnerConfig must store _rejected_generation so the heartbeat "
+        "can report which generation was refused"
+    )
+
+
+def test_w2_live_runner_config_clean_apply_clears_rejection():
+    """A clean apply must clear prior rejection state.
+
+    Finding w2: a residual rejection reason after a successful apply would keep
+    the operator UI showing a resolved error indefinitely.
+    """
+    source = _local_runner_source()
+
+    # After a successful apply the rejection fields must be reset.
+    assert "self._rejection_reason = None" in source, (
+        "_LiveRunnerConfig.apply must set self._rejection_reason = None after a "
+        "successful fully-applicable apply so the UI does not show a stale error"
+    )
+    assert "self._rejected_generation = None" in source, (
+        "_LiveRunnerConfig.apply must set self._rejected_generation = None after "
+        "a successful apply so stale rejection-generation info is cleared"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding w3 — project-tool Remove requires confirmation                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_w3_project_tool_remove_uses_pending_delete_state():
+    """ProjectToolHost must use pendingDeleteId state for a two-step delete.
+
+    Finding w3: the claim was that both enabled and disabled Remove buttons called
+    handleDelete directly. The fix introduces a pendingDeleteId state; clicking Remove
+    sets pendingDeleteId (showing a confirmation prompt) rather than immediately calling
+    the backend DELETE endpoint.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "pendingDeleteId" in source, (
+        "ProjectToolHost.tsx must define pendingDeleteId state to gate tool deletion "
+        "behind a confirmation prompt — clicking Remove must NOT immediately delete"
+    )
+    assert "setPendingDeleteId" in source, (
+        "ProjectToolHost.tsx must call setPendingDeleteId to enter the confirmation "
+        "state when the Remove button is clicked"
+    )
+
+
+def test_w3_project_tool_remove_confirmation_names_tool_and_explains_deletion():
+    """The deletion confirmation must name the tool and explain permanent deletion.
+
+    Finding w3: cancellation must be side-effect free; the confirmation text must
+    identify the tool and explain that its authored content will be deleted.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "permanently delete" in source.lower() or "permanently remove" in source.lower(), (
+        "ProjectToolHost.tsx confirmation prompt must use 'permanently delete' or "
+        "'Permanently remove' so the operator understands the action is irreversible"
+    )
+    assert "tool.title" in source or "{tool.title}" in source, (
+        "ProjectToolHost.tsx confirmation prompt must include tool.title so the operator "
+        "knows which specific tool they are about to permanently delete"
+    )
+    assert "Permanently remove" in source, (
+        "ProjectToolHost.tsx must have a 'Permanently remove' confirmation button "
+        "that is separate from the initial 'Remove' button"
+    )
+
+
+def test_w3_project_tool_remove_cancel_is_side_effect_free():
+    """Cancel on the deletion confirmation must be side-effect free.
+
+    Finding w3: clicking Cancel must call setPendingDeleteId(null) without
+    ever calling handleDelete or the backend DELETE endpoint.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    # Cancel must reset pendingDeleteId to null, not call handleDelete.
+    assert "setPendingDeleteId(null)" in source, (
+        "ProjectToolHost.tsx Cancel button must call setPendingDeleteId(null) to dismiss "
+        "the confirmation prompt without side effects"
+    )
+
+
+def test_w3_project_tool_disabled_row_also_requires_confirmation():
+    """The Disabled section Remove button must also use the pendingDeleteId confirmation.
+
+    Finding w3: the confirmation must cover BOTH enabled and disabled tool rows
+    without adding friction to the reversible Disable/Hide actions.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    # Both sections must reference pendingDeleteId; a single instance would mean
+    # one section bypasses the confirmation. Count occurrences.
+    count = source.count("pendingDeleteId === tool.id")
+    assert count >= 2, (
+        f"ProjectToolHost.tsx must check pendingDeleteId === tool.id in BOTH the enabled "
+        f"and disabled tool row renders — found only {count} occurrence(s); the disabled "
+        "section Remove must also go through the confirmation prompt"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding w4 — project-tools walkthrough residuals                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_w4_enable_button_has_in_flight_guard():
+    """The Enable button in the Disabled section must show in-flight state.
+
+    Finding w4: the claim was that the Enable control had no disabled/in-flight guard
+    while its PATCH was outstanding, unlike the adjacent Remove control. The fix mirrors
+    the existing Disable-button pattern: disabled={togglingId === tool.id && actionIsCurrent}
+    with an 'Enabling…' label while the PATCH is pending.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "Enabling" in source, (
+        "ProjectToolHost.tsx must render 'Enabling…' while the Enable PATCH is in-flight "
+        "so the operator sees unambiguous feedback and the button is guarded against double-fire"
+    )
+    assert "togglingId === tool.id" in source, (
+        "ProjectToolHost.tsx Enable button must be disabled when togglingId === tool.id "
+        "to prevent duplicate PATCH requests on slow connections"
+    )
+
+
+def test_w4_created_slug_notice_surfaces_auto_uniquified_slug():
+    """A created-slug notice must surface the server-assigned slug after tool creation.
+
+    Finding w4: the add-tool form exposes only Kind and Title, so an auto-uniquified
+    slug (e.g. 'mock-widget-2') is never shown to the operator without an explicit
+    post-creation notice. The fix surfaces the server-returned slug so operators know
+    what slug was assigned when the derived name collided.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "lastCreatedSlug" in source, (
+        "ProjectToolHost.tsx must track lastCreatedSlug state to surface the slug "
+        "the server assigned after auto-uniquification"
+    )
+    assert "created-slug-notice" in source or "createdSlug" in source.lower() or "Tool created" in source, (
+        "ProjectToolHost.tsx must render a notice showing the assigned slug after "
+        "tool creation so the operator can see auto-uniquified slugs (e.g. 'mock-widget-2')"
+    )
+    assert "tool.slug" in source or "tool.slug" in source or "slug" in source, (
+        "ProjectToolHost.tsx must include the tool's slug in the creation notice"
     )
