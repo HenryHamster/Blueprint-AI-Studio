@@ -117,6 +117,60 @@ def test_active_elapsed_during_in_flight_pause():
     assert 58.0 <= elapsed <= 62.0
 
 
+# ── active_elapsed_seconds (reaper-side stall/timeout deadlines) ──────────────
+
+
+def test_active_elapsed_seconds_state_none_returns_raw():
+    """No deploy state threaded (legacy/test callers) → raw wall-clock."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
+    elapsed = pause_clock.active_elapsed_seconds(None, started, baseline_paused=0.0)
+    assert 99.0 <= elapsed <= 102.0
+
+
+def test_active_elapsed_seconds_baseline_subtracts_pause_since_start():
+    """With a baseline, pauses accumulated since timer start are excluded."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
+    s = _state(total_manual_paused_seconds=30.0)
+    elapsed = pause_clock.active_elapsed_seconds(s, started, baseline_paused=0.0)
+    assert 69.0 <= elapsed <= 72.0
+
+
+def test_active_elapsed_seconds_baseline_excludes_pre_start_pauses():
+    """Pauses BEFORE the timer started (captured in the baseline) aren't subtracted."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
+    s = _state(total_manual_paused_seconds=100.0)
+    elapsed = pause_clock.active_elapsed_seconds(s, started, baseline_paused=100.0)
+    assert 59.0 <= elapsed <= 62.0
+
+
+def test_active_elapsed_seconds_no_baseline_subtracts_open_window():
+    """Legacy row (no baseline) during an OPEN pause → only the in-flight window
+    is subtracted, so it is never counted as progressing while paused."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
+    pause_started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=40)
+    s = _state(paused_at=pause_started, paused_kind=pause_clock.PAUSED_KIND_MANUAL)
+    elapsed = pause_clock.active_elapsed_seconds(s, started, baseline_paused=None)
+    assert 58.0 <= elapsed <= 62.0
+
+
+def test_active_elapsed_seconds_no_baseline_not_paused_returns_raw():
+    """Legacy row (no baseline), not currently paused → raw. Closed-window totals
+    are NOT credited without a baseline (documented convergence-on-rotate)."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
+    s = _state(total_manual_paused_seconds=999.0)  # closed totals ignored w/o baseline
+    elapsed = pause_clock.active_elapsed_seconds(s, started, baseline_paused=None)
+    assert 99.0 <= elapsed <= 102.0
+
+
+def test_active_elapsed_seconds_clamps_to_zero():
+    """Subtracted pause exceeding raw elapsed clamps to 0 (a fully-paused timer)."""
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
+    pause_started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=90)
+    s = _state(paused_at=pause_started, paused_kind=pause_clock.PAUSED_KIND_MANUAL)
+    elapsed = pause_clock.active_elapsed_seconds(s, started, baseline_paused=None)
+    assert elapsed == 0.0
+
+
 # ── mark_paused ───────────────────────────────────────────────────────────────
 
 

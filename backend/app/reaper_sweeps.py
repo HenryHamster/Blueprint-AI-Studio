@@ -447,7 +447,13 @@ async def sweep_stalled_strategic_cycles(
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 
-    stalled = await strategic_cycle.find_stalled(session)
+    # Pause-aware: a cycle whose completion handler simply could not run while
+    # the pipeline was paused must not be force-terminated as "stalled". Passing
+    # the deploy state makes find_stalled's 3h deadline exclude pause time.
+    from app.models import DeploymentState  # noqa: PLC0415
+
+    _deploy_state = await session.get(DeploymentState, 1)
+    stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
     if not stalled:
         return 0

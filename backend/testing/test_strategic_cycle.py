@@ -11,8 +11,15 @@ from datetime import timedelta
 import pytest
 from sqlmodel import select
 
-from app import strategic_cycle, vision_merge
-from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS, Project, StrategicCycle, Task, TaskStatus
+from app import pause_clock, strategic_cycle, vision_merge
+from app.models import (
+    CYCLE_META_INTEGRITY_CONFLICT_COUNTS,
+    DeploymentState,
+    Project,
+    StrategicCycle,
+    Task,
+    TaskStatus,
+)
 from app.time_utils import _utcnow
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
@@ -427,6 +434,110 @@ async def test_find_stalled_skips_strategic_local_runner_holds(db_session):
     stalled = await strategic_cycle.find_stalled(db_session)
 
     assert all(c.id != cycle.id for c in stalled)
+
+
+@pytest.mark.asyncio
+async def test_find_stalled_excludes_open_pause_window(db_session):
+    """Mutation-proof: a cycle 4h old ONLY because the pipeline is paused is
+    reported stalled by the raw (deploy_state=None) path but NOT when the paused
+    deploy state is threaded — the open pause window is subtracted from its age.
+    """
+    project = await _make_project(db_session)
+    cycle = StrategicCycle(
+        id="sc-open-pause",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+        cycle_metadata={},  # legacy row — no stamped baseline
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    # Mutation control: without pause accounting the raw 4h age stalls it.
+    raw = await strategic_cycle.find_stalled(db_session)
+    assert any(c.id == cycle.id for c in raw)
+
+    # Pipeline paused for the whole 4h → active age ~0 → NOT stalled.
+    paused_state = DeploymentState(
+        id=1,
+        total_manual_paused_seconds=0.0,
+        total_auto_paused_seconds=0.0,
+        paused_at=_utcnow() - timedelta(hours=4),
+        paused_kind=pause_clock.PAUSED_KIND_MANUAL,
+    )
+    paused = await strategic_cycle.find_stalled(db_session, deploy_state=paused_state)
+    assert all(c.id != cycle.id for c in paused)
+
+
+@pytest.mark.asyncio
+async def test_find_stalled_resumed_uses_stamped_baseline(db_session):
+    """After resume, the stall age excludes the CLOSED pause window via the
+    per-phase baseline stamped at phase start. Same 4h-old cycle: with 2h of
+    pause it is 2h active → not stalled; with only 0.5h of pause it is 3.5h
+    active → still stalled (proving the subtraction doesn't over-protect).
+    """
+    project = await _make_project(db_session)
+    cycle = StrategicCycle(
+        id="sc-resumed",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE1_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+        cycle_metadata={"phase1_pause_baseline": 0.0},  # started before any pause
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    # 2h of pause accumulated since the baseline → 4h - 2h = 2h active.
+    resumed_2h = DeploymentState(
+        id=1, total_manual_paused_seconds=2 * 3600.0,
+        total_auto_paused_seconds=0.0, paused_at=None, paused_kind=None,
+    )
+    s2 = await strategic_cycle.find_stalled(db_session, deploy_state=resumed_2h)
+    assert all(c.id != cycle.id for c in s2)  # 2h < 3h → not stalled
+
+    # Only 30min of pause → 3.5h active → genuinely stalled (no over-protection).
+    resumed_30m = DeploymentState(
+        id=1, total_manual_paused_seconds=1800.0,
+        total_auto_paused_seconds=0.0, paused_at=None, paused_kind=None,
+    )
+    s30 = await strategic_cycle.find_stalled(db_session, deploy_state=resumed_30m)
+    assert any(c.id == cycle.id for c in s30)  # 3.5h >= 3h → stalled
+
+
+@pytest.mark.asyncio
+async def test_find_stalled_phase2_excludes_open_pause_window(db_session):
+    """The same pause-aware age applies to the phase-2 (strategic_review) leg."""
+    project = await _make_project(db_session)
+    cycle = StrategicCycle(
+        id="sc-phase2-pause",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase1_completed_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+        cycle_metadata={},  # legacy — no baseline
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    raw = await strategic_cycle.find_stalled(db_session)
+    assert any(c.id == cycle.id for c in raw)
+
+    paused_state = DeploymentState(
+        id=1, total_manual_paused_seconds=0.0, total_auto_paused_seconds=0.0,
+        paused_at=_utcnow() - timedelta(hours=4), paused_kind=pause_clock.PAUSED_KIND_MANUAL,
+    )
+    paused = await strategic_cycle.find_stalled(db_session, deploy_state=paused_state)
+    assert all(c.id != cycle.id for c in paused)
+
+
+@pytest.mark.asyncio
+async def test_create_stamps_phase1_pause_baseline(db_session):
+    """create() stamps a phase-1 pause baseline so the reaper can be pause-aware."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    assert "phase1_pause_baseline" in (cycle.cycle_metadata or {})
 
 
 # --- vision_merge ----------------------------------------------------------

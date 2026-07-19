@@ -26,7 +26,12 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS, StrategicCycle, Task
+from app.models import (
+    CYCLE_META_INTEGRITY_CONFLICT_COUNTS,
+    DeploymentState,
+    StrategicCycle,
+    Task,
+)
 from app.strategic_constants import CYCLE_SUMMARY_MAX
 from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 from app.time_utils import _utcnow
@@ -93,6 +98,11 @@ async def create(
     snapshot, which :func:`baseline_running_update` reports as ``None`` so the
     reconciliation degrades to blind-assign.
     """
+    from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
+    # Pause baseline stamped at phase-1 start so the stalled-cycle reaper's
+    # 3h deadline excludes any pipeline-pause time (see find_stalled).
+    _phase1_pause_baseline = await pause_clock.current_baseline(session)
     cycle = StrategicCycle(
         id=cycle_id or new_cycle_id(),
         project_id=project_id,
@@ -105,6 +115,7 @@ async def create(
             "baseline_running_update": baseline_running_update
             if isinstance(baseline_running_update, str)
             else "",
+            "phase1_pause_baseline": _phase1_pause_baseline,
         },
     )
     session.add(cycle)
@@ -179,9 +190,16 @@ async def mark_phase1_completed(
         return None
     cycle.phase1_completed_at = _utcnow()
     if phase2_task_id is not None:
+        from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
         cycle.phase2_task_id = phase2_task_id
         cycle.phase2_started_at = _utcnow()
         cycle.outcome = OUTCOME_PHASE2_RUNNING
+        # Pause baseline for phase 2's own 3h stall deadline (see find_stalled).
+        _meta = dict(cycle.cycle_metadata or {})
+        _meta["phase2_pause_baseline"] = await pause_clock.current_baseline(session)
+        cycle.cycle_metadata = _meta
+        flag_modified(cycle, "cycle_metadata")
     else:
         cycle.outcome = OUTCOME_PHASE1_DONE
     session.add(cycle)
@@ -799,6 +817,7 @@ async def find_stalled(
     phase1_max_age: timedelta = timedelta(hours=3),
     phase2_max_age: timedelta = timedelta(hours=3),
     limit: int = 50,
+    deploy_state: Optional[DeploymentState] = None,
 ) -> list[StrategicCycle]:
     """Cycles that have been in an active phase for too long.
 
@@ -806,10 +825,19 @@ async def find_stalled(
     transition to ``stalled_*`` states. Bounds are conservative — strategic
     tasks usually finish in <30 min; >3h means something crashed and the
     completion handler never fired.
+
+    ``deploy_state`` (the ``DeploymentState`` row) makes the age PAUSE-AWARE:
+    time the pipeline spent paused does not count toward the stall deadline, so
+    a cycle whose completion handler simply could not run *because the pipeline
+    was paused* is not falsely force-terminated. When ``None`` the age is raw
+    wall-clock (legacy / test behavior). The per-phase pause baseline is read
+    from ``cycle_metadata['phase{1,2}_pause_baseline']`` (stamped at phase
+    start); rows without it fall back to excluding only the open pause window.
     """
-    now = _utcnow()
-    phase1_cutoff = now - phase1_max_age
-    phase2_cutoff = now - phase2_max_age
+    from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
+    phase1_max_seconds = phase1_max_age.total_seconds()
+    phase2_max_seconds = phase2_max_age.total_seconds()
     stmt = (
         select(StrategicCycle)
         .where(
@@ -850,10 +878,16 @@ async def find_stalled(
             OUTCOME_PHASE1_RUNNING,
             OUTCOME_PHASE1_DONE,
         ):
+            _meta = c.cycle_metadata or {}
             if (
                 c.phase1_started_at
-                and c.phase1_started_at < phase1_cutoff
                 and c.phase2_started_at is None
+                and pause_clock.active_elapsed_seconds(
+                    deploy_state,
+                    c.phase1_started_at,
+                    _meta.get("phase1_pause_baseline"),
+                )
+                >= phase1_max_seconds
             ):
                 if c.phase1_task_id is not None:
                     linked_task = linked_tasks_by_id.get(c.phase1_task_id)
@@ -861,8 +895,20 @@ async def find_stalled(
                         continue
                 stalled.append(c)
         elif c.outcome == OUTCOME_PHASE2_RUNNING:
+            _meta = c.cycle_metadata or {}
             ref = c.phase2_started_at or c.phase1_started_at
-            if ref and ref < phase2_cutoff:
+            _ref_baseline = (
+                _meta.get("phase2_pause_baseline")
+                if c.phase2_started_at is not None
+                else _meta.get("phase1_pause_baseline")
+            )
+            if (
+                ref
+                and pause_clock.active_elapsed_seconds(
+                    deploy_state, ref, _ref_baseline
+                )
+                >= phase2_max_seconds
+            ):
                 if c.phase2_task_id is not None:
                     linked_task = linked_tasks_by_id.get(c.phase2_task_id)
                     if task_is_strategic_local_runner_hold(linked_task):
