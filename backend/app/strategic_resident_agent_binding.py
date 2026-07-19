@@ -89,9 +89,9 @@ async def load_live_resident_agent_task_locked(
 ) -> Task:
     """Lock Project -> Resident -> Task and validate the complete live binding."""
 
-    project = (
+    project_id = (
         await session.execute(
-            select(Project)
+            select(Project.id)
             .where(Project.id == binding.project_id)
             .with_for_update(key_share=True)
         )
@@ -104,7 +104,7 @@ async def load_live_resident_agent_task_locked(
             .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
-    if project is None or resident is None:
+    if project_id is None or resident is None:
         raise ResidentAgentAuthorityError("Resident authority is stale")
     task = (
         await session.execute(

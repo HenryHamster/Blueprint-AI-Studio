@@ -248,6 +248,8 @@ async def get_github_token_for_task(
     task_id: uuid.UUID,
     session: AsyncSession,
     force_refresh: bool = False,
+    *,
+    release_dedicated_session_before_io: bool = False,
 ) -> tuple[str, str, str]:
     """Resolve a GitHub token for the task's project.
 
@@ -263,6 +265,16 @@ async def get_github_token_for_task(
     Now that the cache is expiry-correct, ``force_refresh`` is redundant for
     freshness purposes and can be dropped from periodic callers.
     """
+    # Guard before the first SELECT: an autoflush must never make a shared,
+    # write-bearing session look clean before the release-mode rollback.
+    if release_dedicated_session_before_io and (
+        session.new or session.dirty or session.deleted
+    ):
+        raise RuntimeError("credential I/O release requires a clean dedicated session")
+
+    # The opt-in release mode snapshots fallback fields and ends its dedicated
+    # read transaction before GitHub or Secret Manager I/O so a slow mint
+    # cannot pin a pool connection.
     stmt = select(Task).where(Task.id == task_id)
     task = (await session.execute(stmt)).scalars().first()
     if not task:
@@ -310,6 +322,18 @@ async def get_github_token_for_task(
             status_code=403,
             detail="Project does not have an authorized GitHub repository",
         )
+
+    prefetched_installation_id: str | None = None
+    prefetched_pat: str | None = None
+    if release_dedicated_session_before_io:
+        integration_stmt = select(
+            UserIntegration.github_installation_id,
+            UserIntegration.github_pat,
+        ).where(UserIntegration.user_id == project_user_id)
+        integration_row = (await session.execute(integration_stmt)).first()
+        if integration_row:
+            prefetched_installation_id, prefetched_pat = integration_row
+        await session.rollback()
 
     # Preferred: dynamic App-level discovery — always finds the correct
     # installation for this specific repo, even with multiple installations
@@ -359,23 +383,31 @@ async def get_github_token_for_task(
             if cached:
                 return cached["token"], cached["owner"], cached["repo"]
 
-        integration_stmt = select(UserIntegration).where(
-            UserIntegration.user_id == project_user_id
-        )
-        integration = (await session.execute(integration_stmt)).scalars().first()
+        if release_dedicated_session_before_io:
+            installation_id = prefetched_installation_id
+            encrypted_pat = prefetched_pat
+        else:
+            integration_stmt = select(UserIntegration).where(
+                UserIntegration.user_id == project_user_id
+            )
+            integration = (await session.execute(integration_stmt)).scalars().first()
+            installation_id = (
+                integration.github_installation_id if integration else None
+            )
+            encrypted_pat = integration.github_pat if integration else None
 
-        if integration and integration.github_installation_id:
+        if installation_id:
             try:
                 token = await generate_installation_access_token(
-                    integration.github_installation_id, repositories=[repo]
+                    installation_id, repositories=[repo]
                 )
             except Exception:  # noqa: BLE001 — fall through to PAT fallback
                 logger.debug(
                     f"[GITHUB] Stored installation token failed for {owner}/{repo}"
                 )
 
-        if not token and integration and integration.github_pat:
-            decrypted_pat_ref = decrypt_field(integration.github_pat)
+        if not token and encrypted_pat:
+            decrypted_pat_ref = decrypt_field(encrypted_pat)
             token = await get_user_secret(decrypted_pat_ref)
 
         if not token:

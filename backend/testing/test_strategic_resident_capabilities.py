@@ -124,7 +124,9 @@ def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
     assert next(item for item in catalog if item["id"] == "task.inspect")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "runner.inspect")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "runner.list")["availability"] == "invoke"
-    assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "propose_only"
+    assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "pr.diff.inspect")["availability"] == "propose_only"
+    assert next(item for item in catalog if item["id"] == "pr.checks.inspect")["availability"] == "propose_only"
     assert next(item for item in catalog if item["id"] == "pr.merge")["availability"] == "propose_only"
 
 
@@ -494,7 +496,7 @@ async def test_task_bound_capability_route_invokes_only_implemented_inspection(
         await capability_router.invoke_resident_capability(
             None,
             ResidentCapabilityRequest(
-                capability_id="pr.inspect", parameters={"pr_number": 12}
+                capability_id="pr.diff.inspect", parameters={"pr_number": 12}
             ),
             db_session,
             token,
@@ -561,7 +563,7 @@ async def test_capability_route_enforces_durable_unique_budget_and_retry(
     )
     monkeypatch.setattr(
         capability_router,
-        "_canonical_inspection_replay",
+        "canonical_inspection_replay",
         canonical_replay,
     )
     token = {

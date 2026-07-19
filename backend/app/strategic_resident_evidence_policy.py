@@ -71,6 +71,7 @@ INSPECTION_EVIDENCE_KIND_MAP = {
     "provider": "task",
     "runner": "runner",
     "runner_capacity": "runner_capacity",
+    "pr": "pr",
 }
 
 

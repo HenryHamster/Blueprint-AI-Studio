@@ -3,18 +3,21 @@
 **Target:** `automain`
 
 **Status:** Milestones 1, 2a, 2b, and 3 are merged. M4 remains in progress after
-its 2026-07-18 requirement-by-requirement audit. The authority/message hardening
-is merged, and the current completion milestone adds bounded runner inspection,
-managed code/debug Tasks, durable cycle/qualification cadence, and truthful
-pause/resume scheduling. PR/CI/deployment adapters, terminal Task producers,
+its 2026-07-18 requirement-by-requirement audit. Authority/message hardening and
+the runner/managed-Task/cadence milestone are merged. The current completion
+milestone adds receipt-backed terminal managed-Task wakeups and bounded,
+lock-free `pr.inspect`. Ordinary-Task/deployment outcome producers and the
+remaining PR/CI/deployment adapters,
 large-review/CI-repair Task contracts, and the remaining operational surface are
 still open. M5 is in progress; live pilot rollout, rollback rehearsal, the
 seven-day soak, and legacy retirement remain operator- and calendar-gated after
 the code/test gates pass.
 
 **Last refreshed:** 2026-07-18. Authority/message hardening merged through PR
-`#15672` at merge commit `0be99f70e`. M2a merged through PR `#15292` at merge commit
-`7b9b8c80b`. M2b merged through PR `#15486` at merge commit `3d3689e65` after
+`#15672` at merge commit `0be99f70e`; the runner/managed-Task/cadence milestone
+merged through PR `#15676` at merge commit `892dfacc3`. M2a merged through PR
+`#15292` at merge commit `7b9b8c80b`. M2b merged through PR `#15486` at merge
+commit `3d3689e65` after
 migration, locking, latency, provider-boundary, and affected-suite review/fix
 loops converged. M3 adds typed operations and revision-safe human-tool handoff;
 its capability-boundedness inspection contract converged and it was rebased onto
@@ -384,16 +387,33 @@ Implementation checklist:
 - [ ] Implement and prove the remaining plan-required inspection and operation
   adapters. Catalog entries with no bounded adapter remain truthfully
   `propose_only`; that is a safe intermediate state, not M4 completion.
-- [ ] Extend the coalesced project-change lane to terminal managed/ordinary Tasks
-  and revision-linked deployment outcomes. StrategicCycle, qualification, and
-  worker-proposal sources are live; activity-message noise remains excluded.
-- [ ] Add bounded PR/branch/check/log inspection, then enable managed large-review
-  and repeated-CI-repair Tasks with review/fix-specific payload contracts. Code
+- [x] Extend the coalesced project-change lane to terminal Resident-managed Tasks.
+  A receipt/project/turn/capability-fenced database trigger writes append-only,
+  sequence-ordered outcomes in the Task transaction. The indexed sweep preserves
+  revive-before-sweep events, paused catch-up, and the 200-scan/32-wakeup caps
+  without admitting routine pipeline or context-spoofed activity.
+- [x] Add bounded, project-scoped `pr.inspect`. It commits and releases authority
+  locks before GitHub I/O, then re-locks and revalidates the turn, repository, and
+  attempt-owned receipt lease before settlement. Exact refs/SHAs/repository,
+  canonical replay, crash reclaim, and 4.8/5.5KB evidence bounds are enforced.
+- [ ] Add carefully admission-filtered ordinary-Task and revision-linked
+  deployment outcome producers, plus the remaining bounded PR
+  diff/check/review/comment, branch, CI-run, and streamed-log inspections.
+  Then enable managed large-review (using the bounded panel-review handler) and
+  repeated-CI-repair Tasks with exact-head CAS, correlated evidence, and
+  return-to-Resident completion contracts. Code
   editing and open-ended debugging are live; human-tool writes stay fail-closed.
 
-Current hardening evidence: the combined Resident backend gate is green (`287
-passed`, `3 skipped`); the post-review authority/managed gate is green (`123
-passed`, `3 skipped`); cadence/runtime/schema invariants are green (`38 passed`);
+Current hardening evidence: the prior combined Resident backend gate is green
+(`287 passed`, `3 skipped`). For the current milestone, the combined affected
+Resident gate is green (`269 passed`, `3 skipped`), the dedicated-credential and
+PR inspection gate is green (`48 passed`, `3 deselected`), and schema/model
+migration invariants are green (`3 passed`). The terminal outbox gate is green
+(`14 passed`) and its SQLite upgrade/downgrade smoke passed. Slow GitHub
+credential discovery releases the inspector's clean dedicated database session
+before App discovery, fallback minting, Secret Manager, or PR I/O. The prior
+post-review authority/managed
+gate remains green (`123 passed`, `3 skipped`); cadence/runtime/schema invariants are green (`38 passed`);
 the managed/runner focused gate is green (`15 passed`); and Agent prompt tests are
 green (`74 passed`) with typecheck clean. The combined message/health UI gate
 remains green (`448 passed`) with typecheck clean and zero scoped ESLint errors.

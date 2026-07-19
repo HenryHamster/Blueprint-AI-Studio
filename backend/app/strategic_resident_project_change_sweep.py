@@ -15,6 +15,7 @@ from app.models import (
     StrategicCycle,
     StrategicResident,
     StrategicResidentSweepState,
+    StrategicResidentTaskTerminalEvent,
 )
 from app.strategic_cycle import (
     OUTCOME_COMPLETED,
@@ -97,7 +98,7 @@ def _resident_event_statement() -> Any:
         QualificationVerdict.created_at.desc(),
         QualificationVerdict.id.desc(),
     )
-    return select(
+    columns = [
         StrategicResident.project_id,
         StrategicResident.handled_project_change_cursor,
         StrategicResident.recovery_state,
@@ -137,7 +138,35 @@ def _resident_event_statement() -> Any:
             order_by=verdict_order,
             label="verdict_outcome",
         ),
-    ).where(
+    ]
+    terminal_filters = (
+        StrategicResidentTaskTerminalEvent.project_id
+        == StrategicResident.project_id,
+    )
+    terminal_order = (StrategicResidentTaskTerminalEvent.sequence.desc(),)
+    columns.extend(
+        (
+            _latest_scalar(
+                StrategicResidentTaskTerminalEvent.sequence,
+                filters=terminal_filters,
+                order_by=terminal_order,
+                label="managed_task_terminal_sequence",
+            ),
+            _latest_scalar(
+                StrategicResidentTaskTerminalEvent.task_id,
+                filters=terminal_filters,
+                order_by=terminal_order,
+                label="managed_task_terminal_task_id",
+            ),
+            _latest_scalar(
+                StrategicResidentTaskTerminalEvent.event_kind,
+                filters=terminal_filters,
+                order_by=terminal_order,
+                label="managed_task_terminal_status",
+            ),
+        )
+    )
+    return select(*columns).where(
         StrategicResident.engine_owner == "strategic_resident",
         StrategicResident.background_policy == "active",
     )
@@ -224,9 +253,9 @@ async def sweep_durable_project_change_wakeups(
     batch_size: int = 32,
     scan_batch_size: int = 200,
 ) -> int:
-    """Wake Residents for new terminal cycles or qualification verdicts.
+    """Wake Residents for new durable project outcomes.
 
-    Both sources are durable and project-scoped. Strategic cycles are included
+    All sources are durable and project-scoped. Strategic cycles are included
     only after reaching a known terminal outcome, so phase progress cannot cause
     feedback wakeups. Qualification verdicts are immutable finalize records.
     The latest row from each source becomes an opaque bounded cursor. Once that
@@ -235,8 +264,10 @@ async def sweep_durable_project_change_wakeups(
 
     The scan is limited to authoritative, active Residents. Paused projects keep
     their durable rows and are discovered after activation instead of losing the
-    event. At most batch_size projects are signalled per sweep even when both
-    sources are busy.
+    event. Managed Task terminal transitions come from an append-only,
+    sequence-ordered ledger; its write-time lineage gate structurally excludes
+    Resident turn Tasks and unrelated pipeline work. At most 32 projects are
+    signalled per sweep even when every source is busy.
     """
 
     # This is a model-call capacity boundary, not only a caller default. Keep
@@ -282,6 +313,12 @@ async def sweep_durable_project_change_wakeups(
                 outcome=str(row.verdict_outcome),
             )
             candidate_cursor["qualification_verdict"] = verdict_value
+        if row.managed_task_terminal_sequence is not None:
+            candidate_cursor["managed_task_terminal"] = (
+                f"v2:{int(row.managed_task_terminal_sequence):020d}:"
+                f"{row.managed_task_terminal_task_id}:"
+                f"{row.managed_task_terminal_status}"
+            )
         represented = _merge_project_change_cursor({}, handled)
         advanced = _merge_project_change_cursor(represented, candidate_cursor)
         cursor = {

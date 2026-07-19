@@ -301,6 +301,7 @@ async def materialize_managed_task(
         vm_instance_id=f"agent-vm-{plan.task_id.hex}",
         created_by="STRATEGIC_AGENT",
         idempotency_key=f"resident-receipt:{receipt.id}",
+        strategic_operation_receipt_id=receipt.id,
     )
     session.add(task)
     await session.flush()

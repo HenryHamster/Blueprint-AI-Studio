@@ -1,7 +1,5 @@
 """Task-bound typed capability invocations for authoritative Resident turns."""
 
-import hashlib
-import json
 import uuid
 from collections.abc import Iterable, Mapping
 from typing import Any
@@ -69,7 +67,6 @@ from app.strategic_resident_inspection_receipt import (
     TURN_CONTEXT_HASH_KEY,
     build_inspection_receipt,
     citable_inspection_evidence,
-    inspection_operation_id,
 )
 from app.strategic_resident_models import StrategicOperationReceipt
 from app.strategic_resident_operation_approval import (
@@ -82,6 +79,16 @@ from app.strategic_resident_project_field_mutation import (
     PROJECT_FIELD_MUTATION_SERVICE,
     project_field_mutation_callback,
     project_field_mutation_operation_kind,
+)
+from app.strategic_resident_inspection_runtime import (
+    MAX_CAPABILITY_REQUESTS_PER_TURN,
+    canonical_inspection_replay,
+    register_capability_request,
+    request_fingerprint,
+)
+from app.strategic_resident_pr_inspection import (
+    inspect_project_pr,
+    invoke_pr_inspection,
 )
 from app.strategic_resident_runner_inspection import (
     ResidentRunnerNotFound,
@@ -145,56 +152,6 @@ def _build_receipt_evidence_set(
     return frozenset(entries)
 
 
-async def _canonical_inspection_replay(
-    session: AsyncSession,
-    *,
-    task: Task,
-    capability_id: str,
-    request_hash: str,
-    context_hash: str,
-) -> dict[str, Any]:
-    """Load the one receipt-backed snapshot for an idempotent inspection retry."""
-
-    operation_kind = INSPECTION_CAPABILITY_KINDS.get(capability_id)
-    receipt = (
-        await session.execute(
-            select(StrategicOperationReceipt).where(
-                StrategicOperationReceipt.project_id == task.project_id,
-                StrategicOperationReceipt.turn_task_id == task.id,
-                StrategicOperationReceipt.operation_id
-                == inspection_operation_id(task.id, request_hash),
-            )
-        )
-    ).scalar_one_or_none()
-    if (
-        receipt is None
-        or not context_hash
-        or receipt.capability != capability_id
-        or receipt.operation_kind != operation_kind
-        or receipt.request_hash != request_hash
-        or receipt.status not in SUCCESSFUL_INSPECTION_STATUSES
-        or str((receipt.expected_revisions or {}).get("context_hash") or "")
-        != context_hash
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="canonical inspection receipt is unavailable or inconsistent",
-        )
-    body = receipt.receipt if isinstance(receipt.receipt, Mapping) else {}
-    structured = body.get("structured_result")
-    evidence = structured.get("evidence") if isinstance(structured, Mapping) else None
-    if (
-        not isinstance(evidence, list)
-        or len(evidence) != 1
-        or not isinstance(evidence[0], Mapping)
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="canonical inspection receipt evidence is invalid",
-        )
-    return dict(evidence[0])
-
-
 async def _check_evidence_refs_against_receipts(
     session: AsyncSession,
     binding: ResidentAgentBinding,
@@ -243,8 +200,6 @@ async def _check_evidence_refs_against_receipts(
     finally:
         await session.rollback()
 
-MAX_CAPABILITY_REQUESTS_PER_TURN = 8
-_CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY = "_strategic_resident_capability_requests"
 _MAX_PROJECTED_UNKNOWN_EFFECTS = 50
 
 
@@ -352,49 +307,6 @@ def _binding(token: dict[str, Any]) -> ResidentAgentBinding:
         ) from None
 
 
-def _request_fingerprint(
-    capability_id: str,
-    parameters: dict[str, Any],
-) -> str:
-    encoded = json.dumps(
-        {"capability_id": capability_id, "parameters": parameters},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _register_capability_request(
-    task: Any,
-    *,
-    fingerprint: str,
-) -> bool:
-    """Consume one durable unique-call slot under the locked turn Task."""
-
-    context = task.context if isinstance(task.context, dict) else {}
-    raw_ledger = context.get(_CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY, [])
-    if not isinstance(raw_ledger, list) or any(
-        not isinstance(item, str)
-        or len(item) != 64
-        or any(character not in "0123456789abcdef" for character in item)
-        for item in raw_ledger
-    ):
-        raise HTTPException(status_code=409, detail="capability request ledger is invalid")
-    ledger = list(dict.fromkeys(raw_ledger))
-    if len(ledger) > MAX_CAPABILITY_REQUESTS_PER_TURN:
-        raise HTTPException(status_code=409, detail="capability request ledger is invalid")
-    if fingerprint in ledger:
-        return False
-    if len(ledger) >= MAX_CAPABILITY_REQUESTS_PER_TURN:
-        raise HTTPException(status_code=429, detail="Resident capability budget exhausted")
-    task.context = {
-        **context,
-        _CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY: [*ledger, fingerprint],
-    }
-    return True
-
-
 _capability_rate_key = resident_task_token_rate_key
 
 
@@ -427,6 +339,13 @@ async def invoke_resident_capability(
             status_code=501,
             detail="capability is proposal-only until a bounded adapter exists",
         )
+    if body.capability_id == "pr.inspect":
+        return await invoke_pr_inspection(
+            session,
+            binding=binding,
+            parameters=parameters,
+            inspector=inspect_project_pr,
+        )
     if spec.service not in {"resident_task_inspection", "admin_runners"}:
         raise HTTPException(
             status_code=501,
@@ -448,7 +367,7 @@ async def invoke_resident_capability(
     except ResidentAgentBindingError as exc:
         await session.rollback()
         raise HTTPException(status_code=403, detail=str(exc)) from exc
-    fingerprint = _request_fingerprint(body.capability_id, parameters)
+    fingerprint = request_fingerprint(body.capability_id, parameters)
     try:
         context_hash = str(
             (task.context or {}).get(TURN_CONTEXT_HASH_KEY) or ""
@@ -458,7 +377,7 @@ async def invoke_resident_capability(
                 status_code=409,
                 detail="Resident turn context is not frozen for inspection",
             )
-        request_registered = _register_capability_request(
+        request_registered = register_capability_request(
             task,
             fingerprint=fingerprint,
         )
@@ -468,7 +387,7 @@ async def invoke_resident_capability(
             # not stale immediately after commit.
             await session.flush()
         else:
-            evidence_json = await _canonical_inspection_replay(
+            evidence_json = await canonical_inspection_replay(
                 session,
                 task=task,
                 capability_id=body.capability_id,
