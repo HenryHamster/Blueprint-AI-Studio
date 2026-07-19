@@ -6032,6 +6032,24 @@ class TestMessages:
             # Stand in for a concurrent request that won the race: persist the
             # same-key row in a separate transaction so this request's pending
             # INSERT violates the unique index on commit.
+            #
+            # The winner must be an OUT-OF-BAND, non-conversation row: at this
+            # point the route already holds the exclusive projectmessagesequence
+            # row lock (lock_project_and_next_message_sequence, taken before the
+            # message INSERT). A conversation winner would trip the 0608
+            # compat-insert trigger's sequence-allocator upsert (should_project
+            # -> INSERT ... ON CONFLICT on projectmessagesequence) and block on
+            # that held lock while this request synchronously awaits the winner's
+            # commit — an asyncio/DB deadlock Postgres cannot detect (one side is
+            # a Python await, not a DB lock wait). from_type="system" keeps
+            # should_project False (see trigger), so the winner does NOT touch the
+            # sequence allocator; it still shares (project_id, idempotency_key) so
+            # the request's INSERT trips ux_projectmessage_project_idempotency_key.
+            # This is exactly the raw/legacy same-key insert the recovery path
+            # (re-select winner, 409 on mismatched actor/fingerprint) defends
+            # against — a same-key row that never went through the advisory-locked
+            # operator path. (On SQLite FOR UPDATE is a no-op, which is why the
+            # original conversation winner only "passed" there.)
             if not injected["done"] and any(
                 isinstance(obj, ProjectMessage) and obj.idempotency_key == key
                 for obj in session.new
@@ -6042,7 +6060,7 @@ class TestMessages:
                         ProjectMessage(
                             project_id=project.id,
                             message_type=MessageType.NOTE,
-                            from_type="user",
+                            from_type="system",
                             content="winner of the race",
                             context={"user_event_type": "pr_merged"},
                             idempotency_key=key,
