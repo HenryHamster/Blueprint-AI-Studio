@@ -3445,6 +3445,79 @@ async def test_step6_agent_managed_resident_turn_triggers_queued_age_alert(reape
 
 
 @pytest.mark.asyncio
+async def test_queued_age_alert_suppressed_while_pipeline_paused(reaper_db):
+    """PAUSE-AWARE queued-age alerts: while the pipeline is PAUSED nothing
+    dequeues, so a QUEUED task's wall-clock age crosses the alert tiers even
+    though it is stuck only because the operator paused. The tier decision
+    subtracts the open pause window, so no INFO/WARNING/ERROR alert fires."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(hours=3),
+            paused_kind="manual",
+        )
+    )
+    t = Task(
+        project_id=project.id,
+        title="queued during pause",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=now - timedelta(hours=3),  # 3h raw > 2h tier-1, but all paused
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db, now, runtime_config={"queued_age_alert_hours": 2}
+    )
+
+    assert alerted == 0
+    await reaper_db.refresh(t)
+    assert (t.context or {}).get("queued_age_alert_tier") in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_queued_age_alert_fires_despite_brief_pause(reaper_db):
+    """MUTATION-PROOF companion: the pause-aware tier gate is not a blanket mute.
+    A task queued 3h with only a 30-min pause has ~2.5h of ACTIVE age > the 2h
+    tier-1 threshold and DOES fire the INFO alert."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(minutes=30),
+            paused_kind="manual",
+        )
+    )
+    t = Task(
+        project_id=project.id,
+        title="queued mostly active",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=now - timedelta(hours=3),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db, now, runtime_config={"queued_age_alert_hours": 2}
+    )
+
+    assert alerted == 1
+    await reaper_db.refresh(t)
+    assert (t.context or {}).get("queued_age_alert_tier") == 1
+
+
+@pytest.mark.asyncio
 async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
