@@ -33,14 +33,9 @@ EVIDENCE_KINDS = frozenset(
         "other",
     }
 )
-# Maps a declared inspection capability_id (see ``strategic_resident_capabilities``)
-# to the ``operation_kind`` a receipt for that inspection must carry, so that
-# ``build_trusted_evidence_index`` only trusts revisioned evidence whose receipt
-# was written by the matching capability. EVERY key MUST be a real inspection
-# capability_id — a stale/typo'd key silently drops that inspection's evidence
-# from the trusted index (fail-closed), which is only observable once inspection
-# receipts are written. ``test_inspection_capability_kinds_match_real_capabilities``
-# guards against drift.
+# Maps each inspection capability to its receipt operation kind. Trusted evidence
+# requires that exact pairing; stale keys fail closed. The capability-kind
+# consistency test guards this table against drift.
 INSPECTION_CAPABILITY_KINDS = {
     "task.inspect": "inspect_task",
     "task.logs.inspect": "inspect_task_log",
@@ -52,6 +47,8 @@ INSPECTION_CAPABILITY_KINDS = {
     "pipeline.inspect": "inspect_pipeline",
     "qualification.inspect": "inspect_qualification",
     "pr.inspect": "inspect_pr",
+    "pr.diff.inspect": "inspect_pr_diff",
+    "pr.checks.inspect": "inspect_pr_checks",
     "ci.run.inspect": "inspect_ci",
     "deployment.inspect": "inspect_deployment",
 }
@@ -72,6 +69,8 @@ INSPECTION_EVIDENCE_KIND_MAP = {
     "runner": "runner",
     "runner_capacity": "runner_capacity",
     "pr": "pr",
+    "pr_diff": "pr_diff",
+    "pr_check": "pr_check",
 }
 
 

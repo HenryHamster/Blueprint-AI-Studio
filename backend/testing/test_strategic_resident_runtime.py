@@ -1220,7 +1220,13 @@ async def test_recovery_block_preserves_project_change_for_later_turn(db_session
 
 
 @pytest.mark.asyncio
-async def test_out_of_order_durable_signal_retains_newer_inflight_cursor(db_session):
+@pytest.mark.parametrize(
+    "cursor_key",
+    ["strategic_cycle_terminal", "ordinary_task_terminal"],
+)
+async def test_out_of_order_durable_signal_retains_newer_inflight_cursor(
+    db_session, cursor_key
+):
     project, resident = await _authoritative_project(db_session)
     newer = "v2:00000000000000000020:newer:completed"
     older = "v2:00000000000000000010:older:completed"
@@ -1229,13 +1235,13 @@ async def test_out_of_order_durable_signal_retains_newer_inflight_cursor(db_sess
         db_session,
         project_id=project.id,
         trigger_kind="project_change",
-        project_change_cursor={"strategic_cycle_terminal": newer},
+        project_change_cursor={cursor_key: newer},
     )
     second = await coalesce_meaningful_background_wakeup(
         db_session,
         project_id=project.id,
         trigger_kind="project_change",
-        project_change_cursor={"strategic_cycle_terminal": older},
+        project_change_cursor={cursor_key: older},
     )
 
     assert first is not None and first.task_id is not None
@@ -1245,7 +1251,7 @@ async def test_out_of_order_durable_signal_retains_newer_inflight_cursor(db_sess
     ).scalars().all()
     assert len(tasks) == 1
     assert tasks[0].first_payload["project_change_cursor"] == {
-        "strategic_cycle_terminal": newer
+        cursor_key: newer
     }
     assert resident.background_successor_task_id is None
 

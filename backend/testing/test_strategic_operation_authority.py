@@ -1543,6 +1543,116 @@ async def test_pr_inspection_releases_locks_and_replays_canonical_receipt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability_id", "inspector_name", "operation_kind", "evidence_kind"),
+    [
+        ("pr.diff.inspect", "inspect_project_pr_diff", "inspect_pr_diff", "pr_diff"),
+        (
+            "pr.checks.inspect",
+            "inspect_project_pr_checks",
+            "inspect_pr_checks",
+            "pr_check",
+        ),
+    ],
+)
+async def test_bounded_pr_evidence_adapters_release_locks_and_replay(
+    authority_db,
+    monkeypatch,
+    capability_id,
+    inspector_name,
+    operation_kind,
+    evidence_kind,
+):
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_pr_checks_inspection import build_pr_checks_evidence
+    from app.strategic_resident_pr_diff_inspection import (
+        BoundedDiffCapture,
+        PRDiffIdentity,
+        build_pr_diff_evidence,
+    )
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    project.github_owner = "BlueprintAIStudio"
+    project.github_repo = "Blueprint"
+    turn_task.vm_instance_id = "vm-1"
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: f"ctx-{evidence_kind}",
+        "_strategic_resident_claim_nonce": "nonce-1",
+    }
+    authority_db.add_all([project, turn_task])
+    await authority_db.commit()
+    head_sha = "b" * 40
+
+    async def external_inspection(**kwargs):
+        assert not authority_db.in_transaction(), "GitHub I/O ran under DB locks"
+        if evidence_kind == "pr_diff":
+            return build_pr_diff_evidence(
+                BoundedDiffCapture(
+                    content=b"diff --git a/a.py b/a.py\n+bounded\n",
+                    content_length=38,
+                    stream_truncated=False,
+                ),
+                project_id=kwargs["project_id"],
+                identity=PRDiffIdentity(
+                    repository=f'{kwargs["owner"]}/{kwargs["repo"]}',
+                    pr_number=kwargs["pr_number"],
+                    base_ref="automain",
+                    base_sha="a" * 40,
+                    head_ref="feature/bounded",
+                    head_sha=head_sha,
+                ),
+            )
+        return build_pr_checks_evidence(
+            [
+                {
+                    "id": 1,
+                    "name": "unit",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"slug": "actions"},
+                }
+            ],
+            project_id=kwargs["project_id"],
+            owner=kwargs["owner"],
+            repo=kwargs["repo"],
+            pr_number=kwargs["pr_number"],
+            head_sha=kwargs["head_sha"],
+            reported_total=1,
+            pages_fetched=1,
+        )
+
+    inspector = AsyncMock(side_effect=external_inspection)
+    monkeypatch.setattr(capability_router, inspector_name, inspector)
+    parameters = {"pr_number": 31}
+    if capability_id == "pr.checks.inspect":
+        parameters["head_sha"] = head_sha
+    body = ResidentCapabilityRequest(
+        capability_id=capability_id,
+        parameters=parameters,
+    )
+    token = _turn_token(project, turn_task)
+
+    result = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    assert result["evidence"]["kind"] == evidence_kind
+    receipt = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalar_one()
+    assert receipt.capability == capability_id
+    assert receipt.operation_kind == operation_kind
+    assert receipt.receipt["structured_result"]["evidence"] == [result["evidence"]]
+
+    replay = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    assert replay == result
+    inspector.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_pr_inspection_cannot_settle_after_authority_changes(
     authority_db, monkeypatch
 ):
@@ -1855,7 +1965,16 @@ async def test_pr_inspection_lease_fences_stale_attempt_and_fresh_duplicate_io(
 
     from app.routers import agent_resident_capabilities as capability_router
     from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_external_inspection import (
+        EXTERNAL_INSPECTION_LEASE_SECONDS,
+        EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS,
+    )
     from app.strategic_resident_pr_inspection import build_pr_evidence
+
+    assert (
+        EXTERNAL_INSPECTION_LEASE_SECONDS
+        > EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS
+    )
 
     project, turn_task, _resident = await _authority_rows(authority_db)
     project.github_owner = "BlueprintAIStudio"
@@ -1915,14 +2034,40 @@ async def test_pr_inspection_lease_fences_stale_attempt_and_fresh_duplicate_io(
     assert in_progress.value.headers and in_progress.value.headers["Retry-After"]
     assert inspector.await_count == 1
 
-    # Expire A's lease, then let B claim a new attempt while A is still stalled.
+    # Even at the perform deadline, A still owns a safety-margin lease. A
+    # duplicate therefore cannot reclaim while legal execution remains possible.
+    async with AsyncSession(
+        bind=authority_db.bind, expire_on_commit=False, autoflush=False
+    ) as deadline_session:
+        reservation = (
+            await deadline_session.execute(select(StrategicOperationReceipt))
+        ).scalar_one()
+        reservation.updated_at = reservation.updated_at - timedelta(
+            seconds=EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS
+        )
+        deadline_session.add(reservation)
+        await deadline_session.commit()
+
+    async with AsyncSession(
+        bind=authority_db.bind, expire_on_commit=False, autoflush=False
+    ) as duplicate_session:
+        with pytest.raises(HTTPException) as still_in_progress:
+            await capability_router.invoke_resident_capability(
+                None, body, session=duplicate_session, token=token
+            )
+    assert still_in_progress.value.status_code == 409
+    assert inspector.await_count == 1
+
+    # Once the safety-margin lease itself expires, B may reclaim after a crash.
     async with AsyncSession(
         bind=authority_db.bind, expire_on_commit=False, autoflush=False
     ) as expiry_session:
         reservation = (
             await expiry_session.execute(select(StrategicOperationReceipt))
         ).scalar_one()
-        reservation.updated_at = reservation.updated_at - timedelta(seconds=31)
+        reservation.updated_at = reservation.updated_at - timedelta(
+            seconds=EXTERNAL_INSPECTION_LEASE_SECONDS + 1
+        )
         expiry_session.add(reservation)
         await expiry_session.commit()
 
@@ -1946,6 +2091,77 @@ async def test_pr_inspection_lease_fences_stale_attempt_and_fresh_duplicate_io(
     result_b = await attempt_b
     assert result_b["evidence"]["data"]["title"] == "renewed attempt B"
     assert inspector.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_pr_inspection_total_timeout_releases_reservation_for_retry(
+    authority_db, monkeypatch
+):
+    from app import strategic_resident_external_inspection as external_inspection
+    from app.routers import agent_resident_capabilities as capability_router
+    from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
+    from app.strategic_resident_pr_inspection import build_pr_evidence
+
+    project, turn_task, _resident = await _authority_rows(authority_db)
+    project.github_owner = "BlueprintAIStudio"
+    project.github_repo = "Blueprint"
+    turn_task.vm_instance_id = "vm-1"
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: "ctx-pr-total-timeout",
+        "_strategic_resident_claim_nonce": "nonce-1",
+    }
+    authority_db.add_all([project, turn_task])
+    await authority_db.commit()
+
+    monkeypatch.setattr(
+        external_inspection,
+        "EXTERNAL_INSPECTION_TOTAL_TIMEOUT_SECONDS",
+        0.01,
+    )
+
+    async def time_out(**kwargs):
+        await asyncio.sleep(60)
+        raise AssertionError("cancelled inspection unexpectedly completed")
+
+    inspector = AsyncMock(side_effect=time_out)
+    monkeypatch.setattr(capability_router, "inspect_project_pr", inspector)
+    body = ResidentCapabilityRequest(
+        capability_id="pr.inspect", parameters={"pr_number": 23}
+    )
+    token = _turn_token(project, turn_task)
+
+    with pytest.raises(HTTPException) as timed_out:
+        await capability_router.invoke_resident_capability(
+            None, body, session=authority_db, token=token
+        )
+    assert timed_out.value.status_code == 504
+    assert "total time limit" in str(timed_out.value.detail)
+    reservation = (
+        await authority_db.execute(select(StrategicOperationReceipt))
+    ).scalar_one()
+    assert reservation.status == "pending"
+    assert inspector.await_count == 1
+
+    async def succeed(**kwargs):
+        return build_pr_evidence(
+            _github_pr_payload(
+                owner=kwargs["owner"],
+                repo=kwargs["repo"],
+                pr_number=kwargs["pr_number"],
+            ),
+            **_pr_evidence_kwargs(kwargs),
+        )
+
+    monkeypatch.setattr(
+        capability_router, "inspect_project_pr", AsyncMock(side_effect=succeed)
+    )
+    result = await capability_router.invoke_resident_capability(
+        None, body, session=authority_db, token=token
+    )
+    assert result["evidence"]["data"]["pr_number"] == 23
+    await authority_db.refresh(reservation)
+    assert reservation.status == "applied"
 
 
 @pytest.mark.asyncio
@@ -2751,7 +2967,7 @@ async def test_managed_task_create_is_atomic_replay_safe_and_source_bound(
                         "checksum": "c" * 64,
                         "inspected_at": "2026-07-18T00:00:00Z",
                     }
-                ],
+                ] if debug_target else [],
             },
             "target_task_id": debug_target.id if debug_target else None,
         }
@@ -2790,9 +3006,10 @@ async def test_managed_task_create_is_atomic_replay_safe_and_source_bound(
     assert lineage["context_hash"] == "b" * 64
     assert lineage["artifact_refs"][0]["revision"] == 7
     assert lineage["artifact_refs"][0]["checksum"] == "a" * 64
-    assert lineage["evidence"][0]["source_id"] == (
-        str(debug_target.id) if debug_target else "task:source"
-    )
+    if debug_target:
+        assert lineage["evidence"][0]["source_id"] == str(debug_target.id)
+    else:
+        assert lineage["evidence"] == []
     assert set(lineage["artifact_refs"][0]) == {
         "artifact_ref_id",
         "tool_id",
@@ -2818,12 +3035,25 @@ async def test_managed_task_create_is_atomic_replay_safe_and_source_bound(
             **request.__dict__,
             "request_payload": {
                 **dict(request.request_payload),
-                "_source_evidence": [
-                    {
-                        **dict(request.request_payload["_source_evidence"][0]),
-                        "checksum": "e" * 64,
-                    }
-                ],
+                "_source_evidence": (
+                    [
+                        {
+                            **dict(request.request_payload["_source_evidence"][0]),
+                            "checksum": "e" * 64,
+                        }
+                    ]
+                    if debug_target
+                    else [
+                        {
+                            "kind": "task",
+                            "project_id": str(project.id),
+                            "source_id": "newly-added-evidence",
+                            "revision": "revision-2",
+                            "checksum": "e" * 64,
+                            "inspected_at": "2026-07-18T00:00:00Z",
+                        }
+                    ]
+                ),
             },
         }
     )

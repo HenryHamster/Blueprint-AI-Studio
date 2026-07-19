@@ -109,7 +109,10 @@ def test_capability_registry_declares_complete_safety_contracts():
         assert item.receipt_fields
         assert tuple(spec.name for spec in item.parameter_specs) == item.required_parameters
         if item.mode is CapabilityMode.mutate:
-            assert item.evidence_preconditions
+            if item.capability_id == "task.code_change.create":
+                assert item.evidence_preconditions == ()
+            else:
+                assert item.evidence_preconditions
             assert item.idempotency == "operation_id"
             assert item.reconciliation != "not_required"
 
@@ -125,8 +128,13 @@ def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
     assert next(item for item in catalog if item["id"] == "runner.inspect")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "runner.list")["availability"] == "invoke"
     assert next(item for item in catalog if item["id"] == "pr.inspect")["availability"] == "invoke"
-    assert next(item for item in catalog if item["id"] == "pr.diff.inspect")["availability"] == "propose_only"
-    assert next(item for item in catalog if item["id"] == "pr.checks.inspect")["availability"] == "propose_only"
+    assert next(item for item in catalog if item["id"] == "pr.diff.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "pr.checks.inspect")["availability"] == "invoke"
+    assert next(item for item in catalog if item["id"] == "deployment.inspect")["availability"] == "propose_only"
+    assert capability_for("pr.checks.inspect").required_parameters == (
+        "pr_number",
+        "head_sha",
+    )
     assert next(item for item in catalog if item["id"] == "pr.merge")["availability"] == "propose_only"
 
 
@@ -492,16 +500,34 @@ async def test_task_bound_capability_route_invokes_only_implemented_inspection(
         kind="task",
     )
 
-    with pytest.raises(HTTPException) as unavailable:
-        await capability_router.invoke_resident_capability(
-            None,
-            ResidentCapabilityRequest(
-                capability_id="pr.diff.inspect", parameters={"pr_number": 12}
-            ),
-            db_session,
-            token,
-        )
-    assert unavailable.value.status_code == 501
+    external = AsyncMock(return_value={"capability_id": "pr.diff.inspect"})
+    monkeypatch.setattr(capability_router, "invoke_pr_diff_inspection", external)
+    assert await capability_router.invoke_resident_capability(
+        None,
+        ResidentCapabilityRequest(
+            capability_id="pr.diff.inspect", parameters={"pr_number": 12}
+        ),
+        db_session,
+        token,
+    ) == {"capability_id": "pr.diff.inspect"}
+    external.assert_awaited_once()
+
+    checks = AsyncMock(return_value={"capability_id": "pr.checks.inspect"})
+    monkeypatch.setattr(capability_router, "invoke_pr_checks_inspection", checks)
+    head_sha = "b" * 40
+    assert await capability_router.invoke_resident_capability(
+        None,
+        ResidentCapabilityRequest(
+            capability_id="pr.checks.inspect",
+            parameters={"pr_number": 12, "head_sha": head_sha},
+        ),
+        db_session,
+        token,
+    ) == {"capability_id": "pr.checks.inspect"}
+    assert checks.await_args.kwargs["parameters"] == {
+        "pr_number": 12,
+        "head_sha": head_sha,
+    }
 
     with pytest.raises(HTTPException) as mutation:
         await capability_router.invoke_resident_capability(
