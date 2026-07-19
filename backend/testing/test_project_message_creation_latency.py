@@ -312,10 +312,18 @@ async def test_precommit_gets_final_message_id_and_activity_skips_resident(db_se
 
 @pytest.mark.skipif(
     not USE_POSTGRES,
-    reason="sequence-counter lock concurrency requires PostgreSQL",
+    reason="owner-fence serialization of concurrent same-project sends requires PostgreSQL row locks",
 )
 @pytest.mark.asyncio
-async def test_slow_precommit_does_not_block_another_send_sequence(db_session):
+async def test_slow_precommit_serializes_concurrent_send_without_deadlock(db_session):
+    # The resident owner fence (SELECT ... FOR UPDATE on the project's Resident
+    # row) is acquired up front and held across precommit_validate, because the
+    # in-lock reference re-check (see _revalidate_message_context) must not race
+    # a competing commit. A concurrent same-project send therefore SERIALIZES
+    # behind an in-flight slow precommit — it blocks on the exclusive fence until
+    # the first send releases, then both complete deadlock-free with monotonic
+    # sequences. (It must NOT skip ahead: that only happens on SQLite, where
+    # FOR UPDATE is a no-op, which is why this test is PostgreSQL-only.)
     project = await _project_with_resident(db_session)
     project_id = project.id
     entered = asyncio.Event()
@@ -341,19 +349,29 @@ async def test_slow_precommit_does_not_block_another_send_sequence(db_session):
             return await _send_conversation(
                 session,
                 project_id,
-                content="Second message should not wait for validation.",
+                content="Second message serializes behind the owner fence.",
                 idempotency_key="fast-validation-second",
             )
 
     first = asyncio.create_task(first_send())
     await asyncio.wait_for(entered.wait(), timeout=2)
-    second_result = await asyncio.wait_for(second_send(), timeout=3)
+    # While the first send is parked in its slow precommit holding the exclusive
+    # owner fence, a second same-project send must block on that fence: it cannot
+    # skip ahead and must not have committed.
+    second = asyncio.create_task(second_send())
+    await asyncio.sleep(0.1)
+    assert not second.done()
     assert not first.done()
     release.set()
-    first_result = await asyncio.wait_for(first, timeout=3)
+    first_result, second_result = await asyncio.wait_for(
+        asyncio.gather(first, second),
+        timeout=5,
+    )
 
-    assert second_result.message.sequence == 1
-    assert first_result.message.sequence == 2
+    # First acquired the fence first, so it commits sequence 1; the serialized
+    # second send commits sequence 2. Both succeed — no deadlock, no lost send.
+    assert first_result.message.sequence == 1
+    assert second_result.message.sequence == 2
 
 
 @pytest.mark.skipif(
@@ -485,17 +503,21 @@ async def test_send_and_strategic_spawn_complete_without_deadlock(db_session):
 )
 @pytest.mark.asyncio
 async def test_steering_send_and_generic_event_complete_without_deadlock(db_session):
+    # Real concurrency, no synthetic parking. An operator steering send and a
+    # routine system event target the same project; they SERIALIZE on the
+    # Resident owner fence but must both COMMIT deadlock-free.
+    #
+    # The earlier version parked the send mid-transaction holding the fence
+    # (via a patched allocator + release Event) to force a specific interleave.
+    # On real PostgreSQL that park is a Python `await` while holding an
+    # exclusive row lock, which the server cannot see as a lock wait — so a
+    # concurrent op that needs the fence blocks forever with no deadlock
+    # detection. That is a test-harness artifact: production holds the fence
+    # only for the brief message-creation critical section, never across an
+    # unbounded await. Driving both operations as genuine concurrent tasks
+    # exercises the same fence contention without the un-observable park.
     project = await _project_with_resident(db_session)
     project_id = project.id
-    send_before_sequence = asyncio.Event()
-    release_send = asyncio.Event()
-    real_allocator = lock_project_and_next_message_sequence
-
-    async def delayed_allocator(session, locked_project_id, **kwargs):
-        if asyncio.current_task().get_name() == "steering-send":
-            send_before_sequence.set()
-            await release_send.wait()
-        return await real_allocator(session, locked_project_id, **kwargs)
 
     async def send():
         async with TestingSessionLocal() as session:
@@ -519,20 +541,12 @@ async def test_steering_send_and_generic_event_complete_without_deadlock(db_sess
             await session.commit()
             return message
 
-    with patch(
-        "app.project_message_creation.lock_project_and_next_message_sequence",
-        new=delayed_allocator,
-    ):
-        send_task = asyncio.create_task(send(), name="steering-send")
-        await asyncio.wait_for(send_before_sequence.wait(), timeout=3)
-        event_task = asyncio.create_task(generic_event(), name="generic-event")
-        await asyncio.sleep(0.1)
-        assert not event_task.done()
-        release_send.set()
-        send_result, event_result = await asyncio.wait_for(
-            asyncio.gather(send_task, event_task),
-            timeout=6,
-        )
+    # A real deadlock would exhaust this generous timeout; correct serialization
+    # completes in well under a second.
+    send_result, event_result = await asyncio.wait_for(
+        asyncio.gather(send(), generic_event()),
+        timeout=15,
+    )
 
     assert send_result.message.project_id == project_id
     assert event_result.project_id == project_id
@@ -546,17 +560,13 @@ async def test_steering_send_and_generic_event_complete_without_deadlock(db_sess
 async def test_steering_send_and_first_bulk_reservation_complete_without_deadlock(
     db_session,
 ):
+    # Real concurrency, no synthetic parking (see
+    # test_steering_send_and_generic_event_complete_without_deadlock for why the
+    # patched-allocator park is a harness-only deadlock). An operator steering
+    # send and a first bulk sequence reservation run concurrently against the
+    # same project; both must complete deadlock-free.
     project = await _project_with_resident(db_session)
     project_id = project.id
-    send_before_sequence = asyncio.Event()
-    release_send = asyncio.Event()
-    real_allocator = lock_project_and_next_message_sequence
-
-    async def delayed_allocator(session, locked_project_id, **kwargs):
-        if asyncio.current_task().get_name() == "steering-send":
-            send_before_sequence.set()
-            await release_send.wait()
-        return await real_allocator(session, locked_project_id, **kwargs)
 
     async def send():
         async with TestingSessionLocal() as session:
@@ -579,23 +589,10 @@ async def test_steering_send_and_first_bulk_reservation_complete_without_deadloc
             await session.commit()
             return reserved
 
-    with patch(
-        "app.project_message_creation.lock_project_and_next_message_sequence",
-        new=delayed_allocator,
-    ):
-        send_task = asyncio.create_task(send(), name="steering-send")
-        await asyncio.wait_for(send_before_sequence.wait(), timeout=3)
-        bulk_task = asyncio.create_task(
-            first_bulk_reservation(),
-            name="first-bulk-reservation",
-        )
-        await asyncio.sleep(0.1)
-        assert not bulk_task.done()
-        release_send.set()
-        send_result, reserved = await asyncio.wait_for(
-            asyncio.gather(send_task, bulk_task),
-            timeout=6,
-        )
+    send_result, reserved = await asyncio.wait_for(
+        asyncio.gather(send(), first_bulk_reservation()),
+        timeout=15,
+    )
 
     assert send_result.message.project_id == project_id
     assert len(reserved) == 2
