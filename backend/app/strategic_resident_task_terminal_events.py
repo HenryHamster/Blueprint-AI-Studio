@@ -98,8 +98,10 @@ def register_sqlite_terminal_event_listener(
 
     @event.listens_for(Session, "before_flush")
     def _emit_managed_task_terminal_events(session, flush_context, instances):
-        bind = session.get_bind()
-        if bind.dialect.name == "postgresql":
+        from app.database import resolve_dialect_name  # noqa: PLC0415 — local import avoids load cycle
+
+        dialect_name = resolve_dialect_name(session)
+        if dialect_name == "postgresql":
             return
         candidate_tasks = [
             task
@@ -110,7 +112,7 @@ def register_sqlite_terminal_event_listener(
         ]
         if not candidate_tasks:
             return
-        if bind.dialect.name == "sqlite":
+        if dialect_name == "sqlite":
             installed = session.connection().exec_driver_sql(
                 "SELECT 1 FROM sqlite_master "
                 "WHERE type = 'trigger' AND name = ? LIMIT 1",

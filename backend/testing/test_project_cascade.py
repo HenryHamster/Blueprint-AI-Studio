@@ -21,6 +21,8 @@ import uuid
 import pytest
 from sqlalchemy import delete as sql_delete, select, text
 
+from testing._resident_seed import seed_without_authority_enforcement
+
 from app.models import (
     Alert,
     AnomalyFingerprintState,
@@ -260,43 +262,54 @@ async def test_project_delete_cascades_resident_checkpoint_and_receipt(db_sessio
     await db_session.commit()
     await db_session.refresh(task)
 
-    resident = StrategicResident(
-        project_id=project.id,
-        engine_owner="strategic_resident",
-        authority_generation=1,
-        active_turn_task_id=task.id,
-        active_turn_lane="interactive",
-    )
-    db_session.add(resident)
-    await db_session.flush()
-    checkpoint = StrategicResidentCheckpoint(
-        project_id=project.id,
-        version=1,
-        schema_version=1,
-        content_hash="a" * 64,
-        checkpoint={"schema_version": 1},
-        authority_generation=1,
-        source_turn_task_id=None,
-    )
-    db_session.add(checkpoint)
-    await db_session.flush()
-    resident.current_checkpoint_id = checkpoint.id
-    receipt = StrategicOperationReceipt(
-        project_id=project.id,
-        turn_task_id=task.id,
-        authority_generation=1,
-        operation_id="cascade-op",
-        operation_kind="project_mutation",
-        capability="update_direction",
-        request_hash="b" * 64,
-    )
-    db_session.add(receipt)
-    await db_session.commit()
+    # Seed the resident + current checkpoint + applied receipt under enforcement
+    # bypass: the 0611 fences (checkpoint-insert / receipt mutation-authority)
+    # reject direct seeding of this authoritative starting state on Postgres. The
+    # project DELETE below then runs under LIVE enforcement — that cascade is what
+    # this test verifies.
+    async with seed_without_authority_enforcement(db_session):
+        resident = StrategicResident(
+            project_id=project.id,
+            engine_owner="strategic_resident",
+            authority_generation=1,
+            active_turn_task_id=task.id,
+            active_turn_lane="interactive",
+        )
+        db_session.add(resident)
+        await db_session.flush()
+        checkpoint = StrategicResidentCheckpoint(
+            project_id=project.id,
+            version=1,
+            schema_version=1,
+            content_hash="a" * 64,
+            checkpoint={"schema_version": 1},
+            authority_generation=1,
+            source_turn_task_id=None,
+        )
+        db_session.add(checkpoint)
+        await db_session.flush()
+        resident.current_checkpoint_id = checkpoint.id
+        receipt = StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=task.id,
+            authority_generation=1,
+            operation_id="cascade-op",
+            operation_kind="project_mutation",
+            capability="update_direction",
+            request_hash="b" * 64,
+        )
+        db_session.add(receipt)
+        await db_session.commit()
     checkpoint_id = checkpoint.id
     receipt_id = receipt.id
 
     await db_session.delete(project)
     await db_session.commit()
+    # Assert the actual cascaded DB state, not stale identity-map instances: on
+    # the Postgres shard get() can return a still-cached row for the resident/
+    # checkpoint even though the ondelete=CASCADE FKs (migration 0611) removed
+    # them in the DB. The sibling task-delete test refreshes for the same reason.
+    db_session.expunge_all()
 
     assert await db_session.get(StrategicResident, project.id) is None
     assert await db_session.get(StrategicResidentCheckpoint, checkpoint_id) is None
@@ -322,25 +335,30 @@ async def test_task_delete_clears_resident_active_pair_and_preserves_receipt(db_
     await db_session.commit()
     await db_session.refresh(task)
 
-    resident = StrategicResident(
-        project_id=project.id,
-        engine_owner="strategic_resident",
-        authority_generation=3,
-        active_turn_task_id=task.id,
-        active_turn_lane="background",
-    )
-    receipt = StrategicOperationReceipt(
-        project_id=project.id,
-        turn_task_id=task.id,
-        authority_generation=3,
-        operation_id="preserved-op",
-        operation_kind="project_mutation",
-        capability="set_memory",
-        request_hash="c" * 64,
-    )
-    db_session.add(resident)
-    db_session.add(receipt)
-    await db_session.commit()
+    # Seed the resident + applied receipt under enforcement bypass (the live
+    # 0611 fences reject direct seeding of this authoritative state on Postgres);
+    # the task DELETE below runs under LIVE enforcement — that is the behavior
+    # under test (active-pair cleared, receipt preserved).
+    async with seed_without_authority_enforcement(db_session):
+        resident = StrategicResident(
+            project_id=project.id,
+            engine_owner="strategic_resident",
+            authority_generation=3,
+            active_turn_task_id=task.id,
+            active_turn_lane="background",
+        )
+        receipt = StrategicOperationReceipt(
+            project_id=project.id,
+            turn_task_id=task.id,
+            authority_generation=3,
+            operation_id="preserved-op",
+            operation_kind="project_mutation",
+            capability="set_memory",
+            request_hash="c" * 64,
+        )
+        db_session.add(resident)
+        db_session.add(receipt)
+        await db_session.commit()
     task_id = task.id
     receipt_id = receipt.id
 
