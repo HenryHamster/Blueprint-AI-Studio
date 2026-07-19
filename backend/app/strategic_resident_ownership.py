@@ -335,6 +335,7 @@ async def cutover_to_strategic_resident(
             session,
             project_id,
             reject_active_legacy_cycles=True,
+            reconciliation_at=effective_now,
         )
         checkpoint = await _current_checkpoint(session, resident)
         previous_owner = _enum_value(resident.engine_owner)

@@ -35,6 +35,7 @@ from app.models import (
     Project,
     ReleaseVersion,
     StrategicCycle,
+    StrategicResident,
     Task,
     TaskStatus,
 )
@@ -6229,6 +6230,70 @@ async def test_step7_stalled_cycle_skips_strategic_local_runner_hold(reaper_db):
     assert stalled == 0
     assert task.status == TaskStatus.QUEUED
     assert cycle.outcome == "phase2_running"
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_revalidates_legacy_authority_after_discovery(
+    reaper_db, mocker
+):
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-phase1-before-cutover",
+        payloads=[{"type": "design_doc_update", "scope": "medium"}],
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=_utcnow() - timedelta(hours=1),
+    )
+    reaper_db.add(task)
+    await reaper_db.flush()
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_task_id=task.id,
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    from app import strategic_cycle as strategic_cycle_module
+
+    real_find_stalled = strategic_cycle_module.find_stalled
+
+    async def _cutover_after_discovery(session):
+        candidates = await real_find_stalled(session)
+        session.add(
+            StrategicResident(
+                project_id=project.id,
+                engine_owner="strategic_resident",
+                engine_version="strategic-resident-v1",
+                authority_generation=2,
+            )
+        )
+        await session.flush()
+        return candidates
+
+    mocker.patch(
+        "app.strategic_cycle.find_stalled",
+        side_effect=_cutover_after_discovery,
+    )
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+    assert not reaper_db.in_transaction()
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0
+    assert task.status == TaskStatus.IN_PROGRESS
+    assert cycle.outcome == "phase1_running"
+    alerts = (
+        await reaper_db.execute(select(Alert).where(Alert.project_id == project.id))
+    ).scalars()
+    assert list(alerts) == []
 
 
 # ── Orphan reap crash isolation & quarantine ─────────────────────────────

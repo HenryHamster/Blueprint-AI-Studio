@@ -12,7 +12,7 @@ M4X. M5 is in progress; live pilot rollout, rollback rehearsal, the
 seven-day soak, and legacy retirement remain operator- and calendar-gated after
 the code/test gates pass.
 
-**Last refreshed:** 2026-07-18. Authority/message hardening merged through PR
+**Last refreshed:** 2026-07-19. Authority/message hardening merged through PR
 `#15672` at merge commit `0be99f70e`; the runner/managed-Task/cadence milestone
 merged through PR `#15676` at merge commit `892dfacc3`; terminal managed-Task
 outcomes and bounded `pr.inspect` merged through PR `#15678` at merge commit
@@ -440,6 +440,24 @@ ambient shell access, unrestricted credentials, or broader mutation authority.
   justified by real pilot usage rather than catalog completeness.
 
 ### M5 — Rollout, legacy retirement, and release audit — in progress
+
+Rollout note (2026-07-19): the first Blueprint cutover attempt was safely
+blocked by two stale active `StrategicCycle` rows whose exact linked phase Tasks
+were already `CANCELLED`. The launch hotfix reconciles an active cycle inside
+the canonical cutover transaction only when its authoritative linked phase Task
+has exact project/cycle/type lineage, is `FAILED` or `CANCELLED`, and has no
+`post_commit_pending` work. It records the corresponding terminal cycle outcome,
+timestamp, and failure reason before the ownership flip. `COMPLETED` Tasks,
+live Tasks, pending completion work, missing Tasks, inconsistent lineage, and
+mixed unsafe inventories remain hard blockers; mixed reconciliation rolls back
+atomically. The stalled-cycle reaper now revalidates legacy ownership and exact
+cycle/Task state under four bounded, canonically ordered lock batches before it
+mutates, preventing a stale write without broad scan locks or N+1 queries.
+Blueprint activation remains pending a successful cutover retry.
+
+The `phase1_done` state is deliberately conservative: it remains a hard blocker
+even when the linked phase-1 Task is terminal because phase-2 spawn and output
+application may still be in flight or ambiguous.
 
 - Complete shadow comparisons and rollout health surfaces, then atomically flip
   per-project engine ownership at a checkpoint boundary.
