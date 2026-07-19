@@ -4145,6 +4145,7 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     name resolve through ``working_capability_names`` +
     ``registry_satisfies_capability_need``."""
     from app.capability_registry import (
+        PLATFORM_WORKING_CAPABILITIES,
         registry_satisfies_capability_need,
         working_capability_names,
     )
@@ -4176,9 +4177,17 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     assert names == ["ci-pipeline"]
 
     # working_capability_names folds the absorbed aliases in alongside the
-    # survivor's own name.
+    # survivor's own name. It also ALWAYS includes the always-working
+    # PLATFORM_WORKING_CAPABILITIES (foundation capabilities unrelated to this
+    # consolidation), so the survivor + its three absorbed aliases are exactly
+    # the project-model contribution on top of the platform set.
     working = working_capability_names(new_raw)
-    assert working == {"ci-pipeline", "ci-poll", "ci-resolve", "ci-fix-spawn"}
+    assert working == {
+        "ci-pipeline",
+        "ci-poll",
+        "ci-resolve",
+        "ci-fix-spawn",
+    } | PLATFORM_WORKING_CAPABILITIES
 
     # Each absorbed old name resolves as satisfied-by-the-codebase through the
     # exact helper pair the blocked-resume matcher uses.

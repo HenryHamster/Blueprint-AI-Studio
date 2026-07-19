@@ -1743,6 +1743,13 @@ async def test_pr_inspection_cannot_settle_after_project_repository_changes(
 
     inspector = AsyncMock(side_effect=change_repo_then_return)
     monkeypatch.setattr(capability_router, "inspect_project_pr", inspector)
+    # The repository-change rejection below correctly rolls back the session,
+    # which EXPIRES every ORM instance (real expiry is active on the Postgres
+    # shard). Building the turn token from ``project``/``turn_task`` AFTER that
+    # rollback would lazy-load their expired PKs -> MissingGreenlet. The token
+    # content is invariant across both calls, so snapshot it once here while the
+    # instances are still populated.
+    token = _turn_token(project, turn_task)
     with pytest.raises(HTTPException) as changed:
         await capability_router.invoke_resident_capability(
             None,
@@ -1750,7 +1757,7 @@ async def test_pr_inspection_cannot_settle_after_project_repository_changes(
                 capability_id="pr.inspect", parameters={"pr_number": 21}
             ),
             session=authority_db,
-            token=_turn_token(project, turn_task),
+            token=token,
         )
     assert changed.value.status_code == 409
     assert "repository changed" in str(changed.value.detail)
@@ -1774,7 +1781,7 @@ async def test_pr_inspection_cannot_settle_after_project_repository_changes(
             capability_id="pr.inspect", parameters={"pr_number": 21}
         ),
         session=authority_db,
-        token=_turn_token(project, turn_task),
+        token=token,
     )
     assert rebound["evidence"]["source_id"] == (
         "github-pr:BlueprintAIStudio/DifferentRepo#21"

@@ -381,6 +381,12 @@ async def test_dedicated_resolver_releases_before_fallback_mint(
             github_installation_id="installation-7",
         ),
     )
+    # Release mode ends the read transaction with ``session.rollback()`` before the
+    # fallback mint (that is exactly what this test verifies). On Postgres, rollback
+    # EXPIRES every ORM instance in the session, so reading ``project.id`` afterwards
+    # would trigger a sync lazy-reload -> MissingGreenlet. Snapshot the id now, while
+    # ``project`` is still populated, and use the snapshot in cleanup below.
+    project_id = str(project.id)
 
     async def unavailable_app_token(owner, repo):
         assert not db_session.in_transaction()
@@ -412,7 +418,6 @@ async def test_dedicated_resolver_releases_before_fallback_mint(
             "fallback-detached",
         )
     finally:
-        project_id = str(project.id)
         resolver._github_token_cache.pop(project_id, None)
         resolver.forget_project_repo(project_id)
 
