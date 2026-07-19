@@ -162,3 +162,55 @@ async def test_engine_switch_requires_owner_role(client: AsyncClient, db_session
             )
         )
     ).scalar_one_or_none() is None
+
+
+@pytest.mark.asyncio
+async def test_cutover_endpoint_reconciles_cancelled_legacy_cycle(
+    client: AsyncClient, db_session
+):
+    from datetime import datetime, timezone
+
+    from app.models import StrategicCycle, Task, TaskStatus
+
+    project = await _project_with_role(db_session)
+    cycle_id = f"sc-{uuid.uuid4().hex[:12]}"
+    terminal_at = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    task = Task(
+        project_id=project.id,
+        title="Cancelled legacy strategic cycle",
+        payloads=[{"type": "design_doc_update"}],
+        context={"strategic_cycle_id": cycle_id},
+        strategic_cycle_id=cycle_id,
+        status=TaskStatus.CANCELLED,
+        completed_at=terminal_at,
+        latest_status_message="cancelled by operator before Resident cutover",
+    )
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add(
+        StrategicCycle(
+            id=cycle_id,
+            project_id=project.id,
+            outcome="phase1_running",
+            phase1_task_id=task.id,
+        )
+    )
+    await db_session.commit()
+
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/resident-engine/cutover"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["new_owner"] == "strategic_resident"
+    await db_session.rollback()
+    resident = await _resident(db_session, project.id)
+    cycle = (
+        await db_session.execute(
+            select(StrategicCycle).where(StrategicCycle.id == cycle_id)
+        )
+    ).scalar_one()
+    assert resident.engine_owner == "strategic_resident"
+    assert cycle.outcome == "failed_phase1"
+    assert cycle.phase1_completed_at == terminal_at
+    assert "CANCELLED" in (cycle.failure_reason or "")

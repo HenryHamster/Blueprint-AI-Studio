@@ -1702,3 +1702,201 @@ async def test_concurrent_cutovers_serialize_to_one_generation(db_session):
             )
             == 0
         )
+
+async def _seed_terminal_active_cycle(
+    factory,
+    project_id,
+    *,
+    outcome: str,
+    task_type: str,
+    status: TaskStatus,
+    post_commit_pending: bool = False,
+):
+    cycle_id = f"sc-{uuid.uuid4().hex[:12]}"
+    terminal_at = datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc).replace(tzinfo=None)
+    async with factory() as session, session.begin():
+        task = Task(
+            project_id=project_id,
+            title=f"Legacy {task_type}",
+            payloads=[{"type": task_type}],
+            context={"strategic_cycle_id": cycle_id},
+            strategic_cycle_id=cycle_id,
+            status=status,
+            completed_at=terminal_at,
+            post_commit_pending=post_commit_pending,
+            latest_status_message=f"terminal {status.value.lower()}",
+        )
+        session.add(task)
+        await session.flush()
+        cycle = StrategicCycle(
+            id=cycle_id,
+            project_id=project_id,
+            outcome=outcome,
+            phase1_task_id=task.id if task_type == "design_doc_update" else None,
+            phase2_task_id=task.id if task_type == "strategic_review" else None,
+        )
+        session.add(cycle)
+        task_id = task.id
+    return cycle_id, task_id, terminal_at
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "task_type", "status", "terminal_outcome", "timestamp_attr"),
+    [
+        (
+            "phase1_running",
+            "design_doc_update",
+            TaskStatus.CANCELLED,
+            "failed_phase1",
+            "phase1_completed_at",
+        ),
+        (
+            "phase2_running",
+            "strategic_review",
+            TaskStatus.FAILED,
+            "failed_phase2",
+            "phase2_completed_at",
+        ),
+    ],
+)
+async def test_cutover_reconciles_failed_or_cancelled_linked_cycle_task(
+    ownership_factory,
+    outcome,
+    task_type,
+    status,
+    terminal_outcome,
+    timestamp_attr,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    cycle_id, task_id, terminal_at = await _seed_terminal_active_cycle(
+        ownership_factory,
+        project_id,
+        outcome=outcome,
+        task_type=task_type,
+        status=status,
+    )
+
+    transition = await cutover_to_strategic_resident(
+        ownership_factory,
+        project_id,
+        now=datetime(2026, 7, 19, 12, 5, tzinfo=timezone.utc),
+    )
+
+    assert transition.new_owner == "strategic_resident"
+    async with ownership_factory() as session:
+        cycle = await session.get(StrategicCycle, cycle_id)
+        assert cycle is not None
+        assert cycle.outcome == terminal_outcome
+        assert getattr(cycle, timestamp_attr) == terminal_at
+        assert str(task_id) in (cycle.failure_reason or "")
+        assert status.value in (cycle.failure_reason or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "post_commit_pending", "reason"),
+    [
+        (TaskStatus.COMPLETED, False, "remains COMPLETED"),
+        (TaskStatus.FAILED, True, "post-commit work pending"),
+    ],
+)
+async def test_cutover_does_not_discard_unsettled_cycle_completion(
+    ownership_factory,
+    status,
+    post_commit_pending,
+    reason,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    cycle_id, _task_id, _terminal_at = await _seed_terminal_active_cycle(
+        ownership_factory,
+        project_id,
+        outcome="phase1_running",
+        task_type="design_doc_update",
+        status=status,
+        post_commit_pending=post_commit_pending,
+    )
+
+    with pytest.raises(LegacyResidentDrainRequired, match=reason):
+        await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        cycle = await session.get(StrategicCycle, cycle_id)
+        assert resident is not None and resident.engine_owner == "legacy"
+        assert cycle is not None and cycle.outcome == "phase1_running"
+        assert cycle.failure_reason is None
+
+
+@pytest.mark.asyncio
+async def test_cutover_cycle_reconciliation_rolls_back_atomically_on_mixed_inventory(
+    ownership_factory,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    eligible_cycle_id, _task_id, _terminal_at = await _seed_terminal_active_cycle(
+        ownership_factory,
+        project_id,
+        outcome="phase1_running",
+        task_type="design_doc_update",
+        status=TaskStatus.CANCELLED,
+    )
+    live_cycle_id = f"sc-{uuid.uuid4().hex[:12]}"
+    async with ownership_factory() as session, session.begin():
+        live_task = Task(
+            project_id=project_id,
+            title="Live legacy strategic review",
+            payloads=[{"type": "strategic_review"}],
+            context={"strategic_cycle_id": live_cycle_id},
+            strategic_cycle_id=live_cycle_id,
+            status=TaskStatus.IN_PROGRESS,
+        )
+        session.add(live_task)
+        await session.flush()
+        session.add(
+            StrategicCycle(
+                id=live_cycle_id,
+                project_id=project_id,
+                outcome="phase2_running",
+                phase2_task_id=live_task.id,
+            )
+        )
+
+    with pytest.raises(LegacyResidentDrainRequired, match="remains IN_PROGRESS"):
+        await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        eligible = await session.get(StrategicCycle, eligible_cycle_id)
+        live = await session.get(StrategicCycle, live_cycle_id)
+        resident = await session.get(StrategicResident, project_id)
+        assert eligible is not None and eligible.outcome == "phase1_running"
+        assert eligible.failure_reason is None
+        assert live is not None and live.outcome == "phase2_running"
+        assert resident is not None and resident.engine_owner == "legacy"
+
+
+@pytest.mark.asyncio
+async def test_cutover_keeps_phase1_done_as_hard_blocker(ownership_factory):
+    project_id, _ = await _seed_project(ownership_factory)
+    cycle_id, _task_id, _terminal_at = await _seed_terminal_active_cycle(
+        ownership_factory,
+        project_id,
+        outcome="phase1_done",
+        task_type="design_doc_update",
+        status=TaskStatus.COMPLETED,
+    )
+
+    with pytest.raises(
+        LegacyResidentDrainRequired,
+        match=f"StrategicCycle {cycle_id} remains active in phase1_done",
+    ):
+        await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        cycle = await session.get(StrategicCycle, cycle_id)
+        assert resident is not None and resident.engine_owner == "legacy"
+        assert cycle is not None
+        assert cycle.outcome == "phase1_done"
+        assert cycle.failure_reason is None
+        assert cycle.phase2_task_id is None
+        assert cycle.phase2_completed_at is None
