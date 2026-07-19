@@ -34633,6 +34633,120 @@ async def test_auto_merge_stall_alert_fires_when_stuck(db_session):
 
 
 @pytest.mark.asyncio
+async def test_auto_merge_stall_alert_suppressed_while_pipeline_paused(db_session):
+    """PAUSE-AWARE auto-merge stall alert: while the pipeline is PAUSED the
+    promotion PR cannot merge, so counting pause time toward the stall threshold
+    would fire a false "promotion stalled" alert for a pause the operator started.
+    The stall age subtracts the open pause window, so no alert fires — mirroring
+    the pause-aware promotion_pending backstop so the alert and the force-fail
+    agree on what 'stalled' means."""
+    from datetime import timedelta
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    old_enabled = (
+        _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://github.com/pr/77",
+            "auto_merge_enabled": True,
+            "enabled_at": old_enabled,
+        },
+    }
+    db_session.add(version)
+    # Paused since just after arming → nearly the whole stall age is pause time.
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is False
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_alert_fires_despite_brief_pause(db_session):
+    """MUTATION-PROOF companion: the pause-aware stall alert is not a blanket
+    mute. A promotion past the stall threshold with only a brief (60s) pause still
+    has active age above the threshold and DOES fire."""
+    from datetime import timedelta
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    old_enabled = (
+        _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://github.com/pr/77",
+            "auto_merge_enabled": True,
+            "enabled_at": old_enabled,
+        },
+    }
+    db_session.add(version)
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(seconds=60),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is True
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+
+
+@pytest.mark.asyncio
 async def test_auto_merge_stall_does_not_fire_before_threshold(db_session):
     """_check_version_auto_merge_stall does NOT fire when auto-merge was enabled
     recently (under the stall threshold)."""
