@@ -57,6 +57,22 @@ only when required:
 See `scripts/runner_isolation.py` for the full decision tables
 (`decide_agent_backend`, `decide_compute_backend`).
 
+### GPU probe image on restricted networks
+
+Before dispatching an image-backed GPU job, the runner proves that its selected
+container runtime can expose a GPU by running `nvidia-smi -L`. By default this
+uses a public CUDA image. If the runner is allowed to pull project/private
+registry images but Docker Hub is blocked, configure a pullable image that
+includes `nvidia-smi` before starting the runner:
+
+```bash
+export BLUEPRINT_RUNNER_GPU_PROBE_IMAGE='registry.example/project/cuda:stable'
+blueprint-runner start --token <token>
+```
+
+The runner uses this image on startup and on its bounded retry cadence; ensure
+the runner's container runtime is authenticated to that registry.
+
 ---
 
 ## 1. WSL PC (developer laptop, WSL2)
@@ -840,8 +856,14 @@ sudo blueprint-runner install --system --token <token>
 ```
 
 The installed unit includes `Restart=always` and `RestartSec=5`. The runner
-exits 0 after a successful self-update and systemd restarts the fresh binary.
-Crashes (non-zero exit) are also restarted.
+exits 0 after a successful self-update and systemd restarts the fresh binary;
+crashes (non-zero exit) are also restarted. `Restart=always` is required, not
+`Restart=on-failure`: the post-update exit is a *clean* exit-0, which
+`on-failure` would NOT restart, silently leaving the self-updated runner dead
+until a manual restart. A deliberate `systemctl --user stop` still stays stopped
+(systemd never applies the restart policy to an operator-initiated stop). A burst
+cap (`StartLimitIntervalSec=60` / `StartLimitBurst=3`) prevents a persistent
+failure from restarting forever.
 
 To view logs: `journalctl --user -u blueprint-runner -f`  
 To restart manually: `systemctl --user restart blueprint-runner`  
@@ -902,10 +924,12 @@ supervisor : [WARN] no process supervisor detected — crashes will not auto-rec
              (while true; do ...; done with BLUEPRINT_RUNNER_SUPERVISED=1).
 ```
 
-When a supervisor is detected, `--check` reports it:
+When a supervisor is detected, `--check` reports it (the `Restart=always`
+reminder appears for systemd because the detector confirms a service unit but
+cannot read its `Restart=` policy — the installed unit sets `always`):
 
 ```
-supervisor : systemd (Restart=always)
+supervisor : systemd (auto-restart on crash/update — needs Restart=always (blueprint-runner install sets it)) [systemd service cgroup (blueprint-runner.service)]
 ```
 
 This warning is advisory — `--check` still exits 0 if isolation and token are

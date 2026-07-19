@@ -573,6 +573,15 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
         provenance = metadata.get("resume_provenance")
         if isinstance(provenance, dict) and provenance:
             data["resume_provenance"] = provenance
+    # Promote watchdog protection-status fields so the agent surface always has them.
+    # Lazy import avoids the circular dependency (compute_jobs imports schemas).
+    from app.compute_jobs import derive_watchdog_protection_status  # noqa: PLC0415
+    data.update(
+        derive_watchdog_protection_status(
+            data.get("polling_metadata"),
+            started_at=data.get("started_at"),
+        )
+    )
     return data
 
 
@@ -881,6 +890,26 @@ class GitHubCreatePRRequest(BaseModel):
 # --- Build Config & Onboarding ---
 
 
+class ProjectVerificationConfig(BaseModel):
+    """Explicit opt-in to Blueprint's receipt-emitting verification protocol."""
+
+    model_config = ConfigDict(extra="forbid")
+    protocol: Literal["blueprint-v1"]
+    harness: str = Field(
+        ...,
+        min_length=1,
+        max_length=500,
+        pattern=r"^[A-Za-z0-9_./-]+$",
+    )
+
+    @field_validator("harness")
+    @classmethod
+    def _validate_harness_path(cls, v: str) -> str:
+        if v.startswith("/") or ".." in v or "\0" in v:
+            raise ValueError("harness must be a safe repository-relative path")
+        return v
+
+
 class BuildConfigDirectoryEntry(BaseModel):
     """A single directory entry within a project's build configuration."""
 
@@ -899,6 +928,14 @@ class BuildConfigDirectoryEntry(BaseModel):
     confirmed_install_cmd: str | None = None
     commands_confirmed_at: str | None = None  # ISO 8601 UTC timestamp
     confirming_task_id: str | None = None
+    project_verification: ProjectVerificationConfig | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _canonicalize_path(cls, v: str) -> str:
+        normalized = v.strip()
+        normalized = normalized.rstrip("/")
+        return normalized or "."
 
 
 class DiscoveredBuildCommandEntry(BaseModel):
@@ -926,6 +963,13 @@ class BuildDiscoveryReport(BaseModel):
     discovered_directories: List[DiscoveredBuildCommandEntry] = Field(
         default_factory=list, max_length=50
     )
+    # The agent VM's live full-clone verdict on whether the repo is empty/
+    # near-empty (same "real source" exclusion rules as the backend classifier).
+    # When present and it disagrees with the durable ``build_config.repo_is_empty``
+    # in EITHER direction, the endpoint re-runs authoritative detection rather
+    # than trusting the stale durable signal. Optional/None for older agents that
+    # do not report it.
+    observed_repo_is_empty: bool | None = None
 
 
 class MigrationConfig(BaseModel):
@@ -1081,13 +1125,25 @@ class BuildConfig(BaseModel):
     # at most the greenfield source-file threshold after excluding
     # docs/config/data files, dotfiles, and common manifests. If any listing
     # needed for that determination failed to fetch (root or first-level
-    # subdirectory), the read is incomplete and this degrades to False
-    # (treat-as-non-empty) — emptiness is never inferred from a partial read.
-    # Keep this count-based rule aligned with the agent's prompt-time detector
-    # so research/plan bootstrap guidance and the durable onboarding signal
-    # agree. Default False so pre-existing projects (and any repo with detected
-    # source) degrade gracefully.
-    repo_is_empty: bool = False
+    # subdirectory), the read is incomplete and this stays None (undetermined)
+    # — emptiness is NEVER inferred from a partial read, exactly like the
+    # ``has_ci`` sibling below. Keep this count-based rule aligned with the
+    # agent's prompt-time detector so research/plan bootstrap guidance and the
+    # durable onboarding signal agree. Tri-state: True = the bounded walk
+    # completed and found at most the greenfield source threshold; False = the
+    # walk completed and found more; None = the read was incomplete/undetected
+    # (legacy stored configs also have None). ``model_dump(exclude_none=True)``
+    # drops the key when None so an undetermined partial walk persists as an
+    # absent key (which every consumer coalesces to "consult the live signal /
+    # self-heal") rather than a durable, authoritative False.
+    repo_is_empty: bool | None = None
+    # The authoritative real-source-file count from the same bounded onboarding
+    # walk that produced ``repo_is_empty`` (documentation/config/dotfiles/common
+    # manifests excluded by the shared exclusion rules). Persisted so the agent's
+    # live clone-time detector can compare like-for-like against the backend's
+    # count instead of recomputing under its own rules. None when the read was
+    # incomplete (emptiness indeterminate) or for configs predating this field.
+    source_file_count: int | None = None
     # Marker that build-config detection did NOT complete at onboarding time —
     # set True only when ``_detect_build_config`` returned an empty/falsy result
     # or raised (a transient GitHub failure: 5xx, rate-limit, network blip, or a

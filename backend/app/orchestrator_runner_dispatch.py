@@ -35,10 +35,12 @@ from app.models import (
     ComputeJobStatus,
     LocalRunner,
     Project,
+    RunnerProjectBinding,
     Task,
     TaskStatus,
 )
 from app.resource_envelope import resolve_project_require_local_runner
+from app.runner_project_binding import allowed_project_ids
 from app.runner_decline import (
     decline_exclusion_is_advisory,
     decline_record_for_runner,
@@ -49,11 +51,15 @@ from app.runner_health_monitors import (  # noqa: F401
     _RUNNER_LIVENESS_SECONDS,
     _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
     _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
+    _VM_LOW_DISK_THRESHOLD_BYTES_DEFAULT,
+    _VM_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
     _check_degraded_runners,
     _check_fleet_no_healthy_runner,
     _check_idle_gpu_runners,
     _check_low_disk_runners,
+    _check_low_disk_vms,
     _check_low_memory_runners,
+    _check_low_memory_vms,
     _sweep_runner_deactivated_escalations,
 )
 from app.shared_state import runtime_config as _runtime_config
@@ -62,6 +68,9 @@ from app.stall_alert_diagnostics import (
     _format_stall_alert,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.strategic_resident_runner_policy import (
+    resident_turn_requires_local_runner,
+)
 from app.time_utils import _utcnow
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -218,6 +227,60 @@ def _coerce_vram_gb(payload: dict) -> tuple[float | None, str | None]:
     return value, None
 
 
+def _coerce_min_compute_capability(payload: dict) -> tuple[float | None, str | None]:
+    """Resolve an image's ``min_compute_capability`` floor to a float, or an error.
+
+    ``min_compute_capability`` is the CUDA compute-capability an image's bundled
+    GPU wheels require (e.g. ``8.0`` for an ``sm_80``-built image). It is the same
+    class of AGENT/OPERATOR-AUTHORED free-form payload data as ``vram_gb`` and is
+    read in the dispatch hot path, so it gets the identical defensive contract: a
+    bare ``float(raw)`` would raise on the values authors actually write (``"8.0"``
+    with a stray unit, ``[8.0]``, ``{}``) and that exception would propagate out of
+    the dispatch cycle, taking down dispatch for EVERY task in the cycle while the
+    offending task dies later, reasonless, in poison quarantine.
+
+    Returns ``(value, None)`` on success or ``(None, error)`` on a value that
+    cannot be a compute-capability figure — the caller fails THAT task with a
+    message naming the bad field and the cycle survives. ``None`` (unset) and a
+    non-positive figure both mean "no floor" and are not errors. ``bool`` is
+    rejected explicitly (an ``int`` subclass, so ``float(True) == 1.0`` would
+    silently mean a 1.0 floor).
+    """
+    raw = payload.get("min_compute_capability") or (
+        payload.get("compute_experiment") or {}
+    ).get("min_compute_capability")
+    if raw is None:
+        return None, None
+    if isinstance(raw, bool):
+        return None, (
+            f"min_compute_capability must be a CUDA compute-capability number "
+            f"(e.g. 7.0 or 8.9); got boolean {raw!r}"
+        )
+    if isinstance(raw, (int, float)):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            value = float(raw.strip())
+        except (ValueError, TypeError):
+            return None, (
+                f"min_compute_capability must be a CUDA compute-capability number "
+                f"(e.g. 7.0 or 8.9); got {raw!r} — drop the unit suffix and requeue"
+            )
+    else:
+        return None, (
+            f"min_compute_capability must be a CUDA compute-capability number "
+            f"(e.g. 7.0 or 8.9); got {type(raw).__name__} {raw!r}"
+        )
+    if not math.isfinite(value):
+        return None, (
+            f"min_compute_capability must be a finite CUDA compute-capability "
+            f"number (e.g. 7.0 or 8.9); got {raw!r}"
+        )
+    if value <= 0:
+        return None, None  # non-positive floor == no floor
+    return value, None
+
+
 # ── Runner eligibility predicates ────────────────────────────────────────────
 # Moved to app/runner_eligibility.py. This module is a chronic size-limit
 # offender (decomposition required; cap bumps are forbidden by
@@ -229,6 +292,7 @@ from app.runner_eligibility import (  # noqa: F401
     _ACTIVE_AGENT_TASK_COUNT_KEY,
     RunnerDispatchSnapshot,
     _coerce_max_concurrent,
+    _job_requires_gpu_in_container,
     _runner_active_compute_job_count,
     _runner_active_task_count,
     _runner_active_work_count,
@@ -236,11 +300,41 @@ from app.runner_eligibility import (  # noqa: F401
     _runner_at_capacity,
     _runner_at_compute_capacity,
     _runner_gpu_capable,
+    _runner_gpu_in_container_capable,
+    _runner_gpu_passthrough_blocker,
     _runner_handles_task_type,
     _runner_has_container_capability,
+    _runner_has_free_disk,
     _runner_has_free_vram,
+    _runner_has_project_verification,
     _runner_max_concurrent_compute,
+    _runner_meets_min_compute_capability,
+    _task_is_authoring,
+    _task_requires_project_verification,
 )
+
+# Free-disk floor a runner must clear to be sent a container-image compute job.
+# A baked compute image is multi-GB and must be PULLED before the job starts;
+# a runner below this floor would die mid-pull ("no space left on device"),
+# wasting the claim. This is a DISPATCH-FIT floor distinct from the (smaller)
+# ``_RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT`` alert threshold — the alert warns
+# an operator, this gate keeps a doomed job from ever being claimed. Overridable
+# via runtime_config ``container_image_min_free_disk_bytes``. Absent
+# ``disk_free_bytes`` telemetry is treated as eligible (backward compatible).
+_CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT = 10_737_418_240  # 10 GiB
+
+
+def _container_image_min_free_disk_bytes() -> int:
+    """The dispatch-fit free-disk floor for container-image jobs (config-overridable)."""
+    try:
+        return int(
+            _runtime_config.get(
+                "container_image_min_free_disk_bytes",
+                _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT,
+            )
+        )
+    except (TypeError, ValueError):
+        return _CONTAINER_IMAGE_MIN_FREE_DISK_BYTES_DEFAULT
 
 
 async def _load_active_runners_cache(
@@ -285,6 +379,13 @@ async def _load_active_runners_cache(
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
         session, runner_ids_for_load
     )
+    # Per-runner project allow-list bindings (many-to-many). A runner is a dispatch
+    # candidate under EVERY project on its allow-list, not only its enrollment
+    # project, so one daemon serves N projects. The enrollment project is the
+    # implicit anchor member and is folded in below regardless of binding rows.
+    bound_projects_by_runner = await _load_runner_project_bindings(
+        session, runner_ids_for_load
+    )
     # Authoritative per-runner agent-task load from Task rows (heartbeat-independent).
     active_task_count_by_runner = await _load_runner_active_task_counts(
         session, runner_ids_for_load
@@ -321,8 +422,52 @@ async def _load_active_runners_cache(
             consecutive_job_failures=consecutive_job_failures or 0,
             hostname=hostname,
         )
-        by_project.setdefault(project_id, []).append(snapshot)
+        # Register the SAME snapshot object under every project on the runner's
+        # allow-list (enrollment project UNIONed with its explicit bindings). Sharing
+        # one object per physical box is what keeps the GPU/concurrency ledger
+        # unified: per-cycle pins and heartbeat-reported active counts are read off
+        # this single snapshot, so a project-B pin still counts against the same
+        # box's capacity when a project-A task is next considered — one physical GPU
+        # can never be double-booked across two projects.
+        allowed_project_ids = {project_id} | bound_projects_by_runner.get(
+            runner_id, set()
+        )
+        for allowed_project_id in allowed_project_ids:
+            by_project.setdefault(allowed_project_id, []).append(snapshot)
     return by_project
+
+
+async def _load_runner_project_bindings(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, set[uuid.UUID]]:
+    """Return the EXPLICIT project allow-list bindings keyed by runner id.
+
+    Reads ``runner_project_binding`` rows for the given runner ids so the dispatch
+    cache can register each runner as a candidate under every project on its
+    allow-list. The enrollment project (``LocalRunner.project_id``) is the implicit
+    anchor member and is folded in by the caller, so this returns only the EXPLICIT
+    bindings. Best-effort: on a query error returns an empty dict, degrading to
+    enrollment-project-only grouping rather than failing the whole dispatch cycle.
+    """
+    if not runner_ids:
+        return {}
+    try:
+        rows = (
+            await session.execute(
+                select(
+                    RunnerProjectBinding.runner_id,
+                    RunnerProjectBinding.project_id,
+                ).where(RunnerProjectBinding.runner_id.in_(runner_ids))
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner project bindings")
+        return {}
+    by_runner: dict[uuid.UUID, set[uuid.UUID]] = {}
+    for runner_id, project_id in rows:
+        by_runner.setdefault(runner_id, set()).add(project_id)
+    return by_runner
 
 
 async def _load_runner_compute_job_assignments(
@@ -335,17 +480,35 @@ async def _load_runner_compute_job_assignments(
     least one runner poll/heartbeat. Counting persisted runner-subprocess jobs
     closes that window so a later orchestrator cycle cannot over-assign a runner
     before it has claimed the first job.
+
+    Attribution is by committed DB fact, not the lossy heartbeat list:
+
+    - A CLAIMED, in-flight job (status RUNNING/POLLING) is attributed to
+      ``ran_on_runner_id`` — the runner that actually holds it, stamped at
+      ``/next-compute-job`` claim time. For robustness on legacy rows predating
+      that column, a RUNNING/POLLING job with a NULL ``ran_on_runner_id`` falls
+      back to the ``polling_metadata['runner_target_id']`` dispatch pin.
+    - A NOT-YET-CLAIMED job (status QUEUED/STARTING, ``ran_on_runner_id`` still
+      NULL) is attributed to the ``runner_target_id`` reservation pin so a
+      reserved-but-unclaimed slot is still counted against its target runner.
     """
     if not runner_ids:
         return {}
     from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from sqlalchemy import or_
 
     runner_id_strings = [str(runner_id) for runner_id in runner_ids]
     runner_target_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    claimed_statuses = {ComputeJobStatus.RUNNING, ComputeJobStatus.POLLING}
     try:
         rows = (
             await session.execute(
-                select(ComputeJob.id, runner_target_expr)
+                select(
+                    ComputeJob.id,
+                    ComputeJob.status,
+                    ComputeJob.ran_on_runner_id,
+                    runner_target_expr,
+                )
                 .where(
                     ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
                     ComputeJob.status.in_(
@@ -356,7 +519,10 @@ async def _load_runner_compute_job_assignments(
                             ComputeJobStatus.POLLING,
                         ]
                     ),
-                    runner_target_expr.in_(runner_id_strings),
+                    or_(
+                        ComputeJob.ran_on_runner_id.in_(runner_ids),
+                        runner_target_expr.in_(runner_id_strings),
+                    ),
                 )
                 .order_by(ComputeJob.created_at.asc())
             )
@@ -366,15 +532,26 @@ async def _load_runner_compute_job_assignments(
         return {}
 
     by_runner: dict[uuid.UUID, list[str]] = {}
+    runner_ids_set = set(runner_ids)
     runner_ids_by_string = {
         str(runner_id): runner_id
         for runner_id in runner_ids
     }
-    for job_id, raw_runner_id in rows:
-        runner_id = runner_ids_by_string.get(str(raw_runner_id))
-        if runner_id is None:
+    for job_id, status, ran_on_runner_id, raw_runner_id in rows:
+        # A claimed in-flight job belongs to the runner that actually holds it
+        # (ran_on_runner_id, stamped at claim). Fall back to the reservation pin
+        # only when that authoritative record is absent — i.e. legacy rows
+        # predating the column, or jobs not yet claimed (QUEUED/STARTING, where
+        # ran_on_runner_id is still NULL and the pin reserves the slot).
+        if status in claimed_statuses and ran_on_runner_id is not None:
+            attributed_runner = (
+                ran_on_runner_id if ran_on_runner_id in runner_ids_set else None
+            )
+        else:
+            attributed_runner = runner_ids_by_string.get(str(raw_runner_id))
+        if attributed_runner is None:
             continue
-        by_runner.setdefault(runner_id, []).append(str(job_id))
+        by_runner.setdefault(attributed_runner, []).append(str(job_id))
     return by_runner
 
 
@@ -432,6 +609,7 @@ async def _load_runner_active_task_counts(
         by_runner[runner_id] = by_runner.get(runner_id, 0) + 1
     return by_runner
 
+
 _BROWSER_EVIDENCE_KINDS = frozenset(
     {"browser", "playwright", "screenshot", "viewport", "visual"}
 )
@@ -445,7 +623,6 @@ def _payload_requires_browser(payload: dict) -> bool:
     if not isinstance(evidence, dict):
         return False
     return str(evidence.get("kind") or "").strip().lower() in _BROWSER_EVIDENCE_KINDS
-
 
 async def _try_runner_dispatch(
     session: AsyncSession,
@@ -479,6 +656,15 @@ async def _try_runner_dispatch(
         return False
     payload = task.first_payload or {}
     task_type = payload.get("type", "")
+    project = (
+        await session.get(Project, task.project_id)
+        if _task_is_authoring(task_type)
+        else None
+    )
+    requires_project_verification = bool(
+        project is not None
+        and _task_requires_project_verification(task_type, project.build_config)
+    )
     # A declared accelerator (flat or nested compute_experiment form) restricts
     # eligibility to GPU runners. Read generically so the gate is uniform; agent
     # task types simply carry no accelerator and are unaffected.
@@ -504,6 +690,18 @@ async def _try_runner_dispatch(
             vram_error,
         )
         return False
+    # A declared min_compute_capability (image GPU-arch floor) restricts eligibility
+    # to runners whose GPUs meet it. Coerced defensively like vram_gb — a bad value
+    # declines to pin (falls through to the compute path, which fails IT honestly).
+    min_compute_capability, min_cc_error = _coerce_min_compute_capability(payload)
+    if min_cc_error is not None:
+        logger.warning(
+            "[RUNNERS] Not pinning task %s to a runner: invalid "
+            "min_compute_capability — %s",
+            task.id,
+            min_cc_error,
+        )
+        return False
     runner = _select_eligible_runner(
         active_runners_cache,
         task.project_id,
@@ -514,6 +712,7 @@ async def _try_runner_dispatch(
         dispatch_seed=task.id.int,
         container_image=container_image,
         vram_gb=vram_gb,
+        min_compute_capability=min_compute_capability,
         # Runners that recently declined THIS task are excluded — otherwise the
         # per-task-stable tiebreak re-pins it to the same runner that just said
         # no, and the pin→pull→decline loop never terminates.
@@ -523,6 +722,7 @@ async def _try_runner_dispatch(
         # pool, and the 900s hold sweep then evicts the task to cloud. While the
         # declines still look transient, re-pick the decliner instead.
         declined_exclusion_advisory=decline_exclusion_is_advisory(task, task_type),
+        requires_project_verification=requires_project_verification,
         requires_browser=_payload_requires_browser(payload),
     )
     if runner is None:
@@ -603,6 +803,8 @@ async def _try_runner_dispatch(
 def _task_requires_strategic_local_runner(task: Task) -> bool:
     payload = task.first_payload or {}
     task_type = str(payload.get("type") or "")
+    if resident_turn_requires_local_runner(task):
+        return True
     return (
         task_type in STRATEGIC_TASK_TYPES
         and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
@@ -778,14 +980,17 @@ async def _diagnose_strict_runner_pin_hold(
     accelerator: str | None,
     container_image: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
+    min_compute_capability: float | None = None,
+    vram_gb: float | None = None,
     declined_record: dict | None = None,
+    requires_project_verification: bool = False,
 ) -> tuple[str, str]:
     """Explain why a strict-pinned runner cannot take this job RIGHT NOW.
 
     Returns ``(reason_code, detail)``. The reason must be truthful and specific
     (runner id + why), never a generic no-runner message: reason codes are
     ``declined_recently`` / ``at_capacity`` / ``task_type_not_allowed`` /
-    ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
+    ``missing_project_verification`` / ``missing_gpu`` / ``missing_container_runtime`` / ``not_eligible`` (live but
     failed another gate) for runners in the live cache, and ``not_found`` /
     ``not_enrolled`` / ``offline`` for runners that are not live. The pair is
     stamped into ``task.context['runner_pin_hold']`` and the hold status message
@@ -837,6 +1042,14 @@ async def _diagnose_strict_runner_pin_hold(
                 "at_capacity",
                 f"runner is at capacity ({load} active+pinned vs {limit_label})",
             )
+        if requires_project_verification and not _runner_has_project_verification(
+            snapshot
+        ):
+            return (
+                "missing_project_verification",
+                "runner has no valid v1 write-agent proof for python3 -m ruff "
+                "and live Docker/Postgres",
+            )
         if accelerator and not (snapshot.capabilities or {}).get("has_gpu"):
             return (
                 "missing_gpu",
@@ -848,6 +1061,41 @@ async def _diagnose_strict_runner_pin_hold(
                 "missing_container_runtime",
                 f"job declares container_image {container_image!r} but the "
                 "runner advertises no container isolation backend",
+            )
+        if container_image:
+            disk_floor = _container_image_min_free_disk_bytes()
+            if not _runner_has_free_disk(snapshot, disk_floor):
+                reported = (snapshot.capabilities or {}).get("disk_free_bytes")
+                return (
+                    "insufficient_disk",
+                    f"job declares container_image {container_image!r} (a multi-GB "
+                    f"image pull) but the runner reports only {reported} free disk "
+                    f"bytes, below the {disk_floor}-byte fit floor — the pull would "
+                    "fail mid-download",
+                )
+        if min_compute_capability and not _runner_meets_min_compute_capability(
+            snapshot, min_compute_capability
+        ):
+            reported = (snapshot.capabilities or {}).get("gpu_compute_capabilities")
+            return (
+                "incompatible_gpu_arch",
+                f"job requires GPU compute capability >= {min_compute_capability} "
+                f"but the runner's GPUs report {reported} — the image cannot run on "
+                "this architecture",
+            )
+        if _job_requires_gpu_in_container(
+            accelerator, container_image, vram_gb
+        ) and not _runner_gpu_in_container_capable(snapshot):
+            gpu_req = (
+                f"accelerator {accelerator!r}"
+                if accelerator
+                else f"vram_gb {vram_gb!r}"
+            )
+            return (
+                "missing_gpu_in_container_capability",
+                f"job declares both container_image {container_image!r} and "
+                f"{gpu_req} but GPU passthrough is not verified: "
+                f"{_runner_gpu_passthrough_blocker(snapshot)}",
             )
         return ("not_eligible", "runner failed dispatch eligibility this cycle")
 
@@ -861,10 +1109,13 @@ async def _diagnose_strict_runner_pin_hold(
     row = await session.get(LocalRunner, runner_uuid)
     if row is None:
         return ("not_found", "no runner with this id is registered")
-    if row.project_id != project_id:
+    # Enrollment now means allow-list membership, not the single home project: a
+    # multi-project runner bound to this project is validly pinnable even when its
+    # home project_id is a different one.
+    if project_id not in await allowed_project_ids(session, row):
         return (
             "not_enrolled",
-            "runner is enrolled in a different project — a pin must name one "
+            "runner is not on this project's allow-list — a pin must name one "
             "of this project's runners",
         )
     last_seen = (
@@ -900,7 +1151,12 @@ async def _lookup_runner_hostname(
             "[RUNNERS] hostname lookup failed for runner %s", runner_id
         )
         return None
-    if runner is None or runner.project_id != project_id:
+    if runner is None:
+        return None
+    # Membership, not the single home project: a multi-project runner pinned to
+    # any allowed project still resolves its hostname for the "waiting for <host>"
+    # hold message.
+    if project_id not in await allowed_project_ids(session, runner):
         return None
     return runner.hostname
 
@@ -916,8 +1172,10 @@ def _select_eligible_runner(
     container_image: str | None = None,
     forced_runner_target_id: str | None = None,
     vram_gb: float | None = None,
+    min_compute_capability: float | None = None,
     declined_runner_ids: set[str] | None = None,
     declined_exclusion_advisory: bool = False,
+    requires_project_verification: bool = False,
     requires_browser: bool = False,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
@@ -931,6 +1189,11 @@ def _select_eligible_runner(
     ``container_image`` is declared the runner must advertise a container isolation
     backend (docker, podman, etc.) — the orchestrator will not route a
     container-image-dependent job to a runner whose isolation support is unknown.
+    When a ``min_compute_capability`` floor is declared (an image's GPU-arch
+    requirement) a runner must have at least one GPU whose reported
+    ``gpu_compute_capabilities`` meets it — an older-arch box (a V100 for an
+    ``sm_80`` image) is excluded so the job holds for compatible hardware instead
+    of dying in the runner's reactive in-sandbox probe.
     A preferred runner wins only after those eligibility checks pass; otherwise
     selection prefers the least EFFECTIVE load — heartbeat-reported active count
     plus pins already made to the runner this cycle — so a same-cycle burst spreads
@@ -990,6 +1253,8 @@ def _select_eligible_runner(
             and (task_type == "compute_experiment" or _runner_agent_available(r))
             and not _runner_at_capacity(r, pins.get(r.id, 0), task_type)
         ]
+        if requires_project_verification:
+            out = [r for r in out if _runner_has_project_verification(r)]
         if requires_browser:
             # Browser-required work is fail-safe: only a current, explicit runner
             # proof is accepted. Older runners omit this capability and therefore
@@ -1011,9 +1276,41 @@ def _select_eligible_runner(
             out = [r for r in out if _runner_gpu_capable(r)]
         if container_image:
             out = [r for r in out if _runner_has_container_capability(r)]
+            # Disk-fit gate: a baked container image is multi-GB and must be
+            # pulled before the job starts. Exclude runners whose reported free
+            # disk is below the fit floor so a doomed pull is never claimed —
+            # the job holds for a runner that can fit it (or the cloud backend)
+            # instead of dying mid-pull. Runners that do not report
+            # disk_free_bytes are not gated (backward compatible).
+            disk_floor = _container_image_min_free_disk_bytes()
+            out = [r for r in out if _runner_has_free_disk(r, disk_floor)]
+        if _job_requires_gpu_in_container(accelerator, container_image, vram_gb):
+            # Combined gate: when a container image is required AND the job asks
+            # for a GPU (an explicit accelerator OR a positive vram_gb GPU-memory
+            # floor — VRAM lives only on a GPU), the runner must be GPU-in-container
+            # capable — merely having a container runtime AND a GPU independently is
+            # not enough (the job would launch in the container and fail at runtime
+            # with "no supported GPU detected"). A CDI daemon (docker_cdi_gpu) or an
+            # nvidia-hook docker runner (has_gpu verified) both satisfy this gate;
+            # non-docker containers (podman, apptainer, enroot) handle GPU
+            # passthrough natively.
+            out = [r for r in out if _runner_gpu_in_container_capable(r)]
         if vram_gb is not None and vram_gb > 0:
             required_mib = int(vram_gb * 1024)
             out = [r for r in out if _runner_has_free_vram(r, required_mib)]
+        if min_compute_capability is not None and min_compute_capability > 0:
+            # GPU-arch gate: an image built for a newer architecture (its bundled
+            # CUDA/torch wheels carry SASS only for that floor) cannot run on an
+            # older GPU. Exclude runners whose reported gpu_compute_capabilities are
+            # all below the image's floor so the job holds for compatible hardware
+            # instead of being sent and dying in the reactive in-sandbox probe.
+            # Runners that do not report the telemetry are not gated (backward
+            # compatible; the in-sandbox probe stays their safety net).
+            out = [
+                r
+                for r in out
+                if _runner_meets_min_compute_capability(r, min_compute_capability)
+            ]
         return out
 
     if declined_runner_ids and not forced_runner_target_id:
@@ -1072,7 +1369,12 @@ def _select_eligible_runner(
 
 
 def _build_compute_launch_kwargs(
-    payload: dict, *, command: str, spend_cap_usd: float, deadline_seconds: int
+    payload: dict,
+    *,
+    command: str,
+    spend_cap_usd: float,
+    deadline_seconds: int,
+    container_image_override: str | None = None,
 ) -> dict:
     """Map a ``compute_experiment`` task payload to ``create_compute_job`` kwargs.
 
@@ -1085,6 +1387,10 @@ def _build_compute_launch_kwargs(
     as the agent saw it; ``declared_metric`` drives the platform pre-flight smoke, not
     ``create_compute_job``. The validated ``command``/``spend_cap_usd``/``deadline_seconds``
     are passed in by the caller (already range-checked).
+
+    ``container_image_override`` is the project's digest-pinned baked image the
+    caller resolved because the payload declared no ``container_image``; it is
+    forwarded ONLY when the payload has none (an explicit payload image wins).
     """
     def _present(value) -> bool:
         return isinstance(value, str) and value.strip() != ""
@@ -1131,6 +1437,11 @@ def _build_compute_launch_kwargs(
         kwargs["setup_step"] = payload["setup_step"]
     if _present(payload.get("container_image")):
         kwargs["container_image"] = payload["container_image"]
+    elif _present(container_image_override):
+        # USE-default: the payload declared no container_image, so dispatch
+        # resolved the project's digest-pinned baked image. An explicit payload
+        # image always wins over the default (checked first above).
+        kwargs["container_image"] = container_image_override
     if isinstance(payload.get("container_registry_auth"), dict):
         kwargs["container_registry_auth"] = payload["container_registry_auth"]
     if payload.get("allow_host_fallback"):
@@ -1138,14 +1449,20 @@ def _build_compute_launch_kwargs(
     # No-progress watchdog window (peer of runtime deadline). Forwarded when set so
     # a stalled job is cut early; create_compute_job validates/clamps it. Integer
     # field, so it uses a plain presence check rather than the string `_present`.
-    if payload.get("no_progress_timeout_seconds") is not None:
-        kwargs["no_progress_timeout_seconds"] = payload["no_progress_timeout_seconds"]
+    nested_compute_experiment = payload.get("compute_experiment") or {}
+    no_progress_timeout = payload.get("no_progress_timeout_seconds")
+    if no_progress_timeout is None:
+        no_progress_timeout = nested_compute_experiment.get(
+            "no_progress_timeout_seconds"
+        )
+    if no_progress_timeout is not None:
+        kwargs["no_progress_timeout_seconds"] = no_progress_timeout
     # Cross-job checkpoint resume: forward the optional predecessor reference so the
     # new job rehydrates that job's durable bundle before its command runs.
     # create_compute_job does the authoritative same-project + bundle-exists check.
-    input_artifact_job_id = payload.get("input_artifact_job_id") or (
-        payload.get("compute_experiment") or {}
-    ).get("input_artifact_job_id")
+    input_artifact_job_id = payload.get("input_artifact_job_id") or nested_compute_experiment.get(
+        "input_artifact_job_id"
+    )
     if _present(input_artifact_job_id):
         kwargs["input_artifact_job_id"] = input_artifact_job_id
     # declared_metric names the contract metric the no-progress watchdog watches
@@ -1497,6 +1814,35 @@ async def _dispatch_compute_experiment_directly(
     container_image = payload.get("container_image") or (
         payload.get("compute_experiment") or {}
     ).get("container_image")
+    # ── USE-default (images-first): default the project's baked image ──────────
+    # A compute_experiment dispatched WITHOUT an explicit container_image — an
+    # operator-created experiment, a planned compute_experiment prerequisite, or a
+    # retry that never went through the plan/research completion authors — reaches
+    # here image-less and would run unreproducibly on the host toolchain. Resolve
+    # the project's declared, digest-pinned baked image exactly as the completion
+    # path does (shared helper resolve_project_default_container_image). This runs
+    # BEFORE runner selection so the resolved digest flows through the
+    # container-runtime / GPU-in-container eligibility gate below. Fail-OPEN and
+    # additive: an explicit payload container_image is left untouched; a project
+    # with no manifest compute image / no build record / any error keeps today's
+    # image-less behavior (helper returns None).
+    resolved_default_container_image: str | None = None
+    if not container_image:
+        from app.compute_backends import resolve_project_baked_image_strict
+
+        project = await session.get(Project, task.project_id)
+        resolved_default_container_image, image_error = (
+            await resolve_project_baked_image_strict(session, project)
+        )
+        if image_error is not None:
+            return await _fail_compute_experiment_task(
+                session,
+                task,
+                "baked_image_unresolvable",
+                image_error,
+            )
+        if resolved_default_container_image:
+            container_image = resolved_default_container_image
     # vram_gb (flat or nested) gates runner eligibility on free GPU memory. It is
     # AGENT-AUTHORED, so a bad value ("24GB") must fail THIS task with an honest
     # validation message — never raise in the dispatch hot path, which would abort
@@ -1509,6 +1855,18 @@ async def _dispatch_compute_experiment_directly(
             task,
             "compute_launch_failed",
             "Compute experiment misconfigured: " + vram_error,
+        )
+    # min_compute_capability (flat or nested) is the image's GPU-arch floor; it
+    # gates runner eligibility on gpu_compute_capabilities. AGENT/OPERATOR-AUTHORED,
+    # so a bad value fails THIS task with an honest message (never raises in the
+    # dispatch hot path). Same terminal-fail contract as the vram_gb check above.
+    min_compute_capability, min_cc_error = _coerce_min_compute_capability(payload)
+    if min_cc_error is not None:
+        return await _fail_compute_experiment_task(
+            session,
+            task,
+            "compute_launch_failed",
+            "Compute experiment misconfigured: " + min_cc_error,
         )
 
     # Launch-contract runner pin (operator or agent authored). The pin id feeds
@@ -1536,6 +1894,7 @@ async def _dispatch_compute_experiment_directly(
         container_image=container_image,
         forced_runner_target_id=forced_runner_target_id,
         vram_gb=vram_gb,
+        min_compute_capability=min_compute_capability,
         declined_runner_ids=recently_declined_runner_ids(task),
         declined_exclusion_advisory=decline_exclusion_is_advisory(
             task, "compute_experiment"
@@ -1563,6 +1922,8 @@ async def _dispatch_compute_experiment_directly(
             accelerator,
             container_image,
             runner_pins_this_cycle,
+            min_compute_capability=min_compute_capability,
+            vram_gb=vram_gb,
             # A strict `runner_target` pin is passed to _select_eligible_runner as
             # a SOFT preference, so the decline exclusion DOES drop the pinned
             # runner from the candidate pool (unlike an operator hard pin, which
@@ -1630,11 +1991,30 @@ async def _dispatch_compute_experiment_directly(
             session, task.project_id, forced_id
         )
         target_label = forced_hostname or forced_id
-        hold_msg = (
-            f"Waiting for forced runner {target_label}: this compute experiment is "
-            "hard-pinned to that runner and will not run on any other runner or in "
-            "the cloud until it is live and eligible."
+        reason_code, detail = await _diagnose_strict_runner_pin_hold(
+            session,
+            active_runners_cache,
+            task.project_id,
+            forced_id,
+            "compute_experiment",
+            accelerator,
+            container_image,
+            runner_pins_this_cycle,
+            min_compute_capability=min_compute_capability,
+            vram_gb=vram_gb,
         )
+        if reason_code == "missing_gpu_in_container_capability":
+            hold_msg = (
+                f"Waiting for forced runner {target_label}: this compute experiment "
+                "is hard-pinned to that runner; GPU inside the container cannot be "
+                f"fulfilled because {detail}."
+            )
+        else:
+            hold_msg = (
+                f"Waiting for forced runner {target_label}: this compute experiment is "
+                "hard-pinned to that runner and will not run on any other runner or in "
+                f"the cloud until it is live and eligible ({reason_code}: {detail})."
+            )
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None
         if not ctx.get(AWAITING_FORCED_RUNNER_CONTEXT_KEY):
@@ -1649,9 +2029,11 @@ async def _dispatch_compute_experiment_directly(
             await session.commit()
         logger.info(
             "[RUNNERS] Holding compute_experiment %s: forced runner %s not eligible "
-            "this cycle (offline/at-capacity/ineligible) — not dispatching elsewhere",
+            "this cycle (%s: %s) — not dispatching elsewhere",
             task.id,
             target_label,
+            reason_code,
+            detail,
         )
         return "held"
 
@@ -1660,12 +2042,205 @@ async def _dispatch_compute_experiment_directly(
         project is not None and resolve_project_require_local_runner(project)
     )
 
+    # ── GPU-arch hold: a min_compute_capability floor is declared and at least one
+    # live runner has a GPU but its architecture is too OLD to run the image
+    # (gpu_compute_capabilities all below the floor) → keep QUEUED with an honest
+    # "awaiting GPU with compute capability >= X.Y" reason instead of dispatching
+    # to a box where the job would die in the reactive in-sandbox probe. Fires only
+    # when a GPU-capable-but-wrong-arch runner exists (`arch_blocked`), so the arch
+    # floor is a genuine blocker for this fleet and not a stand-in for a more
+    # fundamental gate (no GPU at all, no container runtime — those own their own
+    # holds/fallbacks). Placed BEFORE the container-image hold so an
+    # otherwise-container-capable runner that fails only on GPU arch reports the
+    # accurate reason. Reuses the container-runner hold stamp so the existing
+    # bounded-wait sweep (15-min early alert, 6h terminal fail) covers it unchanged.
+    if runner is None and min_compute_capability:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        arch_blocked = any(
+            _runner_gpu_capable(r)
+            and not _runner_meets_min_compute_capability(r, min_compute_capability)
+            for r in project_runners
+        )
+        if arch_blocked:
+            hold_msg = (
+                f"awaiting GPU with compute capability >= {min_compute_capability}: "
+                "no live runner has a GPU whose architecture can run this image "
+                "(its GPUs report a lower CUDA compute capability)."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: min_compute_capability "
+                "%.1f declared but no GPU-arch-compatible runner available",
+                task.id,
+                min_compute_capability,
+            )
+            return "held"
+
+    # ── Disk-fit hold: image declared + at least one container-capable runner
+    # exists but every such runner reports too little free disk to fit the
+    # multi-GB pull → keep QUEUED with an honest "waiting for disk headroom"
+    # reason instead of dispatching to a box where the pull would die
+    # ("no space left on device") and waste the claim. Placed BEFORE the
+    # container-image hold so a container-capable-but-full fleet reports the
+    # accurate disk reason rather than the misleading "no container-capable
+    # runner" one. Fires only when a container-capable runner exists whose only
+    # failing gate is disk (so this is a genuine, recoverable blocker — the
+    # operator frees space and the same fleet takes the job). Reuses the
+    # container-runner hold stamp so the existing bounded-wait sweep covers it.
+    if runner is None and container_image:
+        project_runners = active_runners_cache.get(task.project_id) or []
+        disk_floor = _container_image_min_free_disk_bytes()
+        disk_blocked = any(
+            _runner_has_container_capability(r)
+            and not _runner_has_free_disk(r, disk_floor)
+            for r in project_runners
+        )
+        if disk_blocked:
+            hold_msg = (
+                "Waiting for a runner with enough free disk: job declares "
+                f"container_image={container_image!r} (a multi-GB image pull) but "
+                "every container-capable runner reports free disk below the "
+                f"{disk_floor}-byte fit floor. Free space on a runner and it will "
+                "claim the job."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image declared "
+                "(%r) but no container-capable runner has enough free disk",
+                task.id,
+                container_image,
+            )
+            return "held"
+
+    # ── GPU-in-container hold: image + accelerator declared and at least one live
+    # runner HAS a container runtime but cannot expose a GPU INSIDE the container
+    # (no CDI daemon and no verified nvidia docker hook) → keep QUEUED with an
+    # HONEST reason. Placed BEFORE the generic container-image hold so such a fleet
+    # is NOT told "no live runner has docker_usable capability" — that is false and
+    # actively misleading: docker IS present, only GPU passthrough is missing, so
+    # the operator would waste time reinstalling docker that is already there
+    # instead of enabling CDI / the nvidia container runtime. Fires only when a
+    # container-capable-but-not-GPU-in-container runner exists (the genuine,
+    # recoverable blocker for this fleet); a fleet with NO container runtime at all
+    # falls through to the generic hold below, and a fleet with no live runner at
+    # all falls through to the cloud backend. Reuses the container-runner hold stamp
+    # so the existing bounded-wait sweep covers it unchanged.
+    if runner is None and _job_requires_gpu_in_container(
+        accelerator, container_image, vram_gb
+    ):
+        project_runners = active_runners_cache.get(task.project_id) or []
+        # Keep the proof-specific diagnosis scoped to runners that survived every
+        # selection gate *before* passthrough proof. A proof on a CPU-only,
+        # wrong-task-type, full, runtime-less, or disk-full runner cannot make
+        # the generic hold more truthful: it is not a runner this job could use
+        # even if its proof were valid. This deliberately mirrors the ordering in
+        # _select_eligible_runner; the passthrough and later VRAM/architecture
+        # gates remain outside this subset because this branch diagnoses the
+        # missing passthrough prerequisite specifically.
+        disk_floor = _container_image_min_free_disk_bytes()
+        pre_passthrough_eligible = [
+            r
+            for r in project_runners
+            if _runner_handles_task_type(r, "compute_experiment")
+            and not _runner_at_capacity(
+                r, runner_pins_this_cycle.get(r.id, 0), "compute_experiment"
+            )
+            and (not accelerator or _runner_gpu_capable(r))
+            and _runner_has_container_capability(r)
+            and _runner_has_free_disk(r, disk_floor)
+        ]
+        # Capacity is deliberately excluded from this companion subset. A full
+        # runner with functional proof demonstrates that the fleet CAN satisfy
+        # the runtime requirement; the accurate wait reason is capacity, not a
+        # false claim that no selected runtime has proof. Task type, host GPU,
+        # runtime and disk gates remain required, since proof on a runner that
+        # fails one of those can never satisfy this job.
+        pre_passthrough_capable = [
+            r
+            for r in project_runners
+            if _runner_handles_task_type(r, "compute_experiment")
+            and (not accelerator or _runner_gpu_capable(r))
+            and _runner_has_container_capability(r)
+            and _runner_has_free_disk(r, disk_floor)
+        ]
+        gpu_in_container_blocked = any(
+            not _runner_gpu_in_container_capable(r)
+            for r in pre_passthrough_eligible
+        )
+        fleet_has_verified_proof = any(
+            _runner_gpu_in_container_capable(r) for r in pre_passthrough_capable
+        )
+        if gpu_in_container_blocked and not fleet_has_verified_proof:
+            blockers = sorted({
+                _runner_gpu_passthrough_blocker(r)
+                for r in pre_passthrough_eligible
+                if not _runner_gpu_in_container_capable(r)
+            })
+            gpu_req = "an accelerator" if accelerator else f"vram_gb={vram_gb!r}"
+            hold_msg = (
+                "Waiting for a runner that can expose a GPU inside the container: "
+                f"job declares both container_image={container_image!r} and "
+                f"{gpu_req}, but no selected runtime has functional passthrough "
+                f"proof ({'; '.join(blockers[:3])})."
+            )
+            ctx = dict(task.context or {})
+            changed = ctx.pop("runner_target_id", None) is not None
+            if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
+                ctx[CONTAINER_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+                changed = True
+            if task.latest_status_message != hold_msg:
+                task.latest_status_message = hold_msg
+                changed = True
+            if changed:
+                task.context = ctx
+                session.add(task)
+                await session.commit()
+            logger.info(
+                "[RUNNERS] Holding compute_experiment %s: container_image (%r) + "
+                "GPU requirement (%s) declared but no live runner has "
+                "GPU-in-container passthrough (docker present, CDI/nvidia-hook "
+                "missing)",
+                task.id,
+                container_image,
+                gpu_req,
+            )
+            return "held"
+
     # ── Enforce-local hold: require_local + no runner → keep QUEUED, never cloud ─
+    # Keep this after the proof-specific hold above: a local-only GPU image job
+    # whose live runner fails functional passthrough needs the actionable runtime
+    # diagnosis, not the generic "no live eligible runner" message.
     if runner is None and require_local:
         ctx = dict(task.context or {})
         changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
         if not ctx.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY):
             ctx[LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+            changed = True
+        hold_msg = "Waiting for a live eligible local runner."
+        if task.latest_status_message != hold_msg:
+            task.latest_status_message = hold_msg
             changed = True
         if changed:
             task.context = ctx
@@ -1678,19 +2253,30 @@ async def _dispatch_compute_experiment_directly(
         )
         return "held"
 
-    # ── Container-image hold: image declared + registered runners but none
-    # container-capable → keep QUEUED with an honest reason, never cloud-dispatch.
+    # ── Container-image hold: image declared + registered runners but none is
+    # currently eligible → keep QUEUED with an honest reason, never cloud-dispatch.
+    # Distinguish a fleet with no runtime from one whose runtime-equipped runners
+    # are blocked by capacity or another gate; never claim Docker is absent when
+    # verified passthrough exists on a temporarily ineligible runner.
     # Only fires when the project has at least one live runner (runners exist but
     # lack the runtime); when no runners are registered at all we fall through to
     # the cloud backend so the job is not silently wedged.
     if runner is None and container_image:
         project_runners = active_runners_cache.get(task.project_id) or []
         if project_runners:
-            hold_msg = (
-                "Waiting for a container-capable runner: job declares "
-                f"container_image={container_image!r} but no live runner "
-                "has docker_usable capability."
-            )
+            if any(_runner_has_container_capability(r) for r in project_runners):
+                hold_msg = (
+                    "Waiting for an eligible container-capable runner: job declares "
+                    f"container_image={container_image!r}; a container runtime is "
+                    "present, but every such runner is at capacity or fails another "
+                    "job requirement."
+                )
+            else:
+                hold_msg = (
+                    "Waiting for a container-capable runner: job declares "
+                    f"container_image={container_image!r} but no live runner "
+                    "has docker_usable capability."
+                )
             ctx = dict(task.context or {})
             changed = ctx.pop("runner_target_id", None) is not None
             if not ctx.get(CONTAINER_RUNNER_HOLD_CONTEXT_KEY):
@@ -1754,6 +2340,7 @@ async def _dispatch_compute_experiment_directly(
         command=command,
         spend_cap_usd=float(spend_cap),
         deadline_seconds=int(deadline_seconds),
+        container_image_override=resolved_default_container_image,
     )
     if runner is not None:
         # A runner was selected → the job runs on operator hardware. Pin the
@@ -2272,6 +2859,9 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not task.archived
             and task.requires_approval is not True
         )
+        is_resident_hold = bool(strategic_stamp) and resident_turn_requires_local_runner(
+            task
+        )
         is_strategic_hold = (
             bool(strategic_stamp)
             and task_type in STRATEGIC_TASK_TYPES
@@ -2284,7 +2874,13 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             and not is_container_hold
             and not is_forced_runner_hold
             and not is_strategic_hold
+            and not is_resident_hold
         ):
+            continue
+
+        # Resident local-only authority has no timeout and no cloud fallback.
+        # The main dispatch loop will pin it when compatible capacity appears.
+        if is_resident_hold:
             continue
 
         if is_strategic_hold:

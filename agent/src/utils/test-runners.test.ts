@@ -22,6 +22,7 @@ import {
   discoverNewlyDisabledTests, isTestFilePath, MAX_DISABLED_TEST_MARKERS,
   buildAcceptanceTestRunner, classifyAcceptanceTestRun, acceptanceTestRunPassed,
   effectiveTestCmd, effectiveBuildCmd, effectiveInstallCmd,
+  isUnscopedPytestRunner, scopePytestRunnerToFiles,
 } from './test-runners.js';
 import type { BuildConfig, TestRunner, DirectoryConfig } from './test-runners.js';
 
@@ -3764,5 +3765,68 @@ describe('acceptanceTestRunPassed — exit-zero + ran is the only green', () => 
     expect(acceptanceTestRunPassed(false, 'skipped')).toBe(false);
     expect(acceptanceTestRunPassed(false, 'absent')).toBe(false);
     expect(acceptanceTestRunPassed(false, 'could_not_run')).toBe(false);
+  });
+});
+
+describe('isUnscopedPytestRunner', () => {
+  const WS = process.env.AGENT_WORKSPACE || '/tmp/workspace';
+  const mk = (cmd: string, args: string[]): TestRunner => ({ cmd, args, cwd: `${WS}/backend`, label: `${cmd} ${args.join(' ')}` });
+
+  it('matches a bare whole-suite `python3 -m pytest` (the wedging command)', () => {
+    expect(isUnscopedPytestRunner(mk('python3', ['-m', 'pytest']))).toBe(true);
+    expect(isUnscopedPytestRunner(mk('python', ['-m', 'pytest']))).toBe(true);
+  });
+
+  it('matches `python3 -m pytest` carrying only FLAGS (-x -q)', () => {
+    expect(isUnscopedPytestRunner(mk('python3', ['-m', 'pytest', '-x', '-q']))).toBe(true);
+  });
+
+  it('matches a bare `pytest` with only flags', () => {
+    expect(isUnscopedPytestRunner(mk('pytest', []))).toBe(true);
+    expect(isUnscopedPytestRunner(mk('pytest', ['-q']))).toBe(true);
+  });
+
+  it('does NOT match a pytest run that already targets a file / nodeid', () => {
+    expect(isUnscopedPytestRunner(mk('python3', ['-m', 'pytest', 'testing/test_x.py']))).toBe(false);
+    expect(isUnscopedPytestRunner(mk('pytest', ['testing/test_x.py::test_y']))).toBe(false);
+  });
+
+  it('does NOT match a pytest run already narrowed by a -k selector value', () => {
+    // `-k` is a flag but its VALUE is a bare token → treat as already scoped.
+    expect(isUnscopedPytestRunner(mk('python3', ['-m', 'pytest', '-k', 'not slow']))).toBe(false);
+  });
+
+  it('does NOT match the bounded scripts/test-backend.sh harness or a bash -c command', () => {
+    expect(isUnscopedPytestRunner(mk('bash', ['scripts/test-backend.sh', '--postgres']))).toBe(false);
+    expect(isUnscopedPytestRunner(mk('bash', ['-c', 'python3 -m pytest']))).toBe(false);
+    expect(isUnscopedPytestRunner(mk('npm', ['test']))).toBe(false);
+  });
+});
+
+describe('scopePytestRunnerToFiles', () => {
+  const WS = '/tmp/workspace';
+
+  it('re-bases impacted repo-relative files onto a backend-rooted runner (strips backend/)', () => {
+    const runner: TestRunner = { cmd: 'python3', args: ['-m', 'pytest'], cwd: `${WS}/backend`, label: 'python3 -m pytest (backend)' };
+    const scoped = scopePytestRunnerToFiles(
+      runner, ['backend/testing/test_a.py', 'backend/testing/test_b.py'], WS,
+    );
+    expect(scoped.cmd).toBe('python3');
+    expect(scoped.args).toEqual(['-m', 'pytest', 'testing/test_a.py', 'testing/test_b.py']);
+    expect(scoped.cwd).toBe(`${WS}/backend`);
+    expect(scoped.label).toContain('impacted: 2 files');
+  });
+
+  it('preserves existing flags and appends the targets', () => {
+    const runner: TestRunner = { cmd: 'python3', args: ['-m', 'pytest', '-x', '-q'], cwd: `${WS}/backend`, label: 'pytest (backend)' };
+    const scoped = scopePytestRunnerToFiles(runner, ['backend/testing/test_a.py'], WS);
+    expect(scoped.args).toEqual(['-m', 'pytest', '-x', '-q', 'testing/test_a.py']);
+    expect(scoped.label).toContain('impacted: 1 file');
+  });
+
+  it('keeps repo-relative paths as-is for a root-rooted runner', () => {
+    const runner: TestRunner = { cmd: 'pytest', args: [], cwd: WS, label: 'pytest (root)' };
+    const scoped = scopePytestRunnerToFiles(runner, ['testing/test_a.py'], WS);
+    expect(scoped.args).toEqual(['testing/test_a.py']);
   });
 });

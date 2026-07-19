@@ -37,6 +37,7 @@ Covers:
 from __future__ import annotations
 from datetime import timezone
 
+import asyncio
 import contextlib
 import json
 import uuid
@@ -49,6 +50,7 @@ from sqlalchemy import select
 from app import release_qualifier as rq
 from app import release_scoring as rs
 from app import release_version as rv
+from app import github_refs
 from app.models import (
     Alert,
     Artifact,
@@ -655,6 +657,56 @@ def test_blocker_labels_have_emitters():
         f"_BLOCKER_LABELS has labels for blockers nothing emits: {dead}. "
         "Either wire up the emitter or delete the dead vocabulary."
     )
+
+
+def test_boot_prereq_missing_has_operator_label():
+    """The Slice-3 deployed-side env-preflight blocker carries an operator label."""
+    label = rq._BLOCKER_LABELS.get("boot_prereq_missing")
+    assert label is not None
+    assert "deploy-target" in label
+    # Presence-only framing: the label instructs binding secrets, not reading values.
+    assert "bind" in label.lower()
+
+
+def test_deployed_env_presence_snapshot_is_presence_only(monkeypatch):
+    """The deploy-target snapshot reads ONLY bool(os.getenv) — never a value.
+
+    Presence-only HARD RULE (design 245212a4): a candidate-declared secret's
+    VALUE must never be read, compared, logged, or persisted.  The snapshot must
+    be a ``{name: bool}`` map, and a real secret value bound in the process env
+    must never leak into it.
+    """
+    SECRET = "super-secret-fernet-value-xyz"
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", SECRET)
+    monkeypatch.setenv("K_REVISION", "prod-rev-1")
+    monkeypatch.delenv("SOME_ABSENT_VAR", raising=False)
+
+    artifact = {
+        "required_env": [
+            {"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"},
+            {"name": "SOME_ABSENT_VAR", "scope": "always"},
+        ]
+    }
+    snap = rq._deployed_env_presence_snapshot(artifact)
+
+    # Every value is a bool — never the underlying env value.
+    assert all(isinstance(v, bool) for v in snap.values())
+    assert snap["GITHUB_PAT_ENCRYPTION_KEY"] is True
+    assert snap["SOME_ABSENT_VAR"] is False
+    # The Cloud Run signal is always snapshotted so the scope can be derived.
+    assert snap["K_REVISION"] is True
+    # The real secret value never appears anywhere in the snapshot.
+    assert SECRET not in repr(snap)
+
+
+def test_deployed_env_presence_snapshot_handles_absent_manifest():
+    # None / malformed artifact still returns at least the Cloud Run signal,
+    # never raises.
+    from app.required_runtime_env import CLOUD_RUN_SIGNAL_ENV
+
+    snap = rq._deployed_env_presence_snapshot(None)
+    assert CLOUD_RUN_SIGNAL_ENV in snap
+    assert all(isinstance(v, bool) for v in snap.values())
 
 
 def test_uncorroborated_attestation_is_fully_retired():
@@ -4719,6 +4771,252 @@ async def test_ledger_stores_post_reconciliation_audit_score(db_session, mocker)
     assert lq["sub_scores"]["audit"] == pytest.approx(1.0)
 
 
+async def _open_hotfix_backfill_debt(db_session, project, candidate_sha: str):
+    """Open a hotfix_deploy_pending_backfill debt row for ``project``, mirroring
+    what ``_record_hotfix_audit_trail`` writes after an operator hotfix-deploy."""
+    from app import completion_debt as cd
+
+    opened = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:{candidate_sha}",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title=f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes re-qual",
+        project_id=project.id,
+        source="hotfix_promote",
+        detail={"candidate_sha": candidate_sha},
+    )
+    assert opened is True
+    await db_session.commit()
+
+
+async def _hotfix_backfill_row(db_session, project, candidate_sha: str):
+    return (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == f"hotfix_deploy:{project.id}:{candidate_sha}"
+            )
+        )
+    ).scalar_one()
+
+
+@pytest.mark.asyncio
+async def test_finalize_discharges_hotfix_backfill_debt_on_passing_gate(
+    db_session, mocker
+):
+    """A passing normal qualification gate discharges the write-only
+    hotfix_deploy_pending_backfill debt the operator hotfix-deploy channel opened.
+
+    The hotfix-deploy channel mints a hotfix_deploy_pending_backfill completion-debt
+    row recording that a fast-tracked release-machinery promotion bypassed the
+    audit/scoring gate and is owed re-qualification by the NORMAL gate.  Nothing
+    used to resolve it, so it stayed open forever and permanently dragged the
+    debt-pressure sub-score down.  When the normal gate composite clears
+    (promote=True, here on the dry-run path so no real promote() is needed), the
+    owed re-qualification has demonstrably happened and the row must flip to
+    resolved with a reason.
+    """
+    from app import shared_state
+    from app.completion_debt import STATUS_OPEN, STATUS_RESOLVED
+
+    # Dry-run path: promote=True but promotion_enabled=False, so finalize returns
+    # 'dry_run' without entering promote() — exactly the composite["promote"] gate
+    # the discharge hooks onto.
+    shared_state.runtime_config["promotion_enabled"] = False
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _open_hotfix_backfill_debt(db_session, project, "abc12345" + "0" * 32)
+
+    # Sanity: the debt is open before the gate runs.
+    row = await _hotfix_backfill_row(db_session, project, "abc12345" + "0" * 32)
+    assert row.status == STATUS_OPEN
+
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={"audit_score": 1.0, "findings": []},
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", result
+
+    row = await _hotfix_backfill_row(db_session, project, "abc12345" + "0" * 32)
+    assert row.status == STATUS_RESOLVED, (
+        f"expected hotfix-backfill debt resolved on passing gate, got {row.status!r}"
+    )
+    assert row.resolved_at is not None
+    assert "re-qualified by normal gate" in (row.resolution_reason or ""), (
+        f"resolution_reason must record the discharge, got {row.resolution_reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_leaves_hotfix_backfill_debt_open_when_not_promoted(
+    db_session, mocker
+):
+    """A not-promoted (blocked) normal gate must NOT discharge the hotfix-backfill
+    debt — the owed re-qualification has not succeeded, so the obligation stands."""
+    from app import shared_state
+    from app.completion_debt import STATUS_OPEN
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session)
+    await _open_hotfix_backfill_debt(db_session, project, "deadbeef" + "0" * 32)
+
+    # A deleted test file classified genuine_erosion drives compute_composite to
+    # the test_file_deleted hard blocker → not_promoted, so composite["promote"]
+    # is False and no discharge fires.
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": ["testing/test_gone.py"],
+                "assertion_delta": 0,
+                "test_count_delta": -5,
+            },
+            "deleted_test_file_classifications": [
+                {
+                    "path": "testing/test_gone.py",
+                    "classification": "genuine_erosion",
+                    "rationale": "Subject module present and unchanged; test removed to stop a failing build.",
+                }
+            ],
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted", result
+    assert result["blocker"] == "test_file_deleted", result
+
+    row = await _hotfix_backfill_row(db_session, project, "deadbeef" + "0" * 32)
+    assert row.status == STATUS_OPEN, (
+        f"a not-promoted gate must leave the hotfix-backfill debt OPEN, got {row.status!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_aresolve_hotfix_backfill_scopes_to_project_and_kind(db_session):
+    """aresolve_hotfix_deploy_backfill_debts resolves ONLY open hotfix-deploy rows
+    for the target project — skipping dismissed rows, other kinds, other projects,
+    and returning the count resolved.  None inputs are a safe no-op (returns 0)."""
+    from app import completion_debt as cd
+
+    project, _ = await _make_project_and_version(db_session)
+    other, _ = await _make_project_and_version(db_session)
+
+    # Two open hotfix-backfill rows for the target project (a project can
+    # accumulate several fast-tracks before the next normal gate runs).
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_one",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix one",
+        project_id=project.id,
+    )
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_two",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix two",
+        project_id=project.id,
+    )
+    # A dismissed hotfix row for the same project — must NOT be reopened/resolved.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{project.id}:sha_dismissed",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="hotfix dismissed",
+        project_id=project.id,
+    )
+    # A different debt kind for the same project — out of scope.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"no_ci_gate:{project.id}:x",
+        kind=cd.KIND_NO_CI_GATE,
+        title="unrelated",
+        project_id=project.id,
+    )
+    # A hotfix row for a DIFFERENT project — out of scope.
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"hotfix_deploy:{other.id}:sha_other",
+        kind=cd.KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+        title="other project hotfix",
+        project_id=other.id,
+    )
+    await db_session.commit()
+
+    dismissed_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == f"hotfix_deploy:{project.id}:sha_dismissed"
+            )
+        )
+    ).scalar_one()
+    dismissed_row.status = cd.STATUS_DISMISSED
+    db_session.add(dismissed_row)
+    await db_session.commit()
+
+    resolved = await cd.aresolve_hotfix_deploy_backfill_debts(
+        db_session, project.id, reason="unit-test discharge"
+    )
+    await db_session.commit()
+    assert resolved == 2, f"expected exactly the 2 open target-project rows, got {resolved}"
+
+    def _status(key):
+        return (
+            db_session.execute(
+                select(CompletionDebtEntry.status).where(
+                    CompletionDebtEntry.dedupe_key == key
+                )
+            )
+        )
+
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_one")
+    ).scalar_one() == cd.STATUS_RESOLVED
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_two")
+    ).scalar_one() == cd.STATUS_RESOLVED
+    # Dismissed stays dismissed; other-kind and other-project stay open.
+    assert (
+        await _status(f"hotfix_deploy:{project.id}:sha_dismissed")
+    ).scalar_one() == cd.STATUS_DISMISSED
+    assert (
+        await _status(f"no_ci_gate:{project.id}:x")
+    ).scalar_one() == cd.STATUS_OPEN
+    assert (
+        await _status(f"hotfix_deploy:{other.id}:sha_other")
+    ).scalar_one() == cd.STATUS_OPEN
+
+    # None inputs are a safe no-op.
+    assert await cd.aresolve_hotfix_deploy_backfill_debts(None, project.id) == 0
+    assert await cd.aresolve_hotfix_deploy_backfill_debts(db_session, None) == 0
+
+
 class TestReconcileRefutedJustificationGate:
     """Backend reason-substantiveness gate for refuted_false_positive verdicts.
 
@@ -5654,7 +5952,7 @@ class TestExtractTestErosionDetail:
         assert detail == {"deleted_test_files": ["testing/test_foo.py"]}
 
     def test_negative_deltas_carried(self):
-        """Net-negative test/assertion deltas are carried; zero/positive ignored."""
+        """Net-negative test/assertion deltas are carried (as before)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
@@ -5665,13 +5963,25 @@ class TestExtractTestErosionDetail:
         detail = rq._extract_test_erosion_detail(report)
         assert detail == {"test_count_delta": -2, "assertion_delta": -5}
 
-    def test_clean_erosion_returns_none(self):
-        """No deletions and no negative delta yields None (nothing to carry)."""
+    def test_positive_deltas_preserved_for_cumulative(self):
+        """Positive deltas are now carried (lossless for cumulative reconstruction)."""
         report = {
             "test_erosion": {
                 "deleted_test_files": [],
                 "test_count_delta": 3,
                 "assertion_delta": 10,
+            }
+        }
+        detail = rq._extract_test_erosion_detail(report)
+        assert detail == {"test_count_delta": 3, "assertion_delta": 10}
+
+    def test_zero_deltas_omitted(self):
+        """Zero deltas (no noise) are omitted; no other signal → None."""
+        report = {
+            "test_erosion": {
+                "deleted_test_files": [],
+                "test_count_delta": 0,
+                "assertion_delta": 0,
             }
         }
         assert rq._extract_test_erosion_detail(report) is None
@@ -6354,7 +6664,7 @@ def _patch_promote_github_defaults(mocker, *, already_on_main: bool = False):
 
 
 @pytest.fixture(autouse=True)
-def _qualifier_ci_resolves_green(mocker):
+def _qualifier_ci_resolves_green(mocker, monkeypatch):
     """Default the qualifier's CI resolution to a real completed green build.
 
     Both ``run_qualification`` and ``_finalize_qualification`` resolve CI for
@@ -6371,6 +6681,10 @@ def _qualifier_ci_resolves_green(mocker):
     the test body; the later patch wins.  Pure-function tests (compute_composite
     etc.) never reach these helpers, so the patches are harmless there.
     """
+    monkeypatch.setenv(
+        "MIGRATION_APPLY_SCRATCH_DATABASE_URL",
+        "postgresql+asyncpg://scratch-user@localhost/scratch-control",
+    )
     mocker.patch(
         "app.github.get_repo_installation_token",
         new=AsyncMock(return_value="gh-token"),
@@ -6553,14 +6867,15 @@ async def test_run_qualification_spawns_both_children_when_smoketest_enabled(
 
 @pytest.mark.asyncio
 async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocker):
-    """Audit H3: with smoketest_enabled=False (the shipped default), only the
-    release_audit child is spawned — NO qualifier-smoketest task — and
-    last_qualification records smoketest_enabled=False with
+    """Audit H3: with smoketest_enabled=False and env_preflight_enabled=False,
+    only the release_audit child is spawned — NO qualifier-smoketest task —
+    and last_qualification records smoketest_enabled=False with
     smoketest_task_id None."""
     from app import shared_state
 
     # Explicit for clarity — this is also the autouse-reset default.
     shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
@@ -6605,6 +6920,373 @@ async def test_run_qualification_skips_smoketest_when_disabled(db_session, mocke
     by_type = {(t.first_payload or {}).get("type"): t for t in tasks}
     assert by_type["release_audit"].first_payload["candidate_sha"] == candidate
     assert by_type["release_audit"].first_payload["diff_range"] == f"main...{candidate}"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_produces_env_preflight_evidence_unconditionally(
+    db_session, mocker
+):
+    """Env-preflight evidence is produced unconditionally during
+    run_qualification *even when both* smoketest_enabled and
+    env_preflight_enabled are False.
+
+    This decouples evidence production from the smoketest child task (the
+    grader gap that motived direction c-277fccb6).  The evidence is a cheap
+    pure-content introspection of the candidate tree done via the GitHub
+    contents API, so it must not depend on any feature flag.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "a1b2c3d4" * 5
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    # Serve the candidate tree's real source files so the evidence builder
+    # produces meaningful content.
+    repo_root = Path(__file__).resolve().parent.parent  # backend/
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # Evidence is present regardless of both flags being False.
+    assert "env_preflight_evidence" in qual, (
+        "env_preflight_evidence must be on the qual record when both flags are off"
+    )
+    evidence = qual["env_preflight_evidence"]
+    assert isinstance(evidence, dict), f"Expected dict, got {type(evidence)}"
+    assert "required_env" in evidence
+    assert "startup_check_names" in evidence
+    assert evidence.get("manifest_source") == "backend/app/required_runtime_env.py"
+
+    # The evidence must reflect the current REQUIRED_RUNTIME_ENV manifest.
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+    expected_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    actual_names = {e["name"] for e in evidence["required_env"]}
+    assert expected_names == actual_names, (
+        f"Evidence required_env {actual_names} does not match "
+        f"current REQUIRED_RUNTIME_ENV {expected_names} — "
+        "the evidence builder did not read the candidate tree correctly"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_evidence_rebuilt_on_full_dimension_reuse(
+    db_session, mocker
+):
+    """When all expensive gate dimensions (audit, test_erosion, smoketest,
+    merge_grade) are already resolved in the QualificationDimensionResult ledger
+    at the same candidate_sha, _build_env_preflight_evidence_for_candidate is
+    still called and env_preflight_evidence is a non-None dict in the resulting
+    last_qualification record.
+
+    This locks the fail-closed boot gate against a future reuse-side
+    short-circuit that would skip env_preflight evidence collection when every
+    ledger dimension is already resolved — the rebuild must always run.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+
+    # Seed all four reuse-eligible dimensions as already resolved so that
+    # run_qualification will carry them forward from the ledger and skip
+    # re-spawning any child task.
+    for dim in ("audit", "test_erosion", "smoketest", "merge_grade"):
+        await _seed_dimension_row(
+            db_session, project, version, dim,
+            status="passed", candidate_sha=candidate,
+        )
+    await db_session.commit()
+
+    # Stamp a prior infra_failure qual at the same sha so the reuse path fires.
+    prior_attempt_id = uuid.uuid4()
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(prior_attempt_id),
+        "retry_episode": 0,
+        "candidate_sha": candidate,
+        "error": "smoketest_task_failed",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-01-01T00:00:00",
+        "finalized_at": "2026-01-01T00:01:00",
+    }
+    version.active_qualification_attempt_id = prior_attempt_id
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-deadbeef",
+    )
+
+    # Serve real file content so the evidence builder produces a non-None dict.
+    repo_root = Path(__file__).resolve().parent.parent
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    # Spy on the evidence builder to confirm it is invoked even when all
+    # expensive gate dimensions are already resolved in the ledger.
+    evidence_spy = mocker.spy(rq, "_build_env_preflight_evidence_for_candidate")
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"Expected 'spawned' but got {result['status']!r}"
+    )
+
+    await db_session.refresh(version)
+    qual = version.last_qualification
+
+    # Core assertion: the evidence builder must have been called exactly once
+    # regardless of full ledger reuse.
+    evidence_spy.assert_awaited_once(), (
+        "_build_env_preflight_evidence_for_candidate was NOT called — "
+        "a reuse-side short-circuit skipped the fail-closed boot gate"
+    )
+
+    # The evidence must be present and non-None in the pending record.
+    assert "env_preflight_evidence" in qual, (
+        "env_preflight_evidence key missing from last_qualification on full-reuse re-drive"
+    )
+    evidence = qual["env_preflight_evidence"]
+    assert isinstance(evidence, dict), (
+        f"env_preflight_evidence should be a dict; got {type(evidence)}"
+    )
+    assert "required_env" in evidence, (
+        "env_preflight_evidence missing 'required_env' key — builder did not run"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_dropped_from_reuse_on_same_sha_redrive(
+    db_session, mocker
+):
+    """Executed same-SHA blocked→refresh regression for env_preflight.
+
+    env_preflight is environment-dependent (mutable): a stale BLOCKED ledger row
+    from a prior attempt must NOT be carried forward as reused on a same-candidate
+    re-drive — otherwise a boot_prereq failure would remain reused even after the
+    operator repaired the deploy environment.  Truly immutable dimensions
+    (audit/test_erosion/smoketest/merge_grade) must still be reused.
+
+    Observable proof: ``last_qualification["resolved_dimensions"]`` (the reuse set
+    written at spawn) must include the immutable gates but exclude env_preflight,
+    forcing env_preflight to be re-measured live this drive.
+    """
+    from app import shared_state
+    from pathlib import Path
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "deadbeef" * 5  # 40-char placeholder SHA
+
+    # Immutable gates resolved+passed in the ledger → carried forward as reused.
+    for dim in ("audit", "test_erosion", "smoketest", "merge_grade"):
+        await _seed_dimension_row(
+            db_session, project, version, dim,
+            status="passed", candidate_sha=candidate,
+        )
+    # A stale BLOCKED env_preflight row from a prior attempt (the environment was
+    # broken then; the operator has since repaired it).
+    await _seed_dimension_row(
+        db_session, project, version, "env_preflight",
+        status="blocked", blocker="boot_prereq_missing", candidate_sha=candidate,
+    )
+    await db_session.commit()
+
+    prior_attempt_id = uuid.uuid4()
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(prior_attempt_id),
+        "retry_episode": 0,
+        "candidate_sha": candidate,
+        "error": "smoketest_task_failed",
+        "consecutive_infra_errors": 0,
+        "started_at": "2026-01-01T00:00:00",
+        "finalized_at": "2026-01-01T00:01:00",
+    }
+    version.active_qualification_attempt_id = prior_attempt_id
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-deadbeef",
+    )
+
+    repo_root = Path(__file__).resolve().parent.parent
+    required_env_py = (repo_root / "app" / "required_runtime_env.py").read_text()
+    smoketest_yaml = (repo_root / "testing" / "smoketest.yaml").read_text()
+
+    async def _mock_file_text(path, *, token, owner, repo, ref, **kw):
+        if path == "backend/app/required_runtime_env.py":
+            return required_env_py
+        if path == "backend/testing/smoketest.yaml":
+            return smoketest_yaml
+        return None
+
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(side_effect=_mock_file_text),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"Expected 'spawned' but got {result['status']!r}"
+    )
+
+    await db_session.refresh(version)
+    resolved = version.last_qualification.get("resolved_dimensions") or {}
+
+    # env_preflight (mutable) must be dropped from the reuse set → re-measured.
+    assert "env_preflight" not in resolved, (
+        "stale blocked env_preflight ledger row must NOT be carried forward as "
+        "reused on a same-SHA re-drive; it must be re-measured after an env repair"
+    )
+    # Truly immutable gates must still be reused (candidate-stable reuse preserved).
+    assert "audit" in resolved and "test_erosion" in resolved, (
+        "immutable dimension reuse must be preserved for candidate-stable gates"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_spawns_smoketest_when_env_preflight_enabled_only(
+    db_session, mocker
+):
+    """Audit H3 / boot-gate: with smoketest_enabled=False but env_preflight_enabled=True,
+    run_qualification still spawns the smoketest child (carrying the env-preflight
+    run) and stamps smoketest_task_id non-None so the finalize gate can wait for it."""
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["env_preflight_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "babe5678" * 5  # 40-char placeholder SHA
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["smoketest_enabled"] is False
+    assert result["env_preflight_enabled"] is True
+    # smoketest child IS spawned even though smoketest_enabled is False,
+    # because env_preflight_enabled triggers the same spawn path.
+    assert result["smoketest_task_id"] is not None
+
+    await db_session.refresh(version)
+    assert version.last_qualification["smoketest_enabled"] is False
+    assert version.last_qualification["env_preflight_enabled"] is True
+    assert version.last_qualification["smoketest_task_id"] is not None
+
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    types = sorted((t.first_payload or {}).get("type") for t in tasks)
+    # Both release_audit and smoketest children are spawned.
+    assert types == ["release_audit", "smoketest"]
 
 
 @pytest.mark.asyncio
@@ -6662,6 +7344,13 @@ async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-analytics-ui",
+        text="Render analytics for the operator",
+    )
 
     candidate = "feed1234" * 5
     mocker.patch(
@@ -6715,10 +7404,281 @@ async def test_run_qualification_spawns_merge_grade_child_when_goal_set(
     assert payload["candidate_sha"] == candidate
     assert payload["version_goal"] == "deliver user analytics dashboard"
     assert payload["merged_prs"] == [101, 102]
+    assert lq["rubric_snapshot"] == [
+        {
+            "criterion_key": "c-analytics-ui",
+            "text": "Render analytics for the operator",
+        },
+    ]
+    assert payload["categories"] == [
+        {"category_key": row["criterion_key"], "text": row["text"]}
+        for row in lq["rubric_snapshot"]
+    ]
+    assert payload["rubric_fingerprint"] == lq["rubric_fingerprint"]
+    assert uuid.UUID(lq["qualification_attempt_id"])
+    assert payload["qualification_attempt_id"] == lq["qualification_attempt_id"]
+    assert lq["rubric_provenance"]["qualification_attempt_id"] == lq[
+        "qualification_attempt_id"
+    ]
+    assert lq["rubric_fingerprint"] == rq._rubric_fingerprint(
+        lq["rubric_snapshot"]
+    )
     # Regression guard: promotion judgment must be pinned to Opus so a future
     # cost-saving runtime-config edit cannot silently downgrade it.
     assert payload.get("quality_tier") == "opus", (
         f"release_merge_grade must pin quality_tier=opus; got {payload.get('quality_tier')!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("lifecycle_change", "expected_change", "merge_grade_failed"),
+    [
+        ("add", "added", True),
+        ("reinstate", "reinstated", False),
+        ("retract", "retracted", False),
+        ("supersede", "superseded", False),
+        ("change", "changed", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_in_flight_rubric_lifecycle_changes_require_fresh_grade(
+    db_session, mocker, lifecycle_change, expected_change, merge_grade_failed
+):
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    version.goal = "Ship a rubric-bound qualification"
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-stable",
+        text="Stable acceptance requirement",
+    )
+    mutable = await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-lifecycle",
+        text="Lifecycle acceptance requirement",
+    )
+    if lifecycle_change in {"add", "reinstate"}:
+        mutable.status = "retracted"
+        db_session.add(mutable)
+        await db_session.commit()
+        await db_session.refresh(mutable)
+
+    candidate = "a11ce123" * 5
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"status": "completed", "conclusion": "success"}),
+    )
+    mocker.patch(
+        "app.release_qualifier._merged_pr_numbers_for_version",
+        new=AsyncMock(return_value=[15001]),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    launched = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert launched["status"] == "spawned"
+    await db_session.refresh(version)
+    first_task_id = version.last_qualification["merge_grade_task_id"]
+    first_fingerprint = version.last_qualification["rubric_fingerprint"]
+    first_attempt_id = version.last_qualification["qualification_attempt_id"]
+    assert uuid.UUID(first_attempt_id)
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    for task in tasks:
+        task.status = (
+            TaskStatus.FAILED
+            if merge_grade_failed and str(task.id) == first_task_id
+            else TaskStatus.COMPLETED
+        )
+        db_session.add(task)
+
+    if lifecycle_change == "add":
+        await _add_version_criterion(
+            db_session,
+            project,
+            version,
+            key="c-added",
+            text="Added while grading",
+            sync_pending_rubric=False,
+        )
+    elif lifecycle_change == "reinstate":
+        mutable.status = "active"
+        db_session.add(mutable)
+    elif lifecycle_change == "retract":
+        mutable.status = "retracted"
+        db_session.add(mutable)
+    elif lifecycle_change == "supersede":
+        mutable.status = "superseded"
+        db_session.add(mutable)
+    else:
+        mutable.text = "Materially changed acceptance requirement"
+        db_session.add(mutable)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates={
+            "ci_green": True,
+            "ci_resolution": {"state": "green", "resolved_sha": candidate},
+        },
+    )
+    await db_session.commit()
+
+    assert result["status"] == "rubric_changed"
+    assert result["blocker"] == "rubric_changed"
+    assert expected_change in {
+        change["change"] for change in result["rubric_drift"]["changes"]
+    }
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["category_verdicts"] is None
+    assert version.last_qualification["rubric_fingerprint"] == first_fingerprint
+    verdict = (
+        await db_session.execute(
+            select(QualificationVerdict)
+            .where(QualificationVerdict.release_version_id == version.id)
+            .order_by(QualificationVerdict.created_at.desc())
+        )
+    ).scalars().first()
+    assert verdict is not None
+    assert verdict.terminal_status == "rubric_changed"
+    assert verdict.blocker == "rubric_changed"
+    assert verdict.merge_grade_detail["rubric_drift"]["total_changes"] >= 1
+
+    redrive = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert redrive["status"] == "spawned"
+    await db_session.refresh(version)
+    assert version.last_qualification["merge_grade_task_id"] != first_task_id
+    assert version.last_qualification["rubric_fingerprint"] != first_fingerprint
+    assert uuid.UUID(version.last_qualification["qualification_attempt_id"])
+    assert version.last_qualification["qualification_attempt_id"] != first_attempt_id
+
+
+@pytest.mark.parametrize("outcome", ["rubric_changed", "rubric_provenance_unknown"])
+@pytest.mark.asyncio
+async def test_sweep_redrives_rubric_outcome_once_with_fresh_merge_grade(
+    db_session, mocker, outcome
+):
+    """The lifecycle sweep replaces either non-conclusive rubric outcome once.
+
+    This covers the public scheduled path (rather than only the trigger
+    resolver): the replacement must be a pending qualification with a newly
+    launched blind merge-grade, and the next sweep must observe that pending
+    attempt and not create duplicate children.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["smoketest_enabled"] = False
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.goal = "Re-grade the frozen acceptance rubric"
+    version.last_qualification = {
+        "status": outcome,
+        "candidate_sha": "priorrubric" * 4,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-sweep-redrive",
+        text="Launch a fresh blind grade after rubric recovery",
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._merged_pr_numbers_for_version",
+        new=AsyncMock(return_value=[]),
+    )
+
+    first_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert first_count == 0  # A re-drive launches work; it does not finalize work.
+    assert version.last_qualification["status"] == "pending"
+    first_merge_grade_id = version.last_qualification["merge_grade_task_id"]
+    assert first_merge_grade_id is not None
+    assert version.qualification_attempts == 1
+    first_tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert sorted((task.first_payload or {}).get("type") for task in first_tasks) == [
+        "release_audit",
+        "release_merge_grade",
+    ]
+    merge_grade = next(
+        task
+        for task in first_tasks
+        if (task.first_payload or {}).get("type") == "release_merge_grade"
+    )
+    assert str(merge_grade.id) == first_merge_grade_id
+
+    second_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert second_count == 0
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["merge_grade_task_id"] == first_merge_grade_id
+    assert version.qualification_attempts == 1
+    task_count = (
+        await db_session.execute(
+            select(sa_func.count()).where(Task.project_id == project.id)
+        )
+    ).scalar_one()
+    assert task_count == len(first_tasks)
+
+
+def test_rubric_dimension_reuse_requires_both_attempt_ids():
+    detail = {
+        "rubric_provenance": {
+            "fingerprint": "same-rubric",
+            "qualification_attempt_id": "prior-attempt",
+        }
+    }
+
+    assert not rq._rubric_dimension_reusable(
+        detail, fingerprint="same-rubric", qualification_attempt_id=None
+    )
+    assert not rq._rubric_dimension_reusable(
+        {"rubric_provenance": {"fingerprint": "same-rubric"}},
+        fingerprint="same-rubric",
+        qualification_attempt_id="current-attempt",
+    )
+    assert rq._rubric_dimension_reusable(
+        detail, fingerprint="same-rubric", qualification_attempt_id="prior-attempt"
     )
 
 
@@ -8087,6 +9047,669 @@ class TestIncrementalAuditBaseline:
 
 
 @pytest.mark.asyncio
+async def test_delta_scoped_audit_reuses_unchanged_surface_without_respawn(
+    db_session,
+    mocker,
+):
+    """Cross-SHA audit facts reuse identical trees and scope changed trees.
+
+    An excluded-only advance copies the prior fact without an audit spawn; a
+    one-file change uses the prior candidate as its incremental base and carries
+    only findings from unchanged paths.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    same_surface_sha = "sameonly" * 5
+    changed_sha = "changed1" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+    old_surface_hash = rq._audited_surface_hash_from_map(old_surface)
+    unchanged_finding = {
+        "severity": "low",
+        "summary": "Unchanged path still leaks internal timing detail",
+        "file": "backend/app/unchanged.py",
+        "key": rq._audit_finding_key(
+            "Unchanged path still leaks internal timing detail",
+            "backend/app/unchanged.py",
+        ),
+    }
+    superseded_finding = {
+        "severity": "low",
+        "summary": "Old changed-path finding",
+        "file": "backend/app/changed.py",
+        "key": rq._audit_finding_key(
+            "Old changed-path finding", "backend/app/changed.py"
+        ),
+    }
+    audit_detail = rq._audit_dimension_detail(
+        surface_paths=old_surface,
+        audit_findings=[unchanged_finding, superseded_finding],
+        excluded_audit_findings=[],
+        findings_meta={
+            "audit_findings_total": 2,
+            "audit_findings_truncated": False,
+            "excluded_audit_findings_total": 0,
+            "excluded_audit_findings_truncated": False,
+        },
+        audit_missing_reason=None,
+        audit_scope={"mode": "full"},
+    )
+    audit_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="audit",
+        status="failed",
+        sub_score=0.96,
+        audited_surface_hash=old_surface_hash,
+        detail=audit_detail,
+        origin_attempt_id=origin_attempt,
+    )
+    erosion_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="test_erosion",
+        status="passed",
+        sub_score=1.0,
+        detail={},
+        origin_attempt_id=origin_attempt,
+    )
+    challenge_row = QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        dimension="challenge",
+        status="passed",
+        detail={"verdicts": [{"verdict": "confirmed"}]},
+        origin_attempt_id=origin_attempt,
+    )
+    db_session.add_all([audit_row, erosion_row, challenge_row])
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": old_sha,
+        "qualification_attempt_id": str(origin_attempt),
+        "error": "merge_grade_report_unparseable",
+    }
+    version.active_qualification_attempt_id = origin_attempt
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=same_surface_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            side_effect=[
+                [
+                    {"path": path, "sha": blob_sha, "size": 1}
+                    for path, blob_sha in old_surface.items()
+                ],
+                [
+                    {
+                        "path": "backend/app/unchanged.py",
+                        "sha": "blob-unchanged",
+                        "size": 1,
+                    },
+                    {
+                        "path": "backend/app/changed.py",
+                        "sha": "blob-new",
+                        "size": 1,
+                    },
+                ],
+            ]
+        ),
+    )
+    spawned_task = MagicMock(id=uuid.uuid4())
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=spawned_task),
+    )
+
+    unchanged_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert unchanged_result["status"] == "spawned"
+    audit_spawn.assert_not_called()
+    active_attempt = uuid.UUID(unchanged_result["qualification_attempt_id"])
+    reused_row = await rq._load_dimension_result(
+        db_session, version, same_surface_sha, "audit"
+    )
+    assert reused_row is not None
+    assert reused_row.origin_attempt_id == origin_attempt
+    assert str(active_attempt) in (reused_row.reused_by_attempt_ids or [])
+    from app.qualification_state_resolver import (
+        resolve_dimension_states_from_ledger,
+    )
+
+    states = await resolve_dimension_states_from_ledger(db_session, version)
+    audit_state = next(state for state in states if state["key"] == "audit")
+    assert audit_state["provenance"]["currency"] == "reused"
+
+    version.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": same_surface_sha,
+        "qualification_attempt_id": str(active_attempt),
+        "error": "migration_apply_check_unavailable",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=changed_sha),
+    )
+
+    changed_result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert changed_result["status"] == "spawned"
+    audit_spawn.assert_awaited_once()
+    assert audit_spawn.await_args.kwargs["audit_base_sha"] == same_surface_sha
+    assert version.last_qualification["changed_audited_paths"] == [
+        "backend/app/changed.py"
+    ]
+
+    fresh_report = {
+        "audit_score": 0.98,
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+            }
+        ],
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": same_surface_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "test_erosion": {},
+    }
+    merged_report, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fresh_report,
+        fresh_report,
+        reused_row.detail,
+        expected_base_sha=same_surface_sha,
+    )
+    merged_findings = rq._extract_audit_findings(merged_report)
+    assert {finding["summary"] for finding in merged_findings} == {
+        "Unchanged path still leaks internal timing detail",
+        "Fresh changed-path finding",
+    }
+    assert rq._score_audit(merged_report)[0] == pytest.approx(0.96)
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_persists_merged_ledger_facts(
+    db_session,
+    mocker,
+):
+    """Finalization with scoped audit merging persists the correct merged facts.
+
+    Prior ledger rows exist for an old SHA (audit + test_erosion).  A new
+    candidate triggers an incremental audit that finds one fresh issue on a
+    changed path and zero test erosion.  After ``_finalize_qualification``:
+    - The audit ledger row for the new SHA carries both the prior unchanged-path
+      finding and the fresh changed-path finding.
+    - The test_erosion ledger row carries cumulative deltas (prior -3 + current +1 = -2).
+    - ``last_qualification`` reflects the merged facts.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "0ldaudit" * 5
+    new_sha = "newaudit" * 5
+    origin_attempt = uuid.uuid4()
+    old_surface = {
+        "backend/app/unchanged.py": "blob-unchanged",
+        "backend/app/changed.py": "blob-old",
+    }
+
+    # --- Prior ledger rows ----------------------------------------------------
+    prior_audit_detail = {
+        "audited_surface_paths": old_surface,
+        "audit_findings": [
+            {
+                "severity": "low",
+                "summary": "Unchanged path still leaks internal timing detail",
+                "file": "backend/app/unchanged.py",
+                "key": rq._audit_finding_key(
+                    "Unchanged path still leaks internal timing detail",
+                    "backend/app/unchanged.py",
+                ),
+            },
+            {
+                "severity": "low",
+                "summary": "Old changed-path finding (superseded)",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Old changed-path finding (superseded)",
+                    "backend/app/changed.py",
+                ),
+            },
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_total": 2,
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_total": 0,
+        "excluded_audit_findings_truncated": False,
+        "audit_scope": {"mode": "full"},
+    }
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+        "assertion_delta": 0,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            detail=prior_audit_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Spawn a completed audit task with scoped artifact --------------------
+    audit_task = Task(
+        project_id=project.id,
+        title="scoped-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+        context={"candidate_sha": new_sha},
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # Scoped audit report: one fresh finding on changed.py, no test deletions
+    audit_report = {
+        "findings": [
+            {
+                "severity": "low",
+                "summary": "Fresh changed-path finding",
+                "file": "backend/app/changed.py",
+                "key": rq._audit_finding_key(
+                    "Fresh changed-path finding", "backend/app/changed.py"
+                ),
+            },
+        ],
+        "computed_test_erosion": {
+            "test_count_delta": 1,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["backend/app/changed.py"],
+        },
+        "reviewed_paths": {"backend/app/changed.py": "finding"},
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    # --- Stamp last_qualification for finalization ---------------------------
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # --- Finalize ------------------------------------------------------------
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Not promoted due to merged finding penalties (prior + fresh = 2 low findings).
+    assert result["status"] == "not_promoted"
+
+    # --- Assert audit ledger row ---------------------------------------------
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    merged_findings = audit_row.detail.get("audit_findings") or []
+    merged_summaries = {f["summary"] for f in merged_findings}
+    assert "Unchanged path still leaks internal timing detail" in merged_summaries, (
+        "prior unchanged-path finding must be carried forward"
+    )
+    assert "Fresh changed-path finding" in merged_summaries, (
+        "current scoped finding must be present"
+    )
+    assert "Old changed-path finding (superseded)" not in merged_summaries, (
+        "superseded path finding must NOT be carried"
+    )
+
+    # --- Assert test_erosion ledger row --------------------------------------
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    ed = erosion_row.detail or {}
+    assert ed.get("test_count_delta") == -2, (
+        f"expected cumulative -3 + 1 = -2, got {ed.get('test_count_delta')}"
+    )
+    assert ed.get("assertion_delta") == 0
+    # Prior deleted file not in current changed_paths → carried forward.
+    assert "testing/test_removed.py" in (ed.get("deleted_test_files") or [])
+    # Prior was blocked and blocking file still present → still blocked.
+    assert erosion_row.status == "blocked"
+    assert erosion_row.sub_score is None
+
+    # --- Assert last_qualification ------------------------------------------
+    lq = version.last_qualification
+    assert lq["status"] == "not_promoted"
+    lq_summaries = {f["summary"] for f in (lq.get("audit_findings") or [])}
+    assert "Unchanged path still leaks internal timing detail" in lq_summaries
+    assert "Fresh changed-path finding" in lq_summaries
+    assert "Old changed-path finding (superseded)" not in lq_summaries
+
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delta_scoped_audit_finalize_restoration_clears_blocker(
+    db_session,
+    mocker,
+):
+    """When a prior blocking file is restored in the current scope, the
+    test_erosion blocker clears and the cumulative delta is computed correctly."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "erosion0" * 5
+    new_sha = "restored" * 5
+    origin_attempt = uuid.uuid4()
+
+    # --- Prior ledger: blocked test_erosion due to deleted test file ----------
+    prior_erosion_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -5,
+        "assertion_delta": -3,
+    }
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="audit",
+            status="passed",
+            sub_score=1.0,
+            detail={"audited_surface_paths": {}, "audit_findings": [],
+                    "excluded_audit_findings": [], "audit_scope": {"mode": "full"}},
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=old_sha,
+            dimension="test_erosion",
+            status="blocked",
+            sub_score=None,
+            detail=prior_erosion_detail,
+            origin_attempt_id=origin_attempt,
+        )
+    )
+    await db_session.commit()
+
+    # --- Completed audit task: file restored in current scope -----------------
+    audit_task = Task(
+        project_id=project.id,
+        title="restoration-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(audit_task)
+    await db_session.flush()
+    await db_session.refresh(audit_task)
+
+    # testing/test_removed.py is in changed_paths but NOT in deleted_test_files
+    # → the scoped computation determined it was restored.
+    audit_report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 3,
+            "assertion_delta": 0,
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "effective_base_sha": old_sha,
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(audit_report),
+        )
+    )
+    await db_session.flush()
+
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": new_sha,
+        "prior_audit_candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-16T00:00:00",
+        "qualification_attempt_id": str(origin_attempt),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "challenge_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Test erosion should no longer be blocked.
+    erosion_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "test_erosion"
+    )
+    assert erosion_row is not None
+    # File was in changed_paths but NOT in deleted_test_files → restored.
+    assert "testing/test_removed.py" not in (erosion_row.detail or {}).get(
+        "deleted_test_files", []
+    ), "restored file must not appear in deleted_test_files"
+    assert erosion_row.status == "passed", (
+        f"expected passed after restoration, got {erosion_row.status}"
+    )
+    assert erosion_row.sub_score is not None, (
+        "blocker must be cleared; sub_score should not be None"
+    )
+    # Cumulative delta: -5 + 3 = -2 → still has some erosion but not blocked.
+    assert (erosion_row.detail or {}).get("test_count_delta") == -2
+
+    # Audit ledger row: no findings.
+    audit_row = await rq._load_dimension_result(
+        db_session, version, new_sha, "audit"
+    )
+    assert audit_row is not None
+    assert len((audit_row.detail or {}).get("audit_findings") or []) == 0
+
+    # last_qualification reflects the merged state.
+    lq = version.last_qualification
+    assert lq.get("sub_scores", {}).get("test_erosion") is not None, (
+        "test_erosion sub_score should not be None after restoration"
+    )
+
+
+def test_scoped_audit_merge_requires_bound_path_complete_unique_facts():
+    base_sha = "a" * 40
+    prior = {
+        "audited_surface_paths": {"backend/app/a.py": "blob"},
+        "audit_findings": [
+            {"file": "backend/app/a.py", "severity": "low", "summary": "one", "surface_key": "same"},
+            {"file": "backend/app/a.py", "severity": "low", "summary": "two", "surface_key": "same"},
+        ],
+        "excluded_audit_findings": [],
+        "audit_findings_truncated": False,
+        "excluded_audit_findings_truncated": False,
+    }
+    report = {
+        "findings": [],
+        "reviewed_paths": {"backend/app/b.py": "clean"},
+        "audit_scope": {"mode": "incremental", "effective_base_sha": base_sha, "changed_paths": ["backend/app/b.py"]},
+    }
+    merged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        report, report, prior, expected_base_sha=base_sha
+    )
+    assert [finding["summary"] for finding in merged["findings"]] == ["one", "two"]
+    fallback = {**report, "audit_scope": {"mode": "full", "effective_base_sha": None}}
+    unmerged, _ = rq._merge_scoped_audit_report_with_prior_fact(
+        fallback, fallback, prior, expected_base_sha=base_sha
+    )
+    assert unmerged["findings"] == []
+    pathless = {**prior, "audit_findings": [{"severity": "low", "summary": "global"}]}
+    assert rq._audit_detail_is_delta_reusable(pathless) is False
+
+
+def test_scoped_test_erosion_preserves_prior_blocker_and_cumulative_deltas():
+    """Prior blocked + file outside current scope carries forward unchanged."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": -2}},
+        {"deleted_test_files": ["testing/test_removed.py"], "test_count_delta": -3},
+        prior_blocked=True,
+    )
+    assert score is None
+    assert detail == {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -2,
+        "assertion_delta": -2,
+    }
+
+
+def test_scoped_test_erosion_restoration_clears_blocker():
+    """Prior-deleted file restored in current scope: blocker clears."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {"test_count_delta": 1, "assertion_delta": 0},
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": ["testing/test_removed.py"],
+        "test_count_delta": -3,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    # File was in changed_paths but NOT in current deleted_test_files → restored.
+    assert score is not None, "blocker should clear after restoration"
+    assert "deleted_test_files" not in (detail or {})
+    assert detail.get("test_count_delta") == -2  # -3 + 1
+
+
+def test_scoped_test_erosion_restoration_preserves_other_deletions():
+    """Only the restored file drops; other prior deletions remain."""
+    report = {
+        "findings": [],
+        "computed_test_erosion": {
+            "test_count_delta": 0, "assertion_delta": 0,
+            "deleted_test_files": ["testing/still_gone.py"],
+        },
+        "audit_scope": {
+            "mode": "incremental",
+            "changed_paths": ["testing/test_removed.py", "testing/still_gone.py"],
+        },
+    }
+    prior_detail = {
+        "deleted_test_files": [
+            "testing/test_removed.py", "testing/still_gone.py",
+        ],
+        "test_count_delta": -5,
+    }
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        report, prior_detail, prior_blocked=True,
+    )
+    assert "testing/still_gone.py" in (detail or {}).get("deleted_test_files", [])
+    assert "testing/test_removed.py" not in (detail or {}).get("deleted_test_files", [])
+
+
+def test_scoped_test_erosion_positive_delta_preservation():
+    """Prior positive delta (stripped by old _extract_test_erosion_detail) is
+    now losslessly preserved so cumulative sum is correct."""
+    score, detail = rq._merge_scoped_test_erosion_with_prior_fact(
+        {"findings": [], "computed_test_erosion": {"test_count_delta": -5, "assertion_delta": 0}},
+        {"test_count_delta": 10, "assertion_delta": 0},
+        prior_blocked=False,
+    )
+    # Old behavior: prior's +10 stripped → merged = 0 + (-5) = -5 (incorrect penalty)
+    # New behavior: prior's +10 preserved → merged = 10 + (-5) = 5 (no penalty)
+    assert score == 1.0, f"expected no erosion penalty for cumulative +5, got {score}"
+    assert detail["test_count_delta"] == 5
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocker):
     """Content-hash cross-SHA reuse for a non-not_promoted verdict: when automain
     HEAD advances to a NEW commit whose audited surface is byte-identical to a
@@ -9166,6 +10789,112 @@ async def test_coverage_recovery_backfills_stranded_evidence_before_check(
 
 
 @pytest.mark.asyncio
+async def test_coverage_recovery_runs_rollup_and_unverified_backfills(
+    db_session, mocker
+):
+    """Reconciler calls backfill_rollup_child_changed_files and
+    backfill_unverified_merge_evidence per direction before
+    backfill_direction_merge_evidence.
+
+    The sweep's coverage-recovery path was missing these two backfills,
+    which are what actually flip declared_unsatisfied merges to verified.
+    Without them the v26 candidate strands at criterion_coverage_incomplete
+    with no autonomous recovery path."""
+    from app.acceptance_criteria import get_version_coverage_summary
+    from app.models import Direction
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "rlbkvf02" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-rollup-bf", text="Criterion needing rollup backfill",
+    )
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-rollupbf01",
+        data={"id": "d-rollupbf01", "text": "Fix rollup backfill", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Pre-condition: criterion is uncovered.
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["total"] >= 1
+
+    # Mock the new backfill functions to track calls.
+    rollup_mock = AsyncMock(return_value=0)
+    unverified_mock = AsyncMock(return_value=0)
+    mocker.patch(
+        "app.acceptance_criteria.backfill_rollup_child_changed_files",
+        new=rollup_mock,
+    )
+    mocker.patch(
+        "app.acceptance_criteria.backfill_unverified_merge_evidence",
+        new=unverified_mock,
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # Seed the ledger with a fully-met verdict so the reconciler clears the gate.
+    from app import category_verdict_ledger as _cvl
+    await _cvl.upsert_category_verdict(
+        db_session,
+        version_id=version.id,
+        candidate_sha=candidate_sha,
+        category_key=criterion.criterion_key,
+        status="met",
+        tier="judged",
+        gap=None,
+        citations=[{"kind": "diff", "ref": "app/mod.py:1"}],
+        grader_run_id="regrade-test",
+    )
+    await db_session.commit()
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert reconciled is True
+
+    # Both new backfills must have been called with the project and direction key.
+    rollup_mock.assert_any_call(
+        db_session, project.id, direction_key="d-rollupbf01"
+    )
+    unverified_mock.assert_any_call(
+        db_session, project.id, direction_key="d-rollupbf01"
+    )
+
+
+@pytest.mark.asyncio
 async def test_coverage_recovery_records_acceptance_window_evidence_before_check(
     db_session, mocker
 ):
@@ -9505,11 +11234,8 @@ async def _seed_qualification_children(
         await db_session.refresh(challenge_task)
         challenge_task_id = str(challenge_task.id)
 
-    # Blind merge-grade child (dir d-c0fe439f). When seed_merge_grade is set, a
-    # COMPLETED release_merge_grade child is created and its id recorded; when
-    # merge_grade_logs is supplied a RELEASE_MERGE_GRADE artifact is attached
-    # (omit it to exercise the MISSING-artifact infra-hold path).
     merge_grade_task_id: str | None = None
+    merge_grade_task: Task | None = None
     if seed_merge_grade:
         merge_grade_task = Task(
             project_id=project.id,
@@ -9536,16 +11262,37 @@ async def _seed_qualification_children(
     if version_goal is not None:
         version.goal = version_goal
 
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    if merge_grade_task is not None:
+        merge_grade_task.payloads = [
+            {
+                **(merge_grade_task.first_payload or {}),
+                "categories": [
+                    {"category_key": row["criterion_key"], "text": row["text"]}
+                    for row in rubric_snapshot
+                ],
+                "rubric_fingerprint": rubric_fingerprint,
+            }
+        ]
+        db_session.add(merge_grade_task)
+
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": _candidate_sha,
         "ci_green": ci_green,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": "2026-05-19T00:00:00",
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
         "challenge_task_id": challenge_task_id,
         "merge_grade_task_id": merge_grade_task_id,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
     }
     db_session.add(version)
     await db_session.commit()
@@ -9561,6 +11308,7 @@ async def _add_version_criterion(
     key: str,
     text: str,
     source_kind: str | None = None,
+    sync_pending_rubric: bool = True,
 ):
     criterion = VersionAcceptanceCriterion(
         project_id=project.id,
@@ -9586,7 +11334,133 @@ async def _add_version_criterion(
         )
     await db_session.commit()
     await db_session.refresh(criterion)
+    if sync_pending_rubric and (version.last_qualification or {}).get("status") == "pending":
+        snapshot, lifecycle = await rq._snapshot_qualification_rubric(
+            db_session, version
+        )
+        fingerprint = rq._rubric_fingerprint(snapshot)
+        qual = {
+            **(version.last_qualification or {}),
+            "rubric_snapshot": snapshot,
+            "rubric_fingerprint": fingerprint,
+            "rubric_lifecycle_snapshot": lifecycle,
+        }
+        merge_grade_id = qual.get("merge_grade_task_id")
+        if merge_grade_id:
+            merge_grade_task = await db_session.get(Task, uuid.UUID(str(merge_grade_id)))
+            if merge_grade_task is not None:
+                merge_grade_task.payloads = [
+                    {
+                        **(merge_grade_task.first_payload or {}),
+                        "categories": [
+                            {"category_key": row["criterion_key"], "text": row["text"]}
+                            for row in snapshot
+                        ],
+                        "rubric_fingerprint": fingerprint,
+                    }
+                ]
+                db_session.add(merge_grade_task)
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
     return criterion
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_rubric_reconstructed_from_merge_grade_payload(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    task = Task(
+        project_id=project.id,
+        title="legacy merge grade",
+        payloads=[{
+            "type": "release_merge_grade",
+            "categories": [{
+                "category_key": "c-legacy",
+                "text": "Legacy payload criterion",
+            }],
+        }],
+        vm_instance_id="vm-legacy-grade",
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.flush()
+    qual = {"status": "pending", "merge_grade_task_id": str(task.id)}
+    await db_session.commit()
+
+    snapshot, provenance, error = await rq._resolve_launched_rubric(
+        db_session, version, qual
+    )
+    assert error is None
+    assert snapshot == [{
+        "criterion_key": "c-legacy",
+        "text": "Legacy payload criterion",
+    }]
+    assert provenance["source"] == "legacy_merge_grade_task_payload"
+    assert provenance["fingerprint"] == rq._rubric_fingerprint(snapshot)
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_without_snapshot_or_task_is_provenance_unknown(
+    db_session,
+):
+    project, version = await _make_project_and_version(db_session)
+    snapshot, provenance, error = await rq._resolve_launched_rubric(
+        db_session, version, {"status": "pending"}
+    )
+
+    assert snapshot is None
+    assert provenance is None
+    assert error == "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
+
+
+@pytest.mark.asyncio
+async def test_legacy_pending_unknown_rubric_holds_without_live_substitution(
+    db_session, mocker
+):
+    project, version = await _make_project_and_version(db_session)
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-unknown",
+        text="Must not be borrowed from live state",
+    )
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={"audit_score": 1.0, "test_erosion": {}},
+        smoke_logs={"passed": True, "suites": {"startup": {"passed": True}}},
+        version_goal="Ship provenance safety",
+        seed_merge_grade=True,
+        merge_grade_logs={"covers_goal": True, "coverage_score": 1.0},
+    )
+    qual = dict(version.last_qualification or {})
+    for key in ("rubric_snapshot", "rubric_fingerprint", "rubric_lifecycle_snapshot"):
+        qual.pop(key, None)
+    merge_task = await db_session.get(Task, uuid.UUID(qual["merge_grade_task_id"]))
+    merge_task.payloads = [
+        {key: value for key, value in merge_task.first_payload.items() if key != "categories"}
+    ]
+    version.last_qualification = qual
+    db_session.add_all([version, merge_task])
+    await db_session.commit()
+    await db_session.refresh(version)
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session, version, _pre_gates=dict(_REUSE_PATH_PRE_GATES)
+    )
+    await db_session.commit()
+
+    assert result["status"] == "rubric_provenance_unknown"
+    assert result["rubric_provenance_error"] == "merge_grade_task_payload_has_no_rubric"
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["category_verdicts"] is None
 
 
 @pytest.mark.asyncio
@@ -9864,6 +11738,9 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     by_dim = {r.dimension: r for r in rows}
 
     # Every dimension is recorded exactly once for this candidate tree.
+    # env_preflight IS ledger_backed (mutable, re-measured live) so it is
+    # dual-written too — the judge is DARK by default in this fixture, so its row
+    # records the inert "unavailable" state.
     expected_dims = {
         "ci",
         "audit",
@@ -9876,6 +11753,7 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
         "acceptance_window",
         "debt_pressure",
         "capability_proof",
+        "env_preflight",
     }
     assert set(by_dim) == expected_dims
     assert len(rows) == len(expected_dims), "dual-write must not duplicate rows"
@@ -9893,6 +11771,11 @@ async def test_finalize_dual_writes_per_dimension_ledger(db_session, mocker):
     assert by_dim["migration_apply"].status == "passed"
     # No version goal / merge-grade child was seeded → not-applicable → unavailable.
     assert by_dim["merge_grade"].status == "unavailable"
+    # env_preflight judge is DARK by default (not enabled in this fixture) → the
+    # deployed-side judge is inert, so no score and the row is unavailable.
+    assert by_dim["env_preflight"].status == "unavailable"
+    assert by_dim["env_preflight"].blocker is None
+    assert by_dim["env_preflight"].sub_score is None
 
     # Failure-isolation (Phase 1b enabler): re-recording ONE dimension for the
     # SAME candidate tree upserts that dimension's row in place (no duplicate) and
@@ -10014,6 +11897,7 @@ async def _seed_dimension_row(
     sub_score=None,
     blocker=None,
     detail=None,
+    origin_attempt_id=None,
 ):
     row = QualificationDimensionResult(
         project_id=project.id,
@@ -10024,6 +11908,7 @@ async def _seed_dimension_row(
         sub_score=sub_score,
         blocker=blocker,
         detail=detail,
+        origin_attempt_id=origin_attempt_id,
     )
     db_session.add(row)
     return row
@@ -10339,6 +12224,149 @@ async def test_infra_failure_isolates_to_failing_dimension(db_session):
 
 
 @pytest.mark.asyncio
+async def test_infra_failure_record_stamps_engine_sha(db_session, monkeypatch):
+    """_handle_infra_failure stamps engine_sha into the top-level record and
+    each attempt_entry in infra_attempt_history so engine vs candidate triage
+    reads directly off the persisted qualification record."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.setenv("DEPLOY_SHA", "aabbccddeeff001")
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in return value, got {result.get('engine_sha')!r}"
+    )
+    # Verify the persisted record also carries engine_sha.
+    lq = version.last_qualification
+    assert lq["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in last_qualification record, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history, "infra_attempt_history must be non-empty"
+    latest = history[-1]
+    assert latest["engine_sha"] == "aabbccddeeff001", (
+        f"expected engine_sha 'aabbccddeeff001' in attempt_entry, got {latest.get('engine_sha')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_failure_engine_sha_none_when_deploy_sha_absent(db_session, monkeypatch):
+    """When DEPLOY_SHA is not set, engine_sha degrades gracefully to None
+    rather than raising — callers read 'unknown' in messages but the record
+    stays structurally intact."""
+    from app import release_qualifier_audit as rqa
+
+    monkeypatch.delenv("DEPLOY_SHA", raising=False)
+
+    project, version = await _make_project_and_version(db_session)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    result = await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        "migration_apply_check_unavailable",
+    )
+    await db_session.commit()
+
+    assert result["status"] == "infra_failure"
+    assert result.get("engine_sha") is None, (
+        f"expected engine_sha None when DEPLOY_SHA absent, got {result.get('engine_sha')!r}"
+    )
+    lq = version.last_qualification
+    assert lq.get("engine_sha") is None, (
+        f"expected engine_sha None in last_qualification, got {lq.get('engine_sha')!r}"
+    )
+    history = lq["infra_attempt_history"]
+    assert history[-1].get("engine_sha") is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_gate_incapacity_message_includes_engine_sha(db_session, monkeypatch):
+    """The permanent-gate-incapacity operator notification embeds the engine SHA
+    so the triage reader can distinguish engine build without parsing tracebacks."""
+    from app import release_qualifier_audit as rqa
+    from app import release_qualifier as rq_module
+    from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK, _infra_failure_signature
+
+    monkeypatch.setenv("DEPLOY_SHA", "deadbeef12345ab")
+
+    notified: list[str] = []
+
+    async def _capture_notify(session, version, event, message, extra=None):
+        notified.append(message)
+
+    monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
+
+    project, version = await _make_project_and_version(db_session)
+    # Compute the expected signature so pre-seeded history entries match.
+    _infra_error = "migration_apply_check_unavailable"
+    _sig = _infra_failure_signature(_infra_error, [])
+    _seed_count = _MIN_INFRA_ERROR_STREAK - 1
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": _LEDGER_SHA_A,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-07-10T00:00:00",
+        # prior_infra_streak drives current_streak so the alert fires.
+        "prior_infra_streak": _seed_count,
+        # Pre-seed matching-signature history so same_signature_streak reaches threshold.
+        "infra_attempt_history": [
+            {
+                "finalized_at": "2026-07-10T00:00:00",
+                "error": _infra_error,
+                "signature": _sig,
+                "candidate_sha": _LEDGER_SHA_A,
+            }
+        ] * _seed_count,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await rqa._handle_infra_failure(
+        db_session,
+        version,
+        dict(version.last_qualification),
+        _infra_error,
+    )
+    await db_session.commit()
+
+    assert notified, "operator notification was never sent"
+    msg = notified[-1]
+    assert "deadbeef12345ab" in msg, (
+        f"engine SHA 'deadbeef12345ab' not found in permanent-incapacity message: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_infra_failure_streak_is_per_dimension(db_session):
     """The consecutive-infra-error streak is tracked PER-DIMENSION: two migration
     infra failures raise migration_identity's streak to 2 while a single audit
@@ -10386,20 +12414,293 @@ async def test_infra_failure_streak_is_per_dimension(db_session):
 
 
 @pytest.mark.asyncio
-async def test_dual_write_reuses_already_resolved_dimension(db_session):
-    """Read-side composition: a re-finalize for the SAME candidate_sha reuses a
-    dimension that already reached a resolved (passed) fact — its stored row is
-    NOT overwritten with a freshly recomputed value — while a dimension left
-    'unavailable' by a prior infra hold IS re-recorded."""
+async def test_finalize_refreshes_migration_identity_from_ledger(db_session, mocker):
+    """A legacy resolved_dimensions marker cannot suppress the live identity gate."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate what run_qualification would have stored after loading a prior
+    # migration_identity=passed fact from the ledger.
+    qual = dict(version.last_qualification)
+    qual["resolved_dimensions"] = {
+        "migration_identity": {
+            "status": "passed",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {"verdict": "ok", "detail": None},
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # A live result distinct from the legacy row proves finalize re-measures it.
+    identity_gate = mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", "current-identity")),
+    )
+    # Let the apply gate succeed so finalize can proceed past both gates.
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("pass", None)),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result.get("status") != "infra_failure", (
+        f"live migration_identity gate unexpectedly deferred: {result.get('error')}"
+    )
+    identity_gate.assert_awaited_once()
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_identity" in by_dim
+    assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["migration_identity"].detail["detail"] == "current-identity"
+
+
+@pytest.mark.asyncio
+async def test_finalize_refreshes_migration_apply_from_ledger(db_session, mocker):
+    """A legacy resolved_dimensions marker cannot suppress the live apply gate."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate run_qualification having stored both migration gate facts from a
+    # prior finalize — identity resolves via ledger AND apply resolves via ledger.
+    qual = dict(version.last_qualification)
+    qual["resolved_dimensions"] = {
+        "migration_apply": {
+            "status": "passed",
+            "sub_score": None,
+            "blocker": None,
+            "detail": {"verdict": "pass", "detail": None},
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Let the identity gate succeed (it has no ledger entry here).
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    # A live result distinct from the legacy row proves finalize re-measures it.
+    apply_gate = mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("pass", "current-apply")),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result.get("status") != "infra_failure", (
+        f"live migration_apply gate unexpectedly deferred: {result.get('error')}"
+    )
+    apply_gate.assert_awaited_once()
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_apply" in by_dim
+    assert by_dim["migration_apply"].status == "passed"
+    assert by_dim["migration_apply"].detail["detail"] == "current-apply"
+
+
+@pytest.mark.asyncio
+async def test_migration_apply_skipped_records_unavailable_in_ledger(db_session, mocker):
+    """When MIGRATION_APPLY_SCRATCH_DATABASE_URL is absent the apply gate returns
+    ('skipped', 'scratch_database_not_configured').  The dual-write ledger must
+    record status='unavailable' — NOT 'passed' — so a skipped gate is never
+    indistinguishable from a gate that genuinely verified the migration."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    # Simulate absent scratch DB config — gate never ran.
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("skipped", "scratch_database_not_configured")),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Finalize must complete (not infra_failure) — the skipped gate is not fatal.
+    assert result.get("status") != "infra_failure", (
+        f"unexpected infra_failure when apply gate skipped: {result}"
+    )
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+    assert "migration_apply" in by_dim, "migration_apply ledger row missing"
+    # CRITICAL: skipped must never read as passed — the whole point of the
+    # distinct 'skipped' return value is to avoid a silent pass masquerade.
+    assert by_dim["migration_apply"].status == "unavailable", (
+        f"skipped apply gate wrote status={by_dim['migration_apply'].status!r}; "
+        "expected 'unavailable' so a missing scratch DB cannot masquerade as a pass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_gates_eagerly_persisted_before_dual_write(db_session, mocker):
+    """migration_identity and migration_apply are eagerly written to the ledger
+    right after their verdicts are computed — a later gate's infra failure cannot
+    discard them before _dual_write_dimension_results is reached."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("pass", None)),
+    )
+    # Suppress the end-of-finalize dual-write so only eager writes can populate
+    # the ledger for these dimensions.
+    mocker.patch(
+        "app.release_qualifier._dual_write_dimension_results",
+        new=AsyncMock(),
+    )
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    by_dim = await _dimension_rows_by_dim(db_session, version)
+
+    assert "migration_identity" in by_dim, (
+        "migration_identity ledger row missing — eager write not called"
+    )
+    assert by_dim["migration_identity"].status == "passed"
+
+    assert "migration_apply" in by_dim, (
+        "migration_apply ledger row missing — eager write not called"
+    )
+    assert by_dim["migration_apply"].status == "passed"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dimension_ledger_refreshed_on_same_sha_redrive(db_session):
+    """A same-SHA re-drive refreshes live CI/migration facts but retains audit.
+
+    This is the merge-verdict ledger seam: the new measurement replaces only
+    the mutable row's status/detail/origin, while an immutable audit verdict
+    stays pinned to its original producer and score.
+    """
     project, version = await _make_project_and_version(db_session)
 
-    # Prior finalize: audit passed with a DISTINCTIVE sub_score; migration_identity
-    # was held 'unavailable' by a transient infra failure.
+    old_attempt = uuid.uuid4()
+    new_attempt = uuid.uuid4()
+    # Prior finalize has resolved facts for every mutable gate plus a distinctive
+    # immutable audit score.  The next merge verdict disagrees with those live
+    # facts, making a stale/reused write observable.
     await _seed_dimension_row(
-        db_session, project, version, "audit", status="passed", sub_score=0.42
+        db_session, project, version, "audit", status="passed", sub_score=0.42,
+        origin_attempt_id=old_attempt,
     )
     await _seed_dimension_row(
-        db_session, project, version, "migration_identity", status="unavailable"
+        db_session, project, version, "ci", status="passed",
+        detail={"state": "old-green"}, origin_attempt_id=old_attempt,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_identity", status="passed",
+        detail={"verdict": "ok", "detail": "old-identity"},
+        origin_attempt_id=old_attempt,
+    )
+    await _seed_dimension_row(
+        db_session, project, version, "migration_apply", status="blocked",
+        detail={"verdict": "block", "detail": "old-apply"},
+        origin_attempt_id=old_attempt,
     )
     db_session.add(version)
     await db_session.commit()
@@ -10407,11 +12708,15 @@ async def test_dual_write_reuses_already_resolved_dimension(db_session):
     base_record = {
         "candidate_sha": _LEDGER_SHA_A,
         "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
-        "ci_green": True,
+        "ci_green": False,
+        "ci_resolution": {"state": "current-red"},
         "smoketest_enabled": True,
-        "migration_safety": "ok",
-        "migration_apply_safety": "ok",
+        "migration_safety": "block",
+        "migration_safety_detail": "current-identity",
+        "migration_apply_safety": "pass",
+        "migration_apply_safety_detail": "current-apply",
         "merge_grade_status": "not_applicable",
+        "qualification_attempt_id": str(new_attempt),
     }
     composite = {"blocker": None}
 
@@ -10419,12 +12724,21 @@ async def test_dual_write_reuses_already_resolved_dimension(db_session):
     await db_session.commit()
 
     by_dim = await _dimension_rows_by_dim(db_session, version)
-    # audit was already resolved → REUSED verbatim (distinctive 0.42 preserved,
-    # NOT overwritten with the freshly-computed 1.0).
+    # audit is immutable → REUSED verbatim (distinctive 0.42 preserved, NOT
+    # overwritten with the freshly-computed 1.0).
     assert by_dim["audit"].status == "passed"
     assert by_dim["audit"].sub_score == 0.42
-    # migration_identity was only 'unavailable' → re-recorded from the live gate.
-    assert by_dim["migration_identity"].status == "passed"
+    assert by_dim["audit"].origin_attempt_id == old_attempt
+    # Every mutable gate is refreshed from this re-drive's merge verdict,
+    # including facts that had already resolved on the same candidate SHA.
+    assert by_dim["ci"].status == "blocked"
+    assert by_dim["ci"].detail == {"state": "current-red"}
+    assert by_dim["migration_identity"].status == "blocked"
+    assert by_dim["migration_identity"].detail["detail"] == "current-identity"
+    assert by_dim["migration_apply"].status == "passed"
+    assert by_dim["migration_apply"].detail["detail"] == "current-apply"
+    for dimension in ("ci", "migration_identity", "migration_apply"):
+        assert by_dim[dimension].origin_attempt_id == new_attempt
     # No duplicate audit rows were created by the re-finalize (upsert-in-place).
     all_audit_rows = (
         (
@@ -10954,6 +13268,12 @@ _REUSE_PATH_PRE_GATES = {
     "apply_detail": {},
 }
 
+_EMPTY_RUBRIC_PROJECTION = {
+    "rubric_snapshot": [],
+    "rubric_fingerprint": rq._rubric_fingerprint([]),
+    "rubric_lifecycle_snapshot": [],
+}
+
 
 @pytest.mark.asyncio
 async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
@@ -10978,6 +13298,7 @@ async def test_reused_blocked_smoketest_fact_stays_blocked_not_scored_1_0(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -11031,6 +13352,7 @@ async def test_reused_blocked_test_erosion_fact_stays_blocked_not_scored_1_0(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -11077,6 +13399,7 @@ async def test_reused_passed_smoketest_with_absent_score_still_neutral(
     sha = _LEDGER_SHA_A
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -11174,6 +13497,25 @@ async def test_category_gate_read_back_exception_fails_closed(db_session, mocker
         key="c-needs-verify",
         text="Widget path must be verified",
     )
+    qual = dict(version.last_qualification or {})
+    qual["merge_grade_task_id"] = None
+    qual["resolved_dimensions"] = {
+        "merge_grade": {
+            "status": "passed",
+            "sub_score": 0.9,
+            "detail": {
+                "rubric_provenance": rq._rubric_provenance(
+                    qual["rubric_snapshot"],
+                    source="same_attempt_reuse",
+                    qualification_attempt_id=None,
+                )
+            },
+        }
+    }
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
     # Make the ledger read-back raise (unreadable evidence).
     from app import category_verdict_ledger as _cvl
@@ -11224,6 +13566,12 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
         text="This criterion was never graded into the ledger",
     )
     version.goal = "Ship the widget end to end"
+    rubric_snapshot = [
+        {
+            "criterion_key": "c-ungraded",
+            "text": "This criterion was never graded into the ledger",
+        }
+    ]
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": sha,
@@ -11234,6 +13582,8 @@ async def test_category_gate_no_verdict_for_active_criterion_fails_closed(
         "smoketest_task_id": None,
         "challenge_task_id": None,
         "merge_grade_task_id": None,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rq._rubric_fingerprint(rubric_snapshot),
         # Re-drive: every quality gate already resolved for this tree, including
         # merge_grade — so no fresh merge-grade artifact / category verdicts are
         # produced and the gate must read the (empty) category ledger back.
@@ -11278,6 +13628,7 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     """
     from httpx import AsyncClient  # noqa: PLC0415
     from app.auth import create_agent_token  # noqa: PLC0415
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS  # noqa: PLC0415
     from app.shared_state import runtime_config as _test_runtime_config  # noqa: PLC0415
 
     assert isinstance(client, AsyncClient)
@@ -11352,7 +13703,11 @@ async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
     assert blocked is not None
     assert blocked["auto_trigger"] == "waiting"
     assert blocked["next_expected_trigger"] is not None
-    assert blocked["attempts"]["count"] == 0
+    assert blocked["lifetime_qualification_attempts"] == 0
+    assert blocked["error_retry_episode"] == {
+        "count": 0,
+        "cap": _MAX_ERROR_REDRIVE_ATTEMPTS,
+    }
     assert blocked["decision"]["reason"] == "criterion_not_met"
     assert blocked["decision"]["fire"] is False
     assert any(
@@ -14441,6 +16796,56 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.last_qualification["status"] == "infra_failure"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("scratch_value", "expected_verdict", "expected_code"),
+    [
+        # Absent config is a permanent operator choice, recorded as a DISTINCT
+        # "skipped" state (never "defer"/"ok") so a gate that was never attempted
+        # can never be mistaken for one that ran and passed.
+        (None, "skipped", "scratch_database_not_configured"),
+        # A malformed URL is a config error the finalizer HOLDS on (defer), with
+        # the offending raw value kept out of every diagnostic.
+        ("malformed://secret-value", "defer", "scratch_database_url_invalid"),
+    ],
+)
+async def test_migration_apply_preflight_holds_without_prod_io(
+    db_session, mocker, monkeypatch, scratch_value, expected_verdict, expected_code
+):
+    _project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+    if scratch_value is None:
+        monkeypatch.delenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL", scratch_value)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("token", "acme", "widget"),
+    )
+    resolve_engine = mocker.patch("app.release_qualifier.resolve_async_engine")
+    apply_gate = mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate", new=AsyncMock()
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == expected_verdict
+    assert expected_code in (detail or "")
+    if expected_verdict == "defer":
+        # The defer diagnostic names the env var so operators know what to fix.
+        assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (detail or "")
+    # The raw scratch value must never leak into any diagnostic.
+    assert "secret-value" not in (detail or "")
+    # Neither preflight-hold path performs production I/O.
+    resolve_engine.assert_not_called()
+    apply_gate.assert_not_awaited()
+
+
 # ===========================================================================
 # Retry-on-defer: migration identity and apply gates retry once with a fresh
 # GitHub token before propagating the defer (covers token-expiry mid-run).
@@ -14664,6 +17069,7 @@ async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources=dup_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine.dispose()
@@ -14711,6 +17117,7 @@ async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry(
         verdict, detail = await run_migration_apply_gate(
             prod_engine=engine,
             candidate_sources=broken_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine.dispose()
@@ -14742,6 +17149,7 @@ async def test_apply_gate_defer_with_broken_chain_blocks_instead_of_infra_retry(
         verdict2, detail2 = await run_migration_apply_gate(
             prod_engine=engine2,
             candidate_sources=cyclic_sources,
+            scratch_db_url="postgresql+asyncpg://scratch:p@localhost/control",
         )
     finally:
         await engine2.dispose()
@@ -15686,10 +18094,12 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
     # Pre-cap completeness meta agrees with the carried (capped) list.
     assert version.last_qualification["audit_findings_total"] == len(findings)
     assert version.last_qualification["audit_findings_truncated"] is False
-    # Test-erosion detail is carried too: this fixture has positive deltas and
-    # no deleted files, so the clean dimension carries None (nothing to fix).
+    # Test-erosion detail carries the lossless deltas (positive included) so
+    # a later scoped-audit merge can reconstruct cumulative erosion correctly.
     assert "test_erosion_detail" in version.last_qualification
-    assert version.last_qualification["test_erosion_detail"] is None
+    assert version.last_qualification["test_erosion_detail"] == {
+        "test_count_delta": 373, "assertion_delta": 840,
+    }
     # Smoketest detail names the specific failing test so the agent can target it.
     smoketest_detail = version.last_qualification["smoketest_detail"]
     assert smoketest_detail["failed_tests"] == ["b"]
@@ -15947,6 +18357,11 @@ async def test_force_promote_current_version_skips_audit_and_promotes(
     )
     spawn_mock = mocker.patch(
         "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": candidate, "detail": "ci green for test"})),
     )
 
     result = await rq.force_promote_current_version(
@@ -16442,6 +18857,432 @@ async def test_force_promote_reason_defaults_to_none(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_hotfix_scope_rejects_incomplete_compare(db_session, mocker):
+    """A capped GitHub compare cannot authorize a machinery-only hotfix.
+
+    This exercises the real compare helper through the promotion seam: GitHub
+    returns its documented 300-file cap, so the helper returns its
+    indeterminate sentinel and promotion declines before any branch or PR side
+    effect.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    real_compare_helper = github_refs.get_changed_files_with_patches_between_refs
+    create_branch_mock, create_pr_mock = _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[("backend/app/release_qualifier.py", "@@ -1 +1 @@\n-x\n+y\n")],
+    )
+    compare_response = MagicMock(status_code=200)
+    compare_response.json.return_value = {
+        "files": [
+            {"filename": "backend/app/release_qualifier.py", "patch": None}
+            for _ in range(300)
+        ],
+    }
+    # Override the helper mock installed by the ordinary hotfix fixture: this
+    # assertion must exercise github_refs' actual completeness check.
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=compare_response))
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=real_compare_helper,
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="candidate diff must be complete",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "scope_rejected"
+    assert "could not resolve the candidate diff" in result["reason"]
+    create_branch_mock.assert_not_called()
+    create_pr_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promote_audit_repair_failure_does_not_mask_committed_result(
+    db_session, mocker
+):
+    """The audit remains best-effort because the promotion commits first."""
+    project, _version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[
+            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
+        ],
+    )
+    mocker.patch(
+        "app.release_qualifier._reconcile_hotfix_audit_trail",
+        new=AsyncMock(side_effect=RuntimeError("audit database unavailable")),
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        reason="best-effort audit regression",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_hotfix_promotion_reconciles_audit_after_crash(db_session, mocker):
+    """A committed hotfix survives request rollback with its debt and Alert restored.
+
+    ``hotfix_promote_current_version`` commits the promotion in its dedicated
+    session but stages its audit trail in the caller's session.  This models a
+    crash in that gap, then exercises the real periodic sweep twice to prove
+    recovery and idempotency rather than merely testing the writer in isolation.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project_id, version_id = project.id, version.id
+    _patch_hotfix_promote_github(
+        mocker,
+        changed_files=[
+            ("backend/app/release_scoring.py", "@@ -1 +1 @@\n-x\n+y\n"),
+        ],
+    )
+
+    result = await rq.hotfix_promote_current_version(
+        db_session,
+        project_id,
+        actor="operator-crash-test",
+        reason="restore the promised audit trail",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+    assert result["status"] == "promoted"
+
+    # Simulate process/request loss after the dedicated promotion commit.
+    await db_session.rollback()
+    reloaded_version = await db_session.get(type(version), version_id)
+    assert reloaded_version.last_qualification["hotfix_promote_diff_file_list"] == [
+        "backend/app/release_scoring.py"
+    ]
+
+    first_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    second_count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    debt_rows = list(
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.project_id == project_id,
+                    CompletionDebtEntry.kind == "hotfix_deploy_pending_backfill",
+                )
+            )
+        ).scalars()
+    )
+    alert_rows = list(
+        (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.source == "hotfix_promote",
+                )
+            )
+        ).scalars()
+    )
+    assert first_count >= 1
+    assert second_count == 0
+    assert len(debt_rows) == 1
+    assert debt_rows[0].detail["actor"] == "operator-crash-test"
+    assert len(alert_rows) == 1
+    assert alert_rows[0].dedupe_key == f"hotfix_deploy_alert:{project_id}:" + (
+        "facec0de" * 5
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "promotion_pending",
+    [
+        {
+            "pr_number": 41,
+            "pr_url": "https://github.test/pull/41",
+            "auto_merge_enabled": True,
+            "enabled_at": "2026-07-15T00:00:00",
+        },
+        {
+            "pr_number": 42,
+            "pr_url": "https://github.test/pull/42",
+            "auto_merge_enabled": False,
+            "managed_check_wait": True,
+            "migration_carrying": True,
+            "enabled_at": "2026-07-15T00:00:00",
+        },
+    ],
+    ids=["pending_auto_merge", "pending_managed_check_wait"],
+)
+async def test_hotfix_pending_wait_reconciles_audit_after_request_crash(
+    db_session, promotion_pending
+):
+    """The two return-only wait statuses persist as pending + sub-state.
+
+    Model a crash after that durable promotion commit but before request-side
+    audit repair.  The sweep must recognize both persisted shapes and create
+    the missing debt and Alert.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "c1wa1t00" * 5
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+        "hotfix_promote_by": "operator-crashed",
+        "hotfix_promote_reason": "CI wait crash recovery",
+        "hotfix_promote_scope_modules": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_diff_file_list": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_prior_deployed_sha": "prior000" * 5,
+        "promotion_pending": promotion_pending,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    assert count >= 1
+    assert (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == debt_key
+            )
+        )
+    ).scalar_one_or_none() is not None
+    assert (
+        await db_session.execute(select(Alert).where(Alert.dedupe_key == alert_key))
+    ).scalar_one_or_none() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("debt_status", "seed_alert", "expected_debt_status"),
+    [
+        ("open", False, "open"),
+        (None, True, "open"),
+        ("resolved", False, "resolved"),
+        ("dismissed", False, "dismissed"),
+    ],
+    ids=["debt_only", "alert_only", "resolved_debt", "dismissed_debt"],
+)
+async def test_hotfix_partial_audit_repair_preserves_existing_debt_state(
+    db_session, debt_status, seed_alert, expected_debt_status
+):
+    """Partial recovery creates only the missing artifact.
+
+    In particular, a later normal qualification's resolved debt and an
+    operator-dismissed debt are historical facts and must never be reopened.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "part1al0" * 5
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    version.status = "promoted"
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+        "hotfix_promote_by": "operator-partial",
+        "hotfix_promote_reason": "partial audit repair",
+        "hotfix_promote_scope_modules": ["backend/app/release_qualifier.py"],
+        "hotfix_promote_diff_file_list": ["backend/app/release_qualifier.py"],
+    }
+    if debt_status is not None:
+        debt = CompletionDebtEntry(
+            project_id=project.id,
+            kind="hotfix_deploy_pending_backfill",
+            dedupe_key=debt_key,
+            status=debt_status,
+            title="existing hotfix debt",
+            source="hotfix_promote",
+            resolution_reason=(
+                "normal gate already passed" if debt_status != "open" else None
+            ),
+        )
+        db_session.add(debt)
+    if seed_alert:
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity="WARNING",
+                title="existing hotfix alert",
+                message="existing",
+                source="hotfix_promote",
+                dedupe_key=alert_key,
+            )
+        )
+    db_session.add(version)
+    await db_session.commit()
+
+    repaired = await rq._reconcile_hotfix_audit_trail(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert repaired is True
+
+    debt_rows = list(
+        (
+            await db_session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.dedupe_key == debt_key
+                )
+            )
+        ).scalars()
+    )
+    alert_rows = list(
+        (await db_session.execute(select(Alert).where(Alert.dedupe_key == alert_key)))
+        .scalars()
+    )
+    assert len(debt_rows) == 1
+    assert debt_rows[0].status == expected_debt_status
+    if debt_status in {"resolved", "dismissed"}:
+        assert debt_rows[0].resolution_reason == "normal gate already passed"
+    assert len(alert_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_hotfix_sweep_prefilters_normal_and_complete_release_history(
+    db_session, mocker
+):
+    """Only a hotfix with a missing artifact enters a dedicated repair session."""
+    _normal_project, normal = await _make_project_and_version(db_session)
+    complete_project, complete = await _make_project_and_version(db_session)
+    missing_project, missing = await _make_project_and_version(db_session)
+    complete_sha = "c0mplete" * 5
+    missing_sha = "m1ssing0" * 5
+
+    normal.status = "promoted"
+    normal.last_qualification = {"status": "promoted", "candidate_sha": "normal00" * 5}
+    complete.status = "promoted"
+    complete.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": complete_sha,
+        "hotfix_promote": True,
+    }
+    missing.status = "promoted"
+    missing.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": missing_sha,
+        "hotfix_promote": True,
+    }
+    db_session.add(
+        CompletionDebtEntry(
+            project_id=complete_project.id,
+            kind="hotfix_deploy_pending_backfill",
+            dedupe_key=f"hotfix_deploy:{complete_project.id}:{complete_sha}",
+            status="open",
+            title="complete debt",
+            source="hotfix_promote",
+        )
+    )
+    db_session.add(
+        Alert(
+            project_id=complete_project.id,
+            severity="WARNING",
+            title="complete alert",
+            message="complete",
+            source="hotfix_promote",
+            dedupe_key=f"hotfix_deploy_alert:{complete_project.id}:{complete_sha}",
+        )
+    )
+    db_session.add_all([normal, complete, missing])
+    await db_session.commit()
+
+    reconcile = mocker.patch(
+        "app.release_qualifier_sweep._reconcile_hotfix_audit_trail",
+        new=AsyncMock(return_value=False),
+    )
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    reconcile.assert_awaited_once()
+    assert reconcile.await_args.args[0] == missing.id
+    assert complete_project.id != missing_project.id
+
+
+@pytest.mark.asyncio
+async def test_hotfix_request_and_sweep_writers_serialize_on_version_lock(
+    db_session,
+):
+    """Concurrent request/reaper repairs create one debt and one Alert."""
+    if db_session.bind.dialect.name == "sqlite":
+        pytest.skip("requires independent transactions and row locks; runs on Postgres")
+
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+    engine = db_session.bind
+
+    @contextlib.asynccontextmanager
+    async def _dedicated_factory():
+        async with _AsyncSession(engine, expire_on_commit=False) as dedicated:
+            yield dedicated
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "c0ncur00" * 5
+    version.status = "promoted"
+    version.last_qualification = {
+        "status": "promoted",
+        "candidate_sha": candidate_sha,
+        "hotfix_promote": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    outcomes = await asyncio.gather(
+        rq._reconcile_hotfix_audit_trail(
+            version.id, session_factory=_dedicated_factory
+        ),
+        rq._reconcile_hotfix_audit_trail(
+            version.id, session_factory=_dedicated_factory
+        ),
+    )
+    assert sorted(outcomes) == [False, True]
+
+    debt_key = f"hotfix_deploy:{project.id}:{candidate_sha}"
+    alert_key = f"hotfix_deploy_alert:{project.id}:{candidate_sha}"
+    assert len(
+        list(
+            (
+                await db_session.execute(
+                    select(CompletionDebtEntry).where(
+                        CompletionDebtEntry.dedupe_key == debt_key
+                    )
+                )
+            ).scalars()
+        )
+    ) == 1
+    assert len(
+        list(
+            (
+                await db_session.execute(
+                    select(Alert).where(Alert.dedupe_key == alert_key)
+                )
+            ).scalars()
+        )
+    ) == 1
+
+
+
+@pytest.mark.asyncio
 async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker):
     """Force-promote refuses when a promotion is already in flight (an audit-passed
     PR open, or the Fix-3 claim) — mirrors /qualify + the version-cut lever, so all
@@ -16475,6 +19316,11 @@ async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker
         ),
     )
     create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": "facec0de" * 5, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -16533,6 +19379,11 @@ async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker)
         ),
     )
     mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(return_value=(True, {"state": "green", "resolved_sha": "facec0de" * 5, "detail": "ci green for test"})),
+    )
 
     result = await rq.force_promote_current_version(
         db_session,
@@ -16544,6 +19395,91 @@ async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker)
     # Must NOT refuse with promotion_in_flight — verdict already resolved.
     assert result["status"] != "promotion_in_flight", (
         "stale-pending+finalized-verdict should not block force_promote"
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_bypasses_require_candidate_ci(db_session, mocker):
+    """force_promote and hotfix_promote both gate on CI being green for the
+    candidate commit.
+
+    Both bypass channels skip the AUDIT/scoring gate but must not skip CI: when
+    CI is not green the bypass returns ``{"status": "ci_not_green"}`` without
+    cutting any branch or opening a PR.  This is the seam the acceptance criterion
+    for direction d-ae60ffe3 requires: operator bypasses must resolve exact-candidate
+    CI rather than relying on branch protection alone.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate = "facec0de" * 5
+
+    # Baseline GitHub mocks shared by both bypass paths.
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main="mainnew" * 5 + "00000"),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    promote_mock = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    # --- CI not green: force_promote is blocked ---
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(False, {"state": rq._CI_RED, "resolved_sha": candidate, "detail": "ci red for test"})
+        ),
+    )
+
+    force_result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        reason="prod incident — must ship",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert force_result["status"] == "ci_not_green", (
+        f"force_promote must return ci_not_green when CI is red; got {force_result['status']!r}"
+    )
+    promote_mock.assert_not_called()
+
+    # --- CI not green: hotfix_promote is blocked (even after scope passes) ---
+    mocker.patch(
+        "app.github_refs.get_changed_files_with_patches_between_refs",
+        new=_hotfix_changed_files_mock(
+            [("backend/app/release_scoring.py", "@@ -1 +1 @@\n-a\n+b\n")]
+        ),
+    )
+
+    hotfix_result = await rq.hotfix_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        reason="machinery fix",
+        scope_modules=["backend/app/release_scoring.py"],
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert hotfix_result["status"] == "ci_not_green", (
+        f"hotfix_promote must return ci_not_green when CI is red; got {hotfix_result['status']!r}"
+    )
+    promote_mock.assert_not_called()
+
+    # Version remains open — no branch was cut, no PR was opened.
+    await db_session.refresh(version)
+    assert version.status == "open", (
+        "version must remain open when operator bypass is blocked by CI"
     )
 
 
@@ -17608,6 +20544,7 @@ async def _seed_infra_failure_children(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": "dead" * 10,
         "ci_green": True,
         "smoketest_enabled": smoketest_enabled,
@@ -18294,6 +21231,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -18341,6 +21279,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -18502,6 +21441,7 @@ class TestFinalizeInfraFailure:
         )
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -18618,6 +21558,7 @@ class TestFinalizeInfraFailure:
         original_challenge_id = str(challenge_task.id)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -18736,6 +21677,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": _candidate_sha,
             "ci_green": True,
             "smoketest_enabled": True,
@@ -18838,6 +21780,7 @@ class TestFinalizeInfraFailure:
         from app.failure_classification import RATE_LIMIT, persist_failure_category
 
         project, version = await _make_project_and_version(db_session)
+        attempt_id = uuid.uuid4()
         audit_task = Task(
             project_id=project.id,
             title="audit",
@@ -18847,11 +21790,15 @@ class TestFinalizeInfraFailure:
                     "base_branch": "main",
                     "diff_range": "main...abcd1234",
                     "candidate_sha": "abcd1234" * 5,
+                    "qualification_attempt_id": str(attempt_id),
                 }
             ],
             vm_instance_id="vm-audit-rate-limited",
             status=TaskStatus.FAILED,
-            context={"release_version_id": str(version.id)},
+            context={
+                "release_version_id": str(version.id),
+                "qualification_attempt_id": str(attempt_id),
+            },
         )
         db_session.add(audit_task)
         await db_session.commit()
@@ -18867,6 +21814,9 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": 0,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -18875,6 +21825,8 @@ class TestFinalizeInfraFailure:
             "smoketest_task_id": None,
             "prior_infra_streak": 0,
         }
+        version.active_qualification_attempt_id = attempt_id
+        version.qualification_attempts = 1
         db_session.add(version)
         await db_session.commit()
         await db_session.refresh(version)
@@ -18891,6 +21843,17 @@ class TestFinalizeInfraFailure:
         new_qual = version.last_qualification
         assert new_qual["audit_rl_respawn_count"] == 1
         assert new_qual["audit_task_id"] != original_audit_id
+        assert new_qual["qualification_attempt_id"] == str(attempt_id)
+        assert new_qual["retry_episode"] == 1
+        assert new_qual["retry_episode_cap"] == rq._MAX_AUDIT_RL_RESPAWNS
+        assert version.qualification_attempts == 1
+        assert version.qualification_retry_episode == 1
+        replacement = await db_session.get(Task, uuid.UUID(new_qual["audit_task_id"]))
+        assert replacement is not None
+        assert replacement.context["qualification_attempt_id"] == str(attempt_id)
+        assert replacement.first_payload["qualification_attempt_id"] == str(
+            attempt_id
+        )
 
         # No QualificationVerdict row — verdict was not rendered.
         verdicts = await _infra_verdicts_for_version(db_session, version)
@@ -18945,6 +21908,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "cafe5678" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19010,6 +21974,7 @@ class TestFinalizeInfraFailure:
         original_audit_id = str(audit_task.id)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19082,6 +22047,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19142,6 +22108,7 @@ class TestFinalizeInfraFailure:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "dead1234" * 5,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19203,6 +22170,7 @@ class TestFinalizeInfraFailure:
         persist_failure_category(first_audit, PROVISION_FAILURE)
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": first_candidate,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -19513,18 +22481,140 @@ class TestFinalizeInfraFailure:
 
 
     @pytest.mark.asyncio
+
     async def test_permanent_gate_incapacity_classification(self, db_session):
         """Volatile per-attempt details do not hide a persistent gate failure."""
+    async def test_permanent_gate_incapacity_recommends_hotfix_channel_when_eligible(
+        self, db_session, mocker
+    ):
+        """3 consecutive same-signature migration_apply_check_unavailable errors
+        classify as permanent gate-incapacity and recommend the eligible narrow
+        hotfix channel, not force-promote."""
         from app import release_qualifier_audit as rqa
 
         project, version = await _make_project_and_version(db_session)
         sig = "migration_apply:unknown:migration_apply_check_unavailable"
         same_entry = {
             "finalized_at": "2026-07-10T00:00:00",
+
             "error": (
                 "migration_apply_check_unavailable: scratch database "
                 "blueprint_migration_attempt_a unavailable"
             ),
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+
+                dict(
+                    same_entry,
+                    finalized_at="2026-07-10T00:01:00",
+                    error="migration_apply_check_unavailable: connection id 8472",
+                ),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "eligible",
+                    "eligible": True,
+                    "reason": "all changed files are hotfix-eligible",
+                    "offending_files": [],
+                    "candidate_sha": "dead" * 10,
+                    "prior_deployed_sha": "beef" * 10,
+                }
+            ),
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+
+            "migration_apply_check_unavailable: scratch database attempt_c timed out",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 4  # 3 prior + current all same sig
+
+
+        await db_session.refresh(version)
+
+        # Verify a force-promote Alert was raised with the right message.
+        assert result["hotfix_preview"]["eligible"] is True
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
+
+        await db_session.refresh(version)
+
+        # The hotfix_preview must be persisted in the version's last_qualification
+        # so post-mortem analysis can see the eligible changes without re-computing.
+        assert version.last_qualification.get("hotfix_preview") == result["hotfix_preview"]
+
+        # The persisted alert gives the operator the narrow endpoint, rather
+        # than authorizing the entire candidate tree through force-promote.
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "persistently incapable" in latest.message
+
+        assert "hotfix scope" in latest.message
+        assert "promote/hotfix" in latest.message
+        assert "whole-tree force-promotion" in latest.message
+        assert "agent VM" not in latest.message
+        assert "clone pipeline" not in latest.message
+        assert latest.message.count("Sanctioned remediation:") == 1
+        assert "Sanctioned Sanctioned" not in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "force-promote" not in latest.message
+        assert "agent VM" not in latest.message
+        assert "clone pipeline" not in latest.message
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_holds_when_hotfix_scope_is_ineligible(
+        self, db_session, mocker
+    ):
+        """3 consecutive same-signature migration_apply errors classify as
+        permanent gate-incapacity, but an INELIGIBLE hotfix scope preview must
+        keep the release held and surface the not-eligible reason clause in BOTH
+        the persisted alert and the operator notification."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
             "signature": sig,
             "candidate_sha": "dead" * 10,
             "failing_leg": "migration_apply",
@@ -19541,32 +22631,49 @@ class TestFinalizeInfraFailure:
             "prior_infra_streak": 2,
             "infra_attempt_history": [
                 dict(same_entry, finalized_at="2026-07-10T00:00:00"),
-                dict(
-                    same_entry,
-                    finalized_at="2026-07-10T00:01:00",
-                    error="migration_apply_check_unavailable: connection id 8472",
-                ),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
             ],
         }
         db_session.add(version)
         await db_session.commit()
         await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(
+                return_value={
+                    "status": "ineligible",
+                    "eligible": False,
+                    "reason": "changed files touch code outside migrations",
+                    "offending_files": ["app/main.py"],
+                    "candidate_sha": "dead" * 10,
+                    "prior_deployed_sha": "beef" * 10,
+                }
+            ),
+        )
+        notify_mock = mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
 
         result = await rqa._handle_infra_failure(
             db_session,
             version,
             dict(version.last_qualification),
-            "migration_apply_check_unavailable: scratch database attempt_c timed out",
+            "migration_apply_check_unavailable",
         )
         await db_session.commit()
 
         assert result["status"] == "infra_failure"
         assert result["is_permanent_gate_incapacity"] is True
         assert result["same_signature_streak"] == 3
+        assert result["hotfix_preview"]["eligible"] is False
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
 
         await db_session.refresh(version)
 
-        # Verify a force-promote Alert was raised with the right message.
+        # An ineligible candidate is held rather than being routed through a
+        # whole-tree qualification bypass.
         alerts = (
             (await db_session.execute(
                 select(Alert).where(
@@ -19580,13 +22687,103 @@ class TestFinalizeInfraFailure:
         assert len(alerts) >= 1
         latest = alerts[-1]
         assert "persistently incapable" in latest.message
-        assert "hotfix scope" in latest.message
-        assert "promote/hotfix" in latest.message
-        assert "whole-tree force-promotion" in latest.message
-        assert "agent VM" not in latest.message
-        assert "clone pipeline" not in latest.message
-        assert latest.message.count("Sanctioned remediation:") == 1
-        assert "Sanctioned Sanctioned" not in latest.message
+        assert "force-promote" not in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "unavailable or ineligible" in latest.message
+
+        # The operator notification carries the same fail-closed guidance.
+        notify_mock.assert_awaited()
+        notify_message = notify_mock.await_args.args[3]
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
+        assert "POST /projects/{id}/promote/hotfix" in notify_message
+
+    @pytest.mark.asyncio
+    async def test_permanent_gate_incapacity_holds_when_hotfix_preview_is_unavailable(
+        self, db_session, mocker
+    ):
+        """When check_hotfix_scope_preview raises, the preview-unavailable path
+        must keep the release held and surface the 'unavailable' status clause
+        rather than authorizing a whole-tree qualification bypass."""
+        from app import release_qualifier_audit as rqa
+
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig,
+            "candidate_sha": "dead" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "dead" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        preview_mock = mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(side_effect=RuntimeError("scope preview backend down")),
+        )
+        notify_mock = mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+        # A failed preview is recorded as None — no preview available — so it
+        # cannot become a silent hotfix authorization.
+        assert result["hotfix_preview"] is None
+        preview_mock.assert_awaited_once_with(
+            db_session, project.id, candidate_sha="dead" * 10
+        )
+
+        await db_session.refresh(version)
+
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "persistently incapable" in latest.message
+        assert "force-promote" not in latest.message
+        assert "POST /projects/{id}/promote/hotfix" in latest.message
+        assert "unavailable or ineligible" in latest.message
+
+        notify_mock.assert_awaited()
+        notify_message = notify_mock.await_args.args[3]
+        assert "hotfix scope preview" in notify_message
+        assert "unavailable or ineligible" in notify_message
+        assert "POST /projects/{id}/promote/hotfix" in notify_message
 
     @pytest.mark.asyncio
     async def test_permanent_gate_incapacity_resets_on_different_signature(
@@ -19624,12 +22821,16 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
         await db_session.refresh(version)
 
+
         # A genuinely different stable gate code resets the per-signature streak.
         # Merely changing the diagnostic suffix is covered by the test above.
+        # The current call has a DIFFERENT error (carries a detail suffix) than the prior
+        # two entries, so the per-signature streak should reset to 1.
         result = await rqa._handle_infra_failure(
             db_session,
             version,
             dict(version.last_qualification),
+
             "migration_apply_scratch_provision_failed: unreachable",
         )
         await db_session.commit()
@@ -19760,6 +22961,7 @@ class TestReaperInducedAuditHeartbeatTimeout:
 
         version.last_qualification = {
             "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
             "candidate_sha": "dead" * 10,
             "ci_green": True,
             "smoketest_enabled": False,
@@ -20011,21 +23213,38 @@ async def _seed_pending_qualification(
     """
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{
+            "type": "release_audit",
+            "base_branch": "main",
+            "qualification_attempt_id": attempt_text,
+        }],
         vm_instance_id="vm-audit-child",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={
+            "release_version_id": str(version.id),
+            "qualification_attempt_id": attempt_text,
+        },
     )
     smoke_task = Task(
         project_id=project.id,
         title="smoke-child",
-        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        payloads=[{
+            "type": "smoketest",
+            "base_branch": "automain",
+            "qualification_attempt_id": attempt_text,
+        }],
         vm_instance_id="vm-smoke-child",
         status=smoke_status,
-        context={"release_version_id": str(version.id)},
+        context={
+            "release_version_id": str(version.id),
+            "qualification_attempt_id": attempt_text,
+        },
     )
     db_session.add(audit_task)
     db_session.add(smoke_task)
@@ -20035,13 +23254,17 @@ async def _seed_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": str(smoke_task.id),
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -20168,6 +23391,624 @@ async def test_maybe_finalize_both_children_terminal_calls_finalize(db_session, 
     assert version.last_qualification["status"] == "dry_run"
 
 
+async def _finalize_with_smoketest_logs(db_session, smoke_logs: dict):
+    """Drive a full qualification finalize with the given SMOKETEST_RESULT logs.
+
+    Returns (result_dict, version) after committing. Mirrors
+    test_maybe_finalize_both_children_terminal_calls_finalize's seeding so the
+    only variable is the smoketest artifact body.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session, project, version,
+        audit_status=TaskStatus.COMPLETED, smoke_status=TaskStatus.COMPLETED,
+    )
+
+    # _resolve_launched_rubric returns early (no env_preflight written) when
+    # last_qualification has no rubric_snapshot. Patch the fields in so
+    # finalization runs the full path, mirroring _seed_qualification_children.
+    rubric_snapshot, rubric_lifecycle = await rq._snapshot_qualification_rubric(
+        db_session, version
+    )
+    rubric_fingerprint = rq._rubric_fingerprint(rubric_snapshot)
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    db_session.add(
+        Artifact(
+            task_id=audit_task.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "findings": [],
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 2,
+                        "test_count_delta": 1,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(smoke_logs),
+        )
+    )
+    await db_session.commit()
+
+    result = await rq.maybe_finalize_qualification(
+        smoke_task, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    # Snapshot last_qualification now: a later finalize commits and would expire
+    # this version's attributes, making a deferred lazy-load fail.
+    return result, dict(version.last_qualification)
+
+
+@pytest.mark.asyncio
+async def test_finalize_surfaces_env_preflight_evidence_without_gating(db_session, monkeypatch):
+    """Slice 2 acceptance: a qualification run stores the pure-content
+    {required_env, startup_check_names, manifest_source} env_preflight artifact
+    on last_qualification, sanitized to presence-only.
+
+    The run WITH evidence passes (declared vars were all-present in
+    scope=cloud_run context).  The run WITHOUT evidence now fail-closes
+    with boot_prereq_evidence_missing — evidence absence is a
+    deterministic block, not a silent pass (the fix for Defect 2).
+    """
+    base_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    env_preflight_body = {
+        "required_env": [
+            # A smuggled value MUST be stripped by the read-side sanitizer.
+            {"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run", "value": "sekret"},
+        ],
+        "startup_check_names": ["python3 -c \"import app.main\""],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
+
+    with_result, with_qual = await _finalize_with_smoketest_logs(
+        db_session, {**base_smoke, "env_preflight": env_preflight_body}
+    )
+    without_result, without_qual = await _finalize_with_smoketest_logs(
+        db_session, dict(base_smoke)
+    )
+
+    # Evidence surfaced, sanitized to presence-only (no smuggled value).
+    stored = with_qual["env_preflight"]
+    assert stored == {
+        "required_env": [{"name": "GITHUB_PAT_ENCRYPTION_KEY", "scope": "cloud_run"}],
+        "startup_check_names": ["python3 -c \"import app.main\""],
+        "manifest_source": "backend/app/required_runtime_env.py",
+    }
+    assert "value" not in stored["required_env"][0]
+
+    # WITHOUT evidence: now fail-closes (boot_prereq_evidence_missing).
+    assert without_qual["env_preflight"] is None
+    assert without_qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {without_qual['blocker']!r} — "
+        "missing evidence must fail-closed"
+    )
+    assert without_result["status"] == "not_promoted"
+
+    # WITH evidence (cloud_run-scoped vars are present in cloud_run context):
+    # promotion proceeds normally.
+    assert with_result["status"] == "dry_run"
+    assert with_result["would_promote"] is True
+
+
+def test_policy_env_preflight_enabled_default_on():
+    """promotion_policy.yaml must ship with env_preflight_enabled: true.
+
+    The Slice-3 deployed-side env-preflight gate was initially shipped dark
+    (env_preflight_enabled: false).  This test pins the ENABLED default so a
+    future yaml edit does not silently re-disable it.
+    """
+    import yaml
+    from pathlib import Path
+
+    policy_path = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
+    with open(policy_path) as f:
+        policy = yaml.safe_load(f)
+    assert policy.get("env_preflight_enabled") is True, (
+        "promotion_policy.yaml must have env_preflight_enabled: true — "
+        "the env-preflight gate must be enabled by default (Slice-3, design 245212a4)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_fires_and_names_missing_var(db_session, monkeypatch):
+    """Slice-3 acceptance: when env_preflight_enabled is true in the policy
+    and a required 'always'-scope var is absent from the deployed env, the
+    gate blocks with boot_prereq_missing AND names the missing var in
+    sub_scores and the operator notification message.
+
+    This is the v22 lesson: a deterministic, actionable blocker that names the
+    exact missing prerequisite rather than degrading into a vague retry loop.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    # Ensure the test var is absent from os.environ so the gate fires.
+    _ABSENT_VAR = "BLUEPRINT_PREFLIGHT_TEST_ABSENT_VAR_SHOULD_NOT_EXIST"
+    monkeypatch.delenv(_ABSENT_VAR, raising=False)
+    # K_REVISION absent → deploy_target_scope = "always", so scope:"always" vars are in scope.
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "startup_check", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                # scope "always" → evaluated in every deploy target (cloud_run AND non-cloud_run).
+                {"name": _ABSENT_VAR, "scope": "always"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # The gate must fire with boot_prereq_missing when the flag is on in the policy.
+    assert qual["blocker"] == "boot_prereq_missing", (
+        f"Expected boot_prereq_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must block when a required var is absent"
+    )
+    # The specific missing var name must appear in sub_scores — not just a generic message.
+    missing = qual["sub_scores"].get("env_preflight_missing", [])
+    assert _ABSENT_VAR in missing, (
+        f"Expected {_ABSENT_VAR!r} in env_preflight_missing, got {missing!r} — "
+        "actionable blocker must name the exact missing prerequisite"
+    )
+    # The candidate was not promoted — gate is deterministic, not a retry loop.
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+    # The operator notification must also name the missing var — deterministic message.
+    msgs = await _messages_for(db_session, project.id, "release_blocked")
+    assert len(msgs) >= 1
+    blocked_msg = msgs[-1]
+    assert _ABSENT_VAR in blocked_msg.content, (
+        f"Operator notification must name the missing var {_ABSENT_VAR!r}; "
+        f"got: {blocked_msg.content!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_when_no_artifact(db_session):
+    """When env_preflight_enabled is true but no env_preflight evidence was
+    produced (the SMOKETEST_RESULT artifact exists but carries no env_preflight
+    key), the gate NOW FAILS CLOSED with boot_prereq_evidence_missing.
+
+    This is the corrected behavior (previously the defect was that missing
+    evidence silently passed through — a fail-open).  The evidence-missing
+    block is a deterministic quality verdict, never an infra-failure retry loop.
+    A real successful producer always emits a non-empty manifest (even
+    required_env: []), so 'no artifact while enabled' legitimately fail-closes.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        # No env_preflight key in smoke_logs — no evidence produced.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Gate must hard-block with evidence-missing when enabled but no evidence.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must fail-closed when no evidence was produced"
+    )
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_for_cloud_run_only_var_in_non_cloud_run_env(
+    db_session, monkeypatch
+):
+    """A required var with scope 'cloud_run' does NOT block in a non-Cloud-Run
+    deploy target (K_REVISION absent).  The scope-gate prevents false positives
+    on developer and CI environments that legitimately lack cloud-run-only secrets.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _CLOUD_RUN_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
+    # K_REVISION absent → deploy_target_scope = "always"; cloud_run-scoped vars are out of scope.
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                {"name": _CLOUD_RUN_VAR, "scope": "cloud_run"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Enable env_preflight explicitly (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # cloud_run-scoped var must NOT block a non-Cloud-Run deployment.
+    assert qual["blocker"] != "boot_prereq_missing", (
+        "cloud_run-scoped var must not block in a non-Cloud-Run environment"
+    )
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_gate_inert_with_ack_override(db_session, monkeypatch):
+    """The owner-armed Slice-4 ack suppresses the boot_prereq_missing block
+    exactly once when the operator acknowledges that the missing var will be
+    bound in the same deploy (ack_env_will_be_bound).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _ABSENT_VAR = "BLUEPRINT_PREFLIGHT_ACK_TEST_VAR"
+    monkeypatch.delenv(_ABSENT_VAR, raising=False)
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [{"name": _ABSENT_VAR, "scope": "always"}],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Arm the Slice-4 one-shot ack and enable env_preflight (seed defaults to False).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+        "ack_env_will_be_bound": {
+            "actor": "test-operator",
+            "acknowledged_at": "2026-07-16T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Ack suppresses the boot_prereq_missing block.
+    assert qual["blocker"] != "boot_prereq_missing", (
+        "Slice-4 ack must suppress boot_prereq_missing block"
+    )
+    # The ack-applied record is auditable.
+    assert qual.get("env_preflight_ack_applied") is not None
+    assert qual["env_preflight_ack_applied"]["overridden_blocker"] == "boot_prereq_missing"
+    # Missing names still recorded for audit (presence-only, names never values).
+    assert _ABSENT_VAR in qual["env_preflight_ack_applied"]["missing"]
+    # Dry-run promotion proceeds.
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_blocks_without_smoketest_child(db_session):
+    """When env_preflight_enabled is True but smoketest_enabled is False
+    and NO env_preflight evidence is produced (the child was never spawned
+    or produced no usable artifact), the gate hard-blocks with
+    boot_prereq_evidence_missing — a deterministic quality verdict, NOT
+    an infra_failure retry loop.
+
+    This is the primary acceptance test: the boot gate is independently
+    enforceable even when the smoketest subsystem is disabled.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        # No env_preflight in smoke_logs — no evidence produced.
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # Must block with boot_prereq_evidence_missing — NOT infra_failure.
+    assert qual["blocker"] == "boot_prereq_evidence_missing", (
+        f"Expected boot_prereq_evidence_missing, got {qual['blocker']!r} — "
+        "env_preflight gate must hard-block when enabled but no evidence produced"
+    )
+    assert qual["status"] == "not_promoted"
+    assert qual["confidence"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_evidence_even_without_smoketest(db_session, monkeypatch):
+    """When env_preflight_enabled is True, smoketest_enabled is False, BUT the
+    evidence producer ran successfully and all declared prerequisites are present:
+    promotion proceeds normally (no block, no confidence erosion).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [
+                # scope "always" → in scope for non-cloud-run.
+                {"name": "SOME_PRESENT_VAR", "scope": "always"},
+            ],
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate: smoketest disabled, env-preflight enabled.
+    version.last_qualification = {
+        **version.last_qualification,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Ensure the declared required var is present in the deployed env.
+    monkeypatch.setenv("SOME_PRESENT_VAR", "1")
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence was produced and all vars are present.
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "gate must pass when evidence exists and all vars are present"
+    )
+    # Dry-run promotion proceeds (promotion_enabled=False but would_promote).
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_env_preflight_passes_with_empty_requirements(db_session, monkeypatch):
+    """When env_preflight_enabled is True and the evidence producer ran
+    successfully reporting required_env: [] (candidate genuinely declares
+    zero prerequisites), the gate passes (score 1.0 — all zero requirements
+    are trivially met).  This must NOT block on evidence-missing or
+    boot_prereq_missing.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    monkeypatch.delenv("K_REVISION", raising=False)
+
+    smoke_logs = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+        "env_preflight": {
+            "required_env": [],  # candidate genuinely declares zero prerequisites
+            "startup_check_names": [],
+            "manifest_source": "backend/app/required_runtime_env.py",
+        },
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 1,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs=smoke_logs,
+    )
+    # Simulate env-preflight enabled (smoketest enabled is the seed default).
+    version.last_qualification = {
+        **version.last_qualification,
+        "env_preflight_enabled": True,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    qual = version.last_qualification
+    # No block — evidence exists (empty list = trivially all-present).
+    assert qual["blocker"] is None, (
+        f"Expected no blocker, got {qual['blocker']!r} — "
+        "empty required_env must pass: candidate genuinely declares zero prerequisites"
+    )
+    assert qual["status"] == "dry_run"
+    assert qual["would_promote"] is True
+
+
 @pytest.mark.asyncio
 async def test_maybe_finalize_already_finalized_version_returns_none(db_session):
     """If the version's last_qualification.status is not 'pending' (e.g.
@@ -20258,29 +24099,32 @@ async def _seed_pending_qualification_with_challenge(
     and stamps challenge_task_id in last_qualification."""
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-audit-child-ch",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     smoke_task = Task(
         project_id=project.id,
         title="smoke-child",
-        payloads=[{"type": "smoketest", "base_branch": "automain"}],
+        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-smoke-child-ch",
         status=smoke_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     challenge_task = Task(
         project_id=project.id,
         title="challenge-child",
-        payloads=[{"type": "release_audit_challenge", "base_branch": "main"}],
+        payloads=[{"type": "release_audit_challenge", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-challenge-child",
         status=challenge_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     db_session.add(audit_task)
     db_session.add(smoke_task)
@@ -20292,6 +24136,8 @@ async def _seed_pending_qualification_with_challenge(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -20301,6 +24147,7 @@ async def _seed_pending_qualification_with_challenge(
         "challenge_task_id": str(challenge_task.id),
         "audit_challenge_task_id": str(challenge_task.id),
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -21072,7 +24919,7 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
         # No error_redrive_count — this is the first error episode.
     }
     # Many lifetime attempts from previous qualification episodes (the bug trigger).
-    version.qualification_attempts = 10
+    version.qualification_attempts = 11
     db_session.add(version)
     await db_session.commit()
 
@@ -21110,6 +24957,9 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
     assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
+    # The successfully spawned qualification begins a new episode. Its retry
+    # counter must not inherit the previous error episode's retry history.
+    assert "error_redrive_count" not in version.last_qualification
 
 
 @pytest.mark.asyncio
@@ -21321,6 +25171,159 @@ async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
 
 
 @pytest.mark.asyncio
+async def test_same_candidate_redrive_reuses_dimension_with_origin_attempt(
+    db_session, mocker,
+):
+    """A fresh operator re-drive reuses same-candidate facts with provenance.
+
+    This exercises the production start seam (not a synthetic serializer): the
+    first attempt's resolved audit/test facts remain owned by their producing
+    attempt, the new active attempt is recorded as a reuser, and the child that
+    still must run carries the new identity in both context and payload.
+    """
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    sha = "c0ffee12" * 5
+    origin_attempt = uuid.uuid4()
+    for dimension, score in (
+        ("audit", 0.92),
+        ("test_erosion", 1.0),
+        ("ci", None),
+        ("migration_identity", None),
+        ("migration_apply", None),
+        ("challenge", None),
+    ):
+        await _seed_dimension_row(
+            db_session,
+            project,
+            version,
+            dimension,
+            status="passed",
+            sub_score=score,
+            candidate_sha=sha,
+            origin_attempt_id=origin_attempt,
+        )
+    await _seed_dimension_row(
+        db_session,
+        project,
+        version,
+        "merge_grade",
+        status="unavailable",
+        candidate_sha=sha,
+        origin_attempt_id=origin_attempt,
+    )
+    version.goal = "Prove qualification attempt provenance across a re-drive"
+    version.active_qualification_attempt_id = origin_attempt
+    version.qualification_attempts = 1
+    version.last_qualification = {
+        "status": "infra_failure",
+        "qualification_attempt_id": str(origin_attempt),
+        "candidate_sha": sha,
+        "error": "merge_grade_report_unparseable",
+        "retry_episode": 0,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=sha))
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="same-candidate-surface",
+    )
+    audit_spawn = mocker.spy(rq, "_spawn_release_audit_task")
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    assert result["status"] == "spawned"
+    active_attempt = uuid.UUID(result["qualification_attempt_id"])
+    assert active_attempt != origin_attempt
+    assert version.active_qualification_attempt_id == active_attempt
+    assert version.qualification_attempts == 2
+    assert version.qualification_retry_episode == 0
+    assert version.last_qualification["qualification_attempt_id"] == str(
+        active_attempt
+    )
+    audit_spawn.assert_not_called()
+
+    audit_row = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.candidate_sha == sha,
+                QualificationDimensionResult.dimension == "audit",
+            )
+        )
+    ).scalar_one()
+    assert audit_row.origin_attempt_id == origin_attempt
+    assert str(active_attempt) in (audit_row.reused_by_attempt_ids or [])
+    assert version.last_qualification["resolved_dimensions"]["audit"] == {
+        "status": "passed",
+        "sub_score": 0.92,
+        "blocker": None,
+        "detail": None,
+        "origin_attempt_id": str(origin_attempt),
+        "reused_by_attempt_id": str(active_attempt),
+        "producing_task_id": None,
+    }
+
+    merge_task = await db_session.get(
+        Task, uuid.UUID(version.last_qualification["merge_grade_task_id"])
+    )
+    assert merge_task is not None
+    assert merge_task.context["qualification_attempt_id"] == str(active_attempt)
+    assert merge_task.first_payload["qualification_attempt_id"] == str(
+        active_attempt
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_to_finalized_attempt_identity_continuity(db_session):
+    """The immutable verdict keeps the UUID published by the pending record."""
+    from app import release_promotion as rp
+
+    _project, version = await _make_project_and_version(db_session)
+    attempt_id = uuid.uuid4()
+    version.active_qualification_attempt_id = attempt_id
+    version.last_qualification = {
+        "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "candidate_sha": "facefeed" * 5,
+        "started_at": "2026-07-15T10:00:00",
+    }
+    finalized = {
+        **version.last_qualification,
+        "status": "dry_run",
+        "finalized_at": "2026-07-15T10:05:00",
+        "confidence": 0.91,
+        "threshold": 0.9,
+    }
+    version.last_qualification = finalized
+    db_session.add(version)
+    await rp._record_qualification_verdict(
+        db_session,
+        version,
+        finalized,
+        terminal_status="dry_run",
+        would_promote=True,
+        promotion_enabled=False,
+    )
+    await db_session.commit()
+
+    verdict = (
+        await db_session.execute(
+            select(QualificationVerdict).where(
+                QualificationVerdict.release_version_id == version.id
+            )
+        )
+    ).scalar_one()
+    assert verdict.qualification_attempt_id == attempt_id
+    assert version.last_qualification["qualification_attempt_id"] == str(attempt_id)
+
+
+@pytest.mark.asyncio
 async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     db_session, mocker,
 ):
@@ -21381,14 +25384,18 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
     # Set version in infra_failure at the SAME candidate_sha — the merge-grade
     # gate hit a transient unparseable-report failure while every other gate
     # already resolved (passed).
+    attempt_id = uuid.uuid4()
     version.last_qualification = {
         "status": "infra_failure",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": 0,
         "candidate_sha": sha,
         "error": "merge_grade_report_unparseable",
         "consecutive_infra_errors": 0,
         "started_at": "2026-07-10T00:00:00",
         "finalized_at": "2026-07-10T00:01:00",
     }
+    version.active_qualification_attempt_id = attempt_id
     version.qualification_attempts = 1
     # The merge-grade spawn requires a non-empty, non-contentless goal.
     version.goal = "Deliver the per-dimension ledger reuse on qualifier re-drive"
@@ -21431,6 +25438,9 @@ async def test_infra_redrive_reuses_resolved_dimensions_without_respawn(
 
     # The version transitioned from infra_failure to pending.
     assert qual["status"] == "pending"
+    assert qual["qualification_attempt_id"] == str(attempt_id)
+    assert qual["retry_episode"] == 1
+    assert version.qualification_attempts == 1
 
     # --- Core assertions: resolved-dimension children were NOT re-spawned ---
     # audit child was NOT spawned (audit+test_erosion already resolved).
@@ -21523,6 +25533,13 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     await _seed_dimension_row(
         db_session, project, version, "merge_grade",
         status="passed", candidate_sha=sha,
+        detail={
+            "rubric_provenance": rq._rubric_provenance(
+                [],
+                source="prior_attempt",
+                qualification_attempt_id=None,
+            )
+        },
     )
     await db_session.commit()
 
@@ -21576,19 +25593,23 @@ async def test_infra_redrive_isolates_failure_to_one_dimension_ledger_facts_surv
     audit_spawn.assert_awaited_once()
     # smoketest already 'passed' — NOT re-spawned by the audit-gate re-drive.
     smoketest_spawn.assert_not_called()
-    # merge_grade already 'passed' — NOT re-spawned either.
-    merge_grade_spawn.assert_not_called()
+    # Automain's rubric provenance is attempt-scoped: a prior merge grade is
+    # re-measured for the newly frozen rubric even when the candidate is stable.
+    merge_grade_spawn.assert_awaited_once()
     assert qual["audit_task_id"] is not None
     assert qual["smoketest_task_id"] is None
-    assert qual["merge_grade_task_id"] is None
+    assert qual["merge_grade_task_id"] is not None
 
-    # audit is being re-measured, so it is NOT in the carried-forward reuse set;
-    # the other resolved dimensions ARE carried forward.
+    # Audit is being re-measured, so it is not in the carried-forward reuse set.
+    # Mutable gate facts are likewise re-measured on every same-SHA redrive;
+    # only immutable resolved dimensions are carried forward.
     resolved = qual.get("resolved_dimensions") or {}
     assert "audit" not in resolved
     assert resolved.get("smoketest", {}).get("status") == "passed"
     assert resolved["smoketest"]["sub_score"] == 0.91
-    assert resolved.get("ci", {}).get("status") == "passed"
+    assert "ci" not in resolved
+    assert "migration_identity" not in resolved
+    assert "migration_apply" not in resolved
 
     # --- (b) sibling dimensions' PASSED ledger facts survive un-discarded ----
     # and un-downgraded: the audit-gate transient failure could not throw away
@@ -23625,13 +27646,16 @@ async def _seed_audit_only_pending_qualification(
     False."""
     from app.time_utils import _utcnow
 
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
     audit_task = Task(
         project_id=project.id,
         title="audit-child",
-        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
         vm_instance_id="vm-audit-only",
         status=audit_status,
-        context={"release_version_id": str(version.id)},
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
     )
     db_session.add(audit_task)
     await db_session.commit()
@@ -23648,13 +27672,17 @@ async def _seed_audit_only_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": False,
+        "env_preflight_enabled": False,
         "started_at": started_at or _utcnow().isoformat(),
         "audit_task_id": str(audit_task.id),
         "smoketest_task_id": None,
     }
+    version.active_qualification_attempt_id = attempt_id
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
@@ -23740,6 +27768,73 @@ async def test_maybe_finalize_smoketest_disabled_audit_only(db_session):
 
 
 @pytest.mark.asyncio
+async def test_maybe_finalize_env_preflight_only_waits_for_smoketest_child(db_session):
+    """Boot-gate: when smoketest_enabled=False but env_preflight_enabled=True,
+    maybe_finalize_qualification must wait for the smoketest child (which carries
+    the env-preflight run) before finalizing — it must NOT call _finalize_qualification
+    while the smoketest child is still non-terminal."""
+    from app import shared_state
+    from app.time_utils import _utcnow
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+
+    attempt_id = uuid.uuid4()
+    attempt_text = str(attempt_id)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-child",
+        payloads=[{"type": "release_audit", "base_branch": "main", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-audit-epf",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    # Smoketest child still running (env-preflight in progress).
+    smoke_task = Task(
+        project_id=project.id,
+        title="smoke-child",
+        payloads=[{"type": "smoketest", "base_branch": "automain", "qualification_attempt_id": attempt_text}],
+        vm_instance_id="vm-smoke-epf",
+        status=TaskStatus.IN_PROGRESS,
+        context={"release_version_id": str(version.id), "qualification_attempt_id": attempt_text},
+    )
+    db_session.add(audit_task)
+    db_session.add(smoke_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+
+    version.last_qualification = {
+        "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
+        "qualification_attempt_id": attempt_text,
+        "candidate_sha": "cafe" * 10,
+        "ci_green": True,
+        "smoketest_enabled": False,
+        "env_preflight_enabled": True,
+        "started_at": _utcnow().isoformat(),
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+    }
+    version.active_qualification_attempt_id = attempt_id
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Triggering via the audit task — audit is done but smoketest is IN_PROGRESS.
+    result = await rq.maybe_finalize_qualification(
+        audit_task, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Must NOT finalize — smoketest child (env-preflight) is still running.
+    assert result is None
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_sweep_smoketest_disabled_audit_only(db_session):
     """Audit H3: the sweep finalizes a stuck smoketest-disabled qualification
     once its sole audit child is terminal — it does not require a smoketest
@@ -23780,7 +27875,8 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     """Audit H2: a qualification pending longer than the qualification-timeout
     is force-finalized as a blocked one (blocker=qualification_timeout) EVEN
     when a child is still non-terminal — the escape hatch for a child that
-    heartbeats-but-hangs."""
+    heartbeats-but-hangs.  Running children are CANCELLED and their VMs
+    scheduled for teardown."""
     # Isolate this sweep/timeout test from the post-commit strategic re-trigger
     # (covered by its own tests); a resolved verdict would otherwise spawn a
     # real strategic_review whose branch-resolution emits extra alerts.
@@ -23794,6 +27890,10 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
         "app.release_qualifier_sweep._redrive_infra_failure_qualification",
         new=AsyncMock(return_value=False),
     )
+    # Prevent actual GCP VM teardown in test.
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -23806,7 +27906,7 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     old_started = (
         _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
     ).isoformat()
-    await _seed_pending_qualification(
+    audit_task, smoke_task = await _seed_pending_qualification(
         db_session,
         project,
         version,
@@ -23830,6 +27930,16 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     assert version.status == "open"
     assert version.phase == "stabilize"
 
+    # The running smoke child was cancelled and its VM teardown scheduled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    # The already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None  # never set — task was already done
+
     # An operator-visible Alert was raised.
     alerts = (
         (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
@@ -23838,6 +27948,182 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     )
     assert len(alerts) == 1
     assert "timed out" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_sweep_timeout_terminalizes_abandoned_children(db_session, mocker):
+    """A qualification that times out with running children (audit, smoketest,
+    challenge — and by extension merge_grade) cancels those children so the
+    sweep can spawn a replacement without abandoned children consuming
+    resources or completing against superseded attempt state."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+
+    # Seed with audit, smoke, and challenge all IN_PROGRESS.
+    audit_task, smoke_task, challenge_task = await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.IN_PROGRESS,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        challenge_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+
+    # Every running child was cancelled.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.CANCELLED
+    assert audit_task.vm_stopped_at is not None
+
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    await db_session.refresh(challenge_task)
+    assert challenge_task.status == TaskStatus.CANCELLED
+    assert challenge_task.vm_stopped_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_timeout_partial_children_cancellation(db_session, mocker):
+    """When some children are already terminal and others are running, only
+    the running children are cancelled during force-finalize."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+
+    # Audit already COMPLETED, smoke IN_PROGRESS, challenge IN_PROGRESS.
+    audit_task, smoke_task, challenge_task = await _seed_pending_qualification_with_challenge(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        challenge_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    # Running children (smoke, challenge) were cancelled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    await db_session.refresh(challenge_task)
+    assert challenge_task.status == TaskStatus.CANCELLED
+    assert challenge_task.vm_stopped_at is not None
+
+    # Already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_crash_loop_cancels_children(db_session, mocker):
+    """When the finalize path crash-loops past the threshold, the
+    force-finalize cancels running children before stamping infra_failure."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    # Prevent the infra_failure redrive loop from re-spawning after
+    # the crash-loop force-finalize in the same sweep cycle.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Seed a pending qual that an immediate crash (below) will force-finalize.
+    audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+    )
+
+    # Make _finalize_in_dedicated_session raise so the crash-streak logic
+    # engages and, after _MAX_SWEEP_CRASH_STREAK attempts, force-finalizes.
+    mocker.patch(
+        "app.release_qualifier._finalize_in_dedicated_session",
+        new=AsyncMock(side_effect=RuntimeError("simulated crash")),
+    )
+
+    for _ in range(rq._MAX_SWEEP_CRASH_STREAK):
+        await rq.sweep_stuck_qualifications(
+            db_session, session_factory=_shared_session_factory(db_session)
+        )
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "sweep_finalize_crash_loop"
+    assert version.phase == "stabilize"
+
+    # The running smoke child was cancelled.
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+    # The already-completed audit child is untouched.
+    await db_session.refresh(audit_task)
+    assert audit_task.status == TaskStatus.COMPLETED
+    assert audit_task.vm_stopped_at is None
 
 
 @pytest.mark.asyncio
@@ -23853,6 +28139,9 @@ async def test_timed_out_already_promoted_uses_qualification_superseded(db_sessi
     mocker.patch(
         "app.release_qualifier_sweep._redrive_infra_failure_qualification",
         new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
     )
     from datetime import timedelta
 
@@ -26239,6 +30528,17 @@ async def test_promote_does_not_commit_caller_unrelated_transaction(db_session, 
     mocker.patch(
         "app.github.create_tag",
         new=AsyncMock(return_value={"ref": "refs/tags/v1"}),
+    )
+    # The full maybe_finalize_qualification wrapper fires post-promote hooks that
+    # make real GitHub calls; stub them so the test does not hang to the 30s
+    # timeout on the network-isolated shard.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
     )
 
     # A genuinely separate "caller" session with UNRELATED uncommitted work —
@@ -37845,7 +42145,8 @@ async def test_record_v22_live_verification_evidence_records_evidence_row(db_ses
 async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, mocker):
     """_finalize_qualification writes one QualificationDimensionResult row per
     gate (audit, test_erosion, ci, smoketest, migration_identity, migration_apply,
-    merge_grade, acceptance_window, debt_pressure) on a clean pass.
+    merge_grade, acceptance_window, debt_pressure, capability_proof, env_preflight)
+    on a clean pass.
 
     Verifies: each finalize run persists the expected dimension rows for its
     candidate_sha.
@@ -37914,6 +42215,7 @@ async def test_finalize_dual_writes_dimension_rows_for_all_gates(db_session, moc
         "acceptance_window",
         "debt_pressure",
         "capability_proof",
+        "env_preflight",
     }
     assert expected_dims == dims_found, (
         f"expected dims {expected_dims}, got {dims_found}"
@@ -38087,6 +42389,7 @@ async def test_finalize_new_candidate_sha_writes_new_dimension_rows(
     sha_2 = "b" * 40
     version.last_qualification = {
         "status": "pending",
+        **_EMPTY_RUBRIC_PROJECTION,
         "candidate_sha": sha_2,
         "ci_green": True,
         "smoketest_enabled": True,
@@ -38226,3 +42529,252 @@ async def test_redrive_isolation_proven_evidence(db_session, resolved_status):
         f"resolved→resolved transition must be permitted: expected '{new_resolved_status}', "
         f"got '{row2.status}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attempt-contract freeze tests (version_goal, promotion_policy, proof mode)
+# ---------------------------------------------------------------------------
+
+
+class TestAttemptContractFreeze:
+    """The attempt contract (version_goal, promotion_policy_snapshot,
+    capability_proof_mode) is frozen at spawn time so mid-flight config
+    changes cannot combine children from one contract with a verdict from
+    another."""
+
+    @pytest.mark.asyncio
+    async def test_version_goal_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores version.goal as version_goal in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+        mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+        mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+            return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+        ))
+        mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+        mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+            return_value=MagicMock(id=uuid.uuid4())
+        ))
+
+        project, version = await _make_project_and_version(db_session, phase="stabilize")
+        version.goal = "Deliver a working login flow"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        await rq.run_qualification(db_session, project.id, version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        qual = version.last_qualification or {}
+        assert qual.get("version_goal") == "Deliver a working login flow", (
+            f"version_goal not frozen at spawn: {qual.get('version_goal')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_stored_at_spawn(self, db_session, mocker):
+        """run_qualification stores capability_proof_gate_mode in last_qualification."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        shared_state.runtime_config["capability_proof_gate_mode"] = "observe"
+        try:
+            mocker.patch("app.github.get_repo_installation_token", new=AsyncMock(return_value="tok"))
+            mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+            mocker.patch("app.release_qualifier._resolve_candidate_ci", new=AsyncMock(
+                return_value={"ci_green": True, "state": "success", "resolved_sha": None}
+            ))
+            mocker.patch("app.release_qualifier._spawn_release_audit_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+            mocker.patch("app.release_qualifier._spawn_qualifier_smoketest_task", new=AsyncMock(
+                return_value=MagicMock(id=uuid.uuid4())
+            ))
+
+            project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+            await rq.run_qualification(db_session, project.id, version)
+            await db_session.commit()
+            await db_session.refresh(version)
+
+            qual = version.last_qualification or {}
+            assert qual.get("capability_proof_mode") == "observe", (
+                f"capability_proof_mode not frozen at spawn: {qual.get('capability_proof_mode')!r}"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)
+
+    @pytest.mark.asyncio
+    async def test_version_goal_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the frozen version_goal from last_qualification,
+        not the live version.goal — even if version.goal was mutated after spawn."""
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+
+        project, version = await _make_project_and_version(db_session)
+        # Seed children with an empty frozen goal so the merge-grade gate is a no-op.
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Freeze version_goal="" (no goal at spawn) but set a live goal afterwards.
+        qual = dict(version.last_qualification or {})
+        qual["version_goal"] = ""
+        version.last_qualification = qual
+        version.goal = "A non-empty live goal that should be ignored"
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Mock evaluate_merge_grade so we can observe what goal it is called with.
+        called_with_goals: list[str | None] = []
+
+        def _fake_evaluate_merge_grade(goal, artifact, categories, evidence):
+            called_with_goals.append(goal)
+            return {"status": "not_applicable", "covers_goal": None, "coverage": None,
+                    "biggest_gap": None, "blocked": False, "detail": None}
+
+        mocker.patch("app.release_qualifier.evaluate_merge_grade", side_effect=_fake_evaluate_merge_grade)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Finalize must have used the frozen empty goal, not the live "non-empty" goal.
+        if called_with_goals:
+            assert called_with_goals[0] == "", (
+                f"_finalize_qualification passed live goal instead of frozen goal: "
+                f"{called_with_goals[0]!r}"
+            )
+        # Either way the run should not fail because the frozen goal is empty.
+        assert result.get("status") in ("dry_run", "not_promoted"), (
+            f"unexpected finalize status: {result.get('status')}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_promotion_policy_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the promotion policy frozen at spawn time.
+
+        A promotion_policy_snapshot stored in last_qualification takes precedence
+        over the live runtime_config / _load_policy result.  Changing the threshold
+        after spawn must not affect the verdict for the in-flight attempt.
+        """
+        from app import shared_state
+
+        # Set a low threshold at "spawn" time that would allow promotion.
+        shared_state.runtime_config["promotion_enabled"] = False
+        _spawn_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                         "threshold": 0.50}
+
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.7, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        # Stamp the frozen policy into last_qualification.
+        qual = dict(version.last_qualification or {})
+        qual["promotion_policy_snapshot"] = _spawn_policy
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Raise the live threshold to something the score would fail.
+        _live_policy = {"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
+                        "threshold": 0.99}
+        mocker.patch("app.release_qualifier._load_policy", return_value=_live_policy)
+        mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # With frozen threshold=0.50 the composite is roughly 0.7*0.4 + 1.0*0.3 + 1.0*0.3 = 0.88,
+        # which exceeds the frozen bar -- result is dry_run, not not_promoted.
+        # (With live threshold=0.99 the same composite would be not_promoted.)
+        assert result.get("status") == "dry_run", (
+            f"promotion policy was not frozen at spawn: expected dry_run "
+            f"(frozen threshold=0.50) but got {result.get('status')!r} — "
+            f"live threshold=0.99 may have been used"
+        )
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_mode_frozen_in_pending_qual(self, db_session, mocker):
+        """_finalize_qualification uses the capability_proof_mode frozen at spawn.
+
+        Changing runtime_config['capability_proof_gate_mode'] between spawn and
+        finalize must not affect the qualification verdict for that attempt.
+        """
+        from app import shared_state
+
+        shared_state.runtime_config["promotion_enabled"] = False
+        # Freeze "off" mode in last_qualification.
+        project, version = await _make_project_and_version(db_session)
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={"audit_score": 0.9, "findings": [], "test_erosion": {
+                "deleted_test_files": [], "assertion_delta": 0, "test_count_delta": 0,
+            }},
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "s", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+        )
+        qual = dict(version.last_qualification or {})
+        qual["capability_proof_mode"] = "off"
+        version.last_qualification = qual
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # After spawn: flip the live config to "enforce" with an unproven capability.
+        shared_state.runtime_config["capability_proof_gate_mode"] = "enforce"
+        # Inject an unproven working capability into the project's problem_model.
+        project.problem_model = {
+            "capabilities": [{"name": "github_api", "status": "working", "evidence_refs": []}]
+        }
+        db_session.add(project)
+        await db_session.commit()
+        try:
+            mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+            result = await rq._finalize_qualification(db_session, version)
+            await db_session.commit()
+
+            # With frozen "off" mode the capability proof gate is inert — should
+            # still produce dry_run, not a capability_proof_blocked not_promoted.
+            assert result.get("status") == "dry_run", (
+                f"capability_proof_mode was not frozen at spawn: expected dry_run "
+                f"(frozen mode=off) but got {result.get('status')!r} with "
+                f"blocker={result.get('blocker')!r}"
+            )
+            assert result.get("blocker") != "capability_proof_blocked", (
+                "capability_proof_blocked fired despite frozen 'off' mode"
+            )
+        finally:
+            shared_state.runtime_config.pop("capability_proof_gate_mode", None)

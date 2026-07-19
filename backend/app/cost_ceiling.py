@@ -141,6 +141,7 @@ async def check_daily_cost_ceiling(task: Task, session: AsyncSession) -> None:
 
     alert = Alert(
         project_id=task.project_id,
+        event_type="cost.ceiling_reached",
         severity=AlertSeverity.WARNING,
         title=alert_title,
         message=(

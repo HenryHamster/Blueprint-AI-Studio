@@ -3,18 +3,38 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import uuid
 from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, text
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.database import resolve_dialect_name
 from sqlmodel import select
 
-from app.models import MESSAGE_CONTENT_MAX, MessageType, Project, ProjectMessage
+from app.models import (
+    MESSAGE_CONTENT_MAX,
+    MessageHandlingState,
+    MessageSurface,
+    MessageType,
+    Project,
+    ProjectMessage,
+    ProjectMessageSequence,
+    _utcnow,
+)
 from app.project_message_projection import message_event_payload
-from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
+from app.strategic_trigger import (
+    ARMING_NOT_ARMED,
+    ARMING_RESIDENT_SESSION,
+    ARMING_STEERING,
+    maybe_arm_operator_refresh,
+)
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
     persist_strategic_workbench_update,
@@ -22,7 +42,49 @@ from app.workbench_state import (
     workbench_state_exceeds_max_bytes,
 )
 
+logger = logging.getLogger(__name__)
+
 OPERATOR_CONTEXT_MAX_BYTES = 50_000
+_REQUEST_FINGERPRINT_KEY = "_message_request_fingerprint"
+_VISIBLE_REQUEST_CONTEXT_KEYS = (
+    "source_refs",
+    "artifact_refs",
+    "attachments",
+    "operator_intent",
+)
+CONVERSATION_EVENT_TYPES = frozenset(
+    {
+        "auto_fix_escalated",
+        "residual_fix_escalated",
+        "residual_fix_audit_deferred",
+        "remediation_escalated",
+        "direction_burn_pause",
+        "direction_outcome_scaffolding_escalation",
+        "direction_churn_pause",
+        "failure_alert",
+        "rollback_recommended",
+        "fix_loop_divergence_regressed",
+        "release_calcifying",
+        "release_build_stalled",
+        "release_stabilize_stalled",
+        "release_ci_unresolved_stall",
+        "direction_outcome_stalled",
+        "direction_staged_activated",
+        "promotion_readiness_reached",
+        "release_auto_merge_stalled",
+        "strategic_steering_deferred",
+        "strategic_steering_acted",
+        "capability_trial_stalled",
+        "capability_verdict_decided",
+        "capability_trial_ambiguous_lift_escalation",
+        "question_answer",
+        "feedback_reply",
+        "capability_proof_gate_graduated_observe",
+        "capability_proof_gate_graduated_enforce",
+        "criterion_retracted",
+        "criterion_superseded",
+    }
+)
 
 # Operator-authored context remains free-form for legacy callers, but the keys
 # owned by the workbench contract are bounded before they become durable hidden
@@ -49,6 +111,7 @@ class OperatorMessageCreateResult:
     message: ProjectMessage
     status: str
     arming: str
+    wakeup_state: str
     message_event: dict[str, Any] | None = None
 
     @property
@@ -61,7 +124,9 @@ def parse_operator_message_type(
     *,
     default_note_for_empty: bool = True,
 ) -> MessageType:
-    raw_value = str(raw_message_type or ("NOTE" if default_note_for_empty else "")).upper()
+    raw_value = str(
+        raw_message_type or ("NOTE" if default_note_for_empty else "")
+    ).upper()
     try:
         return MessageType(raw_value)
     except ValueError:
@@ -92,8 +157,14 @@ def _compact_context_text(value: Any, *, max_chars: int) -> str:
 
 
 def _ensure_context_size(context: dict[str, Any], *, compact: bool) -> None:
-    separators = ((",", ":") if compact else None)
-    if len(json.dumps(context, separators=separators, default=str)) > OPERATOR_CONTEXT_MAX_BYTES:
+    separators = (",", ":") if compact else None
+    encoded = json.dumps(
+        context,
+        separators=separators,
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    if len(encoded) > OPERATOR_CONTEXT_MAX_BYTES:
         raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
 
 
@@ -112,6 +183,305 @@ async def _message_for_idempotency_key(
     ).scalar_one_or_none()
 
 
+async def _lock_operator_idempotency_key(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    idempotency_key: str,
+) -> None:
+    """Serialize one project/client identity before early transactional work."""
+
+    if resolve_dialect_name(session) != "postgresql":
+        return
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:identity, 0))"),
+        {"identity": (f"project-message:{project_id}:{idempotency_key}")},
+    )
+
+
+async def lock_project_and_next_message_sequence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    lock_timeout_ms: int | None = None,
+) -> int:
+    """Allocate one sequence through the canonical parent-first bulk helper."""
+
+    return (
+        await reserve_project_message_sequences(
+            session,
+            project_id,
+            count=1,
+            lock_timeout_ms=lock_timeout_ms,
+        )
+    )[0]
+
+
+async def reserve_project_message_sequences(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    count: int,
+    lock_timeout_ms: int | None = None,
+) -> list[int]:
+    """Reserve a sequence block after locking the parent Project.
+
+    The Project lock must live here, not only in the single-sequence wrapper:
+    strategic completion reserves blocks directly, and a first counter-row
+    insert otherwise takes its FK lock after the counter uniqueness lock.
+    """
+
+    count = int(count)
+    if count < 1 or count > 100:
+        raise ValueError("message sequence reservation count must be between 1 and 100")
+
+    dialect = resolve_dialect_name(session)
+    if dialect == "postgresql":
+        if lock_timeout_ms is not None:
+            await session.execute(
+                text(f"SET LOCAL lock_timeout = '{max(1, int(lock_timeout_ms))}ms'")
+            )
+    try:
+        locked_project_id = await session.scalar(
+            select(Project.id)
+            .where(Project.id == project_id)
+            .with_for_update(read=True, key_share=True)
+        )
+    except OperationalError as exc:
+        await session.rollback()
+        if lock_timeout_ms is not None:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Message was not accepted because the project conversation "
+                    "is busy; retry with the same idempotency key"
+                ),
+                headers={"Retry-After": "1"},
+            ) from exc
+        raise
+    if locked_project_id is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    if dialect == "postgresql":
+        try:
+            value = await session.scalar(
+                text(
+                    """
+                    INSERT INTO projectmessagesequence AS counter
+                      (project_id, last_sequence)
+                    SELECT :project_id, coalesce(max(message.sequence), 0) + :count
+                    FROM projectmessage AS message
+                    WHERE message.project_id = :project_id
+                    ON CONFLICT (project_id) DO UPDATE
+                    SET last_sequence = greatest(
+                      counter.last_sequence + :count,
+                      EXCLUDED.last_sequence
+                    )
+                    RETURNING last_sequence
+                    """
+                ),
+                {"project_id": project_id, "count": count},
+            )
+        except OperationalError as exc:
+            await session.rollback()
+            if lock_timeout_ms is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Message was not accepted because conversation sequencing "
+                        "is busy; retry with the same idempotency key"
+                    ),
+                    headers={"Retry-After": "1"},
+                ) from exc
+            raise
+        if value is None:
+            raise HTTPException(
+                status_code=500, detail="Message sequence allocation failed"
+            )
+        if lock_timeout_ms is not None:
+            await session.execute(text("SET LOCAL lock_timeout = DEFAULT"))
+        last_sequence = int(value)
+        return list(range(last_sequence - count + 1, last_sequence + 1))
+
+    # SQLite/test fallback. Production PostgreSQL uses the single-statement
+    # UPSERT above; SQLite serializes writes at the database level.
+    counter = await session.get(ProjectMessageSequence, project_id)
+    if counter is None:
+        max_sequence = await session.scalar(
+            select(func.max(ProjectMessage.sequence)).where(
+                ProjectMessage.project_id == project_id
+            )
+        )
+        counter = ProjectMessageSequence(
+            project_id=project_id,
+            last_sequence=int(max_sequence or 0) + count,
+        )
+    else:
+        counter.last_sequence += count
+    session.add(counter)
+    await session.flush()
+    last_sequence = int(counter.last_sequence)
+    return list(range(last_sequence - count + 1, last_sequence + 1))
+
+
+async def build_project_message(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    sequence: int | None = None,
+    surface: MessageSurface | None = None,
+    handling_state: MessageHandlingState | None = None,
+    **values: Any,
+) -> ProjectMessage:
+    """Construct one canonical message with a durable project-wide sequence.
+
+    Production writers use this helper instead of constructing ProjectMessage
+    directly. This keeps new activity and conversation rows on the same
+    allocator while the migration trigger remains only as a mixed-version
+    rollback fence.
+    """
+
+    context = values.get("context")
+    event_type = (
+        str(context.get("event_type") or "") if isinstance(context, dict) else ""
+    )
+    from_type = str(values.get("from_type") or "")
+    reply_to_message_id = values.get("reply_to_message_id")
+    resolved_surface = surface or (
+        MessageSurface.CONVERSATION
+        if (
+            from_type in {"user", "strategic"}
+            or reply_to_message_id is not None
+            or event_type in CONVERSATION_EVENT_TYPES
+        )
+        else MessageSurface.ACTIVITY
+    )
+    resolved_handling = handling_state or (
+        MessageHandlingState.RESPONDED
+        if from_type == "strategic"
+        else MessageHandlingState.PENDING
+    )
+    return ProjectMessage(
+        project_id=project_id,
+        sequence=(
+            sequence
+            if sequence is not None
+            else await lock_project_and_next_message_sequence(session, project_id)
+        ),
+        surface=resolved_surface,
+        handling_state=resolved_handling,
+        **values,
+    )
+
+
+def wakeup_state_for_arming(
+    arming: str,
+    *,
+    refresh_was_pending: bool,
+) -> str:
+    if arming == ARMING_RESIDENT_SESSION:
+        return "queued"
+    if arming == ARMING_STEERING:
+        return "coalesced" if refresh_was_pending else "queued"
+    if arming == ARMING_NOT_ARMED:
+        return "waiting_for_capacity"
+    return "paused"
+
+
+def stored_wakeup_state(message: ProjectMessage) -> str:
+    context = message.context if isinstance(message.context, dict) else {}
+    value = context.get("_resident_wakeup_state")
+    if value in {"queued", "coalesced", "paused", "waiting_for_capacity"}:
+        return value
+    return "waiting_for_capacity"
+
+
+def _operator_idempotency_matches(
+    message: ProjectMessage,
+    *,
+    user_id: str,
+    message_type: MessageType,
+    content: str,
+    surface: MessageSurface,
+    reply_to_message_id: uuid.UUID | None,
+    request_fingerprint: str,
+    message_context: dict[str, Any],
+) -> bool:
+    """Reject key reuse instead of adopting an unrelated durable message."""
+
+    actor = getattr(message, "actor_user_id", None)
+    context = message.context if isinstance(message.context, dict) else {}
+    stored_fingerprint = context.get(_REQUEST_FINGERPRINT_KEY)
+    if stored_fingerprint is not None:
+        return bool(
+            message.from_type == "user"
+            and str(actor or "") == str(user_id)
+            and stored_fingerprint == request_fingerprint
+        )
+    return bool(
+        message.from_type == "user"
+        and str(actor or "") == str(user_id)
+        and message.message_type == message_type
+        and message.content == content
+        and getattr(message, "surface", surface) == surface
+        and getattr(message, "reply_to_message_id", None) == reply_to_message_id
+        and {
+            key: context.get(key)
+            for key in _VISIBLE_REQUEST_CONTEXT_KEYS
+            if context.get(key) is not None
+        }
+        == _request_visible_context(message_context)
+    )
+
+
+def _assert_operator_idempotency_match(
+    message: ProjectMessage,
+    **expected: Any,
+) -> None:
+    if not _operator_idempotency_matches(message, **expected):
+        raise HTTPException(
+            status_code=409,
+            detail="idempotency_key already belongs to a different message",
+        )
+
+
+def _request_visible_context(context: dict[str, Any] | None) -> dict[str, Any]:
+    source = context if isinstance(context, dict) else {}
+    return {
+        key: source.get(key)
+        for key in _VISIBLE_REQUEST_CONTEXT_KEYS
+        if source.get(key) is not None
+    }
+
+
+def _operator_request_fingerprint(
+    *,
+    user_id: str,
+    message_type: MessageType,
+    content: str,
+    surface: MessageSurface,
+    reply_to_message_id: uuid.UUID | None,
+    message_context: dict[str, Any],
+) -> str:
+    payload = {
+        "actor_user_id": str(user_id),
+        "surface": surface.value,
+        "message_type": message_type.value,
+        "content": content,
+        "reply_to_message_id": str(reply_to_message_id)
+        if reply_to_message_id
+        else None,
+        "context": _request_visible_context(message_context),
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 async def create_operator_project_message(
     session: AsyncSession,
     *,
@@ -126,29 +496,18 @@ async def create_operator_project_message(
     compact_context_size: bool = True,
     enforce_raw_content_max: bool = False,
     sync_local_continuation_marker: bool = False,
+    surface: MessageSurface = MessageSurface.ACTIVITY,
+    reply_to_message_id: uuid.UUID | None = None,
+    include_strategic_session_snapshot: bool = True,
+    precommit_validate: Callable[
+        [AsyncSession, uuid.UUID, dict[str, Any]],
+        Awaitable[dict[str, Any] | None],
+    ]
+    | None = None,
 ) -> OperatorMessageCreateResult:
     """Create or idempotently return an operator-authored ProjectMessage."""
 
     project_id = project.id
-    # Whether a live resident Workday session owns the project — captured NOW,
-    # while ``project.vision`` is loaded, so the read cannot become a lazy load on
-    # an attribute expired by the message commit below. When active, the standing
-    # agent handles the reply live and cadence steering must not be armed.
-    from app.strategic_resident_session import (
-        read_resident_session,
-        resident_session_is_active,
-    )
-
-    resident_blob = read_resident_session(project.vision)
-    resident_active = resident_session_is_active(resident_blob)
-    # Stamp the live session id so this operator message is scoped to the session
-    # it was sent into; NULL when no session is active (cadence path). See the
-    # scoping queries in strategic_resident_session.py and the poll endpoint.
-    resident_session_id = (
-        resident_blob.get("session_id")
-        if isinstance(resident_blob, dict) and resident_active
-        else None
-    )
     trimmed_content = content.strip()
     if not trimmed_content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
@@ -164,6 +523,15 @@ async def create_operator_project_message(
             detail="Workbench context too large (max 50KB)",
         )
 
+    message_context = _operator_context(context)
+    request_fingerprint = _operator_request_fingerprint(
+        user_id=user_id,
+        message_type=message_type,
+        content=trimmed_content,
+        surface=surface,
+        reply_to_message_id=reply_to_message_id,
+        message_context=message_context,
+    )
     idem_key = (idempotency_key or "").strip() or None
     if idem_key:
         if len(idem_key) > 255:
@@ -173,13 +541,23 @@ async def create_operator_project_message(
             )
         existing = await _message_for_idempotency_key(session, project_id, idem_key)
         if existing is not None:
+            _assert_operator_idempotency_match(
+                existing,
+                user_id=user_id,
+                message_type=message_type,
+                content=trimmed_content,
+                surface=surface,
+                reply_to_message_id=reply_to_message_id,
+                request_fingerprint=request_fingerprint,
+                message_context=message_context,
+            )
             return OperatorMessageCreateResult(
                 message=existing,
                 status="duplicate",
                 arming="duplicate",
+                wakeup_state=stored_wakeup_state(existing),
             )
 
-    message_context = _operator_context(context)
     _ensure_context_size(message_context, compact=compact_context_size)
 
     if message_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
@@ -207,6 +585,9 @@ async def create_operator_project_message(
             arm_interaction_mode=False,
             commit=False,
         )
+        # Persistence locks prefs -> Project. Flush the already-locked Project
+        # mutation before populate_existing refreshes the ownership fence.
+        await session.flush()
         stored_workbench = workbench_write.state
         workbench_context_for_snapshot = None
         if workbench_context is not None:
@@ -217,21 +598,300 @@ async def create_operator_project_message(
                 )
             )
 
-    strategic_session = await build_message_strategic_session_snapshot(
-        session,
-        user_id,
-        project_id,
-        workbench_context_for_snapshot,
-    )
-    if strategic_session:
-        message_context = {
-            **message_context,
-            "strategic_session": strategic_session,
-        }
+    if include_strategic_session_snapshot:
+        strategic_session = await build_message_strategic_session_snapshot(
+            session,
+            user_id,
+            project_id,
+            workbench_context_for_snapshot,
+        )
+        if strategic_session:
+            message_context = {
+                **message_context,
+                "strategic_session": strategic_session,
+            }
     _ensure_context_size(message_context, compact=compact_context_size)
 
+    # Fence the ownership decision before touching either legacy arming state
+    # or the durable Resident successor. Ownership transitions take these rows
+    # in the same Project -> Resident order, so send vs rollback/cutover cannot
+    # observe one owner and enqueue for the other.
+    from app.strategic_resident_message_locking import lock_resident_message_owner_state
+
+    (
+        locked_project,
+        strategic_resident_owns,
+        refresh_was_pending,
+        resident_active,
+        resident_session_id,
+    ) = await lock_resident_message_owner_state(session, project_id)
+    if strategic_resident_owns:
+        # Never revive legacy refresh/session state after cutover.
+        refresh_was_pending = False
+        arming = ARMING_NOT_ARMED
+    else:
+        arming = await maybe_arm_operator_refresh(
+            session,
+            project_id,
+            message_type,
+            message_content=trimmed_content,
+            resident_session_active=resident_active,
+        )
+    if not session.in_transaction():
+        # A failed legacy wake releases every lock. Restore the canonical
+        # prefs -> Project order before refencing Project -> Resident.
+        if should_persist_workbench:
+            await persist_strategic_workbench_update(
+                session,
+                user_id,
+                project_id,
+                workbench_context or {},
+                sync_local_continuation_marker=sync_local_continuation_marker,
+                arm_interaction_mode=False,
+                commit=False,
+            )
+            await session.flush()
+        (
+            locked_project,
+            strategic_resident_owns,
+            refresh_was_pending,
+            resident_active,
+            resident_session_id,
+        ) = await lock_resident_message_owner_state(session, project_id)
+        if strategic_resident_owns:
+            arming = ARMING_NOT_ARMED
+        elif resident_active:
+            arming = ARMING_RESIDENT_SESSION
+
+    if idem_key:
+        # Same-identity retries serialize before reply/source/attachment
+        # mutations. The waiter adopts the committed winner without consuming
+        # an attachment twice or repeating other early transactional effects.
+        await _lock_operator_idempotency_key(session, project_id, idem_key)
+        existing = await _message_for_idempotency_key(session, project_id, idem_key)
+        if existing is not None:
+            _assert_operator_idempotency_match(
+                existing,
+                user_id=user_id,
+                message_type=message_type,
+                content=trimmed_content,
+                surface=surface,
+                reply_to_message_id=reply_to_message_id,
+                request_fingerprint=request_fingerprint,
+                message_context=message_context,
+            )
+            existing_id = existing.id
+            await session.rollback()
+            existing = await session.get(ProjectMessage, existing_id)
+            if existing is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Existing message could not be reloaded",
+                )
+            return OperatorMessageCreateResult(
+                message=existing,
+                status="duplicate",
+                arming="duplicate",
+                wakeup_state=stored_wakeup_state(existing),
+            )
+
+    if reply_to_message_id is not None:
+        reply_target = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.id == reply_to_message_id,
+                    ProjectMessage.project_id == project_id,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if reply_target is None:
+            raise HTTPException(status_code=400, detail="Invalid reply_to_message_id")
+        if (
+            reply_target.message_type == MessageType.QUESTION
+            and reply_target.status == "open"
+        ):
+            now = _utcnow()
+            reply_target.status = "resolved"
+            reply_target.resolution = trimmed_content
+            reply_target.resolved_at = now
+            reply_target.handling_state = MessageHandlingState.RESPONDED
+            reply_target.updated_at = now
+            session.add(reply_target)
+
+    message_id = uuid.uuid4()
+    # Re-run project ownership/revision guards before reserving the sequence.
+    # The validation remains in the message transaction, so attachment receipt
+    # consumption and reply resolution still commit atomically with the message.
+    if precommit_validate is not None:
+        validated_context = await precommit_validate(
+            session,
+            message_id,
+            message_context,
+        )
+        if validated_context is not None:
+            message_context = validated_context
+
+    locked_resident = None
+    locked_turn_tasks = None
+    locked_resident_owner = None
+    if surface == MessageSurface.CONVERSATION:
+        from app.strategic_resident_message_locking import (
+            prelock_resident_message_turn_state,
+        )
+
+        prelock = await prelock_resident_message_turn_state(
+            session,
+            project_id=project_id,
+            locked_project=locked_project,
+        )
+        if prelock.error is not None:
+            # Lock contention or a shadow-only projection defect must not reject
+            # legacy-owned conversation. Once ownership flips, the same gap is
+            # authoritative and acceptance fails closed.
+            if prelock.engine_owner == "strategic_resident":
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Message was not accepted because the Resident turn "
+                        "state is busy; retry with the same idempotency key"
+                    ),
+                    headers={"Retry-After": "1"},
+                ) from prelock.error
+            logger.error(
+                "[RESIDENT_SHADOW] pre-lock failed for legacy conversation "
+                "(project=%s); accepting without a shadow successor",
+                project_id,
+                exc_info=(
+                    type(prelock.error),
+                    prelock.error,
+                    prelock.error.__traceback__,
+                ),
+            )
+        else:
+            locked_resident = prelock.resident
+            locked_turn_tasks = prelock.tasks
+            locked_resident_owner = prelock.engine_owner
+
+    # Reserve only after all potentially slow validation. From this point to
+    # commit, all pre-existing Resident/Task rows are already locked, keeping
+    # the counter window bounded to idempotency race closure, bounded successor
+    # mutation/insert, canonical message insert, and their atomic commit.
+    next_sequence = await lock_project_and_next_message_sequence(
+        session,
+        project_id,
+        lock_timeout_ms=1_500,
+    )
+    if idem_key:
+        # The first lookup is a latency fast path. This second lookup under the
+        # sequence fence closes the concurrent double-submit window. Rolling
+        # back before adoption also discards this loser's early reply,
+        # workbench, source, and attachment mutations.
+        existing = await _message_for_idempotency_key(session, project_id, idem_key)
+        if existing is not None:
+            _assert_operator_idempotency_match(
+                existing,
+                user_id=user_id,
+                message_type=message_type,
+                content=trimmed_content,
+                surface=surface,
+                reply_to_message_id=reply_to_message_id,
+                request_fingerprint=request_fingerprint,
+                message_context=message_context,
+            )
+            existing_id = existing.id
+            await session.rollback()
+            existing = await session.get(ProjectMessage, existing_id)
+            if existing is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Existing message could not be reloaded",
+                )
+            return OperatorMessageCreateResult(
+                message=existing,
+                status="duplicate",
+                arming="duplicate",
+                wakeup_state=stored_wakeup_state(existing),
+            )
+
+    # Migration shadow: mirror genuine operator wakeups into the bounded
+    # backend-managed Resident turn runtime in this SAME message transaction.
+    # The legacy refresh/session path above remains authoritative and its
+    # operator-facing wakeup_state is unchanged. While the project is still
+    # legacy-owned, a shadow comparison gap fails open under a SAVEPOINT so a
+    # rollout-only defect cannot reject an otherwise durable operator message.
+    # Once ownership flips, turn enqueue is authoritative and therefore fails
+    # closed with the message (atomic message + successor contract).
+    resident_wake = None
+    if locked_resident is not None:
+        try:
+            async with session.begin_nested():
+                from app.strategic_resident_runtime import (
+                    coalesce_resident_turn,
+                )
+                from app.artifact_refs import (
+                    artifact_ref_grants_from_message_context,
+                )
+
+                resident_wake = await coalesce_resident_turn(
+                    session,
+                    project_id=project_id,
+                    lane="interactive",
+                    trigger_kind="operator_message",
+                    message_sequence=next_sequence,
+                    locked_resident=locked_resident,
+                    prelocked_tasks=locked_turn_tasks,
+                    artifact_ref_grants=artifact_ref_grants_from_message_context(
+                        message_context
+                    ),
+                )
+        except Exception as exc:
+            # The outer Resident lock survives SAVEPOINT rollback, so ownership
+            # cannot flip while this transaction decides whether enqueue is
+            # authoritative.
+            if locked_resident_owner == "strategic_resident":
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Message was not accepted because the Resident turn "
+                        "successor could not be queued; retry with the same "
+                        "idempotency key"
+                    ),
+                    headers={"Retry-After": "1"},
+                ) from exc
+            logger.exception(
+                "[RESIDENT_SHADOW] enqueue failed for accepted legacy message "
+                "(project=%s sequence=%s); legacy wake remains authoritative",
+                project_id,
+                next_sequence,
+            )
+
+    wakeup_state = (
+        resident_wake.state
+        if (
+            resident_wake is not None
+            and locked_resident_owner == "strategic_resident"
+        )
+        else wakeup_state_for_arming(
+            arming,
+            refresh_was_pending=refresh_was_pending,
+        )
+    )
+    message_context = {
+        **message_context,
+        "_resident_wakeup_state": wakeup_state,
+        _REQUEST_FINGERPRINT_KEY: request_fingerprint,
+    }
+    _ensure_context_size(message_context, compact=compact_context_size)
     msg = ProjectMessage(
+        id=message_id,
         project_id=project_id,
+        actor_user_id=user_id,
+        sequence=next_sequence,
+        surface=surface,
+        handling_state=MessageHandlingState.PENDING,
+        reply_to_message_id=reply_to_message_id,
         message_type=message_type,
         from_type="user",
         content=trimmed_content,
@@ -247,30 +907,26 @@ async def create_operator_project_message(
         if idem_key:
             existing = await _message_for_idempotency_key(session, project_id, idem_key)
             if existing is not None:
+                _assert_operator_idempotency_match(
+                    existing,
+                    user_id=user_id,
+                    message_type=message_type,
+                    content=trimmed_content,
+                    surface=surface,
+                    reply_to_message_id=reply_to_message_id,
+                    request_fingerprint=request_fingerprint,
+                    message_context=message_context,
+                )
                 return OperatorMessageCreateResult(
                     message=existing,
                     status="duplicate",
                     arming="duplicate",
+                    wakeup_state=stored_wakeup_state(existing),
                 )
         raise
     await session.refresh(msg)
     message_id = msg.id
     message_event = message_event_payload(msg)
-
-    # Gate cadence steering when a live resident Workday session owns the project:
-    # the standing agent handles the operator message directly, so arming the
-    # cadence refresh marker (and firing the steering-acted receipt) would only
-    # spawn a competing writer. ``resident_active`` was captured above, before the
-    # message commit could expire ``project.vision``.
-    arming = await maybe_arm_operator_refresh(
-        session,
-        project_id,
-        message_type,
-        message_content=trimmed_content,
-        resident_session_active=resident_active,
-    )
-    if arming == ARMING_STEERING:
-        await session.commit()
 
     reloaded = await session.get(ProjectMessage, message_id)
     if reloaded is None:
@@ -283,5 +939,6 @@ async def create_operator_project_message(
         message=reloaded,
         status="created",
         arming=arming,
+        wakeup_state=wakeup_state,
         message_event=message_event,
     )

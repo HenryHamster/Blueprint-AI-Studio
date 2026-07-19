@@ -13,7 +13,9 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from sqlalchemy import and_, or_
 from sqlmodel import select
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 
 from app.blocked_task_unblock_sweeps import (
     _BLOCKED_ESCALATE_AFTER,
@@ -45,8 +47,33 @@ from app.blocked_task_unblock_sweeps import (
     _event_driven_unblock_project,
     event_driven_unblock_dependents,
     event_driven_unblock_on_knowledge,
+    event_driven_unblock_on_capability_proof,
 )
-from app.models import Task, TaskStatus
+from app.compute_backends import (
+    GCP_BACKEND_NAME,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
+    resolve_project_default_container_image,
+)
+from app.compute_jobs import (
+    RUNNER_SILENT_TIMEOUT_SECONDS,
+    finalize_silent_compute_job,
+    finalize_runner_subprocess_job_for_dead_runner,
+)
+from app.database import AsyncSessionLocal
+from app.models import (
+    ArtifactRefPromotionIntent,
+    ComputeImageBuildStatus,
+    ComputeJob,
+    ComputeJobFile,
+    ComputeJobStatus,
+    LocalRunner,
+    ProjectComputeImageBuild,
+    ProjectMessageAttachmentUpload,
+    Task,
+    TaskStatus,
+)
+from app.storage import delete_storage_uri_best_effort
+from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
     sweep_merge_gate_verification_degradation,
@@ -251,6 +278,12 @@ async def sweep_queued_age_alerts(
                 .where(
                     Task.status == TaskStatus.QUEUED,
                     Task.created_at <= _queued_cutoff,
+                    or_(
+                        Task.payloads[0]["type"].as_string().is_(None),
+                        Task.payloads[0]["type"].as_string().not_in(
+                            sorted(BACKEND_MANAGED_TASK_TYPES)
+                        ),
+                    ),
                 )
                 .limit(batch_size)
             )
@@ -709,6 +742,176 @@ async def sweep_capability_backing_proofs(session, now=None) -> int:
     return total_recorded
 
 
+# Cadence gate for the moot-pending-confirmation auto-clear sweep (Step 22e).
+# Hourly, on an independent timer (see the Step 22/22b split note above for why
+# each cadence-gated sweep needs its own timestamp global).
+_MOOT_CONFIRM_INTERVAL_SECONDS = 3600
+_last_moot_confirm_sweep: datetime | None = None
+
+
+async def _owner_llm_credentials_ready(session, user_id: str | None) -> bool:
+    """Whether the project owner has >=1 enabled, runtime-ready LLM account.
+
+    Reuses the DB-side readiness check the pool uses
+    (``max_plan_pool._db_account_runtime_ready``) rather than inventing a new
+    probe — a positive result means the credential the runtime resolves at
+    dispatch is present. Fail-closed: no user / no accounts / any error -> False.
+    """
+    if not user_id:
+        return False
+    from app.max_plan_pool import _db_account_runtime_ready
+    from app.models import MaxPlanAccount
+
+    accounts = (
+        (
+            await session.execute(
+                select(MaxPlanAccount).where(
+                    MaxPlanAccount.user_id == user_id,
+                    MaxPlanAccount.enabled == True,  # noqa: E712
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return any(_db_account_runtime_ready(a) for a in accounts)
+
+
+async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
+    """Step 22e: Auto-clear moot ``pending_user_confirmation`` items.
+
+    Long-stale operator-action items pile up in ``ProblemModel.pending_user_confirmation``
+    because clearing is entirely manual and the strategy-internals surface where
+    they live is unvisited. This sweep removes the items whose ask the system can
+    already prove is resolved, so the operator's needs-action surface (which
+    re-derives from the durable list each poll) naturally drops them.
+
+    Strictly conservative and fail-closed:
+
+    - only ``credentials_needed`` / ``access_needed`` items are eligible;
+      ``intent_change`` / ``major_decision`` require a human decision and are
+      NEVER auto-removed;
+    - an item is removed ONLY when its moot condition is POSITIVELY detected via
+      the existing credential/access resolution paths — owner LLM-account
+      readiness (``_db_account_runtime_ready``) for credentials, a live cached
+      project repo token (``get_cached_project_token``) for access — AND the
+      item text references that resource class (see
+      :func:`app.problem_model._confirmation_is_moot`);
+    - when uncertain, the item is left in place.
+
+    Iterates ALL projects with a non-empty pending list via keyset pagination
+    (ordered by ``Project.id``, batches of 100) so every project is covered
+    deterministically regardless of fleet size. Mutates the durable model via
+    the pure :func:`app.problem_model.auto_clear_resolved_confirmations` helper
+    (same revision-log / ``last_updated_by`` contract as the operator dismiss
+    endpoint), and persists per project. Hourly cadence-gated, idempotent, and
+    wrapped so it can never crash the reaper cycle. Returns the total number of
+    items cleared.
+    """
+    global _last_moot_confirm_sweep
+    from app.github_token_resolver import get_cached_project_token
+    from app.models import Project
+    from app.problem_model import (
+        ConfirmationResolutionSignals,
+        auto_clear_resolved_confirmations,
+        parse_problem_model,
+    )
+    from sqlalchemy.orm import load_only
+    from sqlalchemy.orm.attributes import flag_modified
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_moot_confirm_sweep, _MOOT_CONFIRM_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_moot_confirm_sweep = _now
+
+    _BATCH = 100
+    last_id = None
+    total_cleared = 0
+
+    while True:
+        query = (
+            select(Project)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.user_id,
+                    Project.problem_model,
+                    raiseload=True,
+                )
+            )
+            .where(Project.problem_model.is_not(None))
+            .order_by(Project.id)
+            .limit(_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+
+        last_id = rows[-1].id
+
+        for project in rows:
+            try:
+                pm = getattr(project, "problem_model", None)
+                if not isinstance(pm, dict):
+                    continue
+                pending = pm.get("pending_user_confirmation")
+                if not isinstance(pending, list) or not pending:
+                    continue
+                # Skip early unless there is at least one auto-eligible item, so the
+                # common case does no credential/token I/O.
+                if not any(
+                    isinstance(p, dict)
+                    and p.get("type") in ("credentials_needed", "access_needed")
+                    for p in pending
+                ):
+                    continue
+
+                try:
+                    model = parse_problem_model(pm)
+                except Exception:  # noqa: BLE001 — a malformed model must not block the sweep
+                    continue
+
+                signals = ConfirmationResolutionSignals(
+                    llm_credentials_ready=await _owner_llm_credentials_ready(
+                        session, getattr(project, "user_id", None)
+                    ),
+                    repo_access_ready=bool(get_cached_project_token(str(project.id))),
+                )
+                cleared = auto_clear_resolved_confirmations(
+                    model, signals, _now.isoformat()
+                )
+                if cleared:
+                    project.problem_model = model.model_dump()
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    await session.commit()
+                    total_cleared += len(cleared)
+
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Moot pending-confirmation sweep failed for project %s:",
+                    getattr(project, "id", "?"),
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total_cleared:
+        logger.info(
+            "[REAPER] Step 22e: auto-cleared %d moot pending confirmation(s)",
+            total_cleared,
+        )
+    return total_cleared
+
+
 async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     """Step 22b: Earn proof for demanded unproven working capabilities.
 
@@ -717,6 +920,15 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     proof by verifying backing_paths at HEAD.  For demanded capabilities that
     have no backing_paths, the gap is surfaced in the return summary so the
     strategist layer can act.
+
+    When there is NO demand (no blocked dependents — common when the proof gate
+    is in ``off`` mode), proactively builds a synthetic demand covering ALL
+    unproven working capabilities so the earn loop can still prove capabilities
+    independently of the demand signal.  This breaks the circularity: demand
+    requires blocked dependents, blocked dependents require enforce mode, and
+    enforce mode requires proven capabilities.  Without this fallthrough the
+    earn loop would never fire on a project with all capabilities unproven and
+    no blocked dependents, leaving the gate permanently stuck in ``off``.
 
     Cadence-gated to the same hourly interval as the backing-path sweep, but on
     an INDEPENDENT timer (``_last_proof_earn_loop_sweep``) so Step 22 stamping
@@ -727,6 +939,9 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     global _last_proof_earn_loop_sweep
     from app.capability_demand import collect_missing_capability_demand
     from app.capability_proof import commission_proof_earn_loop
+    from app.capability_registry import (
+        consumer_gate_proof_status,
+    )
     from app.models import Project
     from sqlalchemy.orm import load_only
 
@@ -766,6 +981,8 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
         "no_backing_paths": [],
         "still_unproven": [],
         "path_proven_stuck": [],
+        "named_test_executed": [],
+        "execution_proven": [],
     }
 
     for project in rows:
@@ -781,11 +998,44 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             demand_result = await collect_missing_capability_demand(
                 session, project.id, now=_now
             )
+
+            # When there is NO demand (no blocked dependents), proactively attempt
+            # to prove ALL unproven working capabilities. This breaks the
+            # circularity where demand requires blocked dependents, blocked
+            # dependents require enforce mode, and enforce mode requires proven
+            # capabilities. Without this fallthrough, the earn loop would never
+            # fire on a project with all capabilities unproven and no blocked
+            # dependents, leaving the gate permanently stuck in 'off'.
             if not demand_result.get("demands"):
-                continue
+                proof_by_name = consumer_gate_proof_status(
+                    pm,
+                    getattr(project, "capability_proof_records", None),
+                    now=_now,
+                )
+                unproven_names = [
+                    name for name, status in proof_by_name.items()
+                    if status != "proven"
+                ]
+                if not unproven_names:
+                    continue
+                # Build a synthetic demand covering all unproven working
+                # capabilities so commission_proof_earn_loop can process them.
+                synthetic_demands = [
+                    {
+                        "kind": "capability",
+                        "ref": name,
+                        "label": name,
+                        "dependent_count": 1,
+                    }
+                    for name in unproven_names
+                ]
+                demand_result = {
+                    "total": len(synthetic_demands),
+                    "demands": synthetic_demands,
+                }
 
             result = await commission_proof_earn_loop(
-                project, demand_result, pm
+                project, demand_result, pm, session=session
             )
             if result.get("total_demanded_unproven", 0) > 0:
                 combined["total_demanded_unproven"] += result["total_demanded_unproven"]
@@ -793,6 +1043,12 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
                 combined["no_backing_paths"].extend(result.get("no_backing_paths", []))
                 combined["still_unproven"].extend(result.get("still_unproven", []))
                 combined["path_proven_stuck"].extend(result.get("path_proven_stuck", []))
+                combined["named_test_executed"].extend(
+                    result.get("named_test_executed", [])
+                )
+                combined["execution_proven"].extend(
+                    result.get("execution_proven", [])
+                )
                 if result["earned"] > 0:
                     session.add(project)
                     await session.commit()
@@ -806,12 +1062,19 @@ async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
             with contextlib.suppress(Exception):
                 await session.rollback()
 
-    if combined["earned"] or combined["still_unproven"] or combined["path_proven_stuck"]:
+    if (
+        combined["earned"]
+        or combined["still_unproven"]
+        or combined["path_proven_stuck"]
+        or combined["named_test_executed"]
+    ):
         logger.info(
             "[REAPER] Step 22b: proof-earn loop: total_demanded_unproven=%d "
-            "earned=%d no_backing_paths=%d still_unproven=%d path_proven_stuck=%d",
+            "earned=%d named_test_executed=%d no_backing_paths=%d "
+            "still_unproven=%d path_proven_stuck=%d",
             combined["total_demanded_unproven"],
             combined["earned"],
+            len(combined["named_test_executed"]),
             len(combined["no_backing_paths"]),
             len(combined["still_unproven"]),
             len(combined["path_proven_stuck"]),
@@ -844,6 +1107,67 @@ async def sweep_routine_message_retention(session, *, retention_days: int = 7) -
         await session.commit()
         logger.info(f"[REAPER] Purged {purged} stale routine message(s)")
     return purged
+
+
+async def sweep_expired_message_attachment_uploads(
+    session,
+    *,
+    batch_size: int = 32,
+    timeout_seconds: float = 5.0,
+) -> int:
+    """Delete a global bounded batch of expired, unconsumed upload receipts."""
+
+    receipts = (
+        await session.execute(
+            select(ProjectMessageAttachmentUpload)
+            .where(
+                ProjectMessageAttachmentUpload.consumed_at.is_(None),
+                ProjectMessageAttachmentUpload.message_id.is_(None),
+                ProjectMessageAttachmentUpload.expires_at <= _utcnow(),
+                ~select(ArtifactRefPromotionIntent.id)
+                .where(
+                    ArtifactRefPromotionIntent.receipt_id
+                    == ProjectMessageAttachmentUpload.attachment_id,
+                    ArtifactRefPromotionIntent.state != "settled",
+                )
+                .exists(),
+            )
+            .order_by(ProjectMessageAttachmentUpload.expires_at.asc())
+            .limit(max(1, min(int(batch_size), 100)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+    if not receipts:
+        return 0
+    try:
+        deleted = await asyncio.wait_for(
+            asyncio.gather(
+                *(
+                    delete_storage_uri_best_effort(receipt.storage_uri)
+                    for receipt in receipts
+                )
+            ),
+            timeout=max(0.1, float(timeout_seconds)),
+        )
+    except TimeoutError:
+        await session.rollback()
+        logger.warning("[REAPER] Expired message attachment cleanup timed out")
+        return 0
+
+    removed = 0
+    for receipt, object_deleted in zip(receipts, deleted, strict=True):
+        if object_deleted:
+            await session.delete(receipt)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Deleted %d expired message attachment upload(s)",
+            removed,
+        )
+    else:
+        await session.rollback()
+    return removed
 
 
 async def sweep_evergreen_fill_decision_retention(
@@ -1491,17 +1815,298 @@ async def sweep_orphaned_cross_base_children(session, *, batch_size: int = 500) 
     return cancelled
 
 
+# ── Stage-2 generalized message lifecycle sweeps (design d-7c851b3f) ──────────
+#
+# Two cadence sweeps that generalize the bug-class-only convergence machinery so
+# actionable operator items auto-clear when their underlying condition resolves
+# and dead conversation ages out — WITHOUT operator involvement:
+#
+#   1. sweep_resolve_linked_messages — resolves ANY 'linked' NON-bug-class
+#      message (NOTE / QUESTION / FEEDBACK) once its recorded _convergence_link
+#      target genuinely lands. Bug-class ('BUG_REPORT'/'BLOCKER') linked messages
+#      stay owned by sweep_converge_linked_bug_messages (Step 15), which ALSO
+#      resurfaces on failure; the two are disjoint by message_type and together
+#      cover every 'linked' message.
+#   2. sweep_decay_stale_open_messages — auto-resolves an OPEN conversational
+#      (NOTE/FEEDBACK) item with no activity for STALE_OPEN_DECAY_DAYS and no
+#      live linked condition, stamping resolution 'auto-decayed (stale)'.
+#      Unanswered QUESTION items age out at a longer window (STALE_QUESTION_DECAY_DAYS)
+#      and receive a distinct resolution reason 'stale_unanswered' so the operator
+#      can distinguish auto-resolved from genuinely-answered questions.
+#      Genuinely-live BLOCKER items are never decayed.
+
+# Decay window (days) after which a stale open NOTE/FEEDBACK message is
+# auto-resolved. Exposed as a module constant so the one-time backlog migration
+# reuses the SAME threshold; overridable at runtime via
+# runtime_config['stale_open_message_decay_days'].
+STALE_OPEN_DECAY_DAYS = 14
+
+# Longer decay window for unanswered QUESTION messages — questions deserve more
+# patience than plain notes. Overridable at runtime via
+# runtime_config['stale_question_decay_days'].
+STALE_QUESTION_DECAY_DAYS = 30
+
+
+async def sweep_resolve_linked_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Resolve NON-bug-class 'linked' messages whose owning outcome landed.
+
+    Generalizes the positive-convergence half of Step 15 to NOTE/QUESTION/
+    FEEDBACK: a 'linked' message is terminally resolved once its recorded
+    ``_convergence_link`` target genuinely LANDS (direction 'completed' or task
+    merged-completion), clearing its needs-action derivation without operator
+    involvement. Disjoint from Step 15 by message_type (bug-class stays owned by
+    ``sweep_converge_linked_bug_messages``, which also resurfaces on failure).
+
+    An outcome that has not landed leaves the message 'linked' — manual resolve
+    and the bug-class resurfacing sweep remain the fallback. Fail-safe per
+    message (one bad row never aborts the batch), idempotent (resolution moves
+    status off 'linked'), and broadcasts a ``message_updated`` envelope per row.
+
+    Returns the number of messages auto-resolved.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        LINKED_STATUS,
+        linked_outcome_landed_resolution,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == LINKED_STATUS,
+                    ProjectMessage.message_type.notin_(list(BUG_CLASS_TYPES)),
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] linked-message resolve sweep hit cap=%d linked messages — "
+            "result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Fail-safe: one malformed/unreadable owner must never abort the batch.
+        try:
+            audit = await linked_outcome_landed_resolution(session, msg, now=now)
+        except Exception:
+            logger.warning(
+                "[REAPER] linked-message resolve failed for message %s — "
+                "leaving linked",
+                msg.id,
+                exc_info=True,
+            )
+            continue
+        if audit is None:
+            continue
+        mark_message_resolved(msg, now, f"Owned outcome landed: {audit}")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] linked-message resolve: auto-resolved message %s — %s",
+            msg.id,
+            audit,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] linked-message resolve broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] linked-message resolve: auto-resolved %d linked message(s)",
+            resolved,
+        )
+    return resolved
+
+
+async def sweep_decay_stale_open_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Auto-resolve dead conversational (NOTE/FEEDBACK/QUESTION) open threads.
+
+    NOTE/FEEDBACK: aged out after ``STALE_OPEN_DECAY_DAYS`` (overridable via
+    ``runtime_config['stale_open_message_decay_days']``), stamping
+    ``resolution='auto-decayed (stale)'``.
+
+    QUESTION: aged out after ``STALE_QUESTION_DECAY_DAYS`` (overridable via
+    ``runtime_config['stale_question_decay_days']``), stamping
+    ``resolution='stale_unanswered'`` so operators can distinguish auto-resolved
+    from genuinely-answered questions.
+
+    Genuinely-live BLOCKER items and any message carrying a live
+    ``_convergence_link`` are left untouched.  Fail-safe per message, idempotent
+    (resolution moves status off 'open'), and broadcasts a ``message_updated``
+    envelope per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        CONVERSATIONAL_DECAY_MESSAGE_TYPES,
+        OPEN_STATUS,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get("stale_open_message_decay_days", STALE_OPEN_DECAY_DAYS)
+    )
+    question_decay_days = int(
+        runtime_config.get("stale_question_decay_days", STALE_QUESTION_DECAY_DAYS)
+    )
+    # Use the shorter cutoff for the DB fetch so we retrieve all candidates;
+    # per-message type logic below applies the correct window per row.
+    min_decay_days = min(decay_days, question_decay_days)
+    cutoff = now - timedelta(days=min_decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type.in_(
+                        list(CONVERSATIONAL_DECAY_MESSAGE_TYPES)
+                    ),
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-open decay sweep hit cap=%d open conversational "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    question_cutoff = now - timedelta(days=question_decay_days)
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Determine the effective decay window and resolution reason by type.
+        msg_type = (
+            msg.message_type.value
+            if hasattr(msg.message_type, "value")
+            else str(msg.message_type)
+        )
+        if msg_type == "QUESTION":
+            if (msg.created_at or now) > question_cutoff:
+                # Not yet old enough under the longer QUESTION window.
+                continue
+            resolution_reason = "stale_unanswered"
+            effective_decay_days = question_decay_days
+        else:
+            resolution_reason = "auto-decayed (stale)"
+            effective_decay_days = decay_days
+        # Never decay an open item that still carries a live linked condition
+        # (defensive — open items are normally unlinked, but a resurfaced link
+        # can leave the stale forward pointer behind).
+        if get_message_link(msg) is not None:
+            continue
+        # Operator-action-needed NOTEs survive the normal decay window; they
+        # eventually decay after a longer threshold (default 60 days) so a
+        # forgotten notice does not accumulate indefinitely.
+        ctx = msg.context or {}
+        if ctx.get("audience") == OPERATOR_ACTION_NEEDED:
+            operator_decay_days = int(
+                runtime_config.get(
+                    "stale_open_operator_action_needed_decay_days", 60
+                )
+            )
+            if (now - msg.created_at).days < operator_decay_days:
+                continue
+        mark_message_resolved(msg, now, resolution_reason)
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] stale-open decay: auto-resolved %s message %s (no activity "
+            "for >=%dd, reason=%s)",
+            msg_type,
+            msg.id,
+            effective_decay_days,
+            resolution_reason,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] stale-open decay broadcast failed for %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] stale-open decay: auto-resolved %d stale open message(s)",
+            resolved,
+        )
+    return resolved
+
+
 # ── Re-exports from extracted sub-module ─────────────────────────────────────
 #
 # These symbols were extracted to app.reaper_bug_message_sweeps. They are
 # re-exported here so every existing import site (reaper.py, digest_metrics.py,
 # test_reaper.py, etc.) keeps working without any change.
 from app.reaper_bug_message_sweeps import (  # noqa: E402
+    STALE_OPEN_BUG_CLASS_DECAY_DAYS,
+    STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
     WakeSweepResult,
     _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD,
     get_wake_delivery_stall_cycles,
     reset_wake_delivery_stall_state,
     sweep_converge_linked_bug_messages,
+    sweep_decay_stale_open_bug_messages,
+    sweep_decay_stale_unlinked_blocker_messages,
     sweep_deliver_task_wakes,
     sweep_resolve_open_owned_bug_messages,
     sweep_resolve_stale_open_bug_messages,
@@ -1690,6 +2295,82 @@ _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
 _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
 _last_compute_image_gc_guard_sweep: datetime | None = None
 
+# Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
+# an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
+# gcloud binary / Artifact Registry API error / non-zero exit), so a failed apply
+# used to be entirely silent: not logged, not counted, not alerted. A missing
+# ``inuse-`` tag means registry time/count retention — which cannot query the DB —
+# can reclaim a digest a live/recent compute job (or the project's DB-pinned
+# default image) still depends on. This surfaces that as an actionable alert.
+_COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE = (
+    "Compute-image GC protection tag failed to apply"
+)
+
+
+async def _alert_compute_image_protection_failures(
+    session, project_ids, *, apply_failed: int, now: datetime
+) -> int:
+    """Raise a deduped WARNING alert per project whose ``inuse-`` tag apply failed.
+
+    ``apply_registry_protection_tag`` is fail-open: on a missing gcloud binary, an
+    Artifact Registry API error, or a non-zero exit it returns ``None`` rather than
+    raising. Previously the sweep just did not increment its applied counter, so
+    the failure vanished. Because the registry's retention policy is purely
+    time/count-based and cannot see the DB, a digest that never got its ``inuse-``
+    protection tag can be GC'd out from under the very job/pin that still references
+    it. One open alert per affected project (deduped on an open row with the same
+    title) until an operator dismisses it. Returns the number of NEW alerts created.
+    """
+    from app.models import Alert, AlertSeverity
+
+    project_ids = [p for p in dict.fromkeys(project_ids) if p is not None]
+    if not project_ids:
+        return 0
+
+    # Single batched existence query (no per-project N+1): which of these projects
+    # already carry an OPEN alert with our title.
+    already = set(
+        (
+            await session.execute(
+                select(Alert.project_id)
+                .where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.title == _COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE,
+                    Alert.dismissed_at.is_(None),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    created = 0
+    for pid in project_ids:
+        if pid in already:
+            continue
+        session.add(
+            Alert(
+                project_id=pid,
+                severity=AlertSeverity.WARNING,
+                title=_COMPUTE_IMAGE_PROTECT_FAIL_ALERT_TITLE,
+                message=(
+                    "The hourly compute-image GC-protection sweep could not apply an "
+                    "inuse- registry protection tag to at least one digest this project "
+                    "references (fail-open gcloud / Artifact Registry error). Until the "
+                    "tag is applied on a later sweep, registry time/count retention "
+                    "could reclaim a digest a live/recent compute job — or this "
+                    "project's pinned default image — still depends on, breaking "
+                    "reproducibility. Check gcloud availability and Artifact Registry "
+                    "API health on the orchestrator host."
+                )[:1000],
+            )
+        )
+        created += 1
+    if created:
+        await session.commit()
+    return created
+
 
 def _split_pinned_ref(ref: str) -> tuple[str, str] | None:
     """Split a digest-pinned image ref into ``(full_repo, digest)``.
@@ -1792,9 +2473,12 @@ async def sweep_protect_referenced_compute_image_digests(
     time-based retention can reclaim the image on a later pass.
 
     A digest is "referenced" when it is the ``container_image`` of a live compute
-    job, of a job completed within the protection window, OR the digest of a
-    ``ProjectComputeImage`` row (re)built within that window (protect the current
-    project default even before its first job lands).
+    job, of a job completed within the protection window, OR a usable
+    ``ProjectComputeImage`` that resolves as a project's configured current
+    default. The last case protects that manifest-selected row before its first
+    job lands. Historical rows are deliberately not standing pins: a
+    superseded digest stays protected only while a live/recent job still
+    references it.
 
     Cadence-gated to hourly on an independent timer. Returns a summary dict
     (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
@@ -1808,7 +2492,7 @@ async def sweep_protect_referenced_compute_image_digests(
         protection_tag_for_digest,
     )
     from app.compute_jobs import referenced_compute_image_digests
-    from app.models import ProjectComputeImage
+    from app.models import Project, ProjectComputeImage
 
     _now = now or _utcnow()
     if not _is_cadence_due(
@@ -1816,7 +2500,7 @@ async def sweep_protect_referenced_compute_image_digests(
         _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
         _now,
     ):
-        return {"applied": 0, "pruned": 0, "skipped_cadence": 1}
+        return {"applied": 0, "pruned": 0, "apply_failed": 0, "skipped_cadence": 1}
     _last_compute_image_gc_guard_sweep = _now
 
     apply_tag = _apply_tag or apply_registry_protection_tag
@@ -1826,23 +2510,146 @@ async def sweep_protect_referenced_compute_image_digests(
     cutoff = _now - timedelta(seconds=_COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS)
     referenced = await referenced_compute_image_digests(session, since=cutoff)
 
-    images = (
-        (
-            await session.execute(
-                select(ProjectComputeImage)
-                .where(ProjectComputeImage.digest.is_not(None))
-                .limit(max_images)
+    # Read every image row in bounded pages. ``max_images`` is retained as the
+    # page size for callers, not a global cap: silently omitting rows loses both
+    # repositories to prune and old rows needed to map a job-referenced digest
+    # back to its repository. The stable keyset avoids offset drift as the table
+    # grows while keeping each database fetch bounded.
+    page_size = max(1, max_images)
+    images: list[ProjectComputeImage] = []
+    last_updated = None
+    last_id = None
+    while True:
+        page_where = []
+        if last_updated is not None and last_id is not None:
+            page_where.append(
+                or_(
+                    ProjectComputeImage.updated_at < last_updated,
+                    and_(
+                        ProjectComputeImage.updated_at == last_updated,
+                        ProjectComputeImage.id < last_id,
+                    ),
+                )
             )
+        page = (
+            (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*page_where)
+                    .order_by(
+                        ProjectComputeImage.updated_at.desc(),
+                        ProjectComputeImage.id.desc(),
+                    )
+                    .limit(page_size)
+                )
+            )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
+        if not page:
+            break
+        images.extend(page)
+        last_updated, last_id = page[-1].updated_at, page[-1].id
+        if len(page) < page_size:
+            break
 
-    # A freshly-(re)built image is protected even before its first job lands, so
-    # the current project default is never GC'd between bake and first use.
+    # Mirror default-image resolution. The resolver reads the configured manifest
+    # and pins its selected build, including an older explicitly tagged row. Do
+    # not retain every per-tag candidate: content-hash build tags are unique, so
+    # that would turn all historical builds into permanent retention pins.
+    latest_by_project: dict[uuid.UUID, set[uuid.UUID]] = {}
+    latest_identities_by_project: dict[uuid.UUID, set[tuple[str, str]]] = {}
+    built_image_ids_by_ref: dict[tuple[uuid.UUID, str, str], uuid.UUID] = {}
+    protection_tags_by_project: dict[uuid.UUID, set[str]] = {}
+    current_ids: set[uuid.UUID] = set()
+    preserved_protection_tags: set[str] = set()
     for img in images:
-        updated = getattr(img, "updated_at", None)
-        if img.digest and updated is not None and updated >= cutoff:
+        if not img.built or not img.digest:
+            continue
+        # Images are ordered newest-first. Keep the existing latest-build
+        # fallback only for projects with no declared default image at all.
+        identity = (img.registry_repo, img.image_name)
+        seen = latest_identities_by_project.setdefault(img.project_id, set())
+        if identity not in seen:
+            seen.add(identity)
+            latest_by_project.setdefault(img.project_id, set()).add(img.id)
+        built_image_ids_by_ref.setdefault(
+            (img.project_id, f"{img.registry_repo}/{img.image_name}", img.digest), img.id
+        )
+        protection_tags_by_project.setdefault(img.project_id, set()).add(
+            protection_tag_for_digest(img.digest)
+        )
+
+    project_ids = list(latest_by_project)
+    projects_by_id: dict[uuid.UUID, Project] = {}
+    if project_ids:
+        projects_by_id = {
+            project.id: project
+            for project in (
+                await session.execute(select(Project).where(Project.id.in_(project_ids)))
+            ).scalars()
+        }
+
+    for project_id, latest_ids in latest_by_project.items():
+        project = projects_by_id.get(project_id)
+        default_ref = (
+            await resolve_project_default_container_image(session, project)
+            if project is not None
+            else None
+        )
+        if default_ref is None:
+            # The shared resolver intentionally fails open to ``None`` for both
+            # no manifest declaration and transient manifest/registry errors.
+            # Re-read the declaration to distinguish them: selecting a newer
+            # row after an indeterminate resolution could prune the inuse tag
+            # for an older explicit manifest tag. In that case retain prior
+            # protection tags for this project's rows until a later sweep can
+            # resolve the actual default. Do not stamp all historical rows.
+            has_declared_default: bool | None
+            if project is None:
+                has_declared_default = False
+            else:
+                try:
+                    from app.routers.admin_project_tools import _discover_manifest_tools
+
+                    manifest = await _discover_manifest_tools(project)
+                    # ``_discover_manifest_tools`` caches fetch/token failures
+                    # as a result rather than raising. Those failures are
+                    # indeterminate here, not proof that no default exists.
+                    # Falling back to the newest row could otherwise prune an
+                    # older explicitly configured image's protection tag.
+                    if manifest.get("error"):
+                        has_declared_default = None
+                    else:
+                        compute_image = (manifest.get("compute") or {}).get("image") or {}
+                        has_declared_default = bool(
+                            compute_image.get("name")
+                            if isinstance(compute_image, dict)
+                            else None
+                        )
+                except Exception:  # noqa: BLE001 — preserve prior tags on discovery failure
+                    has_declared_default = None
+            if has_declared_default is False:
+                # Only an affirmative no-image result uses the historical
+                # newest-build fallback.
+                current_ids.update(latest_ids)
+            else:
+                preserved_protection_tags.update(
+                    protection_tags_by_project.get(project_id, set())
+                )
+            continue
+        selected = _split_pinned_ref(default_ref)
+        if selected is None:
+            # A configured image without a matching durable build is not this
+            # project's default row, so it must not pin an unrelated history.
+            continue
+        full_repo, digest = selected
+        image_id = built_image_ids_by_ref.get((project_id, full_repo, digest))
+        if image_id is not None:
+            current_ids.add(image_id)
+
+    for img in images:
+        if img.id in current_ids and img.digest:
             referenced.add(img.digest)
 
     protected_tags = {protection_tag_for_digest(d) for d in referenced}
@@ -1864,10 +2671,18 @@ async def sweep_protect_referenced_compute_image_digests(
     #     very job that was still pulling it, which is precisely the failure this
     #     sweep's docstring promises to prevent.
     targets: set[tuple[str, str]] = set()
+    # Map each protection target back to the project that pins it, so a FAILED
+    # apply can be surfaced as an actionable alert on the affected project. Only
+    # ProjectComputeImage-derived targets carry a project_id here; job-only refs
+    # (no build row) still count toward apply_failed and log, but have no single
+    # owning project to alert.
+    target_project: dict[tuple[str, str], uuid.UUID] = {}
 
     for img in images:
-        if img.digest and img.digest in referenced:
-            targets.add((f"{img.registry_repo}/{img.image_name}", img.digest))
+        if img.digest and (img.id in current_ids or img.digest in referenced):
+            key = (f"{img.registry_repo}/{img.image_name}", img.digest)
+            targets.add(key)
+            target_project.setdefault(key, img.project_id)
 
     job_refs = await _referenced_compute_image_repo_digests(session, since=cutoff)
     for full_repo, digest in job_refs:
@@ -1875,6 +2690,8 @@ async def sweep_protect_referenced_compute_image_digests(
             targets.add((full_repo, digest))
 
     applied = 0
+    apply_failed = 0
+    failed_projects: list[uuid.UUID] = []
     pruned = 0
     # Every repo we know about gets its stale protection tags pruned — including
     # repos we only learned about from a job's container_image.
@@ -1886,6 +2703,16 @@ async def sweep_protect_referenced_compute_image_digests(
         # sweep cannot stall API responsiveness or heartbeat processing.
         if await asyncio.to_thread(apply_tag, full_repo, digest):
             applied += 1
+        else:
+            # apply_registry_protection_tag is fail-open (None on missing gcloud /
+            # AR API error / non-zero exit). This used to vanish silently — no
+            # warning, no count, no alert — while the referenced digest lost its
+            # only GC protection. Count it, and remember the owning project so the
+            # failure can be alerted below.
+            apply_failed += 1
+            owner = target_project.get((full_repo, digest))
+            if owner is not None:
+                failed_projects.append(owner)
 
     for full_repo in repos:
         try:
@@ -1893,11 +2720,578 @@ async def sweep_protect_referenced_compute_image_digests(
         except Exception:  # noqa: BLE001 — registry helpers fail open
             continue
         for tag in existing:
-            if tag not in protected_tags:
-                if await asyncio.to_thread(delete_tag, full_repo, tag):
-                    pruned += 1
+            if tag not in (protected_tags | preserved_protection_tags) and await asyncio.to_thread(
+                delete_tag, full_repo, tag
+            ):
+                pruned += 1
 
-    return {"applied": applied, "pruned": pruned, "skipped_cadence": 0}
+    # Surface fail-open apply failures — the whole point is that they are no longer
+    # silent. A missing inuse- tag means registry retention can reclaim a digest a
+    # live/recent job or DB-pinned default still references.
+    if apply_failed:
+        logger.warning(
+            "sweep_protect_referenced_compute_image_digests: %d of %d protection-tag "
+            "apply(s) FAILED fail-open (no inuse- tag written) — referenced compute-"
+            "image digest(s) may be GC'd out from under a live/recent job or a DB-"
+            "pinned project default. applied=%d",
+            apply_failed,
+            len(targets),
+            applied,
+        )
+        try:
+            await _alert_compute_image_protection_failures(
+                session, failed_projects, apply_failed=apply_failed, now=_now
+            )
+        except Exception:  # noqa: BLE001 — alerting must never crash the sweep
+            logger.exception(
+                "sweep_protect_referenced_compute_image_digests: failed to raise "
+                "protection-failure alert(s)"
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+
+    return {
+        "applied": applied,
+        "pruned": pruned,
+        "apply_failed": apply_failed,
+        "skipped_cadence": 0,
+    }
+
+
+# ── Auto-rebuild project compute images on manifest change ────────────────────
+#
+# A project-baked compute image (the images-first dependency substrate) only ever
+# rebuilds today via the manual OWNER-only admin endpoint. Nothing rebuilds it
+# when the project's declared dependency manifest changes, so the baked image
+# silently drifts from the code's real deps until an operator remembers to click
+# rebuild. This sweep closes that gap: hourly, it drives the reusable
+# ``compute_backends.refresh_project_compute_image`` driver per connected-repo
+# project, which CHEAPLY (no clone) recomputes the current dependency hash and
+# rebuilds ONLY when the registry tag is absent (a genuinely changed manifest).
+#
+# Independent hourly cadence timer so a shared global stamped earlier in the same
+# reaper cycle can never gate it out. Bounded work: honors the manifest cache,
+# skips repo-less projects, respects the process-wide build concurrency guard
+# (never stampedes the host with concurrent docker builds), and builds at most a
+# small number of projects per cycle so one pass cannot pin the host for an hour.
+_COMPUTE_IMAGE_REFRESH_INTERVAL_SECONDS = 3600
+_COMPUTE_IMAGE_REFRESH_MAX_PROJECTS = 25
+_COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE = 3
+_last_compute_image_refresh_sweep: datetime | None = None
+
+
+async def sweep_refresh_project_compute_images(
+    session,
+    now=None,
+    *,
+    _refresh_fn=None,
+    _build_semaphore=None,
+    max_projects: int = _COMPUTE_IMAGE_REFRESH_MAX_PROJECTS,
+    max_builds_per_cycle: int = _COMPUTE_IMAGE_REFRESH_MAX_BUILDS_PER_CYCLE,
+    progress_cb=None,
+) -> dict[str, int]:
+    """Rebuild project baked compute images whose dependency manifest changed.
+
+    Iterates projects with a connected GitHub repo (bounded) and calls the
+    best-effort per-project driver
+    :func:`app.compute_backends.refresh_project_compute_image`. The driver
+    recomputes the current dependency hash without a clone and rebuilds ONLY when
+    the manifest genuinely changed (the registry tag for the new hash is absent);
+    an unchanged manifest is a cheap registry-lookup no-op.
+
+    Bounded so one cycle cannot pin the orchestrator host for an hour: at most
+    ``max_builds_per_cycle`` rebuilds are triggered (further changed projects are
+    ``deferred`` to the next hourly pass), and the driver is handed the same
+    process-wide build concurrency guard the admin endpoint uses so a build
+    already in flight defers rather than stampeding.
+
+    When *progress_cb* is provided, each build uses heartbeat-loop progress
+    reporting so the reaper's lifecycle watchdog does not cancel the cycle during
+    a multi-minute baked-image build.
+
+    Cadence-gated to hourly on an independent timer. Returns a summary dict of
+    per-status counts (``rebuilt``/``unchanged``/``no_config``/``deferred``/
+    ``errors``/``projects``/``skipped_cadence``). A per-project failure is
+    isolated — it never aborts the sweep. The reaper wraps this so a raised error
+    can never crash the cycle.
+    """
+    global _last_compute_image_refresh_sweep
+    from app.models import Project
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_compute_image_refresh_sweep,
+        _COMPUTE_IMAGE_REFRESH_INTERVAL_SECONDS,
+        _now,
+    ):
+        return {
+            "projects": 0,
+            "rebuilt": 0,
+            "dispatched": 0,
+            "unchanged": 0,
+            "no_config": 0,
+            "deferred": 0,
+            "errors": 0,
+            "skipped_cadence": 1,
+        }
+    _last_compute_image_refresh_sweep = _now
+
+    if _refresh_fn is None:
+        from app.compute_backends import refresh_project_compute_image
+
+        refresh_fn = refresh_project_compute_image
+    else:
+        refresh_fn = _refresh_fn
+
+    if _build_semaphore is None:
+        try:
+            from app.routers.admin_project_tools import (
+                _compute_image_build_semaphore,
+            )
+
+            build_semaphore = _compute_image_build_semaphore
+        except Exception:  # noqa: BLE001 — guard defensively; run unbounded-by-sem
+            build_semaphore = None
+    else:
+        build_semaphore = _build_semaphore
+
+    _prefetched_projects = (
+        (
+            await session.execute(
+                select(Project)
+                .where(
+                    Project.github_owner.is_not(None),
+                    Project.github_repo.is_not(None),
+                )
+                .limit(max_projects)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Extract IDs as plain scalars so they survive a session rollback below.
+    project_ids = [p.id for p in _prefetched_projects]
+
+    summary = {
+        "projects": 0,
+        "rebuilt": 0,
+        "dispatched": 0,
+        "unchanged": 0,
+        "no_config": 0,
+        "deferred": 0,
+        "errors": 0,
+        "skipped_cadence": 0,
+    }
+    builds_done = 0
+    for project_id in project_ids:
+        summary["projects"] += 1
+        try:
+            # A prior project's failed driver may roll back the shared session,
+            # expiring ORM instances. session.get() returns the already-loaded
+            # project from the identity map (no extra round-trip) unless a
+            # rollback expired it, in which case it re-fetches — preserving
+            # the same isolation guarantee as the prior IDs-only approach.
+            project = await session.get(Project, project_id)
+            if project is None:
+                summary["errors"] += 1
+                continue
+            result = await refresh_fn(
+                session,
+                project,
+                allow_build=(builds_done < max_builds_per_cycle),
+                build_semaphore=build_semaphore,
+                progress_cb=progress_cb,
+            )
+        except Exception:  # noqa: BLE001 — driver is best-effort; isolate anyway
+            logger.warning(
+                "[REAPER] compute-image auto-refresh raised for project %s",
+                project_id,
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            summary["errors"] += 1
+            continue
+
+        status = (result or {}).get("status")
+        if status == "rebuilt":
+            summary["rebuilt"] += 1
+            builds_done += 1
+            try:
+                from app.alert_dispatch import _maybe_create_compute_image_drift_alert
+
+                await _maybe_create_compute_image_drift_alert(
+                    session,
+                    project_id,
+                    dep_hash=(result or {}).get("dep_hash"),
+                    pinned_ref=(result or {}).get("pinned_ref"),
+                )
+            except Exception:  # noqa: BLE001 — alert is best-effort
+                logger.warning(
+                    "[REAPER] compute-image drift alert failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
+        elif status == "dispatched":
+            # Off-orchestrator async build kicked off; it counts against the
+            # per-cycle build budget. The reaper poll sweep records the pin (and
+            # any drift alert fires once the pinned_ref is known), so nothing to
+            # record here.
+            summary["dispatched"] += 1
+            builds_done += 1
+        elif status == "unchanged":
+            summary["unchanged"] += 1
+        elif status == "no_config":
+            summary["no_config"] += 1
+        elif status == "deferred":
+            summary["deferred"] += 1
+        else:  # "error" or an unrecognized status
+            summary["errors"] += 1
+
+    if (
+        summary["rebuilt"]
+        or summary["dispatched"]
+        or summary["deferred"]
+        or summary["errors"]
+    ):
+        logger.info(
+            "[REAPER] compute-image auto-refresh: rebuilt=%d dispatched=%d "
+            "unchanged=%d deferred=%d no_config=%d errors=%d (of %d project(s))",
+            summary["rebuilt"],
+            summary["dispatched"],
+            summary["unchanged"],
+            summary["deferred"],
+            summary["no_config"],
+            summary["errors"],
+            summary["projects"],
+        )
+    return summary
+
+
+# ── Off-orchestrator image-build poll monitor (DARK — not wired into the loop) ──
+#
+# Sibling of the compute-job monitor: it drives BUILDING ProjectComputeImageBuild
+# rows to a terminal state by polling the throwaway builder VM's serial marker /
+# durable terminal.json, then records the pinned image (through the same
+# digest-preservation guard the inline path uses) and reaps the VM. Past its
+# deadline a build's VM is deleted and the row is marked TIMED_OUT.
+#
+# This sweep is NOT registered in the reaper cycle and NOT called by the trigger
+# endpoint — the whole builder lane ships dark, selectable by config. It exists
+# so the machinery is testable and ready to wire up once proven.
+_IMAGE_BUILD_POLL_MAX_ROWS = 25
+
+
+async def sweep_poll_image_builds(
+    session,
+    now=None,
+    *,
+    _backend=None,
+    _record_fn=None,
+    _preserve_fn=None,
+    _reap_fn=None,
+    max_builds: int = _IMAGE_BUILD_POLL_MAX_ROWS,
+) -> dict[str, int]:
+    """Poll BUILDING off-orchestrator compute-image builds to a terminal state.
+
+    For each ``BUILDING`` :class:`ProjectComputeImageBuild` row (bounded to
+    ``max_builds``):
+
+    * **Past deadline** — delete the builder VM and mark the row ``TIMED_OUT``
+      (a build that ran past its wall-clock ceiling never completes on its own).
+    * **SUCCEEDED** — reconstruct a ``BuildResult`` from the tool's parsed
+      ``RESULT_JSON``, run it through the digest-preservation guard, UPSERT the
+      ``ProjectComputeImage`` pin, persist ``result_json``, mark ``SUCCEEDED``,
+      and reap the VM.
+    * **FAILED** — persist the reason, mark ``FAILED``, and reap the VM.
+    * **still BUILDING** — leave the row untouched for the next pass.
+
+    All VM/serial/registry calls go through the injected ``_backend`` /
+    ``_record_fn`` / ``_preserve_fn`` / ``_reap_fn`` seams so the state machine is
+    testable with no cloud I/O. A per-row failure is isolated — it never aborts
+    the sweep. Returns a summary dict of per-outcome counts. The reaper (once this
+    is wired) wraps it so a raised error can never crash the cycle.
+    """
+    from app import compute_backends as _cb
+
+    _now = now or _utcnow()
+    backend = _backend if _backend is not None else _cb.get_image_builder_backend()
+    record_fn = _record_fn if _record_fn is not None else _cb.record_project_compute_image_build
+    preserve_fn = (
+        _preserve_fn if _preserve_fn is not None else _cb._preserve_existing_digest_pin_cb
+    )
+
+    async def _default_reap(build: ProjectComputeImageBuild) -> bool:
+        return await backend.abort(build, reason="reap_after_terminal")
+
+    reap_fn = _reap_fn if _reap_fn is not None else _default_reap
+
+    rows = (
+        (
+            await session.execute(
+                select(ProjectComputeImageBuild)
+                .where(
+                    ProjectComputeImageBuild.status == ComputeImageBuildStatus.BUILDING
+                )
+                .order_by(ProjectComputeImageBuild.created_at)
+                .limit(max_builds)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    summary = {
+        "polled": 0,
+        "succeeded": 0,
+        "failed": 0,
+        "timed_out": 0,
+        "still_building": 0,
+        "errors": 0,
+    }
+    for build in rows:
+        summary["polled"] += 1
+        try:
+            # Deadline first: a build past its wall-clock ceiling is reaped and
+            # marked TIMED_OUT without trusting a (possibly never-coming) marker.
+            if build.deadline_at is not None and _now >= build.deadline_at:
+                await reap_fn(build)
+                build.status = ComputeImageBuildStatus.TIMED_OUT
+                build.error_reason = "build exceeded its wall-clock deadline"
+                build.updated_at = _now
+                session.add(build)
+                await session.commit()
+                summary["timed_out"] += 1
+                continue
+
+            status = await backend.poll(build)
+            if status.status == ComputeImageBuildStatus.BUILDING:
+                summary["still_building"] += 1
+                continue
+
+            if status.status == ComputeImageBuildStatus.SUCCEEDED:
+                result_payload = status.result or {}
+                build_result = _cb.build_result_from_serial_payload(
+                    result_payload, dep_hash=build.dep_hash
+                )
+                # Never let a digest-less result NULL an already-stored pin.
+                build_result = await preserve_fn(
+                    session, build.project_id, build_result
+                )
+                await record_fn(
+                    session,
+                    build.project_id,
+                    build.registry_repo,
+                    build.image_name,
+                    build_result,
+                )
+                build.status = ComputeImageBuildStatus.SUCCEEDED
+                build.result_json = build_result.to_json()
+                build.error_reason = None
+                build.updated_at = _now
+                session.add(build)
+                await session.commit()
+                await reap_fn(build)
+                summary["succeeded"] += 1
+                continue
+
+            # FAILED (or any non-BUILDING/SUCCEEDED terminal state).
+            build.status = ComputeImageBuildStatus.FAILED
+            build.error_reason = status.reason or "image build failed"
+            build.updated_at = _now
+            session.add(build)
+            await session.commit()
+            await reap_fn(build)
+            summary["failed"] += 1
+        except Exception:  # noqa: BLE001 — isolate a per-row failure
+            logger.warning(
+                "[REAPER] image-build poll raised for build %s",
+                getattr(build, "id", "?"),
+                exc_info=True,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+            summary["errors"] += 1
+            continue
+
+    if summary["succeeded"] or summary["failed"] or summary["timed_out"] or summary["errors"]:
+        logger.info(
+            "[REAPER] image-build poll: succeeded=%d failed=%d timed_out=%d "
+            "still_building=%d errors=%d (of %d row(s))",
+            summary["succeeded"],
+            summary["failed"],
+            summary["timed_out"],
+            summary["still_building"],
+            summary["errors"],
+            summary["polled"],
+        )
+    return summary
+
+
+async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
+    """Step 22f: Reap silent runner-subprocess and GCP compute jobs.
+
+    GCP jobs delete their VM before finalization; runner jobs only finalize.
+    Best-effort per job so one failure does not block the next.
+    Returns the number of jobs finalized.
+    """
+    _now = now or _utcnow()
+    stale_cutoff = _now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS)
+
+    stmt = (
+        select(ComputeJob)
+        .where(
+            ComputeJob.status == ComputeJobStatus.RUNNING,
+            ComputeJob.backend.in_((RUNNER_SUBPROCESS_BACKEND_NAME, GCP_BACKEND_NAME)),
+            (
+                (ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME)
+                & (
+                    (ComputeJob.last_heartbeat_at.is_(None)
+                     & (ComputeJob.started_at < stale_cutoff))
+                    | (ComputeJob.last_heartbeat_at < stale_cutoff)
+                )
+            )
+            | (
+                (ComputeJob.backend == GCP_BACKEND_NAME)
+                & (ComputeJob.last_heartbeat_at < stale_cutoff)
+            ),
+        )
+        .limit(50)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    finalized = 0
+    for job in rows:
+        try:
+            ok = await finalize_silent_compute_job(session, job, now=_now)
+            if ok:
+                finalized += 1
+        except Exception:
+            logger.exception(
+                f"[REAPER] Failed to finalize silent compute job {job.id}"
+            )
+            await session.rollback()
+    if finalized:
+        logger.info(
+            f"[REAPER] Finalized {finalized} silent compute job(s)"
+        )
+    return finalized
+
+
+async def sweep_stranded_runner_subprocess_compute_jobs(
+    session,
+    now: datetime,
+    *,
+    session_factory=AsyncSessionLocal,
+) -> int:
+    """Finalize claimed runner-subprocess jobs after a runner dies.
+
+    A runner's last report is stored only in ``polling_metadata``.  If the
+    runner crashes or becomes partitioned, the normal monitor therefore sees
+    STARTING/RUNNING forever.  ``ran_on_runner_id`` is the authoritative claim
+    record; never use the dispatch-only ``runner_target_id`` pin here.
+    """
+    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    candidates = (
+        await session.execute(
+            select(ComputeJob.id, ComputeJob.ran_on_runner_id)
+            .join(LocalRunner, LocalRunner.id == ComputeJob.ran_on_runner_id)
+            .where(
+                ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+                ComputeJob.status.in_(
+                    [ComputeJobStatus.STARTING, ComputeJobStatus.RUNNING]
+                ),
+                or_(
+                    LocalRunner.last_seen_at.is_(None),
+                    LocalRunner.last_seen_at < liveness_cutoff,
+                ),
+            )
+        )
+    ).all()
+
+    finalized = 0
+    for job_id, runner_id in candidates:
+        if runner_id is not None and await finalize_runner_subprocess_job_for_dead_runner(
+            session_factory,
+            job_id,
+            runner_id=runner_id,
+            liveness_cutoff=liveness_cutoff,
+            now=now,
+        ):
+            finalized += 1
+    if finalized:
+        logger.warning(
+            "[REAPER] finalized %d stranded runner-subprocess compute job(s)",
+            finalized,
+        )
+    return finalized
+
+
+# How old a completed ComputeJob must be before its viewable artifacts are reaped.
+VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
+
+
+async def sweep_retire_viewable_artifacts(
+    session,
+    *,
+    retention_days: int = VIEWABLE_ARTIFACT_RETENTION_DAYS,
+    batch_size: int = 100,
+) -> int:
+    """Step 23: Delete viewable GCS objects and their ComputeJobFile rows for
+    completed jobs older than ``retention_days`` (default 180).
+
+    Viewable objects at ``compute-jobs/<uuid>/artifacts/viewable/`` are
+    intentionally excluded from the GCS bucket lifecycle rules (which only
+    cover ``.tar.gz`` bundles and ``tasks/`` payloads).  This sweep is their
+    sole reaper: once the owning ComputeJob has been terminal for the full
+    retention window the object is deleted best-effort and the row removed.
+
+    At most ``batch_size`` files are processed per call to bound GCS call
+    volume.  Returns the number of ComputeJobFile rows deleted.
+    """
+    cutoff = _utcnow() - timedelta(days=max(1, int(retention_days)))
+
+    old_job_ids = (
+        select(ComputeJob.id)
+        .where(
+            ComputeJob.completed_at.is_not(None),
+            ComputeJob.completed_at < cutoff,
+        )
+        .scalar_subquery()
+    )
+
+    rows = (
+        await session.execute(
+            select(ComputeJobFile)
+            .where(ComputeJobFile.compute_job_id.in_(old_job_ids))
+            .order_by(ComputeJobFile.id.asc())
+            .limit(max(1, min(int(batch_size), 500)))
+            .with_for_update(skip_locked=True)
+        )
+    ).scalars().all()
+
+    if not rows:
+        return 0
+
+    deleted_flags = await asyncio.gather(
+        *(delete_storage_uri_best_effort(row.storage_uri) for row in rows)
+    )
+
+    removed = 0
+    for row, ok in zip(rows, deleted_flags, strict=True):
+        if ok:
+            await session.delete(row)
+            removed += 1
+    if removed:
+        await session.commit()
+        logger.info(
+            "[REAPER] Retired %d viewable artifact file(s) older than %d days",
+            removed,
+            retention_days,
+        )
+    else:
+        await session.rollback()
+    return removed
 
 
 __all__ = [
@@ -1918,6 +3312,7 @@ __all__ = [
     "_event_driven_unblock_project",
     "event_driven_unblock_dependents",
     "event_driven_unblock_on_knowledge",
+    "event_driven_unblock_on_capability_proof",
     # Re-exported from app.blocked_task_unblock_sweeps (helpers)
     "_apply_needs_disposition",
     "_blocked_precondition_state",
@@ -1936,10 +3331,23 @@ __all__ = [
     "get_wake_delivery_stall_cycles",
     "reset_wake_delivery_stall_state",
     "sweep_converge_linked_bug_messages",
+    "sweep_decay_stale_open_bug_messages",
+    "sweep_decay_stale_unlinked_blocker_messages",
+    "STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS",
     "sweep_deliver_task_wakes",
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",
+    "sweep_resolve_linked_messages",
+    "sweep_decay_stale_open_messages",
+    "STALE_OPEN_DECAY_DAYS",
+    "STALE_OPEN_BUG_CLASS_DECAY_DAYS",
+    "STALE_QUESTION_DECAY_DAYS",
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
+    "sweep_refresh_project_compute_images",
+    "sweep_silent_runner_compute_jobs",
+    "sweep_stranded_runner_subprocess_compute_jobs",
+    "VIEWABLE_ARTIFACT_RETENTION_DAYS",
+    "sweep_retire_viewable_artifacts",
 ]

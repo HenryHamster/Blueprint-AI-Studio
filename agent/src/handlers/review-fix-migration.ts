@@ -77,9 +77,9 @@ export function buildReservedRevisionGuidance(
   schemaRevisionConst: string = 'EXPECTED_SCHEMA_REVISION',
 ): string {
   const dir = versionsDir.endsWith('/') ? versionsDir : `${versionsDir}/`;
-  const downLine = res.provisionalDownRevision
-    ? `- Set \`down_revision = "${res.provisionalDownRevision}"\` so the chain stays linear.\n`
-    : `- Set \`down_revision\` to the current chain head so the chain stays linear.\n`;
+  const advisoryLine = res.provisionalDownRevision
+    ? ` The reservation's advisory parent is \`${res.provisionalDownRevision}\`; use it only if the actual head cannot be determined.\n`
+    : '\n';
   const schemaStep = schemaRevisionFile !== ''
     ? `- Set \`${schemaRevisionConst} = "${res.provisionalRevision}"\` in ${schemaRevisionFile} (it MUST match the reserved revision).\n`
     : '';
@@ -91,11 +91,11 @@ export function buildReservedRevisionGuidance(
     `--autogenerate\` to pick the id:\n` +
     `- Name the migration file \`${dir}${res.provisionalRevision}_<short_description>.py\`.\n` +
     `- Set \`revision = "${res.provisionalRevision}"\` inside it.\n` +
-    downLine +
+    `- Immediately before authoring, derive the actual pre-new-migration chain head from this freshly cloned/rebased checkout (for example, run \`alembic heads\` from the Alembic directory and inspect the migration it reports). Set \`down_revision\` to that actual head — never copy an advisory parent when it disagrees.${advisoryLine}` +
+    `- Before writing, fail safely rather than opening a broken PR if the reserved id already exists in the checkout's pre-existing migration chain, or if both ids are numeric and \`${res.provisionalRevision}\` is not greater than the actual head. Report the conflict; do not renumber the reservation or edit an applied migration.\n` +
     schemaStep +
     `If autogenerate emitted a different id, rename the file and edit the ` +
-    `\`revision\` string to "${res.provisionalRevision}". The reserved id is ` +
-    `linearized against production at merge time.\n\n`
+    `\`revision\` string to "${res.provisionalRevision}". The reservation fixes only the new revision id; its parent must be derived from the checkout immediately before authoring.\n\n`
   );
 }
 
@@ -106,7 +106,7 @@ export function buildMigrationConflictGuidance(
   schemaRevisionConst: string = 'EXPECTED_SCHEMA_REVISION',
   reserved: ReservedMigrationRevision | null = null,
 ): string {
-  if (!c.detected) return '';
+  if (!c.detected && (!reserved || c.prMigrations.length === 0)) return '';
   // When a revision id was reserved up-front, consume it verbatim rather than
   // recomputing max+1 against the (now-advanced) base chain. Merge-time
   // finalization linearizes the reserved id against production, so the agent
@@ -118,19 +118,21 @@ export function buildMigrationConflictGuidance(
     const prDescMatch = prBase.match(/^\d+_(.+)\.py$/);
     const prDesc = prDescMatch ? prDescMatch[1] : '<description>';
     const schemaStep = schemaRevisionFile !== ''
-      ? `4. Set \`${schemaRevisionConst} = "${reserved.provisionalRevision}"\` in ${schemaRevisionFile}.\n`
+      ? `- Set \`${schemaRevisionConst} = "${reserved.provisionalRevision}"\` in ${schemaRevisionFile}.\n`
       : '';
     return (
-      `## Migration revision conflict (reserved revision)\n` +
+      `## Migration revision repair (reserved revision)\n` +
       `This PR adds alembic migration file(s):\n${c.prMigrations.map(f => `  - ${f}`).join('\n')}\n` +
-      `The base branch gained migration file(s) since this PR branched:\n` +
-      `${c.baseNewMigrations.map(f => `  - ${f}`).join('\n')}\n\n` +
+      (c.baseNewMigrations.length
+        ? `The base branch gained migration file(s) since this PR branched:\n${c.baseNewMigrations.map(f => `  - ${f}`).join('\n')}\n\n`
+        : `This reserved migration must still be repaired against the current base ref, even though filename conflict detection found no newer numeric file.\n\n`) +
       `A revision id was RESERVED for this task — use it VERBATIM, do NOT derive max+1:\n` +
       `1. Rename this PR's migration to ${dir}${reserved.provisionalRevision}_${prDesc}.py and set \`revision = "${reserved.provisionalRevision}"\` inside it.\n` +
-      `2. Set \`down_revision = "${reserved.provisionalDownRevision}"\` so the chain is linear.\n` +
-      `3. Do NOT edit existing migration files in ${dir}.\n` +
+      `2. Derive the actual pre-PR chain head from the current base ref, not this PR's already-branched migration (use a base-ref worktree or inspect the base-ref migration tree). Set \`down_revision\` to that base head. The advisory parent \`${reserved.provisionalDownRevision}\` is fallback-only and MUST NOT win when it disagrees with that head.\n` +
+      `3. Fail safely if the reserved id already exists on the base ref, or if both ids are numeric and \`${reserved.provisionalRevision}\` is not greater than the base head. Do not renumber the reservation or edit an applied migration.\n` +
+      `- Do NOT edit existing migration files in ${dir}.\n` +
       schemaStep +
-      `The reserved id is linearized against production at merge time.\n\n`
+      `The reserved id is preserved verbatim; only its stale parent is repaired against the current base ref.\n\n`
     );
   }
   const latestBase = [...c.baseNewMigrations].sort().pop() || '';

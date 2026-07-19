@@ -544,6 +544,19 @@ AGENT_SERVICE_ACCOUNT_EMAIL = os.getenv(
     "vpm-worker@your-gcp-project-id.iam.gserviceaccount.com",
 )
 
+# Leaf identity for throwaway compute-image builder VMs (infra/terraform/iam.tf:
+# google_service_account.image_builder_sa). Its ONLY grant is Artifact Registry
+# writer+reader on the compute-images repo — no orchestrator, GitHub, LLM, or
+# runner credentials are reachable from it. The orchestrator SA holds
+# roles/iam.serviceAccountUser on it so it can attach it to a builder VM without
+# ever handing that VM the orchestrator's own identity. An off-orchestrator,
+# repo-controlled (untrusted) ``docker build`` runs under THIS identity, never
+# AGENT_SERVICE_ACCOUNT_EMAIL.
+IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL = os.getenv(
+    "IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL",
+    "image-builder-sa@your-gcp-project-id.iam.gserviceaccount.com",
+)
+
 # Agent source directory for local mode
 AGENT_DIR = os.getenv(
     "AGENT_DIR", os.path.join(os.path.dirname(__file__), "..", "..", "agent")
@@ -1921,6 +1934,7 @@ async def _provision_gcp(
     machine_type: str | None = None,
     accelerator: str | None = None,
     accelerator_count: int = 1,
+    service_account_email: str | None = None,
 ):
     """Provision a GCP VM. When ``startup_script_override`` is provided it is used
     verbatim as the instance startup-script (the taskless warm-pool path passes
@@ -2055,7 +2069,10 @@ async def _provision_gcp(
     instance_config.metadata = metadata
 
     service_account = compute_v1.ServiceAccount()
-    service_account.email = AGENT_SERVICE_ACCOUNT_EMAIL
+    # A caller may attach a narrower leaf identity (e.g. the image-builder SA for
+    # an untrusted off-orchestrator docker build) instead of the orchestrator's
+    # own agent SA. Absent ⇒ the agent SA, unchanged for every existing caller.
+    service_account.email = service_account_email or AGENT_SERVICE_ACCOUNT_EMAIL
     # Security note: cloud-platform is the ONLY OAuth2 scope that covers Secret Manager.
     # There is no narrower secretmanager-specific scope. The actual security boundary is
     # the agent SA's IAM bindings (see infra/terraform/iam.tf):
@@ -2601,6 +2618,7 @@ async def provision_ephemeral_vm(
     provisioning_model: str | None = None,
     accelerator: str | None = None,
     accelerator_count: int = 1,
+    service_account_email: str | None = None,
 ) -> bool:
     """Provision a non-agent VM that runs a caller-supplied startup script.
 
@@ -2610,6 +2628,10 @@ async def provision_ephemeral_vm(
     (a supported single-GPU short name or GCP type string) the VM is provisioned
     as a GPU instance — GPU-availability zones, guest accelerator, driver image,
     and TERMINATE host-maintenance — instead of a plain CPU VM.
+
+    ``service_account_email`` attaches a narrower leaf identity to the VM (e.g.
+    the image-builder SA for an untrusted off-orchestrator docker build). Absent
+    ⇒ the orchestrator agent SA, unchanged for every existing caller.
     """
     _ensure_image_family_valid()
     if accelerator is not None:
@@ -2626,6 +2648,7 @@ async def provision_ephemeral_vm(
         machine_type=machine_type,
         accelerator=accelerator,
         accelerator_count=accelerator_count,
+        service_account_email=service_account_email,
     )
 
 

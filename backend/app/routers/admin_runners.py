@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import _get_user_project_with_role
@@ -24,11 +24,19 @@ from app.models import (
     ComputeJob,
     ComputeJobStatus,
     LocalRunner,
+    Project,
     RunnerHeartbeatSnapshot,
     Task,
     TASK_OUTCOME_TERMINAL_STATUSES,
     TaskStatus,
     _utcnow,
+)
+from app.runner_project_binding import (
+    add_binding,
+    allowed_project_ids_by_runner,
+    bound_project_ids,
+    remove_binding,
+    runner_allowed_for_project,
 )
 from app.runner_config import (
     GPU_INDICES_ALL,
@@ -36,9 +44,10 @@ from app.runner_config import (
     GPUS_PER_JOB_MIN,
     config_generation,
     live_safe_config,
+    live_safe_config_generation,
 )
 from app.schemas import redact_command_log_text
-from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
+from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, TaskType
 from app.vm_cost_rates import AcceleratorRejection, get_compute_rate_per_second
 from app.workbench_events import (
     SURFACE_RUNTIME,
@@ -72,7 +81,7 @@ _SUCCESS_STALE_SECONDS = 1800  # 30 min
 _LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 # Advisory low-memory flag (does not by itself degrade a runner).
 _LOW_MEMORY_FREE_BYTES = 512 * 1024 * 1024  # 512 MiB
-_STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
+_STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
 # Max chars of command-log tail surfaced inline on a failed recent-outcome row.
 # Kept small so the per-runner stats payload stays lean — operators wanting the
@@ -83,14 +92,21 @@ _COMMAND_LOG_TAIL_MAX_CHARS = 2000
 def _command_log_tail(polling_metadata: Dict[str, Any] | None) -> str | None:
     """Extract a bounded, credential-redacted tail of a job's command log.
 
-    Reads ``polling_metadata["command_log"]["text"]`` (the runner-captured
-    stdout/stderr marker), applies the shared credential redactor, and returns
-    the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters. Returns ``None`` when
-    the log is absent, malformed, or empty so success/legacy rows stay lean.
+    Reads the terminal command-log text, applies the shared credential
+    redactor, and returns the last ``_COMMAND_LOG_TAIL_MAX_CHARS`` characters.
+    Two backends stamp the terminal log under different keys: managed/cloud
+    jobs use ``polling_metadata["command_log"]`` while runner-subprocess jobs
+    use ``polling_metadata["runner_command_log"]`` (see
+    ``runner.report_compute_job``). Prefer the cloud key, then fall back to the
+    runner key so runner-subprocess failures surface a tail too. Returns
+    ``None`` when neither log is present, malformed, or empty so success/legacy
+    rows stay lean.
     """
     if not isinstance(polling_metadata, dict):
         return None
     command_log = polling_metadata.get("command_log")
+    if not isinstance(command_log, dict):
+        command_log = polling_metadata.get("runner_command_log")
     if not isinstance(command_log, dict):
         return None
     text = command_log.get("text")
@@ -515,6 +531,17 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     is what the daemon last reported having in effect (None until it reports).
     ``config_pending`` is True whenever the two generations differ — including the
     "never reported" case, so an old/silent daemon reads as pending, not applied.
+
+    ``desired_changed_at`` is when the live-safe desired config last actually
+    changed (stamped by the operator PATCH / registration baseline). Paired with
+    the runner's ``last_seen_at``, it lets the Fleet UI bound how long a push has
+    been pending and surface a STUCK state instead of eternal "applying".
+    ``daemon_reports_applied`` says whether the daemon has EVER echoed an applied
+    generation at all — this distinguishes a daemon too old to speak the
+    live-config contract (never reports → False) from one that reported a
+    stale/rejected generation (True but non-converged). Both keys are additive and
+    tolerant of legacy caps: a runner enrolled before the stamp existed simply has
+    ``desired_changed_at = None`` (unknown, never a hard failure).
     """
     caps = capabilities or {}
     desired = live_safe_config(caps)
@@ -522,12 +549,46 @@ def _runner_config_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
     applied_generation = caps.get("applied_config_generation")
     if not isinstance(applied_generation, str):
         applied_generation = None
+    desired_changed_at = caps.get("live_config_changed_at")
+    if not isinstance(desired_changed_at, str):
+        desired_changed_at = None
+    # Structured config-apply outcome (additive, tolerant of legacy caps). The
+    # daemon-reported reason is only LIVE when the rejected generation matches the
+    # currently-desired generation — a reason tied to a superseded generation is
+    # stale (the operator has since changed the desired config) and must not be
+    # shown as the current failure. An older daemon reports none of these → None.
+    apply_status = caps.get("config_apply_status")
+    if not isinstance(apply_status, str):
+        apply_status = None
+    rejected_generation = caps.get("config_rejected_generation")
+    if not isinstance(rejected_generation, str):
+        rejected_generation = None
+    raw_reason = caps.get("config_apply_reason")
+    if not isinstance(raw_reason, str):
+        raw_reason = None
+    # Suppress a stale reason whose rejected generation no longer matches desired.
+    is_live_reason = bool(raw_reason) and rejected_generation == desired_generation
+    apply_reason = raw_reason if is_live_reason else None
+    # The offending field name(s) as a structured list, surfaced under the SAME
+    # live/stale discipline as the reason — a field list tied to a superseded
+    # generation is suppressed alongside its reason.
+    config_rejected_fields = None
+    if is_live_reason:
+        stored_fields = caps.get("config_rejected_fields")
+        if isinstance(stored_fields, list):
+            config_rejected_fields = [str(f) for f in stored_fields]
     return {
         "desired": desired,
         "config_generation": desired_generation,
         "applied": caps.get("applied_config"),
         "applied_config_generation": applied_generation,
         "config_pending": applied_generation != desired_generation,
+        "desired_changed_at": desired_changed_at,
+        "daemon_reports_applied": applied_generation is not None,
+        "apply_status": apply_status,
+        "apply_reason": apply_reason,
+        "rejected_config_generation": rejected_generation,
+        "config_rejected_fields": config_rejected_fields,
         "gpu_indices_allowed": desired["gpu_indices_allowed"],
         "gpus_per_job": desired["gpus_per_job"],
     }
@@ -542,6 +603,9 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
     )
     return {
         "id": str(runner.id),
+        # Lifecycle and config mutations remain anchored to the enrollment
+        # project even when a bound project is displaying this runner.
+        "enrollment_project_id": str(runner.project_id),
         "hostname": runner.hostname,
         "version": runner.version,
         "status": runner.status,
@@ -553,6 +617,10 @@ def _runner_view(runner: LocalRunner) -> Dict[str, Any]:
         ),
         "created_at": runner.created_at.isoformat() if runner.created_at else None,
         "token_age_days": token_age_days,
+        "current_token_heartbeat_confirmed": bool(
+            runner.last_heartbeat_token_generation > 0
+            and runner.last_heartbeat_token_generation == runner.token_generation
+        ),
     }
 
 
@@ -575,6 +643,11 @@ async def register_runner(
         capabilities = _normalize_capabilities(payload.capabilities, payload.preset)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Baseline stamp for the desired live-safe config so the Fleet UI can bound how
+    # long the first push has been pending (relative to enrollment) rather than
+    # reading "just changed" forever for a runner that never phones home.
+    capabilities["live_config_changed_at"] = _utcnow().isoformat()
 
     runner = LocalRunner(
         project_id=project_id,
@@ -645,6 +718,11 @@ async def update_runner_capabilities(
 
     # Start from existing capabilities so runner-reported fields survive.
     caps = dict(runner.capabilities or {})
+    # Snapshot the live-safe generation BEFORE the mutation so we can tell a
+    # real config change from a no-op PATCH (same values re-submitted). Only a
+    # real change re-stamps ``live_config_changed_at`` — a no-op must not reset
+    # the pending-window clock, or the STUCK timeout would never fire.
+    generation_before = live_safe_config_generation(caps)
 
     # Detect strategic workload: strategic preset or workload pins concurrency.
     is_strategic = caps.get("runner_preset") in (
@@ -682,6 +760,12 @@ async def update_runner_capabilities(
             caps["gpus_per_job"] = _normalize_gpus_per_job(payload.gpus_per_job)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # Stamp the desired-config change time only when the live-safe generation
+    # actually moved. A no-op PATCH leaves the existing stamp (and thus the
+    # pending-window clock) untouched.
+    if live_safe_config_generation(caps) != generation_before:
+        caps["live_config_changed_at"] = _utcnow().isoformat()
 
     runner.capabilities = caps
     session.add(runner)
@@ -803,7 +887,7 @@ async def list_runners(
     query = (
         select(LocalRunner)
         .where(
-            LocalRunner.project_id == project_id,
+            runner_allowed_for_project(project_id),
             LocalRunner.status != "deleted",
         )
         .order_by(LocalRunner.created_at.desc())
@@ -846,13 +930,12 @@ async def runner_telemetry(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    # 404 on a runner that is not this project's, so telemetry can't be read
-    # cross-project even though snapshots carry no project_id of their own.
+    # 404 if the runner is not reachable from this project (enrollment or allow-list).
     runner = (
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
@@ -904,7 +987,7 @@ async def runner_stats(
         await session.execute(
             select(LocalRunner).where(
                 LocalRunner.id == runner_id,
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
             )
         )
     ).scalars().first()
@@ -919,8 +1002,12 @@ async def runner_stats(
     }
 
     runner_id_str = str(runner_id)
-    pin_condition = ComputeJob.polling_metadata["runner_target_id"].as_string() == runner_id_str
-    base_filter = [ComputeJob.project_id == project_id, pin_condition]
+    pin_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    attribution_condition = or_(
+        ComputeJob.ran_on_runner_id == runner_id,
+        and_(ComputeJob.ran_on_runner_id.is_(None), pin_expr == runner_id_str),
+    )
+    base_filter = [ComputeJob.project_id == project_id, attribution_condition]
 
     # Aggregate counts via SQL — avoids loading every row into Python memory
     total_result = await session.execute(
@@ -1115,7 +1202,9 @@ async def rotate_runner_token(
 
     token = create_runner_token(runner.id)
     runner.token_hash = hash_runner_token(token)
-    runner.token_created_at = _utcnow()
+    rotated_at = _utcnow()
+    runner.token_created_at = rotated_at
+    runner.token_generation = max(1, runner.token_generation) + 1
     summary_status = runner.status
     summary_hostname = runner.hostname
     session.add(runner)
@@ -1138,7 +1227,11 @@ async def rotate_runner_token(
             "hostname": summary_hostname,
         },
     )
-    return {"runner_id": str(runner_id), "token": token}
+    return {
+        "runner_id": str(runner_id),
+        "token": token,
+        "rotated_at": f"{rotated_at.isoformat()}Z",
+    }
 
 
 async def _release_unpulled_runner_pins(
@@ -1236,6 +1329,194 @@ async def delete_runner(
     }
 
 
+class RunnerProjectBindingAddRequest(BaseModel):
+    """Request body for POST /projects/../runners/../projects (add allow-list grant)."""
+    project_id: uuid.UUID
+
+
+async def _load_owned_runner(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    user_id: str,
+    *,
+    for_update: bool = False,
+) -> "tuple[Project, LocalRunner]":
+    """Load a runner scoped to its ENROLLMENT project, owner-gated.
+
+    ``project_id`` is the runner's enrollment project (``LocalRunner.project_id``),
+    matching every other runner endpoint in this module. Requires the caller to be
+    OWNER of that enrollment project — i.e. owner of the runner itself, the
+    authorization boundary the allow-list endpoints protect. Raises 404 for a
+    missing/deleted runner or a runner not enrolled in ``project_id``.
+    """
+    enrollment_project = await _get_user_project_with_role(
+        project_id, user_id, session, "owner"
+    )
+    query = select(LocalRunner).where(
+        LocalRunner.id == runner_id,
+        LocalRunner.project_id == project_id,
+    )
+    if for_update:
+        query = query.with_for_update()
+    runner = (await session.execute(query)).scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+    return enrollment_project, runner
+
+
+async def _runner_projects_view(
+    session: AsyncSession, runner: LocalRunner
+) -> Dict[str, Any]:
+    """Serialize a runner's project allow-list (enrollment anchor + bindings)."""
+    bound = await bound_project_ids(session, runner.id)
+    allowed = bound | {runner.project_id}
+    return {
+        "runner_id": str(runner.id),
+        "enrollment_project_id": str(runner.project_id),
+        "projects": [
+            {
+                "project_id": str(pid),
+                "is_enrollment": pid == runner.project_id,
+            }
+            # Enrollment anchor first, then the rest by stable id order.
+            for pid in sorted(
+                allowed, key=lambda p: (p != runner.project_id, str(p))
+            )
+        ],
+    }
+
+
+@router.get("/projects/{project_id}/runners/{runner_id}/projects")
+async def list_runner_projects(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """List the projects a runner is allowed to serve (owner-gated).
+
+    Returns the enrollment project (implicit anchor) UNIONed with every explicit
+    ``runner_project_binding`` grant. Requires owner on the enrollment project.
+    """
+    _enrollment, runner = await _load_owned_runner(
+        session, project_id, runner_id, current_user["user_id"]
+    )
+    return await _runner_projects_view(session, runner)
+
+
+@router.post("/projects/{project_id}/runners/{runner_id}/projects")
+async def add_runner_project(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    payload: RunnerProjectBindingAddRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Add a project to a runner's allow-list so the daemon also serves it.
+
+    Authorization (server-enforced security boundary):
+      * caller must be OWNER of the runner (owner of its enrollment project);
+      * caller must ALSO be OWNER of the project being added; and
+      * that project must be owned by the SAME account as the runner
+        (``Project.user_id`` must match) — the MVP consent model. Attaching a
+        project owned by a DIFFERENT account is rejected 403; a full cross-account
+        consent handshake is out of MVP scope.
+    """
+    user_id = current_user["user_id"]
+    enrollment_project, runner = await _load_owned_runner(
+        session, project_id, runner_id, user_id, for_update=True
+    )
+    # Caller must own the project being added (404 if not even a member).
+    target_project = await _get_user_project_with_role(
+        payload.project_id, user_id, session, "owner"
+    )
+    # No silent cross-account attach: the added project must belong to the same
+    # account that owns the runner (its enrollment project's account).
+    if target_project.user_id != enrollment_project.user_id:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "cannot attach a project owned by a different account to this "
+                "runner (same-owner is the MVP consent model)"
+            ),
+        )
+
+    await add_binding(session, runner.id, payload.project_id)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Added project %s to runner %s allow-list (enrollment project %s)",
+        payload.project_id,
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="allow_list_updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+            "added_project_id": str(payload.project_id),
+        },
+    )
+    return await _runner_projects_view(session, runner)
+
+
+@router.delete("/projects/{project_id}/runners/{runner_id}/projects/{added_project_id}")
+async def remove_runner_project(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    added_project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Remove a project from a runner's allow-list (owner-gated).
+
+    The enrollment project (``LocalRunner.project_id``) is the anchor member and
+    may NOT be removed — attempting to remove it is rejected 409. Removing a
+    project that is not currently bound is an idempotent no-op. Requires owner on
+    the enrollment project (owner of the runner).
+    """
+    _enrollment, runner = await _load_owned_runner(
+        session, project_id, runner_id, current_user["user_id"], for_update=True
+    )
+    if added_project_id == runner.project_id:
+        raise HTTPException(
+            status_code=409,
+            detail="the enrollment project cannot be removed from the allow-list",
+        )
+
+    removed = await remove_binding(session, runner.id, added_project_id)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Removed project %s from runner %s allow-list (removed=%s)",
+        added_project_id,
+        runner_id,
+        removed,
+    )
+    if removed:
+        await emit_workbench_refetch(
+            project_id,
+            resource="local_runner",
+            action="allow_list_updated",
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+            summary_key="runner",
+            summary={
+                "id": str(runner_id),
+                "status": runner.status,
+                "hostname": runner.hostname,
+                "removed_project_id": str(added_project_id),
+            },
+        )
+    return await _runner_projects_view(session, runner)
+
+
 @router.get("/fleet/runners/health-summary")
 async def fleet_runners_health_summary(
     session: AsyncSession = Depends(get_session),
@@ -1268,10 +1549,11 @@ async def fleet_runners_health_summary(
             _MAX_HEALTH_RUNNERS,
         )
 
+    memberships = await allowed_project_ids_by_runner(session, all_runners)
     per_project: Dict[str, List[LocalRunner]] = {}
     for runner in all_runners:
-        pid = str(runner.project_id)
-        per_project.setdefault(pid, []).append(runner)
+        for allowed_project_id in memberships[runner.id]:
+            per_project.setdefault(str(allowed_project_id), []).append(runner)
 
     fleet = {
         "total": 0,
@@ -1314,10 +1596,20 @@ async def fleet_runners_health_summary(
             if view["health"].get("memory_low"):
                 entry["low_memory"] += 1
 
-        for key in ("total", "connected", "degraded", "stale", "offline", "low_disk", "low_memory"):
-            fleet[key] += entry[key]
-
         per_project_entries.append(entry)
+
+    # Fleet totals count physical devices once; the project breakdown above
+    # intentionally includes a shared runner in every allowed project.
+    for runner in all_runners:
+        view = _runner_view(runner)
+        fleet["total"] += 1
+        status = view["health"]["device_status"]
+        if status in fleet:
+            fleet[status] += 1
+        if view["health"].get("disk_low"):
+            fleet["low_disk"] += 1
+        if view["health"].get("memory_low"):
+            fleet["low_memory"] += 1
 
     fleet["per_project"] = per_project_entries
     fleet["generated_at"] = now.isoformat()

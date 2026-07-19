@@ -183,6 +183,7 @@ import {
   resolveMigrationLayout,
   isRepoBootstrapOverview,
   isCommandMemoryOutcome,
+  assembleRepoBootstrapPrompt,
 } from './specialized.js';
 import {
   persistAndPostStatus, readHandlerOutput, runClaudeCode,
@@ -192,7 +193,7 @@ import { resolveBuildConfig } from '../build-config.js';
 import { runCodeChangeTask } from './code-change.js';
 import { execFileSync } from 'child_process';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
-import { PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
+import { PARALLEL_AUDIT_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE, buildContextPrefix } from '../prompt.js';
 import { recordFormatMiss, recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 
@@ -324,6 +325,52 @@ describe('handleSmoketest — URL health checks', () => {
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
     expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
+  });
+
+  it('folds candidate env-preflight evidence into SMOKETEST_RESULT on success', async () => {
+    const smoketestResult = { passed: true, tests: [{ name: 'startup', status: 'pass', message: '' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    const preflight = {
+      required_env: [{ name: 'GITHUB_PAT_ENCRYPTION_KEY', scope: 'cloud_run' }],
+      startup_check_names: ['python3 -c "import app.main"'],
+      manifest_source: 'backend/app/required_runtime_env.py',
+    };
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'python3' && Array.isArray(argsArr) && argsArr.includes('app.env_preflight_evidence')) {
+        return JSON.stringify(preflight);
+      }
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; env_preflight?: unknown };
+    expect(stored.env_preflight).toEqual(preflight);
+    expect(stored.passed).toBe(true);
+  });
+
+  it('does not change passed and still persists SMOKETEST_RESULT when env-preflight subprocess fails', async () => {
+    const smoketestResult = { passed: true, tests: [{ name: 'startup', status: 'pass', message: '' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    vi.mocked(execFileSync).mockImplementation((cmd: unknown, args: unknown) => {
+      const argsArr = args as string[];
+      if (cmd === 'python3' && Array.isArray(argsArr) && argsArr.includes('app.env_preflight_evidence')) {
+        throw new Error('module import failed');
+      }
+      return Buffer.from('');
+    });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    const stored = JSON.parse(call.logs as string) as { passed: boolean; env_preflight?: unknown; env_preflight_error?: string };
+    expect(stored.passed).toBe(true);
+    expect(stored.env_preflight).toBeUndefined();
+    expect(stored.env_preflight_error).toBeTruthy();
   });
 
   it('reports FAILED when smoketestResult.passed is false', async () => {
@@ -1155,10 +1202,15 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
   });
 
   it('delegates to runCodeChangeTask with the right opts when prompt is provided', async () => {
+    const taskCapability = { agent_mode: 'write', run_shape: 'workflow', output_kind: 'pr' };
+    const buildConfig = {
+      directories: [{ path: 'backend', type: 'python' }],
+    };
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(buildConfig);
     await handleMigrate(
       TASK_ID,
       { ...BASE_PAYLOAD, prompt: 'Add user_role column' },
-      BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
+      { ...BASE_TASK, task_capability: taskCapability }, GH_TOKEN, OWNER, REPO, WS, STATUS_REF(),
     );
 
     expect(vi.mocked(runCodeChangeTask)).toHaveBeenCalledTimes(1);
@@ -1172,6 +1224,8 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     expect(opts.workBranch).toBe('blueprint/migrate-taskabc1');
     expect(opts.baseCommit).toBe('abc1234567');
     expect(opts.noChangesMessage).toBe('No migration changes generated.');
+    expect(opts.buildConfig).toBe(buildConfig);
+    expect(opts.taskCapability).toBe(taskCapability);
   });
 
   it('prepends the acceptance-evidence block when declared', async () => {
@@ -1411,7 +1465,9 @@ describe('handleMigrate — stale-branch handling and runCodeChangeTask delegati
     const prompt = capturedMigratePrompt();
     expect(prompt).toContain('Reserved migration revision');
     expect(prompt).toContain('revision = "0153"');
-    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('actual pre-new-migration chain head');
+    expect(prompt).toContain('advisory parent is `0151`; use it only if the actual head cannot be determined');
+    expect(prompt).not.toContain('down_revision = "0151"');
     expect(prompt).toContain('0153_<short_description>.py');
     expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
   });
@@ -2110,6 +2166,109 @@ describe('specialized handler task-specific content contracts', () => {
       const p = vi.mocked(runClaudeCode).mock.calls[0][0];
       expect(p).toContain(`/tmp/command_memory_${TASK_ID}.json`);
       expect(p).toContain('success | missing_commands | writeback_failed');
+    });
+
+    // ── Cache-optimized prompt prefix (v24 cost lever, direction d-27685510) ──
+    // The repo-bootstrap prompt must lead with stable literal/config guidance so
+    // the automatically-cacheable prefix (Anthropic prefix-cache reads bill at
+    // ~10% of base input) is maximized. Two builds of an identical payload but
+    // different wall-clock / git HEAD must produce a BYTE-IDENTICAL stable prefix;
+    // task-variable content (contextSection, retryContext) lives in a contiguous
+    // trailing tail. Mirrors standard.test.ts's byte-identical-prefix pattern.
+    describe('assembleRepoBootstrapPrompt', () => {
+      const STABLE = {
+        bootstrapCoreBody: 'CORE_BOOTSTRAP_INSTRUCTIONS',
+        fetchGuidance: '## MID-RUN FETCH\nfetch-verbs\n',
+        claudeMdSection: '\n\n## Project Instructions (CLAUDE.md)\nBE CONSISTENT',
+        playbookNote: '\nNote: save setup knowledge\n',
+      } as const;
+
+      it('yields an identical stable prefix when only task-variable content changes (wall-clock/HEAD proxy)', () => {
+        const build1 = assembleRepoBootstrapPrompt({
+          ...STABLE,
+          contextSection: 'CTX_MARKER failed X (2 days ago)\n',
+          retryContext: '',
+        });
+        const build2 = assembleRepoBootstrapPrompt({
+          ...STABLE,
+          contextSection: 'CTX_MARKER failed X (9 days ago)\n',
+          retryContext: 'RETRY_DELTA HEAD def5678',
+        });
+        expect(build1.stablePrefix).toBe(build2.stablePrefix);
+        expect(build1.stablePrefix.length).toBeGreaterThan(0);
+        expect(build1.variableBody).not.toBe(build2.variableBody);
+      });
+
+      it('places every stable guidance constant strictly before any task-variable section', () => {
+        const { fullPrompt } = assembleRepoBootstrapPrompt({
+          ...STABLE,
+          contextSection: 'UNIQUE_CONTEXT_MARKER\n',
+          retryContext: 'RETRY_MARKER',
+        });
+        const firstVariableIdx = Math.min(
+          ...['UNIQUE_CONTEXT_MARKER', 'RETRY_MARKER']
+            .map((m) => fullPrompt.indexOf(m))
+            .filter((i) => i >= 0),
+        );
+        for (const stable of [
+          STABLE.bootstrapCoreBody,
+          DEFAULT_TOOL_GUIDANCE,
+          STABLE.fetchGuidance,
+          STABLE.claudeMdSection,
+          PLAYBOOK_GUIDANCE,
+          STABLE.playbookNote,
+        ]) {
+          const idx = fullPrompt.indexOf(stable);
+          expect(idx).toBeGreaterThanOrEqual(0);
+          expect(idx).toBeLessThan(firstVariableIdx);
+        }
+      });
+
+      it('preserves every sent section (byte-order change only, nothing dropped)', () => {
+        const { fullPrompt } = assembleRepoBootstrapPrompt({
+          ...STABLE,
+          contextSection: 'CTX',
+          retryContext: 'RETRY',
+        });
+        for (const piece of [
+          STABLE.bootstrapCoreBody, STABLE.fetchGuidance, STABLE.claudeMdSection,
+          STABLE.playbookNote, 'CTX', 'RETRY',
+          DEFAULT_TOOL_GUIDANCE, PLAYBOOK_GUIDANCE,
+        ]) {
+          expect(fullPrompt).toContain(piece);
+        }
+      });
+    });
+
+    it('handleRepoBootstrap leads with stable guidance and is byte-identical across wall-clock/HEAD', async () => {
+      vi.mocked(readHandlerOutput).mockReturnValue(null);
+      try {
+        // Build 1 — contextPrefix carries a wall-clock/HEAD-derived tail.
+        vi.mocked(buildContextPrefix).mockReturnValue('CTX_TAIL_MARKER failed X (2 days ago) HEAD aaaaaaaa');
+        await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+        const prompt1 = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+        // Build 2 — same payload, different wall-clock/HEAD-derived contextPrefix.
+        vi.mocked(runClaudeCode).mockClear();
+        vi.mocked(buildContextPrefix).mockReturnValue('CTX_TAIL_MARKER failed X (30 days ago) HEAD bbbbbbbb');
+        await handleRepoBootstrap(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+        const prompt2 = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+        // Stable guidance precedes the task-variable context marker...
+        const markerIdx1 = prompt1.indexOf('CTX_TAIL_MARKER');
+        expect(markerIdx1).toBeGreaterThan(0);
+        expect(prompt1.indexOf(DEFAULT_TOOL_GUIDANCE)).toBeGreaterThanOrEqual(0);
+        expect(prompt1.indexOf(DEFAULT_TOOL_GUIDANCE)).toBeLessThan(markerIdx1);
+        expect(prompt1.indexOf(PLAYBOOK_GUIDANCE)).toBeLessThan(markerIdx1);
+
+        // ...and the leading prefix is byte-identical across the two builds.
+        const prefix1 = prompt1.slice(0, markerIdx1);
+        const prefix2 = prompt2.slice(0, prompt2.indexOf('CTX_TAIL_MARKER'));
+        expect(prefix1.length).toBeGreaterThan(0);
+        expect(prefix1).toBe(prefix2);
+      } finally {
+        vi.mocked(buildContextPrefix).mockReturnValue('');
+      }
     });
   });
 

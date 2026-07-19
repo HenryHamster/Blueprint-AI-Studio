@@ -58,6 +58,24 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
+from app.strategic_resident_models import (  # noqa: F401
+    StrategicOperationApproval,
+    StrategicOperationReceipt,
+    StrategicResident,
+    StrategicResidentCheckpoint,
+    StrategicWorkerMemoryProposal,
+)
+from app.strategic_resident_sweep_models import (  # noqa: F401
+    StrategicResidentSweepState,
+)
+from app.strategic_resident_ordinary_task_events import (  # noqa: F401
+    StrategicResidentOrdinaryTaskTerminalEvent,
+    register_sqlite_ordinary_task_terminal_listener,
+)
+from app.strategic_resident_task_terminal_events import (  # noqa: F401
+    StrategicResidentTaskTerminalEvent,
+    register_sqlite_terminal_event_listener,
+)
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
@@ -446,6 +464,11 @@ class UserIntegration(SQLModel, table=True):
     # GitHub Fine-Grained Personal Access Token (Alternative to App Installation)
     github_pat: str | None = None
 
+    # Caller-scoped OAuth token, stored as an encrypted Secret Manager reference.
+    # Unlike an App installation token, this can prove what the linked GitHub
+    # user is allowed to do to a repository during self-service onboarding.
+    github_oauth_token: str | None = None
+
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False),
@@ -478,6 +501,14 @@ class Project(SQLModel, table=True):
     # between allowlist seeding and project creation that the bootstrap
     # flow doesn't otherwise need. Loose-coupled by design.
     user_id: str = Field(index=True)
+    # DEPRECATED: legacy finite-project lifecycle status (DRAFT/DEPLOYING/
+    # COMPLETED/FAILED/CANCELLED). Autonomous, long-lived projects are created
+    # DEPLOYING and never move, so this value is not a meaningful operator
+    # signal — use ``paused``/``archived`` instead. The all-terminal aggregation
+    # that used to auto-flip this to COMPLETED/FAILED has been removed; only the
+    # explicit /cancel path still writes CANCELLED (and dispatch/spawn gating
+    # reads it). The column is retained (and still returned in API responses)
+    # for backward compatibility; do not surface it as project state in new UI.
     status: ProjectStatus = Field(
         default=ProjectStatus.DRAFT,
         sa_column=Column(String, default=ProjectStatus.DRAFT),
@@ -1021,6 +1052,171 @@ class ProjectTool(SQLModel, table=True):
     )
 
 
+class ArtifactRef(SQLModel, table=True):
+    """Immutable, project-scoped snapshot of a human-authored tool revision."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(), ForeignKey("project.id", ondelete="CASCADE"), nullable=False
+        )
+    )
+    tool_id: uuid.UUID = Field(
+        sa_column=Column(GUID(), nullable=False)
+    )
+    kind: str = Field(sa_column=Column(String(32), nullable=False))
+    revision: int = Field(sa_column=Column(Integer, nullable=False))
+    checksum: str = Field(sa_column=Column(String(64), nullable=False))
+    author_user_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    content_snapshot: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    retrieval_metadata: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        CheckConstraint("kind IN ('notes','whiteboard')", name="chk_artifactref_kind"),
+        CheckConstraint("revision >= 0", name="chk_artifactref_revision_nonnegative"),
+        CheckConstraint("length(checksum) = 64", name="chk_artifactref_checksum_length"),
+        UniqueConstraint(
+            "project_id", "tool_id", "revision", name="uq_artifactref_project_tool_revision"
+        ),
+        Index("ix_artifactref_project_created", "project_id", "created_at"),
+        Index("ix_artifactref_tool_revision", "tool_id", "revision"),
+    )
+
+
+class ArtifactRefCleanupIntent(SQLModel, table=True):
+    """Durable, retryable cleanup for retained project-scoped render objects."""
+
+    project_id: uuid.UUID = Field(primary_key=True)
+    object_prefix: str = Field(sa_column=Column(Text, nullable=False))
+    state: str = Field(
+        default="pending",
+        sa_column=Column(String(24), nullable=False, server_default="pending"),
+    )
+    attempt_count: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default="0"),
+    )
+    next_attempt_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    lease_expires_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    claim_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True),
+    )
+    last_error: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    completed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('pending','processing','complete')",
+            name="chk_artifactrefcleanupintent_state",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="chk_artifactrefcleanupintent_attempt_nonnegative",
+        ),
+        Index(
+            "ix_artifactrefcleanupintent_due",
+            "state",
+            "next_attempt_at",
+        ),
+    )
+
+
+class ArtifactRefPromotionIntent(SQLModel, table=True):
+    """No-FK write-ahead record for one rendered ArtifactRef copy effect."""
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(index=False)
+    tool_id: uuid.UUID = Field(index=False)
+    revision: int = Field(sa_column=Column(Integer, nullable=False))
+    receipt_id: uuid.UUID = Field(index=False)
+    actor_user_id: str = Field(sa_column=Column(String(255), nullable=False))
+    source_storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    candidate_storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    expected_size_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    expected_sha256: str = Field(sa_column=Column(String(64), nullable=False))
+    render_width: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    render_height: int | None = Field(default=None, sa_column=Column(Integer, nullable=True))
+    state: str = Field(default="pending", sa_column=Column(String(24), nullable=False, server_default="pending"))
+    attempt_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    claim_id: uuid.UUID | None = Field(default=None, sa_column=Column(GUID(), nullable=True))
+    lease_expires_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    effect_deadline_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    settle_until: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+    next_attempt_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    destination_generation: int | None = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    settlement_absent_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
+    artifact_ref_id: uuid.UUID | None = Field(default=None, sa_column=Column(GUID(), nullable=True))
+    last_error: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    created_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    updated_at: datetime = Field(default_factory=_utcnow, sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()))
+    completed_at: datetime | None = Field(default=None, sa_column=Column(NaiveUTCDateTime, nullable=True))
+
+    __table_args__ = (
+        CheckConstraint("state IN ('pending','copying','promoted','owned','cleanup','cleanup_claimed','settled')", name="chk_artifactrefpromotionintent_state"),
+        CheckConstraint("revision >= 0", name="chk_artifactrefpromotionintent_revision"),
+        CheckConstraint("expected_size_bytes > 0", name="chk_artifactrefpromotionintent_size"),
+        CheckConstraint("length(expected_sha256) = 64", name="chk_artifactrefpromotionintent_checksum"),
+        CheckConstraint("attempt_count >= 0 AND settlement_absent_count >= 0", name="chk_artifactrefpromotionintent_counts"),
+        CheckConstraint(
+            "state != 'owned' OR (artifact_ref_id IS NOT NULL AND completed_at IS NOT NULL AND destination_generation IS NOT NULL)",
+            name="chk_artifactrefpromotionintent_owned",
+        ),
+        CheckConstraint(
+            "state NOT IN ('promoted','owned') OR destination_generation IS NOT NULL",
+            name="chk_artifactrefpromotionintent_generation",
+        ),
+        CheckConstraint(
+            "state NOT IN ('copying','promoted','cleanup_claimed') OR (claim_id IS NOT NULL AND lease_expires_at IS NOT NULL)",
+            name="chk_artifactrefpromotionintent_claim",
+        ),
+        CheckConstraint(
+            "state != 'copying' OR (effect_deadline_at IS NOT NULL AND settle_until IS NOT NULL AND settle_until >= effect_deadline_at)",
+            name="chk_artifactrefpromotionintent_effect_window",
+        ),
+        CheckConstraint(
+            "state != 'settled' OR completed_at IS NOT NULL",
+            name="chk_artifactrefpromotionintent_settled",
+        ),
+        UniqueConstraint("receipt_id", name="uq_artifactrefpromotionintent_receipt"),
+        Index("ix_artifactrefpromotionintent_due", "state", "next_attempt_at"),
+        Index("ix_artifactrefpromotionintent_project", "project_id", "state"),
+        Index("ix_artifactrefpromotionintent_logical_ref", "project_id", "tool_id", "revision"),
+    )
+
+
 class Task(SQLModel, table=True):
     """
     Extensible Task model. The 'payloads' JSONB column holds a flexible list
@@ -1056,6 +1252,19 @@ class Task(SQLModel, table=True):
     )  # Firebase UID of the user who launched this task (for launcher-pays billing)
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
+    )
+    strategic_operation_receipt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey(
+                "strategicoperationreceipt.id",
+                name="fk_task_strategic_operation_receipt",
+                ondelete="SET NULL",
+                use_alter=True,
+            ),
+            nullable=True,
+        ),
     )
     requires_approval: bool = Field(default=False)
     spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
@@ -1417,6 +1626,12 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
+        Index(
+            "ix_task_strategic_operation_receipt_id",
+            "strategic_operation_receipt_id",
+            postgresql_where=text("strategic_operation_receipt_id IS NOT NULL"),
+            sqlite_where=text("strategic_operation_receipt_id IS NOT NULL"),
+        ),
         Index(
             "ix_task_project_status_completed", "project_id", "status", "completed_at"
         ),
@@ -2099,8 +2314,12 @@ class ProjectComputeImage(SQLModel, table=True):
     mapping so a later trigger can record and re-read what was built without
     re-running the pipeline.
 
-    Additive and purely a record: nothing in dispatch reads it yet. Rows UPSERT
-    on ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
+    Additive record of what was built. Dispatch now reads it: when a
+    compute_experiment is dispatched with no explicit ``container_image``,
+    ``_dispatch_compute_experiment_directly`` resolves the project's manifest
+    default against this table (via ``resolve_digest_pinned_default_image``) to a
+    digest-pinned ref, matching the completion authoring path. Rows UPSERT on
+    ``(project_id, dep_hash)`` — repeated builds for the same dependency hash
     update the single row in place rather than accumulating duplicates.
     """
 
@@ -2133,6 +2352,77 @@ class ProjectComputeImage(SQLModel, table=True):
         UniqueConstraint(
             "project_id", "dep_hash", name="uq_projectcomputeimage_project_dep_hash"
         ),
+    )
+
+
+class ComputeImageBuildStatus(str, Enum):
+    PENDING = "PENDING"
+    BUILDING = "BUILDING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    TIMED_OUT = "TIMED_OUT"
+
+
+class ProjectComputeImageBuild(SQLModel, table=True):
+    """Durable async-tracking row for an off-orchestrator compute-image build.
+
+    Cloud Run's 60-minute request cap forbids the current inline synchronous
+    ``docker build`` path. This row drives the provision -> poll -> terminal ->
+    reap lifecycle for builds dispatched to an isolated builder VM, mirroring
+    the ``ComputeJob`` table's column/typing conventions.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    dep_hash: str = Field(sa_column=Column(String(255), nullable=False))
+    registry_repo: str = Field(sa_column=Column(String(512), nullable=False))
+    image_name: str = Field(sa_column=Column(String(255), nullable=False))
+    builder_vm_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    zone: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    status: ComputeImageBuildStatus = Field(
+        default=ComputeImageBuildStatus.PENDING,
+        sa_column=Column(
+            String,
+            nullable=False,
+            server_default=ComputeImageBuildStatus.PENDING.value,
+        ),
+    )
+    started_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    deadline_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
+    result_json: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    error_reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
+
+    __table_args__ = (
+        Index("ix_projectcomputeimagebuild_project_id_status", "project_id", "status"),
+        Index("ix_projectcomputeimagebuild_project_dep_hash", "project_id", "dep_hash"),
+        Index("ix_projectcomputeimagebuild_status", "status"),
+        Index("ix_projectcomputeimagebuild_deadline_at", "deadline_at"),
+        Index("ix_projectcomputeimagebuild_created_at", "created_at"),
     )
 
 
@@ -2264,6 +2554,21 @@ class ComputeJob(SQLModel, table=True):
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
+    # Authoritative record of the local runner that actually CLAIMED and ran this
+    # job (stamped at /next-compute-job claim time). Detach-on-delete (SET NULL),
+    # NOT cascade: a compute job is durable history that must outlive a deleted
+    # runner — mirrors task_id / artifact_id above. Distinct from the best-effort
+    # heartbeat active-list and the polling_metadata['runner_target_id'] dispatch
+    # PIN, neither of which authoritatively records the runner that ran the job.
+    ran_on_runner_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="SET NULL"),
+            nullable=True,
+            index=True,
+        ),
+    )
 
     __table_args__ = (
         Index("ix_computejob_project_status", "project_id", "status"),
@@ -2273,6 +2578,12 @@ class ComputeJob(SQLModel, table=True):
         Index("ix_computejob_status_deadline", "status", "wall_clock_deadline"),
         Index("ix_computejob_next_poll", "next_poll_at"),
         Index("ix_computejob_created_at", "created_at"),
+        Index("ix_computejob_updated_at", "updated_at"),
+        Index("ix_computejob_completed_at", "completed_at"),
+        Index(
+            "ix_computejob_polling_metadata_runner_target_id",
+            "polling_metadata",
+        ),
     )
 
     project: Project = Relationship(back_populates="compute_jobs")
@@ -2282,7 +2593,7 @@ class ComputeJob(SQLModel, table=True):
 class ComputeJobFile(SQLModel, table=True):
     """Individually-addressable viewable file extracted from a compute job bundle.
 
-    Each row records one file (png, jpg, webp, gif, svg, mp4, webm) that was
+    Each row records one file (png, jpg, webp, gif, pdf, mp4, webm) that was
     extracted from the job's opaque ``bundle.tar.gz`` at completion time, so it
     can be signed and rendered inline without downloading the full tarball.
     """
@@ -2552,6 +2863,10 @@ class TaskHistory(SQLModel, table=True):
     __table_args__ = (
         Index("ix_taskhistory_task_id_timestamp_desc", "task_id", text("timestamp desc")),
     )
+
+
+register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
+register_sqlite_ordinary_task_terminal_listener(Task)
 
 
 # Auto-append to status_log whenever latest_status_message is set
@@ -2933,6 +3248,10 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_event_type", "project_id", "event_type"),
         Index("ix_alert_project_source", "project_id", "source"),
         Index("ix_alert_project_created_at", "project_id", "created_at"),
+        # title is filtered in dedupe/existence WHERE clauses across many alert
+        # call sites; index it alongside project_id to avoid a seq-scan after
+        # the project_id filter on every check.
+        Index("ix_alert_project_title", "project_id", "title"),
         Index(
             "ux_alert_active_dedupe_key",
             "project_id",
@@ -3060,6 +3379,26 @@ class StrategicCycle(SQLModel, table=True):
             "project_id",
             "outcome",
             "phase1_started_at",
+        ),
+        # Exact latest-terminal Resident wakeup lookup. ``outcome`` is a
+        # multi-value predicate, so placing it before updated_at would force a
+        # merge/sort across outcome ranges instead of serving ORDER BY + LIMIT
+        # directly from this partial index.
+        Index(
+            "ix_strategiccycle_project_terminal_updated",
+            "project_id",
+            "updated_at",
+            "id",
+            postgresql_where=text(
+                "outcome IN ('completed','failed_phase1','failed_phase2',"
+                "'failed_phase2_spawn','stalled_phase1','stalled_phase2',"
+                "'thinker_artifacts_missing')"
+            ),
+            sqlite_where=text(
+                "outcome IN ('completed','failed_phase1','failed_phase2',"
+                "'failed_phase2_spawn','stalled_phase1','stalled_phase2',"
+                "'thinker_artifacts_missing')"
+            ),
         ),
         # Covers the stalled-cycle reaper cross-project scan:
         # WHERE outcome IN (...) ORDER BY phase1_started_at LIMIT N.
@@ -3287,18 +3626,82 @@ class MessageType(str, Enum):
     NOTE = "NOTE"
 
 
+class MessageSurface(str, Enum):
+    """Durable projection that owns a project message."""
+
+    CONVERSATION = "conversation"
+    ACTIVITY = "activity"
+
+
+class MessageHandlingState(str, Enum):
+    """Strategic Resident delivery state, separate from message resolution."""
+
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    RESPONDED = "responded"
+    SUPERSEDED = "superseded"
+
+
 class ProjectMessage(SQLModel, table=True):
     """Async message board between users and the strategic agent."""
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(foreign_key="project.id", index=True)
+    # Auth-provider/Firebase UID of the human actor. This deliberately is not a
+    # FK to AllowedUser.id: AllowedUser uses an internal UUID while project
+    # membership and request identity use the external string UID. Nullable for
+    # legacy/system messages whose actor cannot be inferred safely.
+    actor_user_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    # Canonical conversation writers allocate a positive, monotonic sequence
+    # from ProjectMessageSequence's short per-project counter row. It remains
+    # nullable during the legacy-writer migration window; the partial unique
+    # index fences every canonical/backfilled value without breaking untouched
+    # emitters. Remove nullable=True only after all writers have migrated and
+    # the rollback soak has completed.
+    sequence: int | None = Field(
+        default=None, sa_column=Column(BigInteger, nullable=True)
+    )
+    surface: MessageSurface = Field(
+        default=MessageSurface.ACTIVITY,
+        sa_column=Column(
+            String(32),
+            nullable=False,
+            server_default=text("'activity'"),
+        ),
+    )
+    handling_state: MessageHandlingState = Field(
+        default=MessageHandlingState.PENDING,
+        sa_column=Column(
+            String(32),
+            nullable=False,
+            server_default=text("'pending'"),
+        ),
+    )
+    handled_by_task_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("task.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    reply_to_message_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("projectmessage.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
     message_type: MessageType = Field(
         default=MessageType.NOTE, sa_column=Column(String, default=MessageType.NOTE)
     )
     # Allowed values: 'user' | 'agent' | 'strategic' | 'system'. Enforced
     # server-side by ``chk_projectmessage_from_type`` (alembic 0065 /
     # audit L-S1, Postgres-only).
-    from_type: str = Field(default="user")
+    from_type: str = Field(default="user", index=True)
     from_task_id: uuid.UUID | None = Field(default=None, foreign_key="task.id")
     content: str = Field(default="")
     context: Dict[str, Any] = Field(
@@ -3334,9 +3737,57 @@ class ProjectMessage(SQLModel, table=True):
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+            onupdate=_utcnow,
+        ),
+    )
 
     __table_args__ = (
+        CheckConstraint(
+            "sequence IS NULL OR sequence > 0",
+            name="chk_projectmessage_sequence_positive",
+        ),
+        CheckConstraint(
+            "surface IN ('conversation','activity')",
+            name="chk_projectmessage_surface",
+        ),
+        CheckConstraint(
+            "handling_state IN ('pending','claimed','responded','superseded')",
+            name="chk_projectmessage_handling_state",
+        ),
+        CheckConstraint(
+            "reply_to_message_id IS NULL OR reply_to_message_id <> id",
+            name="chk_projectmessage_reply_not_self",
+        ),
         Index("ix_projectmessage_project_status", "project_id", "status"),
+        Index(
+            "ux_projectmessage_project_sequence",
+            "project_id",
+            "sequence",
+            unique=True,
+            postgresql_where=text("sequence IS NOT NULL"),
+            sqlite_where=text("sequence IS NOT NULL"),
+        ),
+        Index(
+            "ix_projectmessage_project_surface_sequence",
+            "project_id",
+            "surface",
+            "sequence",
+        ),
+        Index(
+            "ix_projectmessage_project_handling_sequence",
+            "project_id",
+            "handling_state",
+            "sequence",
+        ),
+        Index("ix_projectmessage_actor_user_id", "actor_user_id"),
+        Index("ix_projectmessage_handled_by_task_id", "handled_by_task_id"),
+        Index("ix_projectmessage_reply_to_message_id", "reply_to_message_id"),
         # One logical message per (project, client key). Partial so keyless
         # legacy sends are unconstrained; the create endpoint queries this
         # before insert and the index is the concurrency-safe backstop.
@@ -3350,7 +3801,22 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
+        # Composite index for the strategic cold-load live-message preview query
+        # (project_id, status IN ('open','linked'), ORDER BY created_at DESC LIMIT 12).
+        # Two-branch UNION ALL rewrite uses this index for each status branch.
+        Index(
+            "ix_projectmessage_project_status_created",
+            "project_id",
+            "status",
+            "created_at",
+        ),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
+        Index("ix_projectmessage_status_from_type", "status", "from_type"),
+        # PostgreSQL migrations create expression indexes for the exact JSONB
+        # scalar predicates.  The metadata entries use the backing column so
+        # the model/migration coverage invariant can track their names.
+        Index("ix_projectmessage_context_event_type", "context"),
+        Index("ix_projectmessage_context_dedupe_key", "context"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(
@@ -3366,6 +3832,126 @@ class ProjectMessage(SQLModel, table=True):
             "project_id",
             "resident_session_id",
             "created_at",
+        ),
+    )
+
+
+class ProjectMessageSequence(SQLModel, table=True):
+    """Per-project atomic allocator for durable conversation sequence values."""
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    last_sequence: int = Field(
+        default=0,
+        sa_column=Column(BigInteger, nullable=False, server_default=text("0")),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "last_sequence >= 0",
+            name="chk_projectmessagesequence_nonnegative",
+        ),
+    )
+
+
+class ProjectMessageAttachmentUpload(SQLModel, table=True):
+    """Durable receipt for one authorized project-message attachment upload."""
+
+    attachment_id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    actor_user_id: str = Field(sa_column=Column(String(255), nullable=False))
+    storage_uri: str = Field(sa_column=Column(Text, nullable=False))
+    filename: str = Field(sa_column=Column(String(512), nullable=False))
+    content_type: str | None = Field(
+        default=None,
+        sa_column=Column(String(128), nullable=True),
+    )
+    expected_size_bytes: int = Field(sa_column=Column(BigInteger, nullable=False))
+    expires_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False)
+    )
+    consumed_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    message_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            # DEFERRABLE INITIALLY DEFERRED (migration 0634): the attachment
+            # receipt's message_id is staged before the referenced projectmessage
+            # row is INSERTed within the same create_operator_project_message
+            # transaction, so the FK must be validated at COMMIT, not per-statement.
+            ForeignKey(
+                "projectmessage.id",
+                ondelete="SET NULL",
+                deferrable=True,
+                initially="DEFERRED",
+            ),
+            nullable=True,
+        ),
+    )
+    artifact_ref_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("artifactref.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(
+            NaiveUTCDateTime,
+            nullable=False,
+            server_default=func.now(),
+        ),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "expected_size_bytes >= 0",
+            name="chk_projectmessageattachmentupload_size_nonnegative",
+        ),
+        CheckConstraint(
+            "expires_at > created_at",
+            name="chk_projectmessageattachmentupload_expiry_after_create",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_project_expires",
+            "project_id",
+            "expires_at",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_project_actor_created",
+            "project_id",
+            "actor_user_id",
+            "created_at",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_artifact_ref_id",
+            "artifact_ref_id",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_message_id",
+            "message_id",
+        ),
+        Index(
+            "ix_projectmessageattachmentupload_consumed_expires",
+            "consumed_at",
+            "expires_at",
         ),
     )
 
@@ -4076,6 +4662,12 @@ class KnowledgeDocument(SQLModel, table=True):
             "lifecycle_status",
         ),
         Index("ix_knowledge_document_project_lifecycle_created", "project_id", "lifecycle_status", "created_at"),
+        # Covers the common list path: filter by project_id then ORDER BY
+        # created_at, when no lifecycle_status predicate is present (the
+        # existing project_lifecycle_created composite cannot serve those
+        # queries). Used across knowledge_query.py and
+        # strategic_context_package.py document-list loads.
+        Index("ix_knowledge_document_project_created", "project_id", "created_at"),
     )
 
 
@@ -4679,6 +5271,13 @@ class ImprovementLane(SQLModel, table=True):
         Index("ix_improvementlane_project_status", "project_id", "status"),
         # Direction scope: find lanes for a given direction.
         Index("ix_improvementlane_direction_status", "direction_id", "status"),
+        # Stale-parked-lane sweep: expired PARKED lanes.
+        Index(
+            "ix_improvementlane_status_parked_at",
+            "status",
+            "parked_at",
+            postgresql_where=text("status = 'PARKED'"),
+        ),
     )
 
 
@@ -4800,6 +5399,17 @@ class TaskWakeRegistration(SQLModel, table=True):
             "ix_taskwakeregistration_state_deadline",
             "delivery_state",
             "deadline_at",
+        ),
+        # Firing hot path: fire_task_wakes() point-looks-up PENDING registrations
+        # by (wake_source_kind, wake_source_ref) on every compute-job terminal
+        # transition. A (wake_source_kind, wake_source_ref, delivery_state)
+        # composite keeps that lookup off a full table scan as parked-task
+        # registrations accumulate.
+        Index(
+            "ix_taskwakeregistration_source_state",
+            "wake_source_kind",
+            "wake_source_ref",
+            "delivery_state",
         ),
     )
 
@@ -5067,6 +5677,18 @@ class LocalRunner(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Monotonic credential generation. A heartbeat records the generation it
+    # authenticated with; the Fleet UI confirms token rotation only when that
+    # acknowledgement equals the current generation. This avoids inferring
+    # credential use from last_seen_at wall-clock ordering.
+    token_generation: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default=text("1")),
+    )
+    last_heartbeat_token_generation: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -5079,6 +5701,64 @@ class LocalRunner(SQLModel, table=True):
             "ix_localrunner_project_status",
             "project_id",
             "status",
+        ),
+        # Cross-project fleet health scan (admin_runners.py) filters on
+        # status alone (status != 'deleted') without a project_id predicate,
+        # which the composite above cannot serve. Standalone status index
+        # avoids a full sequential scan over the runners table.
+        Index("ix_localrunner_status", "status"),
+    )
+
+
+class RunnerProjectBinding(SQLModel, table=True):
+    """Runner-level project allow-list — one row per (runner, project) grant.
+
+    A fleet ``LocalRunner`` historically pinned to exactly one project via its
+    ``project_id`` FK (the ENROLLMENT / default project). This join table adds a
+    many-to-many allow-list so ONE daemon per physical box can serve N projects
+    under a single unified GPU-index/concurrency ledger, without spinning up a
+    second per-project daemon that would double-book the same hardware.
+
+    This is the ADDITIVE, non-breaking schema foundation only: ``LocalRunner.
+    project_id`` is UNCHANGED and remains the anchor member of the runner's own
+    allow-list (a runner is always implicitly allowed on its enrollment project
+    even if no binding row exists — see ``app.runner_project_binding.
+    allowed_project_ids``). Dispatch/authz/claim rewiring lands in a follow-on
+    that depends on this table.
+    """
+
+    __tablename__ = "runner_project_binding"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the runner so bindings never outlive their runner row.
+    runner_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("localrunner.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    # Deleted with the project so bindings never outlive their project row.
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # A runner cannot be double-bound to the same project.
+        UniqueConstraint(
+            "runner_id",
+            "project_id",
+            name="uq_runner_project_binding_runner_project",
         ),
     )
 
@@ -5223,7 +5903,9 @@ class NotificationDeadLetter(SQLModel, table=True):
     last_status: int | None = Field(
         default=None, sa_column=Column(Integer, nullable=True)
     )
-    webhook_url: str = Field(default="", sa_column=Column(String(2048), nullable=False))
+    # Fernet ciphertext can exceed the original 2048-character plaintext URL
+    # allowance, so encrypted-at-rest values require unbounded text storage.
+    webhook_url: str = Field(default="", sa_column=Column(Text, nullable=False))
     payload: dict = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),

@@ -13,24 +13,27 @@ const ResearchBrowser = lazy(() => import('./components/ResearchBrowser').then(m
 const KnowledgeBrowser = lazy(() => import('./components/KnowledgeBrowser').then(m => ({ default: m.KnowledgeBrowser })));
 const NewTaskModal = lazy(() => import('./components/NewTaskModal').then(m => ({ default: m.NewTaskModal })));
 const NewProjectModal = lazy(() => import('./components/NewProjectModal').then(m => ({ default: m.NewProjectModal })));
-import { auth, signInWithGoogle, signOut } from './firebase';
+import {
+  addAccount,
+  switchAccount,
+  signInWithGoogle,
+  signOut,
+  signOutAll,
+  getAccounts,
+  getActiveAccountId,
+} from './accountManager';
 import { fetchTask } from './api/tasks';
 import { apiFetch, API_BASE_URL } from './api/core';
 import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
-import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
-const AlertsPopover = lazy(() => import('./components/AlertsPopover').then(m => ({ default: m.AlertsPopover })));
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
-import { WelcomeScreen } from './components/WelcomeScreen';
-import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { useStrategicSession } from './hooks/useStrategicSession';
 import { useSettingsRouterProps } from './hooks/useSettingsRouterProps';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
-import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { Pagination } from './components/Pagination';
@@ -41,19 +44,24 @@ const ActivityFeed = lazy(() => import('./components/ActivityFeed'));
 const StrategicContextWorkspace = lazy(() => import('./components/StrategicContextWorkspace').then(m => ({ default: m.StrategicContextWorkspace })));
 const StrategicContextRail = lazy(() => import('./components/StrategicContextRail').then(m => ({ default: m.StrategicContextRail })));
 const StrategicSessionControl = lazy(() => import('./components/StrategicSessionControl').then(m => ({ default: m.StrategicSessionControl })));
+const WelcomeScreen = lazy(() => import('./components/WelcomeScreen').then(m => ({ default: m.WelcomeScreen })));
+const ProjectManagementModal = lazy(() => import('./components/ProjectManagementModal').then(m => ({ default: m.ProjectManagementModal })));
+const BulkActionBar = lazy(() => import('./components/BulkActionBar').then(m => ({ default: m.BulkActionBar })));
+const CommandPaletteHost = lazy(() => import('./components/CommandPaletteHost').then(m => ({ default: m.CommandPaletteHost })));
+const KeyboardShortcutsOverlay = lazy(() => import('./components/KeyboardShortcutsOverlay').then(m => ({ default: m.KeyboardShortcutsOverlay })));
+const NullBranchDiagnosticsPanel = lazy(() => import('./components/NullBranchDiagnosticsPanel').then(m => ({ default: m.NullBranchDiagnosticsPanel })));
 import type { StrategicAccountSpendStatus, StrategicInteractionMode } from './components/StrategicSessionControl';
-import { CommandPaletteHost } from './components/CommandPaletteHost';
-import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
+import type { ProjectMessage } from './types/messages';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
-import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
 const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
-const RuntimeWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.RuntimeWorkspace })));
+const RuntimeWorkspace = lazy(() => import('./components/RuntimeWorkspace').then(m => ({ default: m.RuntimeWorkspace })));
 const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').then(m => ({ default: m.PipelineWorkspace })));
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
+import { useStrategicLiveness } from './hooks/useStrategicLiveness';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
@@ -67,6 +75,7 @@ import { normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSur
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { computeStrategicSessionActivity } from './utils/strategicSessionLive';
 import { STATUS_OPTIONS } from './constants';
+import { reportUiLoadTiming } from './uiLoadTiming';
 
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
@@ -102,12 +111,61 @@ function WorkspaceSkeleton() {
   );
 }
 
+function BoardDataReadyReporter({ activeTab, initialLoading, refreshing, fetchEpoch }: { activeTab: PrimaryTab; initialLoading: boolean; refreshing: boolean; fetchEpoch: number }) {
+  const navigationStartRef = useRef(0);
+  const reportedRef = useRef(false);
+  const targetEpochRef = useRef<number | null>(null);
+
+  // On tab switch away from 'chat', record the start time and the epoch
+  // we expect the next fetch to produce (current + 1). If a fetch completes
+  // after the switch, the downstream effect captures it with real timing.
+  useEffect(() => {
+    if (activeTab === 'chat') return;
+    navigationStartRef.current = performance.now();
+    reportedRef.current = false;
+    targetEpochRef.current = fetchEpoch + 1;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab]);
+
+  // Report when a task-fetch completes after the switch (epoch advances past
+  // target).  Otherwise fall back to rAF when nothing is currently loading.
+  useEffect(() => {
+    if (activeTab === 'chat' || reportedRef.current) return;
+
+    // Epoch advanced → a fetch completed since the tab switch → report.
+    if (targetEpochRef.current !== null && fetchEpoch >= targetEpochRef.current) {
+      reportedRef.current = true;
+      reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
+      return;
+    }
+
+    // Nothing loading → fall back to rAF (paint boundary).
+    if (!initialLoading && !refreshing) {
+      const frame = requestAnimationFrame(() => {
+        if (reportedRef.current) return;
+        reportedRef.current = true;
+        reportUiLoadTiming(activeTab, Math.round(performance.now() - navigationStartRef.current), 'board_data_ready');
+      });
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [activeTab, fetchEpoch, initialLoading, refreshing]);
+
+  return null;
+}
+
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
-  const refreshMessagesRef = useRef<() => void>(() => {});
+  const refreshMessagesRef = useRef<(message?: ProjectMessage, canonicalRefetchRequired?: boolean) => void>(() => {});
   const refreshFleetRunnersRef = useRef<() => void>(() => {});
   const [messageRealtimeRefreshSignal, setMessageRealtimeRefreshSignal] = useState(0);
-  refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
+  const [realtimeCanonicalProjection, setRealtimeCanonicalProjection] = useState<{
+    message: ProjectMessage;
+    canonicalRefetchRequired: boolean;
+  } | null>(null);
+  refreshMessagesRef.current = (message, canonicalRefetchRequired = false) => {
+    if (message) setRealtimeCanonicalProjection({ message, canonicalRefetchRequired });
+    else setMessageRealtimeRefreshSignal(value => value + 1);
+  };
   const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
@@ -129,6 +187,7 @@ export default function App() {
   }, [cycleCompletion, addToast]);
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
+  const [activeAlerts, setActiveAlerts] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
 
   // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
@@ -185,6 +244,12 @@ export default function App() {
   const selectedProjectId = s.selectedProjectId;
   const rawActiveTab = s.activeTab;
   const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
+  const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<PrimaryTab>>(() => new Set([activeTab]));
+  useEffect(() => {
+    setVisitedTabs(previous => previous.has(activeTab) ? previous : new Set([...previous, activeTab]));
+  }, [activeTab]);
+  const chatPollersEnabled = visitedTabs.has('chat');
+  const runtimePollersEnabled = visitedTabs.has('runtime');
   const messagesPanelOpen = activeTab === 'chat';
   const [directions, setDirections] = useState<PipelineDirectionOption[]>([]);
   useEffect(() => {
@@ -228,6 +293,7 @@ export default function App() {
     if (messagesPanelOpen) {
       setOpenMessageCount(0);
       setNewSinceLastVisit(0);
+      setActiveAlerts(0);
     }
   }, [messagesPanelOpen]);
   // Load noise prefs from localStorage when the project changes; refresh from server async.
@@ -271,10 +337,12 @@ export default function App() {
       if (!res.ok || signal.aborted) return;
       const data = await res.json();
       if (!signal.aborted) {
-        setOpenMessageCount(
-          (data.blocker ?? 0) + (data.question ?? 0) + (data.bug_report ?? 0) + (data.feedback ?? 0) + (data.high_signal_note ?? 0),
-        );
+        // Use the server-computed needs_operator count (blockers + questions)
+        // from the attention model so the badge agrees with StrategicContextRail
+        // and the in-panel needs-action set.
+        setOpenMessageCount(data.needs_operator ?? 0);
         setNewSinceLastVisit(data.unread ?? 0);
+        setActiveAlerts(data.active_alerts ?? 0);
       }
     } catch { /* ignore */ }
   }, {
@@ -299,9 +367,46 @@ export default function App() {
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
   );
+
+  // Per-tab data-arrival epochs so board_data_ready fires on each tab's own
+  // primary data, not on the shared tasks fetchEpoch.
+  const [projectDataEpoch, setProjectDataEpoch] = useState(0);
+  const [runtimeDataEpoch, setRuntimeDataEpoch] = useState(0);
+  useEffect(() => {
+    if (selectedProject !== null) setProjectDataEpoch(e => e + 1);
+  }, [selectedProject]);
+  useEffect(() => {
+    if (s.orchestratorHealth !== null) setRuntimeDataEpoch(e => e + 1);
+  }, [s.orchestratorHealth]);
+
+  // Route the correct epoch/loading signals to BoardDataReadyReporter per tab.
+  const boardDataEpoch = activeTab === 'project' ? projectDataEpoch : activeTab === 'runtime' ? runtimeDataEpoch : s.fetchEpoch;
+  const boardInitialLoading = activeTab === 'project' ? !s.projectsLoaded : activeTab === 'runtime' ? s.orchestratorHealth === null : s.initialLoading;
+  const boardRefreshing = (activeTab === 'project' || activeTab === 'runtime') ? false : s.refreshing;
+
   const selectedProjectRepoLabel = selectedProject
     ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
     : null;
+  const selectedProjectAutonomous = selectedProject?.autonomous_enabled ?? false;
+  // Command-palette action: flip the selected project's autonomous mode. Reuses
+  // the existing PATCH endpoint (no new API) and refreshes the projects list so
+  // the header AutonomousStatus and the command's own label stay in sync.
+  const toggleSelectedProjectAutonomy = useCallback(async () => {
+    const pid = s.selectedProjectId;
+    if (!pid) return;
+    const next = !(selectedProject?.autonomous_enabled ?? false);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/autonomous`, {
+        method: 'PATCH',
+        body: JSON.stringify({ enabled: next }),
+      });
+      if (!res.ok) throw new Error('Failed to toggle autonomous mode');
+      s.addToast(`Autonomous mode ${next ? 'enabled' : 'paused'}`, 'success');
+      void s.fetchProjects(true);
+    } catch {
+      s.addToast('Failed to toggle autonomous mode', 'error');
+    }
+  }, [s, selectedProject]);
   // Fetch project members when panel opens or project changes
   const { fetchProjectMembers } = s;
   useEffect(() => {
@@ -338,39 +443,6 @@ export default function App() {
       .catch(() => {});
     return () => { cancelled = true; };
   }, [s.showResearchBrowser, selectedProjectId]);
-  // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
-  const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
-  useEffect(() => {
-    if (!selectedProjectId) setSrInvestigationTaskIds({});
-  }, [selectedProjectId]);
-  usePoller(async (signal) => {
-    if (!selectedProjectId) return;
-    const pid = selectedProjectId;
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/sr-investigation-task-ids`);
-      if (!res.ok || signal.aborted) return;
-      const data = (await res.json()) as { task_ids?: Record<string, string> };
-      if (!signal.aborted) setSrInvestigationTaskIds(data.task_ids ?? {});
-    } catch { /* ignore */ }
-  }, { intervalMs: DEFAULT_POLL_MS, enabled: !!selectedProjectId, deps: [selectedProjectId] });
-
-  const handleSpawnSrInvestigation = useCallback(async (signal: SrInvestigationSignal): Promise<string | null> => {
-    if (!selectedProjectId) return null;
-    try {
-      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/sr-investigation`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(signal),
-      });
-      if (!res.ok) return null;
-      const data = (await res.json()) as { task_id: string; created: boolean };
-      setSrInvestigationTaskIds(prev => ({ ...prev, [signal.category]: data.task_id }));
-      return data.task_id;
-    } catch {
-      return null;
-    }
-  }, [selectedProjectId]);
-
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
     const zones = Object.entries(s.zoneHealth);
@@ -420,11 +492,25 @@ export default function App() {
   }, [s.zoneHealth, dismissedZoneAlertIds]);
 
   const combinedAlerts = useMemo(() => [...zoneHealthAlerts, ...s.alerts], [zoneHealthAlerts, s.alerts]);
-  const alertMaxSeverity: 'ERROR' | 'WARNING' | 'INFO' | null = combinedAlerts.some(a => a.severity === 'ERROR') ? 'ERROR'
-    : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
-    : combinedAlerts.length > 0 ? 'INFO' : null;
 
-  const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: activeTab === 'chat' });
+  const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
+  // Monotonic epoch that advances each time the strategic-state poll delivers
+  // new data. Threaded into MessagesPanel → useResidentConversation so the
+  // conversation refresh piggybacks on the strategic-state poll cadence instead
+  // of running its own independent timer (eliminating the duplicate assembly).
+  const strategicPollEpochRef = useRef(0);
+  const [strategicPollEpoch, setStrategicPollEpoch] = useState(0);
+  useEffect(() => {
+    if (strategicReadModel.data) {
+      strategicPollEpochRef.current += 1;
+      setStrategicPollEpoch(strategicPollEpochRef.current);
+    }
+  }, [strategicReadModel.data]);
+  // Fast mode + resident-session liveness probe: resolves the mode indicator and
+  // active/dead chip on reload well before the heavy strategic-state fetch lands.
+  // Once strategicReadModel.data hydrates, its values take precedence (fallback
+  // in useStrategicSession), so there is no flicker when the full state arrives.
+  const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
       void strategicReadModel.refresh();
@@ -435,8 +521,10 @@ export default function App() {
   }, [strategicReadModel.refresh]);
   const {
     strategicWorkbenchState,
+    strategicInteractionMode,
     strategicSessionActive,
     strategicSessionStatus,
+    residentStrategicSession,
     residentStrategicSessionAvailable,
     strategicSessionState,
     strategicSessionReason,
@@ -455,7 +543,9 @@ export default function App() {
     handleStopStrategicSession,
     strategicWorkbenchOperatorSurfaceTouchedRef,
     strategicWorkbenchRestoreProjectRef,
-  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel });
+  } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
+  const strategicOperatorDecisionSummary = residentStrategicSession?.operator_decision_summary ?? null;
+  const strategicTurnLatencySummary = residentStrategicSession?.turn_latency_summary ?? null;
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -467,7 +557,8 @@ export default function App() {
       (counts.stale_queued_tasks ?? 0) +
       (counts.failed_tasks ?? 0) +
       (counts.blocked_tasks ?? 0) +
-      (counts.parked_tasks ?? 0)
+      (counts.parked_tasks ?? 0) +
+      (counts.pending_confirmations ?? 0)
     );
   }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
   const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery } = useCommandPaletteState();
@@ -624,7 +715,7 @@ export default function App() {
   const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
-  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId);
+  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId, { pollerEnabled: runtimePollersEnabled });
   const hasVersionLifecycle = hasVersionLifecycleData(versionLifecycle);
   const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
   const applyPipelineSection = useCallback((section: PipelineSection) => {
@@ -830,7 +921,7 @@ export default function App() {
   const openNextWorkbenchSubtab = useCallback(() => {
     cycleCurrentWorkbenchSection(1);
   }, [cycleCurrentWorkbenchSection]);
-  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
+  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicInteractionMode);
   const strategicAccountSpend = useMemo<StrategicAccountSpendStatus>(() => {
     const accounts = s.maxPlanAccounts ?? [];
     const cooldownAccounts = accounts.filter(account => Object.keys(account.disabled_models ?? {}).length > 0).length;
@@ -875,6 +966,8 @@ export default function App() {
     selectedProjectId: s.selectedProjectId,
     selectedProjectRepoLabel,
     hasVersionLifecycle,
+    autonomousEnabled: selectedProjectAutonomous,
+    toggleAutonomousMode: toggleSelectedProjectAutonomy,
     directionsCount: directions.length,
     filteredTaskCount: filteredTasks.length,
     visibleActiveCount: visibleActiveTasks.length,
@@ -936,7 +1029,6 @@ export default function App() {
   const transientWorkbenchPanelOpen = Boolean(
     s.showResearchBrowser ||
     s.showKnowledgeBrowser ||
-    s.showAlertsPopover ||
     showActivityFeed,
   );
 
@@ -953,7 +1045,6 @@ export default function App() {
     setResearchBrowserDirectionId,
     setShortcutHelpOpen,
     setShowActivityFeed,
-    setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
     shortcutHelpOpen,
@@ -1091,7 +1182,7 @@ export default function App() {
           </p>
           <p className="text-xs text-neutral-600 mb-6">Contact an administrator to request access.</p>
           <button
-            onClick={() => signOut(auth)}
+            onClick={() => { void signOut(); }}
             className="bg-neutral-800 hover:bg-neutral-700 text-neutral-200 px-6 py-2 rounded text-sm font-medium transition-colors w-full"
           >
             Sign out
@@ -1127,10 +1218,6 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
-        alertCount={combinedAlerts.length}
-        alertMaxSeverity={alertMaxSeverity}
-        showAlertsPopover={s.showAlertsPopover}
-        onToggleAlertsPopover={() => s.setShowAlertsPopover(prev => !prev)}
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
@@ -1139,7 +1226,12 @@ export default function App() {
         onOpenSettings={() => openRuntimeSettings('general')}
         onNewProject={() => setShowNewProjectModal(true)}
         onManageProjects={() => setShowProjectManagement(true)}
-        onSignOut={() => signOut(auth)}
+        onSignOut={() => { void signOut(); }}
+        onSignOutAll={() => { void signOutAll(); }}
+        onAddAccount={() => { addAccount().catch(e => s.setError(String(e))); }}
+        onSwitchAccount={(id) => switchAccount(id)}
+        accounts={getAccounts()}
+        activeAccountId={getActiveAccountId()}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
         apiHealthy={s.apiHealthy}
@@ -1158,9 +1250,10 @@ export default function App() {
         ceilingDeferredProjectIds={s.ceilingDeferredProjectIds}
         gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
+        activeAlerts={activeAlerts}
       />
-      <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
-      <KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} />
+      <Suspense fallback={null}><CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} /></Suspense>
+      <Suspense fallback={null}><KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} /></Suspense>
       <Suspense fallback={null}>
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
@@ -1176,6 +1269,8 @@ export default function App() {
         sessionBusy={strategicSessionBusy}
         sessionRunners={residentStrategicSessionRunners}
         sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+        operatorDecisionSummary={strategicOperatorDecisionSummary}
+        turnLatencySummary={strategicTurnLatencySummary}
         projectId={selectedProjectId}
         onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
@@ -1205,7 +1300,7 @@ export default function App() {
         );
       })()}
       <VersionMismatchBanner />
-      {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
+      <Suspense fallback={null}>{s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}</Suspense>
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
@@ -1221,12 +1316,15 @@ export default function App() {
       )}
 
       {showWelcomeScreen ? (
+        <Suspense fallback={null}>
         <WelcomeScreen
           onCreateProject={() => setShowNewProjectModal(true)}
-          onSignOut={() => signOut(auth)}
+          onSignOut={() => { void signOut(); }}
         />
+        </Suspense>
       ) : (
         <WorkbenchFrame>
+      <BoardDataReadyReporter activeTab={activeTab} initialLoading={boardInitialLoading} refreshing={boardRefreshing} fetchEpoch={boardDataEpoch} />
       {s.showUserManagement && s.userRole === 'admin' ? (
         <Suspense fallback={null}>
         <UserManagement
@@ -1246,7 +1344,7 @@ export default function App() {
             <>
               <Suspense fallback={null}>
               <StrategicSessionControl
-                mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
+                mode={normalizeStrategicInteractionMode(strategicInteractionMode)}
                 saving={savingStrategicWorkbench}
                 localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
@@ -1258,6 +1356,8 @@ export default function App() {
                 sessionBusy={strategicSessionBusy}
                 sessionRunners={residentStrategicSessionRunners}
                 sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+                operatorDecisionSummary={strategicOperatorDecisionSummary}
+                turnLatencySummary={strategicTurnLatencySummary}
                 onSelectRunner={handleSelectStrategicRunner}
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}
@@ -1314,18 +1414,33 @@ export default function App() {
                 strategicSessionTranscript={s.strategicSessionTranscript}
                 focusComposerSignal={strategicComposerFocusSignal}
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
+                realtimeCanonicalMessage={realtimeCanonicalProjection?.message ?? null}
+                realtimeCanonicalRefetchRequired={realtimeCanonicalProjection?.canonicalRefetchRequired ?? false}
+                strategicPollEpoch={strategicPollEpoch}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenCommandPalette={openCommandPalette}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
+                alerts={combinedAlerts}
+                onDismissAlert={(id) => {
+                  if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
+                  else s.dismissAlert(id);
+                }}
+                onDismissAllAlerts={() => {
+                  setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
+                  s.dismissAllAlerts();
+                }}
+                onViewAlertTask={handleViewTask}
+                onOpenActivityFeed={() => setShowActivityFeed(true)}
               />
               </Suspense>
             )}
             rail={(
-              <Suspense fallback={null}>
+              <Suspense fallback={<WorkspaceSkeleton />}>
               <StrategicContextRail
+                projectId={s.selectedProjectId}
                 state={strategicReadModel.data ?? null}
                 loading={strategicReadModel.loading}
                 error={strategicReadModel.error}
@@ -1348,6 +1463,8 @@ export default function App() {
                 accountSpend={strategicAccountSpend}
                 savingSessionRefs={savingStrategicWorkbench}
                 onUpdateSessionRefs={updateStrategicSessionRefs}
+                onConfirmationResolved={() => { void strategicReadModel.refresh(); }}
+                addToast={s.addToast}
               />
               </Suspense>
             )}
@@ -1563,6 +1680,7 @@ export default function App() {
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
+        activeAlerts={activeAlerts}
         placement="mobile"
         className="md:hidden"
       />
@@ -1667,6 +1785,7 @@ export default function App() {
       )}
 
       {showProjectManagement && (
+        <Suspense fallback={null}>
         <ProjectManagementModal
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
@@ -1675,6 +1794,7 @@ export default function App() {
           onSelectProject={s.setSelectedProjectId}
           onClose={() => setShowProjectManagement(false)}
         />
+        </Suspense>
       )}
 
       {s.showResearchBrowser && (
@@ -1752,6 +1872,7 @@ export default function App() {
         </ErrorBoundary>
       )}
 
+      <Suspense fallback={null}>
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
         <BulkActionBar
           selectedCount={s.selectedTaskIds.size}
@@ -1766,6 +1887,7 @@ export default function App() {
           toggleSelectionMode={s.toggleSelectionMode}
         />
       )}
+      </Suspense>
 
       {showActivityFeed && (
         <Suspense fallback={null}>
@@ -1783,27 +1905,6 @@ export default function App() {
       )}
 
       <ToastContainer toasts={s.toasts} onDismiss={s.dismissToast} />
-
-      {s.showAlertsPopover && combinedAlerts.length > 0 && (
-        <Suspense fallback={null}>
-        <AlertsPopover
-          alerts={combinedAlerts}
-          onDismiss={(id) => {
-            if (id.startsWith('zone-')) setDismissedZoneAlertIds(prev => new Set([...prev, id]));
-            else s.dismissAlert(id);
-          }}
-          onDismissAll={() => {
-            setDismissedZoneAlertIds(prev => new Set([...prev, ...zoneHealthAlerts.map(a => a.id)]));
-            s.dismissAllAlerts();
-          }}
-          onViewTask={handleViewTask}
-          projectId={s.selectedProjectId ?? undefined}
-          onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
-          activeInvestigationTaskIds={srInvestigationTaskIds}
-          onClose={() => s.setShowAlertsPopover(false)}
-        />
-        </Suspense>
-      )}
 
       {s.showFleetDetail && (
         <Suspense fallback={null}>

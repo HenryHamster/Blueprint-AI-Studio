@@ -1,7 +1,7 @@
 """Tests for strategic_context_package.py read-model functions."""
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +12,8 @@ import app.strategic_context_package as scp
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
+    ComputeJobStatus,
     KnowledgeDocument,
     Project,
     Task,
@@ -190,7 +192,7 @@ async def test_load_strategic_context_evidence_staleness_reflects_oldest_pending
     await db_session.commit()
     await db_session.refresh(task)
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     # Create a doc from 72 hours ago — should be the oldest.
     old_doc = KnowledgeDocument(
         project_id=project.id,
@@ -375,6 +377,56 @@ async def test_bundle_artifact_resolves_manifest_viewable_video(
 
 
 @pytest.mark.asyncio
+async def test_viewable_revision_reaches_signed_preview_and_descriptor(
+    db_session, monkeypatch
+):
+    """Revision/live metadata survives signing without changing the media URI."""
+    project, task = await _make_project_task(db_session, name="RevisionPreview")
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "11111111-1111-1111-1111-111111111111/artifacts/viewable/reward.png"
+    )
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=(
+                f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+                "11111111-1111-1111-1111-111111111111/artifacts/bundle.tar.gz"
+            ),
+            logs=json.dumps(
+                {
+                    "viewable_files": [
+                        {
+                            "filename": "reward.png",
+                            "storage_uri": plot_uri,
+                            "kind": "image",
+                            "revision": "terminal-revision-9",
+                            "live": False,
+                        }
+                    ]
+                }
+            ),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        assert storage_uri == plot_uri
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer([]))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    preview = evidence["artifacts"]["items"][0]["viewable_previews"][0]
+    assert preview["revision"] == "terminal-revision-9"
+    assert preview["live"] is False
+    descriptor = _artifact_descriptor(evidence["artifacts"]["items"][0])
+    assert descriptor["image"]["revision"] == "terminal-revision-9"
+    assert descriptor["images"][0]["live"] is False
+
+
+@pytest.mark.asyncio
 async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
     """Fail-soft: a signing error yields the pre-existing metadata-only stub."""
     project, task = await _make_project_task(db_session, name="PreviewFail")
@@ -409,22 +461,36 @@ async def test_signing_failure_falls_back_to_stub(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_svg_is_never_previewable(db_session, monkeypatch):
-    """svg is excluded from the viewable allowlist (script execution via a
-    signed URL) — no preview and no signing call, whether the svg is the
-    artifact's own storage_uri or a stamped manifest entry."""
+async def test_svg_is_previewable_via_signed_url(db_session, monkeypatch):
+    """SVG is now accepted in the viewable allowlist (sanitized before upload)
+    — a manifest entry with kind='image' and a .svg filename is verified for
+    project ownership and signed just like any other image."""
     project, task = await _make_project_task(db_session, name="PreviewSvg")
+    svg_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/artifacts/viewable/diagram.svg"
+    )
+    # The artifact's own object is the opaque compute bundle; the previewable
+    # svg lives INSIDE it via the viewable_files manifest. Keeping the bundle
+    # storage_uri non-viewable isolates the manifest-signing path this test
+    # targets — otherwise (since #15522 made .svg directly viewable) an svg
+    # storage_uri would ALSO be signed by _resolve_viewable_previews' direct
+    # path, double-counting the sign for the same object.
+    bundle_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/artifacts/bundle.tar.gz"
+    )
     db_session.add(
         Artifact(
             task_id=task.id,
             artifact_type=ArtifactType.SCREENSHOT,
-            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/chart.svg",
+            storage_uri=bundle_uri,
             logs=json.dumps(
                 {
                     "viewable_files": [
                         {
                             "filename": "diagram.svg",
-                            "storage_uri": f"gs://{ARTIFACT_BUCKET_NAME}/tasks/{task.id}/diagram.svg",
+                            "storage_uri": svg_uri,
                             "kind": "image",
                         }
                     ]
@@ -445,9 +511,196 @@ async def test_svg_is_never_previewable(db_session, monkeypatch):
 
     evidence = await load_strategic_context_evidence(db_session, project.id)
     item = evidence["artifacts"]["items"][0]
-    assert "viewable_previews" not in item
-    assert calls == []
-    assert verify_calls == []
+    # SVG is now signed and appears as a viewable preview.
+    assert "viewable_previews" in item
+    assert any(p["filename"] == "diagram.svg" for p in item["viewable_previews"])
+    assert len(verify_calls) == 1
+    assert verify_calls[0] == svg_uri
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_running_compute_job_midrun_previews_populate_descriptor(
+    db_session, monkeypatch
+):
+    """A RUNNING compute job whose polling_metadata carries mid-run viewable
+    files is surfaced as an evidence artifact with signed viewable_previews, so
+    the strategic-canvas descriptor renders inline (kind=image, populated URL,
+    no unsupported_reason stub) before the job terminates — and no raw
+    storage_uri leaks onto the item."""
+    project, task = await _make_project_task(db_session, name="RunningJob")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "22222222-2222-2222-2222-222222222222/artifacts/viewable/reward_curve.png"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward_curve.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    # No-leak contract: raw gs:// never rides on the item itself.
+    assert "storage_uri" not in item
+    assert item["compute_job_running"] is True
+    assert item["task_status"] == "RUNNING"
+    assert item["viewable_previews"] == [
+        {
+            "url": "https://signed.example/reward_curve.png",
+            "storage_uri": plot_uri,
+            "kind": "image",
+            "filename": "reward_curve.png",
+        }
+    ]
+    assert calls == [(plot_uri, scp._PREVIEW_SIGNED_URL_MINUTES)]
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] == "https://signed.example/reward_curve.png"
+    assert "unsupported_reason" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_terminal_linked_compute_job_not_double_surfaced(
+    db_session, monkeypatch
+):
+    """A compute job already linked to a durable Artifact (artifact_id set) is
+    NOT re-surfaced by the running-job pass, so a terminal job's previews come
+    only from its Artifact — no duplicate live item."""
+    project, task = await _make_project_task(db_session, name="TerminalJob")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "33333333-3333-3333-3333-333333333333/artifacts/viewable/final.png"
+    )
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.DEBUG_RESULT,
+        storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/x/bundle.tar.gz",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    # A SUCCEEDED job linked to that artifact — still carries a viewable_files
+    # manifest in polling_metadata, but must not be double-surfaced.
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.SUCCEEDED,
+        artifact_id=artifact.id,
+        polling_metadata={
+            "viewable_files": [
+                {"filename": "final.png", "storage_uri": plot_uri, "kind": "image"}
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    # Exactly one item — the durable Artifact. No live running-job duplicate.
+    assert len(items) == 1
+    assert all(not it.get("compute_job_running") for it in items)
+
+
+@pytest.mark.asyncio
+async def test_running_job_manifest_ownership_and_svg_signed(
+    db_session, monkeypatch
+):
+    """The running-job pass reuses the shared signer: a foreign-owned entry is
+    skipped, but an owned SVG entry IS now signed (sanitized server-side)."""
+    project, task = await _make_project_task(db_session, name="RunningFilter")
+
+    own_video = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "44444444-4444-4444-4444-444444444444/artifacts/viewable/rollout.mp4"
+    )
+    foreign = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "00000000-0000-0000-0000-000000000009/artifacts/viewable/evil.png"
+    )
+    svg = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "44444444-4444-4444-4444-444444444444/artifacts/viewable/diagram.svg"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.POLLING,
+        polling_metadata={
+            "viewable_files": [
+                {"filename": "evil.png", "storage_uri": foreign, "kind": "image"},
+                {"filename": "diagram.svg", "storage_uri": svg, "kind": "image"},
+                {"filename": "rollout.mp4", "storage_uri": own_video, "kind": "video"},
+            ]
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(storage_uri, project_id, session):
+        if storage_uri == foreign:
+            raise Exception("ownership violation")
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    previews = items[0]["viewable_previews"]
+    by_filename = {p["filename"]: p for p in previews}
+    # Foreign-owned entry is skipped; both owned (video + svg) are signed.
+    assert "evil.png" not in by_filename
+    assert by_filename["rollout.mp4"]["kind"] == "video"
+    assert by_filename["rollout.mp4"]["url"] == "https://signed.example/rollout.mp4"
+    assert by_filename["diagram.svg"]["kind"] == "image"
+    assert by_filename["diagram.svg"]["url"] == "https://signed.example/diagram.svg"
+    # Both owned URIs were signed (order determined by gather — just check the set).
+    signed_uris = {uri for uri, _ in calls}
+    assert own_video in signed_uris
+    assert svg in signed_uris
+
+    descriptor = _artifact_descriptor(items[0])
+    # descriptor picks the first image preview (SVG) or the video — just check a URL exists
+    assert descriptor.get("kind") in ("image", "video")
 
 
 def test_snapshot_sanitizer_strips_signed_preview_urls():
@@ -521,7 +774,11 @@ def test_artifact_renderable_kind_video():
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "output.mp4"}) == "video"
     assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "demo.webm"}) == "video"
     assert _artifact_renderable_kind({"kind": "video", "label": "result"}) == "video"
-    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "video"
+    # .mov is intentionally NOT an inline-video format: #15576 ("fix .mov drift")
+    # dropped .mov from the renderable-video tokens to match the viewable
+    # allowlist (only .mp4/.webm play inline), so a .mov falls back to a
+    # download-style resource_detail rather than an inline player.
+    assert _artifact_renderable_kind({"kind": "recording.mov", "label": "run"}) == "resource_detail"
 
 
 def test_artifact_renderable_kind_fallback():
@@ -604,6 +861,60 @@ def test_artifact_descriptor_video_no_preview():
     assert "unsupported_reason" in desc
 
 
+def test_artifact_renderable_kind_pdf():
+    """Artifact with pdf tokens yields kind='pdf' (matplotlib savefig('*.pdf'))."""
+    assert _artifact_renderable_kind({"artifact_type": "COMPUTE_RESULT", "logical_key": "figure.pdf"}) == "pdf"
+    assert _artifact_renderable_kind({"kind": "report.pdf", "label": "run"}) == "pdf"
+    assert _artifact_renderable_kind({"label": "pdf export"}) == "pdf"
+
+
+def test_artifact_descriptor_pdf_with_preview_url():
+    """PDF artifact with a viewable_preview renders kind='pdf' with a resolvable
+    url/storage_uri and drops unsupported_reason."""
+    item = {
+        "id": "art-pdf-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "report.pdf",
+        "label": "Report",
+        "task_title": "Plotting run",
+        "task_status": "completed",
+        "viewable_previews": [
+            {
+                "url": "https://signed.example.com/report.pdf?sig=xyz",
+                "kind": "pdf",
+                "filename": "report.pdf",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf",
+            },
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "pdf"
+    assert desc["pdf"]["url"] == "https://signed.example.com/report.pdf?sig=xyz"
+    assert desc["pdf"]["storage_uri"] == (
+        "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf"
+    )
+    assert desc["pdfs"][0]["filename"] == "report.pdf"
+    assert "unsupported_reason" not in desc
+
+
+def test_artifact_descriptor_pdf_no_preview():
+    """PDF-looking artifact without a signable preview renders the fail-soft stub."""
+    item = {
+        "id": "art-pdf-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "report.pdf",
+        "label": "Report",
+        "task_title": "Plotting run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "pdf"
+    assert desc["pdf"]["url"] is None
+    assert "unsupported_reason" in desc
+
+
 def test_artifact_descriptor_multi_image_populates_images_list():
     """Image artifact with multiple viewable_previews populates both image (first) and images (all)."""
     item = {
@@ -673,6 +984,29 @@ def test_artifact_descriptor_multi_video_populates_videos_list():
     assert desc["videos"][0]["url"] == "https://signed.example.com/clip0.mp4?sig=v1"
     assert desc["videos"][1]["url"] == "https://signed.example.com/clip1.mp4?sig=v2"
     assert desc["videos"][0]["filename"] == "clip0.mp4"
+
+
+def test_artifact_descriptor_preserves_all_mixed_media_preview_groups():
+    """Image precedence identifies the tile without dropping video or PDF evidence."""
+    item = {
+        "id": "art-mixed-media",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "results/",
+        "label": "Training results",
+        "viewable_previews": [
+            {"url": "https://signed.example.com/reward.png", "kind": "image", "filename": "reward.png"},
+            {"url": "https://signed.example.com/rollout.mp4", "kind": "video", "filename": "rollout.mp4"},
+            {"url": "https://signed.example.com/report.pdf", "kind": "pdf", "filename": "report.pdf"},
+        ],
+    }
+
+    desc = _artifact_descriptor(item)
+
+    assert desc is not None
+    assert desc["kind"] == "image"
+    assert desc["images"][0]["filename"] == "reward.png"
+    assert desc["videos"][0]["filename"] == "rollout.mp4"
+    assert desc["pdfs"][0]["filename"] == "report.pdf"
 
 
 def test_artifact_descriptor_image_carries_storage_uri_for_lazy_resolution():
@@ -905,3 +1239,682 @@ async def test_load_strategic_context_evidence_artifact_no_logs(db_session):
     # No-leak contract: the raw gs:// reference never rides on the item.
     assert "storage_uri" not in item
     assert "viewable_previews" not in item
+
+
+@pytest.mark.asyncio
+async def test_compute_artifact_stamped_with_provenance_and_evidence_tier(
+    db_session,
+):
+    """A compute_experiment artifact is stamped with run provenance + evidence
+    tier from its backing compute knowledge doc, and the descriptor surfaces
+    both."""
+    project, task = await _make_project_task(db_session, name="ProvTest")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type="COMPUTE_RESULT",
+            storage_uri="gs://bucket/result",
+            logs=None,
+        )
+    )
+    # Canonical source: the compute doc's forward_quality_verdict carries the
+    # earned evidence tier and terminal_diagnostics (execution location).
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind="compute_experiment",
+            title="Compute run",
+            summary="A run",
+            body="body",
+            lifecycle_status="consumed",
+            forward_quality_verdict={
+                "evidence_tier": "covered",
+                "terminal_diagnostics": {
+                    "executing_backend": "local-runner",
+                    "runner_target_id": "runner-42",
+                    "runner_hostname": "gpu-box-01",
+                },
+            },
+        )
+    )
+    await db_session.commit()
+
+    result = await load_strategic_context_evidence(db_session, project.id)
+    items = result["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["evidence_tier"] == "covered"
+    assert item["executing_backend"] == "local-runner"
+    assert item["runner_target_id"] == "runner-42"
+    assert item["runner_hostname"] == "gpu-box-01"
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["evidence_tier"] == "covered"
+    detail_by_label = {d["label"]: d["value"] for d in descriptor["details"]}
+    assert detail_by_label["Executed on"] == "local-runner"
+    assert detail_by_label["Runner"] == "gpu-box-01 (runner-42)"
+
+
+@pytest.mark.asyncio
+async def test_non_compute_artifact_gets_no_provenance_or_tier(db_session):
+    """An artifact without a backing compute_experiment doc gains no provenance
+    or evidence-tier keys, and its descriptor stays unchanged."""
+    project, task = await _make_project_task(db_session, name="NoProvTest")
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type="COMPUTE_RESULT",
+            storage_uri="gs://bucket/result",
+            logs=None,
+        )
+    )
+    # A non-compute knowledge doc for the same task must not stamp provenance.
+    db_session.add(
+        KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind="web_research",
+            title="Research",
+            summary="A doc",
+            body="body",
+            lifecycle_status="pending",
+            forward_quality_verdict={"evidence_tier": "covered"},
+        )
+    )
+    await db_session.commit()
+
+    result = await load_strategic_context_evidence(db_session, project.id)
+    items = result["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert "evidence_tier" not in item
+    assert "executing_backend" not in item
+    assert "runner_target_id" not in item
+    assert "runner_hostname" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert "evidence_tier" not in descriptor
+    labels = {d["label"] for d in descriptor["details"]}
+    assert "Executed on" not in labels
+    assert "Runner" not in labels
+
+
+def test_artifact_descriptor_runner_falls_back_to_target_id_only():
+    """When only the runner id (no hostname) is stamped, the Runner detail uses
+    the bare id."""
+    item = {
+        "id": "art-1",
+        "kind": "resource_detail",
+        "label": "run",
+        "artifact_type": "COMPUTE_RESULT",
+        "task_status": "completed",
+        "executing_backend": "cloud-gpu",
+        "runner_target_id": "runner-9",
+        "evidence_tier": "attested",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc["evidence_tier"] == "attested"
+    detail_by_label = {d["label"]: d["value"] for d in desc["details"]}
+    assert detail_by_label["Executed on"] == "cloud-gpu"
+    assert detail_by_label["Runner"] == "runner-9"
+
+
+def test_artifact_descriptor_stamps_viewable_files_dropped():
+    """_artifact_descriptor promotes viewable_files_dropped from the item dict
+    when it is a positive integer."""
+    item = {
+        "id": "art-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "demo.mp4",
+        "label": "Demo",
+        "task_title": "Training run",
+        "task_status": "completed",
+        "viewable_files_dropped": 3,
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["viewable_files_dropped"] == 3
+
+
+def test_artifact_descriptor_omits_viewable_files_dropped_when_zero():
+    """_artifact_descriptor omits viewable_files_dropped from the descriptor
+    when the value is 0, negative, or absent."""
+    item = {
+        "id": "art-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "plot.png",
+        "label": "Plot",
+        "task_title": "Training run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert "viewable_files_dropped" not in desc
+
+    # Explicit zero also omitted.
+    item["viewable_files_dropped"] = 0
+    desc = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in desc
+
+    # Negative value also omitted.
+    item["viewable_files_dropped"] = -1
+    desc = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in desc
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_viewable_files_dropped_stamped(db_session):
+    """A terminal artifact whose logs contain viewable_files_dropped stamps it
+    onto the evidence item, and _artifact_descriptor promotes it."""
+    project = Project(name="DroppedTerminal", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = {
+        "compute_job_id": "job-1",
+        "viewable_files": [
+            {"filename": "plot.png", "storage_uri": "gs://bucket/obj1", "kind": "image", "content_type": "image/png"},
+        ],
+        "viewable_files_dropped": 3,
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        mock_verify.return_value = None
+        mock_sign.return_value = "https://signed-url/plot.png?token=abc"
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert item["viewable_files_dropped"] == 3
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["viewable_files_dropped"] == 3
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_omits_viewable_files_dropped_when_zero(db_session):
+    """A terminal artifact whose logs lack viewable_files_dropped (or have it 0)
+    produces an item and descriptor without the key."""
+    project = Project(name="NoDropsTerminal", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute task",
+        status="completed",
+        payloads=[{"type": "research", "prompt": "test"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # No viewable_files_dropped in logs.
+    logs = {
+        "compute_job_id": "job-1",
+        "viewable_files": [],
+    }
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type="COMPUTE_RESULT",
+        storage_uri="gs://bucket/result",
+        logs=json.dumps(logs),
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(artifact)
+
+    with (
+        patch("app.strategic_context_package.verify_artifact_project_ownership") as mock_verify,
+        patch("app.strategic_context_package.generate_download_signed_url") as mock_sign,
+    ):
+        mock_verify.return_value = None
+        mock_sign.return_value = "https://signed-url/plot.png?token=abc"
+        result = await load_strategic_context_evidence(db_session, project.id)
+
+    artifacts = result["artifacts"]["items"]
+    assert len(artifacts) == 1
+    item = artifacts[0]
+    assert "viewable_files_dropped" not in item
+
+    descriptor = _artifact_descriptor(item)
+    assert "viewable_files_dropped" not in descriptor
+
+
+@pytest.mark.asyncio
+async def test_running_job_viewable_files_dropped_stamped(
+    db_session, monkeypatch
+):
+    """A running compute job with viewable_files_dropped in its polling_metadata
+    produces an evidence item carrying the dropped count, and _artifact_descriptor
+    promotes it."""
+    project, task = await _make_project_task(db_session, name="RunningDropped")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "33333333-3333-3333-3333-333333333333/artifacts/viewable/reward_curve.png"
+    )
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward_curve.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ],
+            "viewable_files_dropped": 2,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    async def fake_sign(*a, **kw):
+        return "https://signed.example/reward_curve.png"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+    assert len(items) == 1
+    item = items[0]
+    assert item["viewable_files_dropped"] == 2
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["viewable_files_dropped"] == 2
+
+
+# ── Viewable slot reservation (older viewable rows survive newer empty ones) ──
+
+
+@pytest.mark.asyncio
+async def test_running_job_preview_reserves_slot_for_viewable_older_job(
+    db_session, monkeypatch
+):
+    """With at least 4 newer running compute jobs whose polling_metadata carries
+    NO viewable_files, an older running job whose polling_metadata carries a PNG
+    still surfaces as a signed viewable_preview and reaches a renderable
+    (non-unsupported_reason) descriptor. Evidence stays bounded."""
+    project, task = await _make_project_task(db_session, name="RunningSlotReserve")
+
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "55555555-5555-5555-5555-555555555555/artifacts/viewable/reward.png"
+    )
+    now = datetime.now(timezone.utc)
+
+    # 4 newest running jobs — no viewable_files manifest
+    for i in range(4):
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                task_id=task.id,
+                backend="local_process",
+                status=ComputeJobStatus.RUNNING,
+                polling_metadata={},
+                updated_at=now - timedelta(hours=i),
+            )
+        )
+
+    # 1 older running job — carries a PNG in its viewable_files manifest
+    old_job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local_process",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={
+            "viewable_files": [
+                {
+                    "filename": "reward.png",
+                    "storage_uri": plot_uri,
+                    "kind": "image",
+                    "content_type": "image/png",
+                    "size_bytes": 1024,
+                }
+            ]
+        },
+        updated_at=now - timedelta(hours=48),
+    )
+    db_session.add(old_job)
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+
+    # The old viewable-bearing job surfaces as an evidence item
+    assert len(items) == 1
+    item = items[0]
+    assert item["compute_job_running"] is True
+    assert item["viewable_previews"][0]["kind"] == "image"
+    assert item["viewable_previews"][0]["filename"] == "reward.png"
+
+    descriptor = _artifact_descriptor(item)
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] is not None
+    assert "unsupported_reason" not in descriptor
+
+    # Evidence stays bounded: running jobs cap + terminal artifact cap
+    assert len(items) <= scp._RUNNING_JOB_PREVIEW_LIMIT + scp._ARTIFACT_EVIDENCE_LIMIT
+
+
+@pytest.mark.asyncio
+async def test_terminal_artifact_reserves_slot_for_viewable_older_artifact(
+    db_session, monkeypatch
+):
+    """With at least 4 newer terminal artifacts that have no viewable manifest
+    (pr_url only), an older artifact whose logs carry a viewable_files manifest
+    still surfaces its signed preview and renderable descriptor. Evidence stays
+    bounded."""
+    project, task = await _make_project_task(db_session, name="ArtifactSlotReserve")
+
+    now = datetime.now(timezone.utc)
+
+    # 4 newest artifacts — pr_url only, no viewable_files manifest
+    for i in range(4):
+        db_session.add(
+            Artifact(
+                task_id=task.id,
+                artifact_type=ArtifactType.DEBUG_RESULT,
+                pr_url="https://github.com/owner/repo/pull/123",
+                created_at=now - timedelta(hours=i),
+            )
+        )
+
+    # 1 older artifact — carries a viewable_files manifest in logs
+    plot_uri = (
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        "66666666-6666-6666-6666-666666666666/artifacts/viewable/reward.png"
+    )
+    logs = {
+        "viewable_files": [
+            {
+                "filename": "reward.png",
+                "storage_uri": plot_uri,
+                "kind": "image",
+                "content_type": "image/png",
+            }
+        ]
+    }
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.DEBUG_RESULT,
+            storage_uri=f"gs://{ARTIFACT_BUCKET_NAME}/old/bundle.tar.gz",
+            logs=json.dumps(logs),
+            created_at=now - timedelta(hours=72),
+        )
+    )
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    calls: list = []
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", _fake_signer(calls))
+
+    evidence = await load_strategic_context_evidence(db_session, project.id)
+    items = evidence["artifacts"]["items"]
+
+    # The viewable-bearing terminal artifact is in the evidence items
+    viewable_items = [it for it in items if it.get("viewable_previews")]
+    assert len(viewable_items) >= 1
+    assert viewable_items[0]["viewable_previews"][0]["kind"] == "image"
+
+    # No running-job items mixed in
+    assert all(not it.get("compute_job_running") for it in items)
+
+    descriptor = _artifact_descriptor(viewable_items[0])
+    assert descriptor["kind"] == "image"
+    assert descriptor["image"]["url"] is not None
+    assert "unsupported_reason" not in descriptor
+
+    # Evidence stays bounded (4 terminal artifacts max after cap)
+    assert len(items) <= scp._ARTIFACT_EVIDENCE_LIMIT
+
+
+# ── Parallel signing (Finding 1 & 2 performance) ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_viewable_previews_not_signed_sequentially_per_file(
+    db_session, monkeypatch
+):
+    """_sign_viewable_manifest gathers all GCS signing calls in parallel.
+
+    With N viewable files, generate_download_signed_url must be invoked via
+    asyncio.gather (not awaited one-by-one), so all N GCS round-trips run
+    concurrently. The test spies on asyncio.gather inside the module to confirm
+    it is called with multiple coroutines, and also verifies that every file in
+    the manifest resolves to a signed preview (functional correctness).
+    """
+    import asyncio as _asyncio
+
+    project, _task = await _make_project_task(db_session, name="ParallelSignPerFile")
+    uris = [
+        f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+        f"aaaaaaaa-aaaa-aaaa-aaaa-{str(i).zfill(12)}/artifacts/viewable/plot{i}.png"
+        for i in range(3)
+    ]
+    viewable_files = [
+        {
+            "filename": f"plot{i}.png",
+            "storage_uri": uri,
+            "kind": "image",
+            "content_type": "image/png",
+        }
+        for i, uri in enumerate(uris)
+    ]
+
+    async def fake_verify(*a):
+        return None
+
+    signed_uris: list = []
+
+    async def fake_sign(uri, expiration_minutes=60):
+        signed_uris.append(uri)
+        return f"https://signed.example/{uri.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    gather_calls: list = []
+    real_gather = _asyncio.gather
+
+    async def spy_gather(*coros, **kwargs):
+        gather_calls.append(len(coros))
+        return await real_gather(*coros, **kwargs)
+
+    with patch.object(_asyncio, "gather", new=spy_gather):
+        previews = await scp._sign_viewable_manifest(
+            db_session, project.id, viewable_files
+        )
+
+    # All 3 files must resolve
+    assert len(previews) == 3
+    assert all(p["url"].startswith("https://") for p in previews)
+    assert {p["filename"] for p in previews} == {"plot0.png", "plot1.png", "plot2.png"}
+
+    # asyncio.gather must have been called with all 3 signing coroutines at once
+    assert gather_calls, "asyncio.gather was never called"
+    assert max(gather_calls) == 3, (
+        f"Expected gather with 3 coroutines, got: {gather_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_running_job_previews_signed_concurrently_across_jobs(
+    db_session, monkeypatch
+):
+    """_running_job_preview_items fans out signing across all jobs in one gather.
+
+    With 2 running jobs each carrying 2 viewable files, all 4 GCS signing calls
+    must be issued in a single asyncio.gather (not one per job), so total signing
+    latency is O(1) parallel batches rather than O(jobs) sequential calls.
+    """
+    import asyncio as _asyncio
+
+    project, task = await _make_project_task(db_session, name="ParallelSignAcrossJobs")
+    now = datetime.now(timezone.utc)
+
+    def _make_viewable(basename: str, job_slot: int) -> dict:
+        uri = (
+            f"gs://{ARTIFACT_BUCKET_NAME}/compute-jobs/"
+            f"{job_slot:08x}-0000-0000-0000-000000000000"
+            f"/artifacts/viewable/{basename}"
+        )
+        return {"filename": basename, "storage_uri": uri, "kind": "image", "content_type": "image/png"}
+
+    for slot in range(2):
+        db_session.add(
+            ComputeJob(
+                project_id=project.id,
+                task_id=task.id,
+                backend="local_process",
+                status=ComputeJobStatus.RUNNING,
+                polling_metadata={
+                    "viewable_files": [
+                        _make_viewable(f"plot{slot}a.png", slot),
+                        _make_viewable(f"plot{slot}b.png", slot),
+                    ]
+                },
+                updated_at=now - timedelta(hours=slot),
+            )
+        )
+    await db_session.commit()
+
+    async def fake_verify(*a):
+        return None
+
+    async def fake_sign(uri, expiration_minutes=60):
+        return f"https://signed.example/{uri.rsplit('/', 1)[-1]}"
+
+    monkeypatch.setattr(scp, "verify_artifact_project_ownership", fake_verify)
+    monkeypatch.setattr(scp, "generate_download_signed_url", fake_sign)
+
+    gather_calls: list = []
+    real_gather = _asyncio.gather
+
+    async def spy_gather(*coros, **kwargs):
+        gather_calls.append(len(coros))
+        return await real_gather(*coros, **kwargs)
+
+    with patch.object(_asyncio, "gather", new=spy_gather):
+        items = await scp._running_job_preview_items(db_session, project.id)
+
+    # Both jobs must surface with their previews
+    assert len(items) == 2
+    assert all(len(it["viewable_previews"]) == 2 for it in items)
+    assert all(it["compute_job_running"] is True for it in items)
+
+    # All 4 signing calls must have been issued in a single gather (not 2 x 2)
+    assert gather_calls, "asyncio.gather was never called"
+    assert max(gather_calls) == 4, (
+        f"Expected one gather with 4 coroutines (2 jobs x 2 files), got: {gather_calls}"
+    )
+
+
+def test_artifact_descriptor_chart_progress_series_line():
+    """Chart artifact with a valid progress_series produces a line chart plotting raw values."""
+    item = {
+        "id": "art-chart-1",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+        "progress_series": [
+            {"name": "reward", "value": -1.0, "t": "2026-07-17T00:00:00Z"},
+            {"name": "reward", "value": -0.5, "t": "2026-07-17T00:01:00Z"},
+            {"name": "reward", "value": 0.1, "t": "2026-07-17T00:02:00Z"},
+            # A second, shorter metric group must not win the max() tiebreak.
+            {"name": "loss", "value": 2.0, "t": "2026-07-17T00:00:00Z"},
+        ],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "line"
+    assert desc["chart"]["y_label"] == "reward"
+    # Raw negative values preserved (no Math.abs / abs() applied on the backend).
+    assert [p["value"] for p in desc["chart"]["points"]] == [-1.0, -0.5, 0.1]
+
+
+def test_artifact_descriptor_chart_progress_series_all_non_dict_falls_back_to_bar():
+    """A non-empty progress_series with no dict entries must not crash; falls back to a bar chart."""
+    item = {
+        "id": "art-chart-2",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+        # All entries are non-dicts -> metric_groups stays empty -> must not
+        # raise ValueError from max() on an empty sequence.
+        "progress_series": [1, 2, 3, "not-a-dict"],
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "bar"
+    assert desc["chart"]["points"] == [{"label": "artifact", "value": 1}]
+
+
+def test_artifact_descriptor_chart_no_progress_series_falls_back_to_bar():
+    """A chart artifact without any progress_series falls back to a single-bar chart."""
+    item = {
+        "id": "art-chart-3",
+        "artifact_type": "COMPUTE_RESULT",
+        "logical_key": "reward_plot",
+        "label": "Reward Chart",
+        "task_title": "RL run",
+        "task_status": "completed",
+    }
+    desc = _artifact_descriptor(item)
+    assert desc is not None
+    assert desc["kind"] == "chart"
+    assert desc["chart"]["kind"] == "bar"
+    assert desc["chart"]["points"] == [{"label": "artifact", "value": 1}]

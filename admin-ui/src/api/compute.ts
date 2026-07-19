@@ -62,6 +62,14 @@ export interface ComputeExperimentLaunchRequest {
   // When set, the job stays QUEUED until that runner is available rather than
   // falling back to another runner or cloud. Omit for auto-selection.
   runner_target_id?: string;
+  // Optional setup step executed as `bash -lc <setup_step>` before the main command.
+  setup_step?: string;
+  // Optional no-progress watchdog window in seconds. When set, a stalled job
+  // writing no progress within this window is torn down early.
+  no_progress_timeout_seconds?: number;
+  // Optional cross-job checkpoint resume: rehydrate a prior job's artifact bundle
+  // into this job's workspace before the command runs.
+  input_artifact_job_id?: string;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -744,7 +752,9 @@ export interface ViewableArtifact {
   filename: string | null;
   content_type?: string | null;
   size_bytes?: number | null;
-  kind: 'image' | 'video' | null;
+  kind: 'image' | 'video' | 'pdf' | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface ComputeJob {
@@ -833,6 +843,11 @@ export interface ComputeJob {
     met: boolean | null;
     cost_usd: number | null;
   }> | null;
+  // Canonical earned-vs-claimed evidence tier, derived server-side by
+  // knowledge_completion._compute_evidence_tier and served here as a first-class
+  // field. Prefer this over any client re-derivation. Older/cached responses may
+  // omit it (undefined), in which case consumers fall back to client derivation.
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
   // Runner identity fields — present when the job was dispatched to a registered
   // local runner. Absent on legacy rows or cloud-dispatched jobs. Older backends
   // may omit these fields entirely; consumers must treat absence as null.
@@ -865,6 +880,9 @@ export interface ComputeJob {
     deadline_seconds?: number | null;
     require_live_release?: boolean | null;
     require_durable_artifact?: boolean | null;
+    setup_step?: string | null;
+    no_progress_timeout_seconds?: number | null;
+    input_artifact_job_id?: string | null;
     // Provenance persisted at launch time; absent on legacy or manually-configured launches.
     provenance?: {
       idea?: string | null;
@@ -877,19 +895,82 @@ export interface ComputeJob {
    *  videos) as individually-addressable storage objects. Absent on legacy rows
    *  or jobs without viewable output. */
   viewable_artifacts?: ViewableArtifact[] | null;
+  /** Job-level aggregate: number of viewable files omitted from
+   *  `viewable_artifacts` for exceeding the 25-file count cap or the per-file
+   *  size cap (8 MiB/image, 512 MiB/video). Additive/backward-compatible —
+   *  absent or 0 on legacy rows and jobs where nothing was omitted.
+   *  Only populated at terminal time; use viewable_artifacts_live_omissions
+   *  for running jobs. */
+  viewable_artifacts_dropped_count?: number | null;
+  /** Count of .svg files produced by this job that were excluded from the
+   *  viewable-artifact gallery for XSS security reasons (SVG can execute
+   *  script when served from a signed URL). Absent when zero. */
+  viewable_artifacts_svg_omitted_count?: number | null;
+  /** Live omission telemetry for RUNNING jobs. Contains the count of unique
+   *  artifact files the runner skipped due to the per-kind size cap
+   *  ("size_cap": images ≤ 8 MiB, videos ≤ 512 MiB) or the 25-file count
+   *  cap ("count_cap"). Absent or null on terminal jobs — use
+   *  viewable_artifacts_dropped_count instead once the job finishes. */
+  viewable_artifacts_live_omissions?: {
+    size_cap?: number | null;
+    count_cap?: number | null;
+  } | null;
+  /** When viewable artifacts for this job are expected to expire from GCS
+   *  (the artifacts bucket has a ~7-day lifecycle DELETE). After this
+   *  timestamp, signed preview URLs will 404 — the artifact is permanently
+   *  gone and retries are futile. ISO-8601 string. */
+  artifact_expires_at?: string | null;
   /** Bounded time-series of intermediate progress samples emitted during the
-   *  job. Each sample has an ISO timestamp, a metric name, and a numeric value.
-   *  Absent on legacy rows or jobs that did not emit progress. */
-  progress_series?: Array<{ t: string; name: string; value: number }> | null;
+   *  job. `t` is runner-authored presentation time; `received_at` is the
+   *  authenticated server clock used for watchdog enforcement. */
+  progress_series?: Array<{
+    t: string;
+    name: string;
+    value: number;
+    received_at?: string;
+  }> | null;
   /** Stable terminal disposition marker set when a job ends. Distinguishes a
    *  no-progress watchdog cut ('no_progress') from a full wall-clock expiry
    *  ('deadline'), budget cap ('spend_cap'), operator kill ('operator'), and
    *  natural failure ('failure'). Absent on legacy rows. */
   terminal_kind?: 'deadline' | 'no_progress' | 'spend_cap' | 'operator' | 'failure' | null;
+  /** True only when the server has enough fresh receipt-time history to enforce
+   *  a no-progress cut right now. */
+  watchdog_active?: boolean | null;
+  /** Additive watchdog state. Older backends omit it; consumers should fall back
+   *  to watchdog_active when absent. */
+  watchdog_state?:
+    | 'protected'
+    | 'warming_up'
+    | 'insufficient_history'
+    | 'stale_telemetry'
+    | 'inert'
+    | null;
+  /** Effective no-progress timeout in seconds enforced for this job, derived
+   *  from the per-job override if set, otherwise the global default. Null when
+   *  the watchdog is not configured for this job. */
+  no_progress_timeout_seconds?: number | null;
+  /** Server receipt timestamp of the most recent enforceable progress sample.
+   *  Null when no trustworthy progress samples have been emitted yet. */
+  last_progress_at?: string | null;
+  /** Machine-readable reason the watchdog is not currently protecting this job. */
+  watchdog_inert_reason?: string | null;
+  /** Cross-job checkpoint resume: predecessor job ID that the backend validated
+   *  as the resume source for checkpoint hydration. Present when the compute job
+   *  was launched with a checkpoint source; absent otherwise. Promoted from
+   *  polling_metadata by the backend serialization layer. */
+  input_artifact_job_id?: string | null;
+  /** What actually happened at checkpoint hydration time. A dict with keys:
+   *  `ok` (boolean), `resumed_from_job_id` (string), `file_count` (int),
+   *  `recorded_at` (ISO timestamp), and optionally `reason` (string when !ok).
+   *  Absent when no resume was attempted. Promoted from polling_metadata by the
+   *  backend serialization layer. */
+  resume_provenance?: Record<string, unknown> | null;
 }
 
 export interface ComputeJobsSummary {
   total_jobs: number;
+  total_jobs_all_time?: number;
   active_jobs: number;
   terminal_jobs: number;
   total_spend_usd: number;
@@ -1063,6 +1144,12 @@ export interface ComputeSweepKnowledgeEntry {
   arm_label?: string | null;
   created_at?: string | null;
   source_kind?: string | null;
+  evidence_tier?: 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' | null;
+  run_provenance?: {
+    executing_backend?: string | null;
+    runner_hostname?: string | null;
+    runner_target_id?: string | null;
+  } | null;
 }
 
 export interface ComputeSweepGroupsResponse {
@@ -1326,6 +1413,12 @@ export interface KnowledgeDocument {
   /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
    *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
   criterion_met?: boolean | null;
+  /** Machine-readable reason the criterion was unmeasured (criterion_met === null).
+   *  'no_result_metrics': experiment produced no metrics at all;
+   *  'metric_key_absent': metrics were produced but the declared key was absent (possible name mismatch);
+   *  'metric_not_numeric': key exists but value is not numeric.
+   *  Absent/null when criterion_met is true or false. */
+  criterion_unmeasured_reason?: 'no_result_metrics' | 'metric_key_absent' | 'metric_not_numeric' | null;
   /** Proof-strength tier for compute_experiment documents: 'covered' (local hw execution),
    *  'attested' (cloud execution), 'backfilled' (metrics without direct run evidence),
    *  'partial' (attempted but incomplete), 'uncovered' (no execution evidence). Null for
@@ -1426,6 +1519,9 @@ export interface FleetHealthProjectEntry {
   stale: number;
   offline: number;
   low_disk: number;
+  // Count of runners below the low-memory threshold. Optional/null-tolerant:
+  // a runner (old build) or serving backend that never reported memory omits it.
+  low_memory?: number;
   runners: FleetRunner[];
 }
 
@@ -1436,6 +1532,7 @@ export interface FleetHealthSummaryResponse {
   stale: number;
   offline: number;
   low_disk: number;
+  low_memory?: number;
   per_project: FleetHealthProjectEntry[];
   project_count: number;
   generated_at: string;
@@ -1627,16 +1724,34 @@ export async function patchStructuralHealthSettings(patch: { structural_health_a
   }
 }
 
+export interface MetricsIntegrityFlag {
+  check: string;
+  status: string;
+  self_reported: number | null;
+  ground_truth: number | null;
+  delta: number | null;
+  severity: string;
+  subject: string | null;
+  detail: string;
+  auto_resolved: number | null;
+  auto_resolved_backing_path: number | null;
+  auto_resolved_named_test_present: number | null;
+  at?: string;
+}
+
 export interface MetricsIntegrityObservabilityResponse {
   ticks: number;
   checks_run: number;
   flags_total: number;
   errors_total: number;
   enrolled_total: number;
+  auto_resolved_total: number;
+  auto_resolved_backing_path_total: number;
+  auto_resolved_named_test_present_total: number;
   last_tick_at: string | null;
   last_tick: Record<string, unknown> | null;
   recent_ticks: Record<string, unknown>[];
-  recent_flags: Record<string, unknown>[];
+  recent_flags: MetricsIntegrityFlag[];
 }
 
 export async function fetchMetricsIntegrityObservability(
@@ -1661,11 +1776,38 @@ export async function patchMetricsIntegritySettings(patch: { metrics_integrity_s
 
 export type CapabilityProofGateMode = 'off' | 'observe' | 'enforce';
 
+/**
+ * Fleet-wide capability-proof coverage that the auto-graduation observe/enforce
+ * thresholds are compared against. Surfaced read-only in settings so the
+ * operator can see where the gate stands. `coverage_ratio` is null when the
+ * denominator (non-exempt working capabilities) is zero.
+ */
+export interface CapabilityProofGateCoverage {
+  coverage_ratio: number | null;
+  total_proven: number;
+  total_non_exempt_working: number;
+  projects_contributing: number;
+  num_projects: number;
+  trial_eligible_unproven?: number;
+  /** Whether the coverage sample was truncated by the project cap. */
+  fleet_capped: boolean;
+  /** Total number of projects in the fleet (before sampling). */
+  fleet_total: number;
+}
+
+export interface CapabilityProofTrialProjection {
+  trial_eligible: number;
+  unproven_working: number;
+  projects_contributing: number;
+  num_projects: number;
+}
+
 export interface CapabilityProofGateSettings {
   capability_proof_gate_mode: CapabilityProofGateMode;
   capability_proof_gate_auto_graduation_enabled: boolean;
   capability_proof_gate_auto_graduation_observe_threshold: number;
   capability_proof_gate_auto_graduation_enforce_threshold: number;
+  capability_proof_execution_trials_enabled?: boolean;
 }
 
 // PATCHes any partial of the four capability-proof-gate config keys. The backend
@@ -1685,9 +1827,70 @@ export async function patchCapabilityProofGateSettings(
   }
 }
 
+// Shape returned by both the grant (POST) and revoke (DELETE) capability-exemption
+// endpoints. `exempt_capabilities` is the full normalized set of operator-exempt
+// capability names AFTER the mutation, so the caller can reconcile local state.
+export interface CapabilityExemptionResponse {
+  status: 'granted' | 'revoked';
+  capability_name: string;
+  exempt_capabilities: string[];
+  // Present only on grant — true when the capability was already exempt (no-op).
+  already_exempt?: boolean;
+  // Present only on revoke — number of exemption records removed (0 when none).
+  removed?: number;
+}
+
+// Grants an OPERATOR proof exemption for a named `working` capability, clearing
+// the enforce gate for it WITHOUT machine proof and excluding it from the
+// auto-graduation coverage denominator. OWNER-guarded server-side (403 otherwise);
+// 404 if the name is not a declared `working` capability. Idempotent.
+export async function grantCapabilityProofExemption(
+  projectId: string,
+  capabilityName: string,
+  reason?: string,
+): Promise<CapabilityExemptionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-exemptions`,
+    {
+      method: 'POST',
+      body: JSON.stringify(
+        reason ? { capability_name: capabilityName, reason } : { capability_name: capabilityName },
+      ),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to grant capability exemption: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to grant capability exemption: ${res.status}`);
+  }
+  return res.json();
+}
+
+// Revokes the OPERATOR proof exemption for a named capability, so it once again
+// counts against the coverage denominator and must earn a real proof to clear
+// the enforce gate. OWNER-guarded server-side. Idempotent (removed: 0 when none).
+export async function revokeCapabilityProofExemption(
+  projectId: string,
+  capabilityName: string,
+): Promise<CapabilityExemptionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${projectId}/capability-exemptions/${encodeURIComponent(capabilityName)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to revoke capability exemption: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to revoke capability exemption: ${res.status}`);
+  }
+  return res.json();
+}
+
 
 export interface FleetRunner {
   id: string;
+  // Present on newer servers. Mutations remain scoped here; absence preserves
+  // rolling-deployment compatibility by falling back to the viewed project.
+  enrollment_project_id?: string;
   hostname: string | null;
   version: string | null;
   status: string;
@@ -1719,7 +1922,20 @@ export interface FleetRunner {
     compute_backend?: string;
     // Display-only trust telemetry stashed on capabilities at heartbeat.
     disk_free_bytes?: number;
+    memory_free_bytes?: number;
+    cpu_load_avg?: number;
     gpu_utilization_pct?: number;
+    // Per-project docker image-cache accounting (docker-backed runners only).
+    // A multi-project runner shares one image cache; this attributes its size
+    // back to the project that pulled each image, so the operator can see which
+    // allowed project fills a small image-layer disk.
+    image_cache_by_project?: {
+      total_bytes?: number;
+      image_count?: number;
+      by_project?: Record<string, { bytes?: number; image_count?: number }>;
+      unattributed_bytes?: number;
+      unattributed_image_count?: number;
+    };
     [key: string]: unknown;
   };
   health?: {
@@ -1757,6 +1973,12 @@ export interface FleetRunner {
     consecutive_job_failures?: number;
     disk_free_bytes?: number | null;
     disk_low?: boolean;
+    // Memory-pressure telemetry, symmetric with disk. memory_low is true when
+    // free memory is below the backend's low-memory threshold. Emitted by
+    // _runner_health(); null/absent for runners (old build) that never reported it.
+    memory_free_bytes?: number | null;
+    memory_low?: boolean;
+    cpu_load_avg?: number | null;
     gpu_utilization_pct?: number | null;
     failure_streak_threshold?: number;
   };
@@ -1778,6 +2000,27 @@ export interface FleetRunner {
     // True whenever the operator changed config but the daemon has not yet
     // echoed the matching generation (includes the never-reported case).
     config_pending?: boolean;
+    // ISO timestamp of when the desired live-safe config last actually changed
+    // (operator PATCH or enrollment baseline). Paired with last_seen_at it lets
+    // the UI bound how long a push has been pending and flag a STUCK state.
+    // Absent on runners enrolled before this stamp existed (unknown, not stuck).
+    desired_changed_at?: string | null;
+    // Whether the daemon has EVER echoed an applied generation. False = too old
+    // to speak the live-config contract (never reports); True but still pending =
+    // reported a stale/rejected generation. Distinguishes those honest cases.
+    daemon_reports_applied?: boolean;
+    // Structured config-apply outcome the daemon reported (all additive/optional).
+    // apply_status: 'applied' | 'rejected'. apply_reason names the offending
+    // field(s) — the backend only surfaces it as LIVE when the rejected
+    // generation matches the currently-desired generation (a stale reason tied to
+    // a superseded generation is suppressed to null). rejected_config_generation
+    // is the generation the daemon could not apply. config_rejected_fields is the
+    // offending field name(s) as a structured list, surfaced under the same
+    // live/stale suppression as apply_reason. All absent on a legacy daemon.
+    apply_status?: string | null;
+    apply_reason?: string | null;
+    rejected_config_generation?: string | null;
+    config_rejected_fields?: string[] | null;
     gpu_indices_allowed?: 'all' | number[];
     // Number of GPUs the runner reserves per compute job (server-authoritative,
     // mirrored top-level for the fleet editor). Absent on runners enrolled before
@@ -1786,15 +2029,31 @@ export interface FleetRunner {
   };
   last_seen_at: string | null;
   created_at: string | null;
+  // Server-side proof that a heartbeat authenticated with the current token
+  // generation. False immediately after rotation until the replacement token
+  // is actually used; immune to last_seen_at/rotation commit races.
+  current_token_heartbeat_confirmed?: boolean;
 }
 
-/** Register a new fleet runner for a project. Returns the one-time token. */
+/** Register a new fleet runner for a project. Returns the one-time token.
+ *
+ * The registration endpoint returns exactly `{runner_id, token}` — runner tokens
+ * do not expire, so there is no expiry field here. A prior version of this type
+ * declared phantom
+ * `token_expires_at`/`expires_at`/`expiresAt` fields that the server never sent,
+ * driving a dead "Token expires" affordance in the enroll dialog; both removed. */
 export interface FleetRunnerRegistrationResult {
   runner_id: string;
   token: string;
-  token_expires_at?: string | null;
-  expires_at?: string | null;
-  expiresAt?: string | null;
+}
+
+/** Rotate a fleet runner token and return its one-time replacement token.
+ * `rotated_at` remains optional for rolling-deployment compatibility and display;
+ * reconnect proof comes from FleetRunner.current_token_heartbeat_confirmed. */
+export interface FleetRunnerTokenRotationResult {
+  runner_id: string;
+  token: string;
+  rotated_at?: string;
 }
 
 export async function registerFleetRunner(
@@ -1822,7 +2081,7 @@ export async function registerFleetRunner(
 export async function rotateFleetRunnerToken(
   projectId: string,
   runnerId: string,
-): Promise<FleetRunnerRegistrationResult> {
+): Promise<FleetRunnerTokenRotationResult> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/rotate-token`,
     { method: 'POST' },
@@ -1901,6 +2160,100 @@ export async function patchRunnerStatus(
     throw new Error(typeof msg === 'string' ? msg : `Failed to update runner status: ${res.status}`);
   }
   return res.json();
+}
+
+// --- Runner project allow-list (multi-project runner scoping) ------------------
+
+/** One project a runner is allowed to serve. `is_enrollment` marks the runner's
+ *  enrollment/default project — the implicit anchor member that cannot be removed
+ *  from the allow-list. Mirrors the backend `_runner_projects_view` entry shape. */
+export interface RunnerProjectEntry {
+  project_id: string;
+  is_enrollment: boolean;
+}
+
+/** A runner's project allow-list: the enrollment anchor UNIONed with every
+ *  explicit binding grant. Mirrors the backend `_runner_projects_view` payload. */
+export interface RunnerProjectAllowList {
+  runner_id: string;
+  enrollment_project_id: string;
+  projects: RunnerProjectEntry[];
+}
+
+/** List the projects a runner is allowed to serve (owner-gated). */
+export async function listRunnerProjects(
+  projectId: string,
+  runnerId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects`,
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to list runner projects: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to list runner projects: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Add a project to a runner's allow-list so the daemon also serves it.
+ *  Throws with the backend detail (e.g. the 403 cross-account-attach rejection)
+ *  so callers can surface the precise reason inline. Returns the updated list. */
+export async function addRunnerProject(
+  projectId: string,
+  runnerId: string,
+  addProjectId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects`,
+    { method: 'POST', body: JSON.stringify({ project_id: addProjectId }) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to add runner project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to add runner project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Remove a non-default project from a runner's allow-list. The enrollment
+ *  project cannot be removed (backend rejects it 400). Returns the updated list. */
+export async function removeRunnerProject(
+  projectId: string,
+  runnerId: string,
+  addedProjectId: string,
+): Promise<RunnerProjectAllowList> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/projects/${encodeURIComponent(addedProjectId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to remove runner project: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to remove runner project: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** A project the current user can attach to a runner (owner role). */
+export interface OwnedProjectSummary {
+  id: string;
+  name: string;
+}
+
+/** List projects the current user OWNS — the candidate set for the runner
+ *  allow-list add-picker. Filters the admin project list to `my_role === 'owner'`
+ *  (the role the add endpoint requires on the project being attached). */
+export async function listOwnedProjects(): Promise<OwnedProjectSummary[]> {
+  const res = await apiFetch('/api/admin/projects');
+  if (!res.ok) throw new Error(`Failed to list projects: ${res.status}`);
+  const data = await res.json();
+  const items: Array<{ id?: string; name?: string; my_role?: string }> = Array.isArray(data?.items)
+    ? data.items
+    : [];
+  return items
+    .filter(p => p.my_role === 'owner' && typeof p.id === 'string')
+    .map(p => ({ id: p.id as string, name: (p.name as string) || (p.id as string) }));
 }
 
 /** One heartbeat time-series snapshot for a runner (from RunnerHeartbeatSnapshot). */

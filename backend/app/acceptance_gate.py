@@ -178,6 +178,13 @@ class AcceptanceGateVerdict:
     proof_ref: str | None = None
 
 
+# Maximum number of changed-file paths stored in the ``_pr_changed_files``
+# context signal. The stored list is capped for size, but the acceptance-relevant
+# summary (has-test / has-prod / truncated sentinels) is computed over the FULL
+# list so downstream classification stays truncation-proof.
+_CHANGED_FILES_STAMP_CAP = 50
+
+
 def _changed_files(task: Task) -> list[str]:
     """The PR's changed-file paths recorded on the task, as a list of strings."""
     raw = (task.context or {}).get("_pr_changed_files")
@@ -208,11 +215,11 @@ def stamp_changed_files_signal(
     """
     str_paths = [p for p in paths if isinstance(p, str) and p.strip()]
     signal: dict[str, Any] = {
-        "_pr_changed_files": str_paths[:50],
+        "_pr_changed_files": str_paths[:_CHANGED_FILES_STAMP_CAP],
         "_pr_changed_files_has_test": any(_is_test_path(p) for p in str_paths),
         "_pr_changed_files_has_prod": any(not _is_test_path(p) for p in str_paths),
     }
-    if len(str_paths) > 50:
+    if len(str_paths) > _CHANGED_FILES_STAMP_CAP:
         signal["_pr_changed_files_truncated"] = True
     if github_verified:
         signal["_pr_changed_files_github_verified"] = True
@@ -281,6 +288,11 @@ _CROSS_CUTTING_TEST_FILES: frozenset[str] = frozenset({
     "backend/testing/test_c5_approval_gate_invariant.py",
     "backend/testing/test_event_type_invariants.py",
     "backend/testing/test_schema_invariants.py",
+    # Validates the CI-compliance fetch/gate + cap-bump remediation flow, which
+    # spans ci_compliance, strategic_spawning, strategic_completion,
+    # release_version and models — no single ``ci_compliance_gate.py`` module
+    # exists, so its stem cannot ground via the per-module heuristic.
+    "backend/testing/test_ci_compliance_gate.py",
 })
 
 
@@ -295,27 +307,44 @@ def get_cross_cutting_test_files() -> frozenset[str]:
 # and semantic *grounding* cannot drift apart.
 _JS_TS_TEST_BASENAME_RE = re.compile(r"^(?P<stem>.+)\.(?:test|spec)\.[cm]?[jt]sx?$")
 
+# Suffix-style test-file naming: ``<stem>_test.py`` / ``<stem>_test.go`` /
+# ``<stem>_test.exs`` / ``<stem>_spec.rb`` → ``<stem>``. These conventions are
+# RECOGNIZED by test-file *detection* (:data:`app.payload_schemas._TEST_FILE_BASENAME_RE`)
+# but were previously invisible to stem *grounding*, which only understood the
+# ``test_<module>`` prefix. Mirroring the suffix set here keeps detection and
+# grounding from drifting apart (the same rationale as the JS/TS regex above),
+# so a legitimately-declared ``foo_test.py`` co-changed with ``foo.py`` can earn
+# machine-checked proof instead of silently failing closed.
+_SUFFIX_TEST_BASENAME_RE = re.compile(r"^(?P<stem>.+)_(?:test\.(?:py|go|exs?)|spec\.rb)$")
+
 
 def _test_module_stem(test_basename: str) -> str | None:
     """Extract the production-module stem a test file is named after.
 
-    Understands both the Python ``test_<module>.py`` convention (→ ``module``)
-    and the vitest/jest ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions
-    (→ ``module``). ``test_basename`` is the file basename *including* its
-    extension.
+    Understands the Python ``test_<module>.py`` prefix convention (→ ``module``),
+    the vitest/jest ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions
+    (→ ``module``), and the suffix conventions ``<module>_test.py`` /
+    ``<module>_test.go`` / ``<module>_test.exs`` / ``<module>_spec.rb``
+    (→ ``module``) — every shape test-file detection already recognizes.
+    ``test_basename`` is the file basename *including* its extension.
 
     Returns ``None`` (fail closed) for any name that follows no recognized
-    convention (e.g. ``foo_test.py``), so the caller cannot grant
-    machine-checked proof it is unable to ground.
+    convention (e.g. ``random.py``), so the caller cannot grant machine-checked
+    proof it is unable to ground.
     """
     js_match = _JS_TS_TEST_BASENAME_RE.match(test_basename)
     if js_match:
         return js_match.group("stem") or None
-    # Python: strip the file extension, then the leading ``test_`` prefix.
+    # Prefix convention: strip the file extension, then the leading ``test_``.
     py_stem = test_basename.rsplit(".", 1)[0]
     if py_stem.startswith("test_"):
         module = py_stem[len("test_"):]
         return module or None
+    # Suffix convention: ``<module>_test.<ext>`` / ``<module>_spec.rb`` — a real,
+    # detection-recognized test-file shape the prefix branch cannot capture.
+    suffix_match = _SUFFIX_TEST_BASENAME_RE.match(test_basename)
+    if suffix_match:
+        return suffix_match.group("stem") or None
     return None
 
 
@@ -325,16 +354,17 @@ def _test_semantically_grounded(
     """Whether a declared test path semantically corresponds to a changed seam.
 
     A heuristic that the test file's module stem must match at least one changed
-    non-test file's module name exactly. The stem is derived from either the
-    Python ``test_<module>.py`` convention or the vitest/jest
-    ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions (see
+    non-test file's module name exactly. The stem is derived from the Python
+    ``test_<module>.py`` prefix convention, the vitest/jest
+    ``<module>.test.tsx`` / ``<module>.spec.ts`` conventions, or the suffix
+    conventions ``<module>_test.py`` / ``<module>_spec.rb`` (see
     :func:`_test_module_stem`). A declaration of ``test_acceptance_gate.py``
     must co-occur with a change to ``acceptance_gate.py``; a declaration of
     ``ComputeJobsPanel.test.tsx`` must co-occur with a change to
     ``ComputeJobsPanel.tsx`` (or ``.ts``) — not just any production file.
 
-    Files that follow no recognized test-naming convention (e.g.
-    ``foo_test.py``) fail closed: the heuristic cannot ground them, so the gate
+    Files that follow no recognized test-naming convention (e.g. a bare
+    ``random.py``) fail closed: the heuristic cannot ground them, so the gate
     errs on the side of not granting machine-checked proof.
     """
     test_basename = declared_test_path.rsplit("/", 1)[-1]
@@ -1553,3 +1583,36 @@ def acceptance_window_sub_scores_violations(sub_scores: dict) -> list[str]:
             )
 
     return violations
+
+
+# ---------------------------------------------------------------------------
+# Required-diff-paths completion contract
+# ---------------------------------------------------------------------------
+
+
+def check_required_diff_paths(
+    task: Task, changed_files: list[str]
+) -> list[str]:
+    """Return declared required_diff_paths that are absent from the PR diff.
+
+    When the task's first_payload declares ``required_diff_paths``, every listed
+    path must appear in ``changed_files``. The comparison is exact-string (after
+    stripping leading slashes so both ``backend/app/foo.py`` and
+    ``/backend/app/foo.py`` normalise identically). Returns an empty list when
+    all declared paths are present, no paths are declared, or ``changed_files``
+    is empty and no paths are declared (fail-open for undeclared tasks).
+
+    Callers that receive a non-empty return value MUST reject the PR submission
+    with an actionable error naming the missing paths — fail-closed when declared.
+    """
+    first_payload = task.first_payload or {}
+    required: list[str] | None = first_payload.get("required_diff_paths")
+    if not required:
+        return []
+
+    changed_normalised = {p.lstrip("/") for p in changed_files if isinstance(p, str)}
+    missing = [
+        p for p in required
+        if isinstance(p, str) and p.lstrip("/") not in changed_normalised
+    ]
+    return missing

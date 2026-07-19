@@ -137,6 +137,10 @@ export interface ResidentConfig {
   /** Minimum wall-clock cooldown between compactions (ms). Prevents double-compacting
    *  when consecutive turns both land above the threshold. Default: 5 min. */
   compactionCooldownMs: number;
+  /** Early operator-turn acknowledgment threshold (ms). When an operator turn
+   *  exceeds this duration, a durable "on it" message is posted so the operator
+   *  gets a progress signal during a slow turn. 0 = disabled. Default: 10s. */
+  operatorAckThresholdMs: number;
 }
 
 function num(v: unknown, fallback: number): number {
@@ -277,6 +281,9 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     ? num(payload.strategic_session_compaction_threshold_tokens, 0)
     : undefined;
   const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
+  const ackThresholdSec = num(payload.strategic_session_operator_ack_threshold_seconds, 10);
+  // 0 or negative disables the early ack; positive values clamp to a 1s floor.
+  const operatorAckThresholdMs = ackThresholdSec <= 0 ? 0 : Math.max(1000, Math.round(ackThresholdSec * 1000));
   return {
     idleTickMs,
     // Poll operator messages faster than the heartbeat tick so a turn starts
@@ -291,6 +298,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     maxOpsPerTurn,
     compactionThresholdTokens,
     compactionCooldownMs: Math.max(60_000, Math.round(compactionCooldownSec * 1000)),
+    operatorAckThresholdMs,
   };
 }
 
@@ -412,6 +420,10 @@ export interface CheckpointStateResponse {
    *  open_messages). Present on backends that have shipped this field; absent
    *  on older responses — caller degrades gracefully. */
   open_messages?: unknown;
+  /** Recently-answered operator conversation tail (status handled/resolved).
+   *  Present on backends that have shipped this field; absent on older
+   *  responses — caller degrades gracefully. */
+  recent_handled_conversation?: unknown;
 }
 
 /** The self-model grounding fields the compaction checkpoint carries. */
@@ -423,6 +435,10 @@ export interface CheckpointGrounding {
   /** Formatted open operator messages text (from open_messages). Absent when
    *  not yet computed (older path) or when there are no open messages. */
   openMessagesText?: string;
+  /** Formatted recently-answered operator conversation tail (from
+   *  recent_handled_conversation). Absent when not yet computed (older path) or
+   *  when there is no recent handled conversation. */
+  recentHandledConversationText?: string;
 }
 
 /**
@@ -443,17 +459,34 @@ export function formatCheckpointState(resp: CheckpointStateResponse): Checkpoint
     strategicMemoryNotesText: formatStrategicMemoryNotes(resp.strategic_memory_notes),
     runningUpdate: typeof resp.running_update === 'string' ? resp.running_update : '',
     openMessagesText: '',
+    recentHandledConversationText: '',
   };
 }
 
 /**
- * Resolve the four grounding sub-fields for the compaction checkpoint,
- * preferring grounding refreshed at compaction time over the session-start
- * snapshot. When `refreshed` is present (the checkpoint-state fetch succeeded)
- * its values win entirely — even an empty field, so a mid-session clear (e.g.
- * the operator wipes the running update) is reflected rather than reverting to
- * the stale snapshot. When absent (fetch failed or never ran) the snapshot is
- * used. Empty strings collapse to `undefined` so the checkpoint omits that
+ * Resolve the grounding sub-fields for the compaction checkpoint, preferring
+ * grounding refreshed at compaction time over the session-start snapshot.
+ *
+ * When `refreshed` is absent (the checkpoint-state fetch failed or never ran)
+ * the snapshot is used wholesale. When present, the fields resolve with a
+ * DELIBERATE ASYMMETRY — do NOT "simplify" this back into a whole-object
+ * `refreshed ?? snapshot` switch:
+ *
+ *  - STRUCTURAL fields (problemModelJson, visionJson, strategicMemoryNotesText,
+ *    runningUpdate) fall back FIELD-BY-FIELD: a refreshed value that is
+ *    empty/blank is treated as a transient degraded server read (e.g.
+ *    _agent_view_problem_model / _agent_visible_vision formatting to empty) and
+ *    the session-start snapshot value is used instead. Losing the problem model
+ *    or vision to a momentary empty refetch is a coherence loss we refuse to
+ *    take; a genuine mid-session edit still refreshes because it returns a
+ *    non-empty value.
+ *  - openMessagesText and recentHandledConversationText are the EXCEPTION: a
+ *    refreshed EMPTY value must WIN over the stale bootstrap snapshot. Messages
+ *    the operator's turn just handled should DISAPPEAR from the open feed (and
+ *    appear in the fresh recently-answered tail), so here empty-refreshed beats
+ *    snapshot rather than falling back to it.
+ *
+ * Empty strings collapse to `undefined` so the checkpoint omits that
  * sub-section, matching the existing `refreshedDirectionGrounding` fallback.
  */
 export function resolveCheckpointGrounding(
@@ -465,14 +498,34 @@ export function resolveCheckpointGrounding(
   strategicMemoryNotesText?: string;
   runningUpdate?: string;
   openMessagesText?: string;
+  recentHandledConversationText?: string;
 } {
-  const src = refreshed ?? snapshot;
+  // No refetch → whole-snapshot fallback (unchanged behavior).
+  if (refreshed == null) {
+    return {
+      problemModelJson: snapshot.problemModelJson || undefined,
+      visionJson: snapshot.visionJson || undefined,
+      strategicMemoryNotesText: snapshot.strategicMemoryNotesText || undefined,
+      runningUpdate: snapshot.runningUpdate || undefined,
+      openMessagesText: snapshot.openMessagesText || undefined,
+      recentHandledConversationText: snapshot.recentHandledConversationText || undefined,
+    };
+  }
+  // Refetch succeeded. Structural fields fall back to the snapshot when the
+  // refreshed value is blank (transient degraded read); openMessagesText lets a
+  // refreshed empty WIN (see the asymmetry note above).
+  const structural = (refreshedVal: string, snapshotVal: string): string | undefined =>
+    (refreshedVal && refreshedVal.trim() ? refreshedVal : snapshotVal) || undefined;
   return {
-    problemModelJson: src.problemModelJson || undefined,
-    visionJson: src.visionJson || undefined,
-    strategicMemoryNotesText: src.strategicMemoryNotesText || undefined,
-    runningUpdate: src.runningUpdate || undefined,
-    openMessagesText: src.openMessagesText || undefined,
+    problemModelJson: structural(refreshed.problemModelJson, snapshot.problemModelJson),
+    visionJson: structural(refreshed.visionJson, snapshot.visionJson),
+    strategicMemoryNotesText: structural(refreshed.strategicMemoryNotesText, snapshot.strategicMemoryNotesText),
+    runningUpdate: structural(refreshed.runningUpdate, snapshot.runningUpdate),
+    openMessagesText: refreshed.openMessagesText || undefined,
+    // Same rule as openMessagesText: the refreshed recently-answered tail is the
+    // current source of truth, so let it WIN over the session-start snapshot
+    // (including when a successful refetch returns an empty tail).
+    recentHandledConversationText: refreshed.recentHandledConversationText || undefined,
   };
 }
 
@@ -497,6 +550,9 @@ export interface CompactionCheckpointContext {
   strategicMemoryNotesText?: string;
   /** Formatted open operator messages text (payload.open_messages). */
   openMessagesText?: string;
+  /** Formatted recently-answered operator conversation tail
+   *  (payload.recent_handled_conversation). Read-only, non-actionable. */
+  recentHandledConversationText?: string;
   /** Prior session context text (ctx._session_summary). */
   priorSessionContextText?: string;
   /** Formatted active directions summary (payload.directions_summary). */
@@ -505,12 +561,36 @@ export interface CompactionCheckpointContext {
   runningUpdate?: string;
   /** Formatted decisions register text (durable cross-tick decision memory). */
   decisionsRegisterText?: string;
+  // ── Static session-start grounding (same snapshot forward every checkpoint) ─
+  // These mirror three bootstrap sections that would otherwise vanish after a
+  // compaction restart, letting the resumed session re-derive settled facts or
+  // re-propose already-retired/staged directions. They are session-start values
+  // (not server-mutable grounding), so no refetch is needed — the same snapshot
+  // carries forward on every checkpoint.
+  /** Formatted recently retired / completed directions (buildRetiredContextText). */
+  retiredDirectionsText?: string;
+  /** Formatted already-staged (next-version) directions (buildStagedDirectionsText). */
+  stagedDirectionsText?: string;
+  /** Formatted prior-cycle decision outcomes (buildPriorDecisionsText). */
+  previousDecisionOutcomesText?: string;
   /**
    * True when the self-model grounding was re-fetched from the checkpoint-state
    * endpoint at compaction time (so it reflects current, not session-start,
    * state). Softens the "session-start snapshot" note. Defaults to false.
    */
   groundingRefreshed?: boolean;
+  // ── Session-static bootstrap sections (operator purpose + tool grounding) ──
+  // These are NOT server-mutable mid-session so they never go through the
+  // checkpoint-state refresh path — the same session-start values carry forward
+  // on every checkpoint.  Without them a compacted session loses the operator
+  // purpose/constraints preamble, project skills, and tool-content context that
+  // every autonomous tick starts with.
+  /** Operator purpose, current focus, and constraints preamble (buildContextPrefix). */
+  contextPrefix?: string;
+  /** Formatted project skills from `.blueprint/tools.json`. */
+  skillsText?: string;
+  /** Formatted built-in tool content (operator notes, whiteboard). */
+  toolContentText?: string;
 }
 
 /**
@@ -597,9 +677,51 @@ ${ctx.autonomousState.trim()}`);
     }
   }
 
+  // (v-b) Recently-answered operator conversation tail — READ-ONLY. These
+  // messages are already handled/resolved; they are here only so a correction
+  // the operator made that was never captured as an OPERATOR-DECISION survives
+  // this restart. Do NOT re-answer or re-act on them.
+  if (ctx.recentHandledConversationText?.trim()) {
+    sections.push(`## Recently answered operator conversation (read-only — already handled, do NOT re-answer)
+If any of these settled or corrected a course but is NOT already reflected in your decisions register above, treat it as settled — do not re-propose it.
+
+${ctx.recentHandledConversationText.trim()}`);
+  }
+
   // (vi) Durable decisions register — preserved across restarts.
   if (ctx.decisionsRegisterText?.trim()) {
     sections.push(ctx.decisionsRegisterText.trim());
+  }
+
+  // (vii) Static session-start grounding the bootstrap renders but the
+  // checkpoint previously dropped — so the resumed session does NOT re-derive
+  // settled facts or re-propose already-retired/staged directions. Wording
+  // mirrors buildBootstrapPrompt exactly.
+  if (ctx.stagedDirectionsText?.trim()) {
+    sections.push(`## Already-staged (next-version) directions\n${ctx.stagedDirectionsText.trim()}`);
+  }
+  if (ctx.retiredDirectionsText?.trim()) {
+    sections.push(`## Recently retired / completed directions\n${ctx.retiredDirectionsText.trim()}`);
+  }
+  if (ctx.previousDecisionOutcomesText?.trim()) {
+    sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
+  }
+
+  // (viii) Session-static bootstrap sections — operator purpose + tool grounding.
+  // These mirror the bootstrap sections that carry operator purpose, constraints,
+  // project skills, and tool content.  Without them a post-compaction session
+  // operates without foundational operator grounding every tick normally sees.
+  if (ctx.contextPrefix?.trim()) {
+    sections.push(ctx.contextPrefix.trim());
+  }
+  if (ctx.skillsText?.trim()) {
+    sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
+  }
+  if (ctx.toolContentText?.trim()) {
+    sections.push(`## Project Tool Content
+(Live content the operator jotted in this project's built-in tools — notes and whiteboard sketches. Treat it as operator input, not authoritative state. Pull the latest with \`./fetch tools\` if you need to re-read it mid-session.)
+
+${ctx.toolContentText.trim()}`);
   }
 
   sections.push(`Resume from this checkpoint. Your next turn will arrive as a
@@ -992,12 +1114,22 @@ export interface BootstrapContext {
   strategicMemoryNotesText?: string;
   visionJson: string;
   openMessagesText: string;
+  /** Formatted recently-answered operator conversation tail
+   *  (payload.recent_handled_conversation). Rendered as a read-only,
+   *  non-actionable section so a marker-less operator correction survives a full
+   *  session restart. Empty string or whitespace → section omitted. Absent or
+   *  omitted defaults to ''. */
+  recentHandledConversationText?: string;
   sessionId: string;
   fetchGuidanceText?: string;
   priorSessionContextText?: string;
   /** Formatted project skills text from `.blueprint/tools.json`. Rendered as a
    *  `## Project Skills` section when non-empty. Absent or omitted defaults to ''. */
   skillsText?: string;
+  /** Formatted built-in tool content (operator's notes markdown, whiteboard
+   *  summary). Rendered as a `## Project Tool Content` section when non-empty.
+   *  Absent or omitted defaults to '' (no-op section). */
+  toolContentText?: string;
   /** Pre-rendered durable decisions register (from `decisionsRegisterText`),
    *  restored from persisted `task.context._decisions_reg` on a full session
    *  restart. Carries its own `## Decisions register …` header. Empty string or
@@ -1105,6 +1237,12 @@ ${ctx.strategicMemoryNotesText.trim()}`);
   if (ctx.skillsText?.trim()) {
     sections.push(`## Project Skills\n${ctx.skillsText.trim()}`);
   }
+  if (ctx.toolContentText?.trim()) {
+    sections.push(`## Project Tool Content
+(Live content the operator jotted in this project's built-in tools — notes and whiteboard sketches. Treat it as operator input, not authoritative state. Pull the latest with \`./fetch tools\` if you need to re-read it mid-session.)
+
+${ctx.toolContentText.trim()}`);
+  }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);
   }
@@ -1113,6 +1251,17 @@ ${ctx.strategicMemoryNotesText.trim()}`);
   }
   if (ctx.openMessagesText.trim()) {
     sections.push(`## Open operator messages\n${ctx.openMessagesText.trim()}`);
+  }
+  // Recently-answered operator conversation tail — READ-ONLY. These messages are
+  // already handled/resolved, so they are NOT an inbox and must not be
+  // re-answered. Rendered so a correction the operator made that was never
+  // captured as an OPERATOR-DECISION still survives this full restart and the
+  // strategist stops re-proposing what the operator already settled.
+  if (ctx.recentHandledConversationText?.trim()) {
+    sections.push(`## Recently answered operator conversation (read-only — already handled, do NOT re-answer)
+If any of these settled or corrected a course but is NOT already reflected in your decisions register below, treat it as settled — do not re-propose it.
+
+${ctx.recentHandledConversationText.trim()}`);
   }
   // Durable decisions register — settled cross-tick decisions restored from the
   // persisted context on a full session restart. Rendered here (mirroring the
@@ -1320,6 +1469,48 @@ const SETTLED_DECISION_VERDICTS: ReadonlySet<string> = new Set([
 export function isSettledDecisionVerdict(verdict: string): boolean {
   return SETTLED_DECISION_VERDICTS.has(verdict);
 }
+
+/** Verdicts evicted FIRST when the decisions register is over its cap. A
+ *  `clear` ("nothing actionable on the examined surface") is the designed-common
+ *  autonomous outcome, so a high-volume flood of them must not crowd out and
+ *  evict the scarce operator/advanced/found settlements the register exists to
+ *  preserve — worst at the autonomous<->operator boundary this guards. Any
+ *  verdict NOT in this set (operator/advanced/found) is protected: it is only
+ *  evicted once no low-priority entry remains. */
+const EVICT_FIRST_VERDICTS: ReadonlySet<string> = new Set(['clear']);
+
+/**
+ * Index of the next entry to evict when the decisions register is over cap:
+ * the oldest (lowest-index) low-priority (`clear`) entry, or index 0 (oldest
+ * overall) when no low-priority entry remains. Callers must guard on a
+ * non-empty register. Pure.
+ */
+function decisionEvictIndex(register: DecisionsRegisterEntry[]): number {
+  const idx = register.findIndex(e => EVICT_FIRST_VERDICTS.has(e.verdict));
+  return idx >= 0 ? idx : 0;
+}
+
+/**
+ * Admit `entry` into the durable decisions register with priority-aware
+ * eviction. Appends the entry, then — while the register exceeds `cap` —
+ * evicts the oldest low-priority (`clear`) entry first, falling back to the
+ * oldest entry overall only when no low-priority entry remains. This keeps
+ * scarce operator/advanced/found settlements from being crowded out by routine
+ * clears (the FIFO the register previously used evicted purely by age, so a
+ * flood of clears silently dropped operator corrections). Mutates and returns
+ * `register` in place. Pure aside from that mutation.
+ */
+export function admitDecisionEntry(
+  register: DecisionsRegisterEntry[],
+  entry: DecisionsRegisterEntry,
+  cap: number = DECISIONS_REGISTER_CAP,
+): DecisionsRegisterEntry[] {
+  register.push(entry);
+  while (register.length > cap) {
+    register.splice(decisionEvictIndex(register), 1);
+  }
+  return register;
+}
 /** Default number of focus surfaces surfaced in the prompt each tick. */
 export const FOCUS_LIST_SIZE = 3;
 /** Default floor-tick interval (ms): even with no state change, review at least
@@ -1333,6 +1524,128 @@ export const EXAM_NOTE_CAP = 240;
  * Set to 16_000 to leave headroom for the surrounding heartbeat note envelope.
  */
 export const EXAM_LEDGER_MAX_BYTES = 16_000;
+
+export interface PendingOperatorDecisionReview {
+  status: 'pending';
+  messageIds: string[];
+  exchangeText?: string;
+  exchangeTextTruncated?: true;
+  startedAt: string;
+  attempts: number;
+  queuedExchanges?: Array<{
+    messageIds: string[];
+    exchangeText?: string;
+    exchangeTextTruncated?: true;
+    startedAt: string;
+    attempts: number;
+  }>;
+  overflowed?: true;
+  overflowExchanges?: number;
+}
+
+const OPERATOR_DECISION_REVIEW_MESSAGE_CAP = 20;
+const OPERATOR_DECISION_REVIEW_TEXT_CAP = 384;
+
+export function mergePendingOperatorDecisionReview(
+  current: PendingOperatorDecisionReview | null,
+  messageIds: string[],
+  startedAt: string,
+  exchangeText = '',
+): PendingOperatorDecisionReview {
+  const ids = messageIds
+    .filter((id, index, all) => typeof id === 'string' && id.length > 0 && all.indexOf(id) === index)
+    .slice(-OPERATOR_DECISION_REVIEW_MESSAGE_CAP);
+  if (current) {
+    const knownIds = new Set([
+      ...current.messageIds,
+      ...(current.queuedExchanges ?? []).flatMap(exchange => exchange.messageIds),
+    ]);
+    const newIds = ids.filter(id => !knownIds.has(id));
+    if (newIds.length === 0) return current;
+    const queuedExchanges = current.queuedExchanges ?? [];
+    if (current.overflowed) {
+      return {
+        ...current,
+        overflowed: true,
+        overflowExchanges: (current.overflowExchanges ?? 0) + 1,
+      };
+    }
+    const normalizedText = exchangeText.trim();
+    const boundedText = normalizedText.slice(0, OPERATOR_DECISION_REVIEW_TEXT_CAP);
+    return {
+      ...current,
+      queuedExchanges: [
+        ...queuedExchanges,
+        {
+          messageIds: newIds,
+          ...(boundedText ? { exchangeText: boundedText } : {}),
+          ...(normalizedText.length > boundedText.length ? { exchangeTextTruncated: true } : {}),
+          startedAt,
+          attempts: 0,
+        },
+      ],
+    };
+  }
+  const normalizedText = exchangeText.trim();
+  const boundedText = normalizedText.slice(0, OPERATOR_DECISION_REVIEW_TEXT_CAP);
+  return {
+    status: 'pending',
+    messageIds: ids,
+    ...(boundedText ? { exchangeText: boundedText } : {}),
+    ...(normalizedText.length > boundedText.length ? { exchangeTextTruncated: true } : {}),
+    startedAt,
+    attempts: 0,
+  };
+}
+
+/**
+ * Number of consecutive failed autonomous review turns (missing/malformed marker)
+ * after which a stalled operator-decision review is force-admitted into the durable
+ * register as an exchange text fallback — so the original operator correction is
+ * not silently lost at the next restart or compaction. The caller checks
+ * `retained.attempts >= MAX_REVIEW_ATTEMPTS` immediately after retaining.
+ */
+export const MAX_REVIEW_ATTEMPTS = 3;
+
+export function retainPendingOperatorDecisionReview(
+  current: PendingOperatorDecisionReview,
+): PendingOperatorDecisionReview {
+  return { ...current, attempts: current.attempts + 1 };
+}
+
+export function advancePendingOperatorDecisionReview(
+  current: PendingOperatorDecisionReview,
+  options: { coversOverflow?: boolean } = {},
+): PendingOperatorDecisionReview | null {
+  const queued = current.queuedExchanges ?? [];
+  if (queued.length > 0) {
+    const [next, ...remaining] = queued;
+    return {
+      status: 'pending',
+      messageIds: next.messageIds,
+      ...(next.exchangeText ? { exchangeText: next.exchangeText } : {}),
+      ...(next.exchangeTextTruncated ? { exchangeTextTruncated: true } : {}),
+      startedAt: next.startedAt,
+      attempts: next.attempts,
+      ...(remaining.length > 0 ? { queuedExchanges: remaining } : {}),
+      ...(current.overflowed ? { overflowed: true } : {}),
+      ...(current.overflowExchanges ? { overflowExchanges: current.overflowExchanges } : {}),
+    };
+  }
+  if (current.overflowed) {
+    if (current.messageIds.length === 0) return options.coversOverflow ? null : current;
+    return {
+      status: 'pending',
+      messageIds: [],
+      exchangeTextTruncated: true,
+      startedAt: current.startedAt,
+      attempts: 0,
+      overflowed: true,
+      ...(current.overflowExchanges ? { overflowExchanges: current.overflowExchanges } : {}),
+    };
+  }
+  return null;
+}
 
 // The diagnostic read verbs (a subset of STRATEGIC_FETCH_VERBS in
 // strategic-helpers.ts) that make good STANDING examination surfaces. Kept as a
@@ -1434,11 +1747,31 @@ export function nextFocus(
 }
 
 /**
+ * Strip leading markdown decoration (blockquote `>`, one list bullet `- * + •`,
+ * and an emphasis-open `** __ * _`) plus a trailing emphasis-close from a
+ * candidate marker line, so a model that renders `**TICK-VERDICT: CLEAR ...**`,
+ * `- OPERATOR-DECISION: ...`, or `> TICK-VERDICT: FOUND ...` still parses. Only
+ * line-leading list/quote/emphasis tokens are removed — an inline mention like
+ * "you asked about OPERATOR-DECISION:" keeps its leading prose, so the tight
+ * `^\s*<LABEL>:` anchors below still reject it (mid-reply mentions stay ignored).
+ */
+export function stripMarkerDecoration(line: string): string {
+  return line
+    // leading blockquote markers, then at most one list bullet
+    .replace(/^\s*(?:>\s*)*(?:[-*+•]\s+)?/, '')
+    // leading emphasis-open (**, __, *, _) left after the bullet, if any
+    .replace(/^\s*[*_]{1,3}\s*/, '')
+    // trailing emphasis-close (**, __, *, _)
+    .replace(/\s*[*_]{1,3}\s*$/, '');
+}
+
+/**
  * Parse the trailing TICK-VERDICT marker line from a turn's result text. Scans
  * from the LAST line so a mid-turn mention cannot be mistaken for the verdict.
  * ADVANCED carries no surface (it is about applied ops); FOUND/CLEAR name the ONE
- * surface examined. Returns null when no valid marker is present (missing/garbled
- * → treated as a contract violation by classifyTickOutcome).
+ * surface examined. Markdown decoration around the marker (bold/bullet/blockquote)
+ * is tolerated via stripMarkerDecoration. Returns null when no valid marker is
+ * present (missing/garbled → treated as a contract violation by classifyTickOutcome).
  */
 export function parseTickVerdict(
   resultText: string,
@@ -1446,7 +1779,7 @@ export function parseTickVerdict(
   if (typeof resultText !== 'string') return null;
   const lines = resultText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = /^\s*TICK-VERDICT:\s*(ADVANCED|FOUND|CLEAR)\b\s*(.*)$/i.exec(lines[i]);
+    const m = /^\s*TICK-VERDICT:\s*(ADVANCED|FOUND|CLEAR)\b\s*(.*)$/i.exec(stripMarkerDecoration(lines[i]));
     if (!m) continue;
     const verdict = m[1].toLowerCase() as 'advanced' | 'found' | 'clear';
     const rest = m[2].trim();
@@ -1476,15 +1809,16 @@ export function parseTickVerdict(
  * result text. The resident strategist is instructed (bootstrap prompt) to end a
  * reply with `OPERATOR-DECISION: <settled fact>` whenever the operator corrects
  * or settles a course in live chat. Scans from the LAST line so a mid-reply
- * mention cannot be mistaken for the marker. Returns the settled-fact note
- * (leading dash stripped), or null when no marker is present or its note is
- * empty. Pure — unit-testable in isolation.
+ * mention cannot be mistaken for the marker. Markdown decoration around the
+ * marker (bold/bullet/blockquote) is tolerated via stripMarkerDecoration.
+ * Returns the settled-fact note (leading dash stripped), or null when no marker
+ * is present or its note is empty. Pure — unit-testable in isolation.
  */
 export function parseOperatorDecision(resultText: string): string | null {
   if (typeof resultText !== 'string') return null;
   const lines = resultText.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
-    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(lines[i]);
+    const m = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(stripMarkerDecoration(lines[i]));
     if (!m) continue;
     const note = m[1].replace(/^[—–-]\s*/, '').trim();
     return note.length > 0 ? note : null;
@@ -1492,10 +1826,116 @@ export function parseOperatorDecision(resultText: string): string | null {
   return null;
 }
 
+export type OperatorDecisionReviewResolution = 'no-decision' | 'unresolved';
+
+export interface OperatorDecisionReviewOutcome {
+  kind: 'recovered' | 'no-decision' | 'pending';
+  note?: string;
+  coversOverflow?: boolean;
+  statusNote?: string;
+}
+
+export function classifyOperatorDecisionReview(params: {
+  resultText: string;
+  accumulatedTurnText?: string;
+  interrupted?: boolean;
+}): OperatorDecisionReviewOutcome {
+  if (params.interrupted) {
+    return {
+      kind: 'pending',
+      statusNote: 'operator-decision review interrupted — durable review remains pending',
+    };
+  }
+
+  type ReviewMarker =
+    | { kind: 'decision'; note: string | null; normalized: string }
+    | {
+      kind: 'review';
+      resolution: OperatorDecisionReviewResolution | 'overflow-no-decision' | 'overflow-decision' | null;
+      note?: string | null;
+      normalized: string;
+    };
+  const markersIn = (text: string): ReviewMarker[] => {
+    if (typeof text !== 'string') return [];
+    const markers: ReviewMarker[] = [];
+    for (const line of text.split('\n')) {
+      const normalized = stripMarkerDecoration(line).trim();
+      const decision = /^\s*OPERATOR-DECISION:\s*(.*)$/i.exec(normalized);
+      if (decision) {
+        const note = decision[1].replace(/^[—–-]\s*/, '').trim();
+        markers.push({ kind: 'decision', note: note || null, normalized: normalized.toLowerCase() });
+        continue;
+      }
+      const review = /^\s*OPERATOR-DECISION-REVIEW:\s*(.*)$/i.exec(normalized);
+      if (review) {
+        const value = review[1].trim().toUpperCase();
+        const overflowDecision = /^OVERFLOW-DECISION\s*:\s*(.*)$/i.exec(review[1].trim());
+        const resolution = /^OVERFLOW-NO-DECISION\b/.test(value) ? 'overflow-no-decision'
+          : overflowDecision ? 'overflow-decision'
+          : /^NO-DECISION\b/.test(value) ? 'no-decision'
+          : /^UNRESOLVED\b/.test(value) ? 'unresolved' : null;
+        const note = overflowDecision?.[1].replace(/^[—–-]\s*/, '').trim() || null;
+        markers.push({ kind: 'review', resolution, note, normalized: normalized.toLowerCase() });
+      }
+    }
+    return markers;
+  };
+
+  const resultMarkers = markersIn(params.resultText);
+  const accumulatedMarkers = markersIn(params.accumulatedTurnText ?? '');
+  const bySource = [resultMarkers, accumulatedMarkers];
+  const markerCounts = new Map<string, { marker: ReviewMarker; count: number }>();
+  for (const markers of bySource) {
+    const sourceCounts = new Map<string, { marker: ReviewMarker; count: number }>();
+    for (const marker of markers) {
+      const entry = sourceCounts.get(marker.normalized);
+      sourceCounts.set(marker.normalized, { marker, count: (entry?.count ?? 0) + 1 });
+    }
+    for (const [key, entry] of sourceCounts) {
+      if (entry.count > (markerCounts.get(key)?.count ?? 0)) markerCounts.set(key, entry);
+    }
+  }
+  const markers = [...markerCounts.values()].flatMap(({ marker, count }) =>
+    Array.from({ length: count }, () => marker));
+
+  if (markers.length === 1) {
+    const [marker] = markers;
+    if (marker.kind === 'decision' && marker.note !== null) {
+      return { kind: 'recovered', note: marker.note };
+    }
+    if (marker.kind === 'review' && marker.resolution === 'no-decision') {
+      return { kind: 'no-decision' };
+    }
+    if (marker.kind === 'review' && marker.resolution === 'overflow-no-decision') {
+      return { kind: 'no-decision', coversOverflow: true };
+    }
+    if (marker.kind === 'review' && marker.resolution === 'overflow-decision' && marker.note) {
+      return { kind: 'recovered', note: marker.note, coversOverflow: true };
+    }
+    if (marker.kind === 'review' && marker.resolution === 'unresolved') {
+      return {
+        kind: 'pending',
+        statusNote: 'operator-decision review unresolved — durable review remains pending',
+      };
+    }
+  }
+
+  return {
+    kind: 'pending',
+    statusNote: markers.length === 0
+      ? 'operator-decision review missing a valid resolution marker — durable review remains pending'
+      : 'operator-decision review emitted conflicting, duplicate, or malformed outcome markers — durable review remains pending',
+  };
+}
+
 /** Whether a turn declared more actionable work remains (a literal AGENDA-CONTINUE
- *  line), gating an immediate re-tick in shouldRunAutonomousTurn. */
+ *  line), gating an immediate re-tick in shouldRunAutonomousTurn. Tolerates the
+ *  same leading markdown decoration (blockquote/bullet/emphasis) as the verdict
+ *  and operator-decision markers so a decorated line is not silently dropped. */
 export function parseAgendaContinue(resultText: string): boolean {
-  return /^\s*AGENDA-CONTINUE\b/im.test(typeof resultText === 'string' ? resultText : '');
+  return /^\s*(?:>\s*)*(?:[-*+•]\s+)?(?:[*_]{1,3}\s*)?AGENDA-CONTINUE\b/im.test(
+    typeof resultText === 'string' ? resultText : '',
+  );
 }
 
 /** The FOUND leads still open — the latest record per surface that is a FOUND
@@ -1535,6 +1975,9 @@ export interface TickLedgerUpdate {
  */
 export function classifyTickOutcome(params: {
   resultText: string;
+  /** Streamed text retained separately from the authoritative terminal result.
+   *  Consult it only when a given marker is absent from resultText. */
+  accumulatedTurnText?: string;
   sawToolUse: boolean;
   focus: ExamSurface[];
   atTick: number;
@@ -1553,8 +1996,10 @@ export function classifyTickOutcome(params: {
     };
   }
 
-  const verdict = parseTickVerdict(params.resultText);
-  const agendaContinue = parseAgendaContinue(params.resultText);
+  const verdict = parseTickVerdict(params.resultText)
+    ?? parseTickVerdict(params.accumulatedTurnText ?? '');
+  const agendaContinue = parseAgendaContinue(params.resultText)
+    || parseAgendaContinue(params.accumulatedTurnText ?? '');
 
   if (!verdict) {
     return {
@@ -1632,12 +2077,45 @@ export function buildAutonomousPrompt(
   corrective: boolean,
   maxOpsPerTurn = 3,
   decisionsRegisterText = '',
+  operatorDecisionReview: PendingOperatorDecisionReview | boolean = false,
 ): string {
   const lines: string[] = [];
 
   if (corrective && focus.length > 0) {
     lines.push(
       `CORRECTION: your last idle conclusion examined nothing (no fetch/read ran, or the verdict marker was missing). Examine ${focus[0].key} now — ${focus[0].hint} — and cite what you actually read BEFORE you may conclude CLEAR.`,
+      '',
+    );
+  }
+
+  if (operatorDecisionReview) {
+    const review = typeof operatorDecisionReview === 'object' ? operatorDecisionReview : null;
+    lines.push(
+      'OPERATOR-DECISION REVIEW (required before normal autonomous work): a recent',
+      'operator exchange ended without a classification marker. Review the recent',
+      'handled operator conversation and emit EXACTLY ONE of these review outcomes:',
+      '  OPERATOR-DECISION: <durable fact> — the exchange settled/corrected a course',
+      '  OPERATOR-DECISION-REVIEW: NO-DECISION — routine Q&A/chat settled nothing',
+      '  OPERATOR-DECISION-REVIEW: UNRESOLVED — evidence is unavailable/ambiguous',
+      'If the metadata says an overflow batch remains, ordinary outcomes classify only',
+      'the current exchange. Clear that batch only after reviewing ALL of its exchanges:',
+      '  OPERATOR-DECISION-REVIEW: OVERFLOW-NO-DECISION — every omitted exchange was routine',
+      '  OPERATOR-DECISION-REVIEW: OVERFLOW-DECISION: <complete durable facts for every omitted exchange>',
+      'Do not guess. Only a recovered/NO-DECISION outcome for an explicit exchange, or',
+      'one of the explicit OVERFLOW outcomes for the complete omitted batch, resolves it;',
+      'UNRESOLVED, malformed output, or interruption keeps it armed for a later turn.',
+      review
+        ? `Pending review metadata: current exchange has ${review.messageIds.length} message id(s) and ${review.attempts} prior attempt(s); ${review.queuedExchanges?.length ?? 0} later exchange(s) remain explicitly queued${review.overflowed ? `, plus ${review.overflowExchanges ?? 1} omitted overflow exchange(s)` : ''}. Classify ONLY the current exchange unless issuing one of the explicit OVERFLOW outcomes for the complete omitted batch.`
+        : '',
+      review && review.messageIds.length > 0
+        ? `Current exchange message id(s): ${review.messageIds.join(', ')}. If the excerpt is incomplete, run ./fetch message <id> before classifying it.`
+        : '',
+      review?.exchangeText
+        ? `Current exchange excerpt (durable across compaction${review.exchangeTextTruncated ? '; truncated' : ''}): ${JSON.stringify(review.exchangeText)}`
+        : '',
+      (review?.overflowed && review.messageIds.length === 0) || review?.exchangeTextTruncated
+        ? 'Some durable context was compacted. Use the excerpt, message identities, and any handled conversation context still available; emit UNRESOLVED if that evidence is insufficient. A valid recovered/NO-DECISION classification may resolve this review.'
+        : '',
       '',
     );
   }
@@ -1732,21 +2210,97 @@ export function serializeLedger(
   records: ExamRecord[],
   tick: number,
   corrective: boolean,
+  operatorDecisionCorrective: boolean = false,
+  operatorDecisionReview: PendingOperatorDecisionReview | null = null,
+  operatorDecisionCapture: { total: number; captured: number } | null = null,
 ): string {
   const truncated = records.slice(-EXAM_RECORDS_CAP).map(r => ({
     ...r,
     note: r.note.slice(0, EXAM_NOTE_CAP),
   }));
+  const encode = (selectedRecords: ExamRecord[], review: PendingOperatorDecisionReview | null): string =>
+    JSON.stringify({
+      records: selectedRecords,
+      tick,
+      corrective,
+      operatorDecisionCorrective: operatorDecisionCorrective || review !== null,
+      operatorDecisionReview: review,
+      operatorDecisionCapture,
+    });
+
   // Drop oldest records until the serialized byte length fits the budget.
   let start = 0;
-  while (start < truncated.length) {
-    const candidate = JSON.stringify({ records: truncated.slice(start), tick, corrective });
+  while (start <= truncated.length) {
+    const candidate = encode(truncated.slice(start), operatorDecisionReview);
     if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) {
       return candidate;
     }
     start++;
   }
-  return JSON.stringify({ records: [], tick, corrective });
+
+  if (operatorDecisionReview !== null) {
+    const compactExchange = (exchange: PendingOperatorDecisionReview): PendingOperatorDecisionReview => ({
+      status: 'pending',
+      messageIds: exchange.messageIds.slice(-1),
+      ...(exchange.exchangeText ? { exchangeText: exchange.exchangeText } : {}),
+      ...(exchange.exchangeTextTruncated || exchange.messageIds.length > 1
+        ? { exchangeTextTruncated: true as const } : {}),
+      startedAt: exchange.startedAt,
+      attempts: exchange.attempts,
+    });
+    const compactedCurrent = compactExchange(operatorDecisionReview);
+    const compactedQueue = (operatorDecisionReview.queuedExchanges ?? []).map(exchange => ({
+      messageIds: exchange.messageIds.slice(-1),
+      ...(exchange.exchangeTextTruncated || exchange.exchangeText || exchange.messageIds.length > 1
+        ? { exchangeTextTruncated: true as const } : {}),
+      startedAt: exchange.startedAt,
+      attempts: exchange.attempts,
+    }));
+    let queueLength = compactedQueue.length;
+    while (queueLength >= 0) {
+      const review: PendingOperatorDecisionReview = {
+        ...compactedCurrent,
+        ...(queueLength > 0 ? { queuedExchanges: compactedQueue.slice(0, queueLength) } : {}),
+        ...(operatorDecisionReview.overflowed || queueLength < compactedQueue.length
+          ? { overflowed: true } : {}),
+        ...(operatorDecisionReview.overflowExchanges || queueLength < compactedQueue.length
+          ? { overflowExchanges: (operatorDecisionReview.overflowExchanges ?? 0) + (compactedQueue.length - queueLength) }
+          : {}),
+      };
+      const candidate = encode([], review);
+      if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) return candidate;
+      queueLength--;
+    }
+
+    const sentinel: PendingOperatorDecisionReview = {
+      status: 'pending',
+      messageIds: [],
+      exchangeTextTruncated: true,
+      startedAt: '',
+      attempts: operatorDecisionReview.attempts,
+      overflowed: true,
+      overflowExchanges: Math.max(
+        1,
+        (operatorDecisionReview.overflowExchanges ?? 0)
+          + (operatorDecisionReview.messageIds.length > 0 ? 1 : 0)
+          + (operatorDecisionReview.queuedExchanges?.length ?? 0),
+      ),
+    };
+    const candidate = encode([], sentinel);
+    if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) return candidate;
+  }
+
+  // Fixed scalar fields are bounded in normal operation. Keep a defensive
+  // minimal valid checkpoint if a future caller supplies pathological values.
+  return JSON.stringify({
+    records: [], tick: 0, corrective: true,
+    operatorDecisionCorrective: operatorDecisionCorrective || operatorDecisionReview !== null,
+    operatorDecisionReview: operatorDecisionReview === null ? null : {
+      status: 'pending', messageIds: [], exchangeTextTruncated: true,
+      startedAt: '', attempts: 0, overflowed: true, overflowExchanges: 1,
+    },
+    operatorDecisionCapture: null,
+  });
 }
 
 /**
@@ -1756,7 +2310,14 @@ export function serializeLedger(
  */
 export function restoreLedger(
   value: string | undefined | null,
-): { records: ExamRecord[]; tick: number; corrective: boolean } | null {
+): {
+  records: ExamRecord[];
+  tick: number;
+  corrective: boolean;
+  operatorDecisionCorrective: boolean;
+  operatorDecisionReview: PendingOperatorDecisionReview | null;
+  operatorDecisionCapture: { total: number; captured: number } | null;
+} | null {
   if (!value || typeof value !== 'string') return null;
   try {
     const parsed: unknown = JSON.parse(value);
@@ -1777,7 +2338,90 @@ export function restoreLedger(
       }));
     const tick = typeof p.tick === 'number' && Number.isFinite(p.tick) ? p.tick : 0;
     const corrective = typeof p.corrective === 'boolean' ? p.corrective : false;
-    return { records, tick, corrective };
+    // Legacy blobs (written before this field existed) lack the key and restore
+    // to false so an old checkpoint never spuriously raises the corrective frame.
+    const operatorDecisionCorrective = typeof p.operatorDecisionCorrective === 'boolean'
+      ? p.operatorDecisionCorrective : false;
+    const rawReview = p.operatorDecisionReview;
+    let operatorDecisionReview: PendingOperatorDecisionReview | null = null;
+    if (rawReview && typeof rawReview === 'object' && !Array.isArray(rawReview)) {
+      const review = rawReview as Record<string, unknown>;
+      const rawIds = Array.isArray(review.messageIds) ? review.messageIds : [];
+      const parsedQueuedExchanges = Array.isArray(review.queuedExchanges)
+        ? review.queuedExchanges
+          .filter((exchange): exchange is Record<string, unknown> =>
+            exchange !== null && typeof exchange === 'object' && !Array.isArray(exchange))
+          .map(exchange => ({
+            messageIds: (Array.isArray(exchange.messageIds) ? exchange.messageIds : [])
+              .filter((id): id is string => typeof id === 'string' && id.length > 0)
+              .slice(-OPERATOR_DECISION_REVIEW_MESSAGE_CAP),
+            ...(typeof exchange.exchangeText === 'string' && exchange.exchangeText.trim()
+              ? { exchangeText: exchange.exchangeText.trim().slice(0, OPERATOR_DECISION_REVIEW_TEXT_CAP) }
+              : {}),
+            ...(exchange.exchangeTextTruncated === true
+              || (typeof exchange.exchangeText === 'string'
+                && exchange.exchangeText.trim().length > OPERATOR_DECISION_REVIEW_TEXT_CAP)
+              ? { exchangeTextTruncated: true as const } : {}),
+            startedAt: typeof exchange.startedAt === 'string' ? exchange.startedAt.slice(0, 64) : '',
+            attempts: typeof exchange.attempts === 'number' && Number.isFinite(exchange.attempts)
+              ? Math.max(0, Math.floor(exchange.attempts)) : 0,
+          }))
+        : [];
+      const queuedExchanges = parsedQueuedExchanges;
+      const overflowed = review.overflowed === true
+        || (typeof review.overflowExchanges === 'number' && review.overflowExchanges > 0)
+        || parsedQueuedExchanges.length > queuedExchanges.length;
+      const overflowExchanges = Math.max(
+        typeof review.overflowExchanges === 'number' && Number.isFinite(review.overflowExchanges)
+          ? Math.floor(review.overflowExchanges) : 0,
+        parsedQueuedExchanges.length - queuedExchanges.length,
+        overflowed ? 1 : 0,
+      );
+      operatorDecisionReview = {
+        status: 'pending',
+        messageIds: rawIds
+          .filter((id): id is string => typeof id === 'string' && id.length > 0)
+          .slice(-OPERATOR_DECISION_REVIEW_MESSAGE_CAP),
+        ...(typeof review.exchangeText === 'string' && review.exchangeText.trim()
+          ? { exchangeText: review.exchangeText.trim().slice(0, OPERATOR_DECISION_REVIEW_TEXT_CAP) }
+          : {}),
+        ...(review.exchangeTextTruncated === true
+          || (typeof review.exchangeText === 'string'
+            && review.exchangeText.trim().length > OPERATOR_DECISION_REVIEW_TEXT_CAP)
+          ? { exchangeTextTruncated: true } : {}),
+        startedAt: typeof review.startedAt === 'string' ? review.startedAt.slice(0, 64) : '',
+        attempts: typeof review.attempts === 'number' && Number.isFinite(review.attempts)
+          ? Math.max(0, Math.floor(review.attempts)) : 0,
+        ...(queuedExchanges.length > 0 ? { queuedExchanges } : {}),
+        ...(overflowed ? { overflowed: true } : {}),
+        ...(overflowed ? { overflowExchanges } : {}),
+      };
+    } else if (operatorDecisionCorrective) {
+      operatorDecisionReview = {
+        status: 'pending',
+        messageIds: [],
+        startedAt: '',
+        attempts: 0,
+      };
+    }
+    const rawCapture = p.operatorDecisionCapture;
+    const capture = rawCapture as Record<string, unknown> | null;
+    const operatorDecisionCapture = capture && typeof capture === 'object' && !Array.isArray(capture)
+      ? {
+        total: typeof capture.total === 'number' && Number.isFinite(capture.total)
+          ? Math.max(0, Math.floor(capture.total)) : 0,
+        captured: typeof capture.captured === 'number' && Number.isFinite(capture.captured)
+          ? Math.max(0, Math.floor(capture.captured)) : 0,
+      }
+      : null;
+    return {
+      records,
+      tick,
+      corrective,
+      operatorDecisionCorrective: operatorDecisionReview !== null,
+      operatorDecisionReview,
+      operatorDecisionCapture,
+    };
   } catch {
     return null;
   }
@@ -1877,16 +2521,24 @@ export const DECISIONS_REG_MAX_BYTES = 32_000;
  * across process death/VM recycles (not just across in-process compaction).
  */
 export function serializeDecisionsReg(register: DecisionsRegisterEntry[]): string {
-  const trimmed = register.slice(-DECISIONS_REGISTER_CAP);
-  const candidate = JSON.stringify({ entries: trimmed });
+  // Priority-aware cap: evict the oldest `clear` before any protected
+  // operator/advanced/found entry, so persistence never front-drops a scarce
+  // operator settlement just because it is the oldest entry.
+  const working = register.slice();
+  while (working.length > DECISIONS_REGISTER_CAP) {
+    working.splice(decisionEvictIndex(working), 1);
+  }
+  let candidate = JSON.stringify({ entries: working });
   if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
     return candidate;
   }
-  // Trim from the front until it fits.
-  for (let start = 1; start < trimmed.length; start++) {
-    const smaller = JSON.stringify({ entries: trimmed.slice(start) });
-    if (Buffer.byteLength(smaller, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
-      return smaller;
+  // Still over the byte budget: keep evicting (clears first, then oldest
+  // overall) until it fits.
+  while (working.length > 0) {
+    working.splice(decisionEvictIndex(working), 1);
+    candidate = JSON.stringify({ entries: working });
+    if (Buffer.byteLength(candidate, 'utf8') <= DECISIONS_REG_MAX_BYTES) {
+      return candidate;
     }
   }
   return JSON.stringify({ entries: [] });

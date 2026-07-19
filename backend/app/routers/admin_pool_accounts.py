@@ -381,19 +381,20 @@ def _account_usage_summary(
     }
 
 
-def _account_usage_snapshot(mem_account: dict[str, Any] | None) -> dict[str, Any]:
-    if mem_account is None:
-        return {
-            "known": False,
-            "five_hour_utilization": None,
-            "seven_day_utilization": None,
-            "resets_at": {},
-            "probed_at": None,
-            "stale": True,
-        }
-    from app.max_plan_pool import _usage_snapshot_summary
+def _account_usage_snapshot(
+    mem_account: dict[str, Any] | None, persisted_raw: Any = None
+) -> dict[str, Any]:
+    """Usage-snapshot summary for one account.
 
-    return _usage_snapshot_summary(mem_account, _utcnow())
+    Falls back to the DB-persisted ``rate_limit_usage`` blob when the in-memory
+    probe result is missing/unknown. The probe runs only on the leader instance,
+    so on every load-balanced non-leader instance the in-memory snapshot is
+    blank — the persisted blob (shared across instances) is what keeps the meter
+    populated. See ``usage_snapshot_summary_with_fallback``.
+    """
+    from app.max_plan_pool import usage_snapshot_summary_with_fallback
+
+    return usage_snapshot_summary_with_fallback(mem_account, persisted_raw, _utcnow())
 
 
 def _account_status_summary(
@@ -478,7 +479,9 @@ def _serialize_max_plan_account_row(
         daily_task_cap=db_account.daily_task_cap,
         max_concurrent_tasks=db_account.max_concurrent_tasks,
     )
-    usage_snapshot = _account_usage_snapshot(mem_account)
+    usage_snapshot = _account_usage_snapshot(
+        mem_account, db_account.rate_limit_usage
+    )
     account_status, status_reasons = _account_status_summary(
         enabled=bool(db_account.enabled),
         credential_configured=credential_configured,
@@ -640,7 +643,24 @@ async def _compute_account_health_summary(
     now = _utcnow()
     cutoff = now - timedelta(hours=24)
 
-    summaries = get_all_account_health_summaries(user_id=user_id, now=now)
+    # Load-balanced non-leader instances never re-run the leader-only usage
+    # probe, so their in-memory usage_snapshot is blank. Overlay the shared
+    # DB-persisted rate_limit_usage blob so the meter is populated on every
+    # instance. One cheap indexed read (per-user), covered by the caller's cache.
+    persisted_usage_rows = (
+        await session.execute(
+            select(MaxPlanAccount.id, MaxPlanAccount.rate_limit_usage).where(
+                MaxPlanAccount.user_id == user_id
+            )
+        )
+    ).all()
+    persisted_usage_by_id = {
+        str(row_id): usage for row_id, usage in persisted_usage_rows
+    }
+
+    summaries = get_all_account_health_summaries(
+        user_id=user_id, now=now, persisted_usage_by_id=persisted_usage_by_id
+    )
 
     account_ids = {s["id"] for s in summaries}
     failure_counts: dict[str, dict[str, int]] = {}

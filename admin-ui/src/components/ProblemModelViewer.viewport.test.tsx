@@ -16,6 +16,20 @@ vi.mock('../api', () => ({
   // throws "does not provide an export named '<name>'" at import time.
   dismissPendingConfirmation: vi.fn(async () => {}),
   acceptPendingConfirmation: vi.fn(async () => {}),
+  // ProblemModelViewer statically imports the capability-exemption helpers; the
+  // browser-mode ESM linker requires every named export it imports to exist on
+  // the mock or module linking throws at import time.
+  grantCapabilityProofExemption: vi.fn(async () => ({
+    status: 'granted',
+    capability_name: 'x',
+    exempt_capabilities: ['x'],
+  })),
+  revokeCapabilityProofExemption: vi.fn(async () => ({
+    status: 'revoked',
+    capability_name: 'x',
+    removed: 1,
+    exempt_capabilities: [],
+  })),
 }));
 
 function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
@@ -618,6 +632,55 @@ describe('ProblemModelViewer — viewport regression', () => {
     });
     expect(host.textContent).toContain('Link direction');
     expect(host.textContent).toContain('Fix the contract violation detection flow');
+  });
+
+  test('renders capability proof-exemption controls at 1280px', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      host.style.height = '800px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <ProblemModelViewer
+            problemModel={makeProblemModel({
+              capabilities: [
+                {
+                  name: 'machine-verifiable capability',
+                  status: 'working',
+                  notes: 'Has a covering named test',
+                  proof_status: 'proven',
+                },
+                {
+                  name: 'frontend-visual-verification-loop',
+                  status: 'working',
+                  notes: 'Cannot be machine-verified — operator exempt',
+                  proof_exempt: true,
+                },
+                {
+                  name: 'unprovable claimed capability',
+                  status: 'working',
+                  notes: 'No proof yet, not exempt',
+                },
+                { name: 'a partial capability', status: 'partial', notes: 'In progress' },
+              ],
+            })}
+            {...defaultProps}
+          />
+        );
+      });
+    });
+    // Working non-exempt caps offer a Grant control; the exempt cap offers Revoke.
+    expect(host!.textContent).toContain('Grant exemption');
+    expect(host!.textContent).toContain('Revoke exemption');
+    expect(host!.textContent).toContain('Exempt');
+    // Partial capabilities are not eligible — no exemption control for them.
+    const partialToggle = host!.querySelector(
+      '[data-testid="capability-exempt-toggle-a partial capability"]',
+    );
+    expect(partialToggle).toBeNull();
   });
 
   test('version goal section absent when currentVersion is not provided', async () => {

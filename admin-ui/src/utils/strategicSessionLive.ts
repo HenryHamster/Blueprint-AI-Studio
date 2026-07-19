@@ -12,13 +12,27 @@
  */
 import type { ProjectMessage } from '../types/messages';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
+import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
 import { parseTimestamp } from './time';
+
+/** One classified run of contiguous streamed reply/reasoning text for a turn.
+ *  `reply` = the resident's actual answer (message / legacy kind-less deltas);
+ *  `reasoning` = ephemeral train-of-thought (reasoning-kind deltas), rendered set
+ *  apart so it is never mistaken for the reply. */
+export type StrategicTurnSegmentKind = 'reply' | 'reasoning';
+export interface StrategicTurnSegment {
+  kind: StrategicTurnSegmentKind;
+  text: string;
+}
 
 export interface StrategicStreamingTurn {
   /** Stable React key for the streaming bubble: session id + first visible seq. */
   key: string;
   sessionId: string;
+  /** Reply-only concatenation (scroll anchor + emptiness check). Excludes reasoning. */
   text: string;
+  /** Ordered runs of reply vs reasoning text, contiguous same-kind fragments merged. */
+  segments: StrategicTurnSegment[];
 }
 
 export interface StrategicActivityItem {
@@ -145,12 +159,30 @@ export function computeStrategicStreamingTurn(
   );
   if (replyDeltas.length === 0) return null;
 
-  const text = replyDeltas.map(d => d.text).filter(Boolean).join('\n').trim();
-  if (!text) return null;
+  // Each WS frame is a rate-limited flush fragment of ONE continuous text run, so
+  // contiguous fragments of the SAME classification (reply vs reasoning) are
+  // concatenated WITHOUT any injected separator — a fragment's own newlines (real
+  // paragraph breaks, bullets, fenced code) are the only newlines that survive.
+  const rawSegments: StrategicTurnSegment[] = [];
+  for (const d of replyDeltas) {
+    if (!d.text) continue;
+    const segKind: StrategicTurnSegmentKind = d.kind === 'reasoning' ? 'reasoning' : 'reply';
+    const last = rawSegments[rawSegments.length - 1];
+    if (last && last.kind === segKind) last.text += d.text;
+    else rawSegments.push({ kind: segKind, text: d.text });
+  }
+  // Trim only each run's outer whitespace (streaming boundary artifacts); internal
+  // newlines/blank lines are preserved. Drop runs that trim to nothing.
+  const segments = rawSegments
+    .map(s => ({ kind: s.kind, text: s.text.trim() }))
+    .filter(s => s.text.length > 0);
+  if (segments.length === 0) return null;
+
+  const text = segments.filter(s => s.kind === 'reply').map(s => s.text).join('\n').trim();
 
   const firstSeq = replyDeltas[0].seq ?? replyDeltas[0].id;
   const sessionId = latestSessionId ?? 'session';
-  return { key: `${sessionId}:${firstSeq}`, sessionId, text };
+  return { key: `${sessionId}:${firstSeq}`, sessionId, text, segments };
 }
 
 /**
@@ -193,5 +225,94 @@ export function computeStrategicSessionActivity(
   return {
     items: items.length > MAX_ACTIVITY ? items.slice(-MAX_ACTIVITY) : items,
     latestLifecycle,
+  };
+}
+
+/** One of the three truthful states of the persistent resident live-activity
+ *  widget. `executing` is the ONLY phase whose elapsed timer ticks. */
+export type ResidentActivityPhase = 'executing' | 'idle' | 'dead';
+
+export interface ResidentActivityState {
+  phase: ResidentActivityPhase;
+  /** The shell command / tool one-liner currently (or last) executing. */
+  commandText?: string;
+  /** Epoch ms the executing command started — drives the LIVE counter (executing only). */
+  startMs?: number;
+  /** Epoch ms to FREEZE any counter at (idle/dead) — last known heartbeat / end time. */
+  endMs?: number;
+  /** Short human-readable label for the state. */
+  label: string;
+}
+
+/** Heartbeat older than this (relative to `nowMs`) means the resident session is
+ *  presumed dead even without an explicit `ended`/`stop_requested` snapshot — the
+ *  backstop that keeps a counter from ticking forever when no `done` frame ever
+ *  arrives. The resident heartbeats on a slow cadence, so the threshold is generous. */
+export const RESIDENT_HEARTBEAT_STALE_MS = 90_000;
+
+/** Activity kinds that represent genuine in-progress work. A trailing `tool_result`
+ *  (or a read/file completion) means the prior command already returned, so it does
+ *  NOT count as still-executing. */
+const EXECUTING_ACTIVITY_KINDS = new Set(['command', 'tool', 'subagent', 'action']);
+
+/**
+ * Derive the truthful three-state resident live-activity status for the persistent
+ * chat-view widget from ACTUAL feed data — never solely the last WS lifecycle frame
+ * (which may never arrive when the session dies).
+ *
+ * - `dead`  — the resident session is gone: snapshot `status === 'ended'`,
+ *   `stop_requested`, `ended_at` set, OR its heartbeat (`last_progress_at` /
+ *   `updated_at`) is stale beyond {@link RESIDENT_HEARTBEAT_STALE_MS}. The counter is
+ *   frozen at the last known time — it must NEVER keep ticking for a dead session.
+ * - `executing` — the session is alive AND the live activity feed's last item is an
+ *   in-flight running command (not superseded by a `tool_result` / newer activity /
+ *   `done`). Only this phase carries a live `startMs` so the timer runs.
+ * - `idle` — the session is alive but nothing is currently executing (between
+ *   commands, or the turn is `done` while the session stays up). No ticking timer.
+ *
+ * Returns `null` when there is no resident session at all (nothing to render).
+ */
+export function computeResidentActivityState(
+  transcript: StrategicSessionDelta[] | undefined,
+  conversationMessages: ProjectMessage[],
+  residentSession: StrategicResidentSessionSnapshot | null | undefined,
+  nowMs: number = Date.now(),
+): ResidentActivityState | null {
+  if (!residentSession) return null;
+
+  const heartbeat = residentSession.last_progress_at || residentSession.updated_at || null;
+  const heartbeatMs = heartbeat ? parseTimestamp(heartbeat).getTime() : NaN;
+  const endedAtMs = residentSession.ended_at ? parseTimestamp(residentSession.ended_at).getTime() : NaN;
+  const stale = !Number.isNaN(heartbeatMs) && nowMs - heartbeatMs > RESIDENT_HEARTBEAT_STALE_MS;
+
+  const isDead =
+    (residentSession.status ?? '').toLowerCase() === 'ended'
+    || Boolean(residentSession.stop_requested)
+    || Boolean(residentSession.ended_at)
+    || stale;
+
+  if (isDead) {
+    const frozen = !Number.isNaN(endedAtMs)
+      ? endedAtMs
+      : (!Number.isNaN(heartbeatMs) ? heartbeatMs : undefined);
+    return { phase: 'dead', endMs: frozen, label: 'Session ended' };
+  }
+
+  // Session is alive — inspect the live feed for a genuinely-running command.
+  const activity = computeStrategicSessionActivity(transcript, conversationMessages);
+  const last = activity.items[activity.items.length - 1];
+  const executing =
+    Boolean(last?.inFlight)
+    && EXECUTING_ACTIVITY_KINDS.has(last?.kind ?? '')
+    && activity.latestLifecycle !== 'done';
+
+  if (executing && last) {
+    return { phase: 'executing', commandText: last.text, startMs: last.ts, label: 'Working' };
+  }
+
+  return {
+    phase: 'idle',
+    endMs: !Number.isNaN(heartbeatMs) ? heartbeatMs : undefined,
+    label: 'Waiting for direction',
   };
 }

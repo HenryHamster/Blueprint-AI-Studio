@@ -644,11 +644,14 @@ class RenderUnitTests(unittest.TestCase):
         self.assertIn("EnvironmentFile=-/home/me/.blueprint/runner.env", text)
         # No leftover @…@ placeholder survives.
         self.assertEqual(re.findall(r"@[A-Z_]+@", text), [])
-        # Hardening directives are preserved from the template.
-        for directive in ("Restart=on-failure", "RestartSec=5", "StartLimitIntervalSec=60",
+        # Hardening directives are preserved from the template. Restart=always
+        # (NOT on-failure) so a clean exit-0 self-update is relaunched by systemd.
+        for directive in ("Restart=always", "RestartSec=5", "StartLimitIntervalSec=60",
                           "StartLimitBurst=3", "KillSignal=SIGTERM",
                           "TimeoutStopSec=30", "WantedBy=default.target"):
             self.assertIn(directive, text)
+        # The active directive is always (the comment may still explain on-failure).
+        self.assertNotIn("\nRestart=on-failure\n", text)
         # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
         self.assertLess(
             text.index("StartLimitIntervalSec=60"), text.index("[Service]"),

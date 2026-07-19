@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import { apiFetch } from '../api';
 import { usePoller } from '../hooks/usePoller';
@@ -67,10 +67,18 @@ export function DriftSignalsCard({ projectId }: { projectId: string }) {
   const [lastSuccessAt, setLastSuccessAt] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [systemsExpanded, setSystemsExpanded] = useState(false);
+  // Project-identity guard: discard stale async responses if projectId
+  // changed while the fetch was in-flight.
+  const currentProjectRef = useRef(projectId);
+  useEffect(() => {
+    currentProjectRef.current = projectId;
+  }, [projectId]);
 
-  const fetchSnapshot = useCallback(async () => {
+  const fetchSnapshot = useCallback(async (signal?: AbortSignal) => {
     try {
       const res = await apiFetch(`/api/admin/drift-snapshot?project_id=${encodeURIComponent(projectId)}`);
+      if (signal?.aborted) return;
+      if (projectId !== currentProjectRef.current) return;
       if (res.ok) {
         setSnapshot(await res.json());
         setLastSuccessAt(Date.now());

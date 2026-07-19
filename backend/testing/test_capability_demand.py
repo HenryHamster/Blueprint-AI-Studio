@@ -750,6 +750,21 @@ def _demand_result(*, demands: list[dict]) -> dict:
 class TestComputeUnprovenDemandedCapabilities:
     """Pure-function tests for compute_unproven_demanded_capabilities."""
 
+    @staticmethod
+    def _ledger(*names: str) -> dict:
+        return {
+            name: [
+                {
+                    "task_id": f"proof:{name}",
+                    "proof_kind": "named_test",
+                    "proof_ref": f"testing/test_{name}.py::test_{name}",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                    "commit_sha": "a" * 40,
+                }
+            ]
+            for name in names
+        }
+
     def test_empty_demand_returns_empty(self):
         """No demand → empty result regardless of problem_model."""
         pm = _problem_model(caps=[
@@ -771,14 +786,36 @@ class TestComputeUnprovenDemandedCapabilities:
     def test_proven_capability_excluded(self):
         """A demanded capability that IS proven is not in the intersection."""
         pm = _problem_model(caps=[
-            {"name": "my-capability", "status": "working",
-             "evidence_refs": [{"proven": True, "ref": "test", "source_id": "s1"}]},
+            {"name": "my-capability", "status": "working"},
         ])
         demand = _demand_result(demands=[
             {"kind": "capability", "ref": "my-capability", "dependent_count": 2},
         ])
-        result = compute_unproven_demanded_capabilities(demand, pm)
+        result = compute_unproven_demanded_capabilities(
+            demand, pm, self._ledger("my-capability")
+        )
         assert result == []
+
+    def test_self_declared_proof_with_empty_ledger_remains_candidate(self):
+        """Agent-writable proof cannot suppress autonomous proof earning."""
+        pm = _problem_model(caps=[
+            {"name": "my-capability", "status": "working",
+             "evidence_refs": [{"kind": "named_test", "proven": True, "ref": "test"}]},
+        ])
+        demand = _demand_result(demands=[
+            {"kind": "capability", "ref": "my-capability", "dependent_count": 2},
+        ])
+
+        result = compute_unproven_demanded_capabilities(demand, pm, {})
+
+        assert result == [
+            {
+                "kind": "capability",
+                "ref": "my-capability",
+                "dependent_count": 2,
+                "proof_status": "unverified",
+            }
+        ]
 
     def test_unproven_demanded_included(self):
         """An unproven working capability that IS demanded → in intersection."""
@@ -805,7 +842,9 @@ class TestComputeUnprovenDemandedCapabilities:
             {"kind": "capability", "ref": "proven-cap", "dependent_count": 1},
             {"kind": "capability", "ref": "unproven-cap", "dependent_count": 5},
         ])
-        result = compute_unproven_demanded_capabilities(demand, pm)
+        result = compute_unproven_demanded_capabilities(
+            demand, pm, self._ledger("proven-cap")
+        )
         assert len(result) == 1
         assert result[0]["ref"] == "unproven-cap"
 
@@ -859,3 +898,39 @@ class TestComputeUnprovenDemandedCapabilities:
         assert len(result) == 1
         assert result[0]["ref"] == "backed-cap"
         assert result[0]["proof_status"] == "partial"
+
+
+# ── PLATFORM_WORKING_CAPABILITIES filter ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_platform_working_capability_filtered_from_demand(db_session):
+    """Cancelled dependents waiting on a platform-registered working capability
+    do not appear in the missing-foundation demand surface."""
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES
+
+    project = await _make_project(db_session)
+    now = _utcnow()
+    platform_cap = next(iter(PLATFORM_WORKING_CAPABILITIES))
+
+    cancelled = make_task(
+        project_id=project.id,
+        status=TaskStatus.CANCELLED,
+        context={
+            UNRESUMABLE_CANCEL_CONTEXT_KEY: {
+                "give_up_class": GIVE_UP_NEVER_SATISFIABLE,
+                "need": {"kind": "capability", "ref": platform_cap},
+                "direction_id": "d-test",
+                "at": (now - timedelta(hours=1)).isoformat(),
+                MISSING_FOUNDATION_MARKER_KEY: True,
+            }
+        },
+    )
+    db_session.add(cancelled)
+    await db_session.commit()
+
+    result = await collect_missing_capability_demand(db_session, project.id, now=now)
+    assert result["total"] == 0, (
+        f"Platform capability '{platform_cap}' should be filtered from demand"
+    )
+    assert result["demands"] == []

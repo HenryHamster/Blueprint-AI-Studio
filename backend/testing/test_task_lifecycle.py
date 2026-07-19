@@ -3554,6 +3554,94 @@ async def test_process_post_commit_locks_project_before_task_for_nonstrategic(
     assert calls["skip_locked"] is True
 
 
+def test_strategic_completion_reserves_message_block_before_authority_locks():
+    source = inspect.getsource(_process_post_commit)
+    reserve_at = source.index("await reserve_project_message_sequences(")
+    reservation_commit_at = source.index("await session.commit()", reserve_at)
+    authority_lock_at = source.index("async with lock_project_then_task(")
+
+    assert reserve_at < reservation_commit_at < authority_lock_at
+    assert '_peek_task_type == "strategic_review"' not in source
+    assert '_peek_completion_handler == "strategic"' in source
+    assert "message_sequences=preallocated_strategic_message_sequences" in source
+
+
+@pytest.mark.asyncio
+async def test_design_doc_capability_does_not_reserve_strategic_message_sequences(
+    tl_db, mocker
+):
+    session, factory = tl_db
+    project = await _make_project(session)
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="design_doc_update",
+        status=TaskStatus.COMPLETED,
+    )
+    payload = AgentStatusPayload(
+        task_id=task.id,
+        status=TaskStatus.COMPLETED,
+        logs=json.dumps({"messages": [{"type": "NOTE", "content": "Bounded output"}]}),
+    )
+    events: list[str] = []
+
+    class _StopAfterAuthorityLock(Exception):
+        pass
+
+    @contextlib.asynccontextmanager
+    async def _stop_at_authority_lock(*_args, **_kwargs):
+        events.append("authority_lock")
+        raise _StopAfterAuthorityLock()
+        yield (None, None)  # pragma: no cover
+
+    reserve = mocker.patch(
+        "app.project_message_creation.reserve_project_message_sequences",
+        new_callable=AsyncMock,
+        side_effect=AssertionError("design-doc completion must not reserve messages"),
+    )
+    mocker.patch(
+        "app.task_locking.lock_project_then_task",
+        new=_stop_at_authority_lock,
+    )
+
+    with pytest.raises(_StopAfterAuthorityLock):
+        await _process_post_commit(task.id, payload, _session_factory=factory)
+
+    assert events == ["authority_lock"]
+    reserve.assert_not_awaited()
+
+
+def test_strategic_completion_message_count_covers_direct_and_reply_emissions():
+    from app.strategic_completion import (
+        _handle_strategic_completion,
+        strategic_completion_message_count,
+    )
+
+    logs = json.dumps(
+        {
+            "messages": [
+                {"type": "NOTE", "content": "First"},
+                {"type": "NOTE", "content": "  "},
+                {"type": "QUESTION", "content": "Second"},
+            ],
+            "resolved_messages": [
+                {"id": str(uuid.uuid4())},
+                {"id": str(uuid.uuid4())},
+                {"id": "invalid-but-still-possible"},
+            ],
+        }
+    )
+
+    assert strategic_completion_message_count(logs) == 5
+    source = inspect.getsource(_handle_strategic_completion)
+    for helper_name in ("post_feedback_acknowledgment", "post_question_answer"):
+        helper_at = source.index(f"await {helper_name}")
+        assert (
+            "sequence=next(reserved_message_sequences, None)"
+            in source[helper_at : helper_at + 1_200]
+        )
+
+
 @pytest.mark.asyncio
 async def test_process_post_commit_persists_timing_fields(tl_db, mocker):
     """Phase 0 telemetry: setup_secs, warm_start, prior_role_vm_id round-trip
@@ -6477,6 +6565,162 @@ async def test_fix_completion_preserves_agent_stamped_fix_iteration(tl_db, mocke
     await session.refresh(task)
     sro = (task.context or {}).get("_self_review_outcome") or {}
     assert sro.get("fix_iteration") == 3  # agent stamp wins, not overwritten by backend
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Review-wait respawn reset on fix completion
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_fix_completion_skip_rereview_resets_review_wait_respawn_count(
+    tl_db, mocker
+):
+    """When a ci_failure fix task completes (skip_rereview path), the
+    review_wait_respawn_count from a prior backstop episode must be cleared
+    before the task enters CI-wait.  This ensures each fix→review→CI-pass
+    cycle gets its own full respawn budget."""
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    # Mock pause_clock to avoid DB dependency for the baseline query.
+    mocker.patch(
+        "app.pause_clock.current_baseline", new_callable=AsyncMock, return_value=0
+    )
+    # The skip_rereview path does NOT call _spawn_pipeline_task — it transitions
+    # directly to CI-wait.  Verify this by checking the mock is never called.
+    spawn_mock = mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", new_callable=AsyncMock
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "review_loop": {
+                "pr_number": 42,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+                "fix_reason": "ci_failure",
+                "iteration": 2,
+                # Simulate a prior backstop episode that consumed the respawn:
+                "review_wait_respawn_count": 1,
+            },
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+    await session.refresh(task)
+
+    # The skip_rereview path should have cleared review_wait_respawn_count
+    # from the CI-wait loop before setting ci_waiting=True.
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("ci_waiting") is True, (
+        "fix task must enter CI-wait on skip_rereview"
+    )
+    assert review_loop.get("review_wait_respawn_count") is None, (
+        "review_wait_respawn_count must be cleared for the new episode, "
+        f"got {review_loop.get('review_wait_respawn_count')!r}"
+    )
+    # verify the skip_rereview path did not call _spawn_pipeline_task
+    spawn_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fix_completion_spawn_failure_creates_alert(tl_db, mocker):
+    """When a fix task completes and the review spawn returns (None, False)
+    with a terminal spawn reason, the fix task must have requires_approval=True
+    and a WARNING Alert must be created with the accurate reason label."""
+    from app.models import Alert, AlertSeverity
+
+    mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.security.scan_pr_for_injection",
+        new_callable=AsyncMock,
+        return_value={
+            "blocked": False,
+            "findings": [],
+            "summary": "clean",
+            "report": "",
+        },
+    )
+
+    async def _spawn_fails(*args, **kwargs):
+        source_task = args[0]
+        # Simulate the real _spawn_pipeline_task behavior of writing the
+        # spawn reason to the source task's context before returning None.
+        from app.review_pipeline import SPAWN_REASON_KEY, SPAWN_REASON_CAP
+
+        source_task.context = {
+            **(source_task.context or {}),
+            SPAWN_REASON_KEY: SPAWN_REASON_CAP,
+        }
+        return (None, False)
+
+    mocker.patch(
+        "app.task_lifecycle._spawn_pipeline_task", side_effect=_spawn_fails
+    )
+
+    session, factory = tl_db
+    project = await _make_project(session)
+
+    task = await _make_task(
+        session,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.COMPLETED,
+        context={
+            "review_loop": {
+                "pr_number": 43,
+                "branch": "blueprint/test-branch",
+                "base_branch": "main",
+                "fix_reason": "code_review",
+                "iteration": 2,
+            },
+        },
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+    )
+
+    payload = AgentStatusPayload(task_id=task.id, status=TaskStatus.COMPLETED)
+    await _process_post_commit(task.id, payload, _session_factory=factory)
+    await session.refresh(task)
+
+    assert task.requires_approval is True, (
+        "fix task must require approval when review spawn fails"
+    )
+    assert "Cap Exhausted" in (task.latest_status_message or ""), (
+        f"status message must mention the spawn reason, "
+        f"got: {task.latest_status_message!r}"
+    )
+
+    # Verify a WARNING Alert was created for the spawn failure.
+    alert = (
+        await session.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().first()
+    assert alert is not None, "must create a WARNING Alert for spawn failure"
+    assert "Cap Exhausted" in (alert.title or ""), (
+        f"alert title must mention the reason, got: {alert.title!r}"
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -29,6 +29,7 @@ unchanged.
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -283,7 +284,17 @@ def _recover_confidence_from_ci_unresolved(
             "confidence_recovery_failure_reason": "sub_scores.test_erosion not numeric",
         }
 
-    _policy = policy or _DEFAULT_POLICY
+    # Use the frozen scoring contract from the pending qualification record so
+    # the recovery recomputes the composite with the EXACT same policy weights,
+    # threshold, and gate inputs that the original finalize used.  Falling back
+    # to _DEFAULT_POLICY (or the caller's policy param, which is None when the
+    # pending record was replaced) would lose per-project overrides and mode-gated
+    # weights, producing a different verdict than the original attempt.
+    _policy = (
+        policy
+        or base_record.get("promotion_policy_snapshot")
+        or _DEFAULT_POLICY
+    )
     smoketest_score = (
         float(smoketest_raw)
         if isinstance(smoketest_raw, (int, float))
@@ -314,6 +325,15 @@ def _recover_confidence_from_ci_unresolved(
         residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
         merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
         debt_pressure_score=debt_pressure_score,
+        # Attempt gates from the frozen contract — recomputed from the persisted
+        # facts so the recovery reproduces the SAME verdict as the original attempt.
+        capability_proof_blocked=bool(base_record.get("capability_proof_blocked")),
+        env_preflight_enabled=bool(base_record.get("env_preflight_enabled", False)),
+        env_preflight_score=base_record.get("env_preflight_score"),
+        env_preflight_missing=base_record.get("env_preflight_missing"),
+        env_preflight_ack_override=bool(
+            base_record.get("env_preflight_ack_override", False)
+        ),
     )
 
     return {
@@ -422,6 +442,11 @@ async def _record_qualification_verdict(
         verdict = QualificationVerdict(
             project_id=version.project_id,
             release_version_id=version.id,
+            qualification_attempt_id=(
+                uuid.UUID(str(base_record["qualification_attempt_id"]))
+                if base_record.get("qualification_attempt_id")
+                else version.active_qualification_attempt_id
+            ),
             candidate_sha=base_record.get("candidate_sha"),
             confidence=(
                 float(confidence)
@@ -464,6 +489,13 @@ async def _record_qualification_verdict(
             audit_reconciliation=base_record.get("audit_reconciliation"),
             goal_alignment=base_record.get("goal_alignment"),
             blind_merge_grade=base_record.get("blind_merge_grade"),
+            # Per-attempt goal-verification verdict snapshot: the per-category
+            # verdicts and residual gap that drove the criterion_coverage gate.
+            # Persisted so a re-qualification overwrite of last_qualification
+            # does NOT lose which category/residual facts belonged to this
+            # attempt.  Keys match _finalize_qualification's base_record exactly.
+            category_verdicts=base_record.get("category_verdicts"),
+            residual_uncaptured_gap=base_record.get("residual_uncaptured_gap"),
             # Blind merge-grade goal-coverage verdict (dir d-c0fe439f) — durably
             # retained so a re-qualification overwrite of last_qualification does
             # not drop which goal the merges failed to cover. Keys match
@@ -2119,6 +2151,57 @@ async def _record_promotion_success(
         logger.warning(
             "[RELEASE_QUALIFIER] message supersession failed after v%d "
             "promotion (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
+    # Best-effort: refresh the project's baked compute image so a dependency
+    # manifest change that landed in the promoted commit re-pins the image right
+    # away instead of waiting up to an hour for the periodic sweep — the event-
+    # driven half of the "apply at the event AND self-heal via a periodic sweep"
+    # pattern. Runs in its OWN session (the driver commits its pin write and must
+    # not ride the caller's later transaction) and is STRICTLY fire-and-forget:
+    # any error (no build config, GitHub/registry/docker failure, timeout) is
+    # swallowed and logged only, so promotion can never be blocked, slowed, or
+    # failed by it. Reuses the SAME process-wide build concurrency guard the
+    # periodic sweep and admin endpoint use — a build already in flight defers
+    # (``deferred``/``builder_busy``) and the hourly sweep picks it up. An
+    # unchanged manifest costs only a cheap registry lookup via the driver's
+    # registry-tag-exists fast path. Mirrors the lane-baseline / staged-activation
+    # best-effort blocks above.
+    try:
+        from app.compute_backends import refresh_project_compute_image
+        from app.database import AsyncSessionLocal
+
+        try:
+            from app.routers.admin_project_tools import (
+                _compute_image_build_semaphore,
+            )
+
+            _build_semaphore = _compute_image_build_semaphore
+        except Exception:  # noqa: BLE001 — guard defensively; unbounded-by-sem
+            _build_semaphore = None
+
+        _refresh_pid = version.project_id
+        async with AsyncSessionLocal() as _img_session:
+            _refresh_project = await _img_session.get(Project, _refresh_pid)
+            if _refresh_project is not None:
+                _refresh_result = await refresh_project_compute_image(
+                    _img_session,
+                    _refresh_project,
+                    build_semaphore=_build_semaphore,
+                )
+                logger.info(
+                    "[RELEASE_QUALIFIER] compute-image refresh after v%d "
+                    "promotion for project %s: %s",
+                    version.version_number,
+                    _refresh_pid,
+                    (_refresh_result or {}).get("status"),
+                )
+    except Exception as exc:  # noqa: BLE001 — image refresh must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] compute-image refresh failed after v%d "
+            "promotion (non-fatal; periodic sweep will retry): %s",
             version.version_number,
             exc,
         )

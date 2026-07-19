@@ -15,10 +15,12 @@ vi.mock('../api/projectTools', async () => {
     fetchAssetToken: vi.fn(),
     fetchToolContent: vi.fn(),
     saveToolContent: vi.fn(),
+    updateProjectTool: vi.fn(),
+    fetchComputeImageStatus: vi.fn(),
   };
 });
 
-import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent } from '../api/projectTools';
+import { fetchProjectTools, fetchProjectToolManifest, fetchAssetToken, fetchToolContent, updateProjectTool, fetchComputeImageStatus } from '../api/projectTools';
 import type { FetchProjectToolsResult } from '../api/projectTools';
 import NotesTool from './NotesTool';
 
@@ -84,6 +86,7 @@ describe('ProjectToolHost — viewport regression', () => {
     // that don't exercise the manifest path still behave predictably.
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({ tools: [], skills: [], error: null });
     vi.mocked(fetchAssetToken).mockResolvedValue({ token: 'mock-token', expires_at: '2026-07-11T12:00:00Z' });
+    vi.mocked(fetchComputeImageStatus).mockResolvedValue({ status: 'no_compute_image_declared' });
   });
 
   afterEach(() => {
@@ -168,7 +171,7 @@ describe('ProjectToolHost — viewport regression', () => {
     expect(host.textContent).toContain('No tools registered');
   });
 
-  test('skips disabled tools without crashing', async () => {
+  test('renders a disabled tool with an Enable control instead of hiding it (SEV1)', async () => {
     vi.mocked(fetchProjectTools).mockResolvedValue({
       tools: [
         { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
@@ -184,8 +187,68 @@ describe('ProjectToolHost — viewport regression', () => {
     await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
     if (!host) throw new Error('host not mounted');
+    // The disabled tool's live component body is NOT mounted…
     expect(host.textContent).not.toContain('Mock Widget content');
+    // …but the tool itself is still visible (title + Disabled marker), so it is
+    // no longer a permanent trap, and an Enable control is reachable.
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).toContain('Disabled');
+    const enableBtn = [...host.querySelectorAll('button')].find(
+      b => b.textContent === 'Enable',
+    );
+    expect(enableBtn).toBeTruthy();
+    // The enabled sibling still renders normally.
     expect(host.textContent).toContain('Mock Chart');
+  });
+
+  test('a disabled tool exposes an Enable control that re-enables it', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
+    vi.mocked(updateProjectTool).mockResolvedValue({
+      ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: true,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    // The disabled tool is not hidden — it shows under a "Disabled" section.
+    expect(host.textContent).toContain('Disabled');
+    expect(host.textContent).toContain('Mock Widget');
+    expect(host.textContent).not.toContain('Mock Widget content');
+    // Find the Enable button and click it.
+    const enableBtn = Array.from(host.querySelectorAll('button')).find(
+      b => b.textContent === 'Enable',
+    );
+    if (!enableBtn) throw new Error('Enable button not found');
+    await act(async () => { enableBtn.click(); });
+    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith('proj-a', 'tool-1', { enabled: true });
+  });
+
+  test('a project with only disabled tools does not show the empty state', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], id: 'tool-1', kind: 'mock-widget', enabled: false },
+      ],
+      total_count: 1,
+      next_offset: null,
+    });
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-a" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).not.toContain('No tools registered');
+    expect(host.textContent).toContain('Disabled');
   });
 
   test('shows loading state before fetch resolves', async () => {
@@ -315,6 +378,64 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     expect(host.textContent).not.toContain('Hidden Viewer');
   });
 
+  test('durably hides a manifest tool across remount and offers a restore (SEV5)', async () => {
+    const projectId = 'proj-durable-hide';
+    localStorage.removeItem(`blueprint:projectTools:hidden:${projectId}`);
+    vi.mocked(fetchProjectTools).mockResolvedValue({ tools: [], total_count: 0, next_offset: null });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'durable-viewer',
+        title: 'Durable Viewer',
+        description: 'A tool the operator hides persistently',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      skills: [],
+      error: null,
+    });
+
+    // First mount: hide the tool.
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    let r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId={projectId} />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+    expect(host.textContent).toContain('Durable Viewer');
+    const hideBtn = host.querySelector('button[data-viewport-allow-small-target]') as HTMLButtonElement | null;
+    await act(async () => { hideBtn!.click(); });
+    expect(host.textContent).not.toContain('Durable Viewer');
+    // A restore affordance is offered so hiding is not itself a trap.
+    expect(host.textContent).toContain('Show hidden');
+
+    // Persisted to localStorage keyed by projectId.
+    expect(localStorage.getItem(`project_tools_hidden:${projectId}`)).toContain('durable-viewer');
+
+    // Simulate a reload: unmount and remount the same project — the tool stays hidden.
+    act(() => { r.unmount(); });
+    host.remove();
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId={projectId} />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    expect(host.textContent).not.toContain('Durable Viewer');
+
+    // Restore brings it back.
+    const showBtn = [...host.querySelectorAll('button')].find(b => b.textContent === 'Show hidden');
+    expect(showBtn).toBeTruthy();
+    await act(async () => { showBtn!.click(); });
+    expect(host.textContent).toContain('Durable Viewer');
+
+    localStorage.removeItem(`project_tools_hidden:${projectId}`);
+  });
+
   test('renders manifest and registered tools without overflow at 1440px', async () => {
     vi.mocked(fetchProjectTools).mockResolvedValue(SAMPLE_TOOLS);
     vi.mocked(fetchProjectToolManifest).mockResolvedValue({
@@ -432,5 +553,137 @@ const SAMPLE_TOOLS: FetchProjectToolsResult = TOOLS_RESULT;
     if (!host) throw new Error('host not mounted');
     expect(host.textContent).toContain('Mock Widget');
     expect(host.textContent).not.toContain('Skills');
+  });
+
+  // ---------------------------------------------------------------------------
+  // Screenshot walkthrough — one test per step so each step gets a distinct
+  // capture filename (maybeCapture keys on the current test name).
+  // ---------------------------------------------------------------------------
+
+  test('screenshot walkthrough step 1: grid with disabled-tool Enable control at 1280px', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [
+        { ...TOOLS_RESULT.tools[0], enabled: true },
+        { ...TOOLS_RESULT.tools[1], enabled: false },
+      ],
+      total_count: 2,
+      next_offset: null,
+    });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'walkthrough-viewer',
+        title: 'Walkthrough Viewer',
+        description: '',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      skills: [],
+      error: null,
+    });
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-14T12:00:00Z' });
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.width = '1280px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<ProjectToolHost projectId="proj-wk-step1" myRole="owner" />); });
+      await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    });
+    if (!host) throw new Error('host not mounted');
+    // Disabled tool shows Enable control — not hidden
+    const enableBtn = [...host.querySelectorAll('button')].find(b => b.textContent === 'Enable');
+    expect(enableBtn).toBeTruthy();
+    // Manifest tool is visible alongside registered tools
+    expect(host.textContent).toContain('Walkthrough Viewer');
+    await expectNoTextTruncationAt(1280, async () => {});
+  });
+
+  test('screenshot walkthrough step 2: manifest tool hidden with Show hidden at 1280px', async () => {
+    localStorage.setItem('project_tools_hidden:proj-wk-step2', JSON.stringify(['walkthrough-hidden']));
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [{ ...TOOLS_RESULT.tools[0] }],
+      total_count: 1,
+      next_offset: null,
+    });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'walkthrough-hidden',
+        title: 'Walkthrough Hidden Viewer',
+        description: '',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      skills: [],
+      error: null,
+    });
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-14T12:00:00Z' });
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.width = '1280px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<ProjectToolHost projectId="proj-wk-step2" myRole="owner" />); });
+      await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    });
+    if (!host) throw new Error('host not mounted');
+    // Hidden manifest tool is not visible
+    expect(host.textContent).not.toContain('Walkthrough Hidden Viewer');
+    // Show hidden restore affordance is present
+    const showHiddenBtn = [...host.querySelectorAll('button')].find(b => b.textContent === 'Show hidden');
+    expect(showHiddenBtn).toBeTruthy();
+    localStorage.removeItem('project_tools_hidden:proj-wk-step2');
+    await expectNoTextTruncationAt(1280, async () => {});
+  });
+
+  test('screenshot walkthrough step 3: manifest tool restored via Show hidden at 1280px', async () => {
+    vi.mocked(fetchProjectTools).mockResolvedValue({
+      tools: [{ ...TOOLS_RESULT.tools[0] }],
+      total_count: 1,
+      next_offset: null,
+    });
+    vi.mocked(fetchProjectToolManifest).mockResolvedValue({
+      tools: [{
+        slug: 'walkthrough-restored',
+        title: 'Walkthrough Restored Viewer',
+        description: '',
+        placement: 'project_section',
+        entry: 'index.html',
+        kind: 'project',
+        source: 'project',
+      }],
+      skills: [],
+      error: null,
+    });
+    vi.mocked(fetchAssetToken).mockResolvedValue({ token: 't', expires_at: '2026-07-14T12:00:00Z' });
+
+    host = document.createElement('div');
+    host.style.width = '1280px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<ProjectToolHost projectId="proj-wk-step3" myRole="owner" />); });
+    await act(async () => await new Promise(resolve => setTimeout(resolve, 50)));
+    if (!host) throw new Error('host not mounted');
+
+    // Hide the manifest tool then restore it via Show hidden
+    const hideBtn = host.querySelector('button[data-viewport-allow-small-target]') as HTMLButtonElement | null;
+    if (hideBtn) {
+      await act(async () => { hideBtn.click(); });
+      const showBtn = [...host.querySelectorAll('button')].find(b => b.textContent === 'Show hidden');
+      if (showBtn) {
+        await act(async () => { showBtn.click(); });
+      }
+    }
+
+    // Capture the restored state with existing mounted DOM (no-op render)
+    await expectNoOverflowAt(1280, async () => {});
+    expect(host.textContent).toContain('Walkthrough Restored Viewer');
+    await expectNoTextTruncationAt(1280, async () => {});
   });
 });

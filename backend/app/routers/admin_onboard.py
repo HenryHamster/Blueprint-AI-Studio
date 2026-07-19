@@ -19,6 +19,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
 from app.database import get_session
 from app.shared_state import limiter
@@ -27,9 +28,13 @@ from app.models import (
     ProjectMember,
     ProjectStatus,
     ProjectMessage,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
+    UserIntegration,
 )
-from app.auth import get_current_user, require_admin
+from app.project_message_creation import lock_project_and_next_message_sequence
+from app.auth import get_current_user
 from app.ci_resolution import compute_merge_verification_verdict
 from app.schemas import OnboardPayload
 from app.task_locking import with_design_doc_locked
@@ -41,6 +46,74 @@ router = APIRouter(
     tags=["admin-onboard"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+async def _require_caller_github_push_access(
+    session: AsyncSession, current_user: dict, owner: str, repo: str
+) -> None:
+    """Fail closed unless a non-admin caller can push to the requested repo.
+
+    An App installation token represents the App's access, not the current
+    Blueprint user's GitHub authority. This check intentionally happens before
+    that token is minted, using only a caller-scoped OAuth token (or registered
+    fine-grained PAT) from ``UserIntegration``.
+    """
+    if current_user.get("role") == "admin":
+        return
+
+    integration = (
+        await session.execute(
+            select(UserIntegration).where(
+                UserIntegration.user_id == current_user["user_id"]
+            )
+        )
+    ).scalars().first()
+    if not integration or not (
+        integration.github_oauth_token or integration.github_pat
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Link your GitHub account or ask an admin to onboard this repository.",
+        )
+
+    try:
+        from app.field_encryption import decrypt_field
+        from app.github import _github_request
+        from app.secrets_manager import get_user_secret
+
+        secret_ref = decrypt_field(
+            integration.github_oauth_token or integration.github_pat
+        )
+        if not secret_ref:
+            raise ValueError("linked GitHub credential reference is empty")
+        user_token = await get_user_secret(secret_ref)
+        response = await _github_request(
+            "GET",
+            f"https://api.github.com/repos/{owner}/{repo}",
+            {
+                "Authorization": f"Bearer {user_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+        )
+        if response.status_code != 200:
+            raise ValueError(f"GitHub repository access check returned {response.status_code}")
+        permissions = response.json().get("permissions") or {}
+        if not (permissions.get("push") or permissions.get("admin")):
+            raise PermissionError("GitHub credential lacks push permission")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Do not expose GitHub response details and never proceed on a network,
+        # token, response-shape, or permission failure.
+        logger.warning(
+            "[ONBOARD] GitHub push-access check denied %s for %s/%s: %s",
+            current_user.get("user_id"), owner, repo, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="GitHub push access is required to onboard this repository.",
+        ) from exc
 
 
 def _derive_task_branch_namespace(github_repo: str) -> str:
@@ -177,30 +250,82 @@ def _is_real_source_file(name: str) -> bool:
     return True
 
 
+def _is_empty_repository_response(resp: Any) -> bool:
+    """True when a contents listing failed *because the repo has zero commits*.
+
+    GitHub answers ``GET /contents/`` on a commitless repo with
+    404 ``{"message": "This repository is empty."}`` (and the Git Data endpoints
+    answer 409 ``"Git Repository is empty"``). That is a permanent, meaningful
+    state — not the transient GitHub failure a bare non-200 otherwise implies —
+    and the two must not be conflated: treating it as transient is what let
+    ``repo_is_empty`` default to False and spawned a bootstrap against a repo
+    that can never be cloned.
+    """
+    if resp.status_code not in (404, 409):
+        return False
+    try:
+        message = (resp.json() or {}).get("message", "")
+    except Exception:  # noqa: BLE001 — non-JSON body: not the empty-repo signal
+        return False
+    return "repository is empty" in str(message).lower()
+
+
+def _empty_repo_build_config() -> Dict[str, Any]:
+    """The build config for a repository with no commits.
+
+    Same shape a normal detection returns, so ``detection_completed`` is True
+    and the ``repo_is_empty`` guard in ``repo_bootstrap`` is actually reachable.
+    Nothing is asserted that we did not observe: there is no tree, therefore no
+    language, no directories, and demonstrably no CI.
+    """
+    return {
+        "language": None,
+        "directories": [],
+        "env_vars": {},
+        "detected_at": datetime.now(timezone.utc).isoformat(),
+        "repo_is_empty": True,
+        "source_file_count": 0,
+        "has_ci": False,
+    }
+
+
 def _classify_repo_emptiness(
     root_items: list[Dict[str, Any]], listing_complete: bool = True
-) -> bool:
+) -> tuple[bool | None, int | None]:
     """Classify a repo as empty / near-empty from fetched contents listings.
 
-    Returns True ONLY when the repository was read successfully and completely
-    AND has at most ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across
-    the fetched root listing and every nested directory listing the detector
-    walked. Documentation/config/data files, dotfiles, and common manifests are
-    not counted as source.
+    Returns ``(is_empty, source_file_count)``.
+
+    ``is_empty`` is tri-state, exactly like the ``has_ci`` signal derived from
+    the same bounded walk. It is True ONLY when the repository was read
+    successfully and completely AND has at most
+    ``GREENFIELD_SOURCE_FILE_THRESHOLD`` real source files across the fetched
+    root listing and every nested directory listing the detector walked; False
+    when the walk completed and found more; and None (undetermined) when the
+    read was incomplete. Documentation/config/data files, dotfiles, and common
+    manifests are not counted as source.
+
+    ``source_file_count`` is the authoritative real-source total from that same
+    walk, persisted so the agent's live clone-time detector can compare
+    like-for-like against this count rather than recomputing under its own,
+    possibly divergent, exclusion rules. It is None when ``listing_complete`` is
+    False (emptiness is indeterminate, so no count is asserted).
 
     ``listing_complete`` is the positive confirmation that every listing needed
     to make this determination was fetched. When it is False (e.g. a nested
     directory listing failed to fetch or the bounded scan hit unread deeper
-    paths), emptiness is indeterminate and this returns False
-    (treat-as-non-empty) — a repo whose real source lives in a subdirectory we
-    could not read must never be bootstrapped as greenfield on a transient
-    fetch error.
+    paths), emptiness is indeterminate and this returns ``(None, None)``
+    (undetermined, NOT asserted-non-empty) — a repo whose real source lives in a
+    subdirectory we could not read must never be recorded as a durable,
+    authoritative "not empty" on a transient fetch error, and a genuinely
+    greenfield repo whose listing hit a transient failure must not be suppressed
+    out of greenfield mode by a false negative.
 
     ``root_items`` is the raw GitHub ``contents/`` listings already fetched by
     :func:`_detect_build_config`, so it adds zero GitHub cost.
     """
     if not listing_complete:
-        return False
+        return None, None
 
     source_file_count = 0
     for item in root_items:
@@ -214,10 +339,8 @@ def _classify_repo_emptiness(
             continue
         if _is_real_source_file(name):
             source_file_count += 1
-            if source_file_count > GREENFIELD_SOURCE_FILE_THRESHOLD:
-                return False
 
-    return True
+    return source_file_count <= GREENFIELD_SOURCE_FILE_THRESHOLD, source_file_count
 
 
 async def _detect_build_config(
@@ -605,6 +728,11 @@ async def _detect_build_config(
             params=params,
         )
         if resp.status_code != 200:
+            if _is_empty_repository_response(resp):
+                logger.info(
+                    f"[ONBOARD] {owner}/{repo} has no commits — detected as an empty repo"
+                )
+                return _empty_repo_build_config()
             logger.warning(
                 f"[ONBOARD] Failed to list repo contents for {owner}/{repo}: {resp.status_code}"
             )
@@ -710,18 +838,29 @@ async def _detect_build_config(
     else:
         language = "mixed"
 
+    repo_is_empty, source_file_count = _classify_repo_emptiness(
+        source_items, listing_complete=listing_complete
+    )
     config: Dict[str, Any] = {
         "language": language,
         "directories": directories,
         "env_vars": {},
         "detected_at": datetime.now(timezone.utc).isoformat(),
-        # Deterministic empty/near-empty signal from the already-fetched bounded
-        # contents walk (zero extra GitHub cost beyond detection). Must stay
-        # aligned with agent/src/prompts/discovery.ts and the threshold in
-        # agent/src/constants.ts.
-        "repo_is_empty": _classify_repo_emptiness(
-            source_items, listing_complete=listing_complete
-        ),
+        # Tri-state empty/near-empty signal from the already-fetched bounded
+        # contents walk (zero extra GitHub cost beyond detection): True when the
+        # walk completed and found at most the greenfield threshold of real
+        # source; False when it completed and found more; None (undetermined)
+        # when the read was incomplete, so emptiness is never asserted from a
+        # partial walk (parity with ``has_ci`` below). ``exclude_none`` drops the
+        # key when None so an undetermined walk persists as absent rather than a
+        # durable False. Must stay aligned with agent/src/prompts/discovery.ts
+        # and the threshold in agent/src/constants.ts.
+        "repo_is_empty": repo_is_empty,
+        # The authoritative real-source count from the same walk, persisted so
+        # the agent's clone-time detector compares against this number instead of
+        # recomputing under its own exclusion rules. None when the read was
+        # incomplete (emptiness indeterminate).
+        "source_file_count": source_file_count,
     }
 
     # Tri-state CI-presence signal derived from the same bounded walk (zero
@@ -739,7 +878,12 @@ async def _detect_build_config(
 
 
 def _seed_strategic_intent(
-    project: Project, goal: str | None, steering: Dict[str, Any] | None
+    project: Project,
+    goal: str | None,
+    steering: Dict[str, Any] | None,
+    *,
+    actor_user_id: str | None = None,
+    sequence: int = 1,
 ) -> ProjectMessage | None:
     """Seed the user's onboarding goal into the project's strategic intent.
 
@@ -771,6 +915,10 @@ def _seed_strategic_intent(
 
     message = ProjectMessage(
         project_id=project.id,
+        actor_user_id=actor_user_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
         from_type="user",
         message_type=MessageType.NOTE,
         content=goal,
@@ -812,9 +960,19 @@ async def onboard_project(
     request: Request,
     payload: OnboardPayload,
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),
+    current_user: dict = Depends(get_current_user),
 ):
     """Create a new project, seed membership, and persist detected build config.
+
+    Any allowlisted (authenticated, email-verified) user may onboard a project;
+    they are recorded as its ``owner`` via ``ProjectMember`` below and all
+    project-scoped reads (e.g. ``GET /projects``) are filtered by that
+    membership, so ownership — not platform-admin role — is what grants access.
+    Gating this on ``require_admin`` dead-ended first-run onboarding: a freshly
+    allowlisted user defaults to ``role="user"`` (see ``AllowedUser`` /
+    ``_UserCreate``), lands on the WelcomeScreen, and its "Create your first
+    project" action 403'd here even though the rest of the stack supports
+    non-admin ownership. The allowlist itself remains the access boundary.
 
     Flow:
     1. Create the Project row in DEPLOYING state.
@@ -827,7 +985,15 @@ async def onboard_project(
     """
 
     token = None
-    from app.github import get_repo_default_branch, get_repo_installation_token
+    from app.github import (
+        ensure_repo_initialized,
+        get_repo_default_branch,
+        get_repo_installation_token,
+    )
+
+    await _require_caller_github_push_access(
+        session, current_user, payload.github_owner, payload.github_repo
+    )
 
     token = await get_repo_installation_token(payload.github_owner, payload.github_repo)
     if not token:
@@ -852,6 +1018,33 @@ async def onboard_project(
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Default branch detection failed: {e}",
+        ) from e
+
+    # A repo with zero commits reports a default_branch that does not exist, so
+    # the trunk we are about to store would be a phantom: every clone in the
+    # fleet passes `--branch <trunk>` and would die with "Remote branch not
+    # found in upstream origin", starting with the repo_bootstrap task that is
+    # supposed to seed this very project. Give it its first commit now, while we
+    # still hold a write-capable installation token, so the trunk is real before
+    # anything tries to clone it. No-op on a repo that already has commits.
+    #
+    # Failing loudly here is deliberate: an un-seeded empty repo produces a
+    # project that can never run a single task, and a 502 at onboarding is far
+    # cheaper to diagnose than a bootstrap that retries forever.
+    try:
+        await ensure_repo_initialized(
+            token,
+            payload.github_owner,
+            payload.github_repo,
+            default_branch,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.warning(f"[ONBOARD] Empty-repo initialization failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Empty-repo initialization failed: {e}",
         ) from e
 
     # Auto-detect build config from the same branch Blueprint stores as trunk.
@@ -1005,15 +1198,47 @@ async def onboard_project(
     # Seed the user's goal + optional steering into strategic intent so the
     # first strategic cycle reasons from it. Read defensively: the OnboardPayload
     # schema field lands via a sibling task, so until then this is a no-op.
+    seed_sequence = await lock_project_and_next_message_sequence(
+        session, project.id
+    )
     seeded_message = _seed_strategic_intent(
         project,
         getattr(payload, "goal", None),
         getattr(payload, "initial_steering", None),
+        actor_user_id=current_user["user_id"],
+        sequence=seed_sequence,
     )
     if seeded_message is not None:
         session.add(seeded_message)
         session.add(project)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    resident = await initialize_strategic_resident(
+        session, project.id, locked_project=project
+    )
+    if seeded_message is not None:
+        from app.strategic_resident_turns import coalesce_shadow_resident_turn
+
+        try:
+            async with session.begin_nested():
+                await coalesce_shadow_resident_turn(
+                    session,
+                    project_id=project.id,
+                    lane="interactive",
+                    trigger_kind="operator_message",
+                    message_sequence=seed_sequence,
+                    locked_resident=resident,
+                )
+        except Exception:
+            # Fresh projects are legacy-owned during the shadow rollout. A
+            # projection-only enqueue failure must not reject onboarding or the
+            # durably accepted initial steering message.
+            logger.warning(
+                "[ONBOARD] shadow Resident enqueue failed for project %s",
+                project.id,
+                exc_info=True,
+            )
     await session.commit()
     await session.refresh(project)
 
@@ -1029,13 +1254,14 @@ async def onboard_project(
             is_first_bootstrap=True,
             spawn_reason="first_cycle",
         )
-        if _result.outcome == "spawned":
+        if _result.outcome == "spawned" or _result.build_config_changed:
             await session.commit()
-            logger.info(
-                "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
-                _result.task_id,
-                project.id,
-            )
+            if _result.outcome == "spawned":
+                logger.info(
+                    "[ONBOARD] Spawned repo_bootstrap task %s for project %s",
+                    _result.task_id,
+                    project.id,
+                )
     except Exception:
         logger.exception(
             "[ONBOARD] Failed to spawn repo_bootstrap task for project %s — continuing",

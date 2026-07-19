@@ -334,7 +334,33 @@ async def _apply_status_mutation(
         # the helper is terminal-only so active review progress cannot be reset.
         from app.terminal_rollup_requeue import reconcile_terminal_rollup_requeue
 
-        reconciliation = await reconcile_terminal_rollup_requeue(task, session, payload)
+        try:
+            reconciliation = await reconcile_terminal_rollup_requeue(
+                task, session, payload
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # A requeue that cannot proceed must say WHY, never return a bare
+            # "Internal Server Error". Log the full traceback and surface an
+            # actionable 500 naming the failure; roll back so the task is not
+            # left half-transitioned by a partial reconciliation.
+            # Capture identity BEFORE rollback: a rollback expires every ORM
+            # instance, so a later ``task.id`` read would itself raise
+            # MissingGreenlet in the async context and mask the real cause.
+            _task_id = str(task.id)
+            logger.exception(
+                "[ADMIN] Terminal rollup requeue reconciliation failed for task %s",
+                _task_id,
+            )
+            await session.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Requeue failed while reconciling the prior rollup attempt "
+                    f"for task {_task_id}: {type(exc).__name__}: {str(exc)[:300]}"
+                ),
+            ) from exc
         changes["rollup_requeue_reconciliation"] = reconciliation
         if reconciliation == "merged_pr_rearmed":
             # The operator is requeueing a false terminal state after the
@@ -493,11 +519,37 @@ async def _apply_status_mutation(
                 .all()
             )
         if children:
-            retried = await _requeue_parent_task(
-                task,
-                session,
-                operator_retry_guidance=requeue_guidance,
-            )
+            try:
+                retried = await _requeue_parent_task(
+                    task,
+                    session,
+                    operator_retry_guidance=requeue_guidance,
+                )
+            except HTTPException:
+                raise
+            except Exception as exc:
+                # The requeue path clones failed children, remaps depends_on, and
+                # resolves the parent's terminal verdict — any of which can throw
+                # on an unexpected child-state (e.g. a parent whose children are
+                # all COMPLETED/merged). Surface the real reason with its
+                # traceback instead of a bare, detail-less 500, and roll back so
+                # the parent is not left half-transitioned (e.g. status flipped
+                # to QUEUED but children never cloned).
+                # Capture identity BEFORE rollback: a rollback expires every ORM
+                # instance, so a later ``task.id`` read would itself raise
+                # MissingGreenlet in the async context and mask the real cause.
+                _task_id = str(task.id)
+                logger.exception(
+                    "[ADMIN] Requeue of parent task %s failed", _task_id
+                )
+                await session.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Requeue failed for parent task {_task_id}: "
+                        f"{type(exc).__name__}: {str(exc)[:300]}"
+                    ),
+                ) from exc
             changes["status"] = TaskStatus.EVALUATING
             changes["retried_children"] = retried
         else:
@@ -1301,7 +1353,31 @@ async def _commit_and_broadcast(
             .first()
         )
         if rollup_child is not None:
-            await _check_and_trigger_rollup(rollup_child, session)
+            # This re-drive runs AFTER the status transition has already been
+            # durably committed above, so the parent is already parked at
+            # EVALUATING (or its reconciled state). It is a best-effort
+            # convergence nudge: the reaper's stale-EVALUATING sweep re-drives
+            # rollup on its own cadence. An unhandled exception here (e.g. a
+            # GitHub round-trip failure or a MissingGreenlet on the poisoned
+            # session's recovery path) must NOT turn the already-successful
+            # operator requeue into a bare, detail-less 500. Log it with the
+            # traceback and let the committed transition stand; roll back any
+            # partial, uncommitted rollup mutations so the session is clean.
+            try:
+                await _check_and_trigger_rollup(rollup_child, session)
+            except Exception:
+                logger.exception(
+                    "[ADMIN] Post-requeue rollup re-drive failed for merged "
+                    "rollup parent %s; the parent transition already committed, "
+                    "so it stands and the reaper's stale-EVALUATING sweep will "
+                    "re-drive rollup convergence",
+                    task.id,
+                )
+                # A rollback expires every ORM instance; re-load the task so the
+                # response-shaping attribute reads below do not trip a
+                # MissingGreenlet on an expired instance in the async context.
+                await session.rollback()
+                await session.refresh(task)
         else:
             logger.warning(
                 "[ADMIN] Already-merged rollup parent %s has no completed child "

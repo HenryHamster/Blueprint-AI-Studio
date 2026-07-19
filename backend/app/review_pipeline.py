@@ -948,7 +948,9 @@ async def _post_repeat_fingerprint_blocker_message(
     with ``from_type="system"`` and ``message_type=BLOCKER`` so it sorts
     correctly in the strategic agent's context block.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.message_audience import stamp_message_audience
+    from app.models import MessageType
+    from app.project_message_creation import build_project_message
 
     body = (
         f"Pipeline halt — repeat-fingerprint detected on PR #{pr_number}.\n\n"
@@ -973,19 +975,23 @@ async def _post_repeat_fingerprint_blocker_message(
         f"does not count toward the per-PR review-fix iteration cap, will "
         f"not be auto-resurrected by the reaper)."
     )
-    pm = ProjectMessage(
+    pm = await build_project_message(
+        session,
         project_id=source_task.project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
         from_task_id=source_task.id,
         content=body,
-        context={
-            "pr_number": pr_number,
-            "fingerprint": fingerprint,
-            "source_task_id": str(source_task.id),
-            "prior_task_id": str(prior_task_id),
-            "trigger": "repeat_fingerprint_halt",
-        },
+        context=stamp_message_audience(
+            {
+                "pr_number": pr_number,
+                "fingerprint": fingerprint,
+                "source_task_id": str(source_task.id),
+                "prior_task_id": str(prior_task_id),
+                "trigger": "repeat_fingerprint_halt",
+            },
+            "repeat_fingerprint_halt",
+        ),
     )
     session.add(pm)
 

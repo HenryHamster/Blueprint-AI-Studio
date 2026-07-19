@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import uuid
+from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any, Dict, List
 
@@ -80,6 +81,7 @@ from app.finding_deduplication import (
     resolve_prerequisite_task,
 )
 from app.task_blocked import NEED_REF_MAX_LEN
+from app.capability_execution_fence import stamp_capability_requirements
 from app.task_evaluators import (
     ADVERSARIAL_PARSE_CHALLENGER_FAILED,
     ADVERSARIAL_PARSE_NO_HASH_MATCHES,
@@ -95,6 +97,8 @@ from app.task_evaluators import (
 )
 from app.capability_registry import (
     annotate_capability_proof_status,
+    capability_need_blocked_by_proof_gate,
+    capability_need_proof_status,
     off_registry_capability_refs,
     registry_capability_evidence_refs_map,
     registry_capability_names,
@@ -760,6 +764,126 @@ def _apply_structural_actionability_downgrade(findings: list) -> int:
     return downgrades
 
 
+# Terminal reason for a deliver task whose declared deliverable is a sent
+# message or a written report but which produced neither (and no findings). This
+# is the task-orchestrator peer of compute's _NO_DATA_TERMINAL_REASON: a green
+# COMPLETED here would mask a zero-output outcome (the a70fe988 pathology —
+# 'no actionable findings (degraded: provider capacity)' recorded as SUCCESS).
+_NO_DELIVERED_OUTPUT_TERMINAL_REASON = (
+    "deliver task declared a message/report deliverable but produced none — "
+    "zero findings, no message sent, and no report written; recorded as FAILED "
+    "rather than a green completion that masks the empty outcome"
+)
+
+# Explicit phrases that DECLARE a task's deliverable to BE a sent message or a
+# written report (as opposed to the usual research findings). The match is kept
+# deliberately explicit/conservative — mirroring compute's fail-soft
+# _job_expects_data guard — so an ordinary research task whose prose merely
+# mentions the words 'report' or 'message' is never mis-flagged and false-failed.
+_DELIVERED_OUTPUT_DELIVERABLE_PHRASES = (
+    "message/report deliverable",
+    "report/message deliverable",
+    "deliverable of this task is a sent message",
+    "deliverable of this task is a message",
+    "deliverable of this task is a report",
+    "deliverable of this task is a written report",
+    "deliverable is a sent message",
+    "deliverable is a message",
+    "deliverable is a report",
+    "deliverable is a written report",
+    "declared deliverable is a sent message",
+    "declared deliverable is a message",
+    "declared deliverable is a report",
+    "message deliverable",
+    "report deliverable",
+)
+
+# Structured deliverable-kind values (context/payload) that declare a delivered
+# output rather than parsed findings. Preferred over prose matching; this is what
+# forward-looking spawners should stamp.
+_DELIVERED_OUTPUT_DELIVERABLE_KINDS = {"message", "report", "message_or_report"}
+
+
+def _declares_delivered_output_deliverable(task: Task) -> bool:
+    """True when the task DECLARED that its deliverable is a sent message or a
+    written report/document, rather than parsed research findings.
+
+    Most research tasks deliver findings; an empty-but-honest finding set is a
+    legitimate green completion for those, so this predicate must NOT fire for
+    them. A subset of research/deliver tasks instead declare their deliverable to
+    BE a sent operator message or a written report (e.g. operator-requested
+    state-of-internals reports like task a70fe988). For those, a zero-findings
+    run that ALSO sent no message and wrote no report produced nothing — the
+    green-status-masks-empty-outcome pathology the no-output guard closes.
+
+    Detection is conservative (mirrors compute's fail-soft ``_job_expects_data``):
+    it fires only on an EXPLICIT structured field or an explicit deliverable
+    phrase, never on incidental prose.
+    """
+    payload = task.first_payload or {}
+    context = task.context or {}
+    # 1. Structured declaration (preferred; what future spawners should set).
+    for source in (context, payload):
+        if not isinstance(source, dict):
+            continue
+        kind = source.get("deliverable_kind")
+        if (
+            isinstance(kind, str)
+            and kind.strip().lower() in _DELIVERED_OUTPUT_DELIVERABLE_KINDS
+        ):
+            return True
+        if source.get("requires_delivered_output") is True:
+            return True
+    # 2. Explicit prose declaration in the description / prompt / acceptance
+    #    evidence observable_behavior.
+    texts: list[str] = [task.description or "", str(payload.get("prompt") or "")]
+    evidence = payload.get("acceptance_evidence")
+    if isinstance(evidence, dict):
+        texts.append(
+            str(evidence.get("description") or evidence.get("observable_behavior") or "")
+        )
+    haystack = " ".join(texts).lower()
+    return any(phrase in haystack for phrase in _DELIVERED_OUTPUT_DELIVERABLE_PHRASES)
+
+
+async def _delivered_output_present(task: Task, session: AsyncSession) -> bool:
+    """True when this task produced a durable delivered output.
+
+    A delivered output is either a sent operator message (``ProjectMessage`` with
+    ``from_task_id == task.id``) or a written report/document (``KnowledgeDocument``
+    with ``source_task_id == task.id``). Used by the no-output guard to tell a
+    genuinely-empty deliver task apart from one that sent/wrote its deliverable
+    even though it parsed no findings.
+    """
+    from app.models import KnowledgeDocument, ProjectMessage
+
+    message_id = (
+        (
+            await session.execute(
+                select(ProjectMessage.id)
+                .where(ProjectMessage.from_task_id == task.id)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if message_id is not None:
+        return True
+    document_id = (
+        (
+            await session.execute(
+                select(KnowledgeDocument.id)
+                .where(KnowledgeDocument.source_task_id == task.id)
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    return document_id is not None
+
+
 def _record_research_survival_signal(task: Task, *, surviving: int) -> None:
     """Record the honest research success signal on the task at dispatch time.
 
@@ -923,6 +1047,7 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
             Alert(
                 project_id=task.project_id,
                 severity=AlertSeverity.INFO,
+                event_type="research.direction_auto_completed",
                 title="Direction auto-completed",
                 message=(
                     f"Direction '{info['text'][:80]}' was auto-completed: "
@@ -1523,6 +1648,50 @@ def _build_salvage_payload(
     }
 
 
+#: Durable context key on a spawned dependent recording capability prerequisites
+#: that resolved as satisfied-by-the-codebase but whose ``working`` capability
+#: carries no ``proven`` evidence — the SPAWN-time surfacing of the unverified
+#: status (observe/off modes). Each entry: ``{kind, ref, proof_status}``.
+SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY = "_spawn_capability_proof_unverified"
+
+
+def spawn_capability_gate_disposition(
+    need: Mapping[str, Any],
+    proof_status_by_name: Mapping[str, Any],
+    *,
+    mode: str,
+) -> tuple[str, Any]:
+    """Classify how the spawn-time resolver must treat a capability prerequisite
+    that already resolved as satisfied-by-the-codebase.
+
+    Returns ``(disposition, proof_status)`` where ``disposition`` is one of:
+
+    * ``"block"`` — ENFORCE mode and the capability is not ``proven``: the
+      prerequisite does NOT satisfy the dependent, which must park BLOCKED (the
+      need is wired as blocking). Mirrors
+      :func:`capability_need_blocked_by_proof_gate` exactly, so this seam cannot
+      drift from the blocked-resume sweep or the release-qualifier seam.
+    * ``"surface"`` — non-ENFORCE mode (off/observe) and a KNOWN non-``proven``
+      status (``unproven`` / ``partial`` / ``unverified`` / ``contradicted``):
+      the need still resolves as satisfied-by-the-codebase, but the unverified
+      status is surfaced durably on the dependent (see
+      :data:`SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY`) so an operator can see the
+      unproven foundation instead of it living only in a log line.
+    * ``"ok"`` — the capability is ``proven``, or the need matches no ``working``
+      registry capability (``proof_status is None``): satisfied, no gate, nothing
+      to surface.
+
+    Pure and IO-free: the single source of truth for the spawn seam's three-way
+    branch, so the classification and the enforce decision live in one place.
+    """
+    if capability_need_blocked_by_proof_gate(need, proof_status_by_name, mode=mode):
+        return "block", capability_need_proof_status(need, proof_status_by_name)
+    proof_status = capability_need_proof_status(need, proof_status_by_name)
+    if proof_status is not None and proof_status != "proven":
+        return "surface", proof_status
+    return "ok", proof_status
+
+
 async def _handle_research_completion(task: Task, logs: str, session: AsyncSession):
     """Parse research findings and create tasks from them.
 
@@ -1737,7 +1906,30 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     f"{len(_stored_findings)} stored finding(s)"
                 )[:500]
     if not findings:
-        if _capacity_degradation_reason:
+        # No-output guard: a task whose DECLARED deliverable is a sent message or
+        # a written report, but which parsed zero findings AND sent no message AND
+        # wrote no report, produced nothing. Record it as a terminal FAILURE
+        # instead of the green COMPLETED it inherited — otherwise the empty
+        # outcome is masked as success (task a70fe988: 'no actionable findings
+        # (degraded: provider capacity)' recorded green). Ordinary research tasks
+        # (no declared message/report deliverable) stay green on an honest empty
+        # finding set — the predicate is conservative to avoid false failures.
+        _expects_delivered_output = _declares_delivered_output_deliverable(task)
+        _delivered_output = (
+            await _delivered_output_present(task, session)
+            if _expects_delivered_output
+            else False
+        )
+        _no_output_downgrade = _expects_delivered_output and not _delivered_output
+
+        if _no_output_downgrade:
+            _reason = _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+            if _capacity_degradation_reason:
+                _reason = f"{_reason} (degraded: {_capacity_degradation_reason})"
+                _mark_capacity_degraded(task, _capacity_degradation_reason)
+            task.status = TaskStatus.FAILED
+            task.latest_status_message = _reason[:500]
+        elif _capacity_degradation_reason:
             task.latest_status_message = (
                 "Research completed with no actionable findings "
                 f"(degraded: {_capacity_degradation_reason} — results may be incomplete)"
@@ -1753,6 +1945,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         await _stamp_no_findings_refractory(task, session)
         session.add(task)
         await session.commit()
+        if _no_output_downgrade:
+            # Mirror the forward-quality FAIL path: record the failure on the
+            # direction's research_history so direction-health can observe the
+            # empty deliver task. Guarded so accounting can never crash the
+            # handler (the task is already terminally FAILED and committed).
+            try:
+                await _record_research_task_failure(task, session)
+            except Exception:  # noqa: BLE001 — accounting must not crash the gate
+                logger.debug(
+                    "[RESEARCH] failure accounting after no-delivered-output "
+                    "downgrade raised",
+                    exc_info=True,
+                )
         # Evergreen-fill completion adapter: zero findings → verified_stale.
         # This early-return path bypasses the main adapter call below, so we
         # must fire it here.
@@ -3543,23 +3748,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Pre-load project for scope calibration (SQLAlchemy identity map — no extra query if already loaded)
     _scope_cal_project = await session.get(Project, task.project_id)
 
-    _project_default_container_image: str | None = None
-    if _scope_cal_project:
-        try:
-            from app.routers.admin_project_tools import _discover_manifest_tools as _dmt
-            _manifest = await _dmt(_scope_cal_project)
-            _ci = ((_manifest.get("compute") or {}).get("image") or {})
-            if isinstance(_ci, dict):
-                _project_default_container_image = _ci.get("name") or None
-            if _project_default_container_image:
-                # Pin the mutable manifest tag to a content-addressed digest so
-                # repeated defaulting is bit-identical over time (design gap G3).
-                from app.compute_backends import resolve_digest_pinned_default_image
-                _project_default_container_image = await resolve_digest_pinned_default_image(
-                    session, _scope_cal_project.id, _project_default_container_image
-                )
-        except Exception:
-            logger.debug("[RESEARCH] manifest fetch for compute image default failed")
+    # Default a child compute_experiment's container_image to the project's
+    # declared, digest-pinned baked image. Shared with the dispatch path via
+    # resolve_project_default_container_image so the two cannot drift (fail-open).
+    from app.compute_backends import resolve_project_default_container_image
+    _project_default_container_image = await resolve_project_default_container_image(
+        session, _scope_cal_project
+    )
 
     _directions_by_id: dict = {}
     if _scope_cal_project:
@@ -3675,18 +3870,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # task would inherit no criterion_ids even though its direction has some.
     # Best-effort: a lookup failure leaves that direction absent from the cache.
     _direction_criterion_cache: dict[str, list[str]] = {}
-    _criterion_release_version_id = None
-    try:
-        from app.release_version import current_open_version as _current_open_version
+    from app.acceptance_criteria import (
+        direction_criterion_release_version_id as _direction_criterion_version,
+        resolve_task_criterion_release_version_id as _resolve_criterion_version,
+        task_criterion_release_version_id as _task_criterion_version,
+    )
 
-        _open_version = await _current_open_version(session, task.project_id)
-        if _open_version is not None:
-            _criterion_release_version_id = _open_version.id
-    except Exception:
-        logger.debug(
-            "[RESEARCH] open version lookup failed for project %s; "
-            "criterion cache will stay version-unscoped",
-            task.project_id,
+    _criterion_release_version_id = _task_criterion_version(task)
+    _criterion_version_was_explicit = _criterion_release_version_id is not None
+    if _criterion_release_version_id is None:
+        _criterion_release_version_id = await _resolve_criterion_version(
+            session, task, task.project_id
         )
     _dirs_to_prefetch: set[str] = set()
     if _parent_direction_id:
@@ -3697,12 +3891,27 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _dirs_to_prefetch.add(_pf_did)
     if _dirs_to_prefetch:
         try:
-            from app.directions_repo import get_direction_row as _get_dir_row
+            from app.directions_repo import get_direction_rows as _get_dir_rows
 
-            for _pf_dir_id in _dirs_to_prefetch:
+            # Single batched SELECT for every direction we need, keyed for O(1)
+            # lookup — avoids one round-trip per direction (N+1).
+            _pf_rows = await _get_dir_rows(
+                session, task.project_id, _dirs_to_prefetch
+            )
+            for _pf_dir_id, _pf_row in _pf_rows.items():
                 try:
-                    _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
-                    if _pf_row is not None and _pf_row.criterion_keys:
+                    if (
+                        _pf_row is not None
+                        and _pf_row.criterion_keys
+                        and (
+                            _direction_criterion_version(_pf_row)
+                            == _criterion_release_version_id
+                            or (
+                                not _criterion_version_was_explicit
+                                and _direction_criterion_version(_pf_row) is None
+                            )
+                        )
+                    ):
                         from app.acceptance_criteria import (
                             filter_active_criterion_keys as _filter_active,
                         )
@@ -4185,6 +4394,63 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         needs_approval = _budget_requires_approval or _compute_requires_approval
 
         direction_id = finding.get("direction_id")
+
+        # Knowledge-commission dedup guard (web_research / design only).
+        # Skip the finding when a knowledge document for the same direction AND
+        # topic was produced within the cooldown window, OR when an identical
+        # knowledge task is currently in-flight for that direction+topic pair.
+        # Both checks require direction_id AND topic — a missing key disables
+        # the guard (callers must allow the commission rather than over-block).
+        if task_type in ("web_research", "design"):
+            from app.knowledge_query import (  # noqa: PLC0415
+                knowledge_doc_recently_produced,
+                knowledge_task_in_flight,
+            )
+            from app.shared_state import runtime_config as _rc_kguard  # noqa: PLC0415
+
+            _kguard_topic = finding.get("topic") or title
+            _kguard_dir = direction_id or (task.context or {}).get("direction_id")
+            _kguard_cooldown_cfg = _rc_kguard.get("knowledge_commission_cooldown_hours")
+            _kguard_cooldown: float | None = (
+                float(_kguard_cooldown_cfg)
+                if isinstance(_kguard_cooldown_cfg, (int, float))
+                and not isinstance(_kguard_cooldown_cfg, bool)
+                else None
+            )
+            try:
+                _kguard_recent = await knowledge_doc_recently_produced(
+                    session,
+                    task.project_id,
+                    _kguard_dir,
+                    _kguard_topic,
+                    cooldown_hours=_kguard_cooldown,
+                )
+                _kguard_active = await knowledge_task_in_flight(
+                    session, task.project_id, _kguard_dir, _kguard_topic
+                )
+            except Exception:  # noqa: BLE001 — guard is advisory; must not crash spawn
+                logger.warning(
+                    "[RESEARCH] knowledge-commission dedup guard failed for task %s "
+                    "(direction=%s, topic=%r) — allowing commission",
+                    task.id,
+                    _kguard_dir,
+                    _kguard_topic,
+                    exc_info=True,
+                )
+                _kguard_recent = _kguard_active = False
+            if _kguard_recent or _kguard_active:
+                _reason = "recent_doc" if _kguard_recent else "in_flight_task"
+                logger.info(
+                    "[RESEARCH] Skipping %s commission for finding '%s' "
+                    "(direction=%s, topic=%r): %s",
+                    task_type,
+                    title,
+                    _kguard_dir,
+                    _kguard_topic,
+                    _reason,
+                )
+                continue
+
         # Ignore finding.model: it's a legacy anthropic-only hint that
         # silently anchored children to a provider regardless of the
         # operator's category_routing. Model resolution is the
@@ -4801,6 +5067,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_completion:finding:compute_experiment",
             )
         else:
+            # For knowledge task types (web_research / design), stamp the
+            # dedup key fields (topic + direction_id) onto the payload so the
+            # knowledge_task_in_flight guard can detect duplicate commissions
+            # from concurrent research cycles.  Callers that already set topic
+            # explicitly (e.g. strategic spawner) are unaffected.
+            _knowledge_payload_extras: dict = {}
+            if task_type in ("web_research", "design"):
+                _ktopic = finding.get("topic") or title
+                _kdir = direction_id or (task.context or {}).get("direction_id")
+                if _ktopic:
+                    _knowledge_payload_extras["topic"] = _ktopic
+                if _kdir:
+                    _knowledge_payload_extras["direction_id"] = _kdir
             finding_payload = validate_internal_payload(
                 {
                     "type": task_type,
@@ -4824,6 +5103,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         if _registry_vocab and task_type in _VOCAB_RENDERING_TASK_TYPES
                         else {}
                     ),
+                    **_knowledge_payload_extras,
                 },
                 f"research_completion:finding:{task_type}",
             )
@@ -4915,6 +5195,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 **(
                     {"parent_direction_id": parent_direction_id}
                     if parent_direction_id
+                    else {}
+                ),
+                **(
+                    {
+                        "criterion_release_version_id": str(
+                            _criterion_release_version_id
+                        )
+                    }
+                    if _criterion_release_version_id is not None
                     else {}
                 ),
                 **(
@@ -5380,6 +5669,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "research_task_id": str(task.id),
                 "salvage_source_task_id": str(task.id),
                 "salvage_finding_count": len(_salvage_candidates),
+                "audience": "strategist-internal",
             },
             status=TaskStatus.QUEUED,
             created_by="ORCHESTRATOR",
@@ -5702,10 +5992,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the structural source rather than deferred to the dispatch-time cycle breaker.
     from app.blocked_need_resolution import _would_create_cycle
     from app.capability_registry import (
-        capability_need_blocked_by_proof_gate,
-        capability_need_proof_status,
         consumer_gate_proof_status,
         registry_satisfies_capability_need,
+        task_backed_capability_need_blocked_by_proof_gate,
         working_capability_names,
     )
     from app.shared_state import runtime_config as _rc
@@ -6005,14 +6294,34 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         if prereq:
             foundation = resolve_prerequisite_task(prereq, _prereq_candidates)
             if foundation is not None and foundation.id != ct.id:
-                _wired = _wire_prerequisite_edge(
-                    ct,
-                    foundation,
-                    finding_title=finding_title,
-                    prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
-                )
-                if _wired:
-                    _maybe_inherit_base(ct, foundation, finding_title=finding_title)
+                prereq_need = build_need(prereq.get("kind"), prereq.get("ref"), label=prereq.get("label"))
+                # Durably record the capability prerequisite REGARDLESS of gate
+                # disposition (block or wire-edge) so the shared execution-authority
+                # fence can re-grade this task-backed foundation at cold dispatch /
+                # warm claim even after the gate graduates off/observe -> enforce.
+                # No-op for a non-capability (task-kind) prereq. Survives generic
+                # retry (key excluded from FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+                if prereq_need:
+                    stamp_capability_requirements(ct, [prereq_need])
+                if prereq_need and task_backed_capability_need_blocked_by_proof_gate(
+                    prereq_need, getattr(project_obj, "capability_proof_records", None),
+                    getattr(project_obj, "problem_model", None),
+                    mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
+                ):
+                    needs.append(prereq_need)
+                    unresolved_entries.append(prereq)
+                    session.add(ct)
+                else:
+                    _wired = _wire_prerequisite_edge(
+                        ct, foundation, finding_title=finding_title,
+                        prereq_label=f"{prereq.get('kind')}:{prereq.get('ref')}",
+                    )
+                    if _wired:
+                        _maybe_inherit_base(ct, foundation, finding_title=finding_title)
+                    # Persist the durable requirement stamped above even when
+                    # _wire_prerequisite_edge added no new edge (idempotent re-spawn).
+                    if prereq_need:
+                        session.add(ct)
             elif foundation is None:
                 # Unresolved explicit prerequisite: a finding declared an explicit
                 # {kind, ref} foundation it must build on, but no in-flight or
@@ -6028,14 +6337,20 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if prereq_need and registry_satisfies_capability_need(
                     prereq_need, _working_registry_caps
                 ):
-                    _proof_status = capability_need_proof_status(
-                        prereq_need, _working_registry_proof
-                    )
-                    if capability_need_blocked_by_proof_gate(
+                    _disposition, _proof_status = spawn_capability_gate_disposition(
                         prereq_need,
                         _working_registry_proof,
                         mode=str(_rc.get("capability_proof_gate_mode", "off") or "off"),
-                    ):
+                    )
+                    # Durably record this capability prerequisite on the child
+                    # REGARDLESS of disposition (block/surface/ok) so the shared
+                    # execution-authority fence can re-grade it at cold dispatch
+                    # and warm claim — even a proof that is current now may expire
+                    # or be revoked before the child gains authority. The record
+                    # survives generic retry (not in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS).
+                    stamp_capability_requirements(ct, [prereq_need])
+                    session.add(ct)
+                    if _disposition == "block":
                         # ENFORCE mode: an unproven/partial 'working' capability
                         # does NOT satisfy the prerequisite. Gate the dependent —
                         # wire the need as blocking exactly as an unresolved
@@ -6052,11 +6367,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                         )
                         needs.append(prereq_need)
                         unresolved_entries.append(prereq)
-                    elif _proof_status is not None and _proof_status != "proven":
-                        # OBSERVE mode: surface (never gate) a resolution backed by
-                        # a capability declared 'working' with no proven evidence.
+                    elif _disposition == "surface":
+                        # OBSERVE/OFF mode: surface (never gate) a resolution backed
+                        # by a capability declared 'working' with no proven evidence.
                         # The need still resolves as satisfied-by-the-codebase; this
-                        # only makes the unproven claim visible while enforce is off.
+                        # makes the unproven claim visible while enforce is off —
+                        # both as a WARNING log AND, so an operator sees it without
+                        # re-deriving it from logs, as a durable marker on the
+                        # spawned dependent's context (mirroring the
+                        # ``_spawn_prereq_dropped_duplicate`` surfacing above).
                         logger.warning(
                             "[RESEARCH][capability-proof-observe] Finding '%s' "
                             "prerequisite capability:%s resolved as "
@@ -6067,6 +6386,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             prereq.get("ref"),
                             _proof_status,
                         )
+                        _uv_ctx = dict(ct.context or {})
+                        _uv_ctx[SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY] = [
+                            *(_uv_ctx.get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []),
+                            {
+                                "kind": prereq_need.get("kind"),
+                                "ref": prereq_need.get("ref"),
+                                "proof_status": _proof_status,
+                            },
+                        ]
+                        ct.context = _uv_ctx
+                        flag_modified(ct, "context")
+                        session.add(ct)
                     else:
                         logger.info(
                             "[RESEARCH] Finding '%s' prerequisite capability:%s is "

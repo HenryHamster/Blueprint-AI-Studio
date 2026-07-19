@@ -49,6 +49,7 @@ from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
 from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
+from app.routers.admin_resident_rollout import router as admin_resident_rollout_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_migration_exemptions import (
     router as admin_migration_exemptions_router,
@@ -92,6 +93,9 @@ from app.routers.admin_orchestrator_errors import (
 )
 from app.routers.admin_scope_measurement import router as admin_scope_measurement_router
 from app.routers.agent_status import router as agent_status_router
+from app.routers.agent_resident_turn import router as agent_resident_turn_router
+from app.routers.agent_resident_artifacts import router as agent_resident_artifacts_router
+from app.routers.agent_resident_capabilities import router as agent_resident_capabilities_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_auth import router as admin_auth_router
@@ -112,7 +116,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0530"
+EXPECTED_SCHEMA_REVISION = "0638"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -175,7 +179,7 @@ _current_sha: str = os.getenv("DEPLOY_SHA", "unknown")
 # Webhook dedup state moved to app.routers.github
 
 
-def _verify_encryption_config():
+async def _verify_encryption_config():
     """Validate encryption configuration at startup.
 
     On Cloud Run (``K_REVISION`` is set): require ``GITHUB_PAT_ENCRYPTION_KEY``
@@ -185,22 +189,66 @@ def _verify_encryption_config():
     In development/test (``K_REVISION`` not set): warn when both the encryption
     key and ``ALLOW_PLAINTEXT_CREDENTIALS`` are absent, so developers know to
     either configure a key or set the opt-in flag.
+
+    **Key-continuity probe** (when encryption is active):
+    A per-environment continuity reference ciphertext is persisted in
+    ``DeploymentState.runtime_config_json["encryption_continuity_reference"]``.
+    On first boot the reference is minted with the current key and stored; on
+    subsequent boots the stored reference is verified against the current key
+    and boot fails closed on mismatch (wrong-key rotation / misconfiguration).
     """
     from app.field_encryption import (
         ENCRYPTION_KEY_ENV,
         ALLOW_PLAINTEXT_CREDENTIALS_ENV,
         is_encryption_active,
+        probe_key_continuity,
     )
+    from app.required_runtime_env import _verify_required_env
+
+    # Presence enforcement is delegated to the declarative manifest: on Cloud Run
+    # it raises RuntimeError when GITHUB_PAT_ENCRYPTION_KEY is absent. This keeps a
+    # single machine-readable source of truth for the boot env contract; the
+    # value-validity specialisation (is the key a parseable Fernet key) stays here.
+    _verify_required_env()
 
     if is_encryption_active():
+        from app.database import AsyncSessionLocal
+        from app.models import DeploymentState
+
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            stored_ref: str | None = None
+            if state is not None and state.runtime_config_json:
+                stored_ref = state.runtime_config_json.get(
+                    "encryption_continuity_reference"
+                )
+
+            if stored_ref is not None:
+                # Verify existing reference — raises RuntimeError on wrong key.
+                probe_key_continuity("startup", reference_ciphertext=stored_ref)
+            else:
+                # First boot with encryption — mint and persist a continuity
+                # reference so subsequent boots can detect wrong-key rotation.
+                new_ref = probe_key_continuity("startup")
+                if new_ref is not None:
+                    if state is None:
+                        state = DeploymentState(id=1)
+                    if state.runtime_config_json is None:
+                        state.runtime_config_json = {}
+                    state.runtime_config_json["encryption_continuity_reference"] = new_ref
+                    session.add(state)
+                    await session.commit()
         return
 
     on_cloud_run = bool(os.getenv("K_REVISION"))
     if on_cloud_run:
+        # Presence already passed (_verify_required_env would have raised), so the
+        # key is set but not a valid Fernet key — the value-validity failure.
         msg = (
-            f"[STARTUP] {ENCRYPTION_KEY_ENV} is not set — field encryption is "
-            "unavailable. This is a fatal configuration error in production. "
-            "Set the environment variable to a valid Fernet key before deploying."
+            f"[STARTUP] {ENCRYPTION_KEY_ENV} is set but is not a valid Fernet key "
+            "— field encryption is unavailable. This is a fatal configuration "
+            "error in production. Set the environment variable to a valid Fernet "
+            "key before deploying."
         )
         logger.error(msg)
         raise RuntimeError(msg)
@@ -904,6 +952,7 @@ app = FastAPI(
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
 app.include_router(admin_project_strategic_session_router)
+app.include_router(admin_resident_rollout_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_migration_exemptions_router)
 app.include_router(admin_debug_router)
@@ -941,6 +990,9 @@ app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
 app.include_router(agent_status_router)
+app.include_router(agent_resident_turn_router)
+app.include_router(agent_resident_artifacts_router)
+app.include_router(agent_resident_capabilities_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)
@@ -1564,6 +1616,7 @@ async def resolve_artifact_download_url(
         allowed_uris: set[str] = set()
         if job and job.result_reference:
             allowed_uris.add(job.result_reference)
+        artifact = None
         if job and job.artifact_id is not None:
             artifact = await session.get(Artifact, job.artifact_id)
             if artifact is not None and artifact.storage_uri:
@@ -1594,6 +1647,27 @@ async def resolve_artifact_download_url(
             cjf_result = await session.execute(cjf_query)
             cjf = cjf_result.scalar_one_or_none()
             if cjf is None or cjf.compute_job_id != owning_compute_job_id:
+                raise HTTPException(status_code=404, detail="Artifact not found")
+            # Extension guard: apply the same viewable-extension allowlist that
+            # the manifest build path enforces so the ComputeJobFile signing
+            # branch cannot authorize non-viewable types.
+            from app.storage import (
+                viewable_content_type_for_filename as _vctype,
+            )
+            if _vctype(cjf.safe_relpath) is None:
+                raise HTTPException(status_code=404, detail="Artifact not found")
+        elif storage_uri != (job.result_reference or "") and (
+            artifact is None or storage_uri != artifact.storage_uri
+        ):
+            # This URI came from the viewable_files manifest — apply the same
+            # extension guard that the manifest build path enforces at write time,
+            # making the check symmetric across both signing branches.
+            from app.storage import (
+                viewable_content_type_for_filename as _vctype2,
+            )
+
+            uri_basename = storage_uri.rsplit("/", 1)[-1]
+            if _vctype2(uri_basename) is None:
                 raise HTTPException(status_code=404, detail="Artifact not found")
 
     # 3. Sign. Validation already passed, so any failure here is a storage

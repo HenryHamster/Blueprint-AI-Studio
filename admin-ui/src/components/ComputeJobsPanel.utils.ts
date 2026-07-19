@@ -1,19 +1,33 @@
 import type { ComputeJob, ComputeRpcDiagnostic } from '../api';
 
-/** Derive the evidence tier for a compute job, mirroring backend
- *  knowledge_completion.py::_compute_evidence_tier.
+/** Evidence tier for a compute job. Prefers the canonical `evidence_tier` served
+ *  first-class by the backend (knowledge_completion.py::_compute_evidence_tier),
+ *  and falls back to the client derivation below only for older/cached payloads
+ *  that omit the field — keeping a single source of truth on fresh responses
+ *  while remaining backward compatible.
  *
- *  `covered` renders as "Machine verified", so it requires BOTH that the job ran
- *  on operator hardware AND that it produced a measurable result. A local run
- *  that reported no metric proves only WHERE it ran — labelling that
- *  "Machine verified" is a claimed, not earned, status. It is demoted to
- *  `partial`: real execution provenance, nothing verified. */
+ *  Fallback semantics mirror the backend: `covered` renders as "Machine
+ *  verified", so it requires BOTH that the job ran on operator hardware AND that
+ *  it produced a measurable result. A local run that reported no metric proves
+ *  only WHERE it ran — labelling that "Machine verified" is a claimed, not
+ *  earned, status. It is demoted to `partial`: real execution provenance,
+ *  nothing verified. */
 export function computeJobEvidenceTier(
   job: Pick<
     ComputeJob,
     'backend' | 'status' | 'outcome' | 'criterion_verdict' | 'per_arm_verdicts'
-  >,
+  > & { evidence_tier?: ComputeJob['evidence_tier'] },
 ): 'covered' | 'attested' | 'backfilled' | 'partial' | 'uncovered' {
+  const served = job.evidence_tier;
+  if (
+    served === 'covered' ||
+    served === 'attested' ||
+    served === 'backfilled' ||
+    served === 'partial' ||
+    served === 'uncovered'
+  ) {
+    return served;
+  }
   const backend = job.backend ?? '';
   const ranOnOperatorHardware =
     backend.startsWith('local-') || backend === 'runner-subprocess';
@@ -54,9 +68,48 @@ export function isComputeJobActive(job: ComputeJob): boolean {
   return ACTIVE_STATUSES.has(job.status);
 }
 
+/** Coarse trust grouping for a terminal job's evidence tier — the two buckets
+ *  operators triage on. `machine-verified` is the single highest-trust tier
+ *  ('covered' — executed AND verified on operator hardware); `low-trust` is
+ *  every other terminal tier (attested / backfilled / partial /
+ *  uncovered), i.e. anything NOT machine-verified. Active jobs have no tier yet,
+ *  so they return `null` and are excluded from any tier narrowing. Reuses
+ *  {@link computeJobEvidenceTier} — does not re-derive tier semantics. */
+export function computeJobEvidenceGroup(
+  job: ComputeJob,
+): 'machine-verified' | 'low-trust' | null {
+  if (isComputeJobActive(job)) return null;
+  return computeJobEvidenceTier(job) === 'covered' ? 'machine-verified' : 'low-trust';
+}
+
+/** Deterministic sort rank for a job's evidence tier, ordered from highest-trust
+ *  ('covered' = 0) down to lowest-trust ('uncovered'). Jobs with no tier (active
+ *  jobs, which carry no evidence tier) sort consistently last. Reuses
+ *  {@link computeJobEvidenceTier} for the tier value — does not re-derive it. */
+const EVIDENCE_TIER_RANK: Record<string, number> = {
+  covered: 0,
+  attested: 1,
+  backfilled: 2,
+  partial: 3,
+  uncovered: 4,
+};
+
+export function computeJobEvidenceTierRank(job: ComputeJob): number {
+  if (isComputeJobActive(job)) return Number.MAX_SAFE_INTEGER;
+  const tier = computeJobEvidenceTier(job);
+  return EVIDENCE_TIER_RANK[tier] ?? Number.MAX_SAFE_INTEGER;
+}
+
 /** Human-readable terminal reason for a finished job, distinguishing the three
  *  kill paths (operator / budget / deadline / no-progress) plus natural success/failure. */
 export function computeJobTerminalLabel(job: ComputeJob): string {
+  const legacyRunnerNoProgress =
+    job.outcome === 'FAILURE'
+    && job.backend === 'runner-subprocess'
+    && ((job.terminal_reason || '').toLowerCase().includes('no_progress_timeout')
+      || job.exit_code === 125);
+  if (legacyRunnerNoProgress) return 'Killed: no progress';
+
   switch (job.outcome) {
     case 'SPEND_CAP_EXCEEDED':
       return 'Killed: budget cap';
@@ -177,8 +230,10 @@ export function computeJobExecutionLocation(backend: string): {
 export interface GalleryViewableArtifact {
   name: string;
   storage_uri: string;
-  kind: 'image' | 'video';
+  kind: 'image' | 'video' | 'pdf';
   bytes: number;
+  revision: string | null;
+  live: boolean | null;
 }
 
 /** Defensive parse of the job's first-class `viewable_artifacts` field — the
@@ -195,13 +250,15 @@ export function computeJobViewableArtifacts(job: ComputeJob): GalleryViewableArt
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
     const e = entry as Record<string, unknown>;
     if (typeof e.storage_uri !== 'string' || e.storage_uri.length === 0) continue;
-    if (e.kind !== 'image' && e.kind !== 'video') continue;
+    if (e.kind !== 'image' && e.kind !== 'video' && e.kind !== 'pdf') continue;
     const fallbackName = e.storage_uri.split('/').pop() || 'artifact';
     items.push({
       name: typeof e.filename === 'string' && e.filename.length > 0 ? e.filename : fallbackName,
       storage_uri: e.storage_uri,
       kind: e.kind,
       bytes: typeof e.size_bytes === 'number' && Number.isFinite(e.size_bytes) ? e.size_bytes : 0,
+      revision: typeof e.revision === 'string' && e.revision.length > 0 ? e.revision : null,
+      live: typeof e.live === 'boolean' ? e.live : null,
     });
   }
   return items;

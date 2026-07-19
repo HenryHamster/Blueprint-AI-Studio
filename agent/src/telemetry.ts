@@ -569,3 +569,66 @@ export function getResidentTurnLatencyTelemetry(): {
 export function resetResidentTurnLatencyTelemetry(): void {
   _residentTurnStats = { operator: _emptyKindStats(), autonomous: _emptyKindStats() };
 }
+
+// ── Operator-decision capture telemetry ─────────────────────────────────────
+// Marker coverage consumed by the backend; corrective reviews never rewrite it.
+
+export interface OperatorDecisionCaptureStats {
+  total: number;
+  captured: number;
+}
+
+let _operatorDecisionCaptureStats: OperatorDecisionCaptureStats = { total: 0, captured: 0 }; // @per-role
+
+/**
+ * Record one completed operator turn. `captured` means the reply carried its
+ * marker; `markerless` means it did not. Boolean input remains accepted for
+ * source compatibility (true→captured, false→markerless).
+ */
+export function recordOperatorDecisionCapture(
+  outcome: 'captured' | 'markerless' | boolean,
+): void {
+  _operatorDecisionCaptureStats.total += 1;
+  if (outcome === 'captured' || outcome === true) {
+    _operatorDecisionCaptureStats.captured += 1;
+  }
+}
+
+/** Snapshot the current operator-decision capture telemetry for heartbeat / status
+ *  posts. Field meanings intentionally match the backend contract: `total` is
+ *  operator turns, and `captured` is turns ending with the marker. */
+export function getOperatorDecisionCaptureTelemetry(): {
+  total: number;
+  captured: number;
+  missed: number;
+  capture_rate: number | null;
+} | null {
+  const { total, captured } = _operatorDecisionCaptureStats;
+  if (total === 0) return null;
+  return {
+    total,
+    captured,
+    missed: total - captured,
+    capture_rate: Math.round((captured / total) * 100),
+  };
+}
+
+/** Reset operator-decision capture accumulators between roles. */
+export function resetOperatorDecisionCaptureTelemetry(): void {
+  _operatorDecisionCaptureStats = { total: 0, captured: 0 };
+}
+
+/** Restore the durable per-session counters after a resident process restart. */
+export function restoreOperatorDecisionCaptureTelemetry(
+  stats: OperatorDecisionCaptureStats | null | undefined,
+): void {
+  _operatorDecisionCaptureStats = {
+    total: Number.isFinite(stats?.total)
+      ? Math.max(0, Math.floor(stats?.total ?? 0)) : 0,
+    captured: Number.isFinite(stats?.captured)
+      ? Math.max(0, Math.min(
+        Math.floor(stats?.captured ?? 0),
+        Math.floor(stats?.total ?? 0),
+      )) : 0,
+  };
+}

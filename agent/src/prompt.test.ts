@@ -90,8 +90,10 @@ import {
   SHARED_LIFECYCLE_REMAINDER,
   assembleFailureGuidanceBlocks,
   formatSkills,
+  formatProjectTools,
   writeSkillHelpers,
   type TaskSkill,
+  type TaskToolContent,
   type FixAttempt,
 } from './prompt.js';
 import { getReadOnlyTaskTypes, getWriteTaskTypes } from './taskCapabilities.js';
@@ -5613,6 +5615,69 @@ describe('formatSkills', () => {
     // typeof check returns '' for non-string, so slug is empty
     expect(result).toContain('### Bad slug');
     expect(result).toContain('- Run: `skill-`');
+  });
+});
+
+// ── formatProjectTools ───────────────────────────────────────────────────────
+describe('formatProjectTools', () => {
+  it('returns empty string for undefined', () => {
+    expect(formatProjectTools(undefined)).toBe('');
+  });
+
+  it('returns empty string for empty array', () => {
+    expect(formatProjectTools([])).toBe('');
+  });
+
+  it('renders a notes tool with its markdown text', () => {
+    const tools: TaskToolContent[] = [
+      { slug: 'notes', title: 'Notes', kind: 'notes', text: '# Hypothesis\n\nThe cache is cold.' },
+    ];
+    const result = formatProjectTools(tools);
+    expect(result).toContain('## Project Tool Content');
+    expect(result).toContain('### Notes (notes)');
+    expect(result).toContain('The cache is cold.');
+  });
+
+  it('renders a whiteboard summary line without dumping strokes', () => {
+    const tools: TaskToolContent[] = [
+      { slug: 'wb', title: 'Whiteboard', kind: 'whiteboard', text: "Whiteboard 'Whiteboard' has 12 strokes (visual canvas — not shown as text)." },
+    ];
+    const result = formatProjectTools(tools);
+    expect(result).toContain('### Whiteboard (whiteboard)');
+    expect(result).toContain('has 12 strokes');
+    expect(result).not.toContain('strokes":[');
+  });
+
+  it('renders multiple tools each in their own subsection', () => {
+    const tools: TaskToolContent[] = [
+      { slug: 'notes', title: 'Notes', kind: 'notes', text: 'note body' },
+      { slug: 'board', title: 'Board', kind: 'whiteboard', text: 'summary line' },
+    ];
+    const result = formatProjectTools(tools);
+    expect(result).toContain('### Notes (notes)');
+    expect(result).toContain('### Board (whiteboard)');
+    expect(result).toContain('note body');
+    expect(result).toContain('summary line');
+  });
+
+  it('skips tools whose text is empty/whitespace', () => {
+    const tools: TaskToolContent[] = [
+      { slug: 'empty', title: 'Empty', kind: 'notes', text: '   ' },
+    ];
+    expect(formatProjectTools(tools)).toBe('');
+  });
+
+  it('falls back to slug when title is missing', () => {
+    const tools = [{ slug: 'notes', kind: 'notes', text: 'body' }] as unknown as TaskToolContent[];
+    const result = formatProjectTools(tools);
+    expect(result).toContain('### notes (notes)');
+  });
+
+  it('omits the kind parenthetical when kind is missing', () => {
+    const tools = [{ slug: 'notes', title: 'Notes', text: 'body' }] as unknown as TaskToolContent[];
+    const result = formatProjectTools(tools);
+    expect(result).toContain('### Notes');
+    expect(result).not.toContain('### Notes (');
   });
 });
 

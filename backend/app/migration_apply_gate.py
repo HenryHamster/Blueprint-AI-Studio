@@ -61,6 +61,7 @@ import tempfile
 import textwrap
 import uuid
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from typing import Awaitable, Callable, cast, NamedTuple, TypeVar
 from urllib.parse import quote
 
@@ -70,12 +71,15 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 from sqlmodel import SQLModel
 
+from cryptography.fernet import Fernet
+
 import app.github as github
 from app.deploy_smoketest import reflect_schema_drift
 from app.migration_chain import (
     build_migration_chain,
     find_filename_revision_mismatches,
     find_heads,
+    parse_revision_identifiers,
 )
 from app.migration_reconciliation import reconcile_pre_renumber_divergence
 from app.time_utils import exponential_backoff
@@ -115,6 +119,73 @@ def _safe_tar_extractall(tar: tarfile.TarFile, dest: str) -> None:
 
 # ('ok'|'block'|'defer', detail). Mirrors check_qualification_migration_identity.
 Verdict = tuple[str, str | None]
+
+MIGRATION_APPLY_SCRATCH_ENV = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
+
+
+@dataclass(frozen=True)
+class MigrationApplyScratchPreflight:
+    """Typed, value-safe result for the optional scratch prerequisite."""
+
+    status: str
+    code: str
+    target: URL | None
+    detail: str | None
+
+
+def preflight_migration_apply_scratch(
+    raw_url: str | URL | None,
+) -> MigrationApplyScratchPreflight:
+    """Validate scratch configuration without connecting or attempting DDL.
+
+    The raw value is deliberately absent from every diagnostic.  Availability
+    and CREATE/DROP permission are proven later by the existing isolated gate.
+    """
+    if raw_url is None or (isinstance(raw_url, str) and not raw_url.strip()):
+        return MigrationApplyScratchPreflight(
+            status="absent",
+            code="scratch_database_url_missing",
+            target=None,
+            detail=(
+                "scratch_database_url_missing: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} is not configured; bind a dedicated "
+                "PostgreSQL scratch target whose user can CREATE and DROP databases"
+            ),
+        )
+    try:
+        target = raw_url if isinstance(raw_url, URL) else make_url(raw_url.strip())
+    except Exception:  # noqa: BLE001 — sanitized typed configuration failure
+        return MigrationApplyScratchPreflight(
+            status="defer",
+            code="scratch_database_url_invalid",
+            target=None,
+            detail=(
+                "scratch_database_url_invalid: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} must be a valid PostgreSQL URL "
+                "for a dedicated scratch target"
+            ),
+        )
+
+    if not target.get_backend_name().startswith("postgresql") or not target.database:
+        return MigrationApplyScratchPreflight(
+            status="defer",
+            code="scratch_database_url_invalid",
+            target=None,
+            detail=(
+                "scratch_database_url_invalid: "
+                f"{MIGRATION_APPLY_SCRATCH_ENV} must name a PostgreSQL database "
+                "on a dedicated scratch target"
+            ),
+        )
+    if target.drivername == "postgresql":
+        target = target.set(drivername="postgresql+asyncpg")
+    return MigrationApplyScratchPreflight(
+        status="ready",
+        code="scratch_database_ready",
+        target=target,
+        detail=None,
+    )
+
 
 # Repo-relative directory holding the Alembic migration files, used to resolve a
 # bare basename (as returned by ``github.list_versions_at_ref``) to a full path
@@ -272,6 +343,11 @@ _SUBPROCESS_ENV_ALLOWLIST = (
     "WINDIR",
 )
 
+# The encryption-key env var the gate deliberately withholds from the secret-free
+# scratch replay subprocess.  When present in a migration subprocess failure, it
+# identifies a deliberate fail-closed artifact (not deploy-fatal) rather than a
+# genuine migration defect.
+_ENCRYPTION_KEY_ENV_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
 
 _T = TypeVar("_T")
 
@@ -280,6 +356,7 @@ async def _with_transient_retry(
     coro_factory: Callable[[], Awaitable[_T]],
     *,
     label: str,
+    no_retry_types: tuple[type[Exception], ...] = (),
 ) -> _T:
     """Invoke *coro_factory* with bounded exponential backoff on exceptions.
 
@@ -305,21 +382,21 @@ async def _with_transient_retry(
             )
             logger.warning(
                 "[MIGRATION_APPLY_GATE] %s attempt %d/%d transient failure; "
-                "retrying in %.1fs: %s",
+                "retrying in %.1fs (%s)",
                 label,
                 attempt - 1,
                 _TRANSIENT_RETRY_MAX_ATTEMPTS,
                 delay,
-                last_exc,
+                type(last_exc).__name__,
             )
             await asyncio.sleep(delay)
         try:
             return await coro_factory()
         except _MigrationApplyTimeout:
-            # A stage watchdog already proved this attempt exceeded its budget.
-            # Re-running it internally only multiplies a deterministic stall.
-            raise
-        except Exception as exc:  # noqa: BLE001 — retry on transient exceptions
+            raise  # a timed-out stage cannot be salvaged by retrying
+        except Exception as exc:
+            if isinstance(exc, no_retry_types):
+                raise  # deterministic — retry cannot help
             last_exc = exc
     # All attempts exhausted — re-raise the last exception.
     raise cast(Exception, last_exc)
@@ -341,6 +418,77 @@ class _MigrationApplyError(Exception):
     """A scratch-side seed/apply step failed. Always collapses to ``defer`` — an
     apply failure means we could not prove the candidate is safe, so the release
     must HOLD (never wave through, never hard-block on a possibly-fidelity issue)."""
+
+
+class _DeterministicMigrationDefect(Exception):
+    """A migration defect guaranteed to reproduce on every retry: Python
+    ``SyntaxError`` / ``ImportError`` during Alembic's migration import, or a
+    class-42 SQL error (syntax_error / invalid_schema_name / undefined_table /
+    etc.).  These must hard-block the candidate rather than loop as transient
+    infra failures — retrying cannot resolve them."""
+
+
+class _ServingOnlyImportError(Exception):
+    """An ``ImportError`` that references an ``app.*`` symbol — a self-reference
+    artifact of replaying candidate migrations against the serving process.
+
+    On the actual deploy target the candidate's own app code is present, so this
+    is not a deploy-fatal defect.  Degrades the gate to ``'ok'`` rather than
+    hard-blocking the candidate."""
+
+
+class _KeylessEncryptionArtifact(Exception):
+    """A candidate encryption migration fail-closed in the scratch replay because
+    ``_ENCRYPTION_KEY_ENV_VAR`` is deliberately withheld from the secret-free
+    subprocess environment.
+
+    On the actual deploy target the encryption key IS present (it is a required
+    env var for production operation), so this is not deploy-fatal.  Degrades the
+    gate to ``'ok'`` — mirroring ``_ServingOnlyImportError``."""
+
+
+def _looks_like_serving_only_import(exc: ImportError) -> bool:
+    """Return True when an ImportError references an app.* module.
+
+    Serving-engine replays run candidate migration files against the OLD app
+    code.  A migration that imports a candidate-only symbol (e.g.
+    ``from app.field_encryption import require_encryption_active``) will raise
+    ImportError in this context, but the same migration succeeds on the real
+    deploy target where the candidate's own app code is present.
+    """
+    if exc.name and (exc.name == "app" or exc.name.startswith("app.")):
+        return True
+    return bool(re.search(r"'app\.", str(exc)))
+
+
+def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
+    """Return True when *detail* describes the deliberate keyless fail-closed
+    of an encryption migration in the secret-free scratch subprocess.
+
+    Requires both signals on the same line to prevent false positives:
+      1. "RuntimeError" — the exception type
+      2. ``_ENCRYPTION_KEY_ENV_VAR`` — the encryption key name
+
+    The two-signal check rejects:
+    - Accumulated chain stderr where earlier no-op migrations emit the
+      env-var name as a warning before an unrelated RuntimeError fires
+      (different lines, so the same-line anchor still holds).
+    - Non-RuntimeError exceptions that happen to mention the key name.
+
+    Migration-number-agnostic: covers 0609, 0621, 0628, and any future
+    encryption migrations without per-migration updates.
+    """
+    for line in detail.splitlines():
+        if "RuntimeError" in line and _ENCRYPTION_KEY_ENV_VAR in line:
+            return True
+    return False
+
+
+class _ScratchDatabaseUnavailable(Exception):
+    """The dedicated scratch server could not be reached or provision a DB."""
+
+
+
 
 
 class _MigrationApplyTimeout(_MigrationApplyError):
@@ -618,6 +766,7 @@ async def _create_database(base_url: URL, name: str) -> None:
         async with engine.connect() as conn:
             await conn.execute(sa.text(f'CREATE DATABASE "{name}"'))
 
+
     try:
         await _run_timed_stage(
             _create,
@@ -658,6 +807,7 @@ async def _drop_database(base_url: URL, name: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - teardown is best-effort
         logger.warning(
+
             "[MIGRATION_APPLY_GATE] could not drop scratch database %r: %s",
             name,
             exc,
@@ -738,10 +888,7 @@ async def _seed_scratch(scratch_engine: AsyncEngine, prod_state: _ProdState) -> 
     except _MigrationApplyTimeout:
         raise
     except Exception as exc:
-        raise _MigrationApplyError(
-            f"could not seed scratch DB with production's reflected schema "
-            f"(rev {prod_state.revision!r}): {type(exc).__name__}: {exc}"
-        ) from exc
+        raise _ScratchDatabaseUnavailable() from exc
 
 
 def _alembic_upgrade_head(sync_conn: sa.Connection, script_location: str) -> None:
@@ -831,6 +978,11 @@ async def _run_migration_apply_subprocess(
     env["DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_DATABASE_URL"] = scratch_url
     env["MIGRATION_APPLY_SCRIPT_LOCATION"] = script_location
+    # Some migrations (e.g. 0609) call _load_fernet() at import time and raise
+    # without a key — fail-closed by design. The scratch DB is empty and
+    # ephemeral, so no real key is needed; inject a synthetic one scoped only
+    # to this subprocess so the migration body can execute normally.
+    env["GITHUB_PAT_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
     backend_root = os.path.dirname(os.path.dirname(__file__))
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -848,6 +1000,15 @@ async def _run_migration_apply_subprocess(
         timeout_code=timeout_code,
     )
     if proc.returncode != 0:
+        if _looks_like_keyless_encryption_artifact(
+            stderr.decode(errors="replace")
+        ):
+            raise _KeylessEncryptionArtifact(
+                "candidate encryption migration fail-closed because "
+                f"{_ENCRYPTION_KEY_ENV_VAR} is deliberately withheld from "
+                "the secret-free scratch replay subprocess (not deploy-fatal)"
+            )
+
         detail = _bounded_subprocess_detail(
             stderr,
             stdout,
@@ -887,6 +1048,35 @@ async def _apply_candidate_migrations(
             finally:
                 if acquired:
                     lock.release()
+    except _DeterministicMigrationDefect:
+        raise  # already classified; propagate without re-wrapping
+    except _ServingOnlyImportError:
+        raise  # already classified; propagate without re-wrapping
+    except _KeylessEncryptionArtifact:
+        raise  # already classified; propagate without re-wrapping
+    except (SyntaxError, ImportError) as exc:
+        if isinstance(exc, ImportError) and _looks_like_serving_only_import(exc):
+            raise _ServingOnlyImportError(
+                f"candidate migration imports a candidate-only app symbol "
+                f"(serving-engine artifact, not deploy-fatal): {exc}"
+            ) from exc
+        raise _DeterministicMigrationDefect(
+            f"candidate migration has a deterministic Python defect "
+            f"({type(exc).__name__}): {exc}"
+        ) from exc
+    except sa.exc.ProgrammingError as exc:
+        pgcode = getattr(exc.orig, "pgcode", None) or getattr(
+            exc.orig, "sqlstate", None
+        )
+        if pgcode and str(pgcode).startswith("42"):
+            raise _DeterministicMigrationDefect(
+                f"candidate migration has a deterministic SQL defect "
+                f"(SQLSTATE {pgcode}): {exc}"
+            ) from exc
+        raise _MigrationApplyError(
+            f"candidate migration chain failed to apply against production's "
+            f"recorded state: {type(exc).__name__}: {exc}"
+        ) from exc
     except _MigrationApplyTimeout:
         raise
     except Exception as exc:
@@ -1147,6 +1337,123 @@ def _is_migration_source(filename: str) -> bool:
     )
 
 
+# ---- Data-migration proof gate -----------------------------------------------
+#
+# A migration is a "data migration" when it performs DML operations (UPDATE,
+# INSERT INTO, DELETE FROM) or bulk-inserts directly against table rows.
+# Running such migrations against the EMPTY scratch database always succeeds —
+# there are no rows to touch — so the scratch-apply verdict cannot prove
+# production safety.  Authors must declare a proof via:
+#
+#   # BLUEPRINT_DATA_MIGRATION_PROOF: <invariants or fixture description>
+#
+# in the migration file.  Missing proof causes the gate to defer (HOLD) with an
+# actionable message rather than returning an uninformative 'ok'.
+#
+# Detection is heuristic and intentionally conservative (false negatives for
+# unusual patterns are preferred over false positives that block structural
+# migrations).  Covered patterns:
+#   - op.bulk_insert(...)
+#   - .execute(sa.update/insert/delete(...))   — ORM DML via execute
+#   - .execute("UPDATE ..."/.execute(sa.text("UPDATE ...")/sa.text(f"""UPDATE...)
+#
+# DML inside DDL bodies (trigger functions, stored procedures) is NOT detected
+# because the surrounding context (CREATE FUNCTION / CREATE TRIGGER) is DDL.
+
+_DATA_OP_RE = re.compile(
+    r"\bop\.bulk_insert\b"  # op.bulk_insert(table, rows)
+    # ORM DML via any .execute() — covers op.execute, conn.execute, bind.execute
+    r"|\.execute\s*\(\s*sa\.(?:update|insert|delete)\s*\("
+    # Literal DML string in .execute() or .execute(sa.text(...))
+    r"|\.execute\s*\(\s*(?:sa\.text\s*\()?\s*[bBfFrRuU]*[\"']{1,3}\s*"
+    r"(?:UPDATE\b|INSERT\s+INTO\b|DELETE\s+FROM\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_DATA_MIGRATION_PROOF_RE = re.compile(
+    r"#\s*BLUEPRINT_DATA_MIGRATION_PROOF\s*:",
+    re.IGNORECASE,
+)
+
+
+def _migration_has_data_ops(source: str) -> bool:
+    """Return True when the migration source contains detectable DML operations."""
+    return bool(_DATA_OP_RE.search(source))
+
+
+def _migration_has_proof_declaration(source: str) -> bool:
+    """Return True when the migration carries a BLUEPRINT_DATA_MIGRATION_PROOF marker."""
+    return bool(_DATA_MIGRATION_PROOF_RE.search(source))
+
+
+def _new_migration_sources(
+    candidate_sources: dict[str, str],
+    prod_revision: str | None,
+) -> dict[str, str]:
+    """Return candidate migration sources that are not yet applied in production.
+
+    Walks the chain backwards from heads to *prod_revision*, collecting revisions
+    that postdate the live stamp.  When *prod_revision* is ``None`` or absent from
+    the chain, all migration sources are returned (conservative: check everything).
+    """
+    all_mig = {k: v for k, v in candidate_sources.items() if _is_migration_source(k)}
+    if not prod_revision:
+        return all_mig
+
+    chain, _, _ = build_migration_chain(all_mig)
+    if prod_revision not in chain:
+        return all_mig  # prod revision not in candidate chain — check all conservatively
+
+    new_revs: set[str] = set()
+    queue: list[str] = list(find_heads(chain))
+    visited: set[str] = set()
+    while queue:
+        rev = queue.pop()
+        if rev in visited:
+            continue
+        visited.add(rev)
+        if rev == prod_revision:
+            continue
+        new_revs.add(rev)
+        parent = chain.get(rev)
+        if parent and parent not in visited and parent != prod_revision:
+            queue.append(parent)
+
+    result: dict[str, str] = {}
+    for filename, source in all_mig.items():
+        rev_id, _ = parse_revision_identifiers(source)
+        if rev_id in new_revs:
+            result[filename] = source
+    return result
+
+
+def _check_data_migration_proof_gate(new_sources: dict[str, str]) -> Verdict | None:
+    """Defer when any new migration has DML operations but no proof declaration.
+
+    Data migrations produce correct verdicts on the empty scratch database (no
+    rows to touch) but may behave differently on real production data.  Requiring
+    an explicit ``# BLUEPRINT_DATA_MIGRATION_PROOF: <description>`` comment forces
+    authors to document the invariants or fixtures that validate production safety,
+    making the gate's 'ok' verdict meaningful for data-touching migrations.
+
+    Returns ``('defer', reason)`` if proof is missing, ``None`` otherwise.
+    """
+    offenders = [
+        filename
+        for filename, source in sorted(new_sources.items())
+        if _migration_has_data_ops(source) and not _migration_has_proof_declaration(source)
+    ]
+    if not offenders:
+        return None
+    return (
+        "defer",
+        f"data_migration_proof_missing: {len(offenders)} new migration(s) contain "
+        "data operations (DML / bulk-insert) but no "
+        "# BLUEPRINT_DATA_MIGRATION_PROOF: declaration — add proof evidence to: "
+        + ", ".join(offenders),
+    )
+
+
 def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | None:
     """Detect deterministically-defective migration chains.
 
@@ -1331,7 +1638,8 @@ async def run_migration_apply_gate(
     project_id: str | None = None,
     required_metadata: sa.MetaData | None = None,
     candidate_sources: dict[str, str] | None = None,
-    scratch_db_url: str | None = None,
+    scratch_db_url: str | URL | None = None,
+
 ) -> Verdict:
     """Pre-promotion scratch-DB migration-apply gate.
 
@@ -1355,6 +1663,7 @@ async def run_migration_apply_gate(
     from a fresh apply of its own migration chain AND compares that to the
     candidate code's required schema so a forgotten migration still blocks.
 
+
     *scratch_db_url* is an optional dedicated Postgres target for ephemeral
     database provisioning (``CREATE DATABASE``). When provided, the gate creates
     scratch/reference databases on this server instead of the production
@@ -1371,6 +1680,7 @@ async def run_migration_apply_gate(
     asserts its name differs from production's before any DDL.
     """
     prod_url = prod_engine.url
+
     scratch_base_url = make_url(scratch_db_url) if scratch_db_url else prod_url
 
     if not prod_url.get_backend_name().startswith("postgresql"):
@@ -1381,6 +1691,25 @@ async def run_migration_apply_gate(
             "defer",
             f"scratch-DB migration-apply gate requires a PostgreSQL production "
             f"bind; got {prod_url.get_backend_name()!r}",
+        )
+
+    prod_identity = (
+        prod_url.host,
+        prod_url.port,
+        prod_url.username,
+        prod_url.database,
+    )
+    scratch_identity = (
+        scratch_base_url.host,
+        scratch_base_url.port,
+        scratch_base_url.username,
+        scratch_base_url.database,
+    )
+    if scratch_identity == prod_identity:
+        return (
+            "defer",
+            "scratch_database_url_unsafe: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "must not resolve to the production pool target",
         )
 
     # 1. Candidate migration sources (fetched unless injected) — resolved BEFORE
@@ -1418,6 +1747,7 @@ async def run_migration_apply_gate(
             lambda: _read_prod_state(prod_engine),
             label="read production's recorded state",
         )
+
     except _MigrationApplyTimeout as exc:
         return ("defer", str(exc))
     except Exception as exc:  # noqa: BLE001 — indeterminate prod state HOLDS
@@ -1432,6 +1762,14 @@ async def run_migration_apply_gate(
             "production's recorded Alembic revision is unset/unreadable "
             "(no alembic_version stamp) — cannot reproduce the deploy",
         )
+
+    # 3b. Data-migration proof gate: new migrations with DML must declare proof.
+    # Runs after reading prod_state (needed to identify which migrations are new)
+    # but before the expensive scratch-DB provisioning path.
+    _new_sources = _new_migration_sources(candidate_sources, prod_state.revision)
+    _data_proof_verdict = _check_data_migration_proof_gate(_new_sources)
+    if _data_proof_verdict is not None:
+        return _data_proof_verdict
 
     if required_metadata is None:
         # Derive the candidate's required schema from a clean apply of its OWN
@@ -1448,6 +1786,19 @@ async def run_migration_apply_gate(
                 repo=repo,
                 candidate_ref=candidate_ref,
                 project_id=project_id,
+            )
+        except _ServingOnlyImportError:
+            return ("ok", None)
+        except _KeylessEncryptionArtifact:
+            return ("ok", None)
+        except _DeterministicMigrationDefect as exc:
+            return ("block", str(exc))
+        except _ScratchDatabaseUnavailable:
+            return (
+                "defer",
+                "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+                "must reach dedicated PostgreSQL infrastructure whose user can CREATE "
+                "and DROP databases; restore that prerequisite and retry qualification",
             )
         except _MigrationApplyError as exc:
             return ("defer", str(exc))
@@ -1478,14 +1829,30 @@ async def run_migration_apply_gate(
                 scratch_base_url, prod_state, candidate_sources, required_metadata
             ),
             label="provision-seed-apply-drift",
+            no_retry_types=(_DeterministicMigrationDefect, _ServingOnlyImportError, _KeylessEncryptionArtifact),
+        )
+    except _ServingOnlyImportError:
+        return ("ok", None)
+    except _KeylessEncryptionArtifact:
+        return ("ok", None)
+    except _DeterministicMigrationDefect as exc:
+        return ("block", str(exc))
+    except _ScratchDatabaseUnavailable:
+
+        return (
+            "defer",
+            "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "must reach dedicated PostgreSQL infrastructure whose user can CREATE "
+            "and DROP databases; restore that prerequisite and retry qualification",
         )
     except _MigrationApplyError as exc:
         return ("defer", str(exc))
-    except Exception as exc:  # noqa: BLE001 — any provisioning failure HOLDS
+    except Exception:  # Any provisioning failure holds with a value-safe detail.
         return (
             "defer",
-            f"could not provision/run the isolated scratch database: "
-            f"{type(exc).__name__}: {exc}",
+            "scratch_database_unavailable: MIGRATION_APPLY_SCRATCH_DATABASE_URL "
+            "could not complete the isolated migration apply; verify dedicated "
+            "PostgreSQL availability and CREATE/DROP DATABASE permission",
         )
 
     if drift:

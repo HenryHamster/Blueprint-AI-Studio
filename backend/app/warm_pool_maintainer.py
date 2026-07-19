@@ -363,6 +363,7 @@ async def _maybe_emit_cost_guard_alert(
     session.add(
         Alert(
             project_id=project_id,
+            event_type="warm_pool.cost_guard",
             severity=AlertSeverity.WARNING,
             title=_COST_GUARD_ALERT_TITLE,
             message=reason,
@@ -1857,16 +1858,17 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
         .all()
     )
 
-    for lane in stale_parked:
-        lane_id_str = str(lane.id)
-        # Find non-terminal tasks belonging to this lane's chain. Use Python-side
-        # context filtering to stay dialect-agnostic (SQLite / Postgres).
-        # If any non-terminal task references this lane, the chain is still live.
-        live_tasks = (
+    # Batch the live-task lookup: one query per distinct project_id rather than
+    # one per lane.  This avoids redundant full-project scans when multiple
+    # stale lanes share the same project.
+    stale_project_ids = {lane.project_id for lane in stale_parked}
+    live_tasks_by_project: dict = {}
+    if stale_project_ids:
+        all_live = (
             (
                 await session.execute(
                     select(Task).where(
-                        Task.project_id == lane.project_id,
+                        Task.project_id.in_(list(stale_project_ids)),
                         Task.status.notin_(list(_LANE_TERMINAL_TASK_STATUSES)),
                     )
                 )
@@ -1874,6 +1876,28 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             .scalars()
             .all()
         )
+        for t in all_live:
+            live_tasks_by_project.setdefault(t.project_id, []).append(t)
+
+    # Batch-fetch PoolVm reservations for all stale lanes to avoid N+1 queries.
+    all_stale_lane_ids = [lane.id for lane in stale_parked]
+    pool_vm_by_lane: dict = {}
+    if all_stale_lane_ids:
+        all_reserved_vms = (
+            (await session.execute(
+                select(PoolVm).where(
+                    PoolVm.reserved_lane_id.in_(all_stale_lane_ids)
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        for vm in all_reserved_vms:
+            pool_vm_by_lane.setdefault(vm.reserved_lane_id, []).append(vm)
+
+    for lane in stale_parked:
+        lane_id_str = str(lane.id)
+        live_tasks = live_tasks_by_project.get(lane.project_id, [])
         chain_is_live = any(
             (t.context or {}).get("_review_fix_lane_id") == lane_id_str
             for t in live_tasks
@@ -1893,15 +1917,7 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
                 lane.id,
                 lane.parked_at,
             )
-            reserved = (
-                (
-                    await session.execute(
-                        select(PoolVm).where(PoolVm.reserved_lane_id == lane.id)
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            reserved = pool_vm_by_lane.get(lane.id, [])
             for member in reserved:
                 member.reserved_lane_id = None
                 member.reservation_expires_at = None
@@ -2016,6 +2032,29 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     )
     cleared_expired_reservations = 0
     extended_reservations = 0
+
+    # Batch-fetch all ImprovementLane rows (N+1 fix: one query instead of
+    # session.get per candidate).
+    _all_lane_ids = {
+        lid for _, _, lid, _ in expired_reserved_candidates if lid is not None
+    }
+    _lanes_map: dict[int, ImprovementLane] = {}
+    if _all_lane_ids and is_improvement_lanes_enabled():
+        _lanes_map = {
+            r.id: r
+            for r in (
+                (
+                    await session.execute(
+                        select(ImprovementLane).where(
+                            ImprovementLane.id.in_(_all_lane_ids)
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        }
+
     for member_id, vm_instance_id, lane_id, expires_at in expired_reserved_candidates:
         locked_member = (
             (
@@ -2039,9 +2078,7 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             continue
 
         # Re-read liveness and the hard ceiling UNDER the row lock (no TOCTOU).
-        lane = None
-        if lane_id is not None and is_improvement_lanes_enabled():
-            lane = await session.get(ImprovementLane, lane_id)
+        lane = _lanes_map.get(lane_id) if lane_id is not None else None
         # The chain is still legitimately awaiting its fix only while the lane is
         # PARKED (a phase completed; the next/fix phase has not been dispatched).
         # A terminal/missing/otherwise-non-PARKED lane is no longer awaiting a fix.
@@ -2050,6 +2087,25 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
             and lane.status == ImprovementLaneStatus.PARKED.value
             and lane.status not in _TERMINAL_STATUSES
         )
+        # TOCTOU guard: the batch-fetch above happened before any PoolVm lock was
+        # held, so the lane may have transitioned out of PARKED while we processed
+        # preceding VMs in this loop.  A stale PARKED read causes us to extend a
+        # reservation that should be cleared.  Close the window with a cheap
+        # point-read of lane.status under the PoolVm row lock before committing to
+        # extend.  The clear path (cached non-PARKED → clear) is safe to leave on
+        # cached data: clearing when we should extend is corrected by the next sweep.
+        if chain_awaiting_fix:
+            fresh_status = (
+                await session.execute(
+                    select(ImprovementLane.status).where(
+                        ImprovementLane.id == lane_id
+                    )
+                )
+            ).scalar_one_or_none()
+            chain_awaiting_fix = (
+                fresh_status == ImprovementLaneStatus.PARKED.value
+                and fresh_status not in _TERMINAL_STATUSES
+            )
         hard_anchor = locked_member.reservation_hard_expires_at
         hard_elapsed = hard_anchor is None or hard_anchor <= now
 

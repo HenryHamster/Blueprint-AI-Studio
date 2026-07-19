@@ -25,6 +25,7 @@ from sqlalchemy import func, or_, and_
 from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
+from app.field_encryption import encrypt_field
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
@@ -39,7 +40,7 @@ from app.compute_backends import (
     detect_local_gpu,
     get_compute_backend,
     is_zero_cost_backend,
-    persist_viewable_artifacts,
+    persist_viewable_artifacts_with_completeness,
     run_preflight_smoke,
     validate_backend_name,
 )
@@ -58,10 +59,11 @@ from app.artifact_prerequisites import (
     downstream_artifact_logical_key,
     stamp_artifact_logical_key,
 )
+from app.alert_dispatch import _maybe_create_no_progress_watchdog_alert
 from app.database import AsyncSessionLocal
-from app.json_extract import (
-    scan_all_balanced_json_objects,
-    scan_balanced_json_objects,
+from app.compute_result_metrics import (
+    coerce_metric_number as _coerce_metric_number,
+    stdout_metrics_fallback as _stdout_metrics_fallback,
 )
 from app.models import (
     Artifact,
@@ -70,6 +72,7 @@ from app.models import (
     ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
+    LocalRunner,
     Project,
     ReleaseVersion,
     Task,
@@ -148,10 +151,10 @@ PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
     os.getenv("COMPUTE_PROVISIONING_RETRY_BACKOFF_SECONDS", "120")
 )
 # No-progress watchdog. A long-running compute job (e.g. multi-day RL training)
-# can burn its entire wall-clock deadline while learning nothing; the surfacing
-# half (a bounded progress-metric ring buffer in polling_metadata, written from
-# runner heartbeats via append_progress_sample) already ships. These constants
-# drive the CONSUMER that reads that trend and cuts a stalled job early.
+# can burn its entire wall-clock deadline while learning nothing. Progress is
+# retained as a bounded receipt-time envelope in polling_metadata, written from
+# authenticated runner heartbeats via append_progress_sample. These constants
+# drive the consumer that reads that trend and cuts a stalled job early.
 #
 # The watchdog is FAIL-OPEN by construction: it fires ONLY when the job declares
 # a metric to watch (polling_metadata['declared_metric']) AND enough progress
@@ -161,9 +164,6 @@ PROVISIONING_RETRY_BACKOFF_BASE_SECONDS = int(
 COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS = float(
     os.getenv("COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS", "1800")
 )
-# The progress ring buffer holds at most 50 samples (drop-oldest); at the ~60s
-# heartbeat cadence that is ~50 min of history, so the stall window must stay
-# comfortably under that to ever accumulate a full window of samples.
 COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS = float(
     os.getenv("COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS", "1800")
 )
@@ -212,24 +212,42 @@ _LIVE_PROOF_MARKER_KEYS = (
     "requires_live_release",
 )
 
-# Progress-metric ring buffer — bounded time-series written into polling_metadata.
+# Progress-metric history — bounded, server-timestamped time-series written into
+# polling_metadata.  Samples are coalesced to one per metric/minute, which keeps
+# a full 24-hour contract window (1441 points) even when a runner emits very
+# high-frequency or unrelated-metric telemetry.
 _PROGRESS_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
-_PROGRESS_SERIES_MAX_SAMPLES = 50
+_PROGRESS_SAMPLE_BUCKET_SECONDS = 60
+_PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC = 1500
+_PROGRESS_SERIES_MAX_METRICS = 16
 
 # Stable terminal-kind label for a no-progress early-cut.  Callers that cut a
 # job for a stalled progress trend pass this as terminal_kind to
 # _finalize_terminal_job so the disposition is distinct from a wall-clock expiry.
 NO_PROGRESS_TERMINAL_REASON = "no_progress"
 
+# Runner-subprocess silent-death timeout. A runner is expected to heartbeat
+# every ~60s; after this many seconds without a heartbeat the job is reaped
+# as a silent orphan, freeing the project concurrency slot and spend ceiling.
+RUNNER_SILENT_TIMEOUT_SECONDS = int(
+    os.getenv("COMPUTE_JOB_RUNNER_SILENT_TIMEOUT_SECONDS", "600")
+)
+
 
 def append_progress_sample(
-    meta: dict, *, metric: str, value: float, t: str
+    meta: dict, *, metric: str, value: float, t: str, received_at: datetime | str | None = None
 ) -> dict:
     """Append a progress sample to the ring buffer in a polling_metadata dict.
 
-    Returns a new dict with the sample appended (drop-oldest at 50 entries).
+    Returns a new dict with the sample appended.  History is bounded per metric
+    rather than globally, so chatty auxiliary metrics cannot evict the declared
+    metric needed to enforce a long watchdog window.
     Silently ignores non-finite values, bad metric keys, or any other error
     so the caller never raises on malformed input.
+
+    ``received_at`` is the authenticated server receipt timestamp used by the
+    watchdog to evaluate progress windows.  Pass a ``datetime`` or ISO string.
+    When absent, falls back to ``t`` for backwards compatibility.
     """
     try:
         if not isinstance(metric, str) or not _PROGRESS_METRIC_KEY_RE.fullmatch(metric):
@@ -240,13 +258,49 @@ def append_progress_sample(
         if not isinstance(t, str) or not t:
             return meta
         meta = dict(meta)
-        series: list = list(meta.get("progress_series") or [])
-        series.append({"t": t, "name": metric, "value": float_val})
-        if len(series) > _PROGRESS_SERIES_MAX_SAMPLES:
-            series = series[-_PROGRESS_SERIES_MAX_SAMPLES:]
+        timestamp = _parse_naive_iso_datetime(t)
+        series: list = [item for item in list(meta.get("progress_series") or []) if isinstance(item, dict)]
+        # Keep at most 16 metric names, reserving a slot for a newly declared
+        # metric; the configured metric is always retained.
+        metric_names = {item.get("name") for item in series if isinstance(item.get("name"), str)}
+        if metric not in metric_names and len(metric_names) >= _PROGRESS_SERIES_MAX_METRICS:
+            declared = meta.get("declared_metric")
+            removable = next((name for name in metric_names if name != declared), None)
+            if removable is None:
+                return meta
+            series = [item for item in series if item.get("name") != removable]
+        bucket = (
+            int(timestamp.timestamp()) // _PROGRESS_SAMPLE_BUCKET_SECONDS
+            if timestamp is not None
+            else None
+        )
+        # A server can receive many reports in one minute.  Replacing the bucket's
+        # point retains the latest observed value without allowing report rate to
+        # shrink the retained time horizon.
+        series = [
+            item for item in series
+            if not (
+                item.get("name") == metric
+                and bucket is not None
+                and (parsed := _parse_naive_iso_datetime(item.get("t"))) is not None
+                and int(parsed.timestamp()) // _PROGRESS_SAMPLE_BUCKET_SECONDS == bucket
+            )
+        ]
+        received_at_str: str | None
+        if isinstance(received_at, datetime):
+            received_at_str = received_at.isoformat()
+        elif isinstance(received_at, str) and received_at:
+            received_at_str = received_at
+        else:
+            received_at_str = t
+        series.append({"t": t, "received_at": received_at_str, "name": metric, "value": float_val})
+        metric_series = [item for item in series if item.get("name") == metric]
+        if len(metric_series) > _PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:
+            keep = {id(item) for item in metric_series[-_PROGRESS_SERIES_MAX_SAMPLES_PER_METRIC:]}
+            series = [item for item in series if item.get("name") != metric or id(item) in keep]
         meta["progress_series"] = series
         return meta
-    except Exception:
+    except Exception:  # noqa: BLE001 - telemetry ingestion must remain fail-open
         return meta
 
 
@@ -353,6 +407,24 @@ async def _resolve_resume_source_job_id(
                 "input_artifact_job_id": str(parsed),
             }
         )
+    _source_status = (
+        source.status
+        if isinstance(source.status, ComputeJobStatus)
+        else ComputeJobStatus(source.status)
+    )
+    if _source_status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_job_not_terminal",
+                "message": (
+                    f"input_artifact_job_id {parsed} is still {_source_status.value} — "
+                    "resuming from a non-terminal job risks rehydrating a "
+                    "partial/mid-checkpoint bundle"
+                ),
+                "input_artifact_job_id": str(parsed),
+                "source_status": _source_status.value,
+            }
+        )
     if not _compute_job_has_durable_bundle(source):
         raise ComputeLaunchPreconditionFailed(
             {
@@ -365,7 +437,52 @@ async def _resolve_resume_source_job_id(
                 "input_artifact_job_id": str(parsed),
             }
         )
+    source_meta = source.polling_metadata or {}
+    if source_meta.get("input_artifact_job_id") is not None:
+        provenance = source_meta.get("resume_provenance")
+        valid_provenance = (
+            isinstance(provenance, dict)
+            and provenance.get("ok") is True
+            and str(provenance.get("resumed_from_job_id") or "")
+            == str(source_meta.get("input_artifact_job_id"))
+            and isinstance(provenance.get("file_count"), int)
+            and provenance["file_count"] > 0
+        )
+        if not valid_provenance:
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "input_artifact_job_resume_provenance_invalid",
+                    "message": (
+                        "input_artifact_job_id has incomplete or failed resume "
+                        "hydration provenance and cannot be used as a checkpoint ancestor"
+                    ),
+                    "input_artifact_job_id": str(parsed),
+                }
+            )
     return str(parsed)
+
+
+def _has_verified_resume_provenance(job: Any) -> bool:
+    """Return True when *job* carries a valid cross-job checkpoint provenance.
+
+    A provenance is valid when it was written by a successful hydration run on
+    the same predecessor job: ok=True, resumed_from_job_id matches the job's
+    declared input_artifact_job_id, and at least one file was copied.  This is
+    the same contract enforced by ``_validate_input_artifact_job_id`` but
+    expressed as a boolean predicate for use in tests and status checks.
+    """
+    meta = (job.polling_metadata or {}) if hasattr(job, "polling_metadata") else {}
+    input_job_id = meta.get("input_artifact_job_id")
+    if input_job_id is None:
+        return False
+    provenance = meta.get("resume_provenance")
+    return (
+        isinstance(provenance, dict)
+        and provenance.get("ok") is True
+        and str(provenance.get("resumed_from_job_id") or "") == str(input_job_id)
+        and isinstance(provenance.get("file_count"), int)
+        and provenance["file_count"] > 0
+    )
 
 
 def clamp_spend_cap_usd(raw_value: float) -> float:
@@ -522,6 +639,21 @@ async def create_compute_job(
             capped_np_timeout = None  # 0 = disable
         else:
             capped_np_timeout = max(60, min(raw_np, capped_deadline))
+    if (
+        input_artifact_job_id is not None
+        and str(input_artifact_job_id).strip()
+        and capped_np_timeout is None
+    ):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "input_artifact_watchdog_required",
+                "message": (
+                    "input_artifact_job_id requires an explicit positive "
+                    "no_progress_timeout_seconds watchdog"
+                ),
+                "input_artifact_job_id": str(input_artifact_job_id),
+            }
+        )
     # Persist the canonical accelerator short name (e.g. "T4") so the launch spec,
     # cost rate, and provisioning path all resolve the same supported shape.
     persisted_accelerator = accel_spec.name if accel_spec is not None else None
@@ -586,6 +718,16 @@ async def create_compute_job(
             project_id=locked_task.project_id,
             input_artifact_job_id=input_artifact_job_id,
         )
+        if capped_np_timeout is None or not (isinstance(declared_metric, str) and declared_metric.strip()):
+            raise ComputeLaunchPreconditionFailed(
+                {
+                    "error": "resume_requires_watchdog",
+                    "message": (
+                        "resumed compute jobs require declared_metric and a positive "
+                        "no_progress_timeout_seconds so stalled checkpoint runs are cut"
+                    ),
+                }
+            )
     launch_request_fingerprint = _build_launch_request_fingerprint(
         command=command,
         machine_type=resolved_machine_type,
@@ -712,7 +854,7 @@ async def create_compute_job(
                     registry_meta["server"] = str(container_registry_auth["server"])
                 if container_registry_auth.get("username"):
                     registry_meta["username"] = str(container_registry_auth["username"])
-                registry_meta["password"] = str(container_registry_auth["password"])
+                registry_meta["password"] = encrypt_field(str(container_registry_auth["password"]))
                 polling_metadata["container_registry_auth"] = registry_meta
             else:
                 # No password: persist only server + username — password is never
@@ -1160,11 +1302,14 @@ def _declared_progress_metric(job: ComputeJob) -> str | None:
 def _watched_progress_samples(
     job: ComputeJob, metric: str
 ) -> list[tuple[datetime, float]]:
-    """Return time-sorted ``(t, value)`` samples for ``metric`` from the ring buffer.
+    """Return receipt-time-sorted samples for the declared metric.
 
-    Reads the bounded ``progress_series`` written by ``append_progress_sample``.
-    Malformed entries (bad timestamp, non-numeric value, wrong/absent name) are
-    silently skipped so a single bad heartbeat can never corrupt the trend.
+    ``received_at`` is written by the authenticated ingestion route and is the
+    preferred enforcement clock. When ``received_at`` is *absent* (pre-upgrade
+    samples stored before the field was introduced), the runner-authored ``t``
+    field is used as a fallback so that a rolling deploy cannot convert a
+    healthy in-flight job into TIMED_OUT. Samples where ``received_at`` is
+    *present but malformed* are still skipped.
     """
     series = (job.polling_metadata or {}).get("progress_series")
     if not isinstance(series, list):
@@ -1173,13 +1318,61 @@ def _watched_progress_samples(
     for sample in series:
         if not isinstance(sample, dict) or sample.get("name") != metric:
             continue
-        ts = _parse_naive_iso_datetime(sample.get("t"))
+        if "received_at" in sample:
+            ts = _parse_naive_iso_datetime(sample["received_at"])
+        else:
+            # Pre-upgrade sample: received_at was never written; fall back to
+            # the runner-authored timestamp so the sample is not silently dropped.
+            ts = _parse_naive_iso_datetime(sample.get("t"))
         val = _coerce_metric_number(sample.get("value"))
         if ts is None or val is None:
             continue
         out.append((ts, float(val)))
     out.sort(key=lambda pair: pair[0])
     return out
+
+
+def _watchdog_metric_name_mismatch(job: ComputeJob) -> list[str]:
+    """Return the observed progress-metric names when the no-progress watchdog is
+    INERT purely because of a metric-name mismatch, else ``[]``.
+
+    The watchdog keys on exact name equality between the contract-declared metric
+    (:func:`_declared_progress_metric`) and the ``name`` of each recorded progress
+    sample (:func:`_watched_progress_samples`). A job that declares metric ``X`` but
+    only ever reports progress under some other name ``Y`` accumulates ZERO samples
+    for ``X``, so the watchdog can never fire — the waste-prevention lever the
+    operator explicitly asked for is SILENTLY inert. This predicate detects exactly
+    that case so the poller can surface it honestly (a durable marker + a warning
+    log) instead of the lever failing silent.
+
+    Returns the sorted, de-duplicated set of metric names actually present in the
+    bounded progress history when ALL of the following hold; otherwise ``[]``:
+
+    * the job declares a metric to watch;
+    * the history holds at least one well-formed sample (the job IS reporting
+      progress, so a genuinely silent job — no telemetry at all — is never flagged;
+      that case is the watchdog's normal fail-open domain, not a name mismatch); and
+    * none of those samples carry the declared metric's name.
+    """
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return []
+    series = (job.polling_metadata or {}).get("progress_series")
+    if not isinstance(series, list):
+        return []
+    observed: set[str] = set()
+    for sample in series:
+        if not isinstance(sample, dict):
+            continue
+        name = sample.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        if _coerce_metric_number(sample.get("value")) is None:
+            continue
+        observed.add(name)
+    if not observed or metric in observed:
+        return []
+    return sorted(observed)
 
 
 def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
@@ -1202,24 +1395,52 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
 
     Direction-agnostic: a flat metric is "no progress" whether higher or lower
     is better, so the check never needs to know the metric's polarity.
+
+    Per-job override: if ``no_progress_timeout_seconds`` is stored in the job's
+    ``polling_metadata`` (set at job-creation time from the experiment contract),
+    it is used as both the grace period and the plateau-detection window instead
+    of the global env-var defaults.
     """
-    if COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS <= 0:
+    meta = job.polling_metadata or {}
+    raw_per_job = meta.get("no_progress_timeout_seconds")
+    if raw_per_job is not None:
+        try:
+            per_job_seconds = float(raw_per_job)
+        except (TypeError, ValueError):
+            per_job_seconds = None
+    else:
+        per_job_seconds = None
+
+    window_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+    grace_seconds = per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
+
+    if window_seconds <= 0:
         return False
     metric = _declared_progress_metric(job)
     if metric is None:
         return False
     if job.started_at is None:
         return False
-    if (now - job.started_at).total_seconds() < COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS:
+    if (now - job.started_at).total_seconds() < grace_seconds:
         return False
     samples = _watched_progress_samples(job, metric)
+    if not samples:
+        # Reporting under another name is a contract mismatch, not silence.  It
+        # is surfaced as unprotected and must not be mistaken for a missing signal.
+        if _watchdog_metric_name_mismatch(job):
+            return False
+        # A declared watchdog is an enforcement promise, not merely telemetry
+        # decoration: after its grace window, missing telemetry is no progress.
+        return True
+    window_start = now - timedelta(seconds=window_seconds)
+    if samples[-1][0] < window_start:
+        return True
     if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
     # Enough history: the oldest recorded sample must be at least a full window
     # old, else we have not yet observed a window's worth of the metric.
-    if (now - samples[0][0]).total_seconds() < COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS:
+    if (now - samples[0][0]).total_seconds() < window_seconds:
         return False
-    window_start = now - timedelta(seconds=COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)
     window = [(t, v) for (t, v) in samples if t >= window_start]
     if len(window) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
         return False
@@ -1228,6 +1449,190 @@ def _no_progress_stalled(job: ComputeJob, *, now: datetime) -> bool:
     reference = max((abs(v) for v in values), default=0.0)
     tolerance = COMPUTE_JOB_NO_PROGRESS_EPSILON * (reference if reference > 0 else 1.0)
     return spread <= tolerance
+
+
+def derive_watchdog_protection_status(
+    polling_metadata: dict | None,
+    *,
+    started_at: datetime | None = None,
+    now: datetime | None = None,
+) -> dict:
+    """Derive watchdog-protection status fields from a job's polling_metadata.
+
+    Intended for inclusion in serialized compute-job response payloads.  The
+    derivation mirrors ``_no_progress_stalled`` exactly so operators see the same
+    effective timeout the watchdog would use — there is no forked definition.
+
+    Returns a dict with:
+      watchdog_state (str): High-level state — one of 'protected', 'warming_up',
+          'insufficient_history', 'stale_telemetry', 'inert'.
+      watchdog_active (bool): True only when watchdog_state == 'protected'.
+      no_progress_timeout_seconds (int|None): Effective timeout in seconds
+          (per-job override if set, else global default). None when no metric declared.
+      last_progress_at (str|None): ISO timestamp of the most recent
+          progress_series sample matching the declared metric (server receipt time),
+          or None.
+      watchdog_inert_reason (str|None): Granular reason the watchdog is not
+          firing. None when active.
+    """
+    from types import SimpleNamespace
+
+    _now = now if now is not None else _utcnow()
+
+    meta = polling_metadata or {}
+    _job = SimpleNamespace(polling_metadata=meta)
+
+    # Normalise started_at: accept datetime or ISO string from JSON-serialised payloads.
+    _started_at: datetime | None = None
+    if isinstance(started_at, datetime):
+        _started_at = started_at
+    elif isinstance(started_at, str) and started_at:
+        _started_at = _parse_naive_iso_datetime(started_at)
+
+    # Resolve effective timeout — identical to the resolution in _no_progress_stalled.
+    raw_per_job = meta.get("no_progress_timeout_seconds")
+    per_job_seconds: float | None = None
+    if raw_per_job is not None:
+        try:
+            per_job_seconds = float(raw_per_job)
+        except (TypeError, ValueError):
+            pass
+    effective_seconds = (
+        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS
+    )
+    grace_seconds = (
+        per_job_seconds if per_job_seconds is not None else COMPUTE_JOB_NO_PROGRESS_GRACE_SECONDS
+    )
+
+    metric = _declared_progress_metric(_job)
+
+    if metric is None:
+        return {
+            "watchdog_state": "inert",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": None,
+            "last_progress_at": None,
+            "watchdog_inert_reason": "no_declared_metric",
+        }
+
+    if effective_seconds <= 0:
+        return {
+            "watchdog_state": "inert",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "timeout_disabled",
+        }
+
+    # Collect matching samples using server receipt time (received_at).
+    series = meta.get("progress_series")
+    last_received_at: str | None = None
+    last_received_ts: datetime | None = None
+    has_any_sample = False
+    has_valid_received_at = False
+
+    if isinstance(series, list):
+        for sample in series:
+            if not isinstance(sample, dict) or sample.get("name") != metric:
+                continue
+            has_any_sample = True
+            recv_str = sample.get("received_at")
+            ts = _parse_naive_iso_datetime(recv_str)
+            if ts is None:
+                continue
+            has_valid_received_at = True
+            if last_received_ts is None or ts > last_received_ts:
+                last_received_ts = ts
+                last_received_at = recv_str
+
+    # Metric-name mismatch is deterministic: samples exist for OTHER metrics
+    # but none match the declared one.  Surface this before grace/start-time checks
+    # because it is always inert regardless of when the job started.
+    if not has_any_sample and _watchdog_metric_name_mismatch(_job):
+        return {
+            "watchdog_state": "inert",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "metric_name_mismatch",
+        }
+
+    # When started_at is absent we cannot evaluate the grace period — surface that
+    # honestly as insufficient_history/missing_start_time.
+    if _started_at is None:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "missing_start_time",
+        }
+    if (_now - _started_at).total_seconds() < grace_seconds:
+        return {
+            "watchdog_state": "warming_up",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": None,
+        }
+
+    # No samples for the declared metric (and no mismatch detected above).
+    if not has_any_sample:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "no_telemetry",
+        }
+
+    # Samples exist for the declared metric but none have a valid received_at.
+    if not has_valid_received_at:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": None,
+            "watchdog_inert_reason": "malformed_history",
+        }
+
+    # All samples are older than the effective window — stale telemetry.
+    window_start = _now - timedelta(seconds=effective_seconds)
+    if last_received_ts is not None and last_received_ts < window_start:
+        return {
+            "watchdog_state": "stale_telemetry",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "stale_telemetry",
+        }
+
+    # Samples exist and are fresh — check whether we have a full window of history.
+    samples = _watched_progress_samples(_job, metric)
+    if len(samples) < COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES:
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "insufficient_window",
+        }
+    if samples and ((_now - samples[0][0]).total_seconds() < effective_seconds):
+        return {
+            "watchdog_state": "insufficient_history",
+            "watchdog_active": False,
+            "no_progress_timeout_seconds": int(effective_seconds),
+            "last_progress_at": last_received_at,
+            "watchdog_inert_reason": "insufficient_window",
+        }
+
+    return {
+        "watchdog_state": "protected",
+        "watchdog_active": True,
+        "no_progress_timeout_seconds": int(effective_seconds),
+        "last_progress_at": last_received_at,
+        "watchdog_inert_reason": None,
+    }
 
 
 def _provisioning_timeout_seconds(job: ComputeJob, *, now: datetime) -> float | None:
@@ -1249,6 +1654,14 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
     return status.exit_code == 124
 
 
+def _status_is_no_progress_timeout(status: ComputeStatusResult) -> bool:
+    """True for every backend's reserved no-progress terminal signal."""
+    return (
+        status.exit_code == 125
+        or "no_progress_timeout" in (status.message or "").strip().lower()
+    )
+
+
 # Fatal "no usable GPU" diagnostics printed by container entrypoints (notably
 # the NGC / ``nvcr.io/nvidia/pytorch`` images) when the host GPU predates the
 # image's minimum CUDA compute capability — e.g. a Tesla V100 (Volta, CC 7.0)
@@ -1260,9 +1673,29 @@ def _status_is_runtime_timeout(status: ComputeStatusResult) -> bool:
 _NO_USABLE_GPU_LOG_MARKERS: tuple[str, ...] = (
     "no supported gpu(s) detected to run this container",
     "gpu, which is not supported by this container",
+    # CUDA error 209: image lacks device code for the host GPU arch (e.g. sm_70/Volta)
+    "no kernel image is available for execution on the device",
 )
 _NO_USABLE_GPU_TERMINAL_REASON = (
     "container reported no usable GPU — host GPU/image compatibility mismatch"
+)
+
+# A metric-or-arms job that exits 0 without fulfilling its declared result
+# contract produced no usable result — the command silently no-op'd (crashed
+# before writing its result marker, mis-declared its metric, wrote to the wrong
+# path, etc.) yet the backend reports SUCCEEDED. Incidental durable files (logs
+# and checkpoints) are preserved and linked, but are not evidence that the
+# declared metric or per-arm result was delivered. Detecting the unfulfilled
+# terminal lets the poller reclassify it as a FAILURE so the missing result
+# surfaces loudly. The arms sweep path is especially vulnerable: its pre-flight
+# metric assertion is deliberately skipped (see _run_and_apply_preflight_smoke:
+# declared_metric_for_smoke is None for arms).
+_NO_DATA_TERMINAL_REASON = (
+    "compute job exited 0 but never measured its declared result — no usable result"
+)
+_NO_CRITERION_EXPERIMENT_REASON = (
+    "compute_experiment declared no metric and produced no measurements — "
+    "a metric or success_criterion is required for experiments"
 )
 
 # Seeded into polling_metadata["status_message"] at job-creation time (see the
@@ -1331,6 +1764,192 @@ def _status_reports_no_usable_gpu(status: ComputeStatusResult) -> bool:
         return False
     lowered = text.lower()
     return any(marker in lowered for marker in _NO_USABLE_GPU_LOG_MARKERS)
+
+
+def _resolved_metric_names(
+    job: ComputeJob, status: ComputeStatusResult
+) -> set[str]:
+    """Metric names measurable from a job's FULLY-resolved terminal metric set.
+
+    Mirrors exactly what :func:`_apply_polled_compute_job_result` will persist and
+    what :func:`build_compute_result_logs` (which the success-criterion gate reads)
+    then resolves, so this guard sees the same names the gate will:
+
+    * ``result_metrics`` — the current poll's ``status.metrics`` when non-empty,
+      else the value a PRIOR poll persisted (``_apply_polled_compute_job_result``
+      only overwrites ``result_metrics`` on a truthy ``status.metrics``, so a metric
+      captured earlier stays resolvable — matching the sticky persistence and
+      preventing a false-positive FAILURE on a final metric-less poll);
+    * the per-arm block used by the best-arm evaluator (any numeric key inside any
+      arm of ``result_metrics['arms']``); and
+    * the stdout JSON fallback — but only when ``result_metrics`` is absent/empty,
+      the exact condition under which the artifact builder consults it.
+
+    Defensive: tolerates missing/malformed metadata and only ever counts values
+    that coerce to a real number, matching how the evaluator decides ``measurable``.
+    """
+    meta = job.polling_metadata or {}
+    result_metrics = (
+        dict(status.metrics)
+        if isinstance(status.metrics, dict) and status.metrics
+        else meta.get("result_metrics")
+    )
+    result_metrics = result_metrics if isinstance(result_metrics, dict) else {}
+    command_log = (
+        dict(status.command_log)
+        if isinstance(status.command_log, dict) and status.command_log
+        else meta.get("command_log")
+    )
+    names: set[str] = set()
+    for key, value in result_metrics.items():
+        if key == "arms":
+            continue
+        if _coerce_metric_number(value) is not None:
+            names.add(str(key))
+    arms = result_metrics.get("arms")
+    if isinstance(arms, dict):
+        for arm in arms.values():
+            if isinstance(arm, dict):
+                for key, value in arm.items():
+                    if _coerce_metric_number(value) is not None:
+                        names.add(str(key))
+    # stdout fallback fires ONLY when result-file metrics are absent/empty — the
+    # same gate build_compute_result_logs applies before scanning stdout.
+    if not result_metrics:
+        cl = {"command_log": command_log} if isinstance(command_log, dict) else {}
+        fallback = _stdout_metrics_fallback(cl)
+        if isinstance(fallback, dict):
+            for key, value in fallback.items():
+                if _coerce_metric_number(value) is not None:
+                    names.add(str(key))
+    return names
+
+
+def _declared_metric_unmeasured(job: ComputeJob, status: ComputeStatusResult) -> bool:
+    """True when ``job`` declared a metric its terminal result never captured.
+
+    The general form of the ``_status_reports_no_usable_gpu`` special case: a
+    backend-reported SUCCEEDED that declared a metric (from the compute_experiment
+    launch contract / success_criterion) but produced no value for it — after all
+    existing metric resolution (result file, per-arm block, stdout fallback) — did
+    not actually measure its hypothesis and must not record a clean SUCCESS.
+
+    Fail-safe, mirroring the watchdog and the no-usable-GPU guard: returns False
+    when the job declared no metric (metric-less jobs are byte-for-byte unaffected)
+    or when the declared metric IS present in the fully-resolved set. Comparison is
+    case-insensitive to match the success-criterion evaluator's case-insensitive
+    metric lookup.
+    """
+    metric = _declared_progress_metric(job)
+    if metric is None:
+        return False
+    resolved = {name.lower() for name in _resolved_metric_names(job, status)}
+    return metric.strip().lower() not in resolved
+
+
+def _status_has_no_reported_metrics(status: ComputeStatusResult) -> bool:
+    """True when a terminal status carries no self-reported result metrics.
+
+    The launched command reports its metrics as a small flat JSON object via the
+    result marker; an absent, non-dict, or empty ``metrics`` means the run
+    produced no evaluable metric — the "no data" precondition for the guard.
+    """
+    metrics = status.metrics
+    return not isinstance(metrics, dict) or not metrics
+
+
+def _task_declares_arms(task: Task | None) -> bool:
+    """True when the task contract requires a per-arm result block."""
+    return bool((task.first_payload or {}).get("arms")) if task is not None else False
+
+
+def _arms_have_reported_data(job: ComputeJob, status: ComputeStatusResult) -> bool:
+    """Return whether an arms contract has any numeric per-arm result.
+
+    Use the same current-poll-or-sticky result source as the terminal metric
+    resolver. A flat metric or incidental artifact cannot fulfill an arms
+    contract: the success evaluator needs a numeric value inside an arm block.
+    """
+    result_metrics = (
+        status.metrics
+        if isinstance(status.metrics, dict) and status.metrics
+        else (job.polling_metadata or {}).get("result_metrics")
+    )
+    arms = result_metrics.get("arms") if isinstance(result_metrics, dict) else None
+    return isinstance(arms, dict) and any(
+        isinstance(arm, dict)
+        and any(_coerce_metric_number(value) is not None for value in arm.values())
+        for arm in arms.values()
+    )
+
+
+def _no_data_terminal_reason(artifact_reference: Any | None) -> str:
+    """Explain an unfulfilled result contract without discarding artifacts."""
+    if artifact_reference is None:
+        return _NO_DATA_TERMINAL_REASON
+    return (
+        f"{_NO_DATA_TERMINAL_REASON}; durable artifacts preserved "
+        f"(uri={artifact_reference.uri}, file_count={artifact_reference.file_count})"
+    )
+
+
+def _job_expects_data(job: ComputeJob, task: Task | None) -> bool:
+    """True when the job declared it should produce a metric or arms output.
+
+    A pure side-effect command (no declared metric, no arms sweep) can legitimately
+    finish with neither metrics nor durable artifacts, so the no-data guard must
+    NOT fire for it — that would false-reject a genuinely successful run. Only jobs
+    that declared a metric (``polling_metadata['declared_metric']`` stamped at job
+    creation, or the task payload's ``declared_metric`` / ``success_criterion.metric``)
+    or an ``arms`` block are expected to emit data; those finishing empty are the
+    silent-failure case the guard catches. Mirrors the declared-metric/arms
+    derivation in :func:`_run_and_apply_preflight_smoke` and reads the same
+    ``polling_metadata['declared_metric']`` the no-progress watchdog keys on.
+    """
+    if (job.polling_metadata or {}).get("declared_metric"):
+        return True
+    if task is None:
+        return False
+    payload = task.first_payload or {}
+    if payload.get("arms"):
+        return True
+    criterion = payload.get("success_criterion")
+    declared_metric = payload.get("declared_metric") or (
+        criterion.get("metric") if isinstance(criterion, dict) else None
+    )
+    return bool(declared_metric)
+
+
+def _is_criterion_free_experiment(job: "ComputeJob", task: Task | None) -> bool:
+    """True for compute_experiment tasks that declared no metric and no criterion.
+
+    A compute_experiment is a measurement task by definition — finishing with no
+    declared metric, no arms, and no success_criterion is never a clean SUCCESS.
+    The run produced nothing evaluable, so it must be reclassified as FAILURE rather
+    than silently benefiting from the _job_expects_data carve-out that was designed
+    for pure side-effect commands. Non-experiment task types (research, plan, …) are
+    unaffected: they are legitimate side-effect jobs and the carve-out stays intact.
+
+    Checks both the task payload AND the job's polling_metadata for a stamped
+    declared_metric so a job created with an explicit declared_metric kwarg (which
+    stamps polling_metadata["declared_metric"] at creation time) is never
+    misclassified as criterion-free.
+    """
+    if task is None:
+        return False
+    payload = task.first_payload or {}
+    if str(payload.get("type") or "") != "compute_experiment":
+        return False
+    # Declared metric stamped in polling_metadata at job creation → not criterion-free.
+    if (job.polling_metadata or {}).get("declared_metric"):
+        return False
+    # Already has a declared metric or arms in payload — handled by the existing path.
+    if payload.get("declared_metric") or payload.get("arms"):
+        return False
+    # Has a success_criterion (metric or artifact_produced) — a well-defined contract.
+    if payload.get("success_criterion") is not None:
+        return False
+    return True
 
 
 async def get_compute_job_for_task(
@@ -1516,6 +2135,114 @@ async def _apply_operator_kill_result(
     await session.commit()
     await session.refresh(live)
     return live
+
+
+async def finalize_silent_compute_job(
+    session, job: ComputeJob, *, now
+) -> bool:
+    """Drive a silent runner-subprocess or GCP job to TIMED_OUT.
+
+    Re-locks and re-checks heartbeat staleness before finalizing. GCP jobs are
+    finalized only after successful VM deletion; failed deletes retain RUNNING
+    state with a durable diagnostic for retry.
+    """
+    # Rollback expires every ORM instance in the session.  Keep the identifier
+    # as a plain scalar so the GCP terminate error path can persist its
+    # diagnostic without touching either ``job`` or ``live`` after rollback.
+    job_id = job.id
+    live = await _lock_compute_job(session, job_id)
+    if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        await session.commit()
+        return False
+    if live.status != ComputeJobStatus.RUNNING or live.backend not in (
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+        GCP_BACKEND_NAME,
+    ):
+        await session.commit()
+        return False
+
+    # Re-check heartbeat staleness under the lock.  A concurrent /report
+    # (which refreshes last_heartbeat_at while keeping the status RUNNING)
+    # may have committed between the initial SELECT (without FOR UPDATE)
+    # and this lock.  With populate_existing=True the row above reflects
+    # the latest committed state: if the heartbeat is now fresh the job is
+    # still healthy and must not be terminalized.
+    stale_cutoff = now - timedelta(seconds=RUNNER_SILENT_TIMEOUT_SECONDS)
+    hb = live.last_heartbeat_at
+    if hb is not None and hb >= stale_cutoff:
+        await session.commit()
+        return False
+    # GCP RUNNING means the first heartbeat was received; provisioning owns the
+    # no-first-heartbeat case.
+    if live.backend == GCP_BACKEND_NAME and hb is None:
+        await session.commit()
+        return False
+    if (
+        live.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        and hb is None
+        and (live.started_at is None or live.started_at >= stale_cutoff)
+    ):
+        await session.commit()
+        return False
+
+    terminal_reason = (
+        "vm_died_silently"
+        if live.backend == GCP_BACKEND_NAME
+        else "runner_died_silently"
+    )
+    if live.backend == GCP_BACKEND_NAME:
+        terminate_started_at = _utcnow()
+        try:
+            terminated = await get_compute_backend(live.backend).terminate(
+                live, reason="heartbeat_stale"
+            )
+            if not terminated:
+                raise RuntimeError("GCP VM delete did not complete")
+        except Exception as exc:
+            failed_at = _utcnow()
+            logger.exception(
+                "[COMPUTE_JOB] stale-heartbeat terminate failed for GCP job=%s",
+                live.id,
+            )
+            await session.rollback()
+            await _persist_compute_rpc_failure(
+                session,
+                job_id=job_id,
+                operation="terminate",
+                exc=exc,
+                started_at=terminate_started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="heartbeat_stale",
+            )
+            return False
+
+    _finalize_terminal_job(
+        live,
+        status=ComputeJobStatus.TIMED_OUT,
+        outcome=ComputeJobOutcome.TIMED_OUT,
+        terminal_reason=terminal_reason,
+        now=now,
+        terminal_kind=terminal_reason,
+    )
+    _record_terminal_reason_history(session, live)
+    await _link_terminal_artifact(session, live)
+    await persist_viewable_files_for_job(session, live)
+    if live.task_id is not None:
+        from app.task_lifecycle import fire_task_wakes
+
+        await fire_task_wakes(
+            session,
+            wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(live.id),
+        )
+    await session.commit()
+    return True
+
+
+async def finalize_orphan_runner_job(session, job: ComputeJob, *, now) -> bool:
+    """Backward-compatible name for runner-only callers."""
+    return await finalize_silent_compute_job(session, job, now=now)
 
 
 async def list_compute_jobs(
@@ -1744,6 +2471,17 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         # the (irreversible) task-terminal VM kill is decided. Deliberately NOT
         # batch-prefetching the tasks: a prefetched task snapshot would be exactly
         # the stale input the kill must never be decided on.
+        #
+        # Jobs are processed SERIALLY, in the batch's (created_at, id) order — NOT
+        # concurrently. The per-job re-read only guarantees the (irreversible)
+        # task-terminal VM kill sees an intra-tick task restore if every earlier
+        # job has already fully processed (and committed) by the time a later
+        # job's kill is decided. Running the batch under asyncio.gather defeats
+        # that ordering: a later job's re-read can execute BEFORE an earlier
+        # job's poll commits the restore, killing the VM of a task that is alive
+        # again. Serial processing is the invariant the mid-tick re-read relies
+        # on; do not reintroduce concurrency here without moving the terminal-kill
+        # decision behind an ordering that preserves it.
 
         if not jobs:
             break
@@ -1751,7 +2489,7 @@ async def process_compute_jobs_once(session_factory=AsyncSessionLocal) -> None:
         for job in jobs:
             try:
                 await _process_single_compute_job(job, session_factory=session_factory)
-            except Exception as exc:  # noqa: PERF203
+            except Exception as exc:
                 logger.exception(
                     "[COMPUTE_JOB] monitor failed for job=%s: %s",
                     job.id,
@@ -2426,6 +3164,7 @@ async def _process_single_compute_job(
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
+        no_progress_like = _status_is_no_progress_timeout(status)
         # A backend-reported SUCCEEDED that nonetheless emitted a fatal
         # no-usable-GPU diagnostic is not a real success — the container never
         # had a supported GPU and could not produce its metric. Reclassify it as
@@ -2435,9 +3174,51 @@ async def _process_single_compute_job(
             and status.status == ComputeJobStatus.SUCCEEDED
             and _status_reports_no_usable_gpu(status)
         )
-        if timeout_like:
+        # A backend-reported SUCCEEDED for a job that DECLARED a scalar metric or
+        # per-arm output but never fulfilled that contract is not a real success.
+        # Incidental durable files are preserved by _link_terminal_artifact, but
+        # cannot prove delivery: a log or checkpoint does not measure the declared
+        # result. Guarded by _job_expects_data so pure side-effect commands (no
+        # metric, no arms) are NOT false-rejected. Artifact detection remains
+        # best-effort and never raises (collect_terminal_artifact_reference is
+        # fail-soft by contract).
+        #
+        # For a job with a contract-declared SCALAR metric, defer to the precise
+        # _declared_metric_unmeasured resolver, which mirrors the success-criterion
+        # gate's FULL resolution (result file, per-arm block, stdout fallback, and
+        # the sticky metric a PRIOR poll persisted). That prevents the coarse
+        # current-poll metrics check from false-rejecting a run whose metric was
+        # only ever reported via stdout, inside an arm, or on an earlier poll. An
+        # arms-only sweep instead requires at least one numeric per-arm result;
+        # a flat metric cannot fulfill that distinct contract.
+        #
+        # Separate path: compute_experiment tasks that declare NO metric and NO
+        # success_criterion are criterion-free experiments.  _job_expects_data does
+        # not fire for them (no declared_metric, no arms), but they still must not
+        # record a clean SUCCESS — a metric is definitionally mandatory for experiments.
+        declared_metric = _declared_progress_metric(job)
+        _criterion_free_experiment = _is_criterion_free_experiment(job, task)
+        no_data = (
+            not timeout_like
+            and not no_usable_gpu
+            and status.status == ComputeJobStatus.SUCCEEDED
+            and (
+                _criterion_free_experiment
+                or (
+                    _job_expects_data(job, task)
+                    and (
+                        (declared_metric is not None and _declared_metric_unmeasured(job, status))
+                        or (_task_declares_arms(task) and not _arms_have_reported_data(job, status))
+                    )
+                )
+            )
+        )
+        terminal_artifact_reference = (
+            await collect_terminal_artifact_reference(job) if no_data else None
+        )
+        if timeout_like or no_progress_like:
             outcome = ComputeJobOutcome.TIMED_OUT
-        elif no_usable_gpu:
+        elif no_usable_gpu or no_data:
             outcome = ComputeJobOutcome.FAILURE
         elif status.status == ComputeJobStatus.SUCCEEDED:
             outcome = ComputeJobOutcome.SUCCESS
@@ -2452,21 +3233,34 @@ async def _process_single_compute_job(
             status=status,
             accrued_cost_usd=accrued_cost_usd,
             terminal_status=ComputeJobStatus.TIMED_OUT
-            if timeout_like
+            if timeout_like or no_progress_like
             else status.status,
             outcome=outcome,
             terminal_reason=(
                 "compute job exceeded runtime deadline"
                 if timeout_like
                 else (
+                    "no_progress_timeout"
+                    if no_progress_like
+                    else (
                     _NO_USABLE_GPU_TERMINAL_REASON
                     if no_usable_gpu
-                    else _resolve_terminal_reason(
-                        status_message=status.message, outcome=outcome
+                    else (
+                        _NO_CRITERION_EXPERIMENT_REASON
+                        if _criterion_free_experiment
+                        else (
+                            _no_data_terminal_reason(terminal_artifact_reference)
+                            if no_data
+                            else _resolve_terminal_reason(
+                                status_message=status.message, outcome=outcome
+                            )
+                        )
+                    )
                     )
                 )
             ),
             exit_code=status.exit_code,
+            terminal_kind=NO_PROGRESS_TERMINAL_REASON if no_progress_like else None,
         )
         return
 
@@ -2587,6 +3381,21 @@ async def _process_single_compute_job(
     # nothing. Runs AFTER the deadline/budget hard limits so those always win.
     if _no_progress_stalled(job, now=now):
         watched_metric = _declared_progress_metric(job)
+        # Progressive operator notification BEFORE the cut — fires a WARNING
+        # alert so the operator learns about the stall from the Alerts banner,
+        # not only after the job reaches TIMED_OUT. Best-effort: a failure to
+        # create the alert (e.g. DB blip) must not prevent the terminate from
+        # proceeding — the job is still stalled and should be cut.
+        try:
+            async with session_factory() as _alert_session:
+                await _maybe_create_no_progress_watchdog_alert(
+                    _alert_session, job, now=now, watched_metric=watched_metric
+                )
+        except Exception:
+            logger.exception(
+                "[COMPUTE_JOB] no-progress alert creation failed for job=%s (proceeding to terminate)",
+                job.id,
+            )
         started_at = _utcnow()
         terminate_diagnostic = None
         try:
@@ -2620,9 +3429,9 @@ async def _process_single_compute_job(
             terminal_status=ComputeJobStatus.TIMED_OUT,
             outcome=ComputeJobOutcome.TIMED_OUT,
             terminal_reason=(
-                "compute job made no measurable progress on declared metric "
+                "no_progress_timeout: compute job made no measurable progress on declared metric "
                 f"{watched_metric!r} over "
-                f"{int(COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
+                f"{int((job.polling_metadata or {}).get('no_progress_timeout_seconds') or COMPUTE_JOB_NO_PROGRESS_WINDOW_SECONDS)}s — "
                 "cut early to reclaim compute"
             ),
             terminal_kind=NO_PROGRESS_TERMINAL_REASON,
@@ -2630,6 +3439,23 @@ async def _process_single_compute_job(
             compute_rpc_diagnostic=terminate_diagnostic,
         )
         return
+
+    # Honesty check: the watchdog above keys on EXACT metric-name equality, so a
+    # job that reports progress only under name(s) other than its declared metric
+    # leaves the watchdog silently inert — it can never fire and the operator's
+    # waste-prevention lever protects nothing. Surface that mismatch (durable
+    # marker + one warning log) instead of failing silent. Never itself kills a
+    # job; it only makes the inert-watchdog condition observable.
+    metric_mismatch = _watchdog_metric_name_mismatch(job)
+    if metric_mismatch:
+        logger.warning(
+            "[COMPUTE_JOB] no-progress watchdog INERT for job=%s: declared metric "
+            "%r is never reported; progress arrives only under %s — the watchdog "
+            "cannot fire, so this run has no no-progress protection",
+            job.id,
+            _declared_progress_metric(job),
+            metric_mismatch,
+        )
 
     await _apply_polled_compute_job_result(
         session_factory,
@@ -2639,6 +3465,7 @@ async def _process_single_compute_job(
         next_poll_at=next_poll_at,
         status=status,
         accrued_cost_usd=accrued_cost_usd,
+        progress_metric_mismatch=metric_mismatch,
     )
 
 
@@ -2726,8 +3553,9 @@ def _merge_salvaged_status(
     """Return a new status snapshot with late-arriving fields from salvaged merged in.
 
     The terminal outcome, status code, and cost semantics all come from ``base``.
-    Only metrics, command_log, and echoed_release_sha are overridden by non-None
-    values from the post-terminate poll so late-emitted evidence is not dropped.
+    Only metrics, command_log, echoed_release_sha, and resume_provenance are
+    overridden by non-None values from the post-terminate poll so late-emitted
+    evidence is not dropped.
     """
     if salvaged is None:
         return base
@@ -2743,6 +3571,9 @@ def _merge_salvaged_status(
         echoed_release_sha=salvaged.echoed_release_sha
         if salvaged.echoed_release_sha is not None
         else base.echoed_release_sha,
+        resume_provenance=salvaged.resume_provenance
+        if salvaged.resume_provenance is not None
+        else base.resume_provenance,
     )
 
 
@@ -2762,6 +3593,7 @@ async def _apply_polled_compute_job_result(
     terminate_ok: bool = True,
     terminal_kind: str | None = None,
     compute_rpc_diagnostic: dict[str, Any] | None = None,
+    progress_metric_mismatch: list[str] | None = None,
 ) -> bool:
     async with session_factory() as session:
         live = await _lock_compute_job(session, job_id)
@@ -2781,6 +3613,12 @@ async def _apply_polled_compute_job_result(
             _set_meta(live, command_log=dict(status.command_log))
         if status.echoed_release_sha is not None:
             _set_meta(live, release_echo_sha=status.echoed_release_sha)
+        # Propagate resume provenance from the serial/launch status into
+        # polling_metadata so it reaches the operator and agent surfaces via
+        # serialize_compute_job_response. Only written once (first poll that
+        # carries it); subsequent polls with the same provenance are idempotent.
+        if status.resume_provenance is not None:
+            _set_meta(live, resume_provenance=dict(status.resume_provenance))
         if compute_rpc_diagnostic is None:
             _clear_compute_rpc_diagnostic(live)
         if terminal_status is not None and outcome is not None:
@@ -2813,6 +3651,66 @@ async def _apply_polled_compute_job_result(
                 _set_meta(live, status_message=status.message)
             if status.live_output is not None:
                 _set_meta(live, live_output=dict(status.live_output))
+            _apply_watchdog_metric_mismatch_marker(live, progress_metric_mismatch)
+        await session.commit()
+        return True
+
+
+async def finalize_runner_subprocess_job_for_dead_runner(
+    session_factory,
+    job_id: uuid.UUID,
+    *,
+    runner_id: uuid.UUID,
+    liveness_cutoff: datetime,
+    now: datetime,
+) -> bool:
+    """Fail a claimed runner job when its runner is still confirmed dead.
+
+    The reaper's candidate scan is deliberately only an optimization.  Re-check
+    the runner under the job lock here, immediately before the irreversible
+    terminal transition, so a recovered runner or a normal terminal report wins
+    any race with the sweep.
+    """
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job_id)
+        if (
+            live is None
+            or live.backend != RUNNER_SUBPROCESS_BACKEND_NAME
+            or live.status not in {ComputeJobStatus.STARTING, ComputeJobStatus.RUNNING}
+            or live.ran_on_runner_id != runner_id
+        ):
+            return False
+
+        runner = await session.get(LocalRunner, runner_id, with_for_update=True)
+        if runner is None or (
+            runner.status in ("active", "paused", "draining")
+            and runner.last_seen_at is not None
+            and runner.last_seen_at >= liveness_cutoff
+        ):
+            # A paused or draining runner that is still heartbeating IS alive
+            # and will report its in-flight compute job result normally once
+            # the job completes. Only fail the job when the runner has truly
+            # stopped heartbeating (genuinely dead/hung).
+            return False
+
+        _finalize_terminal_job(
+            live,
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.FAILURE,
+            terminal_reason="runner_subprocess_runner_dead",
+            now=now,
+        )
+        _record_terminal_reason_history(session, live)
+        await _link_terminal_artifact(session, live)
+        await persist_viewable_files_for_job(session, live)
+        if live.task_id is not None:
+            from app.task_lifecycle import fire_task_wakes
+
+            await fire_task_wakes(
+                session,
+                wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                wake_source_ref=str(live.id),
+            )
         await session.commit()
         return True
 
@@ -3035,6 +3933,36 @@ def _set_meta(
         meta["status_message"] = status_message
     meta.update(extra)
     job.polling_metadata = meta
+
+
+# polling_metadata key under which the poller records that the no-progress
+# watchdog is inert because the job reports progress under name(s) other than its
+# declared metric. Surfaced to the operator via serialize_compute_job_response so
+# the silent-degradation edge is observable and fixable, not invisible.
+_WATCHDOG_STATUS_META_KEY = "no_progress_watchdog_status"
+
+
+def _apply_watchdog_metric_mismatch_marker(
+    job: ComputeJob, observed_metrics: list[str] | None
+) -> None:
+    """Stamp (or clear) the metric-name-mismatch watchdog marker on a running job.
+
+    ``observed_metrics`` is the non-empty list returned by
+    :func:`_watchdog_metric_name_mismatch` when the declared metric is never
+    reported; a falsy value clears any previously-stamped marker (the job started
+    reporting its declared metric, so the watchdog is live again).
+    """
+    meta = dict(job.polling_metadata or {})
+    if observed_metrics:
+        meta[_WATCHDOG_STATUS_META_KEY] = {
+            "state": "inert_metric_name_mismatch",
+            "declared_metric": _declared_progress_metric(job),
+            "observed_metrics": observed_metrics,
+        }
+        job.polling_metadata = meta
+    elif _WATCHDOG_STATUS_META_KEY in meta:
+        meta.pop(_WATCHDOG_STATUS_META_KEY, None)
+        job.polling_metadata = meta
 
 
 def _clear_compute_rpc_diagnostic(job: ComputeJob) -> None:
@@ -3330,93 +4258,6 @@ def _is_durable_artifact_uri(reference: str) -> bool:
     if lowered.startswith(("gs://", "s3://", "az://", "file:")):
         return True
     return "/" in text
-
-
-def _coerce_metric_number(value: Any) -> float | int | None:
-    """Numeric coercion mirroring the agent's ``numOrNull`` for reported metrics.
-
-    Accepts finite ints/floats and numeric strings; rejects bools, NaN/inf, and
-    non-numeric values so a reported metric can only land as a real number.
-    """
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return (
-            value
-            if value == value and value not in (float("inf"), float("-inf"))
-            else None
-        )
-    if isinstance(value, str) and value.strip():
-        try:
-            num = float(value)
-        except ValueError:
-            return None
-        return num if num == num and num not in (float("inf"), float("-inf")) else None
-    return None
-
-
-# Upper bound on how much captured command-log text the stdout->metrics fallback
-# scans for a trailing JSON object. The balanced-JSON scan is super-linear in the
-# number of "{" candidates, so a noisy multi-megabyte log can never make the
-# fallback expensive: only the trailing window is scanned (the experiment prints
-# its result object last, so last-object-wins lives in the tail).
-_STDOUT_METRICS_SCAN_MAX_CHARS = 100_000
-
-
-def _stdout_metrics_fallback(meta: dict) -> dict | None:
-    """Recover experiment metrics from captured stdout when no result file exists.
-
-    A command that writes ``{metric: value}`` JSON to ``$BLUEPRINT_RESULT_FILE``
-    populates ``result_metrics`` directly; that path always wins. This fallback
-    only fires when ``result_metrics`` is absent/empty: it scans the captured
-    command log for the LAST balanced JSON object the command printed to
-    stdout/stderr (last-object-wins) and returns its numeric keys so a metric
-    that only reached stdout is still measurable.
-
-    Bounded and defensive: scans at most the trailing
-    ``_STDOUT_METRICS_SCAN_MAX_CHARS`` of the log, keeps only numeric keys, and
-    returns ``None`` when there is no command log or no balanced JSON object. The
-    caller filters reserved/backend-derived keys, so this never overwrites
-    ``durable_file_count`` or a job-level field.
-    """
-    command_log = meta.get("command_log")
-    if not isinstance(command_log, dict):
-        return None
-    text = command_log.get("text")
-    if not isinstance(text, str) or not text.strip():
-        return None
-    if len(text) > _STDOUT_METRICS_SCAN_MAX_CHARS:
-        text = text[-_STDOUT_METRICS_SCAN_MAX_CHARS:]
-    obj = scan_balanced_json_objects(text, last=True)
-    if not isinstance(obj, dict):
-        return None
-    numeric = {k: v for k, v in obj.items() if _coerce_metric_number(v) is not None}
-    if not numeric:
-        return None
-    # Recover repeated-metric series. An A/B experiment authored as a single
-    # command that prints the SAME metric key once per arm (e.g. fp32 then fp16
-    # both emitting {"median_matmul_ms": ...}) collapses under last-object-wins
-    # above: only the final arm's value survives, so the comparison that IS the
-    # proof becomes unrecoverable from structured data. For any recovered metric
-    # emitted more than once with differing values, attach the full ordered
-    # series under ``<metric>__series`` so both arms stay readable. The canonical
-    # ``<metric>`` value is left untouched (still the last emission), keeping
-    # last-object-wins backward compatible for single-value experiments.
-    series: dict[str, list[float | int]] = {}
-    all_objs = scan_all_balanced_json_objects(text)
-    for key in numeric:
-        values = [
-            num
-            for o in all_objs
-            if isinstance(o, dict)
-            for num in (_coerce_metric_number(o.get(key)),)
-            if num is not None
-        ]
-        if len(values) >= 2 and len(set(values)) >= 2:
-            series[f"{key}__series"] = values
-    return {**numeric, **series}
 
 
 def build_compute_result_logs(job: ComputeJob) -> str:
@@ -3725,27 +4566,37 @@ async def _record_viewable_job_files(
 
     One row per durably-stored file, pointing at the SAME canonical ``viewable/``
     URI the manifest already carries — no second upload, no second sanitizer, no
-    second cap policy. Each INSERT runs in its own SAVEPOINT so one constraint
-    violation (notably the UNIQUE ``storage_uri``, which is exactly what makes a
-    re-entry a benign no-op) or DB hiccup cannot lose the rows already written, and
-    can never roll back the job's terminal completion.
+    second cap policy. Existing deterministic-URI rows are updated in place; each
+    new INSERT runs in its own SAVEPOINT so one constraint violation or DB hiccup
+    cannot lose rows already written or roll back terminal completion.
 
     Best-effort by contract: returns the number of rows written, never raises.
     """
     if not manifest:
         return 0
     written = 0
-    for entry in manifest:
-        if not isinstance(entry, dict):
-            continue
+    # Pre-filter to valid entries so we can batch-fetch existing rows in one
+    # query instead of N individual SELECTs (N ≤ 25 due to per-job cap).
+    valid_entries = [
+        e for e in manifest
+        if isinstance(e, dict)
+        and isinstance(e.get("storage_uri"), str) and e.get("storage_uri")
+        and isinstance(e.get("filename"), str) and e.get("filename")
+    ]
+    if not valid_entries:
+        return 0
+    all_uris = [e["storage_uri"] for e in valid_entries]
+    existing_rows_result = await session.execute(
+        select(ComputeJobFile).where(ComputeJobFile.storage_uri.in_(all_uris))
+    )
+    existing_by_uri: dict[str, ComputeJobFile] = {
+        row.storage_uri: row for row in existing_rows_result.scalars().all()
+    }
+    for entry in valid_entries:
         storage_uri = entry.get("storage_uri")
         filename = entry.get("filename")
         content_type = entry.get("content_type")
         size_bytes = entry.get("size_bytes")
-        if not isinstance(storage_uri, str) or not storage_uri:
-            continue
-        if not isinstance(filename, str) or not filename:
-            continue
         # ``kind`` comes straight from the shared extension classifier
         # ("image"/"video"); fall back to the MIME mapping only if it is absent.
         media_type = entry.get("kind")
@@ -3756,6 +4607,21 @@ async def _record_viewable_job_files(
                 else "unknown"
             )
         try:
+            existing_row = existing_by_uri.get(storage_uri)
+            if existing_row is not None:
+                # Mid-run registration already created the signing row.
+                # Reconcile its mutable metadata to the authoritative terminal
+                # bundle without adding a duplicate deterministic-URI row.
+                existing_row.safe_relpath = filename
+                existing_row.media_type = media_type
+                existing_row.content_type = (
+                    content_type if isinstance(content_type, str) else None
+                )
+                existing_row.file_size_bytes = (
+                    size_bytes if isinstance(size_bytes, int) else None
+                )
+                session.add(existing_row)
+                continue
             async with session.begin_nested():
                 row = ComputeJobFile(
                     compute_job_id=job.id,
@@ -3773,7 +4639,6 @@ async def _record_viewable_job_files(
                 await session.flush()
             written += 1
         except Exception:  # noqa: BLE001
-            # A UNIQUE(storage_uri) hit on re-entry is the common, benign case.
             logger.warning(
                 "[COMPUTE_JOB] ComputeJobFile insert failed for viewable file %r "
                 "in job=%s",
@@ -3782,6 +4647,59 @@ async def _record_viewable_job_files(
                 exc_info=True,
             )
     return written
+
+
+async def _purge_orphaned_viewable_rows(
+    session, job: ComputeJob, manifest: list[dict[str, Any]]
+) -> int:
+    """Delete ComputeJobFile rows not in the terminal manifest, plus their GCS objects.
+
+    Called only when the terminal extraction is complete (authoritative). Mid-run
+    uploads that were not selected into the top-25 manifest leave orphaned rows and
+    GCS objects; this purge reconciles them to the authoritative manifest surface.
+    Best-effort: never raises.
+    """
+    keep_uris = {
+        entry["storage_uri"]
+        for entry in manifest
+        if isinstance(entry, dict) and isinstance(entry.get("storage_uri"), str)
+    }
+    try:
+        all_rows = (
+            await session.execute(
+                select(ComputeJobFile).where(ComputeJobFile.compute_job_id == job.id)
+            )
+        ).scalars().all()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE_JOB] failed to query ComputeJobFile rows for orphan purge job=%s",
+            job.id,
+            exc_info=True,
+        )
+        return 0
+
+    purged = 0
+    for row in all_rows:
+        if row.storage_uri in keep_uris:
+            continue
+        try:
+            await storage.delete_storage_uri_best_effort(row.storage_uri)
+            await session.delete(row)
+            purged += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[COMPUTE_JOB] failed to purge orphaned ComputeJobFile row %s job=%s",
+                row.storage_uri,
+                job.id,
+                exc_info=True,
+            )
+    if purged:
+        logger.info(
+            "[COMPUTE_JOB] purged %d orphaned ComputeJobFile row(s) for job=%s",
+            purged,
+            job.id,
+        )
+    return purged
 
 
 async def persist_viewable_files_for_job(
@@ -3809,9 +4727,10 @@ async def persist_viewable_files_for_job(
     WITHOUT re-downloading the bundle or re-uploading a byte. That guard is what
     holds the bundle download to exactly one per job.
 
-    Fail-soft by contract: any extraction/upload/DB error degrades to no manifest
-    and NEVER raises — viewable persistence must never block terminal completion.
-    Returns ``(manifest, dropped)``.
+    Fail-soft by contract: any extraction/upload/DB error NEVER blocks terminal
+    completion. An incomplete terminal pass preserves already-durable live
+    entries and deliberately does not stamp the idempotency marker, so a later
+    terminal reconciliation can retry. Returns ``(manifest, dropped)``.
     """
     meta = job.polling_metadata or {}
     if "viewable_file_count" in meta:
@@ -3823,25 +4742,79 @@ async def persist_viewable_files_for_job(
             dropped if isinstance(dropped, int) else 0,
         )
 
+    complete = False
+    svg_count = 0
     try:
-        manifest, dropped = await persist_viewable_artifacts(job)
+        manifest, dropped, complete, svg_count = (
+            await persist_viewable_artifacts_with_completeness(job)
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "[COMPUTE_JOB] viewable-artifact persistence failed for job=%s; "
-            "completing with no viewable manifest",
+            "preserving durable live previews for a later retry",
             job.id,
             exc_info=True,
         )
         manifest, dropped = [], 0
 
+    # Terminal bundle extraction is authoritative. Ensure every terminal entry
+    # has an opaque revision even when a legacy/custom backend returned the old
+    # shape, and clear the live marker before publishing the reconciled manifest.
+    terminal_manifest: list[dict[str, Any]] = []
+    for raw_entry in manifest if isinstance(manifest, list) else []:
+        if not isinstance(raw_entry, dict):
+            continue
+        entry = dict(raw_entry)
+        entry["revision"] = (
+            storage.normalize_viewable_revision(entry.get("revision"))
+            or storage.new_viewable_revision()
+        )
+        entry["live"] = False
+        terminal_manifest.append(entry)
+    if complete:
+        manifest = terminal_manifest
+    else:
+        # A fail-soft extraction or upload pass is not authoritative. Reconcile
+        # the terminal entries that did persist, but retain prior live entries
+        # for filenames the incomplete pass could not reproduce. Their objects
+        # and ComputeJobFile signing rows are already durable; hiding them would
+        # lose useful output while also stamping the pass as non-retryable.
+        terminal_names = {
+            entry.get("filename")
+            for entry in terminal_manifest
+            if isinstance(entry.get("filename"), str)
+        }
+        prior_live = [
+            dict(entry)
+            for entry in (meta.get("viewable_files") or [])
+            if isinstance(entry, dict)
+            and entry.get("live") is True
+            and entry.get("filename") not in terminal_names
+        ]
+        manifest = terminal_manifest + prior_live
+
     await _record_viewable_job_files(session, job, manifest)
 
-    # Stamped unconditionally (even at 0) — it doubles as the "pass completed"
-    # marker the idempotency guard above reads.
-    _set_meta(job, viewable_file_count=len(manifest))
-    if manifest:
-        _set_meta(job, viewable_files=manifest)
-    if dropped:
-        _set_meta(job, viewable_files_dropped=dropped)
+    if complete:
+        await _purge_orphaned_viewable_rows(session, job, manifest)
+
+    reconciled_meta = dict(job.polling_metadata or {})
+    reconciled_meta["viewable_files"] = manifest
+    if complete:
+        # A complete terminal enumeration is authoritative, including an empty
+        # one. Stamp the idempotency marker only now; this also clears any prior
+        # live omission count and incomplete-pass diagnostic.
+        reconciled_meta["viewable_file_count"] = len(manifest)
+        reconciled_meta["viewable_files_dropped"] = dropped
+        if svg_count:
+            reconciled_meta["viewable_files_svg_excluded"] = svg_count
+        else:
+            reconciled_meta.pop("viewable_files_svg_excluded", None)
+        reconciled_meta.pop("viewable_terminal_reconciliation_incomplete", None)
+    else:
+        # Leave viewable_file_count absent so the next terminal call retries.
+        reconciled_meta.pop("viewable_file_count", None)
+        reconciled_meta["viewable_terminal_reconciliation_incomplete"] = True
+    job.polling_metadata = reconciled_meta
     session.add(job)
     return manifest, dropped

@@ -1,22 +1,38 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
-import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, Edit2, PauseCircle, PlayCircle, Wind, Activity } from 'lucide-react';
-import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, updateRunnerCapabilities, fetchRunnerTelemetry, fetchRunnerStats } from '../api';
-import type { FleetRunner, FleetRunnerRegistrationResult, RunnerTelemetryResponse, RunnerStatsResponse } from '../api';
+import { usePoller } from '../hooks/usePoller';
+import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2, SlidersHorizontal, PauseCircle, PlayCircle, Wind, Activity, AlertTriangle } from 'lucide-react';
+import { API_BASE_URL, listFleetRunners, patchRunnerStatus, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken, fetchRunnerTelemetry, fetchRunnerStats, listRunnerProjects, addRunnerProject, removeRunnerProject, listOwnedProjects } from '../api';
+import type { FleetRunner, RunnerTelemetryResponse, RunnerStatsResponse, RunnerProjectAllowList, OwnedProjectSummary } from '../api';
 import { ConfirmDialog } from './ConfirmDialog';
-import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
+import { FleetRunnerConfigPanel } from './FleetRunnerConfigPanel';
+import { timeAgo, parseTimestamp, formatDurationSec } from '../utils/time';
 import {
   formatBytes,
   formatBackendInventory,
   runnerSetupSnippets,
+  runnerInstallSnippet,
+  RUNNER_PREREQUISITES,
+  gpuAllowlistLabel,
+  taskTypesLabel,
+  gpusPerJobValue,
   type RunnerSetupPreset,
   type RunnerSetupSnippetCommands,
 } from './FleetRunnersPanel.utils';
 
 const LIVENESS_THRESHOLD_SEC = 300;
 const STALE_THRESHOLD_SEC = 600;
+/** How long the enroll dialog shows the optimistic "waiting…" spinner before
+ *  falling back to an honest "not connected yet" state. Bounded so a wrong token
+ *  (which never connects) can't spin forever. Generous enough to cover a normal
+ *  first-time setup (repo clone + first heartbeat) landing within ~2 heartbeats. */
+const ENROLL_CONNECT_TIMEOUT_MS = 90_000;
+/** Same bounded-wait policy for the rotate dialog: after this elapses with no
+ *  new-token heartbeat, the dialog drops the optimistic spinner for an honest
+ *  "not reconnected yet" state. */
+const ROTATE_CONNECT_TIMEOUT_MS = 90_000;
 
-type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands;
+type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands | 'installUser' | 'installSystem';
 type TokenDialogMode = 'enroll' | 'rotate';
 
 function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls: string } {
@@ -82,15 +98,17 @@ function activeTaskCount(runner: FleetRunner): number {
   return Array.isArray(ids) ? ids.length : 0;
 }
 
+function activeComputeCount(runner: FleetRunner): number {
+  if (runner.health?.active_compute_job_count !== undefined) {
+    return runner.health.active_compute_job_count;
+  }
+  const ids = runner.capabilities.active_compute_job_ids;
+  return Array.isArray(ids) ? ids.length : 0;
+}
+
 function activeWorkCount(runner: FleetRunner): number {
   if (runner.health?.active_work_count !== undefined) return runner.health.active_work_count;
-  if (runner.health?.active_compute_job_count !== undefined) {
-    return activeTaskCount(runner) + runner.health.active_compute_job_count;
-  }
-  const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
-    ? runner.capabilities.active_compute_job_ids.length
-    : 0;
-  return activeTaskCount(runner) + activeCompute;
+  return activeTaskCount(runner) + activeComputeCount(runner);
 }
 
 function availableSlots(runner: FleetRunner): number | null {
@@ -98,35 +116,34 @@ function availableSlots(runner: FleetRunner): number | null {
     const health = runner.health;
     // Prefer the per-class agent slot count when available (per-class gating).
     if (typeof health.available_agent_slots === 'number') return health.available_agent_slots;
-    if (typeof health.available_slots === 'number') return health.available_slots;
-    if (health.available_slots === null) return null;
+    if (health.available_agent_slots === null || health.available_slots === null) return null;
     if (typeof health.max_concurrent === 'number') {
-      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+      return Math.max(0, health.max_concurrent - activeTaskCount(runner));
     }
+    // Preserve legacy combined slots when the per-class ceiling is unavailable.
+    if (typeof health.available_slots === 'number') return health.available_slots;
     return null;
   }
   const max = runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
-  return Math.max(0, max - activeWorkCount(runner));
+  return Math.max(0, max - activeTaskCount(runner));
 }
 
 function availableComputeSlots(runner: FleetRunner): number | null {
   if (runner.health) {
     const health = runner.health;
     if (typeof health.available_compute_slots === 'number') return health.available_compute_slots;
-    if (typeof health.available_slots === 'number') return health.available_slots;
-    if (health.available_slots === null) return null;
-    if (typeof health.max_concurrent === 'number') {
-      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+    if (health.available_compute_slots === null || health.available_slots === null) return null;
+    const max = health.max_concurrent_compute ?? health.max_concurrent;
+    if (typeof max === 'number') {
+      return Math.max(0, max - activeComputeCount(runner));
     }
+    if (typeof health.available_slots === 'number') return health.available_slots;
     return null;
   }
   const max = runner.capabilities.max_concurrent_compute ?? runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
-  const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
-    ? runner.capabilities.active_compute_job_ids.length
-    : 0;
-  return Math.max(0, max - activeCompute);
+  return Math.max(0, max - activeComputeCount(runner));
 }
 
 function maxSlotsForRunner(runner: FleetRunner): number | null {
@@ -134,9 +151,33 @@ function maxSlotsForRunner(runner: FleetRunner): number | null {
   return typeof max === 'number' ? max : null;
 }
 
+function maxComputeSlotsForRunner(runner: FleetRunner): number | null {
+  const max = runner.health?.max_concurrent_compute ?? runner.capabilities.max_concurrent_compute
+    ?? runner.health?.max_concurrent ?? runner.capabilities.max_concurrent;
+  return typeof max === 'number' ? max : null;
+}
+
+function summarizeCapacity(
+  runners: FleetRunner[], active: (runner: FleetRunner) => number,
+  available: (runner: FleetRunner) => number | null, maximum: (runner: FleetRunner) => number | null,
+) {
+  const freeSlots = runners.map(available);
+  return {
+    busy: runners.reduce((sum, runner) => sum + active(runner), 0),
+    max: runners.reduce((sum, runner) => sum + (maximum(runner) ?? 0), 0),
+    free: freeSlots.reduce<number>((sum, slots) => sum + (slots ?? 0), 0),
+    unknown: freeSlots.some(slots => slots == null),
+  };
+}
+
 function isComputeCapable(runner: FleetRunner): boolean {
   const taskTypes = runner.capabilities.task_types;
   return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.includes('compute_experiment'));
+}
+
+function isAgentCapable(runner: FleetRunner): boolean {
+  const taskTypes = runner.capabilities.task_types;
+  return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.some(type => type !== 'compute_experiment'));
 }
 
 function capsSummary(caps: FleetRunner['capabilities']): string {
@@ -156,102 +197,115 @@ function capsSummary(caps: FleetRunner['capabilities']): string {
  *  live-safe config but the daemon has not yet echoed the matching generation
  *  (applies on the next heartbeat); applied = the daemon's reported generation
  *  matches. Returns null for runners that never reported a config block. */
-function configStatus(runner: FleetRunner): { label: string; cls: string; pending: boolean } | null {
+/** How long a config push may stay pending on a LIVE (heartbeating) runner before
+ *  we stop showing the optimistic "applying on next heartbeat" spinner and call it
+ *  STUCK. A live daemon reconciles live-safe config on its next heartbeat, so
+ *  ~2 heartbeat windows is generous; past it, the runner is either too old to
+ *  honor the config or actively rejected it. Runners that are NOT live are exempt
+ *  (their pending state is expected — it applies when they reconnect). */
+const CONFIG_PENDING_TIMEOUT_SEC = 120;
+
+type ConfigStatusTone = 'good' | 'warn' | 'idle' | 'bad';
+
+const CONFIG_STATUS_CLS: Record<ConfigStatusTone, string> = {
+  good: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+  warn: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+  idle: 'border-neutral-700 bg-neutral-800/40 text-neutral-300',
+  bad: 'border-red-500/40 bg-red-500/10 text-red-300',
+};
+
+function configStatus(
+  runner: FleetRunner,
+): { label: string; cls: string; pending: boolean; tone: ConfigStatusTone } | null {
   const config = runner.config;
   if (!config) return null;
-  if (config.config_pending) {
+
+  if (!config.config_pending) {
+    // config_pending is false only once the daemon echoed the desired generation.
+    if (config.applied_config_generation != null) {
+      return {
+        label: 'config applied',
+        cls: CONFIG_STATUS_CLS.good,
+        pending: false,
+        tone: 'good',
+      };
+    }
+    return null;
+  }
+
+  // Pending. A runner that is not heartbeating (offline/paused) is NOT stuck —
+  // pending is expected and applies when it reconnects; never flag it red.
+  if (!isRunnerLive(runner)) {
+    return {
+      label: 'config queued — applies when runner reconnects',
+      cls: CONFIG_STATUS_CLS.idle,
+      pending: true,
+      tone: 'idle',
+    };
+  }
+
+  // A live daemon has explicitly rejected the generation we currently want.
+  // That is terminal as soon as the next heartbeat reports it; do not conceal
+  // it behind the otherwise-optimistic pending window.
+  if (
+    config.apply_status === 'rejected'
+    && config.rejected_config_generation === config.config_generation
+  ) {
+    return {
+      label: `config rejected — ${config.apply_reason ?? 'runner rejected this config'}`,
+      cls: CONFIG_STATUS_CLS.bad,
+      pending: false,
+      tone: 'bad',
+    };
+  }
+
+  // Live and pending. Bound how long it has been pending against when the desired
+  // config last changed. Missing stamp (legacy runner) → unknown → keep optimistic
+  // amber, never falsely red.
+  const changedAt = config.desired_changed_at;
+  const pendingSec = changedAt
+    ? (Date.now() - parseTimestamp(changedAt).getTime()) / 1000
+    : null;
+  if (pendingSec == null || pendingSec < CONFIG_PENDING_TIMEOUT_SEC) {
     return {
       label: 'config pending — applying on next heartbeat',
-      cls: 'border-amber-500/40 bg-amber-500/10 text-amber-300',
+      cls: CONFIG_STATUS_CLS.warn,
       pending: true,
+      tone: 'warn',
     };
   }
-  // config_pending is false only once the daemon echoed the desired generation.
-  if (config.applied_config_generation != null) {
+
+  // Live, heartbeating, and STILL not converged past the window → genuinely stuck.
+  // Distinguish a daemon too old to speak the live-config contract (never echoes
+  // an applied generation) from one that reported a stale/rejected generation.
+  if (config.daemon_reports_applied === false) {
     return {
-      label: 'config applied',
-      cls: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300',
+      label: 'config not applied — runner too old, update it',
+      cls: CONFIG_STATUS_CLS.bad,
       pending: false,
+      tone: 'bad',
     };
   }
-  return null;
-}
-
-/** Current GPU allowlist for a runner, from the server-authoritative desired
- *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
-function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
-  const allow = runner.config?.gpu_indices_allowed;
-  if (Array.isArray(allow)) return allow;
-  return 'all';
-}
-
-function gpuAllowlistLabel(runner: FleetRunner): string {
-  const allow = gpuAllowlistValue(runner);
-  if (allow === 'all') return 'GPUs: all';
-  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
-}
-
-/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
- *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
-function parseGpuIndexList(text: string): number[] {
-  const seen = new Set<number>();
-  const out: number[] = [];
-  for (const token of text.split(/[\s,]+/)) {
-    if (!token) continue;
-    if (!/^\d+$/.test(token)) continue;
-    const value = Number(token);
-    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
-    seen.add(value);
-    out.push(value);
+  // The daemon echoed an applied generation but is still not converged. When it
+  // reported a STRUCTURED rejection reason (backend already suppressed a stale
+  // reason tied to a superseded generation), surface it honestly instead of the
+  // ambiguous "rejected it or is stuck". Fall back to the ambiguous label only
+  // for a legacy daemon that never reported a reason.
+  const reason = config.apply_reason;
+  if (reason) {
+    return {
+      label: `config rejected — ${reason}`,
+      cls: CONFIG_STATUS_CLS.bad,
+      pending: false,
+      tone: 'bad',
+    };
   }
-  return out.sort((a, b) => a - b);
-}
-
-// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
-// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
-const GPUS_PER_JOB_MIN = 1;
-const GPUS_PER_JOB_MAX = 8;
-
-/** Current per-job GPU count for a runner, from the server-authoritative config.
- *  Absent means the default of 1 GPU per job (backward compatible). */
-function gpusPerJobValue(runner: FleetRunner): number {
-  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
-  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
-}
-
-/** Current task-type allowlist for a runner. Prefers the server-authoritative
- *  desired config; falls back to the runner-reported capabilities for runners
- *  enrolled before the live-config contract (no config block). Absent / "all"
- *  means every task type is eligible. */
-function taskTypesValue(runner: FleetRunner): 'all' | string[] {
-  const desired = runner.config?.desired?.task_types;
-  if (Array.isArray(desired)) return desired;
-  if (desired === 'all') return 'all';
-  const reported = runner.capabilities.task_types;
-  if (Array.isArray(reported)) return reported;
-  return 'all';
-}
-
-function taskTypesLabel(runner: FleetRunner): string {
-  const value = taskTypesValue(runner);
-  if (value === 'all') return 'tasks: all';
-  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
-}
-
-/** Parse an operator-typed task-type list ("compute_experiment, code_change")
- *  into a deduped, trimmed, non-empty string array — the shape the PATCH
- *  endpoint normalizes ('all' when empty is handled by the caller). */
-function parseTaskTypeList(text: string): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const token of text.split(/[\s,]+/)) {
-    const trimmed = token.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    out.push(trimmed);
-  }
-  return out;
+  return {
+    label: 'config not applied — runner rejected it or is stuck',
+    cls: CONFIG_STATUS_CLS.bad,
+    pending: false,
+    tone: 'bad',
+  };
 }
 
 function isStrategicRunner(runner: FleetRunner): boolean {
@@ -287,7 +341,8 @@ function lastSuccessLabel(runner: FleetRunner): string | null {
 }
 
 /** Trust telemetry one-liner for a runner row: last successful job, GPU util,
- *  disk free. Returns null when the runner reported no telemetry (old runners). */
+ *  disk free, memory free. Returns null when the runner reported no telemetry
+ *  (old runners). Warns on a degraded runner or disk/memory pressure. */
 function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } | null {
   const health = runner.health;
   const parts: string[] = [];
@@ -299,8 +354,21 @@ function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } 
   if (typeof gpuUtil === 'number') parts.push(`GPU ${gpuUtil}%`);
   const diskFree = health?.disk_free_bytes ?? runner.capabilities.disk_free_bytes;
   if (typeof diskFree === 'number') parts.push(`${formatBytes(diskFree)} disk`);
+  const memFree = health?.memory_free_bytes ?? runner.capabilities.memory_free_bytes;
+  if (typeof memFree === 'number') parts.push(`${formatBytes(memFree)} mem`);
+  const imageCache = runner.capabilities.image_cache_by_project;
+  if (imageCache && typeof imageCache.total_bytes === 'number') {
+    const projectCount = imageCache.by_project ? Object.keys(imageCache.by_project).length : 0;
+    // Only note the per-project split when the cache is genuinely shared; a
+    // single-project runner's image cache adds nothing over disk-free.
+    const suffix = projectCount > 1 ? ` (${projectCount} projects)` : '';
+    parts.push(`${formatBytes(imageCache.total_bytes)} images${suffix}`);
+  }
   if (parts.length === 0) return null;
-  return { text: parts.join(' · '), warn: isRunnerDegraded(runner) || health?.disk_low === true };
+  return {
+    text: parts.join(' · '),
+    warn: isRunnerDegraded(runner) || health?.disk_low === true || health?.memory_low === true,
+  };
 }
 
 function runnerReadinessDetail(runner: FleetRunner, runnerLive: boolean, slots: number | null): string {
@@ -324,7 +392,12 @@ interface RunnerReadiness {
   ready: boolean;
 }
 
-function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number | null): RunnerReadiness {
+function runnerReadiness(
+  runner: FleetRunner,
+  runnerLive: boolean,
+  slots: number | null,
+  workload: 'agent' | 'compute' = 'agent',
+): RunnerReadiness {
   const detail = runnerReadinessDetail(runner, runnerLive, slots);
   if (runner.status !== 'active') {
     return { label: 'inactive', detail, nextAction: 'Re-enroll or revoke this runner', tone: 'neutral', ready: false };
@@ -342,7 +415,7 @@ function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number
       ready: false,
     };
   }
-  if (runner.health?.agent_available === false) {
+  if (workload === 'agent' && runner.health?.agent_available === false) {
     const agentReason = runner.health?.agent_unavailable_reason;
     const nextAction = agentReason ?? 'Restart or inspect the local agent';
     return { label: 'agent unavailable', detail, nextAction, tone: 'bad', ready: false };
@@ -397,11 +470,23 @@ interface TokenDialogProps {
   token: string;
   mode?: TokenDialogMode;
   preset?: RunnerSetupPreset;
-  tokenExpiresAt?: string | null;
   /** True once the just-enrolled runner has heartbeated and shows connected. */
   connected: boolean;
   /** Hostname the connected runner reported, shown in the success line. */
   connectedHostname?: string | null;
+  /** True once the bounded connect wait elapsed with no heartbeat: the dialog
+   *  drops the optimistic spinner for an honest "not connected yet" state. */
+  waitTimedOut?: boolean;
+  /** Reset the connect-wait timer and keep waiting (from the timed-out state). */
+  onKeepWaiting?: () => void;
+  /** Rotate mode: true once the rotated runner has sent a new-token heartbeat. */
+  rotateConnected?: boolean;
+  /** Hostname reported by the re-connected runner after token rotation. */
+  rotateConnectedHostname?: string | null;
+  /** Rotate mode: true once the bounded reconnect wait elapsed with no heartbeat. */
+  rotateWaitTimedOut?: boolean;
+  /** Reset the rotate reconnect-wait timer and keep waiting. */
+  onRotateKeepWaiting?: () => void;
   onDismiss: () => void;
 }
 
@@ -410,15 +495,22 @@ function TokenDialog({
   token,
   mode = 'enroll',
   preset = 'default',
-  tokenExpiresAt,
   connected,
   connectedHostname,
+  waitTimedOut = false,
+  onKeepWaiting,
+  rotateConnected = false,
+  rotateConnectedHostname,
+  rotateWaitTimedOut = false,
+  onRotateKeepWaiting,
   onDismiss,
 }: TokenDialogProps) {
   const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
     token: false,
     windowsPowerShell: false,
     macosLinux: false,
+    installUser: false,
+    installSystem: false,
   });
   // The runner POSTs heartbeats to the backend API, not the admin-UI hosting origin (Firebase
   // Hosting only serves the SPA and has no /api/** route). Prefer the configured API base URL;
@@ -426,9 +518,14 @@ function TokenDialog({
   const origin =
     API_BASE_URL || (typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator');
   const snippets = runnerSetupSnippets(token, origin);
+  const install = runnerInstallSnippet(token, origin);
   const setupSnippetItems: Array<{ id: keyof RunnerSetupSnippetCommands; label: string; command: string }> = [
     { id: 'windowsPowerShell', label: 'Windows PowerShell', command: snippets.windowsPowerShell },
     { id: 'macosLinux', label: 'macOS/Linux', command: snippets.macosLinux },
+  ];
+  const installSnippetItems: Array<{ id: 'installUser' | 'installSystem'; label: string; command: string }> = [
+    { id: 'installUser', label: 'Linux — per-user service', command: install.userService },
+    { id: 'installSystem', label: 'Linux — system-wide (shared box)', command: install.systemService },
   ];
 
   const copy = async (target: CopyTarget, text: string) => {
@@ -471,12 +568,49 @@ function TokenDialog({
           </div>
         </div>
 
+        {mode === 'enroll' && (
+          <div className="mb-4 rounded border border-neutral-700 bg-neutral-950/60 px-3 py-2.5" data-testid="runner-prerequisites">
+            <div className="text-xs font-semibold text-neutral-300 mb-1.5">Before you start — prerequisites</div>
+            <ul className="space-y-1.5 text-ui-md text-neutral-400 list-disc pl-4">
+              {RUNNER_PREREQUISITES.map((req, i) => (
+                <li key={i}>{req}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        {mode === 'enroll' && (
+          <div className="mb-4 space-y-2">
+            <div className="text-xs text-neutral-400">
+              Durable install <span className="text-emerald-400">(recommended)</span> — runs the runner as a
+              service that survives logout/reboot. Linux/systemd only.
+            </div>
+            <div className="grid gap-2 md:grid-cols-2">
+              {installSnippetItems.map(item => (
+                <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
+                  <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1.5">
+                    <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">{item.label}</div>
+                    <button
+                      onClick={() => copy(item.id, item.command)}
+                      className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-400 transition-colors hover:text-neutral-200 md:min-h-8 md:min-w-8"
+                      title={`Copy ${item.label} install snippet`}
+                      aria-label={`Copy ${item.label} install snippet`}
+                    >
+                      {copied[item.id] ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                    </button>
+                  </div>
+                  <code className="block max-h-28 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs text-neutral-300">
+                    {item.command}
+                  </code>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div className="mb-4 space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="text-xs text-neutral-400">Setup snippets</div>
-            {tokenExpiresAt && (
-              <div className="text-ui-md text-neutral-500">Token expires {formatAbsolute(tokenExpiresAt)}</div>
-            )}
+          <div className="text-xs text-neutral-400">
+            {mode === 'enroll' ? 'Quick start (foreground) — runs until the shell closes' : 'Setup snippets'}
           </div>
           <div className="grid gap-2 md:grid-cols-2">
             {setupSnippetItems.map(item => (
@@ -501,39 +635,104 @@ function TokenDialog({
           <div className="text-ui-md text-neutral-500">
             {mode === 'rotate'
               ? 'Stop the existing runner process, then restart it from the repo root with the new token.'
-              : 'Run this from the repo root; the first heartbeat connects it below.'}
+              : 'Run from the repo root. Run `bash blueprint-runner check` first to self-verify; the first heartbeat connects it below.'}
           </div>
         </div>
 
         {mode === 'rotate' ? (
           <div
-            className="mb-4 flex items-center gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"
+            className={`mb-4 rounded-md border px-3 py-2 text-xs ${
+              rotateConnected
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                : rotateWaitTimedOut
+                  ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+            }`}
             data-testid="runner-connection-status"
           >
-            <KeyRound className="w-4 h-4 shrink-0 text-amber-300" />
-            <span>Restart required. Existing heartbeats may still reflect the old process until it is restarted.</span>
+            {rotateConnected ? (
+              <div className="flex items-center gap-2">
+                <Check className="w-4 h-4 shrink-0 text-emerald-400" />
+                <span className="font-medium">
+                  Reconnected{rotateConnectedHostname ? ` — ${rotateConnectedHostname}` : ''}
+                </span>
+              </div>
+            ) : rotateWaitTimedOut ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-300" />
+                  <span className="font-medium">Not reconnected yet</span>
+                </div>
+                <p className="text-red-200/90">
+                  No heartbeat arrived with the new token. Stop the existing runner process and restart it with the new
+                  token above. Run <code className="font-mono">bash blueprint-runner check</code> to verify
+                  prerequisites.
+                </p>
+                {onRotateKeepWaiting && (
+                  <button
+                    onClick={onRotateKeepWaiting}
+                    className="mt-1 rounded border border-red-400/40 px-3 py-2 text-red-200 transition-colors hover:bg-red-500/10 min-h-[44px]"
+                  >
+                    Keep waiting
+                  </button>
+                )}
+              </div>
+            ) : (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
+                  <span>Waiting for runner to reconnect with new token…</span>
+                </div>
+                <p className="text-amber-200/80">
+                  Stop the existing runner process and restart it with the new token above.
+                </p>
+              </div>
+            )}
           </div>
         ) : (
           <div
-            className={`mb-4 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
+            className={`mb-4 rounded-md border px-3 py-2 text-xs ${
               connected
                 ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
-                : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                : waitTimedOut
+                  ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                  : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
             }`}
             data-testid="runner-connection-status"
           >
             {connected ? (
-              <>
+              <div className="flex items-center gap-2">
                 <Check className="w-4 h-4 shrink-0 text-emerald-400" />
                 <span className="font-medium">
                   Connected on this project{connectedHostname ? ` — ${connectedHostname}` : ''}
                 </span>
-              </>
+              </div>
+            ) : waitTimedOut ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="w-4 h-4 shrink-0 text-red-300" />
+                  <span className="font-medium">Not connected yet</span>
+                </div>
+                <p className="text-red-200/90">
+                  No heartbeat arrived within the expected window. Check that the token was copied exactly, that the
+                  prerequisites above are met (run <code className="font-mono">bash blueprint-runner check</code>), and
+                  the runner's logs — a wrong or revoked token makes the runner exit on its first heartbeat rather than
+                  connect. First-time setup (repo clone, image build) can also take a few minutes.
+                </p>
+                {onKeepWaiting && (
+                  <button
+                    onClick={onKeepWaiting}
+                    className="mt-1 rounded border border-red-400/40 px-3 py-2 text-red-200 transition-colors hover:bg-red-500/10 min-h-[44px]"
+                  >
+                    Keep waiting
+                  </button>
+                )}
+              </div>
             ) : (
-              <>
+              <div className="flex items-center gap-2">
                 <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
                 <span>Waiting for your runner to connect…</span>
-              </>
+              </div>
             )}
           </div>
         )}
@@ -565,10 +764,6 @@ interface Props {
   onNavigateToTask?: (taskId: string) => void;
 }
 
-function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
-  return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
-}
-
 export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live, onNavigateToTask }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
@@ -579,46 +774,101 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     token: string;
     mode: TokenDialogMode;
     preset: RunnerSetupPreset;
-    tokenExpiresAt: string | null;
+    /** Rotate mode only: server-authored UTC marker for token invalidation. */
+    rotatedAt?: string;
   } | null>(null);
+  // Bounded connect wait for the enroll dialog: after this elapses with no
+  // heartbeat, the dialog drops the optimistic spinner for an honest
+  // "not connected yet" state instead of implying success is imminent forever.
+  const [enrollWaitTimedOut, setEnrollWaitTimedOut] = useState(false);
+  // Same bounded wait for the rotate dialog: after ROTATE_CONNECT_TIMEOUT_MS with
+  // no new-token heartbeat, the dialog shows an honest "not reconnected yet" state.
+  const [rotateWaitTimedOut, setRotateWaitTimedOut] = useState(false);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
-  const [editingCapabilities, setEditingCapabilities] = useState<string | null>(null);
-  const [editMaxConcurrent, setEditMaxConcurrent] = useState<number>(2);
-  const [editingGpuAllowlist, setEditingGpuAllowlist] = useState<string | null>(null);
-  const [gpuAllowlistAll, setGpuAllowlistAll] = useState<boolean>(true);
-  const [gpuAllowlistText, setGpuAllowlistText] = useState<string>('');
-  const [editingGpusPerJob, setEditingGpusPerJob] = useState<string | null>(null);
-  const [editGpusPerJob, setEditGpusPerJob] = useState<number>(GPUS_PER_JOB_MIN);
-  const [editingTaskTypes, setEditingTaskTypes] = useState<string | null>(null);
-  const [taskTypesAll, setTaskTypesAll] = useState<boolean>(true);
-  const [taskTypesText, setTaskTypesText] = useState<string>('');
-  const [updatingCapabilities, setUpdatingCapabilities] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState<string | null>(null);
   // Which runner's heartbeat time-series / stats detail is expanded (lazy-loaded).
   const [expandedTelemetry, setExpandedTelemetry] = useState<string | null>(null);
+  // Which runner's configuration form is expanded.
+  const [expandedConfig, setExpandedConfig] = useState<string | null>(null);
+  // Per-runner project allow-list (enrollment anchor + explicit bindings), keyed
+  // by runner id. Loaded alongside the runner list; a fetch failure just leaves a
+  // runner's entry absent so the Projects section degrades rather than erroring.
+  const [runnerProjects, setRunnerProjects] = useState<Record<string, RunnerProjectAllowList>>({});
+  // Projects the current user owns — the candidate set for the add-picker. Loaded
+  // once per projectId; best-effort (empty on failure disables adding, never errors).
+  const [ownedProjects, setOwnedProjects] = useState<OwnedProjectSummary[]>([]);
+  // Which runner is showing its add-project picker, and the selected project id.
+  const [addingProjectFor, setAddingProjectFor] = useState<string | null>(null);
+  const [addProjectSelection, setAddProjectSelection] = useState<string>('');
+  // Which runner's allow-list is mid-mutation (add/remove) — drives the spinner.
+  const [mutatingProjects, setMutatingProjects] = useState<string | null>(null);
   const mountedRef = useRef(true);
+  // Request-epoch guard: bumped on projectId change so a slow response from
+  // the previous project never overwrites the current project's state.
+  const requestEpochRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
   }, []);
 
+  // Bump epoch on project switch to invalidate any in-flight load() from
+  // the previous project.
+  useEffect(() => {
+    requestEpochRef.current += 1;
+  }, [projectId]);
+
   // showLoading is opt-in so only the initial / projectId-change load surfaces
   // the full-panel spinner; background polls and refreshSignal reloads refresh
   // silently. Keeping setLoading(true) inside this callback (not in the effect
   // body) also keeps the effects free of a synchronous setState.
   const load = useCallback(async (showLoading = false) => {
+    const epoch = requestEpochRef.current;
     if (showLoading && mountedRef.current) setLoading(true);
     try {
       const data = await listFleetRunners(projectId);
+      if (epoch !== requestEpochRef.current) return;
       if (mountedRef.current) { setRunners(data); setError(null); }
+      // Fetch each runner's project allow-list concurrently. Best-effort: a
+      // per-runner failure resolves to null and simply omits that runner's
+      // Projects section rather than failing the whole panel load.
+      const lists = await Promise.all(
+        data.map(r => listRunnerProjects(r.enrollment_project_id ?? projectId, r.id).catch(() => null)),
+      );
+      if (epoch !== requestEpochRef.current) return;
+      if (mountedRef.current) {
+        const map: Record<string, RunnerProjectAllowList> = {};
+        data.forEach((r, i) => {
+          const list = lists[i];
+          if (list && Array.isArray(list.projects)) map[r.id] = list;
+        });
+        setRunnerProjects(map);
+      }
     } catch (e) {
-      if (mountedRef.current) setError(e instanceof Error ? e.message : String(e));
+      if (epoch === requestEpochRef.current && mountedRef.current) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
     } finally {
-      if (mountedRef.current) setLoading(false);
+      if (epoch === requestEpochRef.current && mountedRef.current) setLoading(false);
     }
+  }, [projectId]);
+
+  // Load the owner's project set once per projectId — the candidate list for the
+  // add-picker. Best-effort: on failure the picker just has no options to add.
+  useEffect(() => {
+    let cancelled = false;
+    async function run() {
+      try {
+        const owned = await listOwnedProjects();
+        if (!cancelled && mountedRef.current) setOwnedProjects(owned);
+      } catch {
+        if (!cancelled && mountedRef.current) setOwnedProjects([]);
+      }
+    }
+    void run();
+    return () => { cancelled = true; };
   }, [projectId]);
 
   // load() is invoked through an effect-local async function so the setState
@@ -634,11 +884,12 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     void run();
   }, [load, refreshSignal]);
 
-  useEffect(() => {
-    if (live === true) return;
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
-  }, [load, live]);
+  usePoller(() => load(), {
+    intervalMs: 30000,
+    enabled: live !== true,
+    leading: false,
+    deps: [projectId],
+  });
 
   // While the enroll dialog is open, resolve the just-enrolled runner from the
   // list so the dialog can show live "waiting… / connected" feedback. Poll faster
@@ -650,10 +901,58 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   const enrolledConnected = enrolledRunner ? isRunnerLive(enrolledRunner) : false;
 
   useEffect(() => {
-    if (!pendingToken || enrolledConnected) return;
+    if (!pendingToken || pendingToken.mode !== 'enroll' || enrolledConnected) return;
     const interval = setInterval(load, 3000);
     return () => clearInterval(interval);
   }, [pendingToken, enrolledConnected, load]);
+
+  // Reset the honest-timeout state whenever a fresh enroll dialog opens (new
+  // runner id) or the dialog closes, so every enroll starts optimistic.
+  useEffect(() => {
+    setEnrollWaitTimedOut(false);
+  }, [pendingToken?.runnerId]);
+
+  // Bound the optimistic "waiting…" spinner: after ENROLL_CONNECT_TIMEOUT_MS with
+  // no heartbeat, flip to the honest not-connected state. A wrong/revoked token
+  // never connects (the daemon now fast-fails on its first heartbeat), so an
+  // unbounded spinner would misrepresent an already-dead enroll as in-progress.
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'enroll') return;
+    if (enrolledConnected || enrollWaitTimedOut) return;
+    const timer = setTimeout(() => setEnrollWaitTimedOut(true), ENROLL_CONNECT_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingToken, enrolledConnected, enrollWaitTimedOut]);
+
+  // ── Rotate-mode reconnect tracking ──────────────────────────────────────────
+
+  // Resolve the rotated runner and use the backend's credential-generation
+  // acknowledgement. last_seen_at ordering cannot prove which token authenticated
+  // an in-flight heartbeat that commits after rotation.
+  const rotatedRunner = pendingToken?.mode === 'rotate'
+    ? runners.find(r => r.id === pendingToken.runnerId)
+    : undefined;
+  const rotateConnected = rotatedRunner?.current_token_heartbeat_confirmed === true;
+
+  // Fast-poll while waiting for the rotated runner to reconnect with its new token.
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'rotate' || rotateConnected) return;
+    const interval = setInterval(load, 3000);
+    return () => clearInterval(interval);
+  }, [pendingToken, rotateConnected, load]);
+
+  // Reset rotate timeout state on dialog open/close so every rotation starts optimistic.
+  useEffect(() => {
+    setRotateWaitTimedOut(false);
+  }, [pendingToken?.runnerId]);
+
+  // Bound the rotate reconnect wait: after ROTATE_CONNECT_TIMEOUT_MS with no
+  // new-token heartbeat, flip to honest "not reconnected yet".
+  useEffect(() => {
+    if (!pendingToken || pendingToken.mode !== 'rotate') return;
+    if (rotateConnected || rotateWaitTimedOut) return;
+    const timer = setTimeout(() => setRotateWaitTimedOut(true), ROTATE_CONNECT_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [pendingToken, rotateConnected, rotateWaitTimedOut]);
 
   const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
     setEnrollingPreset(preset);
@@ -666,7 +965,6 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         token: result.token,
         mode: 'enroll',
         preset,
-        tokenExpiresAt: tokenExpiryFromRegisterResult(result),
       });
       await load();
     } catch (e) {
@@ -691,13 +989,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     if (type === 'rotate') {
       setRotating(runner.id);
       try {
-        const result = await rotateFleetRunnerToken(projectId, runner.id);
+        const result = await rotateFleetRunnerToken(runner.enrollment_project_id ?? projectId, runner.id);
         setPendingToken({
           runnerId: result.runner_id,
           token: result.token,
           mode: 'rotate',
           preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
-          tokenExpiresAt: tokenExpiryFromRegisterResult(result),
+          rotatedAt: result.rotated_at,
         });
         await load();
       } catch (e) {
@@ -708,7 +1006,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     } else {
       setRevoking(runner.id);
       try {
-        await revokeFleetRunner(projectId, runner.id);
+        await revokeFleetRunner(runner.enrollment_project_id ?? projectId, runner.id);
         await load();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -718,77 +1016,36 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     }
   };
 
-  const handleUpdateCapabilities = async (runner: FleetRunner, maxConcurrent: number) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingCapabilities(null);
+  const handleAddRunnerProject = async (runner: FleetRunner, addProjectId: string) => {
+    setMutatingProjects(runner.id);
     try {
-      await updateRunnerCapabilities(projectId, runner.id, { max_concurrent: maxConcurrent });
+      await addRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addProjectId);
+      setAddingProjectFor(null);
+      setAddProjectSelection('');
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setUpdatingCapabilities(null);
+      setMutatingProjects(null);
     }
   };
 
-  const handleUpdateGpuAllowlist = async (runner: FleetRunner, gpuIndicesAllowed: 'all' | number[]) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingGpuAllowlist(null);
+  const handleRemoveRunnerProject = async (runner: FleetRunner, addedProjectId: string) => {
+    setMutatingProjects(runner.id);
     try {
-      await updateRunnerCapabilities(projectId, runner.id, { gpu_indices_allowed: gpuIndicesAllowed });
+      await removeRunnerProject(runner.enrollment_project_id ?? projectId, runner.id, addedProjectId);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setUpdatingCapabilities(null);
+      setMutatingProjects(null);
     }
-  };
-
-  const beginEditGpuAllowlist = (runner: FleetRunner) => {
-    const current = gpuAllowlistValue(runner);
-    setGpuAllowlistAll(current === 'all');
-    setGpuAllowlistText(current === 'all' ? '' : current.join(','));
-    setEditingGpuAllowlist(runner.id);
-  };
-
-  const handleUpdateGpusPerJob = async (runner: FleetRunner, gpusPerJob: number) => {
-    const clamped = Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(gpusPerJob)));
-    setUpdatingCapabilities(runner.id);
-    setEditingGpusPerJob(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { gpus_per_job: clamped });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const handleUpdateTaskTypes = async (runner: FleetRunner, taskTypes: 'all' | string[]) => {
-    setUpdatingCapabilities(runner.id);
-    setEditingTaskTypes(null);
-    try {
-      await updateRunnerCapabilities(projectId, runner.id, { task_types: taskTypes });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUpdatingCapabilities(null);
-    }
-  };
-
-  const beginEditTaskTypes = (runner: FleetRunner) => {
-    const current = taskTypesValue(runner);
-    setTaskTypesAll(current === 'all');
-    setTaskTypesText(current === 'all' ? '' : current.join(', '));
-    setEditingTaskTypes(runner.id);
   };
 
   const handleUpdateStatus = async (runner: FleetRunner, status: 'active' | 'paused' | 'draining') => {
     setUpdatingStatus(runner.id);
     try {
-      await patchRunnerStatus(projectId, runner.id, status);
+      await patchRunnerStatus(runner.enrollment_project_id ?? projectId, runner.id, status);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -796,6 +1053,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
       setUpdatingStatus(null);
     }
   };
+
+  // Resolve project ids to human names for the Projects section. Only projects
+  // the user owns carry a name; ids outside that set fall back to a short prefix.
+  const ownedProjectNameById = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const p of ownedProjects) map[p.id] = p.name;
+    return map;
+  }, [ownedProjects]);
 
   const { liveRunners, liveComputeRunners, liveGpuRunners, liveStrategicRunners } = useMemo(() => {
     const live = runners.filter(isRunnerLive);
@@ -807,48 +1072,50 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
     };
   }, [runners]);
 
-  const { readyRunners, eligibleStrategicRunners } = useMemo(() => {
-    const readiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+  const { readyAgentRunners, readyComputeRunners, eligibleStrategicRunners } = useMemo(() => {
+    const agentReadiness = liveRunners
+      .filter(isAgentCapable)
+      .map(runner => runnerReadiness(runner, true, availableSlots(runner), 'agent'));
+    const computeReadiness = liveComputeRunners
+      .map(runner => runnerReadiness(runner, true, availableComputeSlots(runner), 'compute'));
     const strategicReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
     return {
-      readyRunners: readiness.filter(r => r.ready).length,
+      readyAgentRunners: agentReadiness.filter(r => r.ready).length,
+      readyComputeRunners: computeReadiness.filter(r => r.ready).length,
       eligibleStrategicRunners: strategicReadiness.filter(r => r.ready).length,
     };
-  }, [liveRunners, liveStrategicRunners]);
+  }, [liveRunners, liveComputeRunners, liveStrategicRunners]);
 
-  const { failingRunners, agentUnavailable, strategicAgentUnavailable, busyWork, maxSlots, knownFreeSlots, hasUnknownSlots, freeSlotsLabel, gpuCapacityLabel } = useMemo(() => {
-    const slotValues = liveRunners.map(availableSlots);
-    const knownFree = slotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
-    const unknownSlots = slotValues.some(slots => slots == null);
-    const gpuSlotValues = liveGpuRunners.map(availableSlots);
+  const { failingRunners, agentUnavailable, strategicAgentUnavailable, agentCapacity, computeCapacity, gpuCapacityLabel } = useMemo(() => {
+    const gpuSlotValues = liveGpuRunners.map(availableComputeSlots);
     const knownGpuSlots = gpuSlotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
     const unknownGpuSlots = gpuSlotValues.some(slots => slots == null);
     return {
       failingRunners: liveRunners.filter(isRunnerDegraded).length,
       agentUnavailable: liveRunners.filter(runner => runner.health?.agent_available === false).length,
       strategicAgentUnavailable: liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length,
-      busyWork: liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0),
-      maxSlots: liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0),
-      knownFreeSlots: knownFree,
-      hasUnknownSlots: unknownSlots,
-      freeSlotsLabel: unknownSlots ? `${knownFree}+ known` : `${knownFree} free`,
+      agentCapacity: summarizeCapacity(liveRunners, activeTaskCount, availableSlots, maxSlotsForRunner),
+      computeCapacity: summarizeCapacity(liveComputeRunners, activeComputeCount, availableComputeSlots, maxComputeSlotsForRunner),
       gpuCapacityLabel: liveGpuRunners.length === 0
         ? 'offline'
         : unknownGpuSlots
           ? `${liveGpuRunners.length} connected`
           : `${knownGpuSlots} slots free`,
     };
-  }, [liveRunners, liveGpuRunners, liveStrategicRunners]);
+  }, [liveRunners, liveComputeRunners, liveGpuRunners, liveStrategicRunners]);
+  const knownFreeCapacity = agentCapacity.free + computeCapacity.free;
+  const hasUnknownCapacity = agentCapacity.unknown || computeCapacity.unknown;
   const localOnlyBlocked = requireLocalRunner && !loading && liveComputeRunners.length === 0;
   const nextAction = (() => {
     if (loading) return null;
     if (runners.length === 0) return 'Enroll a runner, then start it to send the first heartbeat.';
     if (localOnlyBlocked) return 'Start or enroll a connected compute-capable local runner.';
-    if (agentUnavailable > 0) return 'Inspect agent availability on the affected runner host.';
     if (failingRunners > 0) return 'A connected runner is failing its jobs; inspect the host logs before relying on it.';
     if (liveRunners.length === 0) return 'Check runner hosts; no active runner is connected.';
-    if (!hasUnknownSlots && knownFreeSlots === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
-    if (hasUnknownSlots && knownFreeSlots === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
+    if (agentCapacity.free === 0 && computeCapacity.free > 0) return 'Compute capacity is available; inspect agent availability or free an agent slot for agent work.';
+    if (agentUnavailable > 0 && computeCapacity.free === 0) return 'Inspect agent availability on the affected runner host.';
+    if (!hasUnknownCapacity && knownFreeCapacity === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
+    if (hasUnknownCapacity && knownFreeCapacity === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
     return 'Fleet has dispatch capacity.';
   })();
 
@@ -896,8 +1163,9 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">readiness</div>
-            <div className={`mt-0.5 font-mono ${readyRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
-              {readyRunners}/{runners.length} ready
+            <div className={`mt-0.5 font-mono ${readyAgentRunners + readyComputeRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
+              <span data-testid="fleet-runner-agent-readiness">{readyAgentRunners} agent</span>{' · '}
+              <span data-testid="fleet-runner-compute-readiness">{readyComputeRunners} compute</span>{' ready'}
             </div>
             <div className={`mt-0.5 truncate text-ui-sm ${failingRunners > 0 ? 'text-amber-300' : 'text-neutral-600'}`} data-testid="fleet-runner-connected-summary">
               {failingRunners > 0
@@ -906,9 +1174,16 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             </div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
-            <div className="text-ui-md uppercase tracking-wide text-neutral-500">slots</div>
-            <div className="mt-0.5 font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{busyWork}/{maxSlots || '-'}</div>
-            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{freeSlotsLabel}</div>
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">capacity</div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-500">
+              agents <span className="font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{agentCapacity.busy}/{agentCapacity.max || '-'}</span>
+              {' · '}{agentCapacity.unknown ? `${agentCapacity.free}+ known free` : `${agentCapacity.free} free`}
+            </div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-500">
+              compute <span className="font-mono text-purple-300" data-testid="fleet-runner-compute-capacity">{computeCapacity.busy}/{computeCapacity.max || '-'}</span>
+              {' · '}{liveComputeRunners.length === 0 ? 'unavailable' : computeCapacity.unknown
+                ? `${computeCapacity.free}+ known free` : `${computeCapacity.free} free`}
+            </div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">gpu</div>
@@ -972,14 +1247,26 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
             const hasPerClassCapacity = runner.health?.max_concurrent_compute != null
               && runner.health.max_concurrent_compute !== runner.health.max_concurrent;
             const strategicRunner = isStrategicRunner(runner);
-            const readiness = runnerReadiness(runner, runnerLive, slots);
-            const workday = workdayReadinessLine(readiness, strategicRunner);
+            const agentReadiness = isAgentCapable(runner)
+              ? runnerReadiness(runner, runnerLive, slots, 'agent')
+              : null;
+            const computeReadiness = isComputeCapable(runner)
+              ? runnerReadiness(runner, runnerLive, computeSlots, 'compute')
+              : null;
+            const readiness = agentReadiness ?? computeReadiness ?? runnerReadiness(runner, runnerLive, slots, 'agent');
+            const workday = workdayReadinessLine(agentReadiness ?? readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
             const configState = configStatus(runner);
             const backends = formatBackendInventory(runner.capabilities);
             const hasBackendInfo =
               backends.available.length > 0 || backends.agentBackend !== null || backends.computeBackend !== null;
             const telemetryOpen = expandedTelemetry === runner.id;
+            const configOpen = expandedConfig === runner.id;
+            // Project allow-list for this runner (enrollment anchor + bindings).
+            const allowList = runnerProjects[runner.id];
+            const allowedIds = new Set((allowList?.projects ?? []).map(p => p.project_id));
+            // Owned projects not already on the allow-list — the add-picker options.
+            const addableProjects = ownedProjects.filter(p => !allowedIds.has(p.id));
             return (
               <div
                 key={runner.id}
@@ -1004,6 +1291,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className="text-sm font-medium text-neutral-200 truncate">
                       {runner.hostname ?? runner.id.slice(0, 8)}
                     </span>
+                    {runner.enrollment_project_id && runner.enrollment_project_id !== projectId && (
+                      <span className="rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 text-xs text-sky-300" data-testid="fleet-runner-shared">
+                        shared runner
+                      </span>
+                    )}
                     {runner.version && (
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
@@ -1034,60 +1326,12 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                         {activeCount} active
                       </span>
                     )}
-                    {slots !== null && editingCapabilities === runner.id ? (
-                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
-                        <input
-                          type="number"
-                          min={1}
-                          max={64}
-                          value={editMaxConcurrent}
-                          onChange={e => setEditMaxConcurrent(Math.max(1, Math.min(64, Number(e.target.value) || 1)))}
-                          className="w-10 bg-transparent text-center text-xs text-blue-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                          autoFocus
-                        />
-                        <span>/ max</span>
-                        {updatingCapabilities !== runner.id ? (
-                          <>
-                            <button
-                              onClick={() => handleUpdateCapabilities(runner, editMaxConcurrent)}
-                              className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                              title="Save"
-                              aria-label="Save max concurrent"
-                              data-viewport-allow-small-target
-                            >
-                              <Check className="w-3 h-3" />
-                            </button>
-                            <button
-                              onClick={() => setEditingCapabilities(null)}
-                              className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                              title="Cancel"
-                              aria-label="Cancel"
-                              data-viewport-allow-small-target
-                            >
-                              <span className="text-xs">✕</span>
-                            </button>
-                          </>
-                        ) : (
-                          <span className="text-blue-300 animate-pulse">saving…</span>
-                        )}
-                      </span>
-                    ) : slots !== null && (
+                    {/* Config values are shown read-only here for at-a-glance
+                        status; all editing lives in the Configure panel (gear
+                        toggle in the action strip), reached below. */}
+                    {slots !== null && (
                       <span className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
                         {hasPerClassCapacity ? `${slots} agent slots free` : `${slots} slots free`}
-                        {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
-                          <button
-                            onClick={() => {
-                              setEditMaxConcurrent(runner.capabilities.max_concurrent ?? 2);
-                              setEditingCapabilities(runner.id);
-                            }}
-                            className="text-neutral-500 hover:text-neutral-200 transition-colors min-h-[20px] min-w-[20px] flex items-center justify-center"
-                            title="Edit max concurrent"
-                            aria-label="Edit max concurrent"
-                            data-viewport-allow-small-target
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        )}
                       </span>
                     )}
                     {hasPerClassCapacity && computeSlots !== null && (
@@ -1099,193 +1343,19 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
                     {runner.capabilities.has_gpu && (
-                      editingGpuAllowlist === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
-                          data-testid="fleet-runner-gpu-allowlist-editor"
-                        >
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={gpuAllowlistAll}
-                              onChange={e => setGpuAllowlistAll(e.target.checked)}
-                              aria-label="Allow all GPUs"
-                            />
-                            all
-                          </label>
-                          {!gpuAllowlistAll && (
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              value={gpuAllowlistText}
-                              onChange={e => setGpuAllowlistText(e.target.value)}
-                              placeholder="0,1"
-                              aria-label="GPU indices allowed"
-                              className="w-16 bg-transparent text-center text-xs text-purple-300 outline-none"
-                              autoFocus
-                            />
-                          )}
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => handleUpdateGpuAllowlist(runner, gpuAllowlistAll ? 'all' : parseGpuIndexList(gpuAllowlistText))}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save GPU allowlist"
-                                aria-label="Save GPU allowlist"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingGpuAllowlist(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel GPU allowlist"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-purple-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
-                          {gpuAllowlistLabel(runner)}
-                          <button
-                            onClick={() => beginEditGpuAllowlist(runner)}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
-                            title="Edit GPU allowlist"
-                            aria-label="Edit GPU allowlist"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                        {gpuAllowlistLabel(runner)}
+                      </span>
                     )}
                     {runner.capabilities.has_gpu && (
-                      editingGpusPerJob === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300"
-                          data-testid="fleet-runner-gpus-per-job-editor"
-                        >
-                          <input
-                            type="number"
-                            min={GPUS_PER_JOB_MIN}
-                            max={GPUS_PER_JOB_MAX}
-                            value={editGpusPerJob}
-                            onChange={e => setEditGpusPerJob(
-                              Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Number(e.target.value) || GPUS_PER_JOB_MIN)),
-                            )}
-                            className="w-10 bg-transparent text-center text-xs text-purple-300 outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
-                            aria-label="GPUs per job"
-                            autoFocus
-                          />
-                          <span>GPUs/job</span>
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => handleUpdateGpusPerJob(runner, editGpusPerJob)}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save GPUs per job"
-                                aria-label="Save GPUs per job"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingGpusPerJob(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel GPUs per job"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-purple-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
-                          {`${gpusPerJobValue(runner)} GPUs/job`}
-                          <button
-                            onClick={() => {
-                              setEditGpusPerJob(gpusPerJobValue(runner));
-                              setEditingGpusPerJob(runner.id);
-                            }}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-purple-300/70 transition-colors hover:text-purple-200 md:min-h-5 md:min-w-5"
-                            title="Edit GPUs per job"
-                            aria-label="Edit GPUs per job"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">
+                        {`${gpusPerJobValue(runner)} GPUs/job`}
+                      </span>
                     )}
                     {runner.capabilities.workload !== 'strategic' && runner.capabilities.runner_preset !== 'strategic_local' && (
-                      editingTaskTypes === runner.id ? (
-                        <span
-                          className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300"
-                          data-testid="fleet-runner-task-types-editor"
-                        >
-                          <label className="inline-flex items-center gap-1">
-                            <input
-                              type="checkbox"
-                              checked={taskTypesAll}
-                              onChange={e => setTaskTypesAll(e.target.checked)}
-                              aria-label="Allow all task types"
-                            />
-                            all
-                          </label>
-                          {!taskTypesAll && (
-                            <input
-                              type="text"
-                              value={taskTypesText}
-                              onChange={e => setTaskTypesText(e.target.value)}
-                              placeholder="compute_experiment, code_change"
-                              aria-label="Task types allowed"
-                              className="w-40 bg-transparent text-center text-xs text-blue-300 outline-none"
-                              autoFocus
-                            />
-                          )}
-                          {updatingCapabilities !== runner.id ? (
-                            <>
-                              <button
-                                onClick={() => {
-                                  const list = parseTaskTypeList(taskTypesText);
-                                  handleUpdateTaskTypes(runner, taskTypesAll || list.length === 0 ? 'all' : list);
-                                }}
-                                className="text-emerald-400 hover:text-emerald-300 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Save task types"
-                                aria-label="Save task types"
-                              >
-                                <Check className="w-3 h-3" />
-                              </button>
-                              <button
-                                onClick={() => setEditingTaskTypes(null)}
-                                className="text-neutral-400 hover:text-neutral-200 transition-colors min-h-[28px] min-w-[28px] flex items-center justify-center"
-                                title="Cancel"
-                                aria-label="Cancel task types"
-                              >
-                                <span className="text-xs">✕</span>
-                              </button>
-                            </>
-                          ) : (
-                            <span className="text-blue-300 animate-pulse">saving…</span>
-                          )}
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
-                          {taskTypesLabel(runner)}
-                          <button
-                            onClick={() => beginEditTaskTypes(runner)}
-                            className="flex min-h-[44px] min-w-[44px] items-center justify-center text-blue-300/70 transition-colors hover:text-blue-200 md:min-h-5 md:min-w-5"
-                            title="Edit task types"
-                            aria-label="Edit task types"
-                          >
-                            <Edit2 className="w-3 h-3" />
-                          </button>
-                        </span>
-                      )
+                      <span className="inline-flex items-center gap-1 rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
+                        {taskTypesLabel(runner)}
+                      </span>
                     )}
                     {runner.health?.agent_available !== undefined && (
                       <span
@@ -1332,14 +1402,23 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                    {agentReadiness && computeReadiness && (
+                      <span className="text-ui-md text-neutral-500" data-testid="fleet-runner-workload-readiness">
+                        agent {agentReadiness.label} · compute {computeReadiness.label}
+                      </span>
+                    )}
                     {configState && (
                       <span
                         className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs font-medium ${configState.cls}`}
                         data-testid="fleet-runner-config-status"
                       >
-                        {configState.pending
-                          ? <RefreshCw className="w-3 h-3 animate-spin" />
-                          : <Check className="w-3 h-3" />}
+                        {configState.tone === 'bad'
+                          ? <AlertTriangle className="w-3 h-3" />
+                          : configState.tone === 'good'
+                            ? <Check className="w-3 h-3" />
+                            : configState.tone === 'warn'
+                              ? <RefreshCw className="w-3 h-3 animate-spin" />
+                              : <RefreshCw className="w-3 h-3" />}
                         {configState.label}
                       </span>
                     )}
@@ -1425,6 +1504,16 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                   </button>
                 )}
                 <button
+                  onClick={() => setExpandedConfig(configOpen ? null : runner.id)}
+                  className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-emerald-500/10 hover:text-emerald-300 md:min-h-9 md:min-w-9 ${configOpen ? 'text-emerald-300' : 'text-neutral-500'}`}
+                  aria-label={`Configure runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                  aria-expanded={configOpen}
+                  data-testid="fleet-runner-configure-toggle"
+                  title="Configure runner (concurrency, task types, GPUs)"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                </button>
+                <button
                   onClick={() => setExpandedTelemetry(telemetryOpen ? null : runner.id)}
                   className={`flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md transition-colors hover:bg-sky-500/10 hover:text-sky-300 md:min-h-9 md:min-w-9 ${telemetryOpen ? 'text-sky-300' : 'text-neutral-500'}`}
                   aria-label={`Toggle telemetry for runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
@@ -1453,8 +1542,108 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
                 </button>
                 </div>
               </div>
+              {configOpen && (
+                <FleetRunnerConfigPanel
+                  key={`config-${runner.id}`}
+                  projectId={runner.enrollment_project_id ?? projectId}
+                  runner={runner}
+                  onSaved={() => load()}
+                />
+              )}
+              {allowList && (
+                <div
+                  className="border-t border-neutral-800 px-2.5 py-2"
+                  data-testid="fleet-runner-projects"
+                >
+                  <div className="mb-1 flex items-center gap-1.5 text-xs font-medium text-neutral-400">
+                    <span>Projects</span>
+                    <span className="text-neutral-600">— projects this runner serves</span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {allowList.projects.map(p => {
+                      const name = ownedProjectNameById[p.project_id] ?? p.project_id.slice(0, 8);
+                      return (
+                        <span
+                          key={p.project_id}
+                          className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                          data-testid="fleet-runner-project"
+                        >
+                          {name}
+                          {p.is_enrollment ? (
+                            <span className="text-neutral-500">(default)</span>
+                          ) : (
+                            <button
+                              onClick={() => void handleRemoveRunnerProject(runner, p.project_id)}
+                              disabled={mutatingProjects === runner.id}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-500 transition-colors hover:text-red-300 disabled:opacity-40 md:min-h-4 md:min-w-4"
+                              title={`Remove ${name}`}
+                              aria-label={`Remove project ${name} from runner`}
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          )}
+                        </span>
+                      );
+                    })}
+                    {addingProjectFor === runner.id ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300"
+                        data-testid="fleet-runner-add-project-editor"
+                      >
+                        <select
+                          value={addProjectSelection}
+                          onChange={e => setAddProjectSelection(e.target.value)}
+                          aria-label="Project to add"
+                          className="max-w-[10rem] bg-transparent text-xs text-neutral-200 outline-none"
+                          autoFocus
+                        >
+                          <option value="">
+                            {addableProjects.length > 0 ? 'Select project…' : 'No projects to add'}
+                          </option>
+                          {addableProjects.map(op => (
+                            <option key={op.id} value={op.id}>{op.name}</option>
+                          ))}
+                        </select>
+                        {mutatingProjects !== runner.id ? (
+                          <>
+                            <button
+                              onClick={() => addProjectSelection && void handleAddRunnerProject(runner, addProjectSelection)}
+                              disabled={!addProjectSelection}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-emerald-400 transition-colors hover:text-emerald-300 disabled:opacity-40 md:min-h-4 md:min-w-4"
+                              title="Add project"
+                              aria-label="Add selected project to runner"
+                            >
+                              <Check className="w-3 h-3" />
+                            </button>
+                            <button
+                              onClick={() => { setAddingProjectFor(null); setAddProjectSelection(''); }}
+                              className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-400 transition-colors hover:text-neutral-200 md:min-h-4 md:min-w-4"
+                              title="Cancel"
+                              aria-label="Cancel adding project"
+                            >
+                              <span className="text-xs">✕</span>
+                            </button>
+                          </>
+                        ) : (
+                          <span className="text-neutral-300 animate-pulse">saving…</span>
+                        )}
+                      </span>
+                    ) : (
+                      <button
+                        onClick={() => { setAddProjectSelection(''); setAddingProjectFor(runner.id); }}
+                        className="inline-flex min-h-[44px] items-center gap-1 rounded border border-dashed border-neutral-700 px-1.5 py-0.5 text-xs text-neutral-400 transition-colors hover:border-neutral-500 hover:text-neutral-200 md:min-h-0"
+                        title="Add a project this runner may serve"
+                        aria-label={`Add project to runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
+                      >
+                        + Add project
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
               {telemetryOpen && (
                 <RunnerTelemetryDetail
+                  enrollmentProjectId={runner.enrollment_project_id ?? projectId}
                   projectId={projectId}
                   runnerId={runner.id}
                   onNavigateToTask={onNavigateToTask}
@@ -1472,9 +1661,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
           token={pendingToken.token}
           mode={pendingToken.mode}
           preset={pendingToken.preset}
-          tokenExpiresAt={pendingToken.tokenExpiresAt}
           connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
-          connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
+          connectedHostname={pendingToken.mode === 'enroll' ? (enrolledRunner?.hostname ?? null) : null}
+          waitTimedOut={pendingToken.mode === 'enroll' ? enrollWaitTimedOut : false}
+          onKeepWaiting={() => setEnrollWaitTimedOut(false)}
+          rotateConnected={pendingToken.mode === 'rotate' ? rotateConnected : false}
+          rotateConnectedHostname={pendingToken.mode === 'rotate' ? (rotatedRunner?.hostname ?? null) : null}
+          rotateWaitTimedOut={pendingToken.mode === 'rotate' ? rotateWaitTimedOut : false}
+          onRotateKeepWaiting={() => setRotateWaitTimedOut(false)}
           onDismiss={() => setPendingToken(null)}
         />
       )}
@@ -1547,10 +1741,12 @@ function Sparkline({
  *  over the last hour) + compute-job rollups. Lazy-loaded when the row expands. */
 function RunnerTelemetryDetail({
   projectId,
+  enrollmentProjectId,
   runnerId,
   onNavigateToTask,
 }: {
   projectId: string;
+  enrollmentProjectId: string;
   runnerId: string;
   onNavigateToTask?: (taskId: string) => void;
 }) {
@@ -1582,7 +1778,7 @@ function RunnerTelemetryDetail({
     return () => {
       cancelled = true;
     };
-  }, [projectId, runnerId]);
+  }, [projectId, enrollmentProjectId, runnerId]);
 
   if (loading) {
     return (

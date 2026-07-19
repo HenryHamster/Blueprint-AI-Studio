@@ -122,11 +122,24 @@ ROLLBACK_FLOW_ALLOWLIST: frozenset[str] = frozenset({
     # not ORM-mapped attributes; scanner cannot distinguish list reads from
     # ORM lazy-load reads that would trigger a detached-instance error.
     "metrics_integrity_sweep.py::check_capability_proof_gate_gap",
+    # project.id at the logger.warning() after ShadowResidentOwnershipError rollback
+    # is the loaded PK UUID (always in-memory as the object's identity key, not
+    # a lazy-load attribute); cycle_id is a local Python UUID, not an ORM column;
+    # return False immediately follows so no further ORM access occurs.
+    "strategic_spawning.py::_spawn_design_doc_update",
+    # two rollback sites, both immediately followed by return:
+    # (1) L4587 rollback when state is None — return at L4588 prevents any further
+    #     ORM access; scanner sees L4599 state.runtime_config_json but that line is
+    #     unreachable after the rollback because of the interposed return.
+    # (2) L4605 rollback in the except block — return at L4612 follows immediately;
+    #     post-try code at L4624 (_runtime_config dict write) is only reached when
+    #     the commit succeeded (no rollback occurred on that path).
+    "metrics_integrity_sweep.py::check_capability_proof_gate_auto_graduation",
 })
 
 # Monotonic ceiling for the rollback-flow allowlist: can only shrink as entries
 # are fixed at the production code level. Bump when adding a new entry.
-ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 8
+ROLLBACK_FLOW_ALLOWLIST_CEILING: int = 10
 
 
 def rollback_flow_allowlist_within_ceiling() -> bool:

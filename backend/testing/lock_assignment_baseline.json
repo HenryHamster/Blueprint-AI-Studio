@@ -27,6 +27,7 @@
     "direction_lifecycle.py": 1,
     "routers/admin_projects.py": 1,
     "strategic_completion.py": 0,
+    "strategic_resident_legacy_projection.py": 1,
     "task_locking.py": 1
   },
   "vision": {
@@ -36,6 +37,7 @@
     "routers/admin_debug.py": 1,
     "routers/admin_projects.py": 1,
     "strategic_completion.py": 9,
+    "strategic_resident_legacy_projection.py": 1,
     "strategic_resident_session.py": 1,
     "task_completion.py": 2,
     "task_lifecycle.py": 1,
@@ -44,6 +46,7 @@
   "running_update": {
     "models.py": 1,
     "routers/admin_projects.py": 1,
-    "running_update_merge.py": 1
+    "running_update_merge.py": 1,
+    "strategic_resident_legacy_projection.py": 1
   }
 }

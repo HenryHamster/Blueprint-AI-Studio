@@ -5,7 +5,11 @@
  * utils/strategicSessionLive.ts.
  */
 import { useState, useEffect } from 'react';
-import type { StrategicActivityItem } from '../utils/strategicSessionLive';
+import type {
+  StrategicActivityItem,
+  StrategicTurnSegment,
+  ResidentActivityState,
+} from '../utils/strategicSessionLive';
 
 // Compact glyph per activity kind for the strip (monospace, muted).
 const STRATEGIC_ACTIVITY_GLYPH: Record<string, string> = {
@@ -18,8 +22,15 @@ const STRATEGIC_ACTIVITY_GLYPH: Record<string, string> = {
   action: '★',
 };
 
-/** Live "typing"/streaming preview bubble for the resident strategist's in-flight turn. */
-export function StrategicStreamingBubble({ text }: { text: string }) {
+/** Live "typing"/streaming preview bubble for the resident strategist's in-flight
+ *  turn. Reasoning (train-of-thought) is rendered in a muted, clearly-labelled
+ *  block set apart from the primary reply so the two are never confused. Text uses
+ *  `whitespace-pre-wrap break-words`: the fragment's own newlines survive and prose
+ *  wraps word-wise (never mid-word via `break-all`), while long unbroken tokens
+ *  still wrap inside the column. */
+export function StrategicStreamingBubble({ segments }: { segments: StrategicTurnSegment[] }) {
+  const reasoningText = segments.filter(s => s.kind === 'reasoning').map(s => s.text).join('\n').trim();
+  const replyText = segments.filter(s => s.kind === 'reply').map(s => s.text).join('\n').trim();
   return (
     <div
       data-testid="strategic-streaming-bubble"
@@ -34,25 +45,55 @@ export function StrategicStreamingBubble({ text }: { text: string }) {
             responding…
           </span>
         </div>
-        <div className="rounded-md border border-transparent bg-transparent px-0.5 py-0.5">
-          <div className="whitespace-pre-wrap break-all min-w-0 text-sm leading-relaxed text-neutral-100">{text}</div>
+        <div className="flex w-full min-w-0 flex-col gap-1.5 rounded-md border border-transparent bg-transparent px-0.5 py-0.5">
+          {reasoningText && (
+            <div
+              data-testid="strategic-streaming-reasoning"
+              className="min-w-0 rounded-md border-l-2 border-neutral-700 bg-neutral-900/40 px-2 py-1"
+            >
+              <div className="mb-0.5 text-ui-sm font-medium uppercase tracking-wide text-neutral-500">
+                Reasoning
+              </div>
+              <div className="whitespace-pre-wrap break-words min-w-0 text-sm italic leading-relaxed text-neutral-500">
+                {reasoningText}
+              </div>
+            </div>
+          )}
+          {replyText && (
+            <div
+              data-testid="strategic-streaming-reply"
+              className="whitespace-pre-wrap break-words min-w-0 text-sm leading-relaxed text-neutral-100"
+            >
+              {replyText}
+            </div>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-/** Ticking elapsed-seconds counter for an in-flight activity item. */
-function InFlightCounter({ startMs }: { startMs: number | undefined }) {
+/**
+ * Ticking elapsed-seconds counter for an in-flight activity item. When `endMs` is
+ * provided the counter FREEZES at `endMs - startMs` and no interval runs — this is
+ * what keeps a finished / dead command from ticking forever: the caller passes an
+ * end timestamp the moment the command completes or the session dies. While `endMs`
+ * is undefined it ticks live against the wall clock.
+ */
+function InFlightCounter({ startMs, endMs }: { startMs?: number; endMs?: number }) {
   // Capture origin once on first render; never re-initialized so the counter is monotonic.
   const [origin] = useState<number>(() => startMs ?? Date.now());
-  const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - origin) / 1000));
+  const [nowTick, setNowTick] = useState<number>(() => Date.now());
+  const frozen = endMs != null;
 
   useEffect(() => {
-    const id = setInterval(() => setElapsed(Math.floor((Date.now() - origin) / 1000)), 1000);
+    if (frozen) return; // frozen: never start an interval, so it can never tick forever.
+    const id = setInterval(() => setNowTick(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [origin]);
+  }, [frozen]);
 
+  const reference = frozen ? (endMs as number) : nowTick;
+  const elapsed = Math.max(0, Math.floor((reference - origin) / 1000));
   return <span className="shrink-0 text-neutral-500"> running… ({elapsed}s)</span>;
 }
 
@@ -104,6 +145,79 @@ export function StrategicActivityStrip({
             ))}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The PERSISTENT, truthful resident live-activity widget shown in the chat view
+ * whenever a resident session exists. This compact item is always present, links to
+ * the separate Activity inbox for details, and shows one of three
+ * visually-distinct, feed-driven states:
+ *   - `executing` — cyan pulse + a calm operation label + elapsed timer;
+ *   - `idle`      — neutral steady dot, "Waiting for direction", NO ticking timer;
+ *   - `dead`      — muted/red dot, "Session ended", timer frozen/hidden.
+ * The timer only ever runs in `executing`, so it can never tick for a finished or
+ * dead session.
+ */
+export function StrategicResidentActivityWidget({ state, onOpenActivity }: { state: ResidentActivityState; onOpenActivity?: () => void }) {
+  const base =
+    'group flex scroll-mt-24 justify-start rounded-md';
+  const inner =
+    'flex w-full min-w-0 max-w-[92%] flex-col items-start md:max-w-[76%]';
+
+  if (state.phase === 'executing') {
+    return (
+      <div data-testid="strategic-resident-activity" data-phase="executing" className={base}>
+        <div className={inner}>
+          <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-cyan-900/50 bg-neutral-950/60 px-2 py-1.5 text-ui-md text-neutral-300">
+            <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
+            <span className="shrink-0 font-medium text-cyan-300">{state.label}</span>
+            <span className="min-w-0 flex-1" />
+            <InFlightCounter startMs={state.startMs} />
+            {onOpenActivity && (
+              <button type="button" onClick={onOpenActivity} className="min-h-11 shrink-0 rounded px-2 text-neutral-400 hover:text-neutral-200">
+                Activity
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (state.phase === 'idle') {
+    return (
+      <div data-testid="strategic-resident-activity" data-phase="idle" className={base}>
+        <div className={inner}>
+          <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-400">
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500/70" aria-hidden="true" />
+            <span className="min-w-0 truncate font-medium text-neutral-400">{state.label}</span>
+            {onOpenActivity && (
+              <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
+                Activity
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // dead / not-running: explicit ended presentation, no ticking timer.
+  return (
+    <div data-testid="strategic-resident-activity" data-phase="dead" className={base}>
+      <div className={inner}>
+        <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-500">
+          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500/70" aria-hidden="true" />
+          <span className="min-w-0 truncate font-medium text-neutral-500">{state.label}</span>
+          {onOpenActivity && (
+            <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
+              Activity
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

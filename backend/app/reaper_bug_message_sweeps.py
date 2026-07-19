@@ -1176,20 +1176,24 @@ async def sweep_deliver_task_wakes(
         .scalars()
         .all()
     )
-    for task in stranded:
-        live = (
+    task_ids = [task.id for task in stranded]
+    live_task_ids: set = set()
+    if task_ids:
+        live_rows = (
             await session.execute(
-                select(TaskWakeRegistration.id)
+                select(TaskWakeRegistration.task_id)
                 .where(
-                    TaskWakeRegistration.task_id == task.id,
+                    TaskWakeRegistration.task_id.in_(task_ids),
                     TaskWakeRegistration.delivery_state.in_(
                         [WakeDeliveryState.PENDING, WakeDeliveryState.FIRED]
                     ),
                 )
-                .limit(1)
+                .distinct()
             )
-        ).first()
-        if live is not None:
+        ).scalars().all()
+        live_task_ids = set(live_rows)
+    for task in stranded:
+        if task.id in live_task_ids:
             continue
         touched = True
         stranded_count += 1
@@ -1253,6 +1257,285 @@ async def sweep_deliver_task_wakes(
     )
 
 
+# ── Step 18d: age-based decay for unowned OPEN BUG_REPORT / BLOCKER messages ─
+#
+# Steps 15, 17, and 18 resolve bug-class messages when an owning outcome lands
+# or when cited code is absent on HEAD.  None of those paths handles a
+# BUG_REPORT or BLOCKER that was never owned, never linked to a live outcome,
+# and whose cited code cannot be definitively grounded either way.  Such
+# messages currently stay OPEN forever — noise in the operator inbox that the
+# strategist must manually dismiss.
+#
+# This sweep adds a standalone age-based fallback: after STALE_OPEN_BUG_CLASS_DECAY_DAYS
+# (default 30) an unowned, unlinked, system/agent-authored BUG_REPORT or BLOCKER
+# is auto-decayed just like a stale conversational NOTE.  Operator-authored
+# messages ("user") are excluded — only machine-generated findings decay
+# automatically.  Messages still carrying a live ``_convergence_link`` are
+# skipped so the Step-15 convergence sweep owns the terminal transition.
+#
+# Conservative by construction: messages authored by operators stay open
+# indefinitely; the threshold is long enough (30 days, overridable via
+# ``runtime_config['stale_open_bug_class_decay_days']``) that genuinely
+# actionable findings are unlikely to have been missed; and the sweep only
+# acts on the OPEN state, so a linked or resolved message is never touched.
+
+# Default decay window for unowned OPEN BUG_REPORT / BLOCKER messages.
+STALE_OPEN_BUG_CLASS_DECAY_DAYS = 30
+
+
+async def sweep_decay_stale_open_bug_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 18d: age-out unowned OPEN BUG_REPORT/BLOCKER messages.
+
+    Selects up to ``batch_size`` OPEN, system/agent-authored BUG_REPORT or
+    BLOCKER messages with no live ``_convergence_link``, no creation-time
+    ownership context (``direction_id`` or ``pr_number`` + ``source_task_id``),
+    and ``created_at`` older than ``STALE_OPEN_BUG_CLASS_DECAY_DAYS``
+    (configurable via ``runtime_config['stale_open_bug_class_decay_days']``).
+    Resolves each with ``resolution='auto-decayed (stale)'``.
+
+    Disjoint in effect from Step 17 (only acts on messages that have no
+    owning context) and from Step 15 (the linked sweep owns messages with a
+    live ``_convergence_link``). Fail-safe per message, idempotent (resolution
+    moves status off 'open'), and broadcasts a ``message_updated`` envelope
+    per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import ProjectMessage
+    from app.message_convergence import (
+        BUG_CLASS_TYPES,
+        OPEN_STATUS,
+        SYSTEM_AUTHORED_FROM_TYPES,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get(
+            "stale_open_bug_class_decay_days", STALE_OPEN_BUG_CLASS_DECAY_DAYS
+        )
+    )
+    cutoff = now - timedelta(days=decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type.in_(list(SYSTEM_AUTHORED_FROM_TYPES)),
+                    ProjectMessage.message_type.in_(list(BUG_CLASS_TYPES)),
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-open-bug decay sweep hit cap=%d open bug-class "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Skip messages that still carry a live convergence link — the Step-15
+        # sweep owns their terminal transition.
+        if get_message_link(msg) is not None:
+            continue
+        # Skip messages that carry creation-time ownership context — Step 17
+        # owns their lifecycle (resolves on owner success, NOT on age). A
+        # message with a direction_id or a pr_number+source_task_id is
+        # intentionally kept open by Step 17 when its owner failed, is still
+        # in-flight, or cannot be confirmed landed; decaying it here would
+        # silently clear an actionable BLOCKER/BUG_REPORT.
+        ctx = msg.context if isinstance(msg.context, dict) else {}
+        if ctx.get("direction_id") or (
+            ctx.get("pr_number") and ctx.get("source_task_id")
+        ):
+            continue
+        mark_message_resolved(msg, now, "auto-decayed (stale)")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 18d: auto-decayed stale bug-class message %s "
+            "(no activity for >=%dd)",
+            msg.id,
+            decay_days,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 18d: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 18d: auto-decayed %d stale open bug-class message(s)",
+            resolved,
+        )
+    return resolved
+
+
+# ── Step 18e: age-based decay for unlinked OPEN BLOCKER messages (all authors) ─
+#
+# Step 18d decays system/agent-authored BUG_REPORT and BLOCKER messages that
+# have no owning context after 30 days.  Operator-authored ("user") BLOCKERs
+# are deliberately excluded from that sweep — an operator who files a BLOCKER
+# is not a machine-generated finding and should not be auto-decayed on the
+# short window.
+#
+# However, a user-authored BLOCKER with no convergence link, no direction_id,
+# and no pr_number+source_task_id is a dead thread: there is no automated
+# mechanism to resolve it, and it persists in the operator inbox forever.
+# This sweep closes that gap with a conservative 60-day threshold (default,
+# configurable via runtime_config['stale_open_unlinked_blocker_decay_days']).
+#
+# Disjoint from Step 18d (which only handles system/agent authors), from
+# Step 17 (which requires ownership context), and from Step 15 (which requires
+# a live _convergence_link in status == 'linked').  Like Step 18d, owned or
+# linked messages are skipped so the appropriate sweep owns the terminal
+# transition.
+
+# Default decay window for unlinked OPEN BLOCKER messages (all authors).
+STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS = 60
+
+
+async def sweep_decay_stale_unlinked_blocker_messages(
+    session,
+    now: datetime,
+    *,
+    batch_size: int = 200,
+) -> int:
+    """Step 18e: age-out unlinked OPEN BLOCKER messages (all authors).
+
+    Selects up to ``batch_size`` OPEN BLOCKER messages (any ``from_type``,
+    including "user") with no live ``_convergence_link``, no creation-time
+    ownership context (``direction_id`` or ``pr_number`` + ``source_task_id``),
+    and ``created_at`` older than ``STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS``
+    (configurable via ``runtime_config['stale_open_unlinked_blocker_decay_days']``).
+    Resolves each with ``resolution='auto-decayed (unlinked dead thread)'``.
+
+    This is the counterpart to Step 18d: where 18d restricts to system/agent
+    authors and a 30-day threshold, this sweep catches user-authored dead
+    threads at a longer (60-day) conservative threshold.
+
+    Disjoint from Step 17 (ownership context present) and Step 15 (linked
+    status). Fail-safe per message, idempotent (resolution moves status off
+    'open'), and broadcasts a ``message_updated`` envelope per resolved row.
+
+    Returns the number of messages auto-decayed.
+    """
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import MessageType, ProjectMessage
+    from app.message_convergence import (
+        OPEN_STATUS,
+        get_message_link,
+        mark_message_resolved,
+    )
+    from app.project_message_projection import message_updated_event_payload
+    from app.shared_state import runtime_config
+
+    decay_days = int(
+        runtime_config.get(
+            "stale_open_unlinked_blocker_decay_days",
+            STALE_OPEN_UNLINKED_BLOCKER_DECAY_DAYS,
+        )
+    )
+    cutoff = now - timedelta(days=decay_days)
+
+    msgs = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.message_type == MessageType.BLOCKER.value,
+                    ProjectMessage.created_at <= cutoff,
+                )
+                .order_by(ProjectMessage.created_at)
+                .limit(batch_size)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if len(msgs) >= batch_size:
+        logger.warning(
+            "[REAPER] stale-unlinked-blocker decay sweep hit cap=%d open BLOCKER "
+            "messages — result truncated; next cycle continues",
+            batch_size,
+        )
+    if not msgs:
+        return 0
+
+    resolved = 0
+    pending_broadcasts: list[tuple[str, dict]] = []
+    for msg in msgs:
+        # Skip messages that still carry a live convergence link — Step 15 owns them.
+        if get_message_link(msg) is not None:
+            continue
+        # Skip messages with creation-time ownership context — Step 17 owns them.
+        ctx = msg.context if isinstance(msg.context, dict) else {}
+        if ctx.get("direction_id") or (
+            ctx.get("pr_number") and ctx.get("source_task_id")
+        ):
+            continue
+        mark_message_resolved(msg, now, "auto-decayed (unlinked dead thread)")
+        session.add(msg)
+        resolved += 1
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
+        logger.info(
+            "[REAPER] Step 18e: auto-decayed unlinked BLOCKER %s "
+            "(no activity for >=%dd, from_type=%s)",
+            msg.id,
+            decay_days,
+            msg.from_type,
+        )
+
+    if resolved:
+        await session.commit()
+        for project_id, payload in pending_broadcasts:
+            try:
+                await _bcast(project_id, "message_updated", payload)
+            except Exception as _bcast_err:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Step 18e: broadcast failed for message %s: %s",
+                    payload.get("message_id"),
+                    _bcast_err,
+                )
+        logger.info(
+            "[REAPER] Step 18e: auto-decayed %d unlinked open BLOCKER message(s)",
+            resolved,
+        )
+    return resolved
+
+
 async def sweep_wake_delivery_stall_alerts(
     session,
     *,
@@ -1271,27 +1554,36 @@ async def sweep_wake_delivery_stall_alerts(
     create path (commits inside after the loop); the resolve path commits
     per-project inside :func:`alert_dispatch._resolve_wake_delivery_stall_alert`.
     """
-    from app.alert_dispatch import (
-        _WAKE_DELIVERY_STALL_ALERT_TITLE,
-        _maybe_create_wake_delivery_stall_alert,
-        _resolve_wake_delivery_stall_alert,
-    )
-    from app.models import Alert, TaskWakeRegistration, WakeDeliveryState
+    from app.alert_dispatch import _WAKE_DELIVERY_STALL_ALERT_TITLE
+    from app.broadcast import broadcast_to_project as _bcast
+    from app.models import Alert, AlertSeverity, TaskWakeRegistration, WakeDeliveryState
+    from app.time_utils import _utcnow
 
     if not delivery_stalled:
         # Delivery has recovered — dismiss open stall alerts fleet-wide.
-        result = await session.execute(
-            select(Alert.project_id)
-            .distinct()
-            .where(
-                Alert.dismissed_at.is_(None),
-                Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+        # Batch-load all open stall alerts in a single query instead of N per-project SELECTs.
+        open_alerts = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+                )
             )
-        )
-        project_ids = result.scalars().all()
+        ).scalars().all()
         dismissed = 0
-        for pid in project_ids:
-            dismissed += await _resolve_wake_delivery_stall_alert(session, pid)
+        if open_alerts:
+            now = _utcnow()
+            for alert in open_alerts:
+                alert.dismissed_at = now
+                session.add(alert)
+            await session.commit()
+            for alert in open_alerts:
+                await _bcast(
+                    str(alert.project_id),
+                    "alert_dismissed",
+                    {"alert_id": str(alert.id), "title": alert.title},
+                )
+            dismissed = len(open_alerts)
         if dismissed:
             logger.info(
                 "[REAPER] resolved wake-delivery-stall alert on %d project(s)",
@@ -1306,13 +1598,53 @@ async def sweep_wake_delivery_stall_alerts(
         .where(TaskWakeRegistration.delivery_state == WakeDeliveryState.FIRED)
     )
     project_ids = result.scalars().all()
-    created = 0
+    if not project_ids:
+        return 0
+
+    # Batch-check which project_ids already have an open stall alert.
+    existing_pids = set(
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _WAKE_DELIVERY_STALL_ALERT_TITLE,
+                )
+            )
+        ).scalars().all()
+    )
+    title = _WAKE_DELIVERY_STALL_ALERT_TITLE
+    msg = (
+        f"The wake-delivery sweep has made no progress against the FIRED "
+        f"registration backlog for {stall_cycles} consecutive reaper cycles. "
+        f"Parked tasks whose wake sources have fired are not being advanced — "
+        f"check for a wedged or crashed delivery path."
+    )[:1000]
+    new_alerts = []
     for pid in project_ids:
-        created += await _maybe_create_wake_delivery_stall_alert(
-            session, pid, stall_cycles=stall_cycles
+        if pid in existing_pids:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=AlertSeverity.WARNING,
+            title=title,
+            message=msg,
         )
+        session.add(alert)
+        new_alerts.append(alert)
+    created = len(new_alerts)
     if created:
         await session.commit()
+        for alert in new_alerts:
+            await _bcast(
+                str(alert.project_id),
+                "alert_created",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": AlertSeverity.WARNING.value,
+                    "title": alert.title,
+                },
+            )
         logger.info(
             "[REAPER] raised wake-delivery-stall alert on %d project(s)",
             created,

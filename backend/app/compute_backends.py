@@ -17,6 +17,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import contextlib
+import hashlib
+import hmac
 import io
 import json
 import logging
@@ -29,19 +32,64 @@ import signal
 import subprocess
 import tarfile
 import tempfile
+import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Protocol, Sequence
+from typing import Any, Callable, Dict, Protocol, Sequence
 
 from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
 from app.compute_experiment_contract import ENV_KEY_RE
-from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
+from app.failure_classification import NO_PROGRESS_TIMEOUT_TERMINAL_REASON
+from app.models import (
+    ComputeImageBuildStatus,
+    ComputeJob,
+    ComputeJobStatus,
+    Project,
+    ProjectComputeImage,
+    ProjectComputeImageBuild,
+)
 from app.vm_lifecycle import _ensure_vm_deleted
+
+# Domain-separation prefix for the compute-job heartbeat secret (see
+# ``compute_job_heartbeat_secret``). Versioned so the derivation can be rotated
+# without colliding with any other HMAC use of ``AGENT_JWT_SECRET``.
+_COMPUTE_JOB_HB_SECRET_PREFIX = b"compute-job-heartbeat:v1:"
+
+
+def compute_job_heartbeat_secret(job_id: object) -> str:
+    """Derive the per-job bearer secret the compute VM sends on its heartbeat.
+
+    The compute-job VM heartbeat endpoint used to authenticate with the bare job
+    UUID as its bearer token. But the job UUID is a *resource identifier* — it
+    appears in URL paths, agent poll responses, and serial-console/log output — so
+    anyone who merely observes it could POST heartbeats and mutate watchdog-relevant
+    state (feed the no-progress watchdog fake progress samples, or transition a
+    stuck STARTING job to RUNNING to suppress the provisioning-deadline timeout).
+
+    This returns a per-job secret that is NOT the UUID: an HMAC-SHA256 of the job
+    id keyed by the orchestrator's ``AGENT_JWT_SECRET`` (the same signing secret
+    the agent-JWT machinery already uses — no new key material to manage). The
+    secret is derivable ONLY by the orchestrator; it is embedded into the VM's
+    startup script (delivered as encrypted instance metadata) and never returned
+    by any API, so knowing the job UUID does not let a caller compute it. The VM
+    sends it as its heartbeat bearer; the endpoint recomputes and constant-time
+    compares. See ``app.routers.agent_compute_jobs.compute_job_vm_heartbeat``.
+    """
+    secret = os.getenv("AGENT_JWT_SECRET")
+    if not secret:
+        # AGENT_JWT_SECRET is validated at auth-module import; if it is somehow
+        # absent we must fail loudly rather than fall back to a guessable token.
+        raise RuntimeError(
+            "AGENT_JWT_SECRET is required to derive the compute-job heartbeat secret"
+        )
+    message = _COMPUTE_JOB_HB_SECRET_PREFIX + str(job_id).encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
 
 # Scripts baked into the GCP compute-job startup script as base64 blobs.
 # Loaded at module import time so a missing file fails fast at startup, not
@@ -62,8 +110,54 @@ _ARTIFACT_DOWNLOAD_B64 = base64.b64encode(
 _HEARTBEAT_BODY_B64 = base64.b64encode(
     (_COMPUTE_SCRIPTS_DIR / "heartbeat_body.py").read_bytes()
 ).decode("ascii")
+_VIEWABLE_WATCH_B64 = base64.b64encode(
+    (_COMPUTE_SCRIPTS_DIR / "viewable_watch.py").read_bytes()
+).decode("ascii")
+
+# The image builder embeds the ORCHESTRATOR'S OWN copy of the trusted, stdlib-only
+# build tool — ``compute_image_build.py``, the exact module the standalone
+# ``scripts/build_compute_image.py`` CLI loads and the one imported below as
+# ``compute_image_build`` — base64-encoded and run verbatim on the builder VM.
+# The untrusted project repo can therefore NEVER substitute its own credential
+# scanner or drop the ``--network=none`` confinement, both of which live INSIDE
+# this tool (which carries its own ``if __name__ == "__main__"`` entrypoint). It
+# is a sibling of this module (backend/app/), so the path resolves in any deploy
+# layout — unlike the repo-root ``scripts/`` dir, which is NOT copied into the
+# backend image. Loaded at import time so a missing file fails fast at startup,
+# not during live provisioning. See CLAUDE.md's base64-blob cross-language rule.
+_BUILD_TOOL_B64 = base64.b64encode(
+    (Path(__file__).parent / "compute_image_build.py").read_bytes()
+).decode("ascii")
 
 logger = logging.getLogger(__name__)
+
+_RESUME_STALE_ARTIFACT_FILENAMES = (
+    "result.json",
+    "command.log.json",
+    "terminal.json",
+    "live_tail.b64",
+)
+
+# Python one-liner for safe tar extraction on GCP resume VMs.  The literal
+# strings 'tarfile.open' and 'm.isreg() or m.isdir()' are asserted by the
+# test suite so they must appear verbatim in this constant.
+_RESUME_EXTRACTOR_PY = (
+    "import tarfile,os,sys;"
+    "b,d=sys.argv[1],sys.argv[2];"
+    'STALE={"result.json","command.log.json","terminal.json","live_tail.b64"};'
+    "os.makedirs(d,exist_ok=True);"
+    'tf=tarfile.open(b,"r:gz");'
+    "ms=tf.getmembers();"
+    "safe=[m for m in ms if not m.issym() and not m.islnk()"
+    ' and (m.isreg() or m.isdir())'
+    ' and ".." not in m.name.split("/")'
+    ' and not m.name.startswith("/")'
+    ' and not(m.isreg() and m.name.split("/")[-1] in STALE)];'
+    "[tf.extract(m,d) for m in safe];"
+    "fc=sum(1 for m in safe if m.isreg());"
+    "tf.close();"
+    "sys.exit(0 if fc>0 else 1)"
+)
 
 
 def _load_result_json(result_path: str) -> Any:
@@ -92,60 +186,144 @@ def _is_safe_tar_member(name: str) -> bool:
     return ".." not in parts
 
 
-def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
-    """Extract a ``.tar.gz`` artifact bundle into ``dest_dir``, path-traversal-safe.
+def _extract_safe_members(tar: tarfile.TarFile, dest_dir: str) -> int:
+    """Extract every path-traversal-safe regular member of an OPEN archive.
 
-    Members with absolute paths or ``..`` traversal are SKIPPED (never extracted),
-    so a malicious or corrupt predecessor bundle can only ever write inside
+    Shared core of the bytes- and path-based extractors below. Members with
+    absolute paths or ``..`` traversal are SKIPPED (never extracted), so a
+    malicious or corrupt predecessor bundle can only ever write inside
     ``dest_dir``. Symlink / hardlink members are skipped as well — their targets
     could point outside the destination even when the member name itself is safe.
-    Returns the count of members actually extracted.
+    Stale predecessor run-status files (result.json, terminal.json, etc.) are
+    also skipped so they cannot contaminate the new job's terminal detection.
+    Returns the count of non-stale regular files actually extracted (directories
+    are extracted but not counted, so an archive of only directories or stale
+    files returns 0 — fail-closed).
+    """
+    os.makedirs(dest_dir, exist_ok=True)
+    extracted = 0
+    for member in tar.getmembers():
+        if member.islnk() or member.issym():
+            continue
+        if not _is_safe_tar_member(member.name):
+            logger.warning(
+                "Skipping unsafe artifact-bundle member %r during rehydration",
+                member.name,
+            )
+            continue
+        # Stale run-status files from the predecessor must not contaminate this job.
+        if member.isreg() and os.path.basename(member.name) in _RESUME_STALE_ARTIFACT_FILENAMES:
+            continue
+        tar.extract(member, path=dest_dir, filter="data")
+        # Count only regular files — directories are structural scaffolding only.
+        if member.isreg():
+            extracted += 1
+    return extracted
+
+
+def _safe_extract_artifact_bundle(bundle: bytes, dest_dir: str) -> int:
+    """Extract an IN-MEMORY ``.tar.gz`` artifact bundle into ``dest_dir``.
+
+    Path-traversal-safe (see :func:`_extract_safe_members`). Prefer
+    :func:`_safe_extract_artifact_bundle_path` for a durable results bundle whose
+    size is unbounded — this variant materializes the whole archive as ``bytes``
+    and is an OOM risk on a multi-GB checkpoint bundle.
 
     Raises ``tarfile.TarError`` (or ``OSError``) on an unreadable/corrupt archive
     so the caller can fail the job with a clear reason rather than proceeding
     against a half-populated workspace.
     """
-    os.makedirs(dest_dir, exist_ok=True)
-    extracted = 0
     with tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz") as tar:
-        for member in tar.getmembers():
-            if member.islnk() or member.issym():
-                continue
-            if not _is_safe_tar_member(member.name):
-                logger.warning(
-                    "Skipping unsafe artifact-bundle member %r during rehydration",
-                    member.name,
-                )
-                continue
-            tar.extract(member, path=dest_dir)
-            extracted += 1
-    return extracted
+        return _extract_safe_members(tar, dest_dir)
+
+
+def _safe_extract_artifact_bundle_path(path: str, dest_dir: str) -> int:
+    """Extract an ON-DISK ``.tar.gz`` artifact bundle into ``dest_dir``.
+
+    The memory-bounded counterpart of :func:`_safe_extract_artifact_bundle`: the
+    archive is read from *path* (a seekable file) and each member is streamed to
+    disk by ``tarfile``, so peak memory is a tar block — NOT the bundle size. This
+    is what a multi-GB RL checkpoint bundle must go through so rehydration cannot
+    OOM the leader. Same path-traversal / symlink safety and return contract, and
+    raises the same ``tarfile.TarError`` / ``OSError`` on a corrupt archive.
+    """
+    with tarfile.open(path, mode="r:gz") as tar:
+        return _extract_safe_members(tar, dest_dir)
+
 
 
 async def _rehydrate_input_artifact_bundle(
     input_artifact_job_id: str, dest_dir: str
 ) -> int:
-    """Fetch a predecessor's durable bundle and extract it into ``dest_dir``.
+    """Fetch a predecessor bundle and transactionally publish it to ``dest_dir``.
+
+    The bundle is STREAMED to a temp file on disk (never materialized whole in
+    the orchestrator heap) and extracted from there, so peak memory during a
+    cross-job checkpoint resume is bounded by the download chunk size, not by the
+    bundle size — a multi-GB RL checkpoint bundle cannot OOM the leader. This
+    mirrors the viewable pass's streaming seam
+    (:func:`_download_artifact_bundle_to_path`); the whole-object
+    ``storage.download_compute_job_artifact_bundle`` stays reserved for the tiny
+    ``terminal.json`` recovery read.
 
     Raises ``RuntimeError`` when the predecessor bundle is missing or unreadable
     so the job fails LOUDLY with a clear reason instead of silently running
     against an empty workspace. Returns the number of files rehydrated.
     """
-    bundle = await storage.download_compute_job_artifact_bundle(input_artifact_job_id)
-    if bundle is None:
-        raise RuntimeError(
-            "input_artifact_rehydration_failed: predecessor compute job "
-            f"{input_artifact_job_id} has no durable artifact bundle to resume from"
-        )
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-resume-", suffix=".tar.gz")
+    os.close(handle)
+    staging_dir = os.path.join(
+        os.path.dirname(dest_dir),
+        f".bp-resume-stage-{os.path.basename(dest_dir)}",
+    )
+    await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+    await asyncio.to_thread(lambda: os.makedirs(staging_dir, exist_ok=True))
     try:
-        return await asyncio.to_thread(
-            _safe_extract_artifact_bundle, bundle, dest_dir
-        )
-    except (tarfile.TarError, OSError) as exc:
-        raise RuntimeError(
-            "input_artifact_rehydration_failed: predecessor bundle for "
-            f"{input_artifact_job_id} could not be extracted: {exc}"
-        ) from exc
+        try:
+            downloaded = await asyncio.to_thread(
+                _download_artifact_bundle_to_path, input_artifact_job_id, tmp_path
+            )
+        except Exception as exc:  # surface as a loud, typed failure (re-raised)
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} could not be downloaded: {exc}"
+            ) from exc
+        if not downloaded:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor compute job "
+                f"{input_artifact_job_id} has no durable artifact bundle to resume from"
+            )
+        try:
+            file_count = await asyncio.to_thread(
+                _safe_extract_artifact_bundle_path, tmp_path, staging_dir
+            )
+        except (tarfile.TarError, OSError) as exc:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} could not be extracted: {exc}"
+            ) from exc
+        if file_count <= 0:
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: predecessor bundle for "
+                f"{input_artifact_job_id} contains no resumable files"
+            )
+        try:
+            await asyncio.to_thread(shutil.rmtree, dest_dir, True)
+            await asyncio.to_thread(os.replace, staging_dir, dest_dir)
+        except OSError as exc:
+            await asyncio.to_thread(shutil.rmtree, dest_dir, True)
+            raise RuntimeError(
+                "input_artifact_rehydration_failed: extracted checkpoint could not "
+                f"be published: {exc}"
+            ) from exc
+        return file_count
+    finally:
+        try:
+            await asyncio.to_thread(os.unlink, tmp_path)
+        except OSError:
+            pass
+        if await asyncio.to_thread(os.path.exists, staging_dir):
+            await asyncio.to_thread(shutil.rmtree, staging_dir, True)
 
 _SERIAL_STATUS_PREFIX = "BLUEPRINT_COMPUTE_STATUS="
 _SERIAL_EXIT_PREFIX = "BLUEPRINT_COMPUTE_EXIT_CODE="
@@ -159,7 +337,22 @@ _SERIAL_COMMAND_LOG_PREFIX = "BLUEPRINT_COMPUTE_COMMAND_LOG="
 # Single-line, base64-encoded marker carrying the echoed release SHA so the
 # completion handler can verify the runtime was bound to the promoted release.
 _SERIAL_RELEASE_ECHO_PREFIX = "BLUEPRINT_COMPUTE_RELEASE_ECHO="
-
+# Single-line, base64-encoded marker carrying the cross-job checkpoint resume
+# provenance from the startup script (ok, file_count, reason). Emitted on both
+# the success and the fail-closed branches of the resume block so the operator
+# can always tell whether a resumed job continued from its predecessor's
+# checkpoint or restarted from zero — the waste the direction exists to prevent.
+_SERIAL_RESUME_PREFIX = "BLUEPRINT_COMPUTE_RESUME="
+# Pre-computed base64-encoded resume-provenance payload for the fail-closed
+# branch of the startup-script resume block (hydration never started). Used in
+# ``_build_gcp_startup_script`` where the static string avoids on-VM base64
+# encoding overhead for a known-at-generation-time value.
+_SERIAL_RESUME_FAILED_B64: str = base64.b64encode(
+    json.dumps(
+        {"ok": False, "file_count": 0, "reason": "resume_hydration_failed"},
+        separators=(",", ":"),
+    ).encode()
+).decode()
 # Well-known env var pointing the launched command at a result file it may write
 # (a small flat JSON object of metric-name -> number). Absence = no metrics.
 RESULT_FILE_ENV = "BLUEPRINT_RESULT_FILE"
@@ -178,6 +371,16 @@ ARTIFACT_DIR_ENV = "BLUEPRINT_ARTIFACT_DIR"
 # within that window, the job is killed early with terminal reason
 # ``no_progress_timeout`` and exit code 125.
 PROGRESS_FILE_ENV = "BLUEPRINT_PROGRESS_FILE"
+# Reserved exit code the no-progress watchdog writes when it kills a stalled job.
+# This value is a CONTRACT with three distinct producers — the local-subprocess
+# wrapper (``_build_local_wrapper_command`` below), the GCP startup script, and
+# the self-hosted runner (``scripts/local_runner.py``) — and one consumer,
+# ``RunnerSubprocessBackend.poll_status``, which maps it to terminal reason
+# ``no_progress_timeout`` (→ ``NO_PROGRESS_TIMEOUT``). Naming the value so the
+# emitter and the detector share a single source of truth: were the two literals
+# to silently drift, the platform kill would collapse to ``CODE_ERROR`` — burning
+# retry budget and misattributing blame to the operator's command.
+NO_PROGRESS_WATCHDOG_EXIT_CODE = 125
 # Designated result-file path the command writes; read back after it finishes.
 _GCP_RESULT_FILE_PATH = "/tmp/blueprint_compute_result.json"
 # On-VM artifact directory the GCP startup script provisions and uploads.
@@ -197,8 +400,41 @@ _MAX_TERMINAL_RECORD_DECODED_BYTES = 131072
 # Caps for the individually-persisted viewable-artifact substrate: per-file byte
 # ceiling and total object-count ceiling so a pathological run can't upload
 # unbounded per-file objects. Files over the size cap stay inside the bundle.
-_MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file
+_MAX_VIEWABLE_FILE_BYTES = 8 * 1024 * 1024  # 8 MiB per viewable file (in-memory)
 _MAX_VIEWABLE_FILE_COUNT = 25  # at most N individually-addressable objects/job
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    """Read a positive-int env override, falling back to ``default`` on absent/garbled."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except (ValueError, AttributeError):
+        return default
+    return value if value > 0 else default
+
+
+# Videos (rollout/training footage — the artifact type the RL-witness direction
+# names) routinely exceed the 8 MiB in-memory ceiling. They are STREAMED member
+# by member to storage instead of buffered, so they get a much larger ceiling
+# without ever entering the orchestrator's heap. Kept well under Postgres int4
+# (~2.1 GiB) so ``file_size_bytes`` cannot overflow. Env-overridable.
+_MAX_VIEWABLE_VIDEO_BYTES = _positive_int_env(
+    "BLUEPRINT_MAX_VIEWABLE_VIDEO_BYTES", 512 * 1024 * 1024
+)  # 512 MiB per streamed video
+
+
+def _viewable_size_cap_for_kind(kind: str) -> int:
+    """Per-file byte ceiling for a viewable candidate, by media kind.
+
+    Videos are streamed (never buffered whole) so they get the larger
+    ``_MAX_VIEWABLE_VIDEO_BYTES`` ceiling; images stay at the in-memory
+    ``_MAX_VIEWABLE_FILE_BYTES`` cap. Reads the module globals dynamically so a
+    test can monkeypatch either ceiling.
+    """
+    return _MAX_VIEWABLE_VIDEO_BYTES if kind == "video" else _MAX_VIEWABLE_FILE_BYTES
 # Transfer chunk for STREAMING a durable artifact bundle to disk. A results
 # bundle has no size bound (checkpoints, videos, logs), so it is never pulled
 # into the orchestrator's heap: peak memory during the viewable pass is bounded
@@ -217,6 +453,12 @@ _MAX_RESULT_METRICS_DECODED_BYTES = 8192
 # rather than allowed to balloon the durable result or wedge teardown.
 _MAX_COMMAND_LOG_BYTES = 32768
 _MAX_COMMAND_LOG_DECODED_BYTES = 65536
+
+# How often the reaper's progress heartbeat fires during a compute-image build,
+# so the lifecycle watchdog (REAPER_HANG_SECONDS=300) does not cancel the reaper
+# while a multi-minute baked-image build is in progress. 60s is well under the
+# 300s stall threshold, giving 4 missed beats before the watchdog acts.
+_HEARTBEAT_INTERVAL = 60
 
 class ComputeLaunchSpecError(ValueError):
     """A launch spec is malformed in a way no retry can fix.
@@ -359,6 +601,7 @@ _LOCAL_STATE_ROOT = os.path.join(tempfile.gettempdir(), "blueprint-compute-jobs"
 _LOCAL_PID_FILENAME = "pid"
 _LOCAL_STARTED_AT_FILENAME = "started_at"
 _LOCAL_TERMINAL_FILENAME = "terminal"
+_LOCAL_RESUME_PROVENANCE_FILENAME = "resume_provenance.b64"
 
 
 @dataclass(slots=True)
@@ -644,6 +887,10 @@ class ComputeStatusResult:
     # Live output tail written by the runner during execution. Only populated for
     # RUNNING local jobs that have flushed a live_tail.b64 to the artifact dir.
     live_output: dict[str, Any] | None = None
+    # Resume provenance from cross-job checkpoint hydration, decoded from the
+    # ``_SERIAL_RESUME_PREFIX`` serial marker (GCP backend) or stamped at launch
+    # time (local backend). ``None`` means no resume was attempted.
+    resume_provenance: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -708,6 +955,14 @@ class LocalSubprocessComputeBackend:
     async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
         external_id = spec.external_id or f"local-{spec.job_id}"
         artifact_meta = _local_artifact_metadata(external_id)
+        durable_resume_provenance = await asyncio.to_thread(
+            _read_local_resume_provenance_for_external_id,
+            external_id,
+            spec.input_artifact_job_id,
+        )
+        adoption_meta: dict[str, Any] = dict(artifact_meta)
+        if durable_resume_provenance is not None:
+            adoption_meta["resume_provenance"] = durable_resume_provenance
         existing = self._processes.get(external_id)
         if existing is not None and existing.proc.poll() is None:
             # Idempotent re-launch: the reserved id is already running.
@@ -716,7 +971,7 @@ class LocalSubprocessComputeBackend:
                 started_at=existing.started_at,
                 cost_rate_per_second=0.0,
                 message=f"local subprocess already running pid={existing.proc.pid}",
-                metadata=dict(artifact_meta),
+                metadata=dict(adoption_meta),
             )
         persisted_pid = await asyncio.to_thread(
             _local_subprocess_pid_for_external_id, external_id
@@ -732,12 +987,12 @@ class LocalSubprocessComputeBackend:
                 or _utcnow(),
                 cost_rate_per_second=0.0,
                 message=f"adopted existing local subprocess pid={persisted_pid}",
-                metadata={"pid": persisted_pid, **artifact_meta},
+                metadata={"pid": persisted_pid, **adoption_meta},
             )
         if await asyncio.to_thread(
             _read_local_terminal_status_for_external_id, external_id
         ) is not None:
-            metadata: dict[str, Any] = dict(artifact_meta)
+            metadata: dict[str, Any] = dict(adoption_meta)
             if persisted_pid is not None:
                 metadata["pid"] = persisted_pid
             return ComputeLaunchResult(
@@ -765,10 +1020,29 @@ class LocalSubprocessComputeBackend:
         # wrapper's later `mkdir -p` is idempotent and never removes these files.
         # A missing/unreadable bundle raises (fails the job LOUDLY) rather than
         # letting the command run against an empty workspace.
+        # Stamp resume provenance into launch metadata so it flows through
+        # polling_metadata and reaches the operator/agent surface via
+        # serialize_compute_job_response.
+        resume_provenance: dict[str, Any] | None = None
         if spec.input_artifact_job_id is not None:
-            await _rehydrate_input_artifact_bundle(
-                spec.input_artifact_job_id,
+            file_count = await _rehydrate_input_artifact_bundle(
+                str(spec.input_artifact_job_id),
                 _local_artifact_dir_for_external_id(external_id),
+            )
+            resume_provenance = {
+                "ok": True,
+                "file_count": file_count,
+                "recorded_at": _utcnow().isoformat(),
+                "resumed_from_job_id": str(spec.input_artifact_job_id),
+            }
+            # Persist proof before spawning the subprocess. If the launch result
+            # cannot be applied to the DB (or the leader restarts), every
+            # idempotent adoption and poll path can recover the same source-matched
+            # proof without rehydrating or launching a duplicate command.
+            await asyncio.to_thread(
+                _write_local_resume_provenance_for_external_id,
+                external_id,
+                resume_provenance,
             )
         env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
         env.update(spec.env or {})
@@ -795,15 +1069,23 @@ class LocalSubprocessComputeBackend:
         self._processes[external_id] = _LocalProcessHandle(
             proc=proc, started_at=started_at
         )
+        launch_metadata: dict[str, Any] = {"pid": proc.pid, **artifact_meta}
+        if resume_provenance:
+            launch_metadata["resume_provenance"] = resume_provenance
         return ComputeLaunchResult(
             external_id=external_id,
             started_at=started_at,
             cost_rate_per_second=0.0,
             message=f"spawned local subprocess pid={proc.pid}",
-            metadata={"pid": proc.pid, **artifact_meta},
+            metadata=launch_metadata,
         )
 
     async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        resume_provenance = await asyncio.to_thread(
+            _read_local_resume_provenance_for_external_id,
+            job.external_compute_id,
+            (job.polling_metadata or {}).get("input_artifact_job_id"),
+        )
         handle = self._processes.get(job.external_compute_id or "")
         if handle is None:
             # Offload sync file I/O to a thread-pool thread
@@ -821,7 +1103,8 @@ class LocalSubprocessComputeBackend:
                 live_output = await asyncio.to_thread(_read_local_live_tail, job)
                 return ComputeStatusResult(
                     status=ComputeJobStatus.RUNNING,
-                    live_output=live_output
+                    live_output=live_output,
+                    resume_provenance=resume_provenance,
                 )
             terminal = await asyncio.to_thread(_read_local_terminal_status, job)
             if terminal is not None:
@@ -836,7 +1119,8 @@ class LocalSubprocessComputeBackend:
             live_output = await asyncio.to_thread(_read_local_live_tail, job)
             return ComputeStatusResult(
                 status=ComputeJobStatus.RUNNING,
-                live_output=live_output
+                live_output=live_output,
+                resume_provenance=resume_provenance,
             )
         self._processes.pop(job.external_compute_id or "", None)
         terminal = await asyncio.to_thread(_read_local_terminal_status, job)
@@ -901,7 +1185,16 @@ class GcpComputeBackend:
                 started_at=started_at or _utcnow(),
                 cost_rate_per_second=0.0,
                 message="adopted existing compute-job VM",
-                metadata={"zone": existing_zone, "artifact_uri": artifact_uri},
+                # The adopted VM was provisioned by this backend, so its startup
+                # script embeds the HMAC heartbeat token just like the normal
+                # path below. Stamp the marker so legacy UUID-bearer heartbeats
+                # are rejected for the crash-recovered job too — otherwise anyone
+                # knowing the job UUID could spoof its heartbeats.
+                metadata={
+                    "zone": existing_zone,
+                    "artifact_uri": artifact_uri,
+                    "heartbeat_auth": "hmac",
+                },
             )
         runtime_budget_seconds = spec.runtime_deadline_seconds
         if runtime_budget_seconds is not None:
@@ -944,7 +1237,12 @@ class GcpComputeBackend:
         if not ok:
             raise RuntimeError("GCP compute-job VM provisioning failed")
         zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
-        metadata: Dict[str, Any] = {"artifact_uri": artifact_uri}
+        metadata: Dict[str, Any] = {
+            "artifact_uri": artifact_uri,
+            # Durable per-job marker: this VM's startup script embeds the HMAC
+            # heartbeat token, so legacy UUID-bearer heartbeats must be rejected.
+            "heartbeat_auth": "hmac",
+        }
         if spec.provisioning_deadline_at is not None:
             metadata["provisioning_deadline_at"] = (
                 spec.provisioning_deadline_at.isoformat()
@@ -1128,14 +1426,19 @@ class RunnerSubprocessBackend:
                     ).replace(tzinfo=None)
                 except (ValueError, AttributeError):
                     pass
+            no_progress_timeout = exit_code == NO_PROGRESS_WATCHDOG_EXIT_CODE
             cjs = (
                 ComputeJobStatus.SUCCEEDED
                 if runner_exec_status == "succeeded"
-                else ComputeJobStatus.FAILED
+                else (
+                    ComputeJobStatus.TIMED_OUT
+                    if no_progress_timeout
+                    else ComputeJobStatus.FAILED
+                )
             )
             if cjs == ComputeJobStatus.SUCCEEDED:
                 message = "compute job succeeded"
-            elif exit_code == 125:
+            elif no_progress_timeout:
                 # No-progress watchdog kill on the runner. The runner /report
                 # endpoint carries only exec_status/exit_code (no reason field),
                 # so translate the reserved exit code here into a terminal reason
@@ -1143,7 +1446,7 @@ class RunnerSubprocessBackend:
                 # kill collapses to CODE_ERROR (burns retry budget, misattributes
                 # blame) instead of NO_PROGRESS_TIMEOUT — matching the GCP/local
                 # -subprocess paths which emit REASON=no_progress_timeout directly.
-                message = "no_progress_timeout"
+                message = NO_PROGRESS_TIMEOUT_TERMINAL_REASON
             else:
                 message = "compute job failed"
             return ComputeStatusResult(
@@ -1285,11 +1588,15 @@ def _local_subprocess_started_at_for_external_id(
 
 
 def _read_local_terminal_status(job: ComputeJob) -> ComputeStatusResult | None:
-    return _read_local_terminal_status_for_external_id(job.external_compute_id)
+    return _read_local_terminal_status_for_external_id(
+        job.external_compute_id,
+        (job.polling_metadata or {}).get("input_artifact_job_id"),
+    )
 
 
 def _read_local_terminal_status_for_external_id(
     external_id: str | None,
+    expected_source_job_id: object | None = None,
 ) -> ComputeStatusResult | None:
     raw = _read_local_state_text(_local_terminal_path_for_external_id(external_id))
     if raw is None:
@@ -1322,6 +1629,9 @@ def _read_local_terminal_status_for_external_id(
     metrics = _decode_result_metrics(data.get("METRICS"))
     command_log = _decode_command_log(data.get("COMMAND_LOG"))
     echoed_release_sha = _decode_release_echo_sha(data.get("RELEASE_ECHO"))
+    resume_provenance = _read_local_resume_provenance_for_external_id(
+        external_id, expected_source_job_id
+    )
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -1331,6 +1641,7 @@ def _read_local_terminal_status_for_external_id(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     if exit_code is None:
         return ComputeStatusResult(
@@ -1340,6 +1651,7 @@ def _read_local_terminal_status_for_external_id(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -1349,6 +1661,7 @@ def _read_local_terminal_status_for_external_id(
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
@@ -1361,8 +1674,9 @@ def _build_container_run_prefix(
     extra_env: dict[str, str] | None = None,
     extra_mounts: list[tuple[str, str]] | None = None,
     workdir: str | None = None,
+    name: str | None = None,
 ) -> str:
-    """Return a shell prefix: ``docker run --rm [--gpus all] -v … -e … IMAGE``.
+    """Return a shell prefix: ``docker run --rm [--name N] [--gpus all] -v … -e … IMAGE``.
 
     The caller appends ``bash -lc <quoted-command>`` after this prefix.
     ``host_out_dir`` must exist on the host before docker run is called;
@@ -1370,11 +1684,17 @@ def _build_container_run_prefix(
     result.json and artifacts land at the same host paths the terminal-status
     reader already uses. ``extra_mounts`` adds further ``host:container`` bind
     mounts (e.g. the cloned repo) and ``workdir`` sets the in-container cwd.
+    ``name`` sets a deterministic ``--name`` so an out-of-band killer (the
+    no-progress watchdog) can ``docker kill`` the container: a containerized
+    trainer is parented by dockerd, NOT a member of the wrapper's process group,
+    so a group signal never reaches it — reaching it needs the container id/name.
     """
     result_file = f"{container_out_dir}/result.json"
     artifact_dir = f"{container_out_dir}/artifacts"
     progress_file = f"{container_out_dir}/progress.json"
     parts = ["docker", "run", "--rm"]
+    if name:
+        parts += ["--name", shlex.quote(name)]
     if gpus:
         parts += ["--gpus", "all"]
     parts += [
@@ -1428,7 +1748,12 @@ def _build_local_wrapper_command(
     # reason (container_image_pull_failed) instead of falling through as a
     # generic command failure.
     container_setup_block = ""
+    # Deterministic container name so the no-progress watchdog can ``docker kill``
+    # the dockerd-parented workload (which the group SIGKILL can never reach).
+    # None for a bare (non-containerized) job — the group kill suffices there.
+    container_name: str | None = None
     if container_image:
+        container_name = _local_container_name_for_external_id(external_id)
         host_out_dir = _local_state_dir_for_external_id(external_id)
         gpus = detect_local_gpu() is not None
         # When the contract includes a repo checkout, bind-mount the repo root
@@ -1455,6 +1780,7 @@ def _build_local_wrapper_command(
             extra_env=_container_extra_env,
             extra_mounts=_container_extra_mounts,
             workdir=_container_workdir,
+            name=container_name,
         )
         effective_command = f"{prefix} bash -lc {shlex.quote(command)}"
         auth = container_registry_auth or {}
@@ -1528,6 +1854,22 @@ fi"""
     _np_watchdog_cleanup = ""
     if no_progress_timeout_seconds is not None and no_progress_timeout_seconds > 0:
         _np_seconds = int(no_progress_timeout_seconds)
+        # For a CONTAINERIZED job the trainer runs as a child of dockerd, NOT a
+        # member of this wrapper's process group, so the group SIGKILL below can
+        # never reach it — a TERM-ignoring trainer would keep running (and keep
+        # billing) after the job was recorded FAILED. `docker kill <name>`
+        # (SIGKILL to the container's PID 1) is the only signal path that actually
+        # stops the dockerd-parented workload. Emitted on its own line so the
+        # shared kill-ordering guard still sees the bare `kill -TERM`/`kill -KILL`
+        # lines intact; a no-op (empty) for a bare job where the group kill reaches
+        # everything. `|| true` tolerates a container that never started (e.g. the
+        # window fired mid-`docker pull`).
+        if container_name is not None:
+            _np_container_kill = (
+                f"      docker kill {shlex.quote(container_name)} 2>/dev/null || true\n"
+            )
+        else:
+            _np_container_kill = ""
         _no_progress_watchdog_block = f"""# No-progress watchdog: kills the job if the progress file is untouched
 # for {_np_seconds}s. Runs in parallel with the command as a SLIDING window —
 # each interval that advances the progress mtime resets the deadline, so a job
@@ -1544,7 +1886,7 @@ touch {progress_file} 2>/dev/null || true
       FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
       cat > {terminal_path} <<NP_EOF
 STATUS=FAILED
-EXIT_CODE=125
+EXIT_CODE={NO_PROGRESS_WATCHDOG_EXIT_CODE}
 FINISHED_AT=$FINISHED_AT
 REASON=no_progress_timeout
 METRICS=
@@ -1566,7 +1908,7 @@ NP_EOF
       trap '' TERM
       kill -TERM -$$ 2>/dev/null || true
       sleep 2
-      kill -KILL -$$ 2>/dev/null || true
+{_np_container_kill}      kill -KILL -$$ 2>/dev/null || true
       exit 0
     fi
     _NP_START=$_NP_NOW
@@ -1638,6 +1980,24 @@ def _local_state_dir_for_external_id(external_id: str | None) -> str:
     return os.path.join(_LOCAL_STATE_ROOT, suffix)
 
 
+def _local_container_name_for_external_id(external_id: str | None) -> str:
+    """Deterministic docker ``--name`` for a local containerized job's container.
+
+    The no-progress watchdog needs a stable handle to ``docker kill`` the
+    container: the trainer inside runs as a child of dockerd, NOT a member of the
+    wrapper's process group, so the watchdog's group SIGKILL can never reach it —
+    a TERM-ignoring trainer would keep running (and keep billing) after the job
+    was recorded FAILED. Naming the container lets the watchdog reach the real,
+    dockerd-parented workload. Sanitized to the docker name grammar
+    (``[a-zA-Z0-9][a-zA-Z0-9_.-]*``) so any external_id yields a valid name.
+    """
+    raw = f"blueprint-compute-{external_id or 'unassigned'}"
+    safe = re.sub(r"[^a-zA-Z0-9_.-]", "-", raw)
+    # docker requires the first char to be alphanumeric; the constant prefix
+    # already guarantees that, but stay defensive.
+    return safe if safe[:1].isalnum() else f"c{safe}"
+
+
 def _local_pid_path_for_external_id(external_id: str | None) -> str:
     return os.path.join(
         _local_state_dir_for_external_id(external_id), _LOCAL_PID_FILENAME
@@ -1655,6 +2015,13 @@ def _local_terminal_path_for_external_id(external_id: str | None) -> str:
     return os.path.join(
         _local_state_dir_for_external_id(external_id),
         _LOCAL_TERMINAL_FILENAME,
+    )
+
+
+def _local_resume_provenance_path_for_external_id(external_id: str | None) -> str:
+    return os.path.join(
+        _local_state_dir_for_external_id(external_id),
+        _LOCAL_RESUME_PROVENANCE_FILENAME,
     )
 
 
@@ -1925,15 +2292,29 @@ class ViewableArtifactCandidate:
     ``filename`` is the sanitized object name derived from the file's path
     *relative* to the artifact root (path-traversal safe, subdir context folded
     to ``__`` so multi-arm same-named plots stay distinct),
-    ``content_type`` / ``kind`` come from the extension classifier, ``data`` is
-    the in-memory bytes (already size-capped), and ``size_bytes`` is ``len(data)``.
+    ``content_type`` / ``kind`` come from the extension classifier, and
+    ``size_bytes`` is the file's byte length.
+
+    Exactly one payload source is set:
+
+      * ``data`` — the file's bytes held in memory (images, and small videos
+        within ``_MAX_VIEWABLE_FILE_BYTES``). Uploaded via ``upload_from_string``.
+      * ``source_path`` — an on-disk path to STREAM (large videos over the
+        in-memory cap). Uploaded via ``upload_from_file`` so the bytes never
+        enter the orchestrator's heap. ``source_is_temp`` marks a temp file this
+        pipeline owns and must unlink after upload; ``artifact_root`` (when set)
+        is the local job's artifact root, so the upload path re-verifies symlink
+        containment and opens the original file ``O_NOFOLLOW`` (TOCTOU guard).
     """
 
     filename: str
     content_type: str
     kind: str
-    data: bytes
     size_bytes: int
+    data: bytes | None = None
+    source_path: str | None = None
+    source_is_temp: bool = False
+    artifact_root: str | None = None
 
 
 def _classify_viewable_member(
@@ -1944,31 +2325,70 @@ def _classify_viewable_member(
 
     The single classification rule shared by every viewable selection pass (the
     in-memory extractor and the streaming two-pass selector): viewable extension,
-    positive size within the per-file cap, and a traversal-safe sanitized
-    *relative* path (an absolute/``..`` member path sanitizes to ``None`` and is
-    skipped).
+    positive size within the per-kind cap (images ≤ ``_MAX_VIEWABLE_FILE_BYTES``,
+    videos ≤ ``_MAX_VIEWABLE_VIDEO_BYTES`` since they stream), and a traversal-safe
+    sanitized *relative* path (an absolute/``..`` member path sanitizes to
+    ``None`` and is skipped).
     """
     classified = storage.viewable_content_type_for_filename(name)
     if classified is None:
         return None
-    if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+    content_type, kind = classified
+    if size <= 0 or size > _viewable_size_cap_for_kind(kind):
         return None
     relname = storage.sanitize_viewable_relpath(name)
     if relname is None:
         return None
-    content_type, kind = classified
     return relname, content_type, kind
 
 
-def _read_capped_member(tar: tarfile.TarFile, member: tarfile.TarInfo) -> bytes | None:
-    """Read ONE archive member's bytes, refusing anything over the per-file cap."""
+def _read_capped_member(
+    tar: tarfile.TarFile, member: tarfile.TarInfo, cap: int = _MAX_VIEWABLE_FILE_BYTES
+) -> bytes | None:
+    """Read ONE archive member's bytes, refusing anything over ``cap``."""
     extracted = tar.extractfile(member)
     if extracted is None:
         return None
-    data = extracted.read(_MAX_VIEWABLE_FILE_BYTES + 1)
-    if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
+    data = extracted.read(cap + 1)
+    if not data or len(data) > cap:
         return None
     return data
+
+
+def _extract_member_to_tempfile(
+    tar: tarfile.TarFile, member: tarfile.TarInfo
+) -> str | None:
+    """STREAM one archive member's bytes to a fresh temp file; return its path.
+
+    For large videos that must never be materialized in the orchestrator's heap:
+    the member is decompressed and copied in bounded chunks (``copyfileobj``), so
+    peak memory is the copy buffer, not the file size. Returns the temp-file path
+    (caller owns it and must unlink), or ``None`` on any error (temp file is
+    cleaned up before returning).
+    """
+    extracted = tar.extractfile(member)
+    if extracted is None:
+        return None
+    handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-vid-", suffix=".bin")
+    try:
+        with os.fdopen(handle, "wb") as dest:
+            shutil.copyfileobj(extracted, dest)
+        return tmp_path
+    except OSError:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+
+
+def _unlink_temp_sources(paths: list[str]) -> None:
+    """Best-effort unlink of pipeline-owned temp files; never raises."""
+    for path in paths:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
@@ -1996,7 +2416,9 @@ def _download_artifact_bundle_to_path(job_id, dest_path: str) -> bool:
 
 def _select_viewable_candidates_from_bundle_path(
     path: str,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+    *,
+    fail_soft: bool = True,
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select a bundle's viewable files from an ON-DISK archive, bounded memory.
 
     Two passes over the (seekable) archive file:
@@ -2005,26 +2427,44 @@ def _select_viewable_candidates_from_bundle_path(
          bytes are read, so an archive with thousands of images costs nothing but
          its member headers. Yields the full qualifying set, sorted by sanitized
          name, which is then capped at ``_MAX_VIEWABLE_FILE_COUNT``.
-      2. **Data pass** — read the bytes of ONLY the selected members.
+      2. **Data pass** — materialize ONLY the selected members: images (and
+         small videos) are read into memory under the in-memory cap; large
+         videos over that cap are STREAMED member-by-member to a temp file so
+         they never enter the heap.
 
     Capping BEFORE reading is what bounds peak memory: the selected set can never
-    exceed ``_MAX_VIEWABLE_FILE_COUNT * _MAX_VIEWABLE_FILE_BYTES``, and nothing
-    else about the bundle (its total size, its non-viewable payload, its count of
-    rejected images) is ever resident. Returns ``(selected, dropped)`` with the
-    same contract as the in-memory extractor's caller.
+    exceed ``_MAX_VIEWABLE_FILE_COUNT`` objects, no in-memory member exceeds
+    ``_MAX_VIEWABLE_FILE_BYTES``, and streamed videos add only the copy buffer —
+    nothing else about the bundle (its total size, its non-viewable payload, its
+    count of rejected images) is ever resident. Returns ``(selected, dropped)``
+    with the same contract as the in-memory extractor's caller.
 
     Defensive by contract: a non-gzip/non-tar file or ANY parse error yields
-    ``([], 0)``.
+    ``([], 0)``; any temp files created for streamed videos are unlinked on error.
     """
+    tmp_video_paths: list[str] = []
     try:
         refs: list[tuple[str, str, str, str]] = []  # (relname, member, ctype, kind)
         seen: set[str] = set()
+        size_dropped = 0
+        svg_count = 0
         with tarfile.open(path, mode="r:gz") as tar:
             for member in tar:
                 if not member.isfile():
                     continue
                 classified = _classify_viewable_member(member.name, member.size)
                 if classified is None:
+                    # Count a viewable-extension member omitted SOLELY for the
+                    # per-file size cap so the omitted tally is accurate; a plain
+                    # non-viewable member is not counted.
+                    if (
+                        storage.viewable_content_type_for_filename(member.name)
+                        is not None
+                        and member.size > _MAX_VIEWABLE_FILE_BYTES
+                    ):
+                        size_dropped += 1
+                    elif member.name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 relname, content_type, kind = classified
                 if relname in seen:
@@ -2034,9 +2474,9 @@ def _select_viewable_candidates_from_bundle_path(
 
         refs.sort(key=lambda ref: ref[0])
         selected_refs = refs[:_MAX_VIEWABLE_FILE_COUNT]
-        dropped = len(refs) - len(selected_refs)
+        dropped = (len(refs) - len(selected_refs)) + size_dropped
         if not selected_refs:
-            return [], dropped
+            return [], dropped, svg_count
 
         wanted = {ref[1]: ref for ref in selected_refs}
         out: dict[str, ViewableArtifactCandidate] = {}
@@ -2047,33 +2487,66 @@ def _select_viewable_candidates_from_bundle_path(
                 relname, _member_name, content_type, kind = wanted[member.name]
                 if relname in out:
                     continue  # first occurrence wins (matches the metadata pass)
-                data = _read_capped_member(tar, member)
-                if data is None:
-                    continue
-                out[relname] = ViewableArtifactCandidate(
-                    filename=relname,
-                    content_type=content_type,
-                    kind=kind,
-                    data=data,
-                    size_bytes=len(data),
-                )
+                if kind == "video" and member.size > _MAX_VIEWABLE_FILE_BYTES:
+                    tmp_path = _extract_member_to_tempfile(tar, member)
+                    if tmp_path is None:
+                        continue
+                    tmp_video_paths.append(tmp_path)
+                    try:
+                        streamed_size = os.path.getsize(tmp_path)
+                    except OSError:
+                        continue
+                    out[relname] = ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        size_bytes=streamed_size,
+                        source_path=tmp_path,
+                        source_is_temp=True,
+                    )
+                else:
+                    data = _read_capped_member(
+                        tar, member, _viewable_size_cap_for_kind(kind)
+                    )
+                    if data is None:
+                        continue
+                    out[relname] = ViewableArtifactCandidate(
+                        filename=relname,
+                        content_type=content_type,
+                        kind=kind,
+                        size_bytes=len(data),
+                        data=data,
+                    )
                 if len(out) == len(selected_refs):
                     break
-    except (tarfile.TarError, OSError, EOFError, ValueError):
-        return [], 0
-    return sorted(out.values(), key=lambda c: c.filename), dropped
+    except (tarfile.TarError, OSError, EOFError, ValueError) as exc:
+        _unlink_temp_sources(tmp_video_paths)
+        if not fail_soft:
+            raise RuntimeError("viewable bundle enumeration failed") from exc
+        return [], 0, 0
+    if len(out) != len(selected_refs) and not fail_soft:
+        _unlink_temp_sources(tmp_video_paths)
+        raise RuntimeError("viewable bundle enumeration was incomplete")
+    # Unlink any temp video that did NOT become a surviving candidate (e.g. a
+    # post-extract stat failed) so it can't leak; the rest are unlinked by
+    # persist_viewable_artifacts after upload.
+    kept = {c.source_path for c in out.values() if c.source_path is not None}
+    _unlink_temp_sources([p for p in tmp_video_paths if p not in kept])
+    return sorted(out.values(), key=lambda c: c.filename), dropped, svg_count
 
 
 async def _stream_viewable_candidates_from_bundle(
     job_id,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+    *,
+    fail_soft: bool = True,
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Fetch + select a bundle-backed job's viewable files without ever holding
     the bundle in memory.
 
     The bundle is streamed to a temp file, selected from on disk (two-pass,
     count-capped BEFORE any member bytes are read), and the temp file is always
     removed. Fail-soft: a missing bundle or ANY download/parse error degrades to
-    ``([], 0)``.
+    ``([], 0, 0)``.
     """
     handle, tmp_path = tempfile.mkstemp(prefix="bp-viewable-", suffix=".tar.gz")
     os.close(handle)
@@ -2082,9 +2555,13 @@ async def _stream_viewable_candidates_from_bundle(
             _download_artifact_bundle_to_path, job_id, tmp_path
         )
         if not downloaded:
-            return [], 0
+            if not fail_soft:
+                raise RuntimeError("durable viewable bundle is unavailable")
+            return [], 0, 0
         return await asyncio.to_thread(
-            _select_viewable_candidates_from_bundle_path, tmp_path
+            _select_viewable_candidates_from_bundle_path,
+            tmp_path,
+            fail_soft=fail_soft,
         )
     except Exception:
         logger.warning(
@@ -2093,7 +2570,9 @@ async def _stream_viewable_candidates_from_bundle(
             job_id,
             exc_info=True,
         )
-        return [], 0
+        if not fail_soft:
+            raise
+        return [], 0, 0
     finally:
         try:
             os.unlink(tmp_path)
@@ -2143,7 +2622,11 @@ def _extract_viewable_candidates_from_bundle(
                 relname, content_type, kind = classified
                 if relname in seen:
                     continue
-                data = _read_capped_member(tar, member)
+                # The whole bundle is already resident here, so materializing one
+                # member (image or video) under its per-kind cap adds no new peak.
+                data = _read_capped_member(
+                    tar, member, _viewable_size_cap_for_kind(kind)
+                )
                 if data is None:
                     continue
                 seen.add(relname)
@@ -2152,8 +2635,8 @@ def _extract_viewable_candidates_from_bundle(
                         filename=relname,
                         content_type=content_type,
                         kind=kind,
-                        data=data,
                         size_bytes=len(data),
+                        data=data,
                     )
                 )
     except (tarfile.TarError, OSError, EOFError, ValueError):
@@ -2189,7 +2672,7 @@ def _read_viewable_file_nofollow(path: str, artifact_root: str) -> bytes | None:
 
 def _collect_viewable_candidates_from_dir(
     artifact_dir: str,
-) -> list[ViewableArtifactCandidate]:
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Select viewable files by walking a local job's on-disk artifact dir.
 
     The on-disk analogue of :func:`_extract_viewable_candidates_from_bundle`:
@@ -2198,8 +2681,11 @@ def _collect_viewable_candidates_from_dir(
     ``artifact_dir`` (via :func:`storage.sanitize_viewable_relpath`), NOT the
     bare basename, so same-named plots under different arm subdirectories
     (``arm1/reward.png`` vs ``arm2/reward.png``) stay distinct instead of
-    collapsing to one. Returns ``[]`` for a missing/empty/unreadable dir or on
-    ANY OS error — never raises.
+    collapsing to one. Returns ``(candidates, size_dropped)`` where
+    ``size_dropped`` is the count of viewable-extension files skipped SOLELY for
+    exceeding the per-file byte cap (``_MAX_VIEWABLE_FILE_BYTES``) — so the
+    caller can surface an accurate omitted tally. Returns ``([], 0)`` for a
+    missing/empty/unreadable dir or on ANY OS error — never raises.
 
     SECURITY — symlink exfiltration guard: the artifact dir was writable by the
     experiment command, and this scan runs on the HOST after the run — a
@@ -2217,9 +2703,11 @@ def _collect_viewable_candidates_from_dir(
         or not os.path.isdir(artifact_dir)
         or os.path.islink(artifact_dir)
     ):
-        return []
+        return [], 0, 0
     artifact_root = os.path.realpath(artifact_dir)
     out: list[ViewableArtifactCandidate] = []
+    size_dropped = 0
+    svg_count = 0
     seen: set[str] = set()
     try:
         for root, dirs, files in os.walk(artifact_dir, followlinks=False):
@@ -2229,6 +2717,8 @@ def _collect_viewable_candidates_from_dir(
             for name in sorted(files):
                 classified = storage.viewable_content_type_for_filename(name)
                 if classified is None:
+                    if name.lower().endswith(".svg"):
+                        svg_count += 1
                     continue
                 path = os.path.join(root, name)
                 if os.path.islink(path) or not os.path.isfile(path):
@@ -2241,79 +2731,123 @@ def _collect_viewable_candidates_from_dir(
                 relname = storage.sanitize_viewable_relpath(relpath)
                 if relname is None or relname in seen:
                     continue
+                content_type, kind = classified
                 try:
                     size = os.path.getsize(path)
                 except OSError:
                     continue
-                if size <= 0 or size > _MAX_VIEWABLE_FILE_BYTES:
+                if size <= 0:
+                    continue
+                if size > _viewable_size_cap_for_kind(kind):
+                    # Viewable file omitted SOLELY for the per-file size cap —
+                    # tally it (deduped by relname) so the count reaches the UI.
+                    seen.add(relname)
+                    size_dropped += 1
+                    continue
+                if kind == "video" and size > _MAX_VIEWABLE_FILE_BYTES:
+                    # Large video: STREAM the original file at upload time (never
+                    # buffer it here). The upload path re-verifies containment and
+                    # opens O_NOFOLLOW via ``artifact_root`` to keep the symlink
+                    # TOCTOU guard closed.
+                    seen.add(relname)
+                    out.append(
+                        ViewableArtifactCandidate(
+                            filename=relname,
+                            content_type=content_type,
+                            kind=kind,
+                            size_bytes=size,
+                            source_path=path,
+                            source_is_temp=False,
+                            artifact_root=artifact_root,
+                        )
+                    )
                     continue
                 data = _read_viewable_file_nofollow(path, artifact_root)
                 if not data or len(data) > _MAX_VIEWABLE_FILE_BYTES:
                     continue
-                content_type, kind = classified
                 seen.add(relname)
                 out.append(
                     ViewableArtifactCandidate(
                         filename=relname,
                         content_type=content_type,
                         kind=kind,
-                        data=data,
                         size_bytes=len(data),
+                        data=data,
                     )
                 )
     except OSError:
-        return out
-    return out
+        return out, size_dropped, svg_count
+    return out, size_dropped, svg_count
 
 
 async def _collect_viewable_artifact_candidates(
     job: ComputeJob,
-) -> tuple[list[ViewableArtifactCandidate], int]:
+    *,
+    fail_soft: bool = True,
+) -> tuple[list[ViewableArtifactCandidate], int, int]:
     """Backend-aware selection of a terminal job's viewable files.
 
     Local/local-gpu jobs are read from the on-disk artifact dir that survives the
     subprocess; gcp and runner-subprocess jobs are read from the durable
     ``bundle.tar.gz`` — STREAMED to a temp file and selected from disk, never
     materialized in the orchestrator's heap (a results bundle has no size bound;
-    pulling one into the API process is an OOM). Returns ``([], 0)`` for an
+    pulling one into the API process is an OOM). Returns ``([], 0, 0)`` for an
     unrecognised backend or a missing bundle.
 
     Candidates are sorted by sanitized filename for deterministic selection when
-    the archive/walk order is arbitrary. Returns ``(selected, dropped)`` where
-    ``dropped`` is the count of qualifying files exceeding ``_MAX_VIEWABLE_FILE_COUNT``.
+    the archive/walk order is arbitrary. Returns ``(selected, dropped, svg_count)``
+    where ``dropped`` is the total count of viewable files omitted from the manifest
+    — both those exceeding ``_MAX_VIEWABLE_FILE_COUNT`` (count-cap overflow) AND
+    those skipped for exceeding ``_MAX_VIEWABLE_FILE_BYTES`` (size-cap) — and
+    ``svg_count`` is the number of ``.svg`` files encountered (excluded for XSS).
     """
     if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
         meta = job.polling_metadata or {}
         artifact_dir = str(meta.get("artifact_dir") or "").strip()
         if not artifact_dir:
             artifact_dir = _local_artifact_dir_for_external_id(job.external_compute_id)
-        all_candidates = await asyncio.to_thread(
+        all_candidates, size_dropped, svg_count = await asyncio.to_thread(
             _collect_viewable_candidates_from_dir, artifact_dir
         )
     elif job.backend in (GCP_BACKEND_NAME, RUNNER_SUBPROCESS_BACKEND_NAME):
-        # Already sorted + count-capped on disk (cap applied BEFORE any member
-        # bytes are read), so it returns the final (selected, dropped) directly.
-        return await _stream_viewable_candidates_from_bundle(job.id)
+        # Already sorted + capped on disk (count cap applied BEFORE any member
+        # bytes are read; size-cap omissions folded into the returned count), so
+        # it returns the final (selected, dropped, svg_count) directly.
+        return await _stream_viewable_candidates_from_bundle(
+            job.id,
+            fail_soft=fail_soft,
+        )
     else:
-        return [], 0
+        return [], 0, 0
     all_candidates.sort(key=lambda c: c.filename)
     selected = all_candidates[:_MAX_VIEWABLE_FILE_COUNT]
-    dropped = len(all_candidates) - len(selected)
-    return selected, dropped
+    count_dropped = len(all_candidates) - len(selected)
+    return selected, count_dropped + size_dropped, svg_count
 
 
 async def persist_viewable_artifacts(
     job: ComputeJob,
 ) -> tuple[list[dict[str, Any]], int]:
+    """Compatibility wrapper returning the historical ``(manifest, dropped)``."""
+    manifest, dropped, _complete, _svg = (
+        await persist_viewable_artifacts_with_completeness(job)
+    )
+    return manifest, dropped
+
+
+async def persist_viewable_artifacts_with_completeness(
+    job: ComputeJob,
+) -> tuple[list[dict[str, Any]], int, bool, int]:
     """Persist a terminal job's viewable files as individually-addressable objects.
 
-    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm — NO svg, which
-    can execute script when served from a signed URL) from the
+    Extracts the viewable files (png/jpg/jpeg/webp/gif/mp4/webm/svg — SVG is
+    sanitized before upload; see storage.sanitize_svg_bytes) from the
     job's artifacts, uploads each under the allowlisted per-job prefix, and
-    returns ``(manifest, dropped)`` — a list of
+    returns ``(manifest, dropped, complete)`` — a list of
     ``{filename, storage_uri, content_type, size_bytes, kind}`` for durably stored
     files, and the count of qualifying files that exceeded ``_MAX_VIEWABLE_FILE_COUNT``
-    and were not persisted.
+    and were not persisted. ``complete`` is false when the durable bundle could
+    not be enumerated fully or any selected file failed to persist.
 
     Fail-soft by contract: an empty/corrupt bundle, a missing dir, or ANY
     extraction/upload error degrades to ``([], 0)`` and NEVER raises,
@@ -2322,25 +2856,24 @@ async def persist_viewable_artifacts(
     appear in the returned manifest.
     """
     try:
-        candidates, dropped = await _collect_viewable_artifact_candidates(job)
+        candidates, dropped, svg_count = await _collect_viewable_artifact_candidates(
+            job,
+            fail_soft=False,
+        )
     except Exception:
         logger.warning(
             "Viewable-artifact extraction failed for compute job %s",
             getattr(job, "id", None),
             exc_info=True,
         )
-        return [], 0
+        return [], 0, False, 0
     if not candidates:
-        return [], dropped
+        return [], dropped, True, svg_count
     manifest: list[dict[str, Any]] = []
+    complete = True
     for candidate in candidates:
         try:
-            uri = await storage.upload_compute_job_viewable_file(
-                job.id,
-                candidate.filename,
-                candidate.data,
-                candidate.content_type,
-            )
+            uri = await _upload_viewable_candidate(job, candidate)
         except Exception:
             logger.warning(
                 "Viewable-artifact upload raised for compute job %s file %r",
@@ -2349,7 +2882,13 @@ async def persist_viewable_artifacts(
                 exc_info=True,
             )
             uri = None
+        finally:
+            # A temp file this pipeline created for a streamed video is only ours
+            # to remove; a local job's original artifact file must stay in place.
+            if candidate.source_is_temp and candidate.source_path:
+                _unlink_temp_sources([candidate.source_path])
         if not uri:
+            complete = False
             continue
         manifest.append(
             {
@@ -2358,9 +2897,79 @@ async def persist_viewable_artifacts(
                 "content_type": candidate.content_type,
                 "size_bytes": candidate.size_bytes,
                 "kind": candidate.kind,
+                # The object URI is deterministic and may have held a live
+                # generation already. Terminal persistence is an authoritative
+                # overwrite, so it receives a fresh cache identity.
+                "revision": storage.new_viewable_revision(),
+                "live": False,
             }
         )
-    return manifest, dropped
+    return manifest, dropped, complete, svg_count
+
+
+def _open_viewable_source_nofollow(path: str, artifact_root: str | None):
+    """Open a streamed video candidate's source for upload; ``None`` on refusal.
+
+    For a temp file this pipeline owns (``artifact_root is None``) a plain open is
+    safe. For a local job's ORIGINAL artifact file, re-verify symlink containment
+    and open with ``O_NOFOLLOW`` so an entry swapped for a symlink between the
+    selection scan and the upload (TOCTOU) is refused by the kernel — the same
+    guard :func:`_read_viewable_file_nofollow` applies to in-memory reads.
+    """
+    if artifact_root is None:
+        try:
+            return open(path, "rb")
+        except OSError:
+            return None
+    if os.path.islink(path):
+        return None
+    if not _is_under_artifact_root(os.path.realpath(path), artifact_root):
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        return os.fdopen(fd, "rb")
+    except OSError:
+        return None
+
+
+async def _upload_viewable_candidate(
+    job: ComputeJob, candidate: ViewableArtifactCandidate
+) -> str | None:
+    """Upload one candidate, choosing the in-memory or streaming storage seam.
+
+    Images (and small videos) carry their bytes in ``data`` and go through the
+    in-memory ``upload_compute_job_viewable_file``. Large videos carry a
+    ``source_path`` and are STREAMED via ``upload_compute_job_viewable_stream``,
+    so their bytes never enter the orchestrator's heap. Returns the durable URI
+    or ``None`` (never raises for a missing/unreadable source).
+    """
+    if candidate.source_path is not None:
+        fileobj = await asyncio.to_thread(
+            _open_viewable_source_nofollow,
+            candidate.source_path,
+            candidate.artifact_root,
+        )
+        if fileobj is None:
+            return None
+        try:
+            return await storage.upload_compute_job_viewable_stream(
+                job.id,
+                candidate.filename,
+                fileobj,
+                candidate.content_type,
+                size=candidate.size_bytes,
+            )
+        finally:
+            try:
+                fileobj.close()
+            except OSError:
+                pass
+    return await storage.upload_compute_job_viewable_file(
+        job.id,
+        candidate.filename,
+        candidate.data,
+        candidate.content_type,
+    )
 
 
 def _count_files_in_tree(path: str) -> int:
@@ -2405,6 +3014,36 @@ def _remove_local_terminal_status_for_external_id(external_id: str | None) -> No
         os.remove(_local_terminal_path_for_external_id(external_id))
     except FileNotFoundError:
         return
+
+
+def _write_local_resume_provenance_for_external_id(
+    external_id: str | None, provenance: dict[str, Any]
+) -> None:
+    encoded = base64.b64encode(
+        json.dumps(provenance, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    _write_local_state_text(
+        _local_resume_provenance_path_for_external_id(external_id), encoded
+    )
+
+
+def _read_local_resume_provenance_for_external_id(
+    external_id: str | None, expected_source_job_id: object | None
+) -> dict[str, Any] | None:
+    """Recover only proof that matches the launch/job's declared resume source."""
+    if expected_source_job_id in (None, ""):
+        return None
+    raw = _read_local_state_text(
+        _local_resume_provenance_path_for_external_id(external_id)
+    )
+    provenance = _decode_resume_provenance(raw)
+    if provenance is None or provenance.get("ok") is not True:
+        return None
+    if str(provenance.get("resumed_from_job_id") or "") != str(
+        expected_source_job_id
+    ):
+        return None
+    return provenance
 
 
 def _is_pid_running(pid: int) -> bool:
@@ -2604,9 +3243,9 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 repo_clone_failed:$CLONE_CLASS "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi\n"
@@ -2645,9 +3284,9 @@ def _build_gcp_startup_script(
             f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             f"  python3 /tmp/blueprint_terminal_record.py "
             f"{artifact_dir} FAILED 1 setup_step_failed "
-            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             f"  upload_artifacts\n"
-            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
             f"  poweroff || shutdown -h now || true\n"
             f"  exit 1\n"
             f"fi"
@@ -2696,7 +3335,7 @@ def _build_gcp_startup_script(
             + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
             + "  python3 /tmp/blueprint_terminal_record.py "
             + f"{artifact_dir} FAILED 1 container_image_pull_failed "
-            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            + f'{result_file} {command_log_path} "$__BP_RESUME_D" >/dev/null 2>&1 || true\n'
             + "  upload_artifacts\n"
             + '  kill "$TTL_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true\n'
             + "  poweroff || shutdown -h now || true\n"
@@ -2711,36 +3350,36 @@ def _build_gcp_startup_script(
     # Cross-job checkpoint resume: pull the predecessor's durable bundle from its
     # signed GET URL and extract it into the artifact dir BEFORE the command runs,
     # so a resumed job sees the prior checkpoint already present. Kept to
-    # single-line curl / python3 / tar invocations (no heredoc nesting) per the
-    # repo's "generating code for one language from another" guidance. Honest by
-    # design: a failed download/extract writes a `resume_hydration.failed` marker
-    # (never claims resume happened) and lets the command run from scratch; a
-    # success writes `resume_hydration.ok`. Both markers land in the uploaded
-    # bundle. Stale run-status files from the predecessor (result.json /
-    # command.log.json / terminal.json / live_tail.b64) are removed after extract
-    # so they cannot contaminate THIS run's terminal detection; the boot beacon
-    # below then re-lays a fresh terminal.json.
+    # single-line curl / python3 invocations (no heredoc nesting) per the
+    # repo's "generating code for one language from another" guidance. Fail-closed
+    # by design, mirroring the in-process backend's `_rehydrate_input_artifact_bundle`
+    # (which RAISES on a missing/unreadable predecessor bundle): a failed
+    # download/extract writes a `resume_hydration.failed` marker and then ABORTS the
+    # run — durable terminal record `resume_hydration_failed`, serial FAILED markers,
+    # artifact upload, poweroff — rather than silently running from an empty
+    # workspace and burning the whole deadline redoing (or misreporting) work the
+    # resume was meant to skip. A success writes `resume_hydration.ok` and continues.
+    # Both markers land in the uploaded bundle. Stale run-status files from the
+    # predecessor (result.json / command.log.json / terminal.json / live_tail.b64)
+    # are skipped by _RESUME_EXTRACTOR_PY so they never land in the staging dir;
+    # the boot beacon below then re-lays a fresh terminal.json.
     resume_block = ""
     if input_artifact_download_url:
         _resume_url_q = shlex.quote(input_artifact_download_url)
-        _resume_bundle_q = shlex.quote("/tmp/blueprint_resume_bundle.tar.gz")
+        _resume_bundle_path = "/tmp/blueprint_resume_bundle.tar.gz"
+        _resume_stage_path = "/tmp/blueprint_resume_stage"
+        _resume_bundle_q = shlex.quote(_resume_bundle_path)
         _resume_ok_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.ok")
         )
         _resume_fail_q = shlex.quote(
             os.path.join(_GCP_ARTIFACT_DIR_PATH, "resume_hydration.failed")
         )
-        _resume_stale = " ".join(
-            shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, _name))
-            for _name in (
-                "result.json",
-                "command.log.json",
-                "terminal.json",
-                "live_tail.b64",
-            )
-        )
         resume_block = (
-            f"rm -f {_resume_bundle_q}\n"
+            # Start marker (also the end marker): used by the test harness to locate
+            # and extract the resume block for isolated bash execution.
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}\n"
+            f"mkdir -p {_resume_stage_path}\n"
             f"if timeout {upload_timeout} curl --fail --silent --show-error "
             f"--location --output {_resume_bundle_q} {_resume_url_q} "
             f">/dev/null 2>&1 || timeout {upload_timeout} python3 -c "
@@ -2751,19 +3390,51 @@ def _build_gcp_startup_script(
             f"else\n"
             f"  RESUME_DL=0\n"
             f"fi\n"
+            # Safe extraction via _RESUME_EXTRACTOR_PY: skips links, path-traversal
+            # members, and stale predecessor status files; exits non-zero when no
+            # usable checkpoint files are found so an empty/stale-only archive is
+            # fail-closed (sets RESUME_DL=0 via the else branch below).
             f'if [ "$RESUME_DL" = 1 ] && [ -s {_resume_bundle_q} ] && '
-            f"tar -C {artifact_dir} --no-same-owner -xzf {_resume_bundle_q} "
-            f">/dev/null 2>&1; then\n"
-            f"  rm -f {_resume_stale}\n"
-            f"  echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
-            f'  echo "[resume] hydrated predecessor checkpoint bundle into '
-            f'artifact dir"\n'
+            f"python3 -c '{_RESUME_EXTRACTOR_PY}' "
+            f"{_resume_bundle_q} {_resume_stage_path} >/dev/null 2>&1; then\n"
+            f"  _BP_RESUME_FC=$(find {_resume_stage_path} -type f 2>/dev/null | wc -l)\n"
+            f'  if [ "$_BP_RESUME_FC" -gt 0 ] && rm -rf {artifact_dir} '
+            f"&& cp -a {_resume_stage_path} {artifact_dir} >/dev/null 2>&1; then\n"
+            f"    __BP_RESUME_D=$(python3 -c 'import json,base64,sys,datetime; print("
+            f"base64.b64encode(json.dumps({{"
+            f'"ok":True,"file_count":int(sys.argv[1]),"resumed_from_job_id":{json.dumps(spec.input_artifact_job_id)},'
+            '"recorded_at":datetime.datetime.now(datetime.timezone.utc).isoformat()'
+            f" }}).encode()).decode())' "
+            f'"$_BP_RESUME_FC" 2>/dev/null || true)\n'
+            f'    [ -n "$__BP_RESUME_D" ] && echo "{_SERIAL_RESUME_PREFIX}$__BP_RESUME_D" || true\n'
+            f"    echo resumed > {_resume_ok_q} 2>/dev/null || true\n"
+            f'    echo "[resume] hydrated predecessor checkpoint bundle into artifact dir"\n'
+            f'    echo "$__BP_RESUME_D" > /tmp/blueprint_resume_d.b64 2>/dev/null || true\n'
+            f"  else\n"
+            f"    RESUME_DL=0\n"
+            f"  fi\n"
             f"else\n"
-            f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
-            f'  echo "[resume] predecessor checkpoint hydration FAILED — '
-            f'running from scratch"\n'
+            f"  RESUME_DL=0\n"
             f"fi\n"
-            f"rm -f {_resume_bundle_q}"
+            f'if [ "$RESUME_DL" != 1 ]; then\n'
+            f"  mkdir -p {artifact_dir} 2>/dev/null || true\n"
+            f"  echo failed > {_resume_fail_q} 2>/dev/null || true\n"
+            f'  echo "[resume] predecessor checkpoint hydration FAILED — aborting '
+            f'run (fail-closed; refusing to run against an empty workspace)"\n'
+            f'  echo "{_SERIAL_REASON_PREFIX}resume_hydration_failed"\n'
+            f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f'  echo "{_SERIAL_RESUME_PREFIX}{_SERIAL_RESUME_FAILED_B64}"\n'
+            f'  python3 /tmp/blueprint_terminal_record.py '
+            f'{artifact_dir} FAILED 1 resume_hydration_failed '
+            f'{result_file} {command_log_path} "${{__BP_RESUME_D:-}}" >/dev/null 2>&1 || true\n'
+            f"  upload_artifacts\n"
+            f'  kill "$TTL_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true\n'
+            f"  poweroff || shutdown -h now || true\n"
+            f"  exit 1\n"
+            f"fi\n"
+            # End marker (same as start marker, used by test harness for block extraction).
+            f"rm -rf {_resume_stage_path}; rm -f {_resume_bundle_q}"
         )
     max_log_bytes = _MAX_COMMAND_LOG_BYTES
     command_runner_b64 = _COMMAND_RUNNER_B64
@@ -2772,6 +3443,11 @@ def _build_gcp_startup_script(
     heartbeat_body_b64 = _HEARTBEAT_BODY_B64
     orchestrator_url_q = shlex.quote(compute.ORCHESTRATOR_URL)
     job_id_q = shlex.quote(str(spec.job_id))
+    # Per-job heartbeat bearer secret (NOT the raw job UUID). Embedded into the
+    # startup script — which is delivered as encrypted instance metadata and never
+    # echoed by any API — so a mere UUID observer cannot forge a heartbeat and
+    # quiet the no-progress watchdog or keep a stuck STARTING job alive.
+    hb_token_q = shlex.quote(compute_job_heartbeat_secret(spec.job_id))
     np_timeout = (
         max(60, int(spec.no_progress_timeout_seconds))
         if spec.no_progress_timeout_seconds is not None
@@ -2816,11 +3492,16 @@ upload_artifacts() {{
   return 0
 }}
 trap upload_artifacts EXIT HUP INT TERM QUIT
+# Initialise resume-provenance variable so set-u never fires in setup-failure
+# paths that run before the resume block, and so the TTL subshell below (forked
+# before resume) can still read the value via the /tmp file written on success.
+__BP_RESUME_D=""
 (
   sleep "$TTL_SECONDS"
+  _BP_TTL_PROV=$(cat /tmp/blueprint_resume_d.b64 2>/dev/null || true)
   python3 /tmp/blueprint_terminal_record.py \
     {artifact_dir} FAILED 124 runtime_ttl {result_file} {command_log_path} \
-    >/dev/null 2>&1 || true
+    "$_BP_TTL_PROV" >/dev/null 2>&1 || true
   echo "{_SERIAL_REASON_PREFIX}runtime_ttl"
   echo "{_SERIAL_STATUS_PREFIX}FAILED"
   echo "{_SERIAL_EXIT_PREFIX}124"
@@ -2834,9 +3515,11 @@ TTL_PID=$!
 # `set -u` script can reference "$_NP_WATCHDOG_PID" in the setup-failure kill
 # paths (clone/setup/pull) that run before the watchdog is armed.
 _NP_WATCHDOG_PID=
+_VIEWABLE_PID=
 echo '{heartbeat_body_b64}' | base64 -d > /tmp/blueprint_heartbeat_body.py
 _COMPUTE_ORCHESTRATOR_URL={orchestrator_url_q}
 _COMPUTE_JOB_ID={job_id_q}
+_COMPUTE_HB_TOKEN={hb_token_q}
 _compute_heartbeat() {{
   # Build the heartbeat body off-VM in a real, tested Python file (base64-baked
   # above): it merges the live-output tail with the latest {{"metric","value"}}
@@ -2847,7 +3530,7 @@ _compute_heartbeat() {{
   if [ -z "$_HB_BODY" ]; then
     _HB_BODY='{{}}'
   fi
-  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_JOB_ID" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
+  curl -sf --max-time 5 -X POST -H "Authorization: Bearer $_COMPUTE_HB_TOKEN" -H "Content-Type: application/json" -d "$_HB_BODY" "$_COMPUTE_ORCHESTRATOR_URL/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" >/dev/null 2>&1 || true
 }}
 _compute_heartbeat
 (
@@ -2857,6 +3540,14 @@ _compute_heartbeat
   done
 ) &
 _HEARTBEAT_PID=$!
+echo '{_VIEWABLE_WATCH_B64}' | base64 -d > /tmp/blueprint_viewable_watch.py
+python3 /tmp/blueprint_viewable_watch.py \
+  {artifact_dir} \
+  "$_COMPUTE_ORCHESTRATOR_URL" \
+  "$_COMPUTE_JOB_ID" \
+  "$_COMPUTE_HB_TOKEN" \
+  >/dev/null 2>&1 &
+_VIEWABLE_PID=$!
 echo "{_SERIAL_STATUS_PREFIX}RUNNING"
 {env_block}
 export {RESULT_FILE_ENV}={result_file}
@@ -2868,7 +3559,7 @@ mkdir -p {artifact_dir}
 {resume_block}
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
@@ -2888,7 +3579,7 @@ touch {progress_file} 2>/dev/null || true
       if [ "$_NP_NOW" = "$_NP_START" ]; then
         python3 /tmp/blueprint_terminal_record.py \
           {artifact_dir} FAILED 125 no_progress_timeout {result_file} {command_log_path} \
-          >/dev/null 2>&1 || true
+          "$__BP_RESUME_D" >/dev/null 2>&1 || true
         echo "{_SERIAL_REASON_PREFIX}no_progress_timeout"
         echo "{_SERIAL_STATUS_PREFIX}FAILED"
         echo "{_SERIAL_EXIT_PREFIX}125"
@@ -2939,9 +3630,9 @@ if [ -n "${{BLUEPRINT_RELEASE_SHA:-}}" ]; then
 fi
 python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} "$STATUS" "$EXIT_CODE" "$REASON" {result_file} {command_log_path} \
-  >/dev/null 2>&1 || true
+  "$__BP_RESUME_D" >/dev/null 2>&1 || true
 upload_artifacts
-kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" 2>/dev/null || true
+kill "$TTL_PID" "$_HEARTBEAT_PID" "$_NP_WATCHDOG_PID" "$_VIEWABLE_PID" 2>/dev/null || true
 poweroff || shutdown -h now || true
 exit "$EXIT_CODE"
 """
@@ -3053,6 +3744,32 @@ def _decode_release_echo_sha(raw_b64: str | None) -> str | None:
     return result or None
 
 
+def _decode_resume_provenance(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode a base64 JSON resume-provenance marker. Returns None on any error."""
+    if not raw_b64:
+        return None
+    candidate = raw_b64.strip()
+    if not candidate:
+        return None
+    try:
+        decoded = base64.b64decode(candidate, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        raw = decoded.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, dict) and data:
+        return data
+    return None
+
+
 def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     status_line: str | None = None
     exit_code: int | None = None
@@ -3060,6 +3777,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
     metrics_b64: str | None = None
     command_log_b64: str | None = None
     release_echo_b64: str | None = None
+    resume_provenance_b64: str | None = None
     for raw_line in serial_output.splitlines():
         line = raw_line.strip()
         if line.startswith(_SERIAL_STATUS_PREFIX):
@@ -3077,13 +3795,19 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             command_log_b64 = line[len(_SERIAL_COMMAND_LOG_PREFIX) :]
         elif line.startswith(_SERIAL_RELEASE_ECHO_PREFIX):
             release_echo_b64 = line[len(_SERIAL_RELEASE_ECHO_PREFIX) :]
+        elif line.startswith(_SERIAL_RESUME_PREFIX):
+            resume_provenance_b64 = line[len(_SERIAL_RESUME_PREFIX) :]
     if status_line is None:
         return None
     if status_line == "RUNNING":
-        return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+        return ComputeStatusResult(
+            status=ComputeJobStatus.RUNNING,
+            resume_provenance=_decode_resume_provenance(resume_provenance_b64),
+        )
     metrics = _decode_result_metrics(metrics_b64)
     command_log = _decode_command_log(command_log_b64)
     echoed_release_sha = _decode_release_echo_sha(release_echo_b64)
+    resume_provenance = _decode_resume_provenance(resume_provenance_b64)
     if status_line == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -3093,6 +3817,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -3102,6 +3827,7 @@ def _parse_serial_status(serial_output: str) -> ComputeStatusResult | None:
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
@@ -3174,6 +3900,9 @@ def _reconcile_terminal_record_to_status(
     metrics = _decode_result_metrics(record.get("metrics_b64"))
     command_log = _decode_command_log(record.get("command_log_b64"))
     echoed_release_sha = _decode_release_echo_sha(record.get("release_echo_b64"))
+    resume_provenance = _decode_resume_provenance(
+        record.get("resume_provenance_b64")
+    )
     if raw_status == "SUCCEEDED":
         return ComputeStatusResult(
             status=ComputeJobStatus.SUCCEEDED,
@@ -3183,6 +3912,7 @@ def _reconcile_terminal_record_to_status(
             metrics=metrics,
             command_log=command_log,
             echoed_release_sha=echoed_release_sha,
+            resume_provenance=resume_provenance,
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
@@ -3192,6 +3922,7 @@ def _reconcile_terminal_record_to_status(
         metrics=metrics,
         command_log=command_log,
         echoed_release_sha=echoed_release_sha,
+        resume_provenance=resume_provenance,
     )
 
 
@@ -3233,6 +3964,10 @@ def _launch_setup_state_dir(external_id: str, started_at_iso: str) -> None:
         started_at_iso,
     )
     _remove_local_terminal_status_for_external_id(external_id)
+    try:
+        os.remove(_local_resume_provenance_path_for_external_id(external_id))
+    except FileNotFoundError:
+        pass
 
 
 def _launch_spawn_subprocess(
@@ -3261,6 +3996,7 @@ def _launch_spawn_subprocess(
 # out the repo, and drives the hash-gated build.
 
 from app import compute_image_build  # noqa: E402
+from app import compute_image_remote_build  # noqa: E402
 
 # Files, in priority order, that count as dependency inputs when the manifest
 # does not enumerate them. Any that exist in the checkout are hashed.
@@ -3287,9 +4023,13 @@ def resolve_project_compute_image_build(
     *manifest_compute* is the ``compute`` dict returned by
     ``admin_project_tools._discover_manifest_tools`` (shape
     ``{"image": {"name": ..., "build": {...} | None}}``). Returns a dict
-    ``{"name", "dockerfile", "parent", "build_args"}`` when the project declares
-    a ``build`` section, or ``None`` when it only points at a prebuilt image
-    (or declares no compute image at all).
+    ``{"name", "dockerfile", "parent", "build_args", "deps"}`` when the project
+    declares a ``build`` section, or ``None`` when it only points at a prebuilt
+    image (or declares no compute image at all).
+
+    ``deps`` is either an explicit list of repo-relative dependency file paths
+    (when the manifest's ``build.deps`` field is set) or an empty list (meaning
+    the build system will auto-discover dependency files).
     """
     if not isinstance(manifest_compute, dict):
         return None
@@ -3302,19 +4042,33 @@ def resolve_project_compute_image_build(
     name = image.get("name")
     if not isinstance(name, str) or not name.strip():
         return None
+    raw_deps = build.get("deps")
+    deps: list[str] = list(raw_deps) if isinstance(raw_deps, list) else []
     return {
         "name": name.strip(),
         "dockerfile": build.get("dockerfile") or ".blueprint/Dockerfile.compute",
         "parent": build.get("parent"),
         "build_args": dict(build.get("build_args") or {}),
+        "deps": deps,
     }
 
 
 def _discover_dep_files(repo_dir: str) -> list[str]:
-    """Return the default dependency files that actually exist in *repo_dir*."""
+    """Return dependency files that exist in *repo_dir*, including lockfile-less fallbacks.
+
+    Checks all :data:`_DEFAULT_DEP_FILES` first, then adds bare ecosystem
+    manifests (``package.json``, ``Pipfile``, ``setup.cfg``) for any ecosystem
+    where no lockfile was found, so a project with only a bare manifest still
+    changes its image hash when that manifest changes.
+    """
+    present_set: set[str] = set()
     present: list[str] = []
     for rel in _DEFAULT_DEP_FILES:
         if os.path.isfile(os.path.join(repo_dir, rel)):
+            present.append(rel)
+            present_set.add(rel)
+    for rel in compute_image_build.bare_manifest_fallback_files(frozenset(present_set)):
+        if rel not in present_set and os.path.isfile(os.path.join(repo_dir, rel)):
             present.append(rel)
     return present
 
@@ -3350,6 +4104,30 @@ def _git_clone_ref(clone_url: str, ref: str, dest: str) -> None:
             raise RuntimeError(f"git checkout {ref} failed: {(co.stderr or '')[-500:]}")
 
 
+@dataclass(slots=True)
+class AsyncImageBuildDispatch:
+    """Returned by :func:`build_project_compute_image` when a REAL build was
+    handed to the off-orchestrator builder VM rather than run inline.
+
+    The build is NOT finished: the reaper poll sweep
+    (:func:`app.reaper_sweeps.sweep_poll_image_builds`) drives the reserved
+    :class:`ProjectComputeImageBuild` row to a terminal state and records the
+    ``ProjectComputeImage`` pin. Callers MUST treat this as "accepted, in
+    progress" (the admin endpoint returns HTTP 202; the auto-refresh sweep
+    reports ``status="dispatched"``) and NOT as a :class:`BuildResult`.
+
+    ``adopted`` is True when an in-flight build for the same ``(project, dep_hash)``
+    already existed and this trigger re-used it instead of provisioning a second
+    builder VM.
+    """
+
+    build_id: uuid.UUID
+    dep_hash: str
+    builder_vm_id: str | None
+    status: str
+    adopted: bool = False
+
+
 async def build_project_compute_image(
     project: "Project",
     *,
@@ -3358,11 +4136,14 @@ async def build_project_compute_image(
     ref: str | None = None,
     dep_files: Sequence[str] | None = None,
     dry_run: bool = False,
+    cancel_event: "threading.Event | None" = None,
     _token_fn=None,
     _clone_fn=None,
     _build_fn=None,
+    _reserve_fn=None,
+    _backend=None,
 ) -> Any:
-    """Bake (or reuse) the project's compute image, returning a ``BuildResult``.
+    """Bake (or reuse) the project's compute image.
 
     Clones the project repo at *ref* into a temp dir, then delegates to
     ``scripts/build_compute_image.build_and_push`` which content-hashes the
@@ -3370,13 +4151,51 @@ async def build_project_compute_image(
     for platform credentials, and otherwise builds + pushes a digest-pinned
     image. Returns the build script's ``BuildResult`` (carries ``pinned_ref``).
 
+    **Off-orchestrator dispatch (config-gated).** Cloud Run has no docker daemon,
+    so the untrusted ``docker build`` cannot run inline on the deployed engine.
+    When :func:`image_builder_backend_enabled` is on and a REAL build is needed,
+    only the daemon-free work runs in-process here — clone + content-hash + the
+    source-input credential scan + the registry presence/digest check + the
+    ``dry_run`` early return — and the actual build is handed to the configured
+    :class:`ImageBuilderBackend`: a :class:`ProjectComputeImageBuild` row is
+    reserved, the builder VM is started, and this returns an
+    :class:`AsyncImageBuildDispatch` WITHOUT blocking on the build. The reaper
+    poll sweep finalizes it. An already-present image (or a ``dry_run`` request)
+    still returns a :class:`BuildResult` inline. When the flag is off the whole
+    build runs inline exactly as before (the fallback path, kept until the VM
+    lane is proven).
+
     *build_config* is the dict from :func:`resolve_project_compute_image_build`.
-    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``) exist for tests; production
-    resolves an installation token and uses git + the real build script.
+    Hooks (``_token_fn``/``_clone_fn``/``_build_fn``/``_reserve_fn``/``_backend``)
+    exist for tests; production resolves an installation token and uses git + the
+    real build script / builder backend.
     """
     import tempfile as _tempfile
 
-    build_fn = _build_fn or compute_image_build.build_and_push
+    # The async lane only makes sense for a REAL build — a dry_run is a pure
+    # daemon-free hash/scan and must stay inline (it is what the drift check and
+    # presence probe rely on).
+    async_dispatch = image_builder_backend_enabled() and not dry_run
+    build_fn = _build_fn
+    if build_fn is None:
+        if async_dispatch:
+            # The async lane calls build_fn ONLY as a daemon-free dry_run probe
+            # (content hash + source-credential scan + registry presence/digest
+            # check, never a docker build); the real build is handed to the
+            # builder VM. The local hash implementation is the probe.
+            build_fn = compute_image_build.build_and_push
+        else:
+            # Inline server-side builds must always use the isolated remote
+            # builder. The local docker implementation is reserved for its
+            # standalone CLI; a partial or mistyped production configuration
+            # must fail closed.
+            if not compute_image_remote_build._remote_build_configured():
+                raise RuntimeError(
+                    "Remote compute-image build is not configured: set "
+                    "COMPUTE_IMAGE_BUILDER_SA, COMPUTE_IMAGE_BUILD_LOCATION, and "
+                    "COMPUTE_IMAGE_BUILD_SOURCE_BUCKET"
+                )
+            build_fn = compute_image_remote_build.remote_build_and_push
 
     owner = (getattr(project, "github_owner", None) or "").strip()
     repo = (getattr(project, "github_repo", None) or "").strip()
@@ -3387,15 +4206,22 @@ async def build_project_compute_image(
         ref or getattr(project, "promotion_target", None) or "main"
     )
     image_name = str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+    dockerfile = build_config.get("dockerfile") or ".blueprint/Dockerfile.compute"
+    build_args = dict(build_config.get("build_args") or {})
+    parent = build_config.get("parent")
 
     with _tempfile.TemporaryDirectory(prefix="compute-image-build-") as tmp:
         repo_dir = os.path.join(tmp, "repo")
 
         # Resolve a short-lived read token and clone (unless a hook overrides).
+        # The token is hoisted so the off-orchestrator dispatch can hand it to the
+        # builder VM for its own clone.
+        token = None
         if _clone_fn is not None:
             await asyncio.to_thread(_clone_fn, owner, repo, resolved_ref, repo_dir)
+            if _token_fn is not None:
+                token = await _token_fn(project)
         else:
-            token = None
             if _token_fn is not None:
                 token = await _token_fn(project)
             else:
@@ -3415,20 +4241,208 @@ async def build_project_compute_image(
             clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
             await asyncio.to_thread(_git_clone_ref, clone_url, resolved_ref, repo_dir)
 
-        resolved_dep_files = list(dep_files) if dep_files is not None else _discover_dep_files(repo_dir)
+        explicit_deps = list(build_config.get("deps") or [])
+        resolved_dep_files = (
+            list(dep_files) if dep_files is not None
+            else (explicit_deps if explicit_deps else _discover_dep_files(repo_dir))
+        )
+
+        if async_dispatch:
+            # Daemon-free probe: content-hash + source credential scan + registry
+            # presence/digest check, with NO docker build. An already-present
+            # image (or a scan finding, which raises) returns inline; anything
+            # that would actually build is dispatched to the builder VM.
+            probe = await asyncio.to_thread(
+                build_fn,
+                repo_dir=repo_dir,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                parent=parent,
+                build_args=dict(build_args),
+                dry_run=True,
+            )
+            if getattr(probe, "already_present", False):
+                return probe
+            return await _dispatch_async_image_build(
+                project=project,
+                registry_repo=registry_repo,
+                image_name=image_name,
+                dep_hash=getattr(probe, "dep_hash", "") or "",
+                owner=owner,
+                repo=repo,
+                ref=resolved_ref,
+                repo_token=token or "",
+                dockerfile=dockerfile,
+                dep_files=resolved_dep_files,
+                build_args=build_args,
+                parent=parent,
+                _reserve_fn=_reserve_fn,
+                _backend=_backend,
+            )
 
         result = await asyncio.to_thread(
             build_fn,
             repo_dir=repo_dir,
             registry_repo=registry_repo,
             image_name=image_name,
-            dockerfile=build_config.get("dockerfile") or ".blueprint/Dockerfile.compute",
+            dockerfile=dockerfile,
             dep_files=resolved_dep_files,
-            parent=build_config.get("parent"),
-            build_args=dict(build_config.get("build_args") or {}),
+            parent=parent,
+            build_args=dict(build_args),
             dry_run=dry_run,
+            cancel_event=cancel_event,
         )
     return result
+
+
+async def reserve_project_compute_image_build(
+    session: Any,
+    *,
+    project_id: uuid.UUID,
+    dep_hash: str,
+    registry_repo: str,
+    image_name: str,
+    deadline_at: datetime | None = None,
+) -> ProjectComputeImageBuild:
+    """Reserve (or adopt) a :class:`ProjectComputeImageBuild` tracking row.
+
+    Idempotent on ``(project_id, dep_hash)``: a re-trigger for the same
+    dependency hash while a build is still ``PENDING``/``BUILDING`` returns the
+    existing row rather than inserting a duplicate — a duplicate would provision
+    a second builder VM (double-spend) and produce two poll-sweep finalizers for
+    one image. A fresh reservation is inserted ``PENDING``; the caller flips it to
+    ``BUILDING`` once the VM is started. Commits the session.
+    """
+    from sqlalchemy import select
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImageBuild)
+            .where(
+                ProjectComputeImageBuild.project_id == project_id,
+                ProjectComputeImageBuild.dep_hash == dep_hash,
+                ProjectComputeImageBuild.status.in_(
+                    [
+                        ComputeImageBuildStatus.PENDING,
+                        ComputeImageBuildStatus.BUILDING,
+                    ]
+                ),
+            )
+            .order_by(ProjectComputeImageBuild.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    row = ProjectComputeImageBuild(
+        project_id=project_id,
+        dep_hash=dep_hash,
+        registry_repo=registry_repo,
+        image_name=image_name,
+        status=ComputeImageBuildStatus.PENDING,
+        deadline_at=deadline_at,
+    )
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+async def _dispatch_async_image_build(
+    *,
+    project: "Project",
+    registry_repo: str,
+    image_name: str,
+    dep_hash: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    repo_token: str,
+    dockerfile: str,
+    dep_files: Sequence[str],
+    build_args: dict[str, str],
+    parent: str | None,
+    _reserve_fn=None,
+    _backend=None,
+) -> AsyncImageBuildDispatch:
+    """Reserve a tracking row, start the builder VM, and return without blocking.
+
+    On :meth:`ImageBuilderBackend.start` failure the reserved row is marked
+    ``FAILED`` (so it never lingers ``PENDING``) and a ``RuntimeError`` is raised
+    — the admin endpoint surfaces it as a 422 and the auto-refresh sweep isolates
+    it. The reaper poll sweep is what finalizes a successfully-started build.
+    """
+    from app.database import AsyncSessionLocal
+
+    reserve_fn = _reserve_fn or reserve_project_compute_image_build
+    backend = _backend if _backend is not None else get_image_builder_backend()
+    deadline_at = _utcnow() + timedelta(seconds=_IMAGE_BUILDER_DEADLINE_SECONDS)
+
+    async with AsyncSessionLocal() as session:
+        build_row = await reserve_fn(
+            session,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            deadline_at=deadline_at,
+        )
+        # Adopt an already-dispatched in-flight build instead of starting a
+        # second VM for the same dependency hash.
+        if (
+            build_row.status == ComputeImageBuildStatus.BUILDING
+            and build_row.builder_vm_id
+        ):
+            return AsyncImageBuildDispatch(
+                build_id=build_row.id,
+                dep_hash=dep_hash,
+                builder_vm_id=build_row.builder_vm_id,
+                status=ComputeImageBuildStatus.BUILDING.value,
+                adopted=True,
+            )
+
+        request = ImageBuildRequest(
+            build_id=build_row.id,
+            project_id=project.id,
+            dep_hash=dep_hash,
+            registry_repo=registry_repo,
+            image_name=image_name,
+            repo_clone={"owner": owner, "repo": repo, "ref": ref},
+            repo_token=repo_token,
+            dockerfile=dockerfile,
+            dep_files=tuple(dep_files),
+            build_args=dict(build_args or {}),
+            parent=parent,
+            deadline_at=deadline_at,
+        )
+        try:
+            handle = await backend.start(request)
+        except Exception as e:  # noqa: BLE001 — record the failure, don't leak PENDING
+            build_row.status = ComputeImageBuildStatus.FAILED
+            build_row.error_reason = f"builder start failed: {e}"[:2000]
+            build_row.updated_at = _utcnow()
+            session.add(build_row)
+            with contextlib.suppress(Exception):
+                await session.commit()
+            raise RuntimeError(f"image-builder dispatch failed: {e}") from e
+
+        build_row.status = ComputeImageBuildStatus.BUILDING
+        build_row.builder_vm_id = handle.external_id
+        build_row.zone = handle.zone
+        build_row.started_at = handle.started_at
+        build_row.deadline_at = deadline_at
+        build_row.updated_at = _utcnow()
+        session.add(build_row)
+        await session.commit()
+        return AsyncImageBuildDispatch(
+            build_id=build_row.id,
+            dep_hash=dep_hash,
+            builder_vm_id=handle.external_id,
+            status=ComputeImageBuildStatus.BUILDING.value,
+        )
 
 
 def _parse_digest_from_pinned_ref(pinned_ref: str | None) -> str | None:
@@ -3550,6 +4564,509 @@ async def record_project_compute_image_build(
         )
     ).scalar_one()
     return row
+
+
+async def _preserve_existing_digest_pin_cb(
+    session: Any, project_id: uuid.UUID, result: Any
+) -> Any:
+    """Never let a digest-less build result overwrite a stored digest.
+
+    The backend twin of ``admin_project_tools._preserve_existing_digest_pin``:
+    an unchanged-deps re-trigger takes ``build_and_push``'s already-present fast
+    path, which resolves the digest from the registry — but a briefly-unreachable
+    registry (or a tag-only push) still yields ``digest=None``. Recording that
+    would silently unpin the project's compute image. If a row for this
+    ``(project_id, dep_hash)`` already carries a digest, keep it.
+
+    Lives here (not imported from the router) so the reusable driver never has to
+    reach up into a FastAPI router module — that would be an import cycle
+    (``admin_project_tools`` imports ``compute_backends`` as ``_cb``).
+    """
+    from sqlalchemy import select
+
+    pinned_ref = getattr(result, "pinned_ref", None) or ""
+    if _parse_digest_from_pinned_ref(pinned_ref):
+        return result  # carries a digest — nothing to protect
+
+    dep_hash = getattr(result, "dep_hash", None) or ""
+    if not dep_hash:
+        return result
+
+    existing = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.dep_hash == dep_hash,
+            )
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is None or not existing.digest:
+        return result  # nothing stored to protect
+
+    logger.warning(
+        "[COMPUTE-IMAGE] auto-refresh for project=%s dep_hash=%s resolved no "
+        "digest; keeping the stored pin %s rather than overwriting it with NULL",
+        project_id,
+        dep_hash,
+        existing.pinned_ref,
+    )
+    return compute_image_build.BuildResult(
+        pinned_ref=existing.pinned_ref,
+        tag=existing.tag or getattr(result, "tag", "") or "",
+        dep_hash=dep_hash,
+        already_present=bool(getattr(result, "already_present", True)),
+        built=bool(existing.built or getattr(result, "built", False)),
+        digest=existing.digest,
+    )
+
+
+async def _record_unchanged_pin(
+    session: Any,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+    full_repo: str,
+    dep_hash: str,
+    resolve_digest_fn,
+    record_fn,
+) -> bool:
+    """Best-effort: record the pin for an image that is ALREADY present.
+
+    The fast-path no-op case: the registry already has this ``dep_hash`` tag, so
+    there is nothing to build. We still want the durable ``ProjectComputeImage``
+    pin to exist — but only when we can resolve a REAL ``sha256:`` digest.
+
+    A ``None`` digest means UNKNOWN (registry briefly unreachable), not "no
+    digest"; writing it would clobber a stored pin with NULL, so we refuse. This
+    is the ``_preserve_existing_digest_pin`` philosophy applied to the fast path:
+    only ever write a non-null digest. Returns whether a row was written.
+    """
+    try:
+        digest = await asyncio.to_thread(resolve_digest_fn, full_repo, dep_hash)
+    except Exception:  # noqa: BLE001 — registry helpers fail open
+        digest = None
+    if not digest:
+        return False
+    result = compute_image_build.BuildResult(
+        pinned_ref=f"{full_repo}@{digest}",
+        tag=dep_hash,
+        dep_hash=dep_hash,
+        already_present=True,
+        # The image is present in the registry; the pin describes a real image.
+        built=True,
+        digest=digest,
+    )
+    await record_fn(session, project_id, registry_repo, image_name, result)
+    await session.commit()
+    return True
+
+
+async def refresh_project_compute_image(
+    session: Any,
+    project: "Project",
+    *,
+    allow_build: bool = True,
+    build_semaphore: "asyncio.Semaphore | None" = None,
+    acquire_timeout: float = 1.0,
+    progress_cb: "Callable[[], None] | None" = None,
+    _manifest_fn=None,
+    _token_fn=None,
+    _default_branch_fn=None,
+    _fetch_bytes_fn=None,
+    _tag_exists_fn=None,
+    _resolve_digest_fn=None,
+    _build_fn=None,
+    _record_fn=None,
+) -> dict[str, Any]:
+    """Auto-rebuild ONE project's baked compute image when its manifest changed.
+
+    Closes the drift gap: today a project-baked compute image only ever rebuilds
+    via the manual OWNER-only ``POST /projects/{id}/compute-image/build``. This
+    driver lets a periodic sweep self-heal — a changed dependency manifest (any
+    hashed dep file, or the compute Dockerfile) triggers an automatic rebuild +
+    re-pin, while an unchanged manifest resolves to a cheap no-op with NO git
+    clone and NO docker build.
+
+    Steps, all best-effort — this function never raises into its caller:
+
+    * **resolve config** — discover ``.blueprint/tools.json`` (cached) and extract
+      ``compute.image.build`` via :func:`resolve_project_compute_image_build`;
+      skip cleanly (``no_config``) with no connected repo, no read token, no build
+      section, or no Dockerfile at the declared path.
+    * **cheap current hash** — fetch the Dockerfile and each present
+      :data:`_DEFAULT_DEP_FILES` from the repo's default branch via the GitHub
+      file-fetch helpers (NO clone), keyed exactly the way ``build_and_push``
+      assembles its inputs (Dockerfile as ``"Dockerfile"``, each dep file under
+      its relative path) so :func:`compute_image_build.compute_dependency_hash`
+      matches what a real build would produce.
+    * **fast-path no-op** — if ``registry_tag_exists(full_repo, dep_hash)`` the
+      image is current: do NOT build; best-effort record the pin (never overwrite
+      an existing digest with NULL).
+    * **rebuild** — only when the tag is ABSENT, drive the existing pipeline
+      (:func:`build_project_compute_image` -> :func:`record_project_compute_image_build`),
+      honoring the process-wide build concurrency guard (*build_semaphore*) and a
+      caller-supplied build budget (*allow_build*). When *progress_cb* is provided,
+      the build runs as a background task with periodic heartbeats so the reaper's
+      lifecycle watchdog does not cancel the cycle during a multi-minute build.
+
+    Returns a small structured result whose ``status`` is one of ``no_config`` /
+    ``unchanged`` / ``rebuilt`` / ``deferred`` / ``error``. All hooks default to
+    the real production functions; tests inject them so nothing hits docker or
+    GitHub.
+    """
+    manifest_fn = _manifest_fn
+    if manifest_fn is None:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        manifest_fn = _discover_manifest_tools
+    if _token_fn is None:
+        from app.github_auth import get_repo_installation_read_token
+
+        token_fn = get_repo_installation_read_token
+    else:
+        token_fn = _token_fn
+    if _default_branch_fn is None:
+        from app.github_refs import get_repo_default_branch
+
+        default_branch_fn = get_repo_default_branch
+    else:
+        default_branch_fn = _default_branch_fn
+    if _fetch_bytes_fn is None:
+        from app.github import get_file_bytes_at_ref
+
+        fetch_bytes_fn = get_file_bytes_at_ref
+    else:
+        fetch_bytes_fn = _fetch_bytes_fn
+    # Use Docker-free tag / digest checks when the remote builder is configured
+    # so the fast-path no-op (unchanged manifest) never needs a local docker daemon.
+    _remote_ok = compute_image_remote_build._remote_build_configured()
+    if _tag_exists_fn is not None:
+        tag_exists_fn = _tag_exists_fn
+    elif _remote_ok:
+        tag_exists_fn = compute_image_remote_build.remote_registry_tag_exists
+    else:
+        tag_exists_fn = compute_image_build.registry_tag_exists
+
+    if _resolve_digest_fn is not None:
+        resolve_digest_fn = _resolve_digest_fn
+    elif _remote_ok:
+        resolve_digest_fn = compute_image_remote_build._resolve_registry_digest_from_api
+    else:
+        resolve_digest_fn = compute_image_build._resolve_digest
+
+    build_fn = _build_fn or build_project_compute_image
+    record_fn = _record_fn or record_project_compute_image_build
+
+    project_id = getattr(project, "id", None)
+    try:
+        owner = (getattr(project, "github_owner", None) or "").strip()
+        repo = (getattr(project, "github_repo", None) or "").strip()
+        if not owner or not repo:
+            return {"status": "no_config", "reason": "no connected repo"}
+
+        manifest = await manifest_fn(project)
+        build_config = resolve_project_compute_image_build(
+            (manifest or {}).get("compute")
+        )
+        if build_config is None:
+            return {"status": "no_config", "reason": "no compute.image.build section"}
+
+        token = await token_fn(owner, repo)
+        if not token:
+            return {"status": "no_config", "reason": "no installation read token"}
+
+        # Fail closed on a genuinely buildable project (repo + build section +
+        # token) when no build backend is available: neither the isolated remote
+        # builder nor the off-orchestrator VM builder is configured and no test
+        # hook supplied a build/registry function. Placed AFTER the no_config
+        # short-circuits so a project with nothing to build still resolves to
+        # no_config rather than a misleading error.
+        if (
+            not _remote_ok
+            and not image_builder_backend_enabled()
+            and _tag_exists_fn is None
+            and _resolve_digest_fn is None
+            and _build_fn is None
+        ):
+            return {
+                "status": "error",
+                "error": "Remote compute-image build is not configured",
+            }
+
+        default_branch = await default_branch_fn(token, owner, repo)
+        project_id_str = str(project_id or "")
+        dockerfile_rel = (
+            build_config.get("dockerfile") or ".blueprint/Dockerfile.compute"
+        )
+
+        # Cheap current hash: fetch the Dockerfile + present dep files at the
+        # default branch, NO clone. Absent Dockerfile => nothing buildable (the
+        # real build would raise FileNotFoundError) => skip cleanly.
+        dockerfile_bytes = await fetch_bytes_fn(
+            dockerfile_rel,
+            token=token,
+            owner=owner,
+            repo=repo,
+            ref=default_branch,
+            project_id=project_id_str,
+        )
+        if dockerfile_bytes is None:
+            return {
+                "status": "no_config",
+                "reason": f"no Dockerfile at {dockerfile_rel}",
+            }
+
+        # Fetch dep file bytes using assemble_fingerprint_inputs (same logic as
+        # build_and_push) so the cheap hash is guaranteed to match the real build.
+        # When the manifest declares explicit deps, fetch only those; otherwise
+        # fetch the defaults and bare-manifest fallbacks.
+        explicit_deps = list(build_config.get("deps") or [])
+        dep_file_bytes: Dict[str, bytes] = {}
+        if explicit_deps:
+            for rel in explicit_deps:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is None:
+                    # Explicit declarations are mandatory, just as they are in
+                    # build_and_push.  Never hash a partial input set and reuse
+                    # a registry tag that the real build could not produce.
+                    return {
+                        "status": "no_config",
+                        "reason": f"declared dependency file not found: {rel}",
+                    }
+                dep_file_bytes[rel] = data
+        else:
+            # Fetch all defaults, then bare-manifest fallbacks for any ecosystem
+            # that has no lockfile present.
+            fetched_names: set[str] = set()
+            for rel in _DEFAULT_DEP_FILES:
+                data = await fetch_bytes_fn(
+                    rel,
+                    token=token,
+                    owner=owner,
+                    repo=repo,
+                    ref=default_branch,
+                    project_id=project_id_str,
+                )
+                if data is not None:
+                    dep_file_bytes[rel] = data
+                    fetched_names.add(rel)
+            for rel in compute_image_build.bare_manifest_fallback_files(
+                frozenset(fetched_names)
+            ):
+                if rel not in dep_file_bytes:
+                    data = await fetch_bytes_fn(
+                        rel,
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        ref=default_branch,
+                        project_id=project_id_str,
+                    )
+                    if data is not None:
+                        dep_file_bytes[rel] = data
+
+        parent = build_config.get("parent")
+        build_args = dict(build_config.get("build_args") or {})
+        inputs = compute_image_build.assemble_fingerprint_inputs(
+            dockerfile_bytes,
+            dep_file_bytes,
+            parent=parent,
+            build_args=build_args,
+        )
+        dep_hash = compute_image_build.compute_dependency_hash(inputs)
+
+        registry_repo = resolve_compute_image_registry_repo()
+        image_name = (
+            str(build_config["name"]).rsplit("/", 1)[-1].split(":", 1)[0].split("@", 1)[0]
+        )
+        full_repo = f"{registry_repo}/{image_name}"
+
+        # FAST-PATH NO-OP: the tag already exists => the image is current for this
+        # exact manifest. Do NOT build; just make sure the pin is recorded.
+        if await asyncio.to_thread(tag_exists_fn, full_repo, dep_hash):
+            recorded = await _record_unchanged_pin(
+                session,
+                project_id,
+                registry_repo,
+                image_name,
+                full_repo,
+                dep_hash,
+                resolve_digest_fn,
+                record_fn,
+            )
+            return {"status": "unchanged", "dep_hash": dep_hash, "recorded": recorded}
+
+        # A genuinely new/changed manifest: a real rebuild is needed.
+        if not allow_build:
+            # Per-cycle build budget exhausted — the next hourly pass retries.
+            return {
+                "status": "deferred",
+                "reason": "build_budget_exhausted",
+                "dep_hash": dep_hash,
+            }
+
+        # Respect the process-wide build concurrency guard the admin endpoint
+        # uses: never stampede the orchestrator host with concurrent builds. If a
+        # build is already in flight, skip building this cycle (retry next hour).
+        acquired = False
+        if build_semaphore is not None:
+            if build_semaphore.locked():
+                return {
+                    "status": "deferred",
+                    "reason": "builder_busy",
+                    "dep_hash": dep_hash,
+                }
+            try:
+                await asyncio.wait_for(
+                    build_semaphore.acquire(), timeout=acquire_timeout
+                )
+                acquired = True
+            except asyncio.TimeoutError:
+                return {
+                    "status": "deferred",
+                    "reason": "builder_busy",
+                    "dep_hash": dep_hash,
+                }
+
+        # A threading.Event lets the remote-build worker detect outer cancellation
+        # and issue a Cloud Build cancel before cleanup.
+        _cancel_event = threading.Event()
+        _build_task = None
+        try:
+            if progress_cb is not None:
+                # Run the build as a background task with periodic progress
+                # heartbeats so the reaper lifecycle watchdog
+                # (REAPER_HANG_SECONDS=300) does not cancel the cycle during
+                # a multi-minute baked-image build.
+                _build_task = asyncio.ensure_future(build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                    cancel_event=_cancel_event,
+                ))
+                try:
+                    while True:
+                        _done, _pending = await asyncio.wait(
+                            [_build_task], timeout=_HEARTBEAT_INTERVAL
+                        )
+                        if _done:
+                            result = _build_task.result()
+                            break
+                        progress_cb()
+                except BaseException:
+                    # Signal the remote-build thread so it cancels the Cloud Build
+                    # before cleanup.  Transfer semaphore ownership to a drain task
+                    # so the slot is not released while _build_task is still running.
+                    #
+                    # Do NOT call _build_task.cancel() here.  build_fn wraps
+                    # asyncio.to_thread; cancelling the asyncio Future marks it done
+                    # immediately while the OS thread continues running (Python cannot
+                    # stop threads).  Without cancellation, _drain_and_release's
+                    # ``await _t`` blocks until the thread truly finishes cleanup,
+                    # ensuring the semaphore slot is not released prematurely.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_and_release(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_and_release())
+                        acquired = False
+                    raise
+            else:
+                # Direct-await path (no heartbeat).  Use ensure_future + shield so
+                # outer cancellation does not detach the thread-backed coroutine from
+                # the drain task that owns the semaphore slot.
+                _build_task = asyncio.ensure_future(build_fn(
+                    project,
+                    registry_repo=registry_repo,
+                    build_config=build_config,
+                    ref=default_branch,
+                    cancel_event=_cancel_event,
+                ))
+                try:
+                    result = await asyncio.shield(_build_task)
+                except BaseException:
+                    # Signal the thread so the remote Cloud Build is cancelled.
+                    # Transfer semaphore ownership to a drain task for the same
+                    # reason as the progress path: the thread may still be running
+                    # cleanup even after the shield raised CancelledError.
+                    _cancel_event.set()
+                    if acquired and build_semaphore is not None:
+                        _t, _s = _build_task, build_semaphore
+                        async def _drain_direct(_t=_t, _s=_s):
+                            with contextlib.suppress(BaseException):
+                                await _t
+                            _s.release()
+                        asyncio.ensure_future(_drain_direct())
+                        acquired = False
+                    raise
+        finally:
+            if acquired:
+                build_semaphore.release()
+
+        # Off-orchestrator dispatch: the real build was handed to a builder VM and
+        # is NOT finished — there is nothing to record yet. The reaper poll sweep
+        # (sweep_poll_image_builds) drives the reserved row to terminal and records
+        # the pin. Report the dispatch so the sweep can count it.
+        if isinstance(result, AsyncImageBuildDispatch):
+            logger.info(
+                "[COMPUTE-IMAGE] auto-refresh dispatched async build for "
+                "project=%s dep_hash=%s build_id=%s (adopted=%s)",
+                project_id,
+                dep_hash,
+                result.build_id,
+                result.adopted,
+            )
+            return {
+                "status": "dispatched",
+                "dep_hash": dep_hash,
+                "build_id": str(result.build_id),
+                "builder_vm_id": result.builder_vm_id,
+                "adopted": result.adopted,
+            }
+
+        result = await _preserve_existing_digest_pin_cb(session, project_id, result)
+        row = await record_fn(
+            session, project_id, registry_repo, image_name, result
+        )
+        await session.commit()
+        logger.info(
+            "[COMPUTE-IMAGE] auto-rebuilt project=%s dep_hash=%s (built=%s)",
+            project_id,
+            dep_hash,
+            getattr(row, "built", None),
+        )
+        return {
+            "status": "rebuilt",
+            "dep_hash": dep_hash,
+            "pinned_ref": getattr(row, "pinned_ref", None),
+            "digest": getattr(row, "digest", None),
+            "built": bool(getattr(row, "built", False)),
+        }
+    except Exception as e:  # noqa: BLE001 — best-effort; never raise into the sweep
+        logger.warning(
+            "[COMPUTE-IMAGE] auto-refresh failed for project=%s: %s",
+            project_id,
+            e,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        return {"status": "error", "error": str(e)}
 
 
 def is_digest_pinned(ref: str | None) -> bool:
@@ -3694,6 +5211,153 @@ async def resolve_digest_pinned_default_image(
     return manifest_name
 
 
+async def resolve_project_default_container_image(
+    session: Any,
+    project: Any,
+) -> str | None:
+    """Resolve a project's default baked compute image to a digest-pinned ref.
+
+    The SINGLE shared implementation of the manifest-fetch + digest-pin idiom
+    used to default a ``compute_experiment``'s ``container_image`` to the
+    project's declared baked image. Both the completion authors
+    (``plan_completion`` / ``research_completion``) and the orchestrator dispatch
+    path (``_dispatch_compute_experiment_directly``) call this so the two cannot
+    drift — a compute_experiment gets the same digest-pinned default whether it
+    is authored through a completion handler or dispatched directly (operator
+    experiment, planned prerequisite, retry).
+
+    Reads the project's ``.blueprint/tools.json`` ``compute.image.name`` manifest
+    entry and, when present, pins the (typically mutable) tag to a
+    content-addressed ``registry/repo@sha256:...`` reference via
+    :func:`resolve_digest_pinned_default_image`.
+
+    Fail-OPEN and additive: returns ``None`` when the project is missing, its
+    manifest declares no compute image, or any manifest/registry error occurs —
+    the caller then preserves its current image-less behavior. Never raises.
+    """
+    if project is None:
+        return None
+    try:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+        manifest = await _discover_manifest_tools(project)
+        compute_image = (manifest.get("compute") or {}).get("image") or {}
+        name = compute_image.get("name") if isinstance(compute_image, dict) else None
+        if not name:
+            return None
+        # resolve_digest_pinned_default_image is idempotent (already-digest-pinned
+        # refs return unchanged), so double-resolution across authoring + dispatch
+        # is safe.
+        return await resolve_digest_pinned_default_image(session, project.id, name)
+    except Exception:  # noqa: BLE001 — fail-open to image-less behavior.
+        logger.debug(
+            "[COMPUTE] project default container-image resolution failed for "
+            "project=%s",
+            getattr(project, "id", None),
+        )
+        return None
+
+
+async def resolve_project_baked_image_strict(
+    session: Any,
+    project: Any,
+) -> tuple[str | None, str | None]:
+    """Resolve a project's declared baked compute image — fail CLOSED on unresolvable.
+
+    Returns ``(pinned_ref, None)`` when the project's manifest declares
+    ``compute.image.name`` AND a ``ProjectComputeImage`` row exists with
+    ``built=True`` and a non-null ``digest``.
+
+    Returns ``(None, None)`` when the project declares NO baked image (no
+    manifest, manifest error, or no ``compute.image.name`` key) — the caller
+    must preserve image-less behavior, identical to today.
+
+    Returns ``(None, reason)`` when the project declares a baked image name but
+    no resolved, digest-pinned build record can be found — the caller MUST
+    terminal-fail the dispatch with the returned reason rather than silently
+    running image-less on the host toolchain.
+
+    Unlike :func:`resolve_project_default_container_image` (which is
+    fail-OPEN and used at authoring time), this function is used at dispatch
+    time where the baked-image isolation contract must be enforced: running a
+    declared-but-unbuilt image on the host toolchain is a reproducibility and
+    isolation failure that must surface to the operator.
+    """
+    if project is None:
+        return None, None
+    try:
+        from app.routers.admin_project_tools import _discover_manifest_tools
+
+        manifest = await _discover_manifest_tools(project)
+        compute_image = (manifest.get("compute") or {}).get("image") or {}
+        name = compute_image.get("name") if isinstance(compute_image, dict) else None
+        if not name:
+            return None, None
+    except Exception:  # noqa: BLE001 — no manifest means no image declared
+        logger.debug(
+            "[COMPUTE] manifest fetch failed for project=%s; treating as no baked image",
+            getattr(project, "id", None),
+        )
+        return None, None
+
+    # Image is declared — resolve to a built, digest-pinned record or fail closed.
+    if "@sha256:" in name:
+        # Already content-addressed; accept as-is (no build record needed).
+        return name, None
+
+    registry_repo, image_name, ref_tag = _split_image_ref(name)
+
+    try:
+        from sqlalchemy import select
+
+        conditions = [
+            ProjectComputeImage.project_id == project.id,
+            ProjectComputeImage.image_name == image_name,
+            ProjectComputeImage.built.is_(True),
+            ProjectComputeImage.digest.is_not(None),
+        ]
+        if registry_repo:
+            conditions.append(ProjectComputeImage.registry_repo == registry_repo)
+
+        row = None
+        if ref_tag:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions, ProjectComputeImage.tag == ref_tag)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+
+        if row is None:
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(*conditions)
+                    .order_by(ProjectComputeImage.updated_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001
+        reason = (
+            f"Project declares baked compute image '{name}' but the build-record "
+            f"lookup failed: {exc} — refusing to run image-less on host toolchain"
+        )
+        logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+        return None, reason
+
+    if row is not None and row.pinned_ref:
+        return row.pinned_ref, None
+
+    reason = (
+        f"Project declares baked compute image '{name}' but no built, "
+        "digest-pinned build record exists — image has not been built yet or the "
+        "build failed; refusing to run image-less on host toolchain"
+    )
+    logger.warning("[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None))
+    return None, reason
+
+
 def resolve_compute_image_registry_repo() -> str:
     """Return the Artifact Registry repo base for compute images.
 
@@ -3710,3 +5374,517 @@ def resolve_compute_image_registry_repo() -> str:
     region = os.environ.get("COMPUTE_IMAGE_REGION", "us").strip() or "us"
     project = storage.GCP_PROJECT_ID
     return f"{region}-docker.pkg.dev/{project}/compute-images"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Off-orchestrator compute-image builder (DARK — gated OFF by config)
+#
+# Cloud Run's request process has no docker daemon and a 60-minute request cap,
+# so the untrusted, repo-controlled ``docker build`` cannot run inline on the
+# orchestrator. This backend moves that build onto a THROWAWAY GCE VM that runs
+# under the leaf ``image-builder-sa`` identity (push/pull on the images repo and
+# nothing else), reusing the existing compute-job substrate (provision + serial
+# markers + signed-GCS + poll) rather than inventing new machinery.
+#
+# The build is confined by the TRUSTED release copy of ``build_compute_image.py``
+# (base64-embedded, never the repo's copy): ``docker build --network=none``, the
+# layer-credential scan, then ``docker push``. This module only ADDS the
+# machinery; it is selectable by config and is NOT wired into any trigger or
+# sweep yet. See ``sweep_poll_image_builds`` for the polling half.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+IMAGE_BUILDER_BACKEND_NAME = "gcp-ephemeral-vm"
+
+# Serial markers the builder VM emits (siblings of the compute-job markers). The
+# result payload is base64 so the machine-readable ``RESULT_JSON`` object never
+# has to survive a serial/escape pass — see CLAUDE.md's cross-language rule.
+_SERIAL_BUILD_RESULT_PREFIX = "BLUEPRINT_BUILD_RESULT="
+_SERIAL_BUILD_STATUS_PREFIX = "BLUEPRINT_BUILD_STATUS="
+_SERIAL_BUILD_EXIT_PREFIX = "BLUEPRINT_BUILD_EXIT="
+
+# Default builder VM shape: a CPU VM with enough room for a docker build context
+# and image layers. Env-overridable so the operator can size it per project.
+_IMAGE_BUILDER_MACHINE_TYPE = os.getenv(
+    "COMPUTE_IMAGE_BUILDER_MACHINE_TYPE", "e2-standard-4"
+)
+# Wall-clock ceiling for a single build (provision → build → push → terminal).
+# The poll sweep deletes the VM and marks TIMED_OUT once this elapses.
+_IMAGE_BUILDER_DEADLINE_SECONDS = _positive_int_env(
+    "COMPUTE_IMAGE_BUILDER_DEADLINE_SECONDS", 45 * 60
+)
+# Defensive ceiling on the decoded serial ``RESULT_JSON`` payload — the object is
+# small (a pinned ref + digest + a short findings list), so anything larger is
+# treated as absent rather than parsed.
+_MAX_BUILD_RESULT_DECODED_BYTES = 65536
+
+# On-VM paths for the builder startup script.
+_BUILDER_REPO_DIR = "/tmp/blueprint_build_repo"
+_BUILDER_TOOL_FILE = "/tmp/blueprint_build_tool.py"
+_BUILDER_RESULT_FILE = "/tmp/blueprint_build_result.json"
+_BUILDER_STDOUT_FILE = "/tmp/blueprint_build_stdout.log"
+_BUILDER_TERMINAL_FILE = "/tmp/blueprint_build_terminal.json"
+_BUILDER_CLONE_ERR = "/tmp/blueprint_build_clone.err"
+
+
+def image_builder_backend_enabled() -> bool:
+    """Whether the off-orchestrator image builder is enabled (dark by default).
+
+    Ships OFF: nothing in this module runs until an operator flips
+    ``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED`` to a truthy value. The trigger
+    endpoint and auto-refresh sweep are unchanged and keep using the inline path
+    until this backend is proven.
+    """
+    return os.getenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "false").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _image_builder_vm_name(project_id: object, dep_hash: str) -> str:
+    """Deterministic builder-VM name derived from ``(project_id, dep_hash)``.
+
+    A re-trigger for the SAME project + dependency hash resolves to the SAME VM
+    name, so :meth:`GcpEphemeralVmImageBuilderBackend.start` ADOPTS the in-flight
+    build instead of provisioning a duplicate (and double-spending). The name is
+    a short sha256 over both fields so two projects that happen to share a
+    dep_hash still get distinct VMs, and the result is always a DNS-safe GCE
+    instance name (``[a-z]([-a-z0-9]*[a-z0-9])?``, ≤63 chars).
+    """
+    digest = hashlib.sha256(f"{project_id}:{dep_hash}".encode("utf-8")).hexdigest()
+    return f"img-build-{digest[:20]}"
+
+
+@dataclass(slots=True)
+class ImageBuildRequest:
+    """The inputs one off-orchestrator compute-image build needs.
+
+    Mirrors the ``ComputeLaunchSpec`` role for the builder lane: everything the
+    startup script embeds (repo + ref + short-lived token, registry target,
+    Dockerfile / dep files, build args) plus the row id it reports against.
+    """
+
+    build_id: uuid.UUID
+    project_id: uuid.UUID
+    dep_hash: str
+    registry_repo: str
+    image_name: str
+    repo_clone: dict[str, str]
+    repo_token: str
+    dockerfile: str = ".blueprint/Dockerfile.compute"
+    dep_files: Sequence[str] = ()
+    build_args: dict[str, str] | None = None
+    parent: str | None = None
+    machine_type: str = _IMAGE_BUILDER_MACHINE_TYPE
+    deadline_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ImageBuildHandle:
+    """Best-effort handle returned by ``start`` — the row is the source of truth."""
+
+    external_id: str
+    zone: str | None
+    started_at: datetime
+    message: str | None = None
+
+
+@dataclass(slots=True)
+class ImageBuildStatusResult:
+    """Outcome of a single ``poll`` — the parsed serial/terminal build state."""
+
+    status: ComputeImageBuildStatus
+    exit_code: int | None = None
+    # Parsed ``RESULT_JSON`` object from the trusted build tool (pinned_ref, tag,
+    # dep_hash, already_present, built, findings, digest). None when the build has
+    # not produced one (still building, or failed before emitting it).
+    result: dict[str, Any] | None = None
+    reason: str | None = None
+    finished_at: datetime | None = None
+
+
+class ImageBuilderBackend(Protocol):
+    """Pluggable backend for off-orchestrator compute-image builds.
+
+    Mirrors :class:`ComputeBackend`: callers depend only on this stable
+    start/poll/abort surface, and backend-specific VM/serial handling stays
+    encapsulated so a second builder lane can be added without touching the poll
+    sweep.
+    """
+
+    name: str
+
+    def external_id_for(self, request: ImageBuildRequest) -> str: ...
+
+    async def start(self, request: ImageBuildRequest) -> ImageBuildHandle: ...
+
+    async def poll(self, build: ProjectComputeImageBuild) -> ImageBuildStatusResult: ...
+
+    async def abort(self, build: ProjectComputeImageBuild, *, reason: str) -> bool: ...
+
+
+def _decode_build_result(raw_b64: str | None) -> dict[str, Any] | None:
+    """Decode the base64 ``RESULT_JSON`` serial payload; None on any problem.
+
+    Defensive: a missing, oversized, or garbled marker is treated as ABSENT
+    (None), never raised — a lost result must not crash the poll sweep.
+    """
+    if not raw_b64:
+        return None
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(decoded) > _MAX_BUILD_RESULT_DECODED_BYTES:
+        return None
+    try:
+        parsed = json.loads(decoded.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _parse_image_build_serial(serial_output: str) -> ImageBuildStatusResult | None:
+    """Parse the builder VM's terminal serial markers, or None if not terminal.
+
+    Returns None when no ``BLUEPRINT_BUILD_STATUS`` marker is present yet (the
+    build is still running); otherwise a terminal SUCCEEDED/FAILED result with
+    the decoded ``RESULT_JSON`` object attached when available.
+    """
+    status_line: str | None = None
+    exit_code: int | None = None
+    result_b64: str | None = None
+    for raw_line in serial_output.splitlines():
+        line = raw_line.strip()
+        if line.startswith(_SERIAL_BUILD_STATUS_PREFIX):
+            status_line = line[len(_SERIAL_BUILD_STATUS_PREFIX):]
+        elif line.startswith(_SERIAL_BUILD_EXIT_PREFIX):
+            try:
+                exit_code = int(line[len(_SERIAL_BUILD_EXIT_PREFIX):])
+            except ValueError:
+                exit_code = None
+        elif line.startswith(_SERIAL_BUILD_RESULT_PREFIX):
+            result_b64 = line[len(_SERIAL_BUILD_RESULT_PREFIX):]
+    if status_line is None:
+        return None
+    result = _decode_build_result(result_b64)
+    if status_line == "SUCCEEDED":
+        return ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=exit_code,
+            result=result,
+            reason="completed",
+            finished_at=_utcnow(),
+        )
+    return ImageBuildStatusResult(
+        status=ComputeImageBuildStatus.FAILED,
+        exit_code=exit_code,
+        result=result,
+        reason=f"build_failed_exit_{exit_code}" if exit_code is not None else "build_failed",
+        finished_at=_utcnow(),
+    )
+
+
+def _terminal_record_to_status(record: dict[str, Any]) -> ImageBuildStatusResult | None:
+    """Map a durable ``terminal.json`` record back to a poll result, or None."""
+    status_raw = str(record.get("status") or "").upper()
+    if status_raw not in ("SUCCEEDED", "FAILED"):
+        return None
+    exit_code = record.get("exit_code")
+    try:
+        exit_code = int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        exit_code = None
+    result = _decode_build_result(record.get("result_b64"))
+    status = (
+        ComputeImageBuildStatus.SUCCEEDED
+        if status_raw == "SUCCEEDED"
+        else ComputeImageBuildStatus.FAILED
+    )
+    return ImageBuildStatusResult(
+        status=status,
+        exit_code=exit_code,
+        result=result,
+        reason=str(record.get("reason") or "") or None,
+        finished_at=_utcnow(),
+    )
+
+
+def _build_image_builder_startup_script(
+    request: ImageBuildRequest, *, terminal_upload_url: str
+) -> str:
+    """Render the throwaway builder VM's bash startup script.
+
+    The script clones the untrusted repo at ``ref`` (short-lived token embedded
+    in the clone URL, scrubbed from any error before it reaches the artifact or
+    serial console), lays down the ORCHESTRATOR'S OWN copy of the trusted build
+    tool (base64 blobs, never the repo's copy), runs it — the tool itself does
+    ``docker build --network=none`` + the layer-credential scan + ``docker push``
+    — then emits BLUEPRINT_BUILD_{RESULT,STATUS,EXIT} serial markers AND uploads a
+    durable ``terminal.json`` to the per-build signed GCS URL before poweroff.
+
+    Per CLAUDE.md's cross-language rule the embedded Python is delivered ONLY as
+    base64 blobs decoded on-VM; every other line is single-statement bash with no
+    nested-language heredoc, and ``terminal.json`` is assembled with a single
+    ``printf`` over base64-safe values.
+    """
+    ref = str(request.repo_clone.get("ref") or "main")
+    owner = str(request.repo_clone.get("owner") or "")
+    repo = str(request.repo_clone.get("repo") or "")
+    clone_url = f"https://x-access-token:{request.repo_token}@github.com/{owner}/{repo}.git"
+
+    registry_host = request.registry_repo.split("/", 1)[0]
+
+    # Assemble the trusted-build-tool invocation. All values are shlex-quoted so a
+    # crafted image name / dep path / build arg can't break out of the argv.
+    build_argv = [
+        "python3",
+        shlex.quote(_BUILDER_TOOL_FILE),
+        "--repo-dir",
+        shlex.quote(_BUILDER_REPO_DIR),
+        "--registry",
+        shlex.quote(request.registry_repo),
+        "--image-name",
+        shlex.quote(request.image_name),
+        "--dockerfile",
+        shlex.quote(request.dockerfile),
+    ]
+    for dep_file in request.dep_files or ():
+        build_argv.extend(["--dep-file", shlex.quote(str(dep_file))])
+    if request.parent:
+        build_argv.extend(["--parent", shlex.quote(str(request.parent))])
+    for key, value in sorted((request.build_args or {}).items()):
+        build_argv.extend(["--build-arg", shlex.quote(f"{key}={value}")])
+    build_cmd = " ".join(build_argv)
+
+    q_repo_dir = shlex.quote(_BUILDER_REPO_DIR)
+    q_result = shlex.quote(_BUILDER_RESULT_FILE)
+    q_stdout = shlex.quote(_BUILDER_STDOUT_FILE)
+    q_terminal = shlex.quote(_BUILDER_TERMINAL_FILE)
+    q_clone_err = shlex.quote(_BUILDER_CLONE_ERR)
+    q_tool = shlex.quote(_BUILDER_TOOL_FILE)
+    q_upload = shlex.quote(terminal_upload_url)
+    q_host = shlex.quote(registry_host)
+    q_ref = shlex.quote(ref)
+    q_clone_url = shlex.quote(clone_url)
+
+    return f"""#!/bin/bash
+set -u -o pipefail
+
+BUILD_STATUS=FAILED
+BUILD_EXIT=1
+REASON=unknown
+RESULT_B64=""
+: > {q_result}
+: > {q_stdout}
+
+# Emit the durable terminal.json (uploaded to the per-build signed URL) AND the
+# serial markers the poll sweep reads. terminal.json is built with one printf
+# over base64-safe values (RESULT_B64 is base64; the rest are controlled) so no
+# character has to survive an escape pass.
+emit_terminal() {{
+  if [ -s {q_result} ]; then
+    RESULT_B64=$(base64 -w0 < {q_result} 2>/dev/null || true)
+  fi
+  printf '{{"schema_version":1,"status":"%s","exit_code":%s,"reason":"%s","result_b64":"%s"}}' \
+    "$BUILD_STATUS" "$BUILD_EXIT" "$REASON" "$RESULT_B64" > {q_terminal} 2>/dev/null || true
+  if command -v curl >/dev/null 2>&1; then
+    timeout 120 curl --fail --silent --show-error --request PUT \
+      --upload-file {q_terminal} \
+      --header "Content-Type: application/json" \
+      {q_upload} >/dev/null 2>&1 || true
+  fi
+  echo "{_SERIAL_BUILD_RESULT_PREFIX}$RESULT_B64"
+  echo "{_SERIAL_BUILD_STATUS_PREFIX}$BUILD_STATUS"
+  echo "{_SERIAL_BUILD_EXIT_PREFIX}$BUILD_EXIT"
+}}
+
+# Lay down the ORCHESTRATOR'S OWN trusted, stdlib-only build tool (never the
+# repo's copy). It runs docker build --network=none + the layer-credential scan
+# + docker push all from THIS file.
+echo '{_BUILD_TOOL_B64}' | base64 -d > {q_tool}
+
+# Clone the UNTRUSTED project repo at ref. On failure scrub the token from the
+# captured stderr, emit a typed reason, and power off — the token never reaches
+# the serial console (stderr is redirected to a file, then redacted).
+rm -rf {q_repo_dir}
+if ! git clone --depth 1 --branch {q_ref} {q_clone_url} {q_repo_dir} >/dev/null 2>{q_clone_err}; then
+  sed -i -E 's#x-access-token:[^@]*@#x-access-token:REDACTED@#g; s#gh[a-z]_[A-Za-z0-9]{{20,}}#REDACTED#g' {q_clone_err} 2>/dev/null || true
+  BUILD_STATUS=FAILED
+  BUILD_EXIT=1
+  REASON=repo_clone_failed
+  emit_terminal
+  poweroff || shutdown -h now || true
+  exit 1
+fi
+
+# Authenticate docker to Artifact Registry via the attached image-builder SA
+# (best-effort; the tool's push surfaces a real auth failure as exit 1).
+gcloud auth configure-docker {q_host} --quiet >/dev/null 2>&1 || true
+
+# Run the trusted build tool: docker build --network=none + layer-credential
+# scan + docker push all live INSIDE it, sourced from the release copy above,
+# NEVER the repo's copy. Capture stdout to extract its RESULT_JSON line.
+{build_cmd} > {q_stdout} 2>&1
+BUILD_EXIT=$?
+if [ "$BUILD_EXIT" -eq 0 ]; then
+  BUILD_STATUS=SUCCEEDED
+  REASON=completed
+else
+  BUILD_STATUS=FAILED
+  REASON=build_failed
+fi
+RJSON=$(grep '^RESULT_JSON:' {q_stdout} 2>/dev/null | tail -n1 | sed 's/^RESULT_JSON://' || true)
+if [ -n "$RJSON" ]; then
+  printf '%s' "$RJSON" > {q_result} 2>/dev/null || true
+fi
+emit_terminal
+poweroff || shutdown -h now || true
+exit "$BUILD_EXIT"
+"""
+
+
+class GcpEphemeralVmImageBuilderBackend:
+    """Runs an untrusted compute-image build on a throwaway GCE VM.
+
+    Reuses the compute-job substrate: :func:`compute.provision_ephemeral_vm`
+    (with the leaf image-builder SA attached), a deterministic dep-hash VM name
+    for idempotent adoption, serial markers for status, and a per-build signed
+    GCS object for the durable terminal record.
+    """
+
+    name = IMAGE_BUILDER_BACKEND_NAME
+
+    def external_id_for(self, request: ImageBuildRequest) -> str:
+        return _image_builder_vm_name(request.project_id, request.dep_hash)
+
+    async def start(self, request: ImageBuildRequest) -> ImageBuildHandle:
+        external_id = self.external_id_for(request)
+        # Idempotent re-trigger: adopt the in-flight VM for the same dep hash
+        # instead of provisioning (and paying for) a second builder.
+        existing_zone = await asyncio.to_thread(compute.find_vm_zone, external_id)
+        if existing_zone:
+            started_at = await asyncio.to_thread(
+                compute.get_vm_created_at, external_id, existing_zone
+            )
+            return ImageBuildHandle(
+                external_id=external_id,
+                zone=existing_zone,
+                started_at=started_at or _utcnow(),
+                message="adopted in-flight image-builder VM",
+            )
+        expiry = _artifact_upload_expiry(request.deadline_at)
+        terminal_upload_url = (
+            await storage.generate_compute_job_artifact_upload_signed_url(
+                request.build_id, expires_at=expiry
+            )
+        )
+        startup_script = _build_image_builder_startup_script(
+            request, terminal_upload_url=terminal_upload_url
+        )
+        ok = await compute.provision_ephemeral_vm(
+            external_id,
+            startup_script=startup_script,
+            machine_type=request.machine_type,
+            service_account_email=compute.IMAGE_BUILDER_SERVICE_ACCOUNT_EMAIL,
+        )
+        if not ok:
+            raise RuntimeError("image-builder VM provisioning failed")
+        zone = await asyncio.to_thread(compute.get_vm_zone, external_id)
+        return ImageBuildHandle(
+            external_id=external_id,
+            zone=zone if zone and zone != "unknown" else None,
+            started_at=_utcnow(),
+            message="provisioned image-builder VM",
+        )
+
+    async def _read_terminal_record(
+        self, build: ProjectComputeImageBuild
+    ) -> ImageBuildStatusResult | None:
+        """Best-effort durable-terminal fallback when the serial marker is lost.
+
+        The builder VM uploaded ``terminal.json`` to the per-build signed object
+        before poweroff; read it back so a job whose serial marker was lost to
+        the poweroff-vs-serial-read race can still be reconciled. Any failure
+        (object absent, unreadable, garbled) yields None — never raises.
+        """
+        try:
+            raw = await storage.download_compute_job_artifact_bundle(build.id)
+        except Exception:  # noqa: BLE001 — durable fallback is best-effort
+            return None
+        if not raw or len(raw) > _MAX_BUILD_RESULT_DECODED_BYTES:
+            return None
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        return _terminal_record_to_status(record)
+
+    async def poll(self, build: ProjectComputeImageBuild) -> ImageBuildStatusResult:
+        external_id = build.builder_vm_id or ""
+        serial = await asyncio.to_thread(
+            compute.get_vm_serial_output, external_id, build.zone
+        )
+        parsed = _parse_image_build_serial(serial or "")
+        if parsed is not None:
+            return parsed
+        durable = await self._read_terminal_record(build)
+        if durable is not None:
+            return durable
+        # No terminal marker anywhere: if the VM is gone it died without writing a
+        # result (fail-closed); otherwise it is still building.
+        still_zone = await asyncio.to_thread(compute.find_vm_zone, external_id)
+        if still_zone is None:
+            return ImageBuildStatusResult(
+                status=ComputeImageBuildStatus.FAILED,
+                reason="builder_vm_gone_without_result",
+                finished_at=_utcnow(),
+            )
+        return ImageBuildStatusResult(status=ComputeImageBuildStatus.BUILDING)
+
+    async def abort(self, build: ProjectComputeImageBuild, *, reason: str) -> bool:
+        external_id = build.builder_vm_id
+        if not external_id:
+            return True
+        try:
+            await compute.delete_agent_vm(external_id)
+        except Exception:  # noqa: BLE001 — teardown is best-effort
+            logger.warning(
+                "[IMAGE-BUILDER] failed to delete builder VM %s (%s)",
+                external_id,
+                reason,
+                exc_info=True,
+            )
+            return False
+        return True
+
+
+# Process-wide singleton (stateless — the row is the source of truth).
+_GCP_IMAGE_BUILDER_BACKEND = GcpEphemeralVmImageBuilderBackend()
+
+
+def get_image_builder_backend() -> ImageBuilderBackend:
+    """Return the configured image-builder backend (only the GCP lane today)."""
+    return _GCP_IMAGE_BUILDER_BACKEND
+
+
+def build_result_from_serial_payload(
+    result: dict[str, Any], *, dep_hash: str
+) -> "compute_image_build.BuildResult":
+    """Reconstruct a ``BuildResult`` from the builder's parsed ``RESULT_JSON``.
+
+    Used by the poll sweep to feed :func:`record_project_compute_image_build`
+    (via the digest-preservation guard) exactly as the inline build path does.
+    Falls back to the row's ``dep_hash`` when the payload omits it.
+    """
+    return compute_image_build.BuildResult(
+        pinned_ref=str(result.get("pinned_ref") or ""),
+        tag=str(result.get("tag") or ""),
+        dep_hash=str(result.get("dep_hash") or "") or dep_hash,
+        already_present=bool(result.get("already_present")),
+        built=bool(result.get("built")),
+        findings=list(result.get("findings") or []),
+        digest=result.get("digest") or None,
+    )

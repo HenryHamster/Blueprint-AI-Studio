@@ -1,6 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { ToolComponentProps } from '../toolRegistry';
-import { fetchToolContent, saveToolContent, ConflictError, type ToolContent } from '../api/projectTools';
+import {
+  createResidentToolArtifactRef,
+  fetchToolContent,
+  saveToolContent,
+  ConflictError,
+  type ToolContent,
+} from '../api/projectTools';
+import { dispatchResidentToolHandoff } from '../utils/residentToolHandoff';
+import {
+  ToolResidentHandoffControls,
+  type ToolResidentHandoffIntent,
+} from './ToolResidentHandoffControls';
 import MarkdownContentInner from './MarkdownContentInner';
 
 // ---------------------------------------------------------------------------
@@ -22,37 +33,47 @@ type State =
 type Mode = 'edit' | 'preview';
 
 const DEBOUNCE_MS = 1500;
+const serialize = (text: string) => JSON.stringify({ text });
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 export default function NotesTool({ projectId, tool }: ToolComponentProps) {
+  // A keyed inner component gives every project/tool identity an independent
+  // ref set and save queue. Slow completions from the unmounted predecessor can
+  // finish its own queued saves but cannot update or read the successor.
+  return <NotesDocument key={`${projectId}:${tool.id}`} projectId={projectId} tool={tool} />;
+}
+
+function NotesDocument({ projectId, tool }: ToolComponentProps) {
   const [state, setState] = useState<State>({ status: 'loading' });
   const [mode, setMode] = useState<Mode>('edit');
   const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
   // A conflict surfaced by a 409 on save: another viewer committed a newer
   // revision. We keep the LOCAL edits intact and let the operator reconcile.
   const [conflict, setConflict] = useState<{ serverText: string; serverRevision: number } | null>(null);
 
-  // Latest text/revision refs so the debounced saver always reads fresh values
-  // without re-binding on every keystroke (same pattern as WhiteboardTool).
   const textRef = useRef('');
   const revisionRef = useRef(0);
-  // Serialized snapshot of the last content we successfully persisted (or
-  // loaded). The autosave effect compares CONTENT to this — not state object
-  // identity — so a save-triggered revision refresh never re-fires a save.
-  const lastSavedRef = useRef<string>('');
+  // Match the serialized empty document used by flush(). This keeps an
+  // unmount-before-load (including StrictMode's effect replay) clean instead
+  // of treating the untouched initial refs as an edit.
+  const lastSavedRef = useRef<string>(serialize(''));
+  const savingRef = useRef(false);
+  const pendingRef = useRef(false);
+  const conflictRef = useRef(false);
+  const mountedRef = useRef(true);
 
-  // Keep refs in sync with the committed state.
   useEffect(() => {
-    if (state.status === 'ok') {
-      textRef.current = state.text;
-      revisionRef.current = state.revision;
-    }
-  }, [state]);
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // -----------------------------------------------------------------------
   // Load content on mount
@@ -70,7 +91,8 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
         const text = data.content?.text ?? '';
         textRef.current = text;
         revisionRef.current = data.content_revision;
-        lastSavedRef.current = JSON.stringify({ text });
+        lastSavedRef.current = serialize(text);
+        setDirty(false);
         if (!text) {
           setState({ status: 'empty' });
         } else {
@@ -96,6 +118,8 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
 
   const handleChange = useCallback((value: string) => {
     textRef.current = value;
+    setDirty(serialize(value) !== lastSavedRef.current);
+    if (savingRef.current) pendingRef.current = true;
     setState(prev => {
       // Promote empty → ok on the first keystroke so autosave can begin.
       if (prev.status === 'empty') {
@@ -112,14 +136,25 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
   // Save
   // -----------------------------------------------------------------------
 
-  const doSave = useCallback(async () => {
-    if (state.status !== 'ok') return;
+  const flush = useCallback(async () => {
+    if (conflictRef.current) return false;
+    if (savingRef.current) {
+      pendingRef.current = true;
+      return false;
+    }
     // Snapshot the exact payload we are about to persist. On success this
     // becomes the "last saved" baseline the autosave effect diffs against.
     const payload = { text: textRef.current };
-    const serialized = JSON.stringify(payload);
-    setSaving(true);
-    setSaveError(null);
+    const serialized = serialize(payload.text);
+    if (serialized === lastSavedRef.current) {
+      if (mountedRef.current) setDirty(false);
+      return true;
+    }
+    savingRef.current = true;
+    if (mountedRef.current) {
+      setSaving(true);
+      setSaveError(null);
+    }
     try {
       const result = await saveToolContent(
         projectId,
@@ -129,37 +164,89 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
       );
       revisionRef.current = result.content_revision;
       lastSavedRef.current = serialized;
-      setConflict(null);
-      setState(prev => (prev.status === 'ok' ? { ...prev, revision: result.content_revision } : prev));
+      if (mountedRef.current) {
+        setConflict(null);
+        setState(prev => (prev.status === 'ok' ? { ...prev, revision: result.content_revision } : prev));
+        setDirty(serialize(textRef.current) !== lastSavedRef.current);
+      }
+      return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Save failed';
-      setSaveError(msg);
+      if (mountedRef.current) setSaveError(msg);
       // On a 409 conflict, PRESERVE the local edits — never silently discard a
       // losing writer's work. Fetch the server's version so the operator can
       // reconcile, adopt the server revision as the new save base (so a
       // deliberate "keep mine" retry can land), and pause autosave until the
       // operator resolves the conflict.
       if (err instanceof ConflictError) {
+        conflictRef.current = true;
+        pendingRef.current = false;
         try {
-          const data: ToolContent<NotesContent> = await fetchToolContent<NotesContent>(projectId, tool.id);
+          const data: ToolContent<NotesContent> = await fetchToolContent<NotesContent>(
+            projectId,
+            tool.id,
+          );
           const serverText = data.content?.text ?? '';
           revisionRef.current = data.content_revision;
-          setConflict({ serverText, serverRevision: data.content_revision });
+          if (mountedRef.current) setConflict({ serverText, serverRevision: data.content_revision });
         } catch {
-          // If reload fails too, keep the existing (local) state and error.
+          // If reload fails too, keep the existing (local) state and error, but
+          // release the conflict gate: no conflict UI was created, so Retry
+          // must be able to re-attempt the save/reload sequence.
+          conflictRef.current = false;
         }
       }
+      return false;
     } finally {
-      setSaving(false);
+      savingRef.current = false;
+      if (mountedRef.current) setSaving(false);
+      if (pendingRef.current && !conflictRef.current) {
+        pendingRef.current = false;
+        void flush();
+      }
     }
-  }, [state.status, projectId, tool.id]);
+  }, [projectId, tool.id]);
+
+  const handoffToResident = useCallback(async (
+    intent: ToolResidentHandoffIntent,
+    laneOwner?: string,
+  ) => {
+    if (conflictRef.current) throw new Error('Resolve the Notes conflict before sharing.');
+    let saved = await flush();
+    if (saved && serialize(textRef.current) !== lastSavedRef.current) saved = await flush();
+    if (!saved || serialize(textRef.current) !== lastSavedRef.current) {
+      throw new Error('Notes changed while saving. Wait for Saved, then retry.');
+    }
+    const response = await createResidentToolArtifactRef(
+      projectId,
+      tool.id,
+      revisionRef.current,
+    );
+    if (response.state !== 'ready') {
+      throw new Error('Notes reference is still preparing. Retry in a moment.');
+    }
+    const artifactRef = response.artifact_ref;
+    const handedOff = dispatchResidentToolHandoff({
+      projectId,
+      artifactRef,
+      intent,
+      laneOwner,
+      prompt: intent === 'ask'
+        ? `Review Notes "${tool.title}" revision ${artifactRef.revision} and answer my question.`
+        : `Use Notes "${tool.title}" revision ${artifactRef.revision} as exact project context.`,
+    });
+    if (!handedOff) {
+      throw new Error('Notes revision was saved, but the Resident handoff could not be stored. Retry Share/Ask.');
+    }
+  }, [flush, projectId, tool.id, tool.title]);
 
   // Keep my local text; overwrite the server with it (base revision was already
   // advanced to the server's during conflict handling, so this retry lands).
   const resolveKeepMine = useCallback(() => {
+    conflictRef.current = false;
     setConflict(null);
-    void doSave();
-  }, [doSave]);
+    void flush();
+  }, [flush]);
 
   // Discard my local text in favour of the server's version — an EXPLICIT
   // operator choice, not a silent drop.
@@ -168,9 +255,11 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
     if (!c) return;
     textRef.current = c.serverText;
     revisionRef.current = c.serverRevision;
-    lastSavedRef.current = JSON.stringify({ text: c.serverText });
+    lastSavedRef.current = serialize(c.serverText);
+    conflictRef.current = false;
     setConflict(null);
     setSaveError(null);
+    setDirty(false);
     setState(c.serverText
       ? { status: 'ok', text: c.serverText, revision: c.serverRevision }
       : { status: 'empty' });
@@ -182,12 +271,19 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
   useEffect(() => {
     if (state.status !== 'ok') return;
     if (conflict) return;
-    if (JSON.stringify({ text: state.text }) === lastSavedRef.current) return;
+    if (!dirty) return;
     const timer = setTimeout(() => {
-      void doSave();
+      void flush();
     }, DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [state, doSave, conflict]);
+  }, [state.status, state.status === 'ok' ? state.text : '', dirty, flush, conflict]);
+
+  // Switching tabs or projects must not discard a change still inside its
+  // debounce window. The same single-flight flush also queues edits made
+  // while a slow request is in progress.
+  useEffect(() => () => {
+    if (serialize(textRef.current) !== lastSavedRef.current) void flush();
+  }, [flush]);
 
   // -----------------------------------------------------------------------
   // Render
@@ -249,9 +345,15 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
 
         {/* Save status */}
         <span className="ml-auto text-xs text-neutral-500">
-          {saving ? 'Saving…' : conflict ? 'Conflict' : saveError ? 'Save failed' : 'Saved'}
+          {saving ? 'Saving…' : conflict ? 'Conflict' : saveError ? 'Save failed' : dirty ? 'Unsaved changes' : 'Saved'}
         </span>
       </div>
+
+      <ToolResidentHandoffControls
+        toolLabel="Notes"
+        disabledReason={conflict ? 'Resolve the edit conflict before sharing this revision.' : saving ? 'Wait for the current save to finish.' : null}
+        onHandoff={handoffToResident}
+      />
 
       {/* Conflict banner: another viewer saved a newer revision. Local edits
           are preserved above; the operator explicitly picks a resolution. */}
@@ -307,7 +409,7 @@ export default function NotesTool({ projectId, tool }: ToolComponentProps) {
           {saveError}
           <button
             type="button"
-            onClick={() => { setSaveError(null); void doSave(); }}
+            onClick={() => { setSaveError(null); void flush(); }}
             className="ml-1 underline hover:text-amber-300"
           >
             Retry

@@ -27,7 +27,16 @@ from app.url_security import _resolve_safe_external_url
 from app.field_encryption import encrypt_field, decrypt_field
 from app.shared_state import get_project_promotion_target
 
+from app.message_audience import (
+    PIPELINE_LOG,
+    is_external_webhook_operator_visible,
+    route_event,
+    stamp_message_audience,
+)
+
 from app.models import (
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     NotificationDeadLetter,
     Project,
@@ -36,6 +45,10 @@ from app.models import (
     ResidualRemediationCase,
     Task,
     _utcnow,
+)
+from app.project_message_creation import (
+    build_project_message,
+    lock_project_and_next_message_sequence,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,6 +100,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "criterion_retracted",  # post_criterion_retracted_message
         "criterion_superseded",  # post_criterion_superseded_message
         "question_answer",  # post_question_answer
+        "capability_proof_gate_graduated_observe",  # post_capability_proof_gate_graduated_message
+        "capability_proof_gate_graduated_enforce",  # post_capability_proof_gate_graduated_message
     }
 )
 
@@ -493,6 +508,45 @@ async def notification_retry_drain_service() -> None:
             logger.warning("[NOTIFY] Retry drain loop error: %s", exc)
 
 
+_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY = "_deferred_external_notifications"
+
+
+def begin_deferred_external_notifications(session: AsyncSession) -> None:
+    """Defer session-scoped webhooks until an authority-fenced commit succeeds."""
+    session.info.setdefault(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, [])
+
+
+def _schedule_external_notification(
+    session: AsyncSession,
+    project_id: Any,
+    event_type: str,
+    payload: dict,
+) -> None:
+    pending = session.info.get(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY)
+    if pending is not None:
+        pending.append((project_id, event_type, dict(payload)))
+        return
+    asyncio.ensure_future(
+        dispatch_external_notification(project_id, event_type, payload)
+    )
+
+
+def flush_deferred_external_notifications(session: AsyncSession) -> None:
+    """Schedule webhooks only after the associated transaction has committed."""
+    pending = session.info.pop(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, None)
+    if pending is None:
+        return
+    for project_id, event_type, payload in pending:
+        asyncio.ensure_future(
+            dispatch_external_notification(project_id, event_type, payload)
+        )
+
+
+def discard_deferred_external_notifications(session: AsyncSession) -> None:
+    """Drop effects staged by a transaction that failed its authority fence."""
+    session.info.pop(_DEFERRED_EXTERNAL_NOTIFICATIONS_KEY, None)
+
+
 async def dispatch_external_notification(
     project_id: Any,
     event_type: str,
@@ -526,6 +580,19 @@ async def dispatch_external_notification(
         if not webhook_url:
             return
         if event_type not in enabled_events:
+            return
+        # Unified audience gate: the external webhook is a third operator-reaching
+        # channel and must obey the same fail-closed policy as the ledger and the
+        # alert channel. A strategist-internal / pipeline-log event (e.g. PR_MERGED,
+        # DIRECTION_MILESTONE, AUTO_FIX_SPAWNED) is dropped here even when the
+        # operator's enabled_events (legacy config) still lists it — internal
+        # bookkeeping never leaks to an external system.
+        if not is_external_webhook_operator_visible(event_type):
+            logger.debug(
+                "[NOTIFY] Dropping non-operator external webhook event_type=%s "
+                "(strategist-internal/pipeline-log — audience gate)",
+                event_type,
+            )
             return
         # SSRF guard: only allow http(s) and block internal/metadata IPs
         from urllib.parse import urlparse
@@ -632,12 +699,41 @@ async def post_event_message(
     summary: str,
     context: Optional[dict[str, Any]] = None,
     task_id: Optional[uuid.UUID] = None,
-) -> ProjectMessage:
-    """Core helper — creates a system ProjectMessage with the given event_type in context."""
+) -> Optional[ProjectMessage]:
+    """Core helper — creates a system ProjectMessage with the given event_type in context.
+
+    Every created row is stamped with ``context["audience"]`` resolved from the
+    unified audience registry (:func:`app.message_audience.route_event`), so both
+    the ledger read paths and downstream surfaces can tell an operator-visible
+    message from a strategist-feed one:
+
+    * ``operator-action-needed`` / ``operator-fyi`` → operator-visible NOTE (as before).
+    * ``strategist-internal`` → a non-operator strategist-feed row is still created
+      (bookkeeping the strategist may want), but tagged so it never surfaces to the
+      operator. Unregistered event types fail closed to this class.
+    * ``pipeline-log`` → pure telemetry; **no** ledger row is created and ``None``
+      is returned.
+
+    Callers that forward the return value MUST handle ``None`` for the pipeline-log
+    case.
+    """
+    audience = route_event(event_type)
+    if audience == PIPELINE_LOG:
+        # Pure telemetry — no ledger row at all, logs/observability only.
+        logger.debug(
+            "[NOTIFY] Skipping ledger row for pipeline-log event_type=%s",
+            event_type,
+        )
+        return None
     ctx: dict[str, Any] = {"event_type": event_type}
     if context:
         ctx.update(context)
-    msg = ProjectMessage(
+    # Stamp the resolved audience so operator-facing surfaces can exclude
+    # non-operator (strategist-internal) rows. Canonical value wins over any
+    # audience the caller may have placed in ``context``.
+    ctx["audience"] = audience
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.NOTE,
         from_type="system",
@@ -726,6 +822,76 @@ async def post_criterion_superseded_message(
     )
 
 
+async def post_capability_proof_gate_graduated_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    from_mode: str,
+    to_mode: str,
+    coverage: float,
+    threshold: float,
+    projects_contributing: int,
+    total_non_exempt: int,
+    total_proven: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Post a HIGH-SIGNAL system NOTE when the capability-proof gate auto-graduates.
+
+    The metrics-integrity sweep advances the gate mode ``off → observe → enforce``
+    autonomously once fleet-wide proof coverage crosses the configured thresholds.
+    Previously this significant behavior change was recorded only in an INFO log —
+    the operator learned about it by reading logs or noticing the settings mode
+    flipped. This routes an operator-visible message through the unified audience
+    system on every advance.
+
+    The event type (and hence audience) is split by target mode:
+
+    * ``→ observe`` → ``capability_proof_gate_graduated_observe`` (``operator-fyi``):
+      the gate now records unproven-capability blocks but does not enforce them.
+    * ``→ enforce`` → ``capability_proof_gate_graduated_enforce``
+      (``operator-action-needed``): the gate now BLOCKS task spawning and release
+      promotion for capabilities lacking proof — a change the operator should act
+      on (raise proof coverage or relax the thresholds).
+
+    Both event types are registered in ``HIGH_SIGNAL_NOTE_EVENT_TYPES`` so the
+    NOTE survives paging. Best-effort: the in-session message rides the caller's
+    commit.
+    """
+    to_mode_norm = (to_mode or "").strip().lower()
+    if to_mode_norm == "enforce":
+        event_type = "capability_proof_gate_graduated_enforce"
+        impact = (
+            "gate now BLOCKS task spawning and release promotion for "
+            "capabilities lacking proof"
+        )
+    else:
+        event_type = "capability_proof_gate_graduated_observe"
+        impact = "gate now records unproven-capability blocks (no blocking yet)"
+
+    summary = (
+        f"Capability-proof gate auto-graduated {from_mode} → {to_mode_norm} "
+        f"(fleet coverage={coverage:.1%} ≥ threshold={threshold:.1%}, "
+        f"{total_proven}/{total_non_exempt} proven across "
+        f"{projects_contributing} project(s)) — {impact}."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type=event_type,
+        summary=summary,
+        context={
+            "from_mode": from_mode,
+            "to_mode": to_mode_norm,
+            "coverage": round(float(coverage), 4),
+            "threshold": round(float(threshold), 4),
+            "projects_contributing": projects_contributing,
+            "total_non_exempt": total_non_exempt,
+            "total_proven": total_proven,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_strategic_steering_deferred_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -798,6 +964,51 @@ async def post_pr_merged_message(
     )
 
 
+async def post_operator_decision_capture_low_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    total: int,
+    captured: int,
+    missed: int,
+    capture_rate: int,
+    session_id: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> Optional[ProjectMessage]:
+    """Strategist-internal notice that operator-decision capture is chronically low.
+
+    Fired by the resident-session heartbeat when a session accumulates enough
+    operator turns and its capture rate stays below the low-rate floor — a signal
+    that the OPERATOR-DECISION marker is being systematically forgotten and that
+    operator corrections may not be reaching the durable decisions register. The
+    event routes ``strategist-internal`` so it is bookkeeping the strategist can
+    act on (re-emit the marker) WITHOUT surfacing to the operator chat or the
+    alert channel. The caller de-dupes so it fires at most once per session per
+    low-capture crossing.
+    """
+    summary = (
+        f"Operator-decision capture chronically low this session: "
+        f"{captured}/{total} captured ({capture_rate}%) — {missed} operator "
+        f"correction(s) may not have reached the durable decisions register. "
+        f"End operator turns with the OPERATOR-DECISION marker so settled "
+        f"corrections survive compaction and restart."
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="operator_decision.capture_rate_low",
+        summary=summary,
+        context={
+            "session_id": session_id,
+            "total": total,
+            "captured": captured,
+            "missed": missed,
+            "capture_rate": capture_rate,
+        },
+        task_id=task_id,
+    )
+
+
 async def post_direction_milestone_message(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -846,12 +1057,8 @@ async def post_direction_milestone_message(
         context=context,
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_MILESTONE",
-            payload,
-        )
+    _schedule_external_notification(
+        session, project_id, "DIRECTION_MILESTONE", payload
     )
     return msg
 
@@ -1324,7 +1531,9 @@ async def post_auto_fix_escalation_message(
         "consecutive_failures": failure_count,
         "dedupe_key": dedupe_key,
     }
-    msg = ProjectMessage(
+    ctx = stamp_message_audience(ctx, "auto_fix_escalated")
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1411,16 +1620,15 @@ async def post_residual_fix_spawned_message(
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_SPAWNED",
-            {
-                "fingerprint": fingerprint,
-                "hit_count": case.hit_count,
-                "task_id": str(task_id) if task_id else None,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_SPAWNED",
+        {
+            "fingerprint": fingerprint,
+            "hit_count": case.hit_count,
+            "task_id": str(task_id) if task_id else None,
+        },
     )
     return msg
 
@@ -1630,7 +1838,9 @@ async def post_residual_fix_escalation_message(
         "consecutive_failures": failure_count,
         "dedupe_key": dedupe_key,
     }
-    msg = ProjectMessage(
+    ctx = stamp_message_audience(ctx, "residual_fix_escalated")
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1719,19 +1929,18 @@ async def post_residual_fix_auto_recovered_message(
         },
         task_id=task_id,
     )
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_UNSUSPENDED",
-            {
-                "fingerprint": fingerprint,
-                "recovered_at": recovered_at,
-                "manual_intervention_required": False,
-                "auto_recovered": True,
-                "recovery_attempts": recovery_attempts,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_UNSUSPENDED",
+        {
+            "fingerprint": fingerprint,
+            "recovered_at": recovered_at,
+            "manual_intervention_required": False,
+            "auto_recovered": True,
+            "recovery_attempts": recovery_attempts,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -1781,7 +1990,9 @@ async def post_residual_fix_audit_deferred_escalation_message(
         "audit_defer_count": defer_count,
         "threshold": threshold,
     }
-    msg = ProjectMessage(
+    ctx = stamp_message_audience(ctx, "residual_fix_audit_deferred")
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1790,19 +2001,18 @@ async def post_residual_fix_audit_deferred_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "RESIDUAL_FIX_AUDIT_DEFERRED",
-            {
-                "fingerprint": fingerprint,
-                "audit_defer_count": defer_count,
-                "threshold": threshold,
-                "severity": "blocker",
-                "manual_intervention_required": False,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "RESIDUAL_FIX_AUDIT_DEFERRED",
+        {
+            "fingerprint": fingerprint,
+            "audit_defer_count": defer_count,
+            "threshold": threshold,
+            "severity": "blocker",
+            "manual_intervention_required": False,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -1867,7 +2077,9 @@ async def post_remediation_escalation_message(
         "attempts": attempts,
         "remediation_summary": remediation_summary[:240],
     }
-    msg = ProjectMessage(
+    ctx = stamp_message_audience(ctx, "remediation_escalated")
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1876,20 +2088,19 @@ async def post_remediation_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "REMEDIATION_ESCALATED",
-            {
-                "direction_text": direction_text[:120],
-                "failure_pattern": failure_pattern[:200],
-                "attempts": attempts,
-                "remediation_summary": remediation_summary[:240],
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "REMEDIATION_ESCALATED",
+        {
+            "direction_text": direction_text[:120],
+            "failure_pattern": failure_pattern[:200],
+            "attempts": attempts,
+            "remediation_summary": remediation_summary[:240],
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -1940,11 +2151,13 @@ async def post_direction_burn_pause_message(
         "direction_id": direction_id,
         "manual_intervention_required": True,
     }
+    ctx = stamp_message_audience(ctx, "direction_burn_pause")
     if dedupe_key:
         ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -1953,20 +2166,19 @@ async def post_direction_burn_pause_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_BURN_PAUSE",
-            {
-                "direction_text": direction_text[:120],
-                "reason": reason,
-                "direction_id": direction_id,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_BURN_PAUSE",
+        {
+            "direction_text": direction_text[:120],
+            "reason": reason,
+            "direction_id": direction_id,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2016,11 +2228,13 @@ async def post_direction_churn_pause_message(
         "reason": reason,
         "direction_id": direction_id,
     }
+    ctx = stamp_message_audience(ctx, "direction_churn_pause")
     if dedupe_key:
         ctx["dedupe_key"] = dedupe_key
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2029,19 +2243,18 @@ async def post_direction_churn_pause_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_CHURN_PAUSE",
-            {
-                "direction_text": direction_text[:120],
-                "reason": reason,
-                "direction_id": direction_id,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_CHURN_PAUSE",
+        {
+            "direction_text": direction_text[:120],
+            "reason": reason,
+            "direction_id": direction_id,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2137,9 +2350,11 @@ async def post_direction_outcome_scaffolding_escalation_message(
         "flagged_cycles": flagged_cycles,
         "manual_intervention_required": True,
     }
+    ctx = stamp_message_audience(ctx, "direction_outcome_scaffolding_escalation")
     if evidence:
         ctx["evidence"] = evidence
-    msg = ProjectMessage(
+    msg = await build_project_message(
+        session,
         project_id=project_id,
         message_type=MessageType.BLOCKER,
         from_type="system",
@@ -2148,20 +2363,19 @@ async def post_direction_outcome_scaffolding_escalation_message(
         context=ctx,
     )
     session.add(msg)
-    asyncio.ensure_future(
-        dispatch_external_notification(
-            project_id,
-            "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
-            {
-                "direction_text": direction_text[:120],
-                "direction_id": direction_id,
-                "flagged_cycles": flagged_cycles,
-                "evidence": evidence or {},
-                "severity": "blocker",
-                "manual_intervention_required": True,
-                "summary": summary,
-            },
-        )
+    _schedule_external_notification(
+        session,
+        project_id,
+        "DIRECTION_OUTCOME_SCAFFOLDING_ESCALATION",
+        {
+            "direction_text": direction_text[:120],
+            "direction_id": direction_id,
+            "flagged_cycles": flagged_cycles,
+            "evidence": evidence or {},
+            "severity": "blocker",
+            "manual_intervention_required": True,
+            "summary": summary,
+        },
     )
     return msg
 
@@ -2242,17 +2456,42 @@ async def post_feedback_acknowledgment(
     original_msg_id: uuid.UUID,
     resolution: str,
     task_id: Optional[uuid.UUID] = None,
+    *,
+    from_type: str = "strategic",
+    actor_user_id: Optional[str] = None,
+    event_type: str = "feedback_acknowledgment",
+    content_override: str | None = None,
+    sequence: int | None = None,
 ) -> ProjectMessage:
     """Create a reply message acknowledging a resolved FEEDBACK message."""
-    summary = f"Feedback addressed: {resolution}"
-    return await post_event_message(
-        session,
-        project_id,
-        event_type="feedback_acknowledgment",
-        summary=summary,
-        context={"reply_to": str(original_msg_id), "resolution": resolution},
-        task_id=task_id,
+    summary = content_override if content_override is not None else f"Feedback addressed: {resolution}"
+    if sequence is None:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+    context = stamp_message_audience(
+        {
+            "event_type": event_type,
+            "reply_to": str(original_msg_id),
+            "resolution": resolution,
+        },
+        event_type,
     )
+    msg = await build_project_message(
+        session,
+        project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=task_id,
+        reply_to_message_id=original_msg_id,
+        message_type=MessageType.NOTE,
+        from_type=from_type,
+        actor_user_id=actor_user_id,
+        from_task_id=task_id,
+        content=summary,
+        context=context,
+    )
+    session.add(msg)
+    return msg
 
 
 async def post_question_answer(
@@ -2263,6 +2502,9 @@ async def post_question_answer(
     task_id: Optional[uuid.UUID] = None,
     from_type: str = "strategic",
     resident_session_id: Optional[str] = None,
+    actor_user_id: Optional[str] = None,
+    content_override: str | None = None,
+    sequence: int | None = None,
 ) -> ProjectMessage:
     """Create a reply message answering a resolved QUESTION message.
 
@@ -2275,17 +2517,36 @@ async def post_question_answer(
     to (NULL/None when none is active), matching the session-identity scoping on
     the operator-send surface so the reply is addressed to the same conversation.
     """
-    msg = ProjectMessage(
-        project_id=project_id,
-        message_type=MessageType.NOTE,
-        from_type=from_type,
-        from_task_id=task_id,
-        content=f"Answer: {answer}",
-        context={
+    # Route the context through the shared audience gate so the reply carries a
+    # fail-closed audience classification instead of an unstamped context dict.
+    # ``from_type`` defaults to the operator-reaching "strategic", so an unstamped
+    # row here would stay operator-visible even if the registry later reclassifies
+    # ``question_answer`` as strategist-internal. Stamping binds visibility to the
+    # registry resolution (currently OPERATOR_FYI) regardless of from_type.
+    context = stamp_message_audience(
+        {
             "event_type": "question_answer",
             "reply_to": str(original_msg_id),
             "answer": answer,
         },
+        "question_answer",
+    )
+    if sequence is None:
+        sequence = await lock_project_and_next_message_sequence(session, project_id)
+    msg = await build_project_message(
+        session,
+        project_id=project_id,
+        sequence=sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=task_id,
+        reply_to_message_id=original_msg_id,
+        message_type=MessageType.NOTE,
+        from_type=from_type,
+        actor_user_id=actor_user_id,
+        from_task_id=task_id,
+        content=content_override if content_override is not None else f"Answer: {answer}",
+        context=context,
         resident_session_id=resident_session_id,
     )
     session.add(msg)

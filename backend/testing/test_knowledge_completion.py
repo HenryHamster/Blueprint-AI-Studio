@@ -6,6 +6,7 @@ from app.knowledge_completion import (
     _build_compute_experiment_document,
     _compute_evidence_tier,
     _extract_job_terminal_diagnostics,
+    _viewable_compute_citations,
 )
 from testing.factories import make_task
 
@@ -90,6 +91,40 @@ def _base_task():
     )
 
 
+def test_viewable_compute_citations_keep_only_durable_inline_media():
+    """Knowledge docs cite persisted preview objects, not arbitrary manifest data."""
+    job = MagicMock()
+    plot_uri = "gs://blueprint-artifacts/jobs/run/plot.png"
+    video_uri = "gs://blueprint-artifacts/jobs/run/demo.webm"
+    job.polling_metadata = {
+        "viewable_files": [
+            {"storage_uri": plot_uri},
+            {"storage_uri": video_uri},
+            {"storage_uri": plot_uri},  # deduplicated
+            {"storage_uri": "https://signed.example/plot.png"},
+            {"storage_uri": "gs://blueprint-artifacts/jobs/run/result.json"},
+            {"storage_uri": None},
+            "not-a-manifest-entry",
+        ]
+    }
+
+    assert _viewable_compute_citations(job) == [plot_uri, video_uri]
+
+    document = _build_compute_experiment_document(
+        _base_task(),
+        outcome="SUCCESS",
+        cost=0.01,
+        criterion=None,
+        result_reference="gs://blueprint-artifacts/jobs/run/result.tar.gz",
+        viewable_citations=[plot_uri, video_uri, plot_uri],
+    )
+    assert document["citations"] == [
+        "gs://blueprint-artifacts/jobs/run/result.tar.gz",
+        plot_uri,
+        video_uri,
+    ]
+
+
 class TestBuildComputeExperimentDocumentEvidenceTier:
     def test_evidence_tier_covered_in_verdict_record(self):
         task = _base_task()
@@ -163,6 +198,110 @@ class TestBuildComputeExperimentDocumentEvidenceTier:
             evidence_tier="partial",
         )
         assert doc["verdict_record"]["evidence_tier"] == "partial"
+
+
+# ── _build_compute_experiment_document — criterion_unmeasured_reason ─────────
+
+
+class TestCriterionUnmeasuredReason:
+    """When a criterion is declared but the metric was not measurable, the
+    verdict_record must store criterion_met=None (not False) and a machine-
+    readable criterion_unmeasured_reason so the UI can distinguish an honest
+    "metric not found" from a genuine "criterion was checked but failed"."""
+
+    def _criterion(self, *, measurable: bool, met: bool = False) -> dict:
+        return {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.9,
+            "value": 0.85 if measurable else None,
+            "met": met,
+            "measurable": measurable,
+        }
+
+    def test_no_result_metrics_gives_no_result_metrics_reason(self):
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="failed",
+            cost=None,
+            criterion=self._criterion(measurable=False),
+            result_reference=None,
+            result_metrics=None,  # experiment produced no metrics
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is None, "unmeasured must be None, not False"
+        assert vr["criterion_unmeasured_reason"] == "no_result_metrics"
+
+    def test_metric_key_absent_gives_metric_key_absent_reason(self):
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="failed",
+            cost=None,
+            criterion=self._criterion(measurable=False),
+            result_reference=None,
+            result_metrics={"loss": 0.42},  # metrics present, but 'accuracy' absent
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is None
+        assert vr["criterion_unmeasured_reason"] == "metric_key_absent"
+
+    def test_metric_not_numeric_gives_metric_not_numeric_reason(self):
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="failed",
+            cost=None,
+            criterion=self._criterion(measurable=False),
+            result_reference=None,
+            result_metrics={"accuracy": "high"},  # key exists, value non-numeric
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is None
+        assert vr["criterion_unmeasured_reason"] == "metric_not_numeric"
+
+    def test_measurable_criterion_not_met_stays_false(self):
+        """When the metric was measured but didn't pass, criterion_met stays False."""
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="failed",
+            cost=None,
+            criterion=self._criterion(measurable=True, met=False),
+            result_reference=None,
+            result_metrics={"accuracy": 0.72},
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is False
+        assert "criterion_unmeasured_reason" not in vr
+
+    def test_measurable_criterion_met_stays_true(self):
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="SUCCESS",
+            cost=0.05,
+            criterion=self._criterion(measurable=True, met=True),
+            result_reference=None,
+            result_metrics={"accuracy": 0.95},
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is True
+        assert "criterion_unmeasured_reason" not in vr
+
+    def test_no_criterion_has_no_unmeasured_reason(self):
+        task = _base_task()
+        doc = _build_compute_experiment_document(
+            task,
+            outcome="completed",
+            cost=0.02,
+            criterion=None,
+            result_reference=None,
+        )
+        vr = doc["verdict_record"]
+        assert vr["criterion_met"] is None
+        assert "criterion_unmeasured_reason" not in vr
 
 
 # ── _extract_job_terminal_diagnostics: clean-SUCCESS provenance ──────────────

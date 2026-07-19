@@ -1,5 +1,8 @@
-import { memo, useMemo, type ReactNode } from 'react';
+import { memo, useMemo, useState, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, GitBranch, Network, Radio, X } from 'lucide-react';
+import { acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
+import type { PendingConfirmation, PendingConfirmationType } from '../types';
+import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
   StrategicContextPackageDescriptor,
@@ -28,6 +31,7 @@ import { StrategicActivityStrip } from './StrategicLiveTurn';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { RailMiniCanvas } from './RailMiniCanvas';
+import { WhiteboardRailSection } from './WhiteboardRailSection';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
 type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
@@ -62,6 +66,12 @@ interface StrategicContextRailProps {
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
+  /** Called after a pending-confirmation accept/dismiss succeeds so the parent
+      can refresh strategic state (which re-derives attention). */
+  onConfirmationResolved?: () => void;
+  addToast?: (message: string, type: 'success' | 'error' | 'info') => void;
+  /** Project whose whiteboard/canvas the strategic sidebar surfaces. */
+  projectId?: string | null;
 }
 
 function formatCost(value: number | undefined): string {
@@ -456,6 +466,96 @@ function AttentionItem({
   );
 }
 
+const _PENDING_CONFIRMATION_TYPES: readonly PendingConfirmationType[] = [
+  'credentials_needed',
+  'access_needed',
+  'intent_change',
+  'major_decision',
+];
+
+/** Map a durable ``kind: 'confirmation'`` attention item onto the
+ *  ``PendingConfirmation`` shape consumed by the shared PendingItemRow UI. */
+function attentionItemToPendingConfirmation(item: StrategicStateAttentionItem): PendingConfirmation {
+  const rawType = item.confirmation_type ?? '';
+  const type = (_PENDING_CONFIRMATION_TYPES as readonly string[]).includes(rawType)
+    ? (rawType as PendingConfirmationType)
+    : 'major_decision';
+  return {
+    id: item.ref?.id ?? item.id,
+    type,
+    proposal: item.detail ?? item.label,
+    created_at: item.created_at ?? undefined,
+  };
+}
+
+/** Fully-reachable, inline-actionable list of pending operator confirmations on
+ *  the daily surface. Reuses the shared accept/dismiss row and the existing
+ *  accept/dismiss API so this is the single place the operator acts on these
+ *  items (the problem-model view now renders them read-only). */
+function RailPendingConfirmations({
+  items,
+  onResolved,
+  addToast,
+}: {
+  items: StrategicStateAttentionItem[];
+  onResolved?: () => void;
+  addToast?: (message: string, type: 'success' | 'error' | 'info') => void;
+}) {
+  const [resolvedIds, setResolvedIds] = useState<Set<string>>(() => new Set());
+  const projectByPendingId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const item of items) {
+      const pendingId = item.ref?.id ?? item.id;
+      const projectId = item.ref?.project_id;
+      if (pendingId && projectId) map.set(pendingId, projectId);
+    }
+    return map;
+  }, [items]);
+  const pending = useMemo(
+    () =>
+      items
+        .filter(item => !resolvedIds.has(item.ref?.id ?? item.id))
+        .map(attentionItemToPendingConfirmation),
+    [items, resolvedIds],
+  );
+
+  if (pending.length === 0) return null;
+
+  const handleDismiss = async (id: string, note?: string) => {
+    const projectId = projectByPendingId.get(id);
+    if (!projectId) return;
+    try {
+      await dismissPendingConfirmation(projectId, id, note);
+      setResolvedIds(prev => new Set(prev).add(id));
+      onResolved?.();
+    } catch {
+      addToast?.('Failed to resolve — try again', 'error');
+    }
+  };
+
+  const handleAccept = async (id: string, answer?: string) => {
+    const projectId = projectByPendingId.get(id);
+    if (!projectId) return;
+    try {
+      await acceptPendingConfirmation(projectId, id, answer);
+      setResolvedIds(prev => new Set(prev).add(id));
+      onResolved?.();
+    } catch {
+      addToast?.('Failed to accept — try again', 'error');
+    }
+  };
+
+  return (
+    <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="rail-needs-action">
+      <div className="mb-1.5 flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-semibold text-amber-200">Needs your action</span>
+        <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{formatCompactNumber(pending.length)}</span>
+      </div>
+      <PendingConfirmationList pending={pending} onDismiss={handleDismiss} onAccept={handleAccept} />
+    </div>
+  );
+}
+
 function workSessionActionPriorityText(priority?: string | null): string {
   if (priority === 'critical') return 'text-rose-300';
   if (priority === 'high') return 'text-amber-300';
@@ -801,6 +901,9 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   accountSpend = null,
   savingSessionRefs = false,
   onUpdateSessionRefs,
+  onConfirmationResolved,
+  addToast,
+  projectId = null,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -808,7 +911,17 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const attention = state?.attention ?? null;
-  const attentionItems = useMemo(() => attention?.items.slice(0, 2) ?? [], [attention?.items]);
+  // Pending operator confirmations get a dedicated, fully-reachable actionable
+  // list below; the generic attention preview stays capped and excludes them so
+  // they are never truncated away or shown twice.
+  const confirmationItems = useMemo(
+    () => attention?.items.filter(item => item.kind === 'confirmation') ?? [],
+    [attention?.items],
+  );
+  const attentionItems = useMemo(
+    () => attention?.items.filter(item => item.kind !== 'confirmation').slice(0, 2) ?? [],
+    [attention?.items],
+  );
   const staleCycle = Boolean(activeCycle?.stale);
   const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(
@@ -1102,6 +1215,13 @@ export const StrategicContextRail = memo(function StrategicContextRail({
             </div>
           </div>
         )}
+        {confirmationItems.length > 0 && (
+          <RailPendingConfirmations
+            items={confirmationItems}
+            onResolved={onConfirmationResolved}
+            addToast={addToast}
+          />
+        )}
         {attention && attention.level !== 'clear' && (
           <div className="mt-3 border-t border-neutral-800 pt-3">
             <div className="flex min-w-0 gap-2">
@@ -1166,6 +1286,8 @@ export const StrategicContextRail = memo(function StrategicContextRail({
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />
       </WorkbenchPanel>
+
+      <WhiteboardRailSection projectId={projectId} />
 
       <TaskFocusBlock
         focus={state?.tasks.focus ?? null}

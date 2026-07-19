@@ -1909,6 +1909,74 @@ class TestTaskCostBreakdown:
         assert body["max_tasks"] == 1000
         assert body["truncated"] is False
 
+    @pytest.mark.asyncio
+    async def test_spot_rate_and_evidenceless_exclusion(
+        self, client: AsyncClient, db_session
+    ):
+        """Server-side cost aggregation prices spot vs on-demand per row and drops
+        tasks with no VM cost evidence.
+
+        Exercises the SQL rate CASE (the spot branch specifically) and the
+        evidence filter that replaced the per-row Python ``cost is None`` skip
+        when the breakdown was moved into SQL.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=10)
+        started_at = completed_at - timedelta(seconds=3600)
+
+        def _add(title: str, task_type: str, *, spot: bool, evidence: bool) -> None:
+            kwargs: dict = dict(
+                project_id=project.id,
+                title=title,
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": task_type, "prompt": "x"}],
+                started_at=started_at,
+                created_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_spot=spot,
+            )
+            if evidence:
+                # A provisioning window is the cost evidence; without it (and no
+                # banked cost) the task must be excluded entirely.
+                kwargs["vm_provisioned_at"] = started_at
+                kwargs["vm_stopped_at"] = completed_at
+            db_session.add(make_task(**kwargs))
+
+        _add("on-demand", "create", spot=False, evidence=True)
+        _add("spot", "research", spot=True, evidence=True)
+        _add("no-evidence", "create", spot=False, evidence=False)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        on_demand_cost = round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
+        spot_cost = round(3600 * admin_analytics.SPOT_RATE, 2)
+        # Only the two evidence-bearing tasks are counted.
+        assert body["task_count"] == 2
+        assert body["total_estimated_cost_usd"] == pytest.approx(
+            round(
+                3600 * admin_analytics.ON_DEMAND_RATE
+                + 3600 * admin_analytics.SPOT_RATE,
+                2,
+            )
+        )
+        by_type = {r["task_type"]: r for r in body["task_type_breakdown"]}
+        assert by_type["create"]["estimated_cost_usd"] == pytest.approx(on_demand_cost)
+        assert by_type["research"]["estimated_cost_usd"] == pytest.approx(spot_cost)
+        # Spot is strictly cheaper — proves the spot branch of the rate CASE ran
+        # rather than a single flat rate for both rows.
+        assert spot_cost < on_demand_cost
+        assert "no-evidence" not in {t["task_title"] for t in body["top_tasks"]}
+
 
 class TestOpenPrs:
     @pytest.fixture(autouse=True)
@@ -4162,3 +4230,56 @@ class TestSpendBurnRate:
         body = resp.json()
         assert body["task_count"] == 1
         assert body["window_cost_usd"] > 0.0
+
+    @pytest.mark.asyncio
+    async def test_spend_burn_rate_excludes_evidenceless_task(
+        self, client: AsyncClient, db_session
+    ):
+        """A terminal, in-window task with no VM cost evidence (no provisioning
+        window, no banked cost) is excluded from the SQL-aggregated burn rate."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        completed_at = now - timedelta(days=1)
+        started_at = completed_at - timedelta(hours=1)
+        # Evidence-bearing task: 1h on-demand VM.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="with-evidence",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                created_at=started_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=started_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        # Evidence-less task: same window, but never provisioned and no banked cost.
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="no-evidence",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                created_at=completed_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days=7"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["window_cost_usd"] == pytest.approx(
+            round(3600 * admin_analytics.ON_DEMAND_RATE, 2), abs=0.01
+        )

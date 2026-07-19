@@ -28,6 +28,16 @@ describe('EvidenceTierBadge — label rendering', () => {
     expect(getByText('Partial')).toBeTruthy();
   });
 
+  test('probed tier renders Probed label', () => {
+    const { getByText } = render(<EvidenceTierBadge tier="probed" />);
+    expect(getByText('Probed')).toBeTruthy();
+  });
+
+  test('probed badge tooltip describes time-bounded probe', () => {
+    const { getByTitle } = render(<EvidenceTierBadge tier="probed" />);
+    expect(getByTitle('Lower-confidence machine signal — time-bounded probe, not fully verified')).toBeTruthy();
+  });
+
   test('machine-verified, attested, and self-reported labels are distinct from each other', () => {
     const { getByText: byCovered } = render(<EvidenceTierBadge tier="covered" />);
     const { getByText: byAttested } = render(<EvidenceTierBadge tier="attested" />);

@@ -81,6 +81,7 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const [scopedQueuedCount, setScopedQueuedCount] = useState<number | null>(null);
   const [initialLoading, setInitialLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [fetchEpoch, setFetchEpoch] = useState(0);
   const [page, setPage] = useState(1);
   const [rawLimit, setLimit] = usePersistedState<number>('pageSize', 50);
   // Backend supports up to 500 rows, but the UI caps at 200 — stale
@@ -220,9 +221,31 @@ export function useTasksState(deps: UseTasksStateDeps) {
     } finally {
       setInitialLoading(false);
       setRefreshing(false);
+      setFetchEpoch(epoch => epoch + 1);
     }
   };
   fetchTasksRef.current = fetchTasks;
+
+  const fetchCounts = async () => {
+    let url = `${API_BASE_URL}/api/admin/tasks/counts`;
+    if (selectedProjectId) {
+      url += `?project_id=${encodeURIComponent(selectedProjectId)}`;
+    }
+    try {
+      const res = await authGet(url);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.active_count !== undefined) setGlobalActiveCount(data.active_count);
+      if (data.evaluating_count !== undefined) setGlobalEvaluatingCount(data.evaluating_count);
+      if (data.queued_count !== undefined) setGlobalQueuedCount(data.queued_count);
+      if (data.scoped_active_count !== undefined) setScopedActiveCount(data.scoped_active_count);
+      else setScopedActiveCount(null);
+      if (data.scoped_evaluating_count !== undefined) setScopedEvaluatingCount(data.scoped_evaluating_count);
+      else setScopedEvaluatingCount(null);
+      if (data.scoped_queued_count !== undefined) setScopedQueuedCount(data.scoped_queued_count);
+      else setScopedQueuedCount(null);
+    } catch { /* ignore transient errors */ }
+  };
 
   const handleApprove = async (taskId: string) => {
     const original = tasks.find(t => t.id === taskId);
@@ -571,12 +594,12 @@ export function useTasksState(deps: UseTasksStateDeps) {
     tasks, setTasks, totalTasks,
     globalActiveCount, globalEvaluatingCount, globalQueuedCount,
     scopedActiveCount, scopedEvaluatingCount, scopedQueuedCount,
-    initialLoading, refreshing,
+    initialLoading, refreshing, fetchEpoch,
     page, setPage, limit, setLimit, refreshInterval, setRefreshInterval,
     actionLoadingMap,
     lastRefresh, apiHealthy, lastFetchTime,
     needsAttentionCount,
-    fetchTasks,
+    fetchTasks, fetchCounts,
     handleApprove, handleRequestChanges, handleCancel, handleRetry,
     handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,

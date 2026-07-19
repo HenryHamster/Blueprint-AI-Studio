@@ -58,6 +58,13 @@ from app.models import (
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
 from app.time_utils import _utcnow, set_retry_after
+from app.strategic_resident_runner_policy import (
+    resident_payloads_require_local_runner,
+)
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -107,6 +114,40 @@ async def provision_and_handle(
             if payloads
             else ""
         )
+        # Last boundary before payload upload, secret creation, Cloud Run, or GCE.
+        if resident_payloads_require_local_runner(payloads):
+            try:
+                async with _orch.AsyncSessionLocal() as _local_hold_session:
+                    held = await _orch._lock_provisioning_task_for_vm(
+                        _local_hold_session, t_id, vm_id
+                    )
+                    if held is not None and resident_payloads_require_local_runner(
+                        held.payloads
+                    ):
+                        ctx = dict(held.context or {})
+                        ctx[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
+                        ctx.setdefault(
+                            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+                            _utcnow().isoformat(),
+                        )
+                        ctx.pop("runner_target_id", None)
+                        held.context = ctx
+                        held.status = TaskStatus.QUEUED
+                        held.vm_instance_id = None
+                        held.vm_provisioned_at = None
+                        held.latest_status_message = (
+                            "Resident requires a compatible local runner; cloud "
+                            "provisioning was fenced before external I/O."
+                        )
+                        _local_hold_session.add(held)
+                        await _local_hold_session.commit()
+            except Exception:
+                logger.exception(
+                    "[ORCHESTRATOR] Failed to park local-only Resident task %s; "
+                    "cloud dispatch remains fenced",
+                    t_id,
+                )
+            return
 
         # Upload payload to GCS and store agent credentials in Secret Manager
         # concurrently — both are independent I/O operations (~500ms each)

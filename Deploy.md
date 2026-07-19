@@ -26,6 +26,72 @@ This runs in two phases:
 - `firebase` CLI (`npm install -g firebase-tools`)
 - Node.js 20+
 
+## Required deploy and migration secrets
+
+Before deploying a current backend revision, create
+`GITHUB_PAT_ENCRYPTION_KEY` in Secret Manager with the live Fernet key already
+used by the service. The same secret version must be bound to both the
+`blueprint-orchestrator` service and the `blueprint-migrate` job. Migration 0609
+validates the key before touching rows and refuses to stamp when it is missing
+or invalid; `ALLOW_PLAINTEXT_CREDENTIALS` does not override that data-safety
+rule. Never rotate an existing key without a separate credential re-encryption
+procedure.
+
+`MIGRATION_APPLY_SCRATCH_DATABASE_URL` is different: it is optional,
+qualification-only infrastructure and is not a serving prerequisite. When the
+Secret Manager object exists, `setup.sh` and `backend/cloudbuild.yaml` bind it
+after the replace-all service deploy with `--update-secrets`. When it is absent,
+Cloud Run still deploys and FastAPI still starts; release qualification returns
+an actionable `migration_apply_check_unavailable` hold until a dedicated
+PostgreSQL target whose user can create and drop databases is configured.
+
+For installations managed outside `setup.sh`, bind the optional secret without
+replacing the service's required secret list:
+
+```bash
+gcloud run services update blueprint-orchestrator \
+  --region=us-central1 \
+  --update-secrets=MIGRATION_APPLY_SCRATCH_DATABASE_URL=MIGRATION_APPLY_SCRATCH_DATABASE_URL:latest
+```
+
+The GitHub Actions deploy workflow updates `blueprint-migrate` with only
+`--image` (no `--set-secrets`), which preserves existing secret bindings on
+the job. `backend/cloudbuild.yaml` — which runs during the Cloud Build phase
+that precedes the migration step — now binds `GITHUB_PAT_ENCRYPTION_KEY` to
+the job via `--update-secrets` on every deploy. This guarantees the key is
+present when `gcloud run jobs execute blueprint-migrate` fires. For
+installations that manage deployments outside Cloud Build (e.g. direct
+`gcloud` invocations without `cloudbuild.yaml`), bind the secret manually
+before executing the job:
+
+```bash
+gcloud run jobs update blueprint-migrate \
+  --region=us-central1 \
+  --update-secrets=GITHUB_PAT_ENCRYPTION_KEY=GITHUB_PAT_ENCRYPTION_KEY:latest
+```
+
+The CI full-chain test job still requires a valid non-production Fernet key
+injected at runtime; that is a separate GitHub Actions secret configuration.
+The GitHub Actions deploy and CI workflows are managed separately from this
+repository change; do not edit or deploy workflow files as part of a migration
+hotfix.
+
+## Narrow audited recovery
+
+If qualification itself is broken, first call the read-only
+`GET /api/admin/projects/{project_id}/promote/hotfix/preview` endpoint for the
+exact candidate SHA. Only an eligible release-machinery-only diff may use
+`POST /api/admin/projects/{project_id}/promote/hotfix`, with a non-empty
+operator reason, the reviewed `scope_modules`, and
+`ack_inert_until_deploy=true`. The lane remains owner-only, audited, CI-gated,
+and subject to the merge-time migration-chain backstop.
+
+The hotfix lane never admits migrations, `.github/workflows/**`, product code,
+or an `EXPECTED_SCHEMA_REVISION` bump. Those changes must complete the normal
+qualification and deploy path. Keep the release held when the preview is
+ineligible or unavailable; do not substitute the whole-tree force-promotion
+endpoint for this narrow recovery path.
+
 ---
 
 ## GitHub App Setup

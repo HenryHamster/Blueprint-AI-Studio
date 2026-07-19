@@ -1694,6 +1694,12 @@ def test_version_phase_floor_keeps_per_criterion_state():
         # text may be absent only if the original had no text
         # stuck_reason present (even if None)
         assert "stuck_reason" in entry, "floor entry missing stuck_reason"
+        # status is load-bearing: the strategic renderer (formatCriteriaRubric)
+        # filters the rubric to status == "active"; a floored entry without it
+        # renders as "None authored yet", conflating floored-out with no-criteria.
+        assert entry.get("status") == "active", (
+            "floor entry must preserve status so the rubric renders as active criteria"
+        )
 
     # Covered criteria are the lowest priority — with 3+5+4=12 higher-priority
     # entries and a cap of 10, covered entries should not appear.

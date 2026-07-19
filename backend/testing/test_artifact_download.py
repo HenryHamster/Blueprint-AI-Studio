@@ -468,23 +468,145 @@ def test_viewable_content_type_classifies_images_and_videos():
     assert storage.viewable_content_type_for_filename("a.JPG") == ("image/jpeg", "image")
     assert storage.viewable_content_type_for_filename("clip.mp4") == ("video/mp4", "video")
     assert storage.viewable_content_type_for_filename("v.webm") == ("video/webm", "video")
+    # PDF is a first-class viewable kind (matplotlib savefig('*.pdf')).
+    assert storage.viewable_content_type_for_filename("report.pdf") == (
+        "application/pdf",
+        "pdf",
+    )
+    assert storage.viewable_content_type_for_filename("PLOT.PDF") == (
+        "application/pdf",
+        "pdf",
+    )
     # Non-viewable / no extension.
     assert storage.viewable_content_type_for_filename("data.bin") is None
     assert storage.viewable_content_type_for_filename("noext") is None
 
 
-def test_svg_excluded_fail_closed_on_both_viewable_surfaces():
-    """Finding 63ee179fc66a7b97: the per-file viewable substrate and the
-    bundle-extraction surface MUST agree on SVG, and the agreed policy is
-    fail-closed exclusion (an SVG served from a signed URL can execute script
-    in the viewer's browsing context)."""
+def test_media_kind_for_mime_maps_pdf():
+    assert storage._media_kind_for_mime("image/png") == "image"
+    assert storage._media_kind_for_mime("video/mp4") == "video"
+    assert storage._media_kind_for_mime("application/pdf") == "pdf"
+    assert storage._media_kind_for_mime("application/octet-stream") == "unknown"
+
+
+def test_svg_viewable_on_both_surfaces_after_sanitization():
+    """SVG is accepted on both viewable surfaces now that sanitize_svg_bytes
+    strips <script> elements and on* event attributes before upload.  The two
+    allowlist surfaces must agree (svg_is_viewable returns True)."""
     # Surface 1: the individually-addressable viewable substrate.
-    assert storage.viewable_content_type_for_filename("chart.svg") is None
-    assert "svg" not in storage._VIEWABLE_CONTENT_TYPES
+    assert storage.viewable_content_type_for_filename("chart.svg") == (
+        "image/svg+xml",
+        "image",
+    )
+    assert "svg" in storage._VIEWABLE_CONTENT_TYPES
     # Surface 2: the durable-bundle extraction allowlist.
-    assert ".svg" not in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
-    # Both surfaces agree, and they agree on exclusion.
-    assert storage.svg_is_viewable() is False
+    assert ".svg" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    # Both surfaces agree, and they agree on inclusion.
+    assert storage.svg_is_viewable() is True
+    # PDF is still present on both surfaces.
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
+    assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+
+
+def test_sanitize_svg_bytes_strips_script_and_events():
+    """sanitize_svg_bytes removes <script> elements, on* event attributes, and
+    javascript: hrefs, but preserves valid SVG geometry."""
+    # Script element (namespaced and bare) are removed.
+    svg_with_script = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<script>alert(1)</script>"
+        b"<rect width='10' height='10'/>"
+        b"</svg>"
+    )
+    result = storage.sanitize_svg_bytes(svg_with_script)
+    assert b"<script" not in result
+    assert b"alert" not in result
+    assert b"rect" in result  # geometry preserved
+
+    # on* event attributes are stripped.
+    svg_with_event = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<circle onclick='evil()' r='5'/>"
+        b"</svg>"
+    )
+    result2 = storage.sanitize_svg_bytes(svg_with_event)
+    assert b"onclick" not in result2
+    assert b"circle" in result2
+
+    # javascript: href is stripped.
+    svg_with_href = (
+        b"<svg xmlns='http://www.w3.org/2000/svg'>"
+        b"<a href='javascript:alert(1)'><text>click</text></a>"
+        b"</svg>"
+    )
+    result3 = storage.sanitize_svg_bytes(svg_with_href)
+    assert b"javascript:" not in result3
+    assert b"text" in result3
+
+    # Malformed XML returns the original bytes unchanged (not an error).
+    bad = b"not xml at all <<< >>>"
+    assert storage.sanitize_svg_bytes(bad) == bad
+
+
+def test_sanitize_svg_bytes_strips_xhtml_namespaced_script():
+    """<script> inside <foreignObject> with XHTML namespace must be removed.
+
+    A bare _SVG_SCRIPT_TAGS set-lookup misses {xhtml}script — this test pins
+    the local-name matching fix so the bypass class stays closed.
+    """
+    xhtml_ns = "http://www.w3.org/1999/xhtml"
+    svg_ns = "http://www.w3.org/2000/svg"
+    # foreignObject with an XHTML-namespaced script inside.
+    payload = (
+        f'<svg xmlns="{svg_ns}" xmlns:xhtml="{xhtml_ns}">'
+        f"<foreignObject>"
+        f'<xhtml:script>alert(1)</xhtml:script>'
+        f"</foreignObject>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"script" not in result.lower()
+    assert b"alert" not in result
+    assert b"foreignObject" not in result  # entire foreignObject subtree dropped
+
+
+def test_sanitize_svg_bytes_strips_smil_href_animation():
+    """SMIL <animate> that rewrites href to javascript: must be removed.
+
+    Static-attribute checks miss runtime rewriting — this test pins the
+    animation-element fix so the vector stays closed.
+    """
+    svg_ns = "http://www.w3.org/2000/svg"
+    payload = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe"><text>click</text>'
+        f'<animate attributeName="href" to="javascript:alert(1)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result = storage.sanitize_svg_bytes(payload)
+    assert b"animate" not in result
+    assert b"javascript:" not in result
+    assert b"text" in result  # safe geometry preserved
+
+    # <set> variant
+    payload2 = (
+        f'<svg xmlns="{svg_ns}">'
+        f'<a href="#safe">'
+        f'<set attributeName="href" to="javascript:alert(2)"/>'
+        f"</a>"
+        f"</svg>"
+    ).encode()
+    result2 = storage.sanitize_svg_bytes(payload2)
+    assert b"set" not in result2 or b"javascript:" not in result2
+    assert b"javascript:" not in result2
+
+    # Clean SVG is returned as valid XML bytes.
+    clean = b"<svg xmlns='http://www.w3.org/2000/svg'><rect/></svg>"
+    sanitized = storage.sanitize_svg_bytes(clean)
+    assert b"rect" in sanitized
+    # Idempotent: sanitizing twice does not change the result further.
+    assert storage.sanitize_svg_bytes(sanitized) == sanitized
 
 
 def test_sanitize_viewable_basename_strips_traversal():
@@ -581,7 +703,7 @@ async def test_extract_viewable_candidates_enforces_total_count_cap(monkeypatch,
     job.id = uuid.uuid4()
     job.backend = compute_backends.GCP_BACKEND_NAME
 
-    selected, dropped = await compute_backends._collect_viewable_artifact_candidates(job)
+    selected, dropped, _svg_count = await compute_backends._collect_viewable_artifact_candidates(job)
     assert len(selected) == 2
     assert dropped == 3
 
@@ -629,6 +751,8 @@ def test_viewable_artifacts_descriptor_sanitizes_manifest():
         "content_type": "image/png",
         "size_bytes": 128,
         "kind": "image",
+        "revision": None,
+        "live": None,
     }
     assert out[1] == {
         "filename": None,
@@ -636,6 +760,8 @@ def test_viewable_artifacts_descriptor_sanitizes_manifest():
         "content_type": None,
         "size_bytes": None,
         "kind": None,
+        "revision": None,
+        "live": None,
     }
 
 
@@ -826,7 +952,7 @@ async def _make_compute_job_file(
     session, job: ComputeJob, relpath: str = "plot.png", media_type: str = "image"
 ) -> ComputeJobFile:
     """Create a ComputeJobFile row for a viewable file under a compute job's prefix."""
-    storage_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/files/{relpath}"
+    storage_uri = storage.compute_job_viewable_uri(job.id, relpath)
     cjf = ComputeJobFile(
         compute_job_id=job.id,
         safe_relpath=relpath,
@@ -875,7 +1001,7 @@ async def test_resolve_download_url_compute_job_media_file_wrong_job_404(
 
     # Create a ComputeJobFile whose storage_uri is under job_a's prefix
     # but whose compute_job_id points to job_b.
-    uri_under_a = f"gs://{BUCKET}/compute-jobs/{job_a.id}/artifacts/files/result.png"
+    uri_under_a = storage.compute_job_viewable_uri(job_a.id, "result.png")
     cjf = ComputeJobFile(
         compute_job_id=job_b.id,
         safe_relpath="result.png",
@@ -890,4 +1016,343 @@ async def test_resolve_download_url_compute_job_media_file_wrong_job_404(
         params={"storage_uri": uri_under_a, "project_id": str(project.id)},
     )
     assert resp.status_code == 404
+    sign.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Batch viewable-artifact authorization (extraction failure / retry)
+# ---------------------------------------------------------------------------
+
+
+async def _make_compute_job_with_viewable_manifest(
+    session, project, task, *, uris: list[str]
+) -> ComputeJob:
+    """Compute job whose polling_metadata viewable-files manifest contains
+    multiple URIs (the signed-URL batch case)."""
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    session.add(job)
+    await session.flush()
+    entries = []
+    for uri in uris:
+        basename = uri.rsplit("/", 1)[-1]
+        entries.append(
+            {
+                "filename": basename,
+                "storage_uri": uri,
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            }
+        )
+    job.polling_metadata = {"viewable_files": entries}
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_artifact_via_compute_job_file_row(
+    client: AsyncClient, db_session, mocker
+):
+    """A viewable artifact stored under the /artifacts/viewable/ prefix is
+    signable when it is recorded as a ComputeJobFile row — the canonical path
+    taken after the single-pipeline persist pass."""
+    _mock_signing(mocker, url="https://signed.example/viewable-cjf-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    # Use the canonical /artifacts/viewable/ prefix (not /artifacts/files/).
+    viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/reward_curve.png"
+    )
+    cjf = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="reward_curve.png",
+        media_type="image",
+        content_type="image/png",
+        storage_uri=viewable_uri,
+    )
+    db_session.add(cjf)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/viewable-cjf-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_all_viewable_files_in_manifest_are_signable(
+    client: AsyncClient, db_session, mocker
+):
+    """All URIs recorded in a job's viewable-file manifest (the batch) can be
+    individually resolved via the download-url endpoint — each is authorized and
+    signed, not just the first one."""
+    _mock_signing(mocker, url="https://signed.example/batch-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    # Create the job first so its id is available for building the URIs.
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    plot_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/plot.png"
+    video_uri = f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/rollout.mp4"
+
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "plot.png",
+                "storage_uri": plot_uri,
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            },
+            {
+                "filename": "rollout.mp4",
+                "storage_uri": video_uri,
+                "content_type": "video/mp4",
+                "size_bytes": 5_000_000,
+                "kind": "video",
+            },
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    # Both URIs resolve independently.
+    for uri in (plot_uri, video_uri):
+        resp = await client.get(
+            "/api/admin/artifacts/download-url",
+            params={"storage_uri": uri, "project_id": str(project.id)},
+        )
+        assert resp.status_code == 200, f"expected 200 for {uri}"
+        assert resp.json()["url"] == "https://signed.example/batch-ok"
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_extraction_failure_no_manifest_no_cjf_404(
+    client: AsyncClient, db_session, mocker
+):
+    """When viewable-artifact extraction failed (no polling_metadata manifest
+    entry AND no ComputeJobFile row), a viewable-prefix URI is rejected as 404.
+
+    This is the extraction-failure visibility case: the endpoint fails closed
+    rather than signing an unapproved object, so the UI can surface the error
+    and offer a retry path."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    # A URI under the viewable prefix that was never recorded anywhere
+    # (extraction failed — neither the manifest nor ComputeJobFile rows exist).
+    missing_viewable = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/missing_plot.png"
+    )
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": missing_viewable, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404
+    sign.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_viewable_manifest_and_cjf_both_authorize(
+    client: AsyncClient, db_session, mocker
+):
+    """A viewable URI recorded in BOTH the polling_metadata manifest AND as a
+    ComputeJobFile row resolves successfully — the manifest check passes first
+    and the endpoint returns 200 without requiring the ComputeJobFile fallback."""
+    _mock_signing(mocker, url="https://signed.example/dual-auth-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+    job = await _make_compute_job(db_session, project, task)
+
+    dual_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/dual_plot.png"
+    )
+    # Record in polling_metadata manifest.
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "dual_plot.png",
+                "storage_uri": dual_uri,
+                "content_type": "image/png",
+                "size_bytes": 1024,
+                "kind": "image",
+            }
+        ]
+    }
+    db_session.add(job)
+    # Also record as a ComputeJobFile row.
+    cjf = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="dual_plot.png",
+        media_type="image",
+        content_type="image/png",
+        storage_uri=dual_uri,
+    )
+    db_session.add(cjf)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": dual_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["url"] == "https://signed.example/dual-auth-ok"
+
+
+@pytest.mark.asyncio
+async def test_signable_viewable_set_matches_listed_set(
+    client: AsyncClient, db_session, mocker
+):
+    """The set of URIs the download-url endpoint will sign must equal the set
+    the viewable-files manifest lists — no extra signing via ComputeJobFile rows
+    whose extension is not in the viewable allowlist.
+
+    Concretely: a ComputeJobFile row whose safe_relpath has a non-viewable
+    extension (e.g. '.csv') must be rejected with 404 even though the row
+    exists in the DB.  This verifies the extension guard that was added to the
+    ComputeJobFile signing branch so it matches the manifest build path.
+    """
+    _mock_signing(mocker, url="https://signed.example/lockstep-ok")
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    # A terminal job whose manifest contains one viewable image.
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    listed_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/reward.png"
+    )
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "reward.png",
+                "storage_uri": listed_uri,
+                "content_type": "image/png",
+                "size_bytes": 128,
+                "kind": "image",
+            }
+        ]
+    }
+    db_session.add(job)
+
+    # A ComputeJobFile row with a non-viewable extension — must NOT be signable.
+    non_viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/metrics.csv"
+    )
+    cjf_bad = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="metrics.csv",
+        media_type="unknown",
+        storage_uri=non_viewable_uri,
+    )
+    db_session.add(cjf_bad)
+    await db_session.commit()
+
+    # Listed URI (in manifest) is signable.
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": listed_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 200, "manifest URI must be signable"
+
+    # Non-viewable-extension ComputeJobFile is NOT signable — signable set
+    # matches listed set; extension guard closes the divergence.
+    resp2 = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": non_viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp2.status_code == 404, (
+        "non-viewable-extension ComputeJobFile row must not be signable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolve_download_url_manifest_uri_non_viewable_extension_404(
+    client: AsyncClient, db_session, mocker
+):
+    """A URI in the viewable_files manifest whose filename has a non-viewable
+    extension (e.g. '.csv') is rejected 404 — the extension guard is symmetric
+    across both the manifest branch and the ComputeJobFile branch."""
+    sign = _mock_signing(mocker)
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id)
+    task = await _make_task(db_session, project)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+    )
+    db_session.add(job)
+    await db_session.flush()
+
+    # Inject a non-viewable URI directly into the manifest (bypassing
+    # write-time enforcement to simulate a bypass attempt or legacy data).
+    non_viewable_uri = (
+        f"gs://{BUCKET}/compute-jobs/{job.id}/artifacts/viewable/metrics.csv"
+    )
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "metrics.csv",
+                "storage_uri": non_viewable_uri,
+                "content_type": "text/csv",
+                "size_bytes": 256,
+                "kind": "unknown",
+            }
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(
+        "/api/admin/artifacts/download-url",
+        params={"storage_uri": non_viewable_uri, "project_id": str(project.id)},
+    )
+    assert resp.status_code == 404, (
+        "manifest URI with non-viewable extension must not be signable"
+    )
     sign.assert_not_called()

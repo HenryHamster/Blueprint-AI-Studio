@@ -8,6 +8,7 @@ install of bubblewrap.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -161,7 +162,8 @@ class TestDecisionTable(unittest.TestCase):
     def test_agent_docker_types_membership(self):
         # The MUST-include read-only slice is present.
         for t in (
-            "strategic_review", "research", "web_research", "plan", "design",
+            "strategic_resident_turn", "strategic_review", "research",
+            "web_research", "plan", "design",
             "memo", "investigate", "design_doc_update",
         ):
             self.assertIn(t, iso.AGENT_DOCKER_TYPES)
@@ -860,6 +862,8 @@ class TestAgentPlan(unittest.TestCase):
         # bind mountpoint itself) so the agent's rm -rf avoids EBUSY.
         self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace/agent")
         self.assertIn("/tmp/ws/t1", plan.argv)
+        self.assertIn("--chdir", plan.argv)
+        self.assertEqual(plan.argv[plan.argv.index("--chdir") + 1], "/workspace")
 
     def test_agent_plan_docker_backend(self):
         plan = iso.plan_agent_execution(
@@ -1120,6 +1124,124 @@ class TestProbeDockerCdiGpu(unittest.TestCase):
         with mock.patch.object(iso.subprocess, "run", return_value=self._info("")):
             self.assertFalse(iso.probe_docker_cdi_gpu())
 
+
+class TestProbeContainerGpuPassthrough(unittest.TestCase):
+    @staticmethod
+    def _info(stdout, rc=0):
+        return subprocess.CompletedProcess(args=[], returncode=rc, stdout=stdout, stderr="")
+
+    def test_docker_cdi_probe_uses_job_argv_and_requires_gpu_output(self):
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Test GPU (UUID: GPU-1)\n", stderr=""
+        )
+        caps = _caps(docker_usable=True, docker_cdi_gpu=True, gpu_indices=(0,))
+        with mock.patch.dict(os.environ, {"BLUEPRINT_RUNNER_TOKEN": "secret"}), \
+             mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            proof = iso.probe_container_gpu_passthrough(caps, image="probe:image")
+        self.assertEqual(proof["docker"]["verified"], True)
+        self.assertEqual(proof["docker"]["mode"], "cdi")
+        self.assertIn("--device", run.call_args.args[0])
+        self.assertNotIn("--gpus", run.call_args.args[0])
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", run.call_args.kwargs["env"])
+
+    def test_configured_private_image_is_used_for_retryable_gpu_proof(self):
+        """A Docker-Hub-blocked runner can prove its configured project image."""
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Project GPU\n", stderr=""
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"BLUEPRINT_RUNNER_GPU_PROBE_IMAGE": "registry.example/project/cuda:stable"},
+            clear=False,
+        ), mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            proof = iso.refresh_container_gpu_passthrough(caps)
+
+        self.assertTrue(proof.container_gpu_passthrough["docker"]["verified"])
+        self.assertIn("registry.example/project/cuda:stable", run.call_args.args[0])
+        self.assertNotIn(iso._GPU_PROBE_IMAGE, run.call_args.args[0])
+
+    def test_runtime_presence_without_host_gpu_is_negative_evidence(self):
+        proof = iso.probe_container_gpu_passthrough(_caps(podman_usable=True))
+        self.assertEqual(
+            proof,
+            {"podman": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}},
+        )
+
+    def test_timeout_force_removes_probe_container(self):
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(list(argv))
+            if argv[1:3] == ["rm", "-f"]:
+                return subprocess.CompletedProcess(args=argv, returncode=0)
+            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=45)
+
+        with mock.patch.object(iso.subprocess, "run", side_effect=fake_run):
+            proof = iso.probe_container_gpu_passthrough(caps)
+
+        self.assertEqual(proof["docker"]["reason"], "probe_timeout")
+        cleanup = next(call for call in calls if call[1:3] == ["rm", "-f"])
+        self.assertRegex(cleanup[3], r"^bp-gpu-passthrough-probe-\d+-[0-9a-f]{8}$")
+
+    def test_probe_names_do_not_collide_after_runner_restart(self):
+        """A stale predecessor probe name must not poison the next daemon probe."""
+        caps = _caps(docker_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="GPU 0: Test GPU\n", stderr=""
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            iso.probe_container_gpu_passthrough(caps)
+            first_name = run.call_args_list[0].args[0][
+                run.call_args_list[0].args[0].index("--name") + 1
+            ]
+            iso.probe_container_gpu_passthrough(caps)
+            second_name = run.call_args_list[1].args[0][
+                run.call_args_list[1].args[0].index("--name") + 1
+            ]
+
+        self.assertNotEqual(first_name, second_name)
+        self.assertTrue(first_name.startswith("bp-gpu-passthrough-probe-"))
+
+    def test_zero_exit_without_gpu_is_no_gpu_visible(self):
+        caps = _caps(podman_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr=""
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            proof = iso.probe_container_gpu_passthrough(caps)
+        self.assertEqual(
+            proof["podman"],
+            {"verified": False, "mode": "hook", "reason": "no_gpu_visible"},
+        )
+
+    def test_nonzero_exit_retains_exit_reason(self):
+        caps = _caps(podman_usable=True, gpu_indices=(0,))
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=125, stdout="", stderr="hook unavailable"
+        )
+        with mock.patch.object(iso.subprocess, "run", return_value=completed):
+            proof = iso.probe_container_gpu_passthrough(caps)
+        self.assertEqual(proof["podman"]["reason"], "probe_exit_125")
+
+    def test_only_recoverable_proof_failures_are_retried(self):
+        transient = _caps(docker_usable=True, gpu_indices=(0,))
+        transient = iso.replace(
+            transient,
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "probe_timeout"}
+            },
+        )
+        no_host_gpu = iso.replace(
+            _caps(docker_usable=True),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
+            },
+        )
+        self.assertTrue(iso.container_gpu_passthrough_needs_retry(transient))
+        self.assertFalse(iso.container_gpu_passthrough_needs_retry(no_host_gpu))
+
     def test_false_when_spec_dir_missing_or_empty(self):
         with tempfile.TemporaryDirectory() as d:
             missing = os.path.join(d, "nonexistent")
@@ -1140,6 +1262,126 @@ class TestProbeDockerCdiGpu(unittest.TestCase):
             self.assertFalse(iso.probe_docker_cdi_gpu())
         with mock.patch.object(iso.subprocess, "run", side_effect=OSError("boom")):
             self.assertFalse(iso.probe_docker_cdi_gpu())
+
+
+# ── Project verification boundary probe ──────────────────────────────────────
+
+class TestProjectVerificationProbe(unittest.TestCase):
+    def _plan(self):
+        return iso.plan_agent_execution(
+            caps=_caps(
+                bwrap_path="/usr/bin/bwrap",
+                userns_ok=True,
+                docker_usable=True,
+            ),
+            agent_binary=["node", "/repo/agent/dist/index.js"],
+            workspace_host="/tmp/verification-workspace",
+            injected_env={"TASK_ID": "verification"},
+            source_env={"PATH": "/usr/bin:/bin"},
+            task_type="fix",
+            agent_image="registry/agent:latest",
+        )
+
+    def test_all_zero_exit_probes_earn_readiness(self):
+        plan = self._plan()
+        completed = subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", "")
+        with mock.patch.object(iso.subprocess, "run", return_value=completed) as run:
+            report = iso.probe_project_verification(plan)
+
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["version"], 1)
+        self.assertEqual(report["boundary"], {"class": "agent", "backend": "bwrap"})
+        self.assertEqual(report["probes"]["ruff"]["exit_code"], 0)
+        self.assertEqual(report["probes"]["docker_postgres"]["exit_code"], 0)
+        self.assertEqual(run.call_count, 2)
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertIn(iso.PROJECT_VERIFICATION_VENV, argv)
+            self.assertNotIn("/var/run/docker.sock", argv)
+            self.assertNotIn("/run/docker.sock", argv)
+
+    def test_real_probe_runs_live_sandbox_postgres_when_installed(self):
+        pg_config = shutil.which("pg_config")
+        ruff_available = subprocess.run(
+            [sys.executable, "-m", "ruff", "--version"],
+            capture_output=True,
+        ).returncode == 0
+        if not pg_config or not ruff_available:
+            self.skipTest("functional probe requires pg_config and Ruff")
+        bindir = subprocess.run(
+            [pg_config, "--bindir"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        if not os.path.isfile(os.path.join(bindir, "initdb")):
+            self.skipTest("functional probe requires the PostgreSQL server tools")
+
+        completed = subprocess.run(
+            [iso.PROJECT_VERIFICATION_PROBE_PATH, "all"],
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        self.assertEqual(
+            completed.returncode,
+            0,
+            msg=(completed.stderr or "") + (completed.stdout or ""),
+        )
+        self.assertIn("PROJECT_VERIFICATION_V1_OK", completed.stdout)
+
+    def test_host_docker_does_not_make_daemonless_bwrap_ready(self):
+        plan = self._plan()
+        results = [
+            subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", ""),
+            subprocess.CompletedProcess([], 127, "", "docker: command not found"),
+        ]
+        with mock.patch.object(iso.subprocess, "run", side_effect=results) as run:
+            report = iso.probe_project_verification(plan)
+
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["probes"]["ruff"]["ok"])
+        self.assertFalse(report["probes"]["docker_postgres"]["ok"])
+        self.assertEqual(report["probes"]["docker_postgres"]["exit_code"], 127)
+        self.assertIn("docker: command not found", report["reason"])
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertEqual(argv[0], "/usr/bin/bwrap")
+            self.assertNotIn("/var/run/docker.sock", argv)
+            self.assertNotIn("/run/docker.sock", argv)
+            self.assertIn(iso.PROJECT_VERIFICATION_SANDBOX_PATH, argv)
+
+    def test_timeout_is_structured_failure(self):
+        plan = self._plan()
+        with mock.patch.object(
+            iso.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["bwrap"], 3),
+        ):
+            report = iso.probe_project_verification(
+                plan, ruff_timeout=3, docker_postgres_timeout=4
+            )
+
+        self.assertFalse(report["ready"])
+        self.assertIsNone(report["probes"]["ruff"]["exit_code"])
+        self.assertEqual(
+            report["probes"]["ruff"]["reason"], "ruff probe timed out after 3s"
+        )
+        self.assertEqual(
+            report["probes"]["docker_postgres"]["reason"],
+            "docker-postgres probe timed out after 4s",
+        )
+
+    def test_signal_terminated_probe_is_nonzero_failure_evidence(self):
+        plan = self._plan()
+        results = [
+            subprocess.CompletedProcess([], -9, "", "killed"),
+            subprocess.CompletedProcess([], 0, "PROJECT_VERIFICATION_V1_OK\n", ""),
+        ]
+        with mock.patch.object(iso.subprocess, "run", side_effect=results):
+            report = iso.probe_project_verification(plan)
+
+        self.assertFalse(report["ready"])
+        self.assertFalse(report["probes"]["ruff"]["ok"])
+        self.assertEqual(report["probes"]["ruff"]["exit_code"], 137)
+        self.assertIn("killed", report["probes"]["ruff"]["reason"])
 
 
 # ── Capabilities inventory (heartbeat backend-availability map) ────────────────
@@ -1168,7 +1410,8 @@ class TestCapabilitiesInventory(unittest.TestCase):
             systemd_run_path="/usr/bin/systemd-run",
         )
         inv = iso.capabilities_inventory(caps)
-        self.assertTrue(all(inv.values()))
+        self.assertTrue(all(value for key, value in inv.items() if key != "enroot_ok"))
+        self.assertFalse(inv["enroot_ok"])
         self.assertEqual(set(inv), self._EXPECTED_KEYS)
 
     def test_bwrap_ok_reflects_userns_property_semantics(self):
@@ -1188,7 +1431,7 @@ class TestCapabilitiesInventory(unittest.TestCase):
         )
         inv = iso.capabilities_inventory(caps)
         self.assertTrue(inv["apptainer_ok"])
-        self.assertTrue(inv["enroot_ok"])
+        self.assertFalse(inv["enroot_ok"])
         self.assertTrue(inv["systemd_run_ok"])
 
     def test_empty_caps_all_false(self):

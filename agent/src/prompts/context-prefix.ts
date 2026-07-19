@@ -441,7 +441,13 @@ export function formatStrategicIntent(intent: Record<string, unknown> | undefine
   return lines.join('\n') + '\n';
 }
 
-export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppressTaskLists?: boolean }): string {
+export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppressTaskLists?: boolean; nowMs?: number }): string {
+  // Deterministic reference epoch for relative-time rendering (see the
+  // "Avoid (already tried and failed)" block). undefined → relativeTimeFromIso
+  // falls back to its live wall-clock default.
+  const relativeTimeReference = typeof opts?.nowMs === 'number' && Number.isFinite(opts.nowMs)
+    ? new Date(opts.nowMs)
+    : undefined;
   const projectCtx = task.project_context as Record<string, unknown> | undefined;
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload = payloads[0] as Record<string, unknown> | undefined;
@@ -450,6 +456,49 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
   const taskScope = taskContext ? strVal(taskContext.scope) : '';
 
   let prefix = '';
+
+  // Exact human-tool revisions explicitly shared with the Resident and copied
+  // into a receipt-bound managed Task. Presence-gated for every other Task.
+  const managedSource = taskContext?._resident_managed_task as Record<string, unknown> | undefined;
+  if (managedSource && typeof managedSource === 'object') {
+    const refs = Array.isArray(managedSource.artifact_refs)
+      ? managedSource.artifact_refs as Array<Record<string, unknown>>
+      : [];
+    const sourceLines: string[] = ['## Resident Source Revisions'];
+    sourceLines.push(
+      'These are immutable, explicitly shared revisions from the frozen Resident turn. Retrieve and inspect the exact revision before relying on it.',
+    );
+    for (const ref of refs) {
+      const id = strVal(ref.artifact_ref_id) || strVal(ref.id);
+      const kind = strVal(ref.kind);
+      const revision = typeof ref.revision === 'number'
+        ? String(ref.revision)
+        : strVal(ref.revision);
+      const checksum = strVal(ref.checksum);
+      const retrieval = ref.retrieval as Record<string, unknown> | undefined;
+      const href = retrieval ? strVal(retrieval.href) : '';
+      if (!id) continue;
+      sourceLines.push(
+        `- ${kind || 'artifact'} ${id} revision ${revision || '?'} checksum ${checksum || '?'}${href ? ` — GET ${href}` : ''}`,
+      );
+    }
+    const evidence = Array.isArray(managedSource.evidence)
+      ? managedSource.evidence.slice(0, 8) as Array<Record<string, unknown>>
+      : [];
+    for (const item of evidence) {
+      const kind = strVal(item.kind);
+      const sourceId = strVal(item.source_id);
+      const revision = strVal(item.revision);
+      const checksum = strVal(item.checksum);
+      const inspectedAt = strVal(item.inspected_at);
+      if (!sourceId) continue;
+      sourceLines.push(
+        `- evidence ${kind || 'source'} ${sourceId} revision ${revision || '?'} checksum ${checksum || '?'}${inspectedAt ? ` inspected ${inspectedAt}` : ''}`,
+      );
+    }
+    sourceLines.push('');
+    prefix += sourceLines.join('\n') + '\n';
+  }
 
   // Project Vision — strategic "why" set by the strategic research agent.
   // Surfaced first so tactical agents can align their work to it.
@@ -761,7 +810,14 @@ export function buildContextPrefix(task: Record<string, unknown>, opts?: { suppr
             const headParts = [`- ${text}`];
             if (ftype) headParts.push(`[${ftype}]`);
             const qualifiers: string[] = [];
-            const rel = relativeTimeFromIso(failedAt);
+            // Render relative to a caller-supplied deterministic reference epoch
+            // (the backend-baked payload timestamp) when provided, NOT the VM
+            // wall clock — so this text stays byte-identical across two builds of
+            // an identical payload and never busts a cacheable prompt prefix it
+            // lands in (v24 cost lever, direction d-27685510). Handlers that place
+            // this block only in their task-variable tail pass no nowMs; passing
+            // undefined lets relativeTimeFromIso keep its live wall-clock default.
+            const rel = relativeTimeFromIso(failedAt, relativeTimeReference);
             if (rel) qualifiers.push(rel);
             if (stage) qualifiers.push(`failed at ${stage}`);
             if (qualifiers.length > 0) headParts.push(`(${qualifiers.join(', ')})`);

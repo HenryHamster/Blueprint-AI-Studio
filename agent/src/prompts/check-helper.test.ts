@@ -92,7 +92,21 @@ describe('writeCheckHelper — direct invocation', () => {
     // (not diff-scoped) — a rebase/merge can grow a file in a stack the diff
     // never touched, and the check is sub-second, so it's cheap always-on
     // insurance against burning a CI iteration on a common, trivial breach.
-    expect(script).toContain('run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"');
+    expect(script).toContain('python3 backend/testing/check_size_limits.py > "$SIZE_GR_LOG" 2>&1');
+    // Baseline-recheck: on failure, the checker re-runs with --base-root
+    // against a detached worktree of the base branch so a breach INHERITED
+    // from the base (e.g. an upstream merge pushed a chronic offender over
+    // its cap on automain) warn-passes instead of blocking every unrelated
+    // PR — mirroring the viewport/backend-pytest baseline pattern. A NEW or
+    // GROWN breach still fails closed.
+    expect(script).toContain('size guardrail FAILED — checking baseline on origin/$BASE');
+    expect(script).toContain('python3 backend/testing/check_size_limits.py --base-root "$SIZE_GR_WT"');
+    expect(script).toContain('size guardrail WARN — every offender pre-exists on $SIZE_GR_BASE_REF; not blocking this PR');
+    expect(script).toContain('FAILED+=("size guardrail")');
+    // --full skips the baseline recheck (the result IS the new baseline),
+    // matching the viewport gate, so an agent can force a blocking view of a
+    // baseline-warned WARN.
+    expect(script).toContain('size guardrail FAILED (--full, no baseline recheck)');
     // It must NOT be gated on the touched stacks anymore.
     expect(script).not.toContain('SIZE_SECTIONS');
     expect(script).not.toContain('--sections $SIZE_SECTIONS');
@@ -865,6 +879,432 @@ esac
     // A real test failure must block ./check (and therefore ./pr open).
     expect(r.status).not.toBe(0);
     expect(r.stdout).toContain('FAIL');
+  });
+});
+
+describe('writeCheckHelper — required backend-authoring verification', () => {
+  let capturedScripts: Record<string, string> = {};
+  const authoringCapability = { agent_mode: 'write', run_shape: 'workflow', output_kind: 'pr' };
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+  const render = async (taskCapability: Record<string, unknown> = authoringCapability): Promise<string> => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-authoring-1',
+      workBranch: 'blueprint/verify-authoring-1',
+      baseBranch: 'automain',
+      owner: 'HenryHamster',
+      repo: 'BlueprintAIStudio',
+      testsOnMainBranch: false,
+      taskCapability,
+      buildConfig: {
+        directories: [{
+          path: 'backend',
+          type: 'python',
+          lint_cmd: 'ruff check .',
+          test_cmd: 'python3 -m pytest',
+          project_verification: {
+            protocol: 'blueprint-v1',
+            harness: 'scripts/test-backend.sh',
+          },
+        }],
+      },
+    });
+    return capturedScripts['/tmp/workspace/.check-task'];
+  };
+  it('derives the requirement from capability axes and configured Ruff+pytest', async () => {
+    const script = await render();
+    expect(script).toContain('required backend-authoring verification');
+    expect(script).toContain('python3 -m ruff check --select E,F,W --ignore E501');
+    expect(script).toContain('USE_TEST_POSTGRES=true bash "$_VERIFICATION_HARNESS" "$_verification_postgres_flag"');
+    expect(script).toContain('pg_config --bindir');
+    expect(script).toContain('/tmp/project_verification_receipt_verify-authoring-1.json');
+    expect(script).toContain('"skipped":runtime["skipped"],"exit_code":0');
+    expect(script).toContain('no impacted pytest file/node was resolved');
+    expect(script).toContain("grep -E '^backend/(testing|tests)/test_.*\\.py$'");
+    expect(script).toContain('PostgreSQL runtime unavailable');
+    expect(script).toContain('sanctioned harness missing');
+    expect(script).not.toContain('touches "backend/" && [ "$WITH_TESTS" = "1" ]');
+  });
+  it('does not apply the gate to canonical read-only or compute capabilities', async () => {
+    for (const capability of [
+      { agent_mode: 'read_only', run_shape: 'single_agent', output_kind: 'knowledge' },
+      { agent_mode: 'write', run_shape: 'experiment_loop', output_kind: 'artifact' },
+    ]) {
+      const script = await render(capability);
+      expect(script).not.toContain('required backend-authoring verification');
+      expect(script).not.toContain('project_verification_receipt_verify-authoring-1.json');
+    }
+  });
+  it('does not infer a requirement when either configured command is absent', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-authoring-no-pytest',
+      workBranch: 'blueprint/verify-authoring-no-pytest',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'python-only',
+      testsOnMainBranch: true,
+      taskCapability: authoringCapability,
+      buildConfig: {
+        directories: [{ path: 'service', type: 'python', lint_cmd: 'ruff check .' }],
+      },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).not.toContain('required backend-authoring verification');
+    expect(script).not.toContain('project_verification_receipt_verify-authoring-no-pytest.json');
+  });
+  it.each(['.', 'services/api', 'service'])(
+    'does not impose the Blueprint receipt contract on ordinary Ruff+pytest project path %s',
+    async projectPath => {
+      const { writeCheckHelper } = await import('./check-helper.js');
+      writeCheckHelper({
+        taskId: 'verify-external-project',
+        workBranch: 'blueprint/verify-external-project',
+        baseBranch: 'main',
+        owner: 'acme',
+        repo: 'python-service',
+        testsOnMainBranch: true,
+        taskCapability: authoringCapability,
+        buildConfig: {
+          directories: [{
+            path: projectPath,
+            type: 'python',
+            lint_cmd: 'ruff check .',
+            test_cmd: 'pytest',
+          }],
+        },
+      });
+      const script = capturedScripts['/tmp/workspace/check'];
+      expect(script).not.toContain('required backend-authoring verification');
+      expect(script).not.toContain('BLUEPRINT_VERIFICATION_RESULT_FILE');
+    },
+  );
+  it('an explicitly opted-in root project matches repo-relative Python changes', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-root-project',
+      workBranch: 'blueprint/verify-root-project',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'python-root',
+      testsOnMainBranch: true,
+      taskCapability: authoringCapability,
+      buildConfig: {
+        directories: [{
+          path: '.',
+          type: 'python',
+          lint_cmd: 'ruff check .',
+          test_cmd: 'pytest',
+          project_verification: {
+            protocol: 'blueprint-v1',
+            harness: 'tools/verified-postgres-tests.sh',
+          },
+        }],
+      },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    expect(script).toContain(`case "$f" in *.py) [ -f "$f" ] && printf x && break`);
+    expect(script).toContain("grep -E '.*\\.py$'");
+    expect(script).toContain("grep -E '^(testing|tests)/test_.*\\.py$'");
+    expect(script).toContain("_VERIFICATION_HARNESS='tools/verified-postgres-tests.sh'");
+    const requiredBlock = script.slice(script.indexOf('required backend-authoring verification'));
+    expect(requiredBlock).not.toContain('if touches "./"');
+  });
+  it('canonicalizes opted-in directory paths and rejects noncanonical harnesses', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    const baseConfig = {
+      taskId: 'verify-canonical-project',
+      workBranch: 'blueprint/verify-canonical-project',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'python-service',
+      testsOnMainBranch: true,
+      taskCapability: authoringCapability,
+    };
+    writeCheckHelper({
+      ...baseConfig,
+      buildConfig: { directories: [{
+        path: ' backend/// ', type: 'python',
+        lint_cmd: 'ruff check .', test_cmd: 'pytest',
+        project_verification: {
+          protocol: 'blueprint-v1', harness: 'scripts/test-backend.sh',
+        },
+      }] },
+    });
+    expect(capturedScripts['/tmp/workspace/check']).toContain(
+      'case "$f" in backend/*.py) [ -f "$f" ] && printf x && break',
+    );
+
+    writeCheckHelper({
+      ...baseConfig,
+      buildConfig: { directories: [{
+        path: './backend', type: 'python',
+        lint_cmd: 'ruff check .', test_cmd: 'pytest',
+        project_verification: {
+          protocol: 'blueprint-v1', harness: 'scripts/test-backend.sh',
+        },
+      }] },
+    });
+    const dotPrefixedScript = capturedScripts['/tmp/workspace/check'];
+    expect(dotPrefixedScript).toContain(
+      'case "$f" in backend/*.py) [ -f "$f" ] && printf x && break',
+    );
+    expect(dotPrefixedScript).not.toContain('case "$f" in ./backend/*.py');
+
+    expect(() => {
+      writeCheckHelper({
+        ...baseConfig,
+        buildConfig: { directories: [{
+          path: 'backend', type: 'python',
+          lint_cmd: 'ruff check .', test_cmd: 'pytest',
+          project_verification: {
+            protocol: 'blueprint-v1', harness: 'scripts/test backend.sh',
+          },
+        }] },
+      });
+    }).toThrow('project verification harness contains unsafe characters');
+  });
+  it('generated required-verification check passes bash syntax validation', async () => {
+    const script = await render();
+    const { execSync } = await import('child_process');
+    execSync('bash -n', { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+  });
+  const runRequiredCheck = async (
+    script: string,
+    scenario: {
+      ruffExit: number; docker: boolean; harnessExit: number; skipped?: number;
+      changedPath?: string; changedPaths?: string[]; missingPaths?: string[];
+      harnessPath?: string;
+    },
+  ): Promise<{ status: number; stdout: string; log: string; receipt?: Record<string, unknown> }> => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'required-verification-'));
+    const receiptPath = '/tmp/project_verification_receipt_verify-authoring-1.json';
+    const posix = (p: string): string =>
+      p.replace(/\\/g, '/').replace(/^([A-Za-z]):\//, (_m, d: string) => `/${d.toLowerCase()}/`);
+    try {
+      try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
+      const bin = realPath.join(dir, 'bin');
+      const changedPaths = scenario.changedPaths ?? [scenario.changedPath ?? 'backend/x.py'];
+      const missingPaths = new Set(scenario.missingPaths ?? []);
+      const harnessPath = scenario.harnessPath ?? 'scripts/test-backend.sh';
+      realFs.mkdirSync(bin, { recursive: true });
+      realFs.mkdirSync(realPath.join(dir, 'backend', 'testing'), { recursive: true });
+      realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
+      realFs.writeFileSync(realPath.join(dir, 'backend', 'x.py'), 'value = 1\n');
+      realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'test_x.py'), 'def test_x(): assert True\n');
+      realFs.writeFileSync(realPath.join(dir, 'backend', 'testing', 'impacted_tests.py'), '# shimmed by python3\n');
+      for (const changedPath of changedPaths) {
+        if (missingPaths.has(changedPath)) continue;
+        const changedFile = realPath.join(dir, changedPath);
+        realFs.mkdirSync(realPath.dirname(changedFile), { recursive: true });
+        realFs.writeFileSync(changedFile, changedPath.includes('test_') ? 'def test_x(): assert True\n' : 'value = 1\n');
+      }
+      const changedOutput = changedPaths.map(p => `'${p}'`).join(' ');
+      realFs.writeFileSync(realPath.join(bin, 'git'), `#!/bin/sh
+case "$*" in
+  *"rev-parse --git-dir"*) echo .git; exit 0 ;;
+  *"rev-parse --verify origin/automain"*) exit 0 ;;
+  *"diff --name-only origin/automain...HEAD"*) printf '%s\\n' ${changedOutput}; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      const realPython = realCp.execFileSync('sh', ['-c', 'command -v python3'], { encoding: 'utf8' }).trim();
+      realFs.writeFileSync(realPath.join(bin, 'python3'), `#!/bin/sh
+if [ "$1" = "-m" ] && [ "$2" = "ruff" ]; then
+  echo "ruff $*" >> "$LOGFILE"
+  exit ${scenario.ruffExit}
+fi
+if [ "$1" = "backend/testing/impacted_tests.py" ]; then
+  echo backend/testing/test_x.py
+  exit 0
+fi
+case "$*" in *backend/testing/check_size_limits.py*) exit 0 ;; esac
+exec "${realPython}" "$@"
+`, { mode: 0o755 });
+      realFs.writeFileSync(realPath.join(bin, 'npm'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(
+        realPath.join(bin, 'pg_config'),
+        `#!/bin/sh\n[ "$1" = "--bindir" ] && echo "${scenario.docker ? posix(bin) : '/missing/postgres/bin'}"\n`,
+        { mode: 0o755 },
+      );
+      realFs.writeFileSync(realPath.join(bin, 'initdb'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      realFs.writeFileSync(
+        realPath.join(bin, 'docker'),
+        `#!/bin/sh\nexit ${scenario.docker ? 0 : 1}\n`,
+        { mode: 0o755 },
+      );
+      const harnessFile = realPath.join(dir, harnessPath);
+      realFs.mkdirSync(realPath.dirname(harnessFile), { recursive: true });
+      realFs.writeFileSync(harnessFile, `#!/bin/sh
+echo "harness USE_TEST_POSTGRES=\${USE_TEST_POSTGRES:-} $*" >> "$LOGFILE"
+case "$*" in *--standalone*) exit 0 ;; esac
+if [ -n "\${BLUEPRINT_VERIFICATION_RESULT_FILE:-}" ] && [ ${scenario.harnessExit} -eq 0 ]; then
+  printf '%s\\n' '{"version":1,"targeted":true,"use_test_postgres":true,"postgres_sidecar":true,"tests":1,"skipped":${scenario.skipped ?? 0},"failures":0,"exit_code":0,"selectors":["testing/test_x.py"]}' > "$BLUEPRINT_VERIFICATION_RESULT_FILE"
+fi
+exit ${scenario.harnessExit}
+`, { mode: 0o755 });
+      const checkPath = realPath.join(dir, 'check');
+      const logPath = realPath.join(dir, 'run.log');
+      realFs.writeFileSync(checkPath, script, { mode: 0o755 });
+      realFs.writeFileSync(logPath, '');
+      let status = 0;
+      let stdout = '';
+      try {
+        stdout = realCp.execFileSync('bash', [posix(checkPath)], {
+          cwd: dir,
+          env: {
+            PATH: `${posix(bin)}:${process.env.PATH ?? ''}`,
+            WORKSPACE: posix(dir),
+            LOGFILE: posix(logPath),
+            HOME: process.env.HOME ?? '',
+          },
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err: unknown) {
+        const e = err as { status?: number; stdout?: string; stderr?: string };
+        status = e.status ?? -1;
+        stdout = (e.stdout ?? '') + (e.stderr ?? '');
+      }
+      const receipt = realFs.existsSync(receiptPath)
+        ? JSON.parse(realFs.readFileSync(receiptPath, 'utf8')) as Record<string, unknown>
+        : undefined;
+      return { status, stdout, log: realFs.readFileSync(logPath, 'utf8'), receipt };
+    } finally {
+      try { realFs.unlinkSync(receiptPath); } catch { /* absent */ }
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
+  };
+  it('runtime: mints a receipt only after real-shaped Ruff and targeted Postgres evidence', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0, docker: true, harnessExit: 0,
+    });
+    expect(result.status).toBe(0);
+    expect(result.log).toContain('ruff -m ruff check');
+    expect(result.log).toContain('harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_x.py');
+    expect(result.receipt).toMatchObject({
+      task_id: 'verify-authoring-1',
+      ruff: { exit_code: 0 },
+      pytest: {
+        selectors: ['testing/test_x.py'],
+        targeted: true,
+        use_test_postgres: true,
+        postgres_sidecar: true,
+        skipped: 0,
+        exit_code: 0,
+      },
+    });
+  });
+  it('runtime: combines changed tests with resolver output, filters deletions, and deduplicates', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: true,
+      harnessExit: 0,
+      changedPaths: [
+        'backend/x.py',
+        'backend/testing/test_bar.py',
+        'backend/testing/test_deleted.py',
+        'backend/testing/test_x.py',
+      ],
+      missingPaths: ['backend/testing/test_deleted.py'],
+    });
+    expect(result.status).toBe(0);
+    expect(result.log).toContain(
+      'harness USE_TEST_POSTGRES=true --sandbox-postgres testing/test_bar.py testing/test_x.py',
+    );
+    expect(result.log).not.toContain('test_deleted.py');
+    expect(result.receipt).toMatchObject({
+      pytest: { selectors: ['testing/test_bar.py', 'testing/test_x.py'] },
+    });
+  });
+  it('runtime: a nested opted-in project ignores non-Python-only changes', async () => {
+    const result = await runRequiredCheck(await render(), {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      changedPath: 'backend/Dockerfile',
+    });
+    expect(result.status).toBe(0);
+    expect(result.log).not.toContain('ruff -m ruff check');
+    expect(result.stdout).not.toContain('no Python target');
+    expect(result.receipt).toBeUndefined();
+  });
+  it('runtime: an opted-in root project executes for repo-relative Python changes and fails closed', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-authoring-1',
+      workBranch: 'blueprint/verify-authoring-1',
+      baseBranch: 'automain',
+      owner: 'acme',
+      repo: 'python-root',
+      testsOnMainBranch: false,
+      taskCapability: authoringCapability,
+      buildConfig: { directories: [{
+        path: '.', type: 'python', lint_cmd: 'ruff check .', test_cmd: 'pytest',
+        project_verification: {
+          protocol: 'blueprint-v1', harness: 'tools/verified-postgres-tests.sh',
+        },
+      }] },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    const result = await runRequiredCheck(script, {
+      ruffExit: 0,
+      docker: false,
+      harnessExit: 0,
+      changedPath: 'testing/test_x.py',
+      harnessPath: 'tools/verified-postgres-tests.sh',
+    });
+    expect(result.log).toContain('ruff -m ruff check');
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain('PostgreSQL runtime unavailable');
+    expect(result.receipt).toBeUndefined();
+  });
+  it('runtime: an opted-in ./backend project executes for repo-relative Python changes and fails closed', async () => {
+    const { writeCheckHelper } = await import('./check-helper.js');
+    writeCheckHelper({
+      taskId: 'verify-authoring-1',
+      workBranch: 'blueprint/verify-authoring-1',
+      baseBranch: 'automain',
+      owner: 'acme',
+      repo: 'python-service',
+      testsOnMainBranch: false,
+      taskCapability: authoringCapability,
+      buildConfig: { directories: [{
+        path: './backend', type: 'python', lint_cmd: 'ruff check .', test_cmd: 'pytest',
+        project_verification: {
+          protocol: 'blueprint-v1', harness: 'scripts/test-backend.sh',
+        },
+      }] },
+    });
+    const script = capturedScripts['/tmp/workspace/check'];
+    const result = await runRequiredCheck(script, {
+      ruffExit: 0, docker: false, harnessExit: 0, changedPath: 'backend/x.py',
+    });
+    expect(result.log).toContain('ruff -m ruff check');
+    expect(result.status).not.toBe(0);
+    expect(result.stdout).toContain('PostgreSQL runtime unavailable');
+    expect(result.receipt).toBeUndefined();
+  });
+  it.each([
+    ['missing Ruff', { ruffExit: 1, docker: true, harnessExit: 0 }],
+    ['daemonless Docker', { ruffExit: 0, docker: false, harnessExit: 0 }],
+    ['Postgres harness failure', { ruffExit: 0, docker: true, harnessExit: 1 }],
+    ['all tests skipped', { ruffExit: 0, docker: true, harnessExit: 0, skipped: 1 }],
+  ])('runtime: %s fails closed and cannot mint a green receipt', async (_label, scenario) => {
+    const result = await runRequiredCheck(await render(), scenario);
+    expect(result.status).not.toBe(0);
+    expect(result.receipt).toBeUndefined();
+    expect(result.stdout).toContain('FAIL');
   });
 });
 

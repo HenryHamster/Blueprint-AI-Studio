@@ -17,6 +17,8 @@
     "promotion_in_flight",
     "protection_blocked_review",
     "qualifying",
-    "required_check_failed"
+    "required_check_failed",
+    "rubric_changed",
+    "rubric_provenance_unknown"
   ]
 }

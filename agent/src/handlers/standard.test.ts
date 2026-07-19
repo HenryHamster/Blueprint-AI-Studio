@@ -276,7 +276,9 @@ describe('overlap warning text generation', () => {
     const prompt = capturedPrompt();
     expect(prompt).toContain('Reserved migration revision');
     expect(prompt).toContain('revision = "0153"');
-    expect(prompt).toContain('down_revision = "0151"');
+    expect(prompt).toContain('actual pre-new-migration chain head');
+    expect(prompt).toContain('advisory parent is `0151`; use it only if the actual head cannot be determined');
+    expect(prompt).not.toContain('down_revision = "0151"');
     expect(prompt).toContain('EXPECTED_SCHEMA_REVISION = "0153"');
   });
 
@@ -1087,6 +1089,7 @@ describe('stable prompt prefix is byte-identical across wall-clock and HEAD', ()
       acceptanceEvidenceNotice: '',
       playbookSection: '',
       skillsSection: '',
+      projectToolsSection: '',
       retryContext: '',
       provenanceNotice: '',
       corePrompt: 'CORE_TASK_PROMPT',

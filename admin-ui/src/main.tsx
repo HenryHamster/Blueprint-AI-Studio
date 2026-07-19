@@ -5,22 +5,14 @@ import './index.css'
 import './appTools'
 import App from './App.tsx'
 import { ErrorBoundary } from './components/ErrorBoundary'
-import { getIdToken } from './firebase'
+import { currentUiSurface, reportUiLoadTiming } from './uiLoadTiming'
 
 const _loadStart = performance.now()
 
 function LoadTimingReporter() {
   useEffect(() => {
     const ms = Math.round(performance.now() - _loadStart)
-    const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64)
-    getIdToken().then(token => {
-      if (!token) return
-      fetch('/api/admin/ui-load-timing', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'first_commit' }),
-      }).catch(() => {})
-    }).catch(() => {})
+    reportUiLoadTiming(currentUiSurface(), ms, 'first_commit')
   }, [])
   return null
 }

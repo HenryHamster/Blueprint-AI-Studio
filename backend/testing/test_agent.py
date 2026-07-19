@@ -5,7 +5,7 @@ import hashlib
 import time
 import uuid
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from datetime import datetime, timedelta
@@ -732,7 +732,9 @@ async def test_agent_claim_includes_compute_experiment_capability_slice(
 async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     """
     Tests an agent updating task status and creating an artifact.
-    Also verifies that completing the last task completes the project.
+    Also verifies that completing the last task does NOT flip the project's
+    (deprecated) lifecycle status — the finite-project all-terminal aggregation
+    was removed, so project.status stays untouched by task completion.
     """
     # VM deletion on task completion now uses fire_and_forget_vm_delete (a
     # non-awaited background task) to avoid holding the DB FOR UPDATE lock
@@ -740,9 +742,10 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     # captures the synchronous call rather than racing a background asyncio task.
     mock_fire_forget = mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete")
 
-    # Finite (non-autonomous) project: terminal-status aggregation only applies
-    # to finite projects — live autonomous projects are never flipped to a
-    # terminal status by task-completion aggregation (see task_lifecycle.py).
+    # Project.status is a deprecated legacy field; task completion no longer
+    # aggregates it to a terminal status (the all-terminal aggregation was
+    # removed). The project's status must stay at its default after the last
+    # task completes.
     project = Project(
         name="Agent Status Test",
         user_id="test-user-123",
@@ -777,7 +780,9 @@ async def test_agent_status_update(client: AsyncClient, db_session, mocker):
     assert task.status == TaskStatus.COMPLETED
 
     await db_session.refresh(project)
-    assert project.status == ProjectStatus.COMPLETED
+    # Aggregation removed: completing the last task leaves project.status at its
+    # creation default (DRAFT) rather than flipping it to COMPLETED.
+    assert project.status == ProjectStatus.DRAFT
 
     mock_fire_forget.assert_called_once_with("agent-vm-888", reason="agent_completion")
 
@@ -3295,7 +3300,10 @@ async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_sessio
     assert resp.status_code == 200
     assert resp.json()["repo_is_empty"] is True
 
-    # A project without the signal (older onboarding / detected source) → False.
+    # A project without the signal (older onboarding / detected source) → None.
+    # The tri-state signal (true / false / null) lets the agent distinguish
+    # "determined empty" from "never determined", falling through to a live
+    # scan rather than treating an absent determination as definitive non-empty.
     project_mature = Project(
         name="Mature Repo",
         user_id="test-user-123",
@@ -3320,7 +3328,7 @@ async def test_agent_claim_surfaces_repo_is_empty(client: AsyncClient, db_sessio
     token2 = create_agent_token(str(task_mature.id), "agent-vm-mature-1")
     resp2 = await client.post("/api/agent/claim", headers={"x-agent-token": token2})
     assert resp2.status_code == 200
-    assert resp2.json()["repo_is_empty"] is False
+    assert resp2.json()["repo_is_empty"] is None
 
 
 @pytest.mark.asyncio
@@ -5802,6 +5810,44 @@ async def test_playbook_delete_is_rejected_for_agents(client: AsyncClient, db_se
 
     await db_session.refresh(project)
     assert "playbook/lint-rules" in project.design_doc
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_design_doc_authorized_list_does_not_enter_message_lock_path(
+    client: AsyncClient, db_session
+):
+    project = Project(
+        name="Design Doc Message Lock Regression",
+        user_id="test-user-123",
+        design_doc={"overview": "stable"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-design-doc-regression",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(
+        str(task.id),
+        task.vm_instance_id,
+        task_type="design_doc_update",
+    )
+
+    response = await client.post(
+        "/api/agent/design-doc",
+        headers={"x-agent-token": token},
+        json={"task_id": str(task.id), "op": "list"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "overview" in response.json()["keys"]
 
 
 @pytest.mark.smoketest
@@ -15796,6 +15842,282 @@ async def test_agent_status_pr_base_branch_gh_fail_open(
 
 
 @pytest.mark.asyncio
+async def test_required_diff_paths_missing_rejects_pr_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """When required_diff_paths declares paths absent from the PR diff,
+    the completion must be rejected with HTTP 400 naming the missing paths."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Required Diff Paths Missing", user_id="test-user-rdp-miss")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "implement the feature",
+                "required_diff_paths": [
+                    "backend/app/models.py",
+                    "backend/testing/test_models.py",
+                ],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-miss",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-miss")
+    headers = {"x-agent-token": token}
+
+    # PR diff only touches models.py — test file is missing.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19001",
+        "changed_files": ["backend/app/models.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 400, f"Expected 400, got {resp.status_code}: {resp.text}"
+    err = resp.json().get("error", {})
+    assert "message" in err
+    assert "backend/testing/test_models.py" in err["message"]
+    assert "required_diff_paths" in err["message"]
+
+    # No Artifact row must have been created.
+    from app.models import Artifact, ArtifactType
+
+    artifacts = (
+        (
+            await db_session.execute(
+                select(Artifact).where(
+                    Artifact.task_id == task.id,
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert artifacts == [], "Rejected PR must not persist an Artifact row"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_all_present_accepts_pr_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """When all required_diff_paths are present in the PR diff, the submission is accepted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="Required Diff Paths Present", user_id="test-user-rdp-ok")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-rdp-ok-sib",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "implement the feature",
+                "required_diff_paths": [
+                    "backend/app/models.py",
+                    "backend/testing/test_models.py",
+                ],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-ok",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(sibling)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-ok")
+    headers = {"x-agent-token": token}
+
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19002",
+        "changed_files": [
+            "backend/app/models.py",
+            "backend/testing/test_models.py",
+            "backend/app/other.py",
+        ],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_absent_when_undeclared(
+    client: AsyncClient, db_session, mocker
+):
+    """Tasks with no required_diff_paths declaration are unaffected — any diff is accepted."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="No Required Diff Paths", user_id="test-user-rdp-none")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sibling = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "sibling"}],
+        vm_instance_id="agent-vm-rdp-none-sib",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do work"}],  # no required_diff_paths
+        vm_instance_id="agent-vm-rdp-none",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(sibling)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-none")
+    headers = {"x-agent-token": token}
+
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19003",
+        "changed_files": ["some/unrelated/file.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_not_enforced_on_failed_status(
+    client: AsyncClient, db_session, mocker
+):
+    """required_diff_paths enforcement only fires on COMPLETED — FAILED submissions
+    must pass through even when declared paths are absent from the diff."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="RDP Failed Status", user_id="test-user-rdp-fail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "required_diff_paths": ["backend/app/models.py"],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-fail",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-fail")
+    headers = {"x-agent-token": token}
+
+    # FAILED status — gate must not fire even though the required path is absent.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "PULL_REQUEST",
+        "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/19004",
+        "changed_files": ["some/other/file.py"],
+        "logs": "failed",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 200, f"Expected 200 for FAILED, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_required_diff_paths_enforced_on_git_commit_completion(
+    client: AsyncClient, db_session, mocker
+):
+    """required_diff_paths enforcement fires for GIT_COMMIT artifact type, not just PULL_REQUEST."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    project = Project(name="RDP GIT_COMMIT Test", user_id="test-user-rdp-commit")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {
+                "type": "create",
+                "prompt": "do work",
+                "required_diff_paths": ["backend/app/models.py"],
+            }
+        ],
+        vm_instance_id="agent-vm-rdp-commit",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rdp-commit")
+    headers = {"x-agent-token": token}
+
+    # GIT_COMMIT artifact type — required path is absent from changed_files.
+    status_payload = {
+        "task_id": str(task.id),
+        "status": "COMPLETED",
+        "artifact_type": "GIT_COMMIT",
+        "commit_hash": "abc1234",
+        "changed_files": ["some/other/file.py"],
+        "logs": "done",
+    }
+    resp = await client.post("/api/agent/status", json=status_payload, headers=headers)
+    assert resp.status_code == 400, f"Expected 400 for GIT_COMMIT missing required path, got {resp.status_code}: {resp.text}"
+    err = resp.json().get("error", {})
+    assert "backend/app/models.py" in err.get("message", "")
+
+
+@pytest.mark.asyncio
 async def test_agent_status_failed_error_log_does_not_stamp_or_deliver_downstream_artifact(
     client: AsyncClient, db_session, mocker
 ):
@@ -17311,7 +17633,15 @@ async def test_rotate_credentials_updates_openai_oauth_secret(
     assert res.json() == {"rotated": True}
 
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate/versions/2"
+    from app.field_encryption import decrypt_field
+
+    # secret_blob_ref is Fernet-encrypted at rest; the Postgres CI shard sets
+    # the encryption key (SQLite runs are keyless passthrough), so assert the
+    # decrypted plaintext, not the raw ciphertext column.
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate/versions/2"
+    )
 
 
 @pytest.mark.asyncio
@@ -17354,7 +17684,12 @@ async def test_rotate_credentials_stale_writer_adopts_winner_without_overwrite(
     }
     store_secret.assert_awaited_once()
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate-cas/versions/2"
+    from app.field_encryption import decrypt_field
+
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate-cas/versions/2"
+    )
 
 
 @pytest.mark.asyncio
@@ -17463,7 +17798,12 @@ async def test_rotate_credentials_updates_openai_oauth_secret_from_pool_vm_token
     assert res.json() == {"rotated": True}
 
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate-pool/versions/4"
+    from app.field_encryption import decrypt_field
+
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate-pool/versions/4"
+    )
 
 
 @pytest.mark.asyncio
@@ -18285,6 +18625,14 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
         "warm_target_pr": 1,
         "warm_handoff_deadline": "2099-01-01T00:00:00",
         "_timing": {"warm_start": True, "prior_role_vm_id": "victim-vm"},
+        # Forged acceptance verdict — agent must NOT inject this:
+        "code_acceptance_verdict": {
+            "proven": True,
+            "satisfied": True,
+            "kind": "named_test",
+            "reason": "forged",
+            "proof_ref": "testing/test_forged.py::test_evil",
+        },
         "other_key": "ok",
     }
     resp = await client.post(
@@ -18308,6 +18656,8 @@ async def test_spawn_strips_warm_target_keys(client: AsyncClient, db_session):
     assert "warm_target_pr" not in ctx
     assert "warm_handoff_deadline" not in ctx
     assert "_timing" not in ctx
+    # Forged acceptance verdict must also be stripped
+    assert "code_acceptance_verdict" not in ctx
     # Non-forbidden keys are preserved
     assert ctx.get("other_key") == "ok"
 
@@ -20838,6 +21188,12 @@ async def _seed_qualifier_children(
 
     version.last_qualification = {
         "status": "pending",
+        # Real run_qualification always stamps the launched rubric projection;
+        # #15102 made _finalize_qualification resolve it first and short-circuit
+        # to rubric_provenance_unknown when it is absent. Seed the empty
+        # projection so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": [],
+        "rubric_lifecycle_snapshot": [],
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -20873,6 +21229,18 @@ async def test_failed_release_audit_last_child_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Smoketest sibling already terminal (COMPLETED); the release_audit is the
@@ -20922,6 +21290,18 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Audit sibling already terminal; the qualifier-smoketest is the last child
@@ -20964,6 +21344,18 @@ async def test_cancelled_release_audit_last_child_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     audit_task, _smoke = await _seed_qualifier_children(
@@ -21042,6 +21434,18 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Smoketest sibling still IN_PROGRESS — finalization must defer.
@@ -21092,6 +21496,16 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Post-finalize strategic hooks make real GitHub calls that hang on the
+    # network-isolated harness; neutralize them (outside this test's contract).
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
     # Finalize re-resolves CI for the candidate commit rather than trusting the
     # spawn-time ci_green snapshot; with no GitHub credentials in this test that
     # resolution degrades to not-green and would hard-block on ci_not_green.
@@ -21176,6 +21590,12 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
 
     version.last_qualification = {
         "status": "pending",
+        # Real run_qualification always stamps the launched rubric projection;
+        # #15102 made _finalize_qualification resolve it first and short-circuit
+        # to rubric_provenance_unknown when it is absent. Seed the empty
+        # projection so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": [],
+        "rubric_lifecycle_snapshot": [],
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -21235,6 +21655,18 @@ async def test_non_qualifier_terminal_task_does_not_finalize(db_session, mocker)
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # A pending qualification exists, but the task below is unrelated to it.
@@ -25138,6 +25570,140 @@ async def test_agent_reported_build_discovery_fills_build_config(
 
 
 @pytest.mark.asyncio
+async def test_agent_build_discovery_redetects_on_emptiness_disagreement(
+    client: AsyncClient, db_session
+):
+    """Agent reports observed_repo_is_empty=False against a durable
+    repo_is_empty=True => endpoint re-runs authoritative detection and flips the
+    stale signal (bidirectional re-detect wiring)."""
+    import app.build_config_detection as bcd
+
+    bcd._redetect_disagreement_cooldown.clear()
+    project = Project(
+        name="Discovery Disagreement Project",
+        user_id="user-disc-dis",
+        github_owner="acme",
+        github_repo="disagreement-repo",
+        integration_branch="develop",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [],
+            "repo_is_empty": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc-dis"}],
+        vm_instance_id="vm-disc-dis",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-dis")
+    with (
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value={
+                "language": "python",
+                "directories": [{"path": "backend", "type": "python"}],
+                "repo_is_empty": False,
+                "source_file_count": 17,
+            },
+        ) as mock_detect,
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+    ):
+        resp = await client.post(
+            "/api/agent/build-config-discovery",
+            headers={"x-agent-token": token},
+            json={
+                "discovered_directories": [
+                    {
+                        "path": "backend",
+                        "type": "python",
+                        "test_cmd": "pytest backend/",
+                        "executed_successfully": True,
+                    }
+                ],
+                "observed_repo_is_empty": False,
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["emptiness_redetected"] is True
+    mock_detect.assert_awaited_once()
+
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("repo_is_empty") is False
+    assert (project.build_config or {}).get("source_file_count") == 17
+    bcd._redetect_disagreement_cooldown.clear()
+
+
+@pytest.mark.asyncio
+async def test_agent_build_discovery_no_redetect_without_observed_signal(
+    client: AsyncClient, db_session
+):
+    """Omitting observed_repo_is_empty leaves the durable signal untouched and
+    reports emptiness_redetected=False (backward compatible with older agents)."""
+    project = Project(
+        name="Discovery No Observed Project",
+        user_id="user-disc-noobs",
+        github_owner="acme",
+        github_repo="no-observed-repo",
+        build_config={
+            "requires_ci_checks": False,
+            "directories": [],
+            "repo_is_empty": True,
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "disc-noobs"}],
+        vm_instance_id="vm-disc-noobs",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-disc-noobs")
+    with patch(
+        "app.routers.admin_onboard._detect_build_config",
+        new_callable=AsyncMock,
+    ) as mock_detect:
+        resp = await client.post(
+            "/api/agent/build-config-discovery",
+            headers={"x-agent-token": token},
+            json={
+                "discovered_directories": [
+                    {
+                        "path": "backend",
+                        "type": "python",
+                        "test_cmd": "pytest backend/",
+                        "executed_successfully": True,
+                    }
+                ]
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.json()["emptiness_redetected"] is False
+    mock_detect.assert_not_awaited()
+    await db_session.refresh(project)
+    assert (project.build_config or {}).get("repo_is_empty") is True
+
+
+@pytest.mark.asyncio
 async def test_agent_build_discovery_ignored_when_directories_populated(
     client: AsyncClient, db_session
 ):
@@ -26872,3 +27438,145 @@ async def test_design_doc_set_shrink_allowed_when_over_cap(
     assert "too large" in resp2.json().get("detail", "").lower() or "too large" in str(
         resp2.json()
     ).lower(), f"Expected 'too large' in error detail: {resp2.json()}"
+
+
+@pytest.mark.asyncio
+async def test_warm_claim_finalizer_fences_unproven_capability(db_session):
+    """Shared warm-claim finalizer denies a claim under enforce when a durable
+    capability requirement has no CURRENT platform proof.
+
+    The task admitted in a permissive mode carries a
+    ``_capability_execution_requirements`` record; at warm-claim time the gate is
+    ``enforce`` and the capability is ``working`` with only a self-declared
+    (uncorroborated) proof. The finalizer must NOT flip the task to IN_PROGRESS —
+    it parks it BLOCKED with machine-resolvable needs, clears the warm pin, and
+    returns 204 so all three warm callers decline the claim.
+    """
+    from app.routers.agent_warm_continuity import _finalize_warm_claim
+    from app.capability_execution_fence import CAPABILITY_EXECUTION_REQUIREMENTS_KEY
+    from app.task_blocked import get_blocker_needs
+    import app.shared_state as _ss
+
+    project = Project(name="Warm Fence Test", user_id="u")
+    # 'forged-cap' is 'working' with a self-declared proven ref but NO platform
+    # ledger entry → uncorroborated → unproven under enforce.
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "forged-cap",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                ],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        vm_instance_id="agent-vm-warm",
+        context={
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [
+                {"kind": "capability", "ref": "forged-cap"}
+            ],
+            "warm_pool_pin": True,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prev = _ss.runtime_config.get("capability_proof_gate_mode")
+    _ss.runtime_config["capability_proof_gate_mode"] = "enforce"
+    try:
+        result = await _finalize_warm_claim(
+            db_session,
+            task,
+            "agent-vm-warm",
+            origin="warm_pool",
+            refresh_capable=True,
+            boot_account=None,
+        )
+    finally:
+        if prev is None:
+            _ss.runtime_config.pop("capability_proof_gate_mode", None)
+        else:
+            _ss.runtime_config["capability_proof_gate_mode"] = prev
+
+    # Claim declined (204) — not a warm-start response dict.
+    assert getattr(result, "status_code", None) == 204
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.BLOCKED
+    assert get_blocker_needs(task) == [{"kind": "capability", "ref": "forged-cap"}]
+    # Durable requirement preserved; transient warm pin unwound.
+    assert task.context.get(CAPABILITY_EXECUTION_REQUIREMENTS_KEY) == [
+        {"kind": "capability", "ref": "forged-cap"}
+    ]
+    assert "warm_pool_pin" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_warm_claim_finalizer_allows_when_gate_off(db_session):
+    """Control: the same unproven capability requirement does NOT deny the warm
+    claim when the gate is ``off`` — off/observe execution behavior is preserved
+    (the finalizer proceeds past the fence to the normal warm-start path)."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        evaluate_execution_authority_block,
+    )
+    import app.shared_state as _ss
+
+    project = Project(name="Warm Fence Off Test", user_id="u")
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": "forged-cap",
+                "status": "working",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                ],
+            }
+        ]
+    }
+    project.capability_proof_records = {}
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        vm_instance_id="agent-vm-warm-off",
+        context={
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [
+                {"kind": "capability", "ref": "forged-cap"}
+            ]
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    prev = _ss.runtime_config.get("capability_proof_gate_mode")
+    _ss.runtime_config["capability_proof_gate_mode"] = "off"
+    try:
+        # Under 'off' the fence grants authority (no blocking needs), so the
+        # finalizer would proceed rather than 204.
+        blocking = await evaluate_execution_authority_block(db_session, task)
+        assert blocking == []
+    finally:
+        if prev is None:
+            _ss.runtime_config.pop("capability_proof_gate_mode", None)
+        else:
+            _ss.runtime_config["capability_proof_gate_mode"] = prev
+
+    await db_session.refresh(task)
+    # Fence did not mutate the task — still QUEUED, requirement intact.
+    assert task.status == TaskStatus.QUEUED

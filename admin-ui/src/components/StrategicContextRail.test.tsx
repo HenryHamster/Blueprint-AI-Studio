@@ -6,12 +6,27 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { StrategicContextRail } from './StrategicContextRail';
+import { acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
 import type {
+  StrategicStateAttentionItem,
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
   StrategicWorkSessionEvent,
 } from '../strategicStateApi';
+
+// The rail imports the pending-confirmation accept/dismiss helpers from
+// '../api'; override those on a complete api mock so the inline daily-surface
+// actions can be asserted without a real fetch, while every other real export
+// stays defined (delegating to createApiMock keeps this factory in sync with
+// the module's full export surface — see mock-factory-export-coverage).
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    acceptPendingConfirmation: vi.fn(async () => ({ status: 'accepted', type: 'credentials_needed' })),
+    dismissPendingConfirmation: vi.fn(async () => {}),
+  });
+});
 
 const BACKEND_CONTEXT_FIXTURE = JSON.parse(
   readFileSync(
@@ -1350,6 +1365,120 @@ describe('StrategicContextRail', () => {
 
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
+  });
+
+  const CONFIRMATION_ITEMS: StrategicStateAttentionItem[] = [
+    {
+      id: 'confirmation:p-2e5edcbc',
+      kind: 'confirmation',
+      severity: 'needs_operator',
+      reason: 'confirmation_credentials_needed',
+      confirmation_type: 'credentials_needed',
+      label: 'Credentials needed',
+      detail: 'Provide the Hugging Face token so the runner can pull the gated model.',
+      unread: true,
+      created_at: '2026-06-29T01:05:00Z',
+      actions: [
+        { kind: 'accept', label: 'Mark provided', method: 'POST', path: '/api/admin/projects/proj-1/pending-confirm/p-2e5edcbc/accept' },
+        { kind: 'dismiss', label: 'Dismiss', method: 'POST', path: '/api/admin/projects/proj-1/pending-confirm/p-2e5edcbc/dismiss' },
+      ],
+      ref: { kind: 'confirmation', id: 'p-2e5edcbc', project_id: 'proj-1' },
+    },
+    {
+      id: 'confirmation:p-0f59f334',
+      kind: 'confirmation',
+      severity: 'needs_operator',
+      reason: 'confirmation_major_decision',
+      confirmation_type: 'major_decision',
+      label: 'Decision needed',
+      detail: 'Should the pipeline adopt the 30-day retention window?',
+      unread: true,
+      created_at: '2026-06-29T01:04:00Z',
+      ref: { kind: 'confirmation', id: 'p-0f59f334', project_id: 'proj-1' },
+    },
+    {
+      id: 'confirmation:p-1307a3f1',
+      kind: 'confirmation',
+      severity: 'needs_operator',
+      reason: 'confirmation_access_needed',
+      confirmation_type: 'access_needed',
+      label: 'Access needed',
+      detail: 'Grant repo access for dependency scanning.',
+      unread: true,
+      created_at: '2026-06-29T01:03:00Z',
+      ref: { kind: 'confirmation', id: 'p-1307a3f1', project_id: 'proj-1' },
+    },
+  ];
+
+  function stateWithConfirmations(extra: StrategicStateAttentionItem[] = []): StrategicStateResponse {
+    return {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        counts: { ...STATE.attention!.counts, pending_confirmations: CONFIRMATION_ITEMS.length },
+        items: [...CONFIRMATION_ITEMS, ...extra],
+      },
+    };
+  }
+
+  test('renders every pending confirmation in a dedicated needs-your-action list, never truncated', () => {
+    const { host } = mount({
+      state: stateWithConfirmations([
+        {
+          id: 'message:msg-1',
+          kind: 'message',
+          severity: 'needs_operator',
+          reason: 'question',
+          label: 'Question waiting',
+          detail: 'Keep local Strategic enabled during the workday?',
+          unread: true,
+          ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+        },
+      ]),
+    });
+
+    const section = host.querySelector('[data-testid="rail-needs-action"]');
+    expect(section).toBeTruthy();
+    // All three confirmations are reachable (cap is 3 with show-more beyond).
+    expect(section?.textContent).toContain('Provide the Hugging Face token');
+    expect(section?.textContent).toContain('Should the pipeline adopt the 30-day retention window?');
+    expect(section?.textContent).toContain('Grant repo access for dependency scanning.');
+    // Confirmations are not double-rendered in the generic attention preview.
+    expect(host.textContent).toContain('Question waiting');
+  });
+
+  test('accepting a confirmation calls the accept API and refreshes strategic state', async () => {
+    vi.mocked(acceptPendingConfirmation).mockClear();
+    const onConfirmationResolved = vi.fn();
+    const { host } = mount({ state: stateWithConfirmations(), onConfirmationResolved });
+
+    const section = host.querySelector('[data-testid="rail-needs-action"]')!;
+    const acceptButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.getAttribute('title') === 'Mark provided');
+    expect(acceptButton).toBeTruthy();
+
+    await act(async () => { acceptButton!.click(); });
+
+    expect(acceptPendingConfirmation).toHaveBeenCalledWith('proj-1', 'p-2e5edcbc', undefined);
+    expect(onConfirmationResolved).toHaveBeenCalledTimes(1);
+    // Resolved item is optimistically removed from the list.
+    expect(host.querySelector('[data-testid="rail-needs-action"]')?.textContent).not.toContain('Credentials needed');
+  });
+
+  test('resolving a long-stale confirmation is one click and hits the dismiss API', async () => {
+    vi.mocked(dismissPendingConfirmation).mockClear();
+    const onConfirmationResolved = vi.fn();
+    const { host } = mount({ state: stateWithConfirmations(), onConfirmationResolved });
+
+    const section = host.querySelector('[data-testid="rail-needs-action"]')!;
+    const resolveButton = Array.from(section.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.getAttribute('title') === 'Mark as resolved without action');
+    expect(resolveButton).toBeTruthy();
+
+    await act(async () => { resolveButton!.click(); });
+
+    expect(dismissPendingConfirmation).toHaveBeenCalledWith('proj-1', 'p-2e5edcbc', undefined);
+    expect(onConfirmationResolved).toHaveBeenCalledTimes(1);
   });
 
   test('task attention items open the task drawer when task navigation is available', () => {

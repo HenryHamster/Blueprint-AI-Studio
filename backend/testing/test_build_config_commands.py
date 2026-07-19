@@ -19,9 +19,11 @@ def _clear_redetect_cooldowns():
 
     build_config_detection._redetect_no_test_cooldown.clear()
     build_config_detection._redetect_empty_cooldown.clear()
+    build_config_detection._redetect_stale_empty_cooldown.clear()
     yield
     build_config_detection._redetect_no_test_cooldown.clear()
     build_config_detection._redetect_empty_cooldown.clear()
+    build_config_detection._redetect_stale_empty_cooldown.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +170,52 @@ def test_build_config_directory_entry_has_confirmed_lint_cmd():
     entry2 = BuildConfigDirectoryEntry(path=".", type="python")
     dumped2 = entry2.model_dump(exclude_none=True)
     assert "confirmed_lint_cmd" not in dumped2
+
+
+def test_build_config_directory_entry_round_trips_project_verification():
+    from app.schemas import BuildConfigDirectoryEntry
+
+    entry = BuildConfigDirectoryEntry(
+        path=" backend/// ",
+        type="python",
+        project_verification={
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        },
+    )
+
+    assert entry.model_dump(exclude_none=True) == {
+        "path": "backend",
+        "type": "python",
+        "project_verification": {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "project_verification",
+    [
+        {"protocol": "other", "harness": "scripts/test-backend.sh"},
+        {"protocol": "blueprint-v1", "harness": "scripts/test backend.sh"},
+        {"protocol": "blueprint-v1", "harness": "/tmp/verify.sh"},
+        {"protocol": "blueprint-v1", "harness": "../verify.sh"},
+    ],
+)
+def test_build_config_directory_entry_rejects_invalid_project_verification(
+    project_verification,
+):
+    from pydantic import ValidationError
+
+    from app.schemas import BuildConfigDirectoryEntry
+
+    with pytest.raises(ValidationError):
+        BuildConfigDirectoryEntry(
+            path="backend",
+            type="python",
+            project_verification=project_verification,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1372,3 +1420,299 @@ async def test_maybe_redetect_missing_test_command_skips_when_quota_reserve_acti
 
     assert result is False
     mock_detect.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# maybe_correct_stale_repo_empty_signal — the inverse self-heal that unwedges a
+# stale repo_is_empty=False on a genuinely empty/near-empty repo.
+# ---------------------------------------------------------------------------
+
+
+def _stale_empty_project():
+    project = _make_project({"repo_is_empty": False, "source_file_count": 12})
+    project.github_owner = "external-owner"
+    project.github_repo = "external-repo"
+    project.id = "proj-stale-empty"
+    return project
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_flips_on_authoritative_empty():
+    """A stale repo_is_empty=False flips to True when fresh detection
+    authoritatively confirms the repo is empty (repo_is_empty True + a real
+    source_file_count)."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+    detected = {
+        "language": None,
+        "directories": [],
+        "env_vars": {},
+        "repo_is_empty": True,
+        "source_file_count": 0,
+        "has_ci": False,
+    }
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="test-token",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected,
+        ),
+        patch("sqlalchemy.orm.attributes.flag_modified"),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is True
+    assert project.build_config["repo_is_empty"] is True
+    assert project.build_config["source_file_count"] == 0
+    session.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_does_not_flip_when_repo_has_content():
+    """FAIL-LOUD: a repo that genuinely HAS content (detection returns
+    repo_is_empty=False) leaves the stored signal untouched, so a real clone
+    shortfall keeps failing loud rather than being masked as greenfield."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+    detected_non_empty = {
+        "language": "python",
+        "directories": [{"path": "./", "type": "python"}],
+        "repo_is_empty": False,
+        "source_file_count": 12,
+    }
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected_non_empty,
+        ),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    assert project.build_config["repo_is_empty"] is False
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_does_not_flip_on_indeterminate_read():
+    """FAIL-LOUD: an indeterminate/partial read (source_file_count None) is NOT
+    an authoritative empty verdict, so the signal is not corrected."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+    # listing_complete=False path returns (None, None) (undetermined); but even
+    # a defensive repo_is_empty=True paired with an unknown count must not flip.
+    detected_indeterminate = {
+        "repo_is_empty": True,
+        "source_file_count": None,
+    }
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected_indeterminate,
+        ),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    assert project.build_config["repo_is_empty"] is False
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_does_not_flip_on_transient_failure():
+    """FAIL-LOUD: a transient GitHub failure (detector returns {}) leaves the
+    stored signal untouched."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value={},
+        ),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    assert project.build_config["repo_is_empty"] is False
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_noop_when_already_true():
+    """No-op (no GitHub call) when the stored signal is already True — nothing
+    to correct."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _make_project({"repo_is_empty": True, "source_file_count": 0})
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-already-true"
+
+    session = AsyncMock()
+
+    with patch(
+        "app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock
+    ) as mock_detect:
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    mock_detect.assert_not_awaited()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_noop_when_signal_absent():
+    """No-op when repo_is_empty is absent — the guard fires only on an explicit
+    False (a repo whose emptiness was never determined must not be flipped)."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _make_project({"directories": [{"path": ".", "type": "python"}]})
+    project.github_owner = "owner"
+    project.github_repo = "repo"
+    project.id = "proj-absent-signal"
+
+    session = AsyncMock()
+
+    with patch(
+        "app.routers.admin_onboard._detect_build_config", new_callable=AsyncMock
+    ) as mock_detect:
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    mock_detect.assert_not_awaited()
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_honors_cooldown():
+    """A second call within the cooldown window skips _detect_build_config."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+    detected = {"repo_is_empty": True, "source_file_count": 0}
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            return_value=detected,
+        ) as mock_detect,
+        patch("sqlalchemy.orm.attributes.flag_modified"),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        first = await maybe_correct_stale_repo_empty_signal(project, session)
+        # Reset the signal so the second call would otherwise be eligible.
+        project.build_config = {"repo_is_empty": False, "source_file_count": 12}
+        second = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert first is True
+    assert second is False
+    assert mock_detect.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_empty_signal_swallows_detector_exception():
+    """Best-effort: an exception in the detector never propagates; the session
+    is rolled back and the stored signal is left unchanged."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+
+    project = _stale_empty_project()
+    session = AsyncMock()
+
+    with (
+        patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value="tok",
+        ),
+        patch(
+            "app.routers.admin_onboard._detect_build_config",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("boom"),
+        ),
+        patch(
+            "app.shared_state.get_project_integration_branch",
+            return_value="main",
+        ),
+    ):
+        result = await maybe_correct_stale_repo_empty_signal(project, session)
+
+    assert result is False
+    assert project.build_config["repo_is_empty"] is False
+    session.rollback.assert_awaited_once()

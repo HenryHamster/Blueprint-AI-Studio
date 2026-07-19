@@ -9,6 +9,7 @@ Tests three areas:
 
 import os
 
+import asyncio
 import pytest
 import json
 import uuid
@@ -464,6 +465,15 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    resident = await initialize_strategic_resident(
+        db_session,
+        project.id,
+        locked_project=project,
+    )
+    await db_session.commit()
+
     task = make_task(
         project_id=project.id,
         status=TaskStatus.QUEUED,
@@ -510,6 +520,8 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
         "project must be hard-paused when pause_on_ceiling_exceeded=True "
         "and spend ceiling is breached"
     )
+    await db_session.refresh(resident)
+    assert resident.background_policy == "paused"
 
     # broadcast_to_project must have been called with project_spend_ceiling_exceeded.
     broadcast_calls = [
@@ -520,6 +532,60 @@ async def test_dispatch_gate_hard_pause_on_ceiling_exceeded(db_session, mocker):
     assert "project_spend_ceiling_exceeded" in broadcast_calls, (
         f"expected project_spend_ceiling_exceeded broadcast; calls={broadcast_calls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_gate_hard_pause_commits_without_resident(db_session, mocker):
+    """Resident lookup autoflush must not make the Project pause look clean."""
+    from app.orchestrator import _filter_project_resource_dispatch_eligible
+    import app.shared_state as _shared_state
+
+    _shared_state.project_ceiling_deferred_ids = set()
+    project = make_project(
+        name="hard-pause-no-resident",
+        user_id=_TEST_USER,
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 100.0,
+                "spend_window_days": 30,
+                "pause_on_ceiling_exceeded": True,
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "hard-pause without Resident"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={
+                "total": 150.0,
+                "ceiling_gate_total": 150.0,
+                "compute": 100.0,
+                "agent_vm": 50.0,
+                "llm": 0.0,
+                "idle": 0.0,
+            }
+        ),
+    )
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        AsyncMock(),
+    )
+    assert task.id not in result
+    await db_session.rollback()
+    await db_session.refresh(project)
+    assert project.paused is True
 
 
 @pytest.mark.asyncio
@@ -713,6 +779,134 @@ def test_idle_runner_dispatch_rotates_across_ties():
     )
 
 
+def _passing_project_verification() -> dict:
+    return {
+        "version": 1,
+        "boundary": {"class": "agent", "backend": "bwrap"},
+        "ready": True,
+        "probes": {
+            "ruff": {"ok": True, "exit_code": 0},
+            "docker_postgres": {"ok": True, "exit_code": 0},
+        },
+    }
+
+
+_BACKEND_VERIFICATION_BUILD_CONFIG = {"directories": [{
+    "path": "backend", "type": "python", "lint_cmd": "ruff check .",
+    "test_cmd": "python3 -m pytest",
+    "project_verification": {
+        "protocol": "blueprint-v1", "harness": "scripts/test-backend.sh"
+    },
+}]}
+
+
+def test_project_verification_requirement_comes_from_capability_and_build_config():
+    from app.runner_eligibility import (
+        _project_backend_verification_directories,
+        _task_requires_project_verification,
+    )
+
+    config = _BACKEND_VERIFICATION_BUILD_CONFIG
+    assert _project_backend_verification_directories(config) == ("backend",)
+    assert _task_requires_project_verification("create", config) is True
+    assert _task_requires_project_verification("fix", config) is True
+    assert _task_requires_project_verification("research", config) is False
+    assert _task_requires_project_verification("compute_experiment", config) is False
+    canonicalized = {"directories": [{
+        **config["directories"][0],
+        "path": " backend/// ",
+    }]}
+    assert _project_backend_verification_directories(canonicalized) == ("backend",)
+    unsafe_harness = {"directories": [{
+        **config["directories"][0],
+        "project_verification": {
+            "protocol": "blueprint-v1", "harness": "scripts/test backend.sh",
+        },
+    }]}
+    assert _project_backend_verification_directories(unsafe_harness) == ()
+    without_pytest = {
+        "directories": [
+            {"path": "backend", "type": "python", "lint_cmd": "ruff check ."}
+        ]
+    }
+    assert _task_requires_project_verification("create", without_pytest) is False
+
+    for path in (".", "services/api", "service"):
+        ordinary_project = {"directories": [{
+            "path": path, "type": "python", "lint_cmd": "ruff check .",
+            "test_cmd": "pytest",
+        }]}
+        assert _project_backend_verification_directories(ordinary_project) == ()
+        assert _task_requires_project_verification("create", ordinary_project) is False
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda report: report.pop("probes"),
+        lambda report: report.update(version=0),
+        lambda report: report.update(version=True),
+        lambda report: report["boundary"].update(backend="declined"),
+        lambda report: report["probes"]["ruff"].update(exit_code=1),
+        lambda report: report["probes"]["docker_postgres"].update(ok=False),
+    ],
+)
+def test_runner_project_verification_rejects_old_malformed_or_failed_reports(
+    mutation,
+):
+    from app.runner_eligibility import (
+        RunnerDispatchSnapshot,
+        _runner_has_project_verification,
+    )
+
+    report = _passing_project_verification()
+    mutation(report)
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={"project_verification": report},
+    )
+    assert _runner_has_project_verification(runner) is False
+
+
+def test_select_eligible_runner_filters_only_when_project_verification_required():
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project_id, {"task_types": "all"}
+    )
+    capable = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "project_verification": _passing_project_verification(),
+        },
+    )
+    cache = {project_id: [incapable, capable]}
+    selected = _select_eligible_runner(
+        cache,
+        project_id,
+        "create",
+        None,
+        {},
+        requires_project_verification=True,
+    )
+    assert selected is not None
+    assert selected.id == capable.id
+
+    for task_type in ("research", "compute_experiment"):
+        selected_legacy = _select_eligible_runner(
+            {project_id: [incapable]}, project_id, task_type, None, {}
+        )
+        assert selected_legacy is not None
+        assert selected_legacy.id == incapable.id
+
+
 def test_select_eligible_runner_requires_explicit_browser_proof():
     from app.orchestrator_runner_dispatch import (
         RunnerDispatchSnapshot,
@@ -747,6 +941,68 @@ def test_select_eligible_runner_requires_explicit_browser_proof():
         {project_id: [incapable]}, project_id, "salvage_bundle", None, {}
     )
     assert legacy is not None and legacy.id == incapable.id
+
+
+@pytest.mark.asyncio
+async def test_strict_pin_diagnosis_names_missing_project_verification(db_session):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _diagnose_strict_runner_pin_hold,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        uuid.uuid4(), project_id, {"task_types": "all", "max_concurrent": 1}
+    )
+    reason, detail = await _diagnose_strict_runner_pin_hold(
+        db_session,
+        {project_id: [runner]},
+        project_id,
+        str(runner.id),
+        "create",
+        None,
+        None,
+        {},
+        requires_project_verification=True,
+    )
+    assert reason == "missing_project_verification"
+    assert "python3 -m ruff" in detail
+    assert "Docker/Postgres" in detail
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_falls_through_to_cloud_without_verification(
+    db_session,
+):
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _try_runner_dispatch,
+    )
+
+    project = make_project(name="verified-authoring", user_id=_TEST_USER)
+    project.build_config = _BACKEND_VERIFICATION_BUILD_CONFIG
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "author backend"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    incapable = RunnerDispatchSnapshot(
+        uuid.uuid4(), project.id, {"task_types": "all", "max_concurrent": 1}
+    )
+
+    dispatched = await _try_runner_dispatch(
+        db_session, task, {project.id: [incapable]}, {}
+    )
+
+    assert dispatched is False
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("runner_target_id") is None
 
 
 @pytest.mark.asyncio
@@ -974,6 +1230,687 @@ def test_select_eligible_runner_no_container_image_ignores_container_cap():
     assert selected is not None, (
         "a non-container runner must still be selectable when no "
         "container_image is declared"
+    )
+
+
+# ── Disk-fit gating for container-image jobs ──────────────────────────────────
+
+
+def _disk_floor_bytes():
+    from app.orchestrator_runner_dispatch import _container_image_min_free_disk_bytes
+
+    return _container_image_min_free_disk_bytes()
+
+
+def test_runner_has_free_disk_present_absent_malformed():
+    """_runner_has_free_disk gates only on real, sufficient disk data."""
+    from app.runner_eligibility import _runner_has_free_disk, RunnerDispatchSnapshot
+
+    floor = 10_000
+
+    roomy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": 20_000},
+    )
+    full = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": 5_000},
+    )
+    absent = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities={},
+    )
+    malformed = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"disk_free_bytes": "lots"},
+    )
+
+    assert _runner_has_free_disk(roomy, floor) is True
+    assert _runner_has_free_disk(full, floor) is False
+    # Absent telemetry ⇒ eligible (backward compatible), like _runner_has_free_vram.
+    assert _runner_has_free_disk(absent, floor) is True
+    # Malformed telemetry ⇒ not gated (do not trust unparseable data).
+    assert _runner_has_free_disk(malformed, floor) is True
+    # A non-positive floor is no floor.
+    assert _runner_has_free_disk(full, 0) is True
+
+
+def test_select_eligible_runner_disk_filter_excludes_full_runner():
+    """A container-image job is NOT dispatched to a container-capable runner whose
+    reported free disk is below the fit floor."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,  # ~1 MB free — below the multi-GB floor
+        },
+    )
+    cache = {project_id: [full_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "a container-capable but nearly-full runner must be excluded so the "
+        "multi-GB image job holds instead of dying mid-pull"
+    )
+
+
+def test_select_eligible_runner_disk_filter_selects_roomy_runner():
+    """Between a full and a roomy container-capable runner, the roomy one wins."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    floor = _disk_floor_bytes()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,
+        },
+    )
+    roomy_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": floor + 1_000_000_000,
+        },
+    )
+    cache = {project_id: [full_runner, roomy_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == roomy_runner.id
+
+
+def test_select_eligible_runner_disk_absent_telemetry_passes():
+    """A container-capable runner that does not report disk_free_bytes is still
+    eligible (backward compatible — never gate on missing telemetry)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    old_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            # no disk_free_bytes reported
+        },
+    )
+    cache = {project_id: [old_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == old_runner.id
+
+
+def test_select_eligible_runner_no_container_image_ignores_disk():
+    """Without a container_image, the disk-fit gate does not apply — a nearly-full
+    runner is still eligible for a non-image compute job."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000,
+        },
+    )
+    cache = {project_id: [full_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,
+        runner_pins_this_cycle={},
+        container_image=None,
+    )
+    assert selected is not None
+    assert selected.id == full_runner.id
+
+
+def test_diagnose_strict_pin_hold_reports_insufficient_disk():
+    """A strict pin to a container-capable-but-full runner reports the honest
+    insufficient_disk reason (not the generic not_eligible)."""
+    from app.orchestrator_runner_dispatch import (
+        _diagnose_strict_runner_pin_hold,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner_id = uuid.uuid4()
+    full_runner = RunnerDispatchSnapshot(
+        id=runner_id,
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+            "disk_free_bytes": 1_000_000,
+        },
+    )
+    cache = {project_id: [full_runner]}
+    reason, detail = asyncio.run(
+        _diagnose_strict_runner_pin_hold(
+            session=None,
+            active_runners_cache=cache,
+            project_id=project_id,
+            pinned_runner_id=str(runner_id),
+            task_type="compute_experiment",
+            accelerator=None,
+            container_image="my-image:latest",
+            runner_pins_this_cycle={},
+        )
+    )
+    assert reason == "insufficient_disk", (
+        f"expected insufficient_disk, got {reason!r}: {detail}"
+    )
+    assert "free disk" in detail
+
+
+# ── GPU-in-container-capability gating (image + accelerator) ──────────────────
+
+
+@pytest.mark.parametrize("docker_cdi_gpu,has_gpu,gpu_count,expected", [
+    (True,  True,  1, False),   # Config/host GPU without functional proof
+    (False, True,  1, False),   # Hook inference is not functional proof
+    (False, True,  0, False),   # Docker + has_gpu but telemetry contradicts → not capable
+    (False, False, 0, False),   # Docker, no GPU → not capable
+])
+def test_runner_gpu_in_container_capable_docker(
+    docker_cdi_gpu, has_gpu, gpu_count, expected
+):
+    """Docker config and host GPU alone never substitute for a runtime probe."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    proj_id = uuid.uuid4()
+    base_caps = {
+        "task_types": "all",
+        "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": docker_cdi_gpu},
+    }
+    if has_gpu:
+        base_caps["has_gpu"] = has_gpu
+    if has_gpu and gpu_count >= 0:
+        base_caps["gpu_count"] = gpu_count
+
+    runner = RunnerDispatchSnapshot(id=uuid.uuid4(), project_id=proj_id, capabilities=base_caps)
+    result = _runner_gpu_in_container_capable(runner)
+    assert result is expected, (
+        f"docker_cdi_gpu={docker_cdi_gpu}, has_gpu={has_gpu}, "
+        f"gpu_count={gpu_count}: expected {expected}, got {result}"
+    )
+
+
+def test_runner_gpu_in_container_capable_podman():
+    """Podman presence alone is not functional passthrough proof."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"podman_usable": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_runner_gpu_in_container_capable_apptainer():
+    """Apptainer presence alone is not functional passthrough proof."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"apptainer_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_runner_gpu_in_container_capable_enroot():
+    """Enroot presence alone is neither execution nor passthrough proof."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"enroot_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_image_gpu_dispatch_requires_verified_runtime_passthrough():
+    """Image+GPU dispatch selects only the exact runtime with positive proof."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _select_eligible_runner,
+    )
+
+    project_id = uuid.uuid4()
+    legacy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+        },
+    )
+    failed = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"podman_usable": True},
+            "container_gpu_passthrough": {
+                "podman": {"verified": False, "mode": "hook", "reason": "probe_exit_125"}
+            },
+        },
+    )
+    verified = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=project_id,
+        capabilities={
+            "task_types": "all", "has_gpu": True, "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    selected = _select_eligible_runner(
+        {project_id: [legacy, failed, verified]}, project_id,
+        "compute_experiment", "gpu", {}, container_image="repo/image@sha256:abc",
+    )
+    assert selected is not None
+    assert selected.id == verified.id
+
+
+def test_runner_gpu_in_container_capable_false_no_container_backend():
+    """Returns False when no container backend is available."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+@pytest.mark.parametrize(
+    ("backends", "runtime", "reported_mode"),
+    [
+        ({"docker_usable": True, "docker_cdi_gpu": True}, "docker", "hook"),
+        ({"docker_usable": True, "docker_cdi_gpu": False}, "docker", "cdi"),
+        ({"podman_usable": True}, "podman", "cdi"),
+        ({"apptainer_ok": True}, "apptainer", "hook"),
+    ],
+)
+def test_runner_gpu_in_container_rejects_verified_wrong_mode(
+    backends, runtime, reported_mode
+):
+    """Verified proof is invalid when it did not exercise the selected flag path."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _runner_gpu_in_container_capable,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        capabilities={
+            "isolation_backends": backends,
+            "container_gpu_passthrough": {
+                runtime: {
+                    "verified": True,
+                    "mode": reported_mode,
+                    "reason": "verified",
+                }
+            },
+        },
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_runner_gpu_in_container_capable_false_no_isolation_backends():
+    """Returns False when isolation_backends is absent (old runner)."""
+    from app.orchestrator_runner_dispatch import (
+        _runner_gpu_in_container_capable,
+        RunnerDispatchSnapshot,
+    )
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(),
+        capabilities={"task_types": "all"},
+    )
+    assert _runner_gpu_in_container_capable(runner) is False
+
+
+def test_select_eligible_runner_image_plus_gpu_excludes_no_gpu_docker():
+    """A docker runner with no GPU must not be selected for image+GPU job."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    no_gpu_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
+        },
+    )
+    cache = {project_id: [no_gpu_docker, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id == cdi_docker.id, (
+        "the CDI-capable runner must be selected; no-gpu docker runner "
+        "must be excluded by the combined image+GPU gate"
+    )
+
+
+def test_job_requires_gpu_in_container_trigger_conditions():
+    """The dispatch trigger fires only for an imaged job that ALSO asks for a GPU —
+    via an accelerator string OR a positive vram_gb — and never for a plain CPU
+    imaged job or a GPU job with no image."""
+    from app.orchestrator_runner_dispatch import _job_requires_gpu_in_container
+
+    img = "my-image:latest"
+    # Image + accelerator → trigger.
+    assert _job_requires_gpu_in_container("gpu", img, None) is True
+    # Image + positive vram_gb, no accelerator → trigger (VRAM lives on a GPU).
+    assert _job_requires_gpu_in_container(None, img, 8.0) is True
+    assert _job_requires_gpu_in_container("", img, 8.0) is True
+    # Image only, no GPU ask → no trigger (plain CPU container job).
+    assert _job_requires_gpu_in_container(None, img, None) is False
+    assert _job_requires_gpu_in_container(None, img, 0) is False
+    assert _job_requires_gpu_in_container(None, img, 0.0) is False
+    # GPU ask but no image → no trigger (nothing to expose a GPU *into*).
+    assert _job_requires_gpu_in_container("gpu", None, None) is False
+    assert _job_requires_gpu_in_container(None, None, 8.0) is False
+
+
+def test_select_eligible_runner_image_plus_vram_only_excludes_no_cdi_docker():
+    """A container_image + vram_gb job with NO accelerator string is still a GPU
+    job: a docker runner with a GPU and free VRAM but no CDI/hook must be excluded
+    by the GPU-in-container gate, leaving only the CDI-capable runner."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    # Has a GPU with free VRAM, docker present, but NO CDI and (no hook because
+    # has_gpu False) — cannot expose a GPU inside the container.
+    no_gpu_in_container = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
+        },
+    )
+    cache = {project_id: [no_gpu_in_container, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,  # NO accelerator string — only a vram_gb GPU-memory ask
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+        vram_gb=8.0,
+    )
+    assert selected is not None
+    assert selected.id == cdi_docker.id, (
+        "a vram_gb+image job must exclude the non-GPU-in-container docker runner "
+        "even without an explicit accelerator string"
+    )
+
+
+def test_select_eligible_runner_image_plus_gpu_selects_verified_hook_or_cdi():
+    """Both hook and CDI modes are eligible after their functional probe passes."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    hook_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    cdi_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "cdi", "reason": "verified"}
+            },
+        },
+    )
+    cache = {project_id: [hook_docker, cdi_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None
+    assert selected.id in {hook_docker.id, cdi_docker.id}, (
+        "both CDI and hook docker runners should be eligible for image+GPU job"
+    )
+
+
+def test_select_eligible_runner_image_plus_gpu_verified_hook_docker_eligible():
+    """A hook-mode Docker runner passes only after a functional probe."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    hook_docker = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    cache = {project_id: [hook_docker]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None, (
+        "hook docker runner (has_gpu, no CDI) must be eligible for "
+        "image+GPU dispatch"
+    )
+    assert selected.id == hook_docker.id
+
+
+def test_select_eligible_runner_image_plus_gpu_excludes_non_container_runner():
+    """A GPU runner without container backend fails image+GPU dispatch."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 2,
+            "isolation_backends": {"bwrap_ok": True},
+        },
+    )
+    cache = {project_id: [runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator="T4",
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is None, (
+        "a bwrap-only runner must not be selected for an image+GPU job"
+    )
+
+
+def test_select_eligible_runner_image_no_gpu_unaffected():
+    """When container_image is set but accelerator is None, the combined
+    GPU-in-container gate is NOT engaged (only individual checks fire)."""
+    from app.orchestrator_runner_dispatch import (
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    docker_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    cache = {project_id: [docker_runner]}
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="compute_experiment",
+        accelerator=None,  # no accelerator — combined gate not engaged
+        runner_pins_this_cycle={},
+        container_image="my-image:latest",
+    )
+    assert selected is not None, (
+        "a non-GPU docker runner must still be selectable when only "
+        "container_image is declared (no accelerator)"
     )
 
 
@@ -11256,6 +12193,154 @@ async def test_retry_after_release_clears_failure_class(db_session, mocker):
     )
 
 
+class TestResidentProviderPolicyDispatch:
+    """The cold orchestrator must not escape a rejected Resident route.
+
+    This drives the real selector through the one-cycle dispatch harness.  A
+    configured Anthropic environment credential is deliberately available so
+    the test fails if a policy hold is collapsed to ``None`` and then silently
+    falls through the generic environment-credential fallback.
+    """
+
+    orch_warm_db = TestWarmVMSkipProvision.orch_warm_db  # type: ignore[attr-defined]
+    _run_one_cycle = staticmethod(TestWarmVMSkipProvision._run_one_cycle)  # type: ignore[attr-defined]
+    _naive_utcnow = staticmethod(TestWarmVMSkipProvision._naive_utcnow)  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        ("payload", "context"),
+        [
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "resident_provider_policy": {
+                        "provider": "openai",
+                        "model": "gpt-5.4",
+                    },
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="unsafe-pinned-provider",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["openai"],
+                    "resident_provider_policy": {},
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="unsafe-only-unpinned-route",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"provider": "anthropic"},
+                    "resident_failover_policy": {},
+                },
+                {},
+                id="missing-no-silent-downgrade-fence",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"provider": "zai"},
+                    "resident_failover_policy": {},
+                },
+                {"_resident_no_silent_provider_downgrade": True},
+                id="primary-forbidden-by-project-route",
+            ),
+            pytest.param(
+                {
+                    "type": "strategic_resident_turn",
+                    "shadow_only": False,
+                    "provider_preference": ["anthropic"],
+                    "resident_provider_policy": {"model": "gpt-5.4"},
+                    "resident_failover_policy": {},
+                },
+                {
+                    "_resident_no_silent_provider_downgrade": True,
+                    "_resident_mutation_authorized": True,
+                    "_resident_input_frozen": True,
+                },
+                id="model-pin-without-provider",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_unsafe_resident_route_holds_before_env_fallback(
+        self, orch_warm_db, mocker, monkeypatch, payload, context
+    ):
+        from sqlmodel import select as _select
+
+        import app.orchestrator as _orch_module
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "must-not-be-used")
+        env_fallback = mocker.spy(_orch_module, "_resolve_env_runtime_fallback")
+        provision = mocker.patch(
+            "app.orchestrator.provision_agent_vm",
+            new_callable=AsyncMock,
+            return_value=True,
+        )
+        mocker.patch(
+            "app.orchestrator._sync_runtime_config_from_state",
+            new_callable=AsyncMock,
+            return_value=[],
+        )
+
+        async with orch_warm_db() as session:
+            project = make_project(name="Resident Provider Hold", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+            task = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                payloads=[payload],
+                context={
+                    "_resident_mutation_authorized": True,
+                    "_resident_input_frozen": True,
+                    **context,
+                },
+            )
+            session.add(task)
+            await session.commit()
+            await session.refresh(task)
+            task_id = task.id
+
+        await self._run_one_cycle(mocker)
+
+        assert not env_fallback.called, (
+            "a Resident provider-policy hold must never enter the generic "
+            "environment credential fallback"
+        )
+        assert not provision.called
+        async with orch_warm_db() as session:
+            row = await session.get(Task, task_id)
+            assert row is not None
+            assert row.status == TaskStatus.QUEUED
+            assert row.vm_instance_id is None
+            assert "Waiting for configured Resident provider policy" in (
+                row.latest_status_message or ""
+            )
+            active = (
+                await session.execute(
+                    _select(Task).where(
+                        Task.id == task_id,
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        ),
+                    )
+                )
+            ).scalars().all()
+            assert active == []
+
+
 class TestCloudRunDispatch:
     """Tests for the Cloud Run Jobs dispatch path in the orchestrator.
 
@@ -12452,6 +13537,862 @@ async def test_dispatch_holds_when_container_image_declared_but_no_capable_runne
     )
 
 
+@pytest.mark.asyncio
+async def test_gpu_in_container_ineligible_holds_with_honest_reason(
+    db_session, mocker
+):
+    """A non-pinned compute_experiment declaring BOTH an accelerator and a
+    container_image that cannot place because every live runner HAS a container
+    runtime but lacks GPU-in-container passthrough (no CDI daemon, no verified
+    nvidia docker hook) is held with an HONEST reason — it must NOT reuse the
+    generic 'no live runner has docker_usable capability' message, which is false
+    (docker IS present) and would send the operator to reinstall docker instead of
+    enabling CDI / the nvidia container runtime.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(
+        name="GpuInContainerHoldProject",
+        user_id=_TEST_USER,
+        # Regression: require-local used to return before the proof-specific
+        # hold, leaving this task with no actionable status message.
+        build_config={"resource_envelope": {"require_local_runner": True}},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # A live runner that HAS docker (container runtime present) but reports no CDI
+    # and no verified GPU → it cannot expose a GPU inside the container.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    active_runners_cache = {project.id: [runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED, (
+        "task must remain QUEUED when held for GPU-in-container passthrough"
+    )
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "awaiting_container_runner_since must be stamped so the bounded-wait "
+        "sweep covers the hold"
+    )
+    msg = refreshed.latest_status_message or ""
+    # The honest reason names the ACTUAL blocker (GPU passthrough), not docker.
+    assert "GPU inside the container" in msg or "GPU-in-container" in msg, (
+        f"status message must name the GPU-in-container passthrough blocker: {msg!r}"
+    )
+    assert "verified GPU passthrough probe" in msg, (
+        f"status message should identify the missing runtime proof: {msg!r}"
+    )
+    # The FALSE generic docker-missing wording must NOT be used for this fleet.
+    assert "no live runner has docker_usable capability" not in msg, (
+        "must not claim docker is missing when it is present — that is the bug "
+        f"this hold fixes: {msg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_forced_runner_gpu_in_container_hold_names_probe_blocker(
+    db_session, mocker
+):
+    """A hard pin preserves the functional-proof diagnosis, not a generic hold."""
+    from app.orchestrator_runner_dispatch import (
+        FORCED_RUNNER_TARGET_CONTEXT_KEY,
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="ForcedGpuProofHold", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        context={FORCED_RUNNER_TARGET_CONTEXT_KEY: str(runner.id)},
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    assert (task.context or {}).get("awaiting_forced_runner_since")
+    message = task.latest_status_message or ""
+    assert "GPU inside the container" in message
+    assert "verified GPU passthrough probe" in message
+
+
+@pytest.mark.asyncio
+async def test_gpu_in_container_hold_fires_for_vram_only_no_accelerator(
+    db_session, mocker
+):
+    """A compute_experiment declaring container_image + vram_gb but NO accelerator
+    string is still a GPU job (VRAM lives on a GPU). When every live runner has a
+    container runtime but no GPU-in-container passthrough it must hit the HONEST
+    GPU-in-container hold — not be silently routed to a runner that would fail at
+    runtime, and not fall through to the generic docker-missing hold.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="GpuInContainerVramHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                # No "accelerator" — the GPU ask is expressed only via vram_gb.
+                "vram_gb": 8.0,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    # docker present, GPU present with free VRAM, but no CDI and no verified hook
+    # (has_gpu False) → cannot expose a GPU inside the container.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": False,
+            "gpu_free_vram_mib": [40960],
+            "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+        },
+    )
+    active_runners_cache = {project.id: [runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    ctx = refreshed.context or {}
+    assert ctx.get("awaiting_container_runner_since"), (
+        "the vram-only GPU-in-container hold must reuse the bounded-wait stamp"
+    )
+    msg = refreshed.latest_status_message or ""
+    assert "GPU inside the container" in msg or "GPU-in-container" in msg, (
+        f"status message must name the GPU-in-container passthrough blocker: {msg!r}"
+    )
+    # The honest reason names the vram_gb GPU requirement, not a bogus accelerator.
+    assert "vram_gb" in msg, (
+        f"vram-only hold message should name the vram_gb requirement: {msg!r}"
+    )
+    assert "no live runner has docker_usable capability" not in msg, (
+        "must not claim docker is missing when it is present"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gpu_proof_hold_does_not_mask_mixed_fleet_capacity(
+    db_session, mocker
+):
+    """Fleet proof exists: do not claim no selected runtime has proof."""
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="MixedGpuProofFleet", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    verified_but_busy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "max_concurrent_compute": 1,
+            "active_compute_job_ids": ["busy"],
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {
+                    "verified": True,
+                    "mode": "hook",
+                    "reason": "verified",
+                }
+            },
+        },
+    )
+    unverified_idle = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session,
+        task,
+        {project.id: [verified_but_busy, unverified_idle]},
+        runner_pins_this_cycle={},
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert "no selected runtime has functional passthrough proof" not in msg
+    assert "at capacity or fails another job requirement" in msg
+    assert "no live runner has docker_usable capability" not in msg
+
+
+@pytest.mark.asyncio
+async def test_gpu_proof_hold_ignores_proof_on_wrong_task_type_runner(
+    db_session, mocker
+):
+    """Proof on a runner that cannot take compute work must not mask the
+    passthrough hold for an otherwise eligible runner that lacks that proof.
+    """
+    from app.orchestrator_runner_dispatch import (
+        RunnerDispatchSnapshot,
+        _dispatch_compute_experiment_directly,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = make_project(name="WrongTypeGpuProofFleet", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python3 train.py",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 1800,
+                "accelerator": "gpu",
+                "container_image": "registry.example.com/image@sha256:abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    verified_but_wrong_type = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": ["research"],
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+            "container_gpu_passthrough": {
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        },
+    )
+    unverified_compute_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session,
+        task,
+        {project.id: [verified_but_wrong_type, unverified_compute_runner]},
+        runner_pins_this_cycle={},
+    )
+
+    assert result == "held"
+    await db_session.refresh(task)
+    msg = task.latest_status_message or ""
+    assert "no selected runtime has functional passthrough proof" in msg
+    assert "at capacity or fails another job requirement" not in msg
+
+
+@pytest.mark.asyncio
+async def test_container_image_only_still_holds_with_generic_docker_reason(
+    db_session, mocker
+):
+    """Regression guard for hold ORDERING: a container_image job with NO accelerator
+    whose only runner lacks a container runtime entirely must still hit the GENERIC
+    container-capable hold (unchanged docker_usable wording) — the new
+    GPU-in-container branch (guarded on ``accelerator and container_image``) must
+    not divert it.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="GenericContainerHoldProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "echo hello",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": "registry.example.com/myproject:sha256-abc",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    incapable_runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": False},
+        },
+    )
+    active_runners_cache = {project.id: [incapable_runner]}
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, active_runners_cache, runner_pins_this_cycle={}
+    )
+
+    assert result == "held", f"expected 'held', got {result!r}"
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert "docker_usable" in (refreshed.latest_status_message or ""), (
+        "a fleet with NO container runtime must still get the generic "
+        "docker_usable hold reason, not the GPU-in-container reason"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Images-first USE-default on the DISPATCH path: a compute_experiment dispatched
+# WITHOUT an explicit container_image defaults to the project's digest-pinned
+# baked image (ProjectComputeImage), exactly as the completion authoring path
+# does — so operator-created experiments, planned prerequisites, and retries run
+# reproducibly on the declared image instead of image-less on the host toolchain.
+# ---------------------------------------------------------------------------
+
+
+def _build_launch_kwargs(**overrides):
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    base = dict(command="python3 run.py", spend_cap_usd=5.0, deadline_seconds=1800)
+    base.update(overrides)
+    payload = base.pop("payload", {})
+    return _build_compute_launch_kwargs(payload, **base)
+
+
+def test_build_compute_launch_kwargs_applies_container_image_override():
+    """When the payload declares NO container_image, the resolved project-default
+    (``container_image_override``) is forwarded to create_compute_job."""
+    kwargs = _build_launch_kwargs(
+        payload={},
+        container_image_override="reg/repo/proj@sha256:abc123",
+    )
+    assert kwargs["container_image"] == "reg/repo/proj@sha256:abc123"
+
+
+def test_build_compute_launch_kwargs_explicit_payload_image_beats_override():
+    """An explicit payload container_image ALWAYS wins over the project default —
+    the override must never clobber an operator/agent-declared image."""
+    kwargs = _build_launch_kwargs(
+        payload={"container_image": "explicit/image:tag"},
+        container_image_override="reg/repo/proj@sha256:abc123",
+    )
+    assert kwargs["container_image"] == "explicit/image:tag"
+
+
+def test_build_compute_launch_kwargs_no_override_leaves_image_unset():
+    """No payload image and no override ⇒ image-less (unchanged host-toolchain
+    behavior); create_compute_job applies its own default."""
+    kwargs = _build_launch_kwargs(payload={}, container_image_override=None)
+    assert "container_image" not in kwargs
+    # An empty-string override is not a real image and must not be forwarded.
+    kwargs_blank = _build_launch_kwargs(payload={}, container_image_override="")
+    assert "container_image" not in kwargs_blank
+
+
+@pytest.mark.asyncio
+async def test_dispatch_defaults_project_baked_image_when_payload_has_none(
+    db_session, mocker
+):
+    """A compute_experiment dispatched with NO container_image in its payload
+    defaults to the project's digest-pinned baked image (ProjectComputeImage),
+    and THAT resolved ref is what reaches create_compute_job.
+
+    Closes the images-first USE-default gap on the dispatch path: experiments
+    that never went through the plan/research completion authors (operator
+    experiments, planned prerequisites, retries) previously ran image-less on the
+    host toolchain, unreproducibly.
+    """
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="BakedImageDefaultProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Durable baked-image build record for this project (what the pipeline pushes).
+    pinned_ref = "reg.example.com/org/repo/compute-proj@sha256:deadbeefcafe"
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-1",
+            tag="latest",
+            pinned_ref=pinned_ref,
+            digest="sha256:deadbeefcafe",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # The project manifest declares the MUTABLE tag for the baked image; dispatch
+    # must pin it down to the digest via resolve_digest_pinned_default_image.
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+            }
+        },
+    )
+
+    # Capture what dispatch forwards to create_compute_job; park is a no-op so the
+    # test stays a pure dispatch-path assertion.
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                # NO container_image — the case this feature closes.
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A container-capable runner so the (now image-declaring) job is dispatchable.
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert captured.get("container_image") == pinned_ref, (
+        "dispatch must forward the project's digest-pinned baked image when the "
+        f"payload declares none; got {captured.get('container_image')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_leaves_explicit_container_image_untouched(db_session, mocker):
+    """An explicit payload container_image is used AS-IS — dispatch must NOT
+    consult the project manifest or override it with the baked default."""
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+    from app.models import ProjectComputeImage
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="ExplicitImageProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # A baked default EXISTS — but the explicit payload image must win over it.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="reg.example.com/org/repo",
+            dep_hash="dep-hash-2",
+            tag="latest",
+            pinned_ref="reg.example.com/org/repo/compute-proj@sha256:defaultdigest",
+            digest="sha256:defaultdigest",
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # The manifest fetch MUST NOT be consulted when the payload already declares an
+    # image — assert it is never called.
+    manifest_spy = mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/compute-proj:latest"}
+            }
+        },
+    )
+
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    explicit_image = "ghcr.io/vendor/custom:v3"
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                "container_image": explicit_image,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", f"expected 'launched', got {result!r}"
+    assert captured.get("container_image") == explicit_image, (
+        "an explicit payload container_image must be forwarded verbatim; got "
+        f"{captured.get('container_image')!r}"
+    )
+    manifest_spy.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# fail-CLOSED baked-image dispatch: a compute_experiment whose project declares
+# compute.image.name must be terminal-FAILED (not run image-less) when no
+# built, digest-pinned ProjectComputeImage row exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_dispatch_fails_closed_when_baked_image_declared_but_no_build_record(
+    db_session, mocker
+):
+    """A project that declares compute.image.name but has no built
+    ProjectComputeImage row must NOT run image-less — dispatch terminal-FAILs
+    the task with an honest reason and class 'baked_image_unresolvable'.
+    """
+    from sqlmodel import select as _select
+    from app.models import ComputeJob
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="DeclaredButUnbuiltProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Manifest declares an image name — but NO ProjectComputeImage row has been
+    # inserted, so the strict resolver cannot produce a digest-pinned reference.
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={
+            "compute": {
+                "image": {"name": "reg.example.com/org/repo/not-built-yet:latest"}
+            }
+        },
+    )
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+                # No container_image — must hit the strict resolver.
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={
+            "task_types": "all",
+            "isolation_backends": {"docker_usable": True},
+        },
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "failed", (
+        "dispatch must terminal-FAIL when baked image is declared but unresolvable; "
+        f"got {result!r}"
+    )
+    # No ComputeJob must have been created — the task dies before launch.
+    jobs = (await db_session.execute(_select(ComputeJob))).scalars().all()
+    assert not jobs, "no ComputeJob must be created for a task that fails before launch"
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == "baked_image_unresolvable"
+    assert "image" in (task.latest_status_message or "").lower(), (
+        "failure message should mention the image; got: "
+        f"{task.latest_status_message!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dispatch_image_less_unaffected_when_no_manifest_image_declared(
+    db_session, mocker
+):
+    """A project with no compute.image.name in its manifest is unaffected —
+    dispatch proceeds image-less exactly as before (no regression for the
+    common case of projects that never declared a baked image).
+    """
+    from types import SimpleNamespace
+    from app.orchestrator_runner_dispatch import (
+        _dispatch_compute_experiment_directly,
+        RunnerDispatchSnapshot,
+    )
+
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="NoImageDeclaredProject", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Manifest with no compute.image section — common for most projects.
+    mocker.patch(
+        "app.routers.admin_project_tools._discover_manifest_tools",
+        new_callable=AsyncMock,
+        return_value={},
+    )
+
+    captured: dict = {}
+
+    async def _fake_create(session, task, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(id=uuid.uuid4(), polling_metadata={})
+
+    mocker.patch(
+        "app.compute_jobs.create_compute_job", new=AsyncMock(side_effect=_fake_create)
+    )
+    mocker.patch("app.task_lifecycle.park_task", new_callable=AsyncMock)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python run.py",
+                "spend_cap_usd": 1.0,
+                "deadline_seconds": 300,
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    runner = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        capabilities={"task_types": "all"},
+    )
+
+    result = await _dispatch_compute_experiment_directly(
+        db_session, task, {project.id: [runner]}, runner_pins_this_cycle={}
+    )
+
+    assert result == "launched", (
+        "a project declaring no baked image must not be blocked by the strict resolver; "
+        f"got {result!r}"
+    )
+    assert "container_image" not in captured, (
+        "no container_image must be forwarded when the project declares none; "
+        f"got {captured.get('container_image')!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Finding 12 — unvalidated float() coercion of the agent-authored `vram_gb`
 # payload field raised in the dispatch HOT PATH, taking down the whole dispatch
@@ -12961,3 +14902,117 @@ class TestZoneExhaustionColdProvisionGate:
                 assert row.status == TaskStatus.PROVISIONING
         finally:
             _orch_module._runtime_config["cloud_run_task_type_allowlist"] = []
+
+
+@pytest.mark.asyncio
+async def test_cold_dispatch_fence_blocks_unproven_capability(db_session):
+    """Cold-dispatch execution-authority fence: a QUEUED task carrying a durable
+    capability requirement whose ``working`` capability is uncorroborated is moved
+    to first-class BLOCKED under enforce, consuming NO dispatch slot
+    (``attempt_count`` untouched, no failure recorded). This is the exact
+    evaluate+block pair the orchestrator inlines before every cold route."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        block_task_for_capability_proof,
+        evaluate_execution_authority_block,
+    )
+    from app.task_blocked import get_blocker_needs
+
+    cap_need = {"kind": "capability", "ref": "forged-cap"}
+    project = make_project(
+        name="cold-fence",
+        user_id=_TEST_USER,
+        problem_model={
+            "capabilities": [
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        },
+        capability_proof_records={},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "p"}],
+        context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    _prior_attempts = task.attempt_count or 0
+
+    blocking = await evaluate_execution_authority_block(
+        db_session, task, mode="enforce"
+    )
+    assert blocking == [cap_need]
+    block_task_for_capability_proof(task, blocking, source="cold dispatch")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert task.status == TaskStatus.BLOCKED
+    assert get_blocker_needs(task) == [cap_need]
+    # No dispatch slot consumed: BLOCKED is not a failure/attempt.
+    assert (task.attempt_count or 0) == _prior_attempts
+
+
+@pytest.mark.asyncio
+async def test_cold_dispatch_fence_grants_after_ledger_proof(db_session):
+    """Restoration: once the platform proof ledger records a machine-verified
+    entry for the required capability, the same durable requirement grades proven
+    and the fence grants execution authority (no blocking needs)."""
+    from app.capability_execution_fence import (
+        CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+        evaluate_execution_authority_block,
+    )
+
+    cap_need = {"kind": "capability", "ref": "real-cap"}
+    project = make_project(
+        name="cold-fence-restored",
+        user_id=_TEST_USER,
+        problem_model={
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        },
+        # Platform-recorded machine proof corroborates the claim.
+        capability_proof_records={
+            "real-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "create", "prompt": "p"}],
+        context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    blocking = await evaluate_execution_authority_block(
+        db_session, task, mode="enforce"
+    )
+    assert blocking == []
+    assert task.status == TaskStatus.QUEUED

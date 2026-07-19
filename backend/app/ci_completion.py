@@ -2005,6 +2005,12 @@ async def handle_ci_completion(
             # can detect an orphaned review task.
             if not ci_loop.get("review_wait_started"):
                 ci_loop["review_wait_started"] = _utcnow().isoformat()
+                # Per-episode respawn budget: when a new review-wait episode
+                # begins AND a fix has been applied since the last episode,
+                # reset the backstop's per-episode count so a respawn consumed
+                # in an earlier episode does not permanently exhaust the budget.
+                if ci_loop.get("ci_fix_spawned"):
+                    ci_loop.pop("review_wait_respawn_count", None)
 
             # Accelerated retry for deferred review spawns (Fix 1b): if
             # a fix task's completion handler failed with a transient lock-
@@ -2018,6 +2024,7 @@ async def handle_ci_completion(
             if _deferred_at and not ci_loop.get("review_wait_escalated"):
                 try:
                     from datetime import datetime as _ddt
+
                     _dd = _ddt.fromisoformat(_deferred_at)
                     if (_utcnow() - _dd).total_seconds() < 120:
                         _orig_prompt = ci_payload.get("prompt", "") or (

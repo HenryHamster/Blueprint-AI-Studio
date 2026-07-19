@@ -4,6 +4,7 @@ Extracted from ``app.github``; all symbols are re-exported from there so
 existing imports keep working.
 """
 
+import base64
 import time
 from datetime import datetime
 from urllib.parse import quote
@@ -18,6 +19,9 @@ _DATETIME = datetime
 
 _RECENT_COMMIT_MESSAGES_DEFAULT_LIMIT = 30
 _RECENT_COMMIT_MESSAGES_MAX_LIMIT = 50
+# GitHub's compare endpoint returns at most this many file entries.  It does
+# not provide a total-file count, so a response at this limit is ambiguous.
+_GITHUB_COMPARE_FILES_MAX = 300
 
 
 def _github_request(*args, **kwargs):
@@ -405,6 +409,114 @@ async def get_repo_default_branch(token: str, owner: str, repo: str) -> str:
             detail="GitHub API response missing default_branch field.",
         )
     return data["default_branch"]
+
+
+async def repo_has_commits(token: str, owner: str, repo: str) -> bool:
+    """True when the repository has at least one branch (i.e. at least one commit).
+
+    A GitHub repository created without an initial commit still *reports* a
+    ``default_branch`` (usually ``main``) from ``GET /repos/{owner}/{repo}`` —
+    but that ref does not exist. The repo has no branches and no refs at all.
+    ``get_repo_default_branch`` therefore cannot distinguish a real trunk from a
+    phantom one; this can.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    response = await _github_request(
+        "GET",
+        f"https://api.github.com/repos/{owner}/{repo}/branches",
+        headers,
+        params={"per_page": 1},
+    )
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"GitHub API error listing branches for {owner}/{repo} "
+                f"(HTTP {response.status_code})."
+            ),
+        )
+    branches = response.json()
+    return isinstance(branches, list) and len(branches) > 0
+
+
+async def ensure_repo_initialized(
+    token: str,
+    owner: str,
+    repo: str,
+    default_branch: str,
+    readme_body: str | None = None,
+) -> bool:
+    """Give a commitless repository its first commit, creating ``default_branch``.
+
+    A repo with zero commits has no refs, so every clone in the fleet — all of
+    which pass ``--branch <trunk>`` — dies with ``fatal: Remote branch <trunk>
+    not found in upstream origin`` (exit 128). That strands ``repo_bootstrap``,
+    the very task meant to seed the project, in a retry loop it cannot escape.
+
+    The Git Data API cannot be used to fix this: ``POST /git/trees``,
+    ``/git/commits`` and ``/git/refs`` all reject a commitless repository with
+    409 ``"Git Repository is empty"``. The Contents API is the only endpoint
+    that can create the first commit, and it requires a file — hence the README
+    seed rather than an empty-tree commit.
+
+    Idempotent: returns False without writing when the repo already has a
+    commit. Returns True when this call created the initial commit.
+    """
+    if await repo_has_commits(token, owner, repo):
+        return False
+
+    body = readme_body if readme_body else f"# {repo}\n"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    payload = {
+        "message": "Initialize repository",
+        "content": base64.b64encode(body.encode("utf-8")).decode("ascii"),
+        "branch": default_branch,
+    }
+    response = await _github_request(
+        "PUT",
+        f"https://api.github.com/repos/{owner}/{repo}/contents/README.md",
+        headers,
+        json=payload,
+    )
+
+    # 409/422 here means someone else seeded the repo between our check and this
+    # write. Confirm a commit actually exists now rather than assuming it does —
+    # a wrong "already initialized" would hand the caller the same phantom trunk
+    # this function exists to prevent.
+    if response.status_code in (409, 422) and await repo_has_commits(
+        token, owner, repo
+    ):
+        logger.info(
+            f"[SEED] {owner}/{repo} was initialized concurrently; nothing to do"
+        )
+        return False
+
+    if response.status_code not in (200, 201):
+        logger.error(
+            f"[SEED] Failed to initialize empty repo {owner}/{repo}: "
+            f"{response.status_code} {response.text}"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                f"Could not create the initial commit on empty repository "
+                f"{owner}/{repo} (GitHub {response.status_code}). The GitHub App "
+                f"installation needs contents:write to seed an empty repo."
+            ),
+        )
+
+    logger.info(
+        f"[SEED] Initialized empty repo {owner}/{repo}: first commit on '{default_branch}'"
+    )
+    return True
 
 
 async def delete_branch(token: str, owner: str, repo: str, branch: str) -> bool:
@@ -918,12 +1030,35 @@ async def get_changed_files_with_patches_between_refs(
         )
         return None
     try:
-        files = response.json().get("files", [])
-        return [
+        payload = response.json()
+        files = payload["files"]
+        # GitHub caps the inline compare ``files`` collection.  Authorization
+        # callers must never mistake that prefix for the complete diff: a
+        # non-allowlisted path outside it could otherwise pass the hotfix gate.
+        # GitHub documents this collection as capped at 300 entries and does
+        # not return a total-file count.  A response at the cap could omit
+        # non-allowlisted files, so it is indeterminate for authorization.
+        parsed_files = [
             {"filename": f["filename"], "patch": f.get("patch")}
             for f in files
-            if "filename" in f
+            if isinstance(f, dict) and isinstance(f.get("filename"), str) and f["filename"]
         ]
+        if (
+            not isinstance(files, list)
+            or len(files) >= _GITHUB_COMPARE_FILES_MAX
+            or len(parsed_files) != len(files)
+        ):
+            logger.warning(
+                "[GITHUB] get_changed_files_with_patches_between_refs: incomplete "
+                "compare response for %s/%s (returned=%s) — "
+                "cannot authorize a partial diff",
+                owner,
+                repo,
+                len(parsed_files) if isinstance(files, list) else "non-list",
+            )
+            return None
+        return parsed_files
+
     except (ValueError, TypeError, KeyError) as exc:
         logger.warning(
             "[GITHUB] get_changed_files_with_patches_between_refs: unparseable "

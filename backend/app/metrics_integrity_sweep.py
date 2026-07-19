@@ -78,13 +78,23 @@ exactly how many capabilities need real evidence before the gate can be enabled)
 ``capability_proof_gate_auto_graduation`` (computes fleet-wide proof coverage and
 automatically advances the gate mode off→observe→enforce as coverage crosses the
 configured thresholds; disabled by default — operators must opt in via
-``capability_proof_gate_auto_graduation_enabled``).
+``capability_proof_gate_auto_graduation_enabled``), and
+``capability_proof_trial_stall`` (per-project scan of recently-completed
+``capability_proof_trial`` tasks whose ``capability_proof_trial_contradiction``
+stamp shows ALL recent outcomes were non-green — could_not_run / red / skipped;
+flags stalled (project, cap) pairs, distinguishing infrastructure failure
+(could_not_run) from definitive failure (red), without altering any gate decision),
+and ``operator_inbox_needs_action_liveness`` (per-project check that every open
+operator-visible ProjectMessage is genuinely needs-action per derive_needs_action();
+flags projects where internal-only chatter is leaking into the operator inbox —
+measuring the direction's headline success criterion that zero non-actionable notices
+reach the operator).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
 * ``metrics_integrity_sweep_mode``            — ``off`` / ``observe`` / ``enforce``
 * ``metrics_integrity_sweep_interval_minutes``— cadence gate (default 60)
-* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 25)
+* ``metrics_integrity_sweep_max_checks``      — checks run per tick (default 50)
 * ``metrics_integrity_sweep_max_projects``    — projects scanned per check (25)
 * ``metrics_integrity_sweep_sample_limit``    — rows sampled per DB check (200)
 """
@@ -99,7 +109,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Awaitable, Callable, Deque, Dict, List, cast
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, cast
 
 from sqlalchemy import func
 from sqlmodel import or_, select
@@ -128,7 +138,7 @@ CAPABILITY_PROOF_RESEARCH_PROVENANCE = "capability_proof_research"
 
 DEFAULT_MODE = "observe"
 DEFAULT_INTERVAL_MINUTES = 60
-DEFAULT_MAX_CHECKS_PER_TICK = 25
+DEFAULT_MAX_CHECKS_PER_TICK = 50
 DEFAULT_MAX_PROJECTS_PER_CHECK = 25
 DEFAULT_SAMPLE_LIMIT = 200
 #: How far back a windowed check looks when recomputing ground truth. Keeps the
@@ -158,6 +168,22 @@ class CheckResult:
     severity: str = "info"  # info | warn | error
     subject: str | None = None  # e.g. project_id / direction_id / "global"
     detail: str = ""
+    # Count of gaps this check actively self-HEALED on the tick that produced it
+    # (e.g. capability proof gaps auto-resolved). None for checks that only
+    # recompute/flag and never mutate. Surfaced structured — not buried in
+    # ``detail`` prose — so the observability snapshot and dashboards can report
+    # self-heal throughput machine-readably.
+    auto_resolved: int | None = None
+    # Breakdown of ``auto_resolved`` by the proof tier that closed each gap. Both
+    # tiers are structural (``path_proven``) and neither clears the enforce gate,
+    # but the split matters operationally: a fleet auto-resolving caps entirely via
+    # the weaker ``backing_path`` fallback looks healthy by ``auto_resolved`` count
+    # yet has earned no ``named_test_present`` coverage at all. Surfaced structured
+    # so the observability snapshot can report tier throughput without parsing the
+    # ``detail`` prose. Both are ``None`` for checks that never auto-resolve; when
+    # set they sum to ``auto_resolved``.
+    auto_resolved_backing_path: int | None = None
+    auto_resolved_named_test_present: int | None = None
 
     @property
     def flagged(self) -> bool:
@@ -173,6 +199,9 @@ class CheckResult:
             "severity": self.severity,
             "subject": self.subject,
             "detail": self.detail,
+            "auto_resolved": self.auto_resolved,
+            "auto_resolved_backing_path": self.auto_resolved_backing_path,
+            "auto_resolved_named_test_present": self.auto_resolved_named_test_present,
         }
 
     def finding_key(self) -> str:
@@ -242,6 +271,14 @@ class _MetricsIntegrityObservability:
     flags_total: int = 0
     errors_total: int = 0
     enrolled_total: int = 0
+    # Cumulative self-heal throughput across all ticks. Each CheckResult already
+    # carries per-result ``auto_resolved`` (and its tier split), but nothing
+    # aggregated it, so self-heal throughput was invisible to operators and
+    # dashboards. Summed per tick and exposed in ``snapshot()`` alongside the
+    # per-tick totals so the trend is machine-readable.
+    auto_resolved_total: int = 0
+    auto_resolved_backing_path_total: int = 0
+    auto_resolved_named_test_present_total: int = 0
     last_tick_at: str | None = None
     last_tick: Dict[str, Any] | None = None
     recent_ticks: Deque[Dict[str, Any]] = field(
@@ -261,11 +298,19 @@ class _MetricsIntegrityObservability:
     ) -> Dict[str, Any]:
         flagged = [r for r in results if r.flagged]
         errored = [r for r in results if r.status == CheckStatus.ERROR]
+        auto_resolved = sum(r.auto_resolved or 0 for r in results)
+        auto_resolved_bp = sum(r.auto_resolved_backing_path or 0 for r in results)
+        auto_resolved_nt = sum(
+            r.auto_resolved_named_test_present or 0 for r in results
+        )
         self.ticks += 1
         self.checks_run += len(results)
         self.flags_total += len(flagged)
         self.errors_total += len(errored)
         self.enrolled_total += enrolled
+        self.auto_resolved_total += auto_resolved
+        self.auto_resolved_backing_path_total += auto_resolved_bp
+        self.auto_resolved_named_test_present_total += auto_resolved_nt
         tick = {
             "at": now.isoformat(),
             "mode": mode,
@@ -273,6 +318,9 @@ class _MetricsIntegrityObservability:
             "flagged": len(flagged),
             "errors": len(errored),
             "enrolled": enrolled,
+            "auto_resolved": auto_resolved,
+            "auto_resolved_backing_path": auto_resolved_bp,
+            "auto_resolved_named_test_present": auto_resolved_nt,
             "flags": [r.as_dict() for r in flagged],
         }
         self.last_tick_at = str(tick["at"])
@@ -291,6 +339,11 @@ class _MetricsIntegrityObservability:
             "flags_total": self.flags_total,
             "errors_total": self.errors_total,
             "enrolled_total": self.enrolled_total,
+            "auto_resolved_total": self.auto_resolved_total,
+            "auto_resolved_backing_path_total": self.auto_resolved_backing_path_total,
+            "auto_resolved_named_test_present_total": (
+                self.auto_resolved_named_test_present_total
+            ),
             "last_tick_at": self.last_tick_at,
             "last_tick": dict(self.last_tick) if self.last_tick else None,
             "recent_ticks": list(self.recent_ticks),
@@ -488,6 +541,81 @@ async def _enroll_capability_proof_research(
     return True
 
 
+async def _enroll_trial_ineligible_earn_obligation(
+    session, *, project_id, cap_name: str, backing_paths: list[str]
+) -> bool:
+    """Enroll a per-capability earn obligation for a cap that is permanently
+    stuck at path_proven because it has NO discoverable covering test.
+
+    These caps carry a ``backing_path`` proof (so they are NOT missing
+    backing_paths) but cannot advance to ``proven`` via the execution-trial earn
+    path until a convention-named test file is added.  Recording this obligation
+    makes the gap operator-and-strategist-visible and surfaces a concrete action:
+    add a test that covers the backing paths so the trial path can fire.
+
+    Idempotent via :func:`~app.completion_debt.capability_earn_obligation_dedupe_key`:
+    repeated ticks upsert the same row.  Returns ``True`` when a NEW row was
+    created or an existing resolved/reopened row was reopened.  Never raises.
+    """
+    from app.completion_debt import (
+        KIND_CAPABILITY_EARN_OBLIGATION,
+        arecord_completion_debt,
+        capability_earn_obligation_dedupe_key,
+    )
+
+    dedupe_key = capability_earn_obligation_dedupe_key(str(project_id), cap_name)
+    title = f"Add test coverage to unlock trial-proven path for capability: {cap_name}"
+    paths_preview = ", ".join(backing_paths[:5])
+    detail = (
+        f"Capability '{cap_name}' carries a path_proven (backing_path) proof but "
+        "has no convention-named test file covering its declared backing paths. "
+        "The execution-trial earn path — the only automated route to the real "
+        "'proven' tier — requires a covering test. "
+        f"Backing paths: {paths_preview}. "
+        "Add a test file following the project's test-naming convention that "
+        "imports and exercises the modules at these paths. Once a covering test "
+        "exists the sweep will auto-enroll a capability_proof_trial; a green run "
+        "mints the 'proven' tier and clears the enforce-gate gap."
+    )
+    return await arecord_completion_debt(
+        session,
+        dedupe_key=dedupe_key,
+        kind=KIND_CAPABILITY_EARN_OBLIGATION,
+        title=title,
+        project_id=project_id,
+        detail={"description": detail, "backing_paths": backing_paths},
+    )
+
+
+async def _resolve_trial_ineligible_earn_obligation(
+    session, *, project_id, cap_name: str, reason: str | None = None
+) -> bool:
+    """Resolve an open earn obligation when a previously trial-ineligible
+    capability is no longer stuck.
+
+    Called when a capability that carried ONLY a ``backing_path`` proof
+    (path_proven tier, no discoverable covering test) gains test coverage —
+    a named_test_present proof is recorded, an execution trial is enrolled,
+    a fresh executed proof clears the enforce gate, or the capability becomes
+    platform-exempt under the existing registry semantics.  The resolution is
+    idempotent on the stable dedup key — a missing or already-resolved row is
+    a no-op that returns ``False``.  Never raises.
+    """
+    from app.completion_debt import (
+        aresolve_completion_debt,
+        capability_earn_obligation_dedupe_key,
+    )
+
+    dedupe_key = capability_earn_obligation_dedupe_key(str(project_id), cap_name)
+    resolution_reason = reason or (
+        f"capability '{cap_name}' gained test coverage or proof, "
+        "no longer trial-ineligible"
+    )
+    return await aresolve_completion_debt(
+        session, dedupe_key, reason=resolution_reason
+    )
+
+
 # --- Leader-only recurring sweep (called from the reaper cycle) --------------
 
 # Module-level cadence gate, exactly like structural_health_audit._last_audit_scan.
@@ -605,6 +733,121 @@ async def run_metrics_integrity_sweep(
 
 
 # Near-cap warning constants — patchable in tests.
+# =============================================================================
+# Check: audience_routing_attestation
+# =============================================================================
+
+
+@register_check(
+    "audience_routing_attestation",
+    "Sample recent ProjectMessage rows, re-route each by event_type via the "
+    "canonical route_event() resolver, and flag per-project any mismatch between "
+    "the stamped audience and the canonical audience (or NULL audience — the legacy "
+    "fallthrough that the read-side filter retains, making it a latent leak vector).",
+)
+async def check_audience_routing_attestation(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: every ProjectMessage with a registered event_type must carry
+    a context["audience"] that matches ``route_event(context["event_type"])``.
+    A NULL audience (legacy pass-through where the read-side filter retains the
+    row as operator-visible) or a mismatched audience is a latent leak vector:
+    a message intended for strategist-internal visibility can reach the operator.
+
+    Bounded to ``sample_limit`` rows, filtered to messages within ``window_days``;
+    groups flags per project. Pure recompute — never writes to ProjectMessage
+    in any mode.
+    """
+    from app.message_audience import route_event
+    from app.models import ProjectMessage
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+    messages = (
+        await ctx.session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.created_at >= cutoff)
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(ctx.sample_limit)
+        )
+    ).scalars().all()
+
+    if not messages:
+        return [
+            CheckResult(
+                check="audience_routing_attestation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no ProjectMessage rows in sample window",
+            )
+        ]
+
+    # Per-project counters: total messages with a known event_type, and how many
+    # carry a canonical audience stamp.  NULL audience counts as mismatched — it
+    # is the legacy fallthrough that the read-side filter retains as operator-visible.
+    per_project: Dict[str, Dict[str, int]] = {}
+    for msg in messages:
+        ctx_dict = msg.context or {}
+        event_type = ctx_dict.get("event_type")
+        if not event_type:
+            continue
+        stamped_audience = ctx_dict.get("audience")
+        canonical_audience = route_event(str(event_type))
+        pid = str(msg.project_id)
+        if pid not in per_project:
+            per_project[pid] = {"correct": 0, "total": 0}
+        per_project[pid]["total"] += 1
+        if stamped_audience == canonical_audience:
+            per_project[pid]["correct"] += 1
+
+    if not per_project:
+        return [
+            CheckResult(
+                check="audience_routing_attestation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no ProjectMessage rows with a known event_type in sample window",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for pid, counts in per_project.items():
+        total = counts["total"]
+        correct = counts["correct"]
+        mismatches = total - correct
+        if mismatches > 0:
+            results.append(
+                CheckResult(
+                    check="audience_routing_attestation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=correct,
+                    ground_truth=total,
+                    delta=mismatches,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{mismatches}/{total} sampled ProjectMessage(s) have an "
+                        "audience stamp that diverges from the canonical "
+                        "route_event() derivation (mis-routed or NULL audience)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="audience_routing_attestation",
+                    status=CheckStatus.OK,
+                    self_reported=correct,
+                    ground_truth=total,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {total} sampled ProjectMessage(s) carry canonical "
+                        "audience stamps matching route_event()"
+                    ),
+                )
+            )
+
+    return results
+
+
 _NEAR_CAP_RATIO: float = 0.95
 _NEAR_CAP_LIMITS_PATH: str = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "testing", "module_size_limits.json")
@@ -735,6 +978,7 @@ async def check_criterion_merge_evidence_gap(
 
     from app.acceptance_criteria import (
         get_criteria_for_version,
+        task_matches_criterion_release_version,
     )
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
     from app.landed_signal import has_landed_signal
@@ -820,6 +1064,8 @@ async def check_criterion_merge_evidence_gap(
         ground_truth = 0
         missing_task_ids: List[str] = []
         for task in tasks:
+            if not task_matches_criterion_release_version(task, open_version):
+                continue
             if not has_landed_signal(task):
                 continue
             verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
@@ -3616,10 +3862,12 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     commit for one project is logged and rolled back without aborting the check.
 
     * ``self_reported`` = total ``working`` capabilities in the project.
-    * ``ground_truth``  = caps with recorded proof (pre-existing ``proven`` plus
-      newly auto-recorded ``path_proven`` self-heal tiers); it counts recorded
-      evidence, not enforce-gate-clearing ``proven`` status specifically.
-    * ``delta``         = unresolved gap: needs_backing_paths + failed verification.
+    * ``ground_truth``  = caps with a true machine-verified ``proven`` status only;
+      ``path_proven`` self-heal tiers (structural backing-path or static
+      named_test_present checks) are NOT counted here because they do not clear
+      the enforce gate and do not represent an executed green merge-test verdict.
+    * ``delta``         = unresolved gap: needs_backing_paths + backing_paths that
+      failed HEAD verification + caps that already carry only a path_proven proof.
 
     Bounded to ``ctx.max_projects`` projects.
     """
@@ -3627,15 +3875,16 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
     from app.capability_proof import (
         _discover_candidate_backing_paths,
+        _maybe_enroll_proof_trial,
         _named_tests_covering_paths,
         _read_file_at_head,
         record_capability_backing_path_proof,
         record_capability_named_test_proof,
     )
     from app.capability_registry import (
+        consumer_gate_proof_status,
         exempt_capability_names,
         normalize_capability_name,
-        working_capability_proof_status,
     )
     from app.models import Project
     from app.source_ref_validation import _looks_like_file_path, _path_exists_at_head
@@ -3661,6 +3910,11 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
     for project in projects:
         pid = str(project.id)
         pm = project.problem_model if isinstance(project.problem_model, dict) else {}
+        proof_records = (
+            project.capability_proof_records
+            if isinstance(project.capability_proof_records, dict)
+            else None
+        )
         caps_list = pm.get("capabilities") if pm else None
         if not isinstance(caps_list, list) or not caps_list:
             results.append(
@@ -3673,8 +3927,8 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
             )
             continue
 
-        proof_by_name = working_capability_proof_status(pm)
-        exempt_set = exempt_capability_names(pm)
+        proof_by_name = consumer_gate_proof_status(pm, proof_records, now=ctx.now)
+        exempt_set = exempt_capability_names(pm, proof_records)
         if not proof_by_name:
             results.append(
                 CheckResult(
@@ -3741,8 +3995,25 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # backing_path-tier.
         auto_resolved: list[str] = []
         named_test_present_resolved: list[str] = []
+        trials_enrolled: list[str] = []
         needs_backing_paths: list[str] = []
-        still_unproven: list[str] = []
+        # Distinct unresolved buckets — kept separate so the FLAGGED detail is
+        # truthful about WHY each cap is still a gap (a dedup no-op that already
+        # carries a path_proven proof is NOT the same as a declared backing path
+        # that fails HEAD verification):
+        #   verification_failed — declared file-like backing_paths that do not
+        #     resolve at HEAD (stale/moved paths) or a proof-recording exception;
+        #     genuinely unresolvable by self-heal, so these also enroll research.
+        #   already_recorded_has_test — dedup no-op on a named_test_present proof;
+        #     cap is TRIAL-ELIGIBLE (test exists; trial awaits flag or cadence).
+        #   already_recorded_no_test — dedup no-op on a backing_path proof only;
+        #     cap has NO covering test → TRIAL-INELIGIBLE (permanently stuck at
+        #     path_proven until a test is added). These earn obligations are
+        #     enrolled in enforce mode so the gap is operator-visible.
+        verification_failed: list[str] = []
+        already_recorded_has_test: list[str] = []
+        already_recorded_no_test: list[str] = []  # trial-ineligible; file_paths per-cap
+        already_recorded_no_test_paths: dict[str, list[str]] = {}
 
         for cap_name in unproven_names:
             raw_name, backing_paths = cap_backing.get(cap_name, (cap_name, []))
@@ -3793,6 +4064,21 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
 
                 try:
                     if test_refs:
+                        # Slice 3 (design 84021e2d): under the execution-trials
+                        # flag, ENROLL a bounded capability_proof_trial that RUNS
+                        # the covering tests (a green run mints the real ``proven``
+                        # tier) instead of minting the static named_test_present
+                        # proof. Flag-off / degraded falls through unchanged.
+                        _trial = await _maybe_enroll_proof_trial(
+                            ctx.session,
+                            project,
+                            raw_name or cap_name,
+                            cap_name,
+                            test_refs,
+                        )
+                        if _trial in ("enrolled", "fresh"):
+                            trials_enrolled.append(cap_name)
+                            continue
                         recorded = record_capability_named_test_proof(
                             project, raw_name or cap_name, test_refs
                         )
@@ -3801,7 +4087,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                             named_test_present_resolved.append(cap_name)
                         else:
                             # Dedup: named_test_present proof already present.
-                            still_unproven.append(cap_name)
+                            # Cap is TRIAL-ELIGIBLE (test exists; only awaiting
+                            # trial flag or cadence window).
+                            already_recorded_has_test.append(cap_name)
                     else:
                         recorded = record_capability_backing_path_proof(
                             project, raw_name or cap_name
@@ -3809,9 +4097,12 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         if recorded:
                             auto_resolved.append(cap_name)
                         else:
-                            # Dedup: proof already present (path_proven tier, not
-                            # fully proven).
-                            still_unproven.append(cap_name)
+                            # Dedup: backing_path proof already present but NO
+                            # covering test → TRIAL-INELIGIBLE.  Permanently stuck
+                            # at path_proven until a test is added.  Track the
+                            # file_paths so the earn obligation can cite them.
+                            already_recorded_no_test.append(cap_name)
+                            already_recorded_no_test_paths[cap_name] = file_paths
                 except Exception:  # noqa: BLE001 — proof recording is non-fatal
                     logger.warning(
                         "[METRICS_INTEGRITY] capability_proof_gate_gap: "
@@ -3820,9 +4111,9 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         pid,
                         exc_info=True,
                     )
-                    still_unproven.append(cap_name)
+                    verification_failed.append(cap_name)
             else:
-                still_unproven.append(cap_name)
+                verification_failed.append(cap_name)
 
         # DISCOVERY pass: for caps with no declared file-like backing_paths, try
         # to discover candidate backing paths at HEAD by name. Apply the SAME
@@ -3871,6 +4162,20 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     test_refs = []
 
                 if test_refs:
+                    # Slice 3 (design 84021e2d): enroll an execution trial for the
+                    # discovered-covered candidate set under the flag; a green run
+                    # earns the real ``proven`` tier. Flag-off/degraded falls
+                    # through to the unchanged static named_test_present recording.
+                    _trial = await _maybe_enroll_proof_trial(
+                        ctx.session,
+                        project,
+                        raw_name or cap_name,
+                        cap_name,
+                        test_refs,
+                    )
+                    if _trial in ("enrolled", "fresh"):
+                        trials_enrolled.append(cap_name)
+                        continue
                     try:
                         recorded = record_capability_named_test_proof(
                             project, raw_name or cap_name, test_refs
@@ -3887,6 +4192,36 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     if recorded:
                         auto_resolved.append(cap_name)
                         named_test_present_resolved.append(cap_name)
+                        continue
+                    # Dedup/failure: fall through and keep the cap as a gap, but
+                    # still surface the candidates as research suggestions.
+                else:
+                    # Candidates present at HEAD (guaranteed by
+                    # _discover_candidate_backing_paths) but no covering test
+                    # file: apply the SAME backing_path fallback as the
+                    # declared-backing_paths self-heal above. The confidence bar
+                    # is identical — the discovered paths already passed
+                    # _path_exists_at_head — so record a ``backing_path`` proof
+                    # (graded ``path_proven``, NOT ``proven``). A successful
+                    # record auto-resolves the cap; a dedup no-op means a
+                    # path_proven proof already exists, so keep it in the gap
+                    # with the candidates folded into the research obligation.
+                    try:
+                        recorded = record_capability_backing_path_proof(
+                            project, raw_name or cap_name
+                        )
+                    except Exception:  # noqa: BLE001 — proof recording is non-fatal
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                            "backing-path proof recording failed for discovered "
+                            "cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        recorded = False
+                    if recorded:
+                        auto_resolved.append(cap_name)
                         continue
                     # Dedup/failure: fall through and keep the cap as a gap, but
                     # still surface the candidates as research suggestions.
@@ -3912,9 +4247,63 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                 )
                 with contextlib.suppress(Exception):
                     await ctx.session.rollback()
-                # Move auto_resolved to still_unproven since the commit failed.
-                still_unproven.extend(auto_resolved)
+                # The commit failed, so no proof was actually persisted — treat
+                # these as verification_failed (unresolved + needing research),
+                # NOT already_recorded (which implies a durable path_proven proof).
+                verification_failed.extend(auto_resolved)
                 auto_resolved.clear()
+
+        # ENFORCE mode: resolve earn obligations for caps that are no longer
+        # trial-ineligible. When a cap that was previously stuck at backing_path-only
+        # (already_recorded_no_test bucket in a prior sweep) gains test coverage —
+        # a named_test_present proof is recorded, an execution trial is enrolled, or
+        # a fresh executed proof already covers HEAD — the corresponding earn
+        # obligation is explicitly RESOLVED. Also resolve obligations for exempt
+        # caps since they are no longer counted in the gap. Resolution is idempotent
+        # on the stable dedupe key — a missing or already-resolved row is a no-op.
+        resolved_earn: list[str] = []
+        if ctx.mode == "enforce":
+            no_longer_stuck = (
+                set(named_test_present_resolved)
+                | set(trials_enrolled)
+                | set(already_recorded_has_test)
+            )
+            if exempt_set:
+                no_longer_stuck |= exempt_set
+            if no_longer_stuck:
+                project_uuid = _uuid.UUID(pid)
+                for cap_name in sorted(no_longer_stuck):
+                    try:
+                        if await _resolve_trial_ineligible_earn_obligation(
+                            ctx.session,
+                            project_id=project_uuid,
+                            cap_name=cap_name,
+                        ):
+                            resolved_earn.append(cap_name)
+                    except Exception:  # noqa: BLE001, PERF203 — resolution must not abort per-cap loop
+                        logger.warning(
+                            "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                            "earn-obligation resolve failed for cap=%s pid=%s",
+                            cap_name,
+                            pid,
+                            exc_info=True,
+                        )
+                        with contextlib.suppress(Exception):
+                            await ctx.session.rollback()
+            if resolved_earn:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: earn-obligation "
+                        "resolve commit failed for project %s after resolving %d "
+                        "obligation(s): %s",
+                        pid,
+                        len(resolved_earn),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
 
         # ENFORCE mode only: for caps that cannot be auto-proven (no file-like
         # backing_paths, no proof), enroll ONE deduped per-capability research
@@ -3922,12 +4311,19 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
         # Never crashes the check: a per-enroll failure is logged + rolled back
         # and the sweep continues; enrolled rows are committed in their own
         # commit (the auto-resolve proofs, if any, already committed above).
+        # Both the no-backing-paths caps AND caps whose declared backing_paths
+        # fail HEAD verification are genuine gaps self-heal cannot close on its
+        # own — enroll research for both so a stale/moved backing path is
+        # investigated rather than flagged forever. already_recorded caps are
+        # excluded: they already carry a path_proven proof and only a real green
+        # merge verdict can advance them to ``proven``.
         enrolled_research: list[str] = []
-        if ctx.mode == "enforce" and needs_backing_paths:
+        research_needed = needs_backing_paths + verification_failed
+        if ctx.mode == "enforce" and research_needed:
             # Reconstruct the UUID from the captured pid string so we never touch
             # a (possibly commit-expired) ORM attribute after the auto-resolve commit.
             project_uuid = _uuid.UUID(pid)
-            for cap_name in needs_backing_paths:
+            for cap_name in research_needed:
                 try:
                     if await _enroll_capability_proof_research(
                         ctx.session,
@@ -3961,11 +4357,76 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     with contextlib.suppress(Exception):
                         await ctx.session.rollback()
 
-        new_proven = proven_count + len(auto_resolved)
-        unresolved = needs_backing_paths + still_unproven
+        # ENFORCE mode: for caps that already carry a backing_path proof but have
+        # NO covering test, enroll a per-capability earn obligation so the gap is
+        # operator-and-strategist-visible with a concrete action (add a test file).
+        # Committed in the same batch as the research obligations above.
+        enrolled_earn: list[str] = []
+        if ctx.mode == "enforce" and already_recorded_no_test:
+            project_uuid = _uuid.UUID(pid)
+            for cap_name in already_recorded_no_test:
+                try:
+                    if await _enroll_trial_ineligible_earn_obligation(
+                        ctx.session,
+                        project_id=project_uuid,
+                        cap_name=cap_name,
+                        backing_paths=already_recorded_no_test_paths.get(cap_name, []),
+                    ):
+                        enrolled_earn.append(cap_name)
+                except Exception:  # noqa: BLE001, PERF203 — enrollment must not abort the check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: "
+                        "earn-obligation enroll failed for cap=%s pid=%s",
+                        cap_name,
+                        pid,
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+            if enrolled_earn:
+                try:
+                    await ctx.session.commit()
+                except Exception as exc:  # noqa: BLE001 — commit failure must not abort check
+                    logger.warning(
+                        "[METRICS_INTEGRITY] capability_proof_gate_gap: earn-obligation "
+                        "commit failed for project %s after enrolling %d obligation(s): %s",
+                        pid,
+                        len(enrolled_earn),
+                        exc,
+                    )
+                    with contextlib.suppress(Exception):
+                        await ctx.session.rollback()
+
+        # ``auto_resolved`` are path_proven (backing_path / named_test_present
+        # tier) — NOT the genuine ``proven`` tier. ground_truth is the count of
+        # working capabilities that have actually reached ``proven``, which is
+        # only ``proven_count``. Auto-resolved caps are tracked via the
+        # ``auto_resolved`` CheckResult field so dashboards can report self-heal
+        # throughput without conflating path_proven with proven.
+        auto_resolved_nt = len(named_test_present_resolved)
+        auto_resolved_bp = len(auto_resolved) - auto_resolved_nt
+        already_recorded = already_recorded_has_test + already_recorded_no_test
+        # Caps with an enrolled execution trial are NOT yet proven — the trial
+        # must run green first — so they still count as an unresolved gap this
+        # sweep, but are reported distinctly (a real proof is en route) rather
+        # than as a static resolution or a verification failure.
+        unresolved = (
+            needs_backing_paths
+            + verification_failed
+            + already_recorded
+            + trials_enrolled
+        )
 
         if unresolved:
             detail_parts: list[str] = []
+            if trials_enrolled:
+                preview_te = ", ".join(sorted(trials_enrolled)[:3])
+                if len(trials_enrolled) > 3:
+                    preview_te += f" (+{len(trials_enrolled) - 3} more)"
+                detail_parts.append(
+                    f"{len(trials_enrolled)} execution trial(s) enrolled "
+                    f"(pending green run → proven): {preview_te}"
+                )
             if auto_resolved:
                 preview_ar = ", ".join(sorted(auto_resolved)[:3])
                 if len(auto_resolved) > 3:
@@ -3993,12 +4454,40 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                         "path suggestion(s) folded into research obligations)"
                     )
                 detail_parts.append(_nb_part)
-            if still_unproven:
-                preview_su = ", ".join(sorted(still_unproven)[:3])
-                if len(still_unproven) > 3:
-                    preview_su += f" (+{len(still_unproven) - 3} more)"
+            if verification_failed:
+                preview_vf = ", ".join(sorted(verification_failed)[:3])
+                if len(verification_failed) > 3:
+                    preview_vf += f" (+{len(verification_failed) - 3} more)"
                 detail_parts.append(
-                    f"{len(still_unproven)} backing_paths failed verification: {preview_su}"
+                    f"{len(verification_failed)} backing_paths failed verification: "
+                    f"{preview_vf}"
+                )
+            if already_recorded_has_test:
+                preview_ir = ", ".join(sorted(already_recorded_has_test)[:3])
+                if len(already_recorded_has_test) > 3:
+                    preview_ir += f" (+{len(already_recorded_has_test) - 3} more)"
+                detail_parts.append(
+                    f"{len(already_recorded_has_test)} already carry a named_test_present "
+                    f"proof (trial-eligible, awaiting execution run → proven): {preview_ir}"
+                )
+            if already_recorded_no_test:
+                preview_nt = ", ".join(sorted(already_recorded_no_test)[:3])
+                if len(already_recorded_no_test) > 3:
+                    preview_nt += f" (+{len(already_recorded_no_test) - 3} more)"
+                _earn_note = (
+                    " (earn obligations enrolled)" if enrolled_earn else ""
+                )
+                detail_parts.append(
+                    f"{len(already_recorded_no_test)} carry a backing_path proof but "
+                    f"have no covering test (trial-ineligible{_earn_note}): {preview_nt}"
+                )
+            if resolved_earn:
+                preview_re = ", ".join(sorted(resolved_earn)[:3])
+                if len(resolved_earn) > 3:
+                    preview_re += f" (+{len(resolved_earn) - 3} more)"
+                detail_parts.append(
+                    f"{len(resolved_earn)} earn obligation(s) resolved (capability "
+                    f"no longer trial-ineligible): {preview_re}"
                 )
             _detail = (
                 f"{len(unresolved)} working capability(ies) remain unproven "
@@ -4016,28 +4505,32 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     check="capability_proof_gate_gap",
                     status=CheckStatus.FLAGGED,
                     self_reported=total_working,
-                    ground_truth=new_proven,
+                    ground_truth=proven_count,
                     delta=len(unresolved),
                     severity="warn",
                     subject=pid,
                     detail=_detail,
+                    auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
         else:
             _ok_detail = (
-                f"all {total_working} working capability(ies) carry proven evidence"
+                f"all {total_working} working capability(ies) addressed: "
+                f"{proven_count} proven"
             )
             if auto_resolved:
                 if named_test_present_resolved:
                     _ok_detail += (
-                        f" ({len(auto_resolved)} auto-resolved: "
-                        f"{len(named_test_present_resolved)} via named_test_present, "
+                        f", {len(auto_resolved)} path_proven via self-heal "
+                        f"({len(named_test_present_resolved)} named_test_present, "
                         f"{len(auto_resolved) - len(named_test_present_resolved)} "
-                        "via backing_paths)"
+                        "backing_paths)"
                     )
                 else:
                     _ok_detail += (
-                        f" ({len(auto_resolved)} auto-resolved via backing_paths)"
+                        f", {len(auto_resolved)} path_proven via self-heal (backing_paths)"
                     )
             if exempt_count:
                 _ok_detail += (
@@ -4052,10 +4545,13 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
                     check="capability_proof_gate_gap",
                     status=CheckStatus.OK,
                     self_reported=total_working,
-                    ground_truth=new_proven,
+                    ground_truth=proven_count,
                     delta=0,
                     subject=pid,
                     detail=_ok_detail,
+                    auto_resolved=len(auto_resolved),
+                    auto_resolved_backing_path=auto_resolved_bp,
+                    auto_resolved_named_test_present=auto_resolved_nt,
                 )
             )
 
@@ -4069,6 +4565,219 @@ async def check_capability_proof_gate_gap(ctx: SweepContext) -> List[CheckResult
             )
         ]
     return results
+
+
+async def compute_fleet_proof_coverage(
+    session: Any, max_projects: int, now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """Compute the fleet-wide capability-proof coverage ratio.
+
+    This is the exact quantity the auto-graduation thresholds
+    (``capability_proof_gate_auto_graduation_observe_threshold`` /
+    ``..._enforce_threshold``) are compared against, extracted so it can be
+    surfaced read-only to the operator (e.g. the settings endpoint) as well as
+    driving :func:`check_capability_proof_gate_auto_graduation`.
+
+    Coverage = total ledger-cleared working caps / total non-exempt working caps.
+    Exempt capabilities are excluded from BOTH numerator and denominator, and a
+    project with working caps that are all exempt does not contribute.
+
+    Bounded by ``max_projects`` (mirrors the sweep's ``ctx.max_projects``).
+
+    Returns a dict with:
+
+    * ``num_projects`` — projects examined (bounded by ``max_projects``)
+    * ``projects_contributing`` — projects with >=1 non-exempt working cap
+    * ``contributing_project_ids`` — ids of those contributing projects (used by
+      the auto-graduation check to notify each contributing project's operator)
+    * ``total_non_exempt_working`` — coverage denominator
+    * ``total_proven`` — coverage numerator
+    * ``coverage_ratio`` — ``total_proven / total_non_exempt_working`` as a
+      float, or ``None`` when the denominator is zero (ratio undefined)
+    """
+    from app.capability_registry import (
+        consumer_gate_proof_status,
+        exempt_capability_names,
+    )
+    from app.models import Project
+
+    # Snapshot ``now`` ONCE for the whole fleet scan and thread it explicitly into
+    # every authoritative grading call below. PROOF_FRESHNESS_TTL demotion is
+    # applied against this single instant, so a proof older than the TTL is NOT
+    # counted toward ``total_proven``.
+    if now is None:
+        now = _utcnow()
+
+    # ``capability_proof_records`` (the platform-only ledger) is loaded alongside
+    # the problem_model so an operator-recorded exemption is honored here: without
+    # it, ``exempt_capability_names`` defaults ``proof_records`` to None (an EMPTY
+    # ledger) and a genuinely unprovable-but-exempted working capability counts
+    # against the denominator forever, so fleet coverage can never reach the enforce
+    # threshold and the gate stalls. Threading the ledger in grades a platform-
+    # exempted capability ``proven`` AND drops it from the denominator, matching the
+    # every-other gate seam (:func:`exempt_capability_names`). A bare agent-writable
+    # ``proof_exempt`` flag still does NOT exclude — only the platform ledger does.
+    projects = (
+        await session.execute(
+            select(
+                Project.id,
+                Project.problem_model,
+                Project.capability_proof_records,
+            ).limit(max_projects)
+        )
+    ).all()
+
+    fleet_total: int = (
+        await session.execute(select(func.count(Project.id)))
+    ).scalar_one()
+
+    total_non_exempt_working = 0
+    total_proven = 0
+    projects_contributing = 0
+    contributing_project_ids: list = []
+    # Count of non-exempt unproven working capabilities that declare at least
+    # one backing_path: these are trial-eligible when
+    # ``capability_proof_execution_trials_enabled`` is ON, giving the operator
+    # a projection of how enabling trials would change coverage. This is a
+    # declaration-only check (no git verification) — it answers "how many caps
+    # could earn a trial?" not "how many tests pass?".
+    trial_eligible_unproven = 0
+
+    for project_id, raw_pm, raw_records in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_records = raw_records if isinstance(raw_records, dict) else {}
+        proof_by_name = consumer_gate_proof_status(
+            pm, proof_records, now=now
+        )
+        if not proof_by_name:
+            continue
+        exempt_set = exempt_capability_names(pm, proof_records)
+        # Exclude exempt capabilities from both numerator and denominator.
+        non_exempt = {
+            name: status
+            for name, status in proof_by_name.items()
+            if name not in exempt_set
+        }
+        if not non_exempt:
+            # Project has working caps but all are exempt — exclude from aggregate.
+            continue
+        projects_contributing += 1
+        contributing_project_ids.append(project_id)
+        total_non_exempt_working += len(non_exempt)
+        total_proven += sum(1 for s in non_exempt.values() if s == "proven")
+
+        # Projection: count non-exempt unproven caps with backing_paths declared.
+        from app.capability_registry import normalize_capability_name
+        caps_list = pm.get("capabilities") or []
+        for cap in caps_list:
+            if not isinstance(cap, dict):
+                continue
+            cap_name = normalize_capability_name(cap.get("name"))
+            if not cap_name or cap_name in exempt_set:
+                continue
+            if non_exempt.get(cap_name, "proven") == "proven":
+                continue
+            backing = cap.get("backing_paths")
+            if isinstance(backing, list) and any(
+                isinstance(p, str) and p.strip() for p in backing
+            ):
+                trial_eligible_unproven += 1
+
+    coverage_ratio = (
+        total_proven / total_non_exempt_working
+        if total_non_exempt_working > 0
+        else None
+    )
+
+    return {
+        "num_projects": len(projects),
+        "fleet_total": fleet_total,
+        "fleet_capped": len(projects) == max_projects and fleet_total > max_projects,
+        "projects_contributing": projects_contributing,
+        "contributing_project_ids": contributing_project_ids,
+        "total_non_exempt_working": total_non_exempt_working,
+        "total_proven": total_proven,
+        "coverage_ratio": coverage_ratio,
+        "trial_eligible_unproven": trial_eligible_unproven,
+    }
+
+
+async def compute_trial_eligibility_projection(
+    session: Any, max_projects: int
+) -> Dict[str, Any]:
+    """Count unproven working capabilities that have backing_paths (trial-eligible).
+
+    A capability is trial-eligible when the platform ledger has not cleared it,
+    it has a ``working`` status, and declares at least one ``backing_path``. Enabling
+    ``capability_proof_execution_trials_enabled`` allows the earn loop to discover
+    test coverage for these capabilities and enroll bounded execution trials that
+    can mint the real ``proven`` tier — clearing the enforce gate.
+
+    This is a STATIC, read-only projection — no git HEAD checks or test discovery
+    are performed. It answers the operator question "how many capabilities could
+    benefit from enabling trials?" based purely on problem_model declarations.
+
+    Returns a dict with:
+
+    * ``trial_eligible`` — caps with backing_paths that are unproven working
+    * ``unproven_working`` — total unproven working caps across the scanned fleet
+    * ``projects_contributing`` — projects with at least one unproven working cap
+    * ``num_projects`` — projects scanned (bounded by ``max_projects``)
+    """
+    from app.capability_registry import consumer_gate_proof_status
+    from app.models import Project
+
+    projects = (
+        await session.execute(
+            select(
+                Project.id,
+                Project.problem_model,
+                Project.capability_proof_records,
+            ).limit(max_projects)
+        )
+    ).all()
+
+    total_trial_eligible = 0
+    total_unproven_working = 0
+    projects_contributing = 0
+
+    for _project_id, raw_pm, raw_records in projects:
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        proof_records = raw_records if isinstance(raw_records, dict) else {}
+        proof_by_name = consumer_gate_proof_status(pm, proof_records)
+        if not proof_by_name:
+            continue
+
+        unproven_names = {
+            name for name, status in proof_by_name.items() if status != "proven"
+        }
+        if not unproven_names:
+            continue
+
+        projects_contributing += 1
+        total_unproven_working += len(unproven_names)
+
+        caps = pm.get("capabilities") or []
+        for cap in caps:
+            if not isinstance(cap, dict):
+                continue
+            raw_name = cap.get("name", "")
+            if not isinstance(raw_name, str):
+                continue
+            # Normalize the name the same way working_capability_proof_status does.
+            norm = raw_name.lower().replace(" ", "-").strip("-")
+            if norm not in unproven_names:
+                continue
+            bp = cap.get("backing_paths")
+            if isinstance(bp, list) and any(isinstance(p, str) and p for p in bp):
+                total_trial_eligible += 1
+
+    return {
+        "trial_eligible": total_trial_eligible,
+        "unproven_working": total_unproven_working,
+        "projects_contributing": projects_contributing,
+        "num_projects": len(projects),
+    }
 
 
 @register_check(
@@ -4096,11 +4805,7 @@ async def check_capability_proof_gate_auto_graduation(
     Returns a CheckResult with coverage ratio, threshold, and whether advancement
     occurred. Idempotent — running twice with the same coverage advances at most once.
     """
-    from app.capability_registry import (
-        exempt_capability_names,
-        working_capability_proof_status,
-    )
-    from app.models import DeploymentState, Project
+    from app.models import DeploymentState
     from app.shared_state import runtime_config as _runtime_config
 
     # Read auto-graduation config from runtime_config.
@@ -4142,13 +4847,9 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    # Compute fleet-wide proof coverage.
-    projects = (
-        await ctx.session.execute(
-            select(Project.id, Project.problem_model).limit(ctx.max_projects)
-        )
-    ).all()
-    if not projects:
+    # Compute fleet-wide proof coverage (shared with the settings endpoint).
+    coverage = await compute_fleet_proof_coverage(ctx.session, ctx.max_projects)
+    if coverage["num_projects"] == 0:
         return [
             CheckResult(
                 check="capability_proof_gate_auto_graduation",
@@ -4158,28 +4859,10 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    total_non_exempt_working = 0
-    total_proven = 0
-    projects_contributing = 0
-
-    for _project_id, raw_pm in projects:
-        pm = raw_pm if isinstance(raw_pm, dict) else {}
-        proof_by_name = working_capability_proof_status(pm)
-        if not proof_by_name:
-            continue
-        exempt_set = exempt_capability_names(pm)
-        # Exclude exempt capabilities from both numerator and denominator.
-        non_exempt = {
-            name: status
-            for name, status in proof_by_name.items()
-            if name not in exempt_set
-        }
-        if not non_exempt:
-            # Project has working caps but all are exempt — exclude from aggregate.
-            continue
-        projects_contributing += 1
-        total_non_exempt_working += len(non_exempt)
-        total_proven += sum(1 for s in non_exempt.values() if s == "proven")
+    total_non_exempt_working = coverage["total_non_exempt_working"]
+    total_proven = coverage["total_proven"]
+    projects_contributing = coverage["projects_contributing"]
+    contributing_project_ids: list = coverage["contributing_project_ids"]
 
     if total_non_exempt_working == 0:
         return [
@@ -4191,7 +4874,7 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    coverage_ratio = total_proven / total_non_exempt_working
+    coverage_ratio = coverage["coverage_ratio"]
 
     # Determine if advancement is warranted.
     advance_to: str | None = None
@@ -4199,6 +4882,27 @@ async def check_capability_proof_gate_auto_graduation(
         advance_to = "observe"
     elif current_mode == "observe" and coverage_ratio >= enforce_threshold:
         advance_to = "enforce"
+
+    # Refuse to advance when the fleet exceeds the sample cap: unseen projects may
+    # be unproven, so coverage looks artificially high. For enforce this would
+    # block tasks for projects never checked; for observe the blast radius is
+    # log-only, but the asymmetry is surprising and the signal is unreliable.
+    if advance_to and coverage.get("fleet_capped"):
+        fleet_total = coverage.get("fleet_total", "?")
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail=(
+                    f"fleet has {fleet_total} projects but sample cap is "
+                    f"{ctx.max_projects}; cannot safely graduate to {advance_to} "
+                    "without complete fleet coverage — increase "
+                    "metrics_integrity_sweep_max_projects or prove all projects "
+                    "within the current cap first"
+                ),
+            )
+        ]
 
     if advance_to is None:
         # Coverage below the threshold for the next step — no advancement.
@@ -4219,7 +4923,48 @@ async def check_capability_proof_gate_auto_graduation(
             )
         ]
 
-    # Advance the gate mode — update in-memory config.
+    # Persist the new gate mode before changing process-local state.  A process
+    # must never enforce a mode that was not durably committed.
+    try:
+        state = await ctx.session.get(DeploymentState, 1)
+        if state is None:
+            await ctx.session.rollback()
+            return [
+                CheckResult(
+                    check="capability_proof_gate_auto_graduation",
+                    status=CheckStatus.ERROR,
+                    subject="global",
+                    detail=(
+                        f"cannot auto-graduate gate from {current_mode} to {advance_to}: "
+                        "deployment state is missing; in-memory mode unchanged"
+                    ),
+                )
+            ]
+        config_json = dict(getattr(state, "runtime_config_json", None) or {})
+        config_json["capability_proof_gate_mode"] = advance_to
+        state.runtime_config_json = config_json
+        ctx.session.add(state)
+        await ctx.session.commit()
+    except Exception as exc:
+        await ctx.session.rollback()
+        logger.warning(
+            "[METRICS-INTEGRITY] failed to persist capability proof gate "
+            "auto-graduation to DB; in-memory mode remains %s",
+            current_mode,
+            exc_info=True,
+        )
+        return [
+            CheckResult(
+                check="capability_proof_gate_auto_graduation",
+                status=CheckStatus.ERROR,
+                subject="global",
+                detail=(
+                    f"failed to persist gate auto-graduation from {current_mode} "
+                    f"to {advance_to}: {exc}; in-memory mode unchanged"
+                ),
+            )
+        ]
+
     _runtime_config["capability_proof_gate_mode"] = advance_to
     logger.info(
         "[METRICS-INTEGRITY] capability proof gate auto-graduated: "
@@ -4235,25 +4980,49 @@ async def check_capability_proof_gate_auto_graduation(
         total_proven,
     )
 
-    # Persist the new gate mode to the database so it survives restarts.
+    # Notify the operator of this autonomous gate-mode change. The advance
+    # (especially → enforce, which begins BLOCKING task spawning and release
+    # promotion pipeline-wide) was previously visible only in an INFO log.
+    # Route one operator-visible message per contributing project through the
+    # unified message-audience system. Best-effort — a post failure must never
+    # abort the check or roll back the already-persisted gate advancement.
     try:
-        state = await ctx.session.get(DeploymentState, 1)
-        if state is not None:
-            config_json = getattr(state, "runtime_config_json", None)
-            if isinstance(config_json, dict):
-                config_json["capability_proof_gate_mode"] = advance_to
-            else:
-                config_json = {"capability_proof_gate_mode": advance_to}
-            state.runtime_config_json = config_json
-            ctx.session.add(state)
+        from app.notification_dispatch import (
+            post_capability_proof_gate_graduated_message,
+        )
+
+        advance_threshold = (
+            observe_threshold if current_mode == "off" else enforce_threshold
+        )
+        for pid in contributing_project_ids:
+            await post_capability_proof_gate_graduated_message(
+                ctx.session,
+                pid,
+                from_mode=current_mode,
+                to_mode=advance_to,
+                coverage=coverage_ratio,
+                threshold=advance_threshold,
+                projects_contributing=projects_contributing,
+                total_non_exempt=total_non_exempt_working,
+                total_proven=total_proven,
+            )
+        if contributing_project_ids:
             await ctx.session.commit()
     except Exception:
         logger.warning(
-            "[METRICS-INTEGRITY] failed to persist capability proof gate "
-            "auto-graduation to DB; in-memory value is %s",
+            "[METRICS-INTEGRITY] failed to post operator notification for "
+            "capability proof gate auto-graduation (%s → %s); gate advancement "
+            "itself is unaffected",
+            current_mode,
             advance_to,
             exc_info=True,
         )
+        # A notification flush/commit failure leaves AsyncSession in a failed
+        # transaction until it is rolled back.  Keep this best-effort side
+        # effect from poisoning completion-debt resolution or the next sweep
+        # check; the gate advancement above is already durably committed.
+        with contextlib.suppress(Exception):
+            await ctx.session.rollback()
 
     # Resolve the dormant-knob debt for capability_proof_gate_mode when advancing
     # to enforce (the knob's "off" / "observe" value meant an open obligation).
@@ -4290,3 +5059,820 @@ async def check_capability_proof_gate_auto_graduation(
             ),
         )
     ]
+
+
+@register_check(
+    "observe_mode_unverified_resolution",
+    "Aggregate SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY stamps from tasks spawned "
+    "while the capability proof gate was in observe (or off) mode. Per-project "
+    "counts show how many dependents resolved against an unproven 'working' "
+    "capability — the operational evidence that the gate needs before the operator "
+    "can safely advance observe→enforce.",
+)
+async def check_observe_mode_unverified_resolution(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Surface per-project counts of observe-mode unverified-resolution stamps.
+
+    The spawn resolver (``research_completion.py``) writes
+    ``SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY`` into every dependent task's context
+    when a prerequisite resolves as satisfied-by-the-codebase but the backing
+    capability is ``working`` without a ``proven`` status. Those stamps are durable
+    but were never read back — this check aggregates them so the operator has
+    visibility into how many in-flight and recent tasks relied on an unproven
+    capability foundation.
+
+    * ``self_reported`` = total tasks carrying the stamp (our own write, so this
+      is both source and recompute — the check surfaces the accumulated count,
+      not a divergence from a separate counter).
+    * ``ground_truth``  = 0 (no task should resolve against an unproven cap once
+      the gate is in enforce mode; this signals the outstanding debt).
+    * ``delta``         = count of stamped tasks, i.e. the unresolved observe-mode
+      obligation.
+
+    Bounded to ``ctx.max_projects`` projects; within each project at most
+    ``ctx.sample_limit`` recently-created tasks are scanned.
+    """
+    from app.database import resolve_dialect_name
+    from app.models import Project, Task
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    # ``has_key`` compiles to the Postgres-only JSONB ``?`` operator — fails
+    # on the SQLite smoke gate. Branch to ``func.json_extract`` for SQLite.
+    if resolve_dialect_name(ctx.session) == "sqlite":
+        stamp_predicate = func.json_extract(
+            Task.context, f"$.{SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY}"
+        ).is_not(None)
+    else:
+        stamp_predicate = Task.context.has_key(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY)
+
+    results: List[CheckResult] = []
+    any_stamped = False
+
+    for (project_id,) in projects:
+        pid = str(project_id)
+        stamped_tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.created_at >= cutoff,
+                    stamp_predicate,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not stamped_tasks:
+            results.append(
+                CheckResult(
+                    check="observe_mode_unverified_resolution",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no tasks with unverified-resolution stamps in window",
+                )
+            )
+            continue
+
+        any_stamped = True
+        count = len(stamped_tasks)
+
+        # Aggregate distinct capability refs across all stamped tasks.
+        cap_refs: dict[str, int] = {}
+        for t in stamped_tasks:
+            for entry in (t.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []:
+                ref = entry.get("ref") if isinstance(entry, dict) else None
+                if ref:
+                    cap_refs[ref] = cap_refs.get(ref, 0) + 1
+
+        top_refs = sorted(cap_refs, key=lambda r: -cap_refs[r])[:5]
+        ref_summary = ", ".join(
+            f"{r}({cap_refs[r]})" for r in top_refs
+        ) if top_refs else "unknown"
+        truncated = f"+{len(cap_refs) - 5} more" if len(cap_refs) > 5 else ""
+
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.FLAGGED,
+                self_reported=count,
+                ground_truth=0,
+                delta=count,
+                severity="warn",
+                subject=pid,
+                detail=(
+                    f"{count} task(s) in window resolved against an unproven "
+                    f"'working' capability (observe/off mode stamp); "
+                    f"top refs by count: {ref_summary}"
+                    + (f" {truncated}" if truncated else "")
+                ),
+            )
+        )
+
+    if not any_stamped:
+        results.append(
+            CheckResult(
+                check="observe_mode_unverified_resolution",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no observe-mode unverified-resolution stamps found in window",
+            )
+        )
+
+    return results
+
+
+# --- Check: capability_proof_trial_stall -------------------------------------
+
+#: Context key written by task_completion._handle_capability_proof_trial_completion
+#: on every non-green trial outcome. The sweep reads this key to detect stall patterns.
+_CAP_TRIAL_CONTRADICTION_KEY = "capability_proof_trial_contradiction"
+
+
+@register_check(
+    "capability_proof_trial_stall",
+    "Per-project scan of recently-completed capability_proof_trial tasks whose "
+    "capability_proof_trial_contradiction stamp shows ALL recent outcomes were "
+    "non-green (could_not_run / red / skipped). Flags stalled (project, cap) pairs, "
+    "distinguishing infrastructure failure (could_not_run) from definitive failure "
+    "(red), without altering any gate decision.",
+)
+async def check_capability_proof_trial_stall(ctx: SweepContext) -> List[CheckResult]:
+    """Surface per-project, per-cap trial stalls so silent earn-loop no-ops are visible.
+
+    When a ``capability_proof_trial`` task completes non-green, the ingestion handler
+    in ``task_completion`` stamps ``capability_proof_trial_contradiction`` on the task
+    context but does NOT demote proof status.  This is intentionally safe — but it
+    means the earn loop can silently no-op forever with no fleet-visible signal.
+
+    This check queries COMPLETED ``capability_proof_trial`` tasks within the
+    ``window_days`` window, groups them by (project_id, cap), and flags any group
+    where EVERY recent outcome was non-green.  It distinguishes:
+
+    * ``could_not_run`` — infrastructure failure (Docker, wall-clock, etc.); severity
+      ``warn`` — the tests may well pass once the runner is fixed.
+    * definitive red (``ran=True, passed=False, could_not_run=False``) — tests
+      actually ran and failed; severity ``error``.
+    * skipped — at least some trials were skipped (indeterminate); severity ``warn``.
+
+    A group with at least one green trial in the window is NOT flagged.
+
+    * ``self_reported`` = total trial tasks for this (project, cap) in the window.
+    * ``ground_truth``  = 0 (none of the trials were green).
+    * ``delta``         = self_reported (all trials were non-green).
+
+    Does NOT mutate any proof, gate setting, or counter.
+    Bounded to ``ctx.max_projects`` projects and ``ctx.sample_limit`` trial tasks.
+    """
+    from app.models import Project, Task, TaskStatus
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_proof_trial_stall",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_trial_found = False
+
+    for (project_id,) in projects:
+        pid = str(project_id)
+
+        trial_tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.payloads[0]["type"].as_string() == "capability_proof_trial",
+                    Task.created_at >= cutoff,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not trial_tasks:
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no completed trial tasks in window",
+                )
+            )
+            continue
+
+        any_trial_found = True
+
+        # Group contradiction stamps by cap name.  A single non-green task has exactly
+        # one contradiction stamp; green tasks have none.  We track caps that have at
+        # least one green trial so we can skip flagging them even if other trials for
+        # the same cap were non-green.
+        cap_could_not_run: dict[str, int] = {}
+        cap_red: dict[str, int] = {}
+        cap_skipped_only: dict[str, int] = {}
+        cap_total: dict[str, int] = {}
+        cap_has_green: dict[str, bool] = {}
+
+        for t in trial_tasks:
+            contradiction = (t.context or {}).get(_CAP_TRIAL_CONTRADICTION_KEY)
+            if not isinstance(contradiction, dict):
+                # Green trial: no contradiction stamp.  Extract cap from payload so we
+                # can mark this cap as having at least one passing outcome in the window.
+                payloads = t.payloads or []
+                cap = payloads[0].get("cap") if payloads else None
+                if isinstance(cap, str) and cap.strip():
+                    cap_has_green[cap] = True
+                continue
+            cap = contradiction.get("cap")
+            if not isinstance(cap, str) or not cap.strip():
+                continue
+            cap_total[cap] = cap_total.get(cap, 0) + 1
+            if contradiction.get("could_not_run"):
+                cap_could_not_run[cap] = cap_could_not_run.get(cap, 0) + 1
+            elif bool(contradiction.get("ran")) and not bool(contradiction.get("passed")):
+                cap_red[cap] = cap_red.get(cap, 0) + 1
+            else:
+                cap_skipped_only[cap] = cap_skipped_only.get(cap, 0) + 1
+
+        # If all trial tasks in the window were green (cap_total empty), there are no
+        # stalls for this project.
+        if not cap_total:
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no non-green trial tasks in window (all trials passed)",
+                )
+            )
+            continue
+
+        # Now check each cap: are ALL trials in this window non-green?  A cap with at
+        # least one green trial in the window is not stalled and must not be flagged.
+        for cap, total in cap_total.items():
+            # A cap with at least one green trial in the window is not stalled.
+            if cap_has_green.get(cap):
+                continue
+
+            cnr = cap_could_not_run.get(cap, 0)
+            red = cap_red.get(cap, 0)
+            skp = cap_skipped_only.get(cap, 0)
+            non_green_sum = cnr + red + skp
+
+            # If we can't account for all trials via contradiction outcomes, the data
+            # is inconsistent — treat conservatively as inconclusive rather than flag.
+            if non_green_sum < total:
+                results.append(
+                    CheckResult(
+                        check="capability_proof_trial_stall",
+                        status=CheckStatus.INCONCLUSIVE,
+                        subject=pid,
+                        detail=(
+                            f"cap={cap!r}: {total} contradiction-stamped trial(s) "
+                            f"but only {non_green_sum} outcome(s) parseable — "
+                            "inconclusive (possible data inconsistency)"
+                        ),
+                    )
+                )
+                continue
+
+            # Choose severity: definitive red beats could_not_run beats skipped-only.
+            if red > 0:
+                severity = "error"
+                outcome_summary = (
+                    f"red={red}"
+                    + (f", could_not_run={cnr}" if cnr else "")
+                    + (f", skipped={skp}" if skp else "")
+                )
+            elif cnr > 0:
+                severity = "warn"
+                outcome_summary = (
+                    f"could_not_run={cnr}"
+                    + (f", skipped={skp}" if skp else "")
+                )
+            else:
+                severity = "warn"
+                outcome_summary = f"skipped={skp}"
+
+            results.append(
+                CheckResult(
+                    check="capability_proof_trial_stall",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total,
+                    ground_truth=0,
+                    delta=total,
+                    severity=severity,
+                    subject=pid,
+                    detail=(
+                        f"cap={cap!r}: {total} trial(s) in window, all non-green "
+                        f"({outcome_summary}); earn loop may be silently stalled"
+                    ),
+                )
+            )
+
+    if not any_trial_found and not any(r.flagged for r in results):
+        results.append(
+            CheckResult(
+                check="capability_proof_trial_stall",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no stalled capability_proof_trial outcomes found in window",
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "unmapped_acceptance_criteria",
+    "Flag active criteria not linked to any direction — they can never accumulate merge evidence",
+)
+async def check_unmapped_acceptance_criteria(ctx: SweepContext) -> List[CheckResult]:
+    """Flag ACTIVE acceptance criteria that are not mapped to any Direction.
+
+    An unmapped criterion is structurally guaranteed to never receive
+    ``task_merge`` evidence via ``record_task_merge_evidence``, because that
+    function only writes evidence for criteria that are (a) carried on the task
+    as ``criterion_ids``, or (b) inherited from the spawning Direction's
+    ``criterion_keys``.  A criterion authored but never linked to a Direction
+    falls into neither bucket and silently stays uncovered indefinitely.
+
+    This check surfaces unmapped active criteria per project so operators can
+    take corrective action (link the criterion to a Direction, or retract it).
+
+    * ``self_reported`` = total active criteria on the open version.
+    * ``ground_truth``  = active criteria that ARE mapped to at least one Direction.
+    * ``delta``         = unmapped active criteria count (self_reported - ground_truth).
+
+    SKIPPED when no open version or no active criteria exist.
+    Bounded to ``ctx.max_projects`` projects.
+    """
+    from app.acceptance_criteria import get_unmapped_active_criterion_keys
+    from app.models import Project
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="unmapped_acceptance_criteria",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        from app.acceptance_criteria import get_criteria_for_version
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        active_criteria = [c for c in criteria if c.status == "active"]
+        if not active_criteria:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no active criteria on open version",
+                )
+            )
+            continue
+
+        any_checked = True
+        total_active = len(active_criteria)
+        unmapped_keys = await get_unmapped_active_criterion_keys(
+            ctx.session, project_id, open_version.id
+        )
+        unmapped_count = len(unmapped_keys)
+        mapped_count = total_active - unmapped_count
+
+        if unmapped_count == 0:
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.OK,
+                    self_reported=total_active,
+                    ground_truth=mapped_count,
+                    delta=0,
+                    subject=pid,
+                    detail=f"all {total_active} active criterion/criteria mapped to a direction",
+                )
+            )
+        else:
+            preview = unmapped_keys[:5]
+            results.append(
+                CheckResult(
+                    check="unmapped_acceptance_criteria",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_active,
+                    ground_truth=mapped_count,
+                    delta=unmapped_count,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{unmapped_count} active criterion/criteria unmapped to any direction "
+                        f"and will never receive merge evidence: {preview}"
+                        + (" (and more)" if unmapped_count > 5 else "")
+                    ),
+                )
+            )
+
+    if not any_checked:
+        results.append(
+            CheckResult(
+                check="unmapped_acceptance_criteria",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no projects with active criteria to audit",
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "research_quality_grader_pass_rate",
+    "Flag directions with a persistently low forward-quality grader pass rate",
+)
+async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[CheckResult]:
+    """Surface directions where recent research cycles consistently fail quality grading.
+
+    Reads ``quality_grader_verdict`` from the last 3 ``research_history`` entries
+    on each active Direction.  When ALL entries with a verdict show
+    ``passed=False``, the direction is flagged — it is generating findings that
+    the quality grader rejects.  Cycles without a verdict (legacy entries or
+    directions that do not use the quality grader) are skipped so this check is
+    additive and never fires on legacy data.
+
+    * ``self_reported`` = cycles with a quality grader verdict in the window.
+    * ``ground_truth``  = cycles with ``passed=True``.
+    * ``delta``         = cycles with ``passed=False``.
+
+    SKIPPED when no project has active directions with quality grader data.
+    Bounded to ``ctx.max_projects`` projects.
+    """
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="research_quality_grader_pass_rate",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_flagged = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        project = await ctx.session.get(Project, project_id)
+        if not project:
+            continue
+        directions = list(project.directions or [])
+        for d in directions:
+            if d.get("status") not in ("active", "paused"):
+                continue
+            history = d.get("research_history") or []
+            recent = history[-3:]
+            verdicts = [
+                e.get("quality_grader_verdict")
+                for e in recent
+                if isinstance(e.get("quality_grader_verdict"), dict)
+                and "passed" in e.get("quality_grader_verdict", {})
+            ]
+            if not verdicts:
+                continue
+            passed = sum(1 for v in verdicts if v.get("passed"))
+            failed = len(verdicts) - passed
+            if failed > 0 and passed == 0:
+                any_flagged = True
+                results.append(
+                    CheckResult(
+                        check="research_quality_grader_pass_rate",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=len(verdicts),
+                        ground_truth=passed,
+                        delta=failed,
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"direction {d.get('id')!r} ({d.get('text', '')[:60]!r}): "
+                            f"{failed}/{len(verdicts)} recent research cycle(s) failed "
+                            "quality grading — findings may be low-actionability"
+                        ),
+                    )
+                )
+
+    if not any_flagged:
+        results.append(
+            CheckResult(
+                check="research_quality_grader_pass_rate",
+                status=CheckStatus.OK,
+                subject="global",
+                detail="no directions with persistent quality grader failures in recent cycles",
+            )
+        )
+
+    return results
+
+
+@register_check(
+    "operator_inbox_needs_action_liveness",
+    "Sample open operator-visible ProjectMessage rows per project and flag any "
+    "project where the open operator-visible set contains messages that "
+    "derive_needs_action() marks non-actionable — internal chatter leaking into "
+    "the operator inbox.",
+)
+async def check_operator_inbox_needs_action_liveness(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: every open, operator-visible ProjectMessage should have
+    ``derive_needs_action() == True``.  A message that is open and operator-visible
+    but not genuinely needs-action is internal chatter reaching the operator
+    inbox — the ``size-cap / salvage / dedup / lifecycle`` notices the direction's
+    success evidence says must reach zero.
+
+    self_reported = total open operator-visible count per project.
+    ground_truth  = subset where ``derive_needs_action()`` is True.
+    delta         = non-actionable messages leaking into the operator inbox.
+
+    Bounded to ``max_projects`` projects; within each, at most ``sample_limit``
+    open operator-visible rows.  Returns SKIPPED when a project has no open
+    operator-visible messages.  Pure recompute — never writes to ProjectMessage.
+    """
+    from app.message_audience import operator_visible_audience_filter
+    from app.message_convergence import OPEN_STATUS, derive_needs_action
+    from app.models import Project, ProjectMessage
+
+    project_ids = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not project_ids:
+        return [
+            CheckResult(
+                check="operator_inbox_needs_action_liveness",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in project_ids:
+        pid = str(project_id)
+        messages = (
+            await ctx.session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type != "user",
+                    operator_visible_audience_filter(ProjectMessage.context),
+                )
+                .order_by(ProjectMessage.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        if not messages:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open operator-visible messages",
+                )
+            )
+            continue
+
+        total = len(messages)
+        actionable = sum(1 for m in messages if derive_needs_action(m))
+        non_actionable = total - actionable
+
+        if non_actionable > 0:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total,
+                    ground_truth=actionable,
+                    delta=non_actionable,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{non_actionable}/{total} open operator-visible "
+                        "message(s) are not genuinely needs-action "
+                        "(internal chatter in operator inbox)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="operator_inbox_needs_action_liveness",
+                    status=CheckStatus.OK,
+                    self_reported=total,
+                    ground_truth=total,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"all {total} open operator-visible message(s) are "
+                        "genuinely needs-action"
+                    ),
+                )
+            )
+
+    return results
+
+
+@register_check(
+    "encrypted_field_plaintext_detector",
+    "Sample encrypted-at-rest columns and flag rows still in plaintext after "
+    "a stamped-applied encryption backfill migration; SKIPPED when encryption "
+    "is not active",
+)
+async def check_encrypted_field_plaintext_detector(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: when Fernet encryption is active, every non-NULL value in the
+    audited (table, column) pairs should be decryptable.  A value where
+    ``decrypt_field(value) == value`` is still plaintext — the backfill migration
+    may have stamped ``applied`` without actually encrypting (e.g. because the
+    key was absent or misconfigured at migration time).
+
+    Returns a single global SKIPPED when ``is_encryption_active()`` is False —
+    the whole deployment fails closed on write, so there is nothing to detect.
+
+    Audits the same 5 (table, column) pairs as migration 0621
+    (``_BACKFILL_TARGETS``), bounded to ``ctx.sample_limit`` rows per pair.
+    Returns one ``CheckResult`` per (table, column) with ``subject`` set to
+    ``"<table>.<column>"``.
+    """
+    from app.field_encryption import decrypt_field, is_encryption_active
+    from app.models import MaxPlanAccount, NotificationDeadLetter, UserIntegration
+
+    if not is_encryption_active():
+        return [
+            CheckResult(
+                check="encrypted_field_plaintext_detector",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail=(
+                    "encryption not active — cannot detect plaintext in "
+                    "encrypted columns"
+                ),
+            )
+        ]
+
+    # (model_class, column_attr, subject_label, skip_empty_strings)
+    targets = [
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.oauth_token,
+            "maxplanaccount.oauth_token",
+            False,
+        ),
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.claude_config_json,
+            "maxplanaccount.claude_config_json",
+            False,
+        ),
+        (
+            MaxPlanAccount,
+            MaxPlanAccount.secret_blob_ref,
+            "maxplanaccount.secret_blob_ref",
+            False,
+        ),
+        (
+            NotificationDeadLetter,
+            NotificationDeadLetter.webhook_url,
+            "notification_dead_letter.webhook_url",
+            True,
+        ),
+        (
+            UserIntegration,
+            UserIntegration.github_pat,
+            "userintegration.github_pat",
+            False,
+        ),
+    ]
+
+    results: List[CheckResult] = []
+    for model_class, column_attr, label, skip_empty in targets:
+        col_name = column_attr.key
+        try:
+            stmt = select(model_class).where(column_attr.isnot(None))
+            if skip_empty:
+                stmt = stmt.where(column_attr != "")
+            stmt = stmt.limit(ctx.sample_limit)
+            rows = (await ctx.session.execute(stmt)).scalars().all()
+
+            plaintext_count = 0
+            for row in rows:
+                value = getattr(row, col_name)
+                if value and decrypt_field(value) == value:
+                    plaintext_count += 1
+
+            sampled = len(rows)
+            if plaintext_count:
+                results.append(
+                    CheckResult(
+                        check="encrypted_field_plaintext_detector",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=sampled,
+                        ground_truth=sampled - plaintext_count,
+                        delta=plaintext_count,
+                        severity="warn",
+                        subject=label,
+                        detail=(
+                            f"{plaintext_count}/{sampled} sampled {label} "
+                            "value(s) are still plaintext after encryption "
+                            "backfill"
+                        ),
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        check="encrypted_field_plaintext_detector",
+                        status=CheckStatus.OK,
+                        self_reported=sampled,
+                        ground_truth=sampled,
+                        delta=0,
+                        subject=label,
+                        detail=(
+                            f"all {sampled} sampled {label} value(s) "
+                            "are encrypted"
+                        ),
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — per-column isolation is intentional
+            logger.warning(
+                "[METRICS_INTEGRITY] encrypted_field_plaintext_detector "
+                "failed for %s: %s",
+                label,
+                exc,
+            )
+            results.append(
+                CheckResult(
+                    check="encrypted_field_plaintext_detector",
+                    status=CheckStatus.ERROR,
+                    severity="error",
+                    subject=label,
+                    detail=str(exc)[:200],
+                )
+            )
+
+    return results

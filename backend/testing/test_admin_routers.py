@@ -39,6 +39,8 @@ from app.models import (
     TaskWakeRegistration,
     Alert,
     ProjectMessage,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     MessagesLastSeen,
     MessagesNoisePrefs,
@@ -114,7 +116,7 @@ def _assert_message_event_payload(
     assert payload["message"]["status"] == status
     if excerpt is not None:
         assert payload["message"]["excerpt"] == excerpt
-    assert len(json.dumps(payload, default=str).encode("utf-8")) < 800
+    assert len(json.dumps(payload, default=str).encode("utf-8")) < 16_384
 
 
 async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project", role="owner"):
@@ -1041,6 +1043,151 @@ class TestGetProject:
         assert "proof_records" not in caps[1]
 
 
+class TestCapabilityProofExemption:
+    """Operator grant/revoke of the capability-proof exemption carve-out."""
+
+    async def _make_proof_project(self, db_session, role="owner"):
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Exempt Test", role=role)
+        project.problem_model = {
+            "capabilities": [
+                {"name": "Frontend Visual Verification", "status": "working"},
+                {"name": "Some Planned Cap", "status": "planned"},
+            ]
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+        return project
+
+    @pytest.mark.asyncio
+    async def test_grant_writes_authorized_exemption_record(
+        self, client: AsyncClient, db_session
+    ):
+        """Grant appends an operator-attributed exemption to the platform ledger
+        and it is recognized by platform_exempt_capability_names."""
+        from app.capability_registry import (
+            CAPABILITY_EXEMPTION_PROOF_KIND,
+            platform_exempt_capability_names,
+        )
+
+        project = await self._make_proof_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={
+                "capability_name": "Frontend Visual Verification",
+                "reason": "cannot be machine-verified",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "granted"
+        assert data["capability_name"] == "frontend-visual-verification"
+        assert data["already_exempt"] is False
+        assert "frontend-visual-verification" in data["exempt_capabilities"]
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        entry = records["frontend-visual-verification"][0]
+        assert entry["proof_kind"] == CAPABILITY_EXEMPTION_PROOF_KIND
+        assert entry["authorized_by"] == "test@example.com"
+        assert entry["proof_ref"] == "cannot be machine-verified"
+        assert "frontend-visual-verification" in platform_exempt_capability_names(
+            records
+        )
+
+    @pytest.mark.asyncio
+    async def test_grant_is_idempotent(self, client: AsyncClient, db_session):
+        """A second grant for the same capability does not append a duplicate."""
+        project = await self._make_proof_project(db_session)
+        url = f"/api/admin/projects/{project.id}/capability-exemptions"
+        body = {"capability_name": "Frontend Visual Verification"}
+
+        r1 = await client.post(url, json=body)
+        assert r1.status_code == 200
+        r2 = await client.post(url, json=body)
+        assert r2.status_code == 200
+        assert r2.json()["already_exempt"] is True
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        assert len(records["frontend-visual-verification"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_revoke_removes_exemption_record(
+        self, client: AsyncClient, db_session
+    ):
+        """Revoke removes the operator-exemption record for the named capability."""
+        from app.capability_registry import platform_exempt_capability_names
+
+        project = await self._make_proof_project(db_session)
+        url = f"/api/admin/projects/{project.id}/capability-exemptions"
+        await client.post(url, json={"capability_name": "Frontend Visual Verification"})
+
+        resp = await client.delete(f"{url}/frontend-visual-verification")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["status"] == "revoked"
+        assert data["removed"] == 1
+        assert data["exempt_capabilities"] == []
+
+        await db_session.refresh(project)
+        records = project.capability_proof_records or {}
+        assert "frontend-visual-verification" not in platform_exempt_capability_names(
+            records
+        )
+
+    @pytest.mark.asyncio
+    async def test_revoke_absent_exemption_is_noop(
+        self, client: AsyncClient, db_session
+    ):
+        """Revoking a capability with no exemption returns removed=0, not an error."""
+        project = await self._make_proof_project(db_session)
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/capability-exemptions/frontend-visual-verification"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["removed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_grant_unknown_capability_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A name that is not a declared 'working' capability is rejected 404."""
+        project = await self._make_proof_project(db_session)
+        # 'Some Planned Cap' exists but is status=planned, not working.
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "Some Planned Cap"},
+        )
+        assert resp.status_code == 404
+        resp2 = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "does-not-exist"},
+        )
+        assert resp2.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_grant_requires_owner_role(self, client: AsyncClient, db_session):
+        """A member (below owner) cannot grant an exemption — 403."""
+        project = await self._make_proof_project(db_session, role="member")
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/capability-exemptions",
+            json={"capability_name": "Frontend Visual Verification"},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_revoke_requires_owner_role(self, client: AsyncClient, db_session):
+        """A member (below owner) cannot revoke an exemption — 403."""
+        project = await self._make_proof_project(db_session, role="member")
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/capability-exemptions/frontend-visual-verification"
+        )
+        assert resp.status_code == 403
+
+
 class TestGetProjectSummary:
     @pytest.mark.asyncio
     async def test_summary_excludes_design_doc_and_self_reflection_log(
@@ -1952,6 +2099,30 @@ class TestApplyOperatorBuildConfigOverrides:
         merged = apply_operator_build_config_overrides(detected, {})
         assert merged == {"language": "rust", "directories": []}
 
+    def test_preserves_project_verification_by_normalized_directory_path(self):
+        from app.build_config_detection import apply_operator_build_config_overrides
+
+        detected = {
+            "directories": [{"path": "backend", "type": "python"}],
+        }
+        existing = {
+            "directories": [{
+                "path": " ./backend/// ",
+                "type": "python",
+                "project_verification": {
+                    "protocol": "blueprint-v1",
+                    "harness": "scripts/test-backend.sh",
+                },
+            }],
+        }
+
+        merged = apply_operator_build_config_overrides(detected, existing)
+
+        assert merged["directories"][0]["project_verification"] == {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        }
+
 
 class TestBuildConfigLintWarnings:
     """Operator-visible warnings when build_config.directories[*].lint_cmd
@@ -2072,6 +2243,66 @@ class TestBuildConfigLintWarnings:
         assert isinstance(warnings, list)
         assert len(warnings) == 1
         assert "./a" in warnings[0]
+
+
+class TestPatchBuildConfigProjectVerification:
+    @pytest.mark.asyncio
+    async def test_patch_persists_canonical_project_verification(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-project-verification")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [{
+                        "path": " backend/// ",
+                        "type": "python",
+                        "lint_cmd": "ruff check .",
+                        "test_cmd": "pytest",
+                        "project_verification": {
+                            "protocol": "blueprint-v1",
+                            "harness": "scripts/test-backend.sh",
+                        },
+                    }],
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        directory = resp.json()["build_config"]["directories"][0]
+        assert directory["path"] == "backend"
+        assert directory["project_verification"] == {
+            "protocol": "blueprint-v1",
+            "harness": "scripts/test-backend.sh",
+        }
+        await db_session.refresh(project)
+        assert project.build_config["directories"][0] == directory
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_noncanonical_verification_harness(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="patch-invalid-verification")
+
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "build_config": {
+                    "directories": [{
+                        "path": "backend",
+                        "type": "python",
+                        "project_verification": {
+                            "protocol": "blueprint-v1",
+                            "harness": "scripts/test backend.sh",
+                        },
+                    }],
+                },
+            },
+        )
+
+        assert resp.status_code == 400
 
 
 class TestPatchBuildConfigRequiresCiChecks:
@@ -2904,6 +3135,53 @@ class TestPurgeArchive:
         assert gone is None
 
     @pytest.mark.asyncio
+    async def test_purge_deletes_payloadless_and_agent_executed_resident_archive(
+        self, client: AsyncClient, db_session
+    ):
+        # Since #be905b401 made strategic_resident_turn agent-executed,
+        # BACKEND_MANAGED_TASK_TYPES is empty, so the archive-purge no longer
+        # special-cases resident-turn shadow rows — both archived tasks are
+        # purged. The durable Resident control-plane state (checkpoints /
+        # operation receipts) is preserved by its own FKs, independent of the
+        # ephemeral turn task, so purging the archived turn row is safe.
+        # NOTE: with no backend-managed task types currently defined, the purge's
+        # "keep backend-managed" branch is presently vacuous — follow-up: prune
+        # it or reintroduce a backend-managed type to re-cover it.
+        project = await _make_project(db_session)
+        payloadless = Task(
+            project_id=project.id,
+            title="legacy parent",
+            payloads=[],
+            archived=True,
+            status=TaskStatus.COMPLETED,
+        )
+        shadow = Task(
+            project_id=project.id,
+            title="Resident shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            archived=True,
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(payloadless)
+        db_session.add(shadow)
+        await db_session.commit()
+
+        response = await client.post("/api/admin/tasks/purge-archive", json={})
+        assert response.status_code == 200
+        assert response.json()["deleted_count"] == 2
+        remaining_ids = set(
+            (
+                await db_session.execute(
+                    select(Task.id).where(Task.id.in_([payloadless.id, shadow.id]))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert payloadless.id not in remaining_ids
+        assert shadow.id not in remaining_ids
+
+    @pytest.mark.asyncio
     async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
         """older_than_days skips recently archived tasks."""
         from testing.factories import make_task
@@ -3344,6 +3622,42 @@ class TestAutonomousMode:
 
         await db_session.refresh(project)
         assert project.paused is False
+
+    @pytest.mark.asyncio
+    async def test_project_pause_syncs_resident_policy_and_restores_deadline(
+        self, client: AsyncClient, db_session
+    ):
+        from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+        project = await _make_project(db_session)
+        resident = await initialize_strategic_resident(
+            db_session,
+            project.id,
+            locked_project=project,
+        )
+        deadline = _utcnow() + timedelta(hours=2)
+        resident.scheduling_state = {"deadline_at": deadline.isoformat()}
+        resident.next_wakeup_at = deadline
+        db_session.add(resident)
+        await db_session.commit()
+
+        paused = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": True},
+        )
+        assert paused.status_code == 200
+        await db_session.refresh(resident)
+        assert resident.background_policy == "paused"
+        assert resident.next_wakeup_at is None
+
+        resumed = await client.patch(
+            f"/api/admin/projects/{project.id}/pause",
+            json={"paused": False},
+        )
+        assert resumed.status_code == 200
+        await db_session.refresh(resident)
+        assert resident.background_policy == "active"
+        assert resident.next_wakeup_at == deadline
 
     @pytest.mark.asyncio
     async def test_pause_project_missing_field_returns_400(
@@ -4472,6 +4786,69 @@ class TestMessages:
         assert data["total"] == 0
 
     @pytest.mark.asyncio
+    async def test_list_messages_excludes_strategist_internal_audience(
+        self, client: AsyncClient, db_session
+    ):
+        """Ledger read path filters out strategist-internal-tagged rows.
+
+        post_event_message tags routine/unregistered NOTEs with a
+        strategist-internal audience (bookkeeping the strategist may want) but
+        those must never surface on the operator's Messages panel. Rows tagged
+        with an operator audience — and legacy rows with no audience key — stay
+        visible.
+        """
+        project = await _make_project(db_session)
+        # Strategist-internal bookkeeping row — must be hidden from the operator.
+        hidden = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="strategist bookkeeping",
+            status="open",
+            context={"event_type": "pr_merged", "audience": "strategist-internal"},
+        )
+        # Operator-visible row — must be returned.
+        # NOTE: the event_type is deliberately a NON-high-signal operator-fyi
+        # event. On Postgres the ``projectmessage_0567_compat_insert`` BEFORE-INSERT
+        # trigger (migration 0567/0608) routes any system NOTE whose event_type is
+        # high-signal (e.g. ``failure_alert``) onto the CONVERSATION surface, so it
+        # would never appear on the ACTIVITY messages list this endpoint queries —
+        # a surface concern orthogonal to the audience filter under test here.
+        # ``operator_command`` is operator-fyi but not high-signal, so it stays on
+        # the ACTIVITY surface and correctly exercises the audience gate.
+        visible = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="operator fyi",
+            status="open",
+            context={"event_type": "operator_command", "audience": "operator-fyi"},
+        )
+        # Legacy row with no audience key — must remain visible (backward compat).
+        legacy = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="legacy untagged note",
+            status="open",
+            context={"event_type": "some_old_event"},
+        )
+        db_session.add_all([hidden, visible, legacy])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=all"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        contents = {m["content"] for m in data["messages"]}
+        assert "operator fyi" in contents
+        assert "legacy untagged note" in contents
+        assert "strategist bookkeeping" not in contents
+        # total count must also exclude the hidden strategist-internal row.
+        assert data["total"] == 2
+
+    @pytest.mark.asyncio
     async def test_create_message(self, client: AsyncClient, db_session):
         """User can post a message to a project they belong to."""
         project = await _make_project(db_session)
@@ -4900,6 +5277,28 @@ class TestMessages:
             .all()
         )
         assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_create_message_context_limit_counts_utf8_bytes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        context = {"operator_note": "🙂" * 13_000}
+        assert len(json.dumps(context, ensure_ascii=False)) < 50_000
+        assert len(json.dumps(context, ensure_ascii=False).encode("utf-8")) > 50_000
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Reject a multibyte context over the byte budget.",
+                "context": context,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "Context too large" in resp.json()["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_create_message_empty_content_returns_400(
@@ -5427,6 +5826,9 @@ class TestMessages:
         assert first.json()["status"] == "created"
         assert second.json()["status"] == "duplicate"
         assert first.json()["id"] == second.json()["id"]
+        assert first.json()["wakeup_state"] == second.json()["wakeup_state"]
+        assert "_message_request_fingerprint" not in first.json()["message"]["context"]
+        assert "_message_request_fingerprint" not in second.json()["message"]["context"]
 
         rows = (
             (
@@ -5442,6 +5844,7 @@ class TestMessages:
         assert len(rows) == 1
         assert str(rows[0].id) == first.json()["id"]
         assert rows[0].idempotency_key == key
+        assert (rows[0].context or {}).get("_message_request_fingerprint")
 
     @pytest.mark.asyncio
     async def test_idempotent_duplicate_arming_coalesces(
@@ -5604,15 +6007,15 @@ class TestMessages:
         assert rows[0].context.get("user_event_type") == "pr_merged"
 
     @pytest.mark.asyncio
-    async def test_idempotent_concurrent_insert_recovers_to_200(
+    async def test_idempotent_concurrent_insert_rejects_mismatched_winner(
         self, client: AsyncClient, db_session
     ):
         """TOCTOU: a competitor commits the same-key row AFTER this request's
         idempotency pre-check passed but BEFORE its own commit, so the INSERT
         trips ux_projectmessage_project_idempotency_key. The handler must
-        recover — roll back, re-select the winner, and return the idempotent 200 pointing at
-        the already-committed row — instead of surfacing the IntegrityError as
-        a 500.
+        recover by re-selecting the winner, then reject it because its actor and
+        request fingerprint do not match this request. A reused key must never
+        silently adopt an unrelated committed message.
 
         Patch AsyncSession.commit to inject a winning row just before the route
         commits its pending message, exactly modelling an in-flight duplicate.
@@ -5629,6 +6032,24 @@ class TestMessages:
             # Stand in for a concurrent request that won the race: persist the
             # same-key row in a separate transaction so this request's pending
             # INSERT violates the unique index on commit.
+            #
+            # The winner must be an OUT-OF-BAND, non-conversation row: at this
+            # point the route already holds the exclusive projectmessagesequence
+            # row lock (lock_project_and_next_message_sequence, taken before the
+            # message INSERT). A conversation winner would trip the 0608
+            # compat-insert trigger's sequence-allocator upsert (should_project
+            # -> INSERT ... ON CONFLICT on projectmessagesequence) and block on
+            # that held lock while this request synchronously awaits the winner's
+            # commit — an asyncio/DB deadlock Postgres cannot detect (one side is
+            # a Python await, not a DB lock wait). from_type="system" keeps
+            # should_project False (see trigger), so the winner does NOT touch the
+            # sequence allocator; it still shares (project_id, idempotency_key) so
+            # the request's INSERT trips ux_projectmessage_project_idempotency_key.
+            # This is exactly the raw/legacy same-key insert the recovery path
+            # (re-select winner, 409 on mismatched actor/fingerprint) defends
+            # against — a same-key row that never went through the advisory-locked
+            # operator path. (On SQLite FOR UPDATE is a no-op, which is why the
+            # original conversation winner only "passed" there.)
             if not injected["done"] and any(
                 isinstance(obj, ProjectMessage) and obj.idempotency_key == key
                 for obj in session.new
@@ -5639,7 +6060,7 @@ class TestMessages:
                         ProjectMessage(
                             project_id=project.id,
                             message_type=MessageType.NOTE,
-                            from_type="user",
+                            from_type="system",
                             content="winner of the race",
                             context={"user_event_type": "pr_merged"},
                             idempotency_key=key,
@@ -5664,9 +6085,7 @@ class TestMessages:
                 },
             )
 
-        # Recovered to an idempotent 200, not a 500.
-        assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "duplicate"
+        assert resp.status_code == 409, resp.text
 
         # Exactly one row survived, and the response points at the winner.
         rows = (
@@ -5683,7 +6102,6 @@ class TestMessages:
         )
         assert len(rows) == 1
         assert rows[0].content == "winner of the race"
-        assert resp.json()["id"] == str(rows[0].id)
 
     @pytest.mark.asyncio
     async def test_resolve_message(self, client: AsyncClient, db_session):
@@ -5750,6 +6168,10 @@ class TestMessages:
             status="resolved",
             excerpt="Close me everywhere.",
         )
+        canonical = broadcast.await_args.args[2]["message"]
+        assert canonical["handling_state"] == "responded"
+        assert canonical["resolution"] == "Done."
+        assert canonical["updated_at"]
 
     @pytest.mark.asyncio
     async def test_resolve_linked_message(self, client: AsyncClient, db_session):
@@ -5929,6 +6351,45 @@ class TestMessages:
             assert body["message"]["resolution"] == msg.resolution
 
     @pytest.mark.asyncio
+    async def test_resolve_reconciles_legacy_resolved_question_missing_reply(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            sequence=1,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Which path?",
+            status="resolved",
+            resolution="Take path A.",
+            resolved_at=_utcnow(),
+        )
+        db_session.add(question)
+        await db_session.commit()
+
+        first = await client.patch(f"/api/admin/messages/{question.id}", json={})
+        second = await client.patch(f"/api/admin/messages/{question.id}", json={})
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["reply_message_id"] == second.json()["reply_message_id"]
+        assert first.json()["wakeup_state"] == second.json()["wakeup_state"]
+        replies = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.reply_to_message_id == question.id
+                )
+            )
+        ).scalars().all()
+        assert len(replies) == 1
+        assert replies[0].content == "Take path A."
+        assert (
+            replies[0].context["_resident_wakeup_state"]
+            == first.json()["wakeup_state"]
+        )
+
+    @pytest.mark.asyncio
     async def test_resolve_message_retried_request_is_safe(
         self, client: AsyncClient, db_session
     ):
@@ -5994,6 +6455,7 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "resolved"
         assert body["arming"] == "steering"
+        assert body["wakeup_state"] == "queued"
         assert body["message"]["id"] == str(question.id)
         assert body["message"]["status"] == "resolved"
         assert body["message"]["resolution"] == "Do X instead."
@@ -6034,7 +6496,6 @@ class TestMessages:
         a question_answer NOTE linked back to it so the strategist sees it answered.
         """
         from sqlmodel import select
-        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 
         project = await _make_project(db_session)
         question = ProjectMessage(
@@ -6120,48 +6581,12 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Use approach A."
-        session = note.context.get("strategic_session")
-        assert session["interaction_mode"] == "continuous"
-        assert session["context_package_id"] == "strategic-context:test"
-        assert session["selected_ref_descriptors"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-                "summary": "Decision notes from the current review.",
-                "target": {
-                    "surface": "project",
-                    "section": "problem-model",
-                    "document_id": "kdoc-1",
-                },
-            }
-        ]
-        assert session["context_package_descriptor"] == {
-            "kind": "context_package",
-            "id": "strategic-context:test",
-            "label": "Current session context",
-            "target": {
-                "surface": "project",
-                "section": "problem-model",
-            },
-        }
-        assert session["selected_refs"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-            }
-        ]
+        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
+        assert "strategic_session" not in note.context
         assert body["reply_message_id"] == str(note.id)
         assert body["reply_message"]["id"] == str(note.id)
         assert body["reply_message"]["message_type"] == "NOTE"
-        assert body["reply_message"]["context"]["strategic_session"]["selected_refs"] == [
-            {
-                "kind": "knowledge_document",
-                "id": "knowledge:kdoc-1",
-                "label": "Operator notes",
-            }
-        ]
+        assert "strategic_session" not in body["reply_message"]["context"]
         prefs_row = (
             await db_session.execute(
                 select(MessagesNoisePrefs).where(
@@ -6181,10 +6606,6 @@ class TestMessages:
             }
         ]
         assert "context_package_id" not in stored_workbench
-        await db_session.refresh(project)
-        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
-        assert marker["operator_user_id"] == TEST_USER_ID
-        assert marker["active"] is True
         assert broadcast.await_count == 2
         events = [
             (call.args[1], call.args[2])
@@ -6209,15 +6630,14 @@ class TestMessages:
             message_type="NOTE",
             from_type="user",
             action="created",
-            excerpt="Answer: Use approach A.",
+            excerpt="Use approach A.",
         )
 
     @pytest.mark.asyncio
-    async def test_operator_question_answer_survives_arming_rollback(
+    async def test_operator_question_answer_rolls_back_atomically_when_arming_rolls_back(
         self, client: AsyncClient, db_session
     ):
-        """A contended Strategic wake must not erase a committed operator answer."""
-        from app.strategic_trigger import strategic_refresh_pending
+        """A poisoned wake transaction leaves no partial answer and is retryable."""
 
         project = await _make_project(db_session)
         question = ProjectMessage(
@@ -6244,17 +6664,11 @@ class TestMessages:
                 json={"resolution": "Take the simpler path."},
             )
 
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "resolved"
-        assert body["arming"] == "not_armed"
-        assert isinstance(body["reply_message_id"], str)
-        assert body["message"]["id"] == str(question.id)
-        assert body["message"]["status"] == "resolved"
-        assert body["message"]["resolution"] == "Take the simpler path."
+        assert resp.status_code == 503, resp.text
 
         await db_session.refresh(question)
-        assert question.status == "resolved"
+        assert question.status == "open"
+        assert question.resolution is None
         notes = (
             await db_session.execute(
                 select(ProjectMessage).where(
@@ -6264,17 +6678,18 @@ class TestMessages:
                 )
             )
         ).scalars().all()
-        assert len(notes) == 1
-        assert notes[0].context.get("event_type") == "question_answer"
-        assert notes[0].context.get("answer") == "Take the simpler path."
-        assert body["reply_message_id"] == str(notes[0].id)
-        assert body["reply_message"]["id"] == str(notes[0].id)
-        assert body["reply_message"]["context"]["event_type"] == "question_answer"
-        vision = await self._reload_vision(db_session, project.id)
-        assert strategic_refresh_pending(vision) is False
+        assert notes == []
+
+        retry = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Take the simpler path."},
+        )
+        assert retry.status_code == 200, retry.text
+        assert retry.json()["status"] == "resolved"
+        assert retry.json()["wakeup_state"] == "queued"
 
     @pytest.mark.asyncio
-    async def test_resolve_feedback_posts_feedback_acknowledgment_note(
+    async def test_resolve_feedback_posts_operator_reply_note(
         self, client: AsyncClient, db_session
     ):
         """Resolving FEEDBACK creates a durable acknowledgment linked to the original."""
@@ -6311,7 +6726,8 @@ class TestMessages:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] == "resolved"
-        assert body["arming"] == "passive_note"
+        assert body["arming"] == "steering"
+        assert body["wakeup_state"] == "queued"
         assert body["message"]["id"] == str(feedback.id)
         assert body["message"]["status"] == "resolved"
         assert body["message"]["resolution"] == "Deploy summary now cites the active release."
@@ -6324,28 +6740,26 @@ class TestMessages:
                 select(ProjectMessage).where(
                     ProjectMessage.project_id == project.id,
                     ProjectMessage.message_type == MessageType.NOTE,
-                    ProjectMessage.from_type == "system",
+                    ProjectMessage.from_type == "user",
                 )
             )
         ).scalars().all()
         assert len(notes) == 1
         note = notes[0]
-        assert note.context.get("event_type") == "feedback_acknowledgment"
+        assert note.actor_user_id == TEST_USER_ID
+        assert note.context.get("event_type") == "feedback_reply"
+        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
         assert note.context.get("reply_to") == str(feedback.id)
         assert (
             note.context.get("resolution")
             == "Deploy summary now cites the active release."
         )
-        session = note.context.get("strategic_session")
-        assert session["interaction_mode"] == "continuous"
-        assert session["active_surface"] == "pipeline"
-        assert session["selected_refs"] == [
-            {"kind": "release", "id": "release:v2", "label": "v2 release"}
-        ]
+        assert "strategic_session" not in note.context
         assert body["reply_message_id"] == str(note.id)
         assert body["reply_message"]["id"] == str(note.id)
         assert body["reply_message"]["message_type"] == "NOTE"
-        assert body["reply_message"]["context"]["event_type"] == "feedback_acknowledgment"
+        assert body["reply_message"]["context"]["event_type"] == "feedback_reply"
+        assert body["reply_message"]["content"] == "Deploy summary now cites the active release."
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
@@ -6453,6 +6867,99 @@ class TestMessages:
 
         resp = await client.get(
             f"/api/admin/messages?project_id={project.id}&status=pending"
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_list_messages_needs_action_scope(
+        self, client: AsyncClient, db_session
+    ):
+        """needs_action scope returns only QUESTION/BLOCKER with non-resolved status."""
+        project = await _make_project(db_session)
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.QUESTION,
+                from_type="user",
+                content="Open question",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Open blocker",
+                status="open",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Resolved blocker",
+                status="resolved",
+            )
+        )
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="user",
+                content="Open note",
+                status="open",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=needs_action"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        returned_types = {m["message_type"] for m in data["messages"]}
+        assert returned_types == {"QUESTION", "BLOCKER"}
+        returned_contents = {m["content"] for m in data["messages"]}
+        assert "Resolved blocker" not in returned_contents
+        assert "Open note" not in returned_contents
+
+    @pytest.mark.asyncio
+    async def test_list_messages_needs_action_linked_included(
+        self, client: AsyncClient, db_session
+    ):
+        """needs_action scope includes BLOCKER in 'linked' status (linked != resolved)."""
+        project = await _make_project(db_session)
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.BLOCKER,
+                from_type="system",
+                content="Linked blocker",
+                status="linked",
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=needs_action"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["messages"][0]["content"] == "Linked blocker"
+        assert data["messages"][0]["status"] == "linked"
+
+    @pytest.mark.asyncio
+    async def test_list_messages_needs_action_invalid_still_rejects(
+        self, client: AsyncClient, db_session
+    ):
+        """Unrecognized status values still return 400 after needs_action was added."""
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages?project_id={project.id}&status=foobar"
         )
         assert resp.status_code == 400
 
@@ -6682,7 +7189,7 @@ class TestMessages:
     async def test_strategic_session_message_persists_workbench_snapshot_and_arms(
         self, client: AsyncClient, db_session
     ):
-        """Strategic-session messages share workbench snapshot and arming behavior."""
+        """Strategic messages persist workbench state without hiding it in chat."""
         project = await _make_project(db_session)
         resp = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/messages",
@@ -6710,25 +7217,15 @@ class TestMessages:
         assert body["arming"] == "steering"
         assert body["message"]["id"] == body["id"]
         assert body["message"]["message_type"] == "FEEDBACK"
-        assert body["message"]["context"]["strategic_session"]["selected_refs"] == [
-            {"kind": "task", "id": "task-1", "label": "Release blocker"}
-        ]
+        assert "strategic_session" not in body["message"]["context"]
 
         msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
         assert msg is not None
         context = msg.context or {}
-        assert context["reply_to"] == "m-1"
-        assert context["user_event_type"] == "operator_supplied"
+        assert "reply_to" not in context
+        assert "user_event_type" not in context
         assert "event_type" not in context
-        session = context["strategic_session"]
-        assert session["interaction_mode"] == "continuous"
-        assert session["active_surface"] == "pipeline"
-        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
-        assert session["context_package_id"] == "strategic-context:test"
-        assert session["selected_refs"] == [
-            {"kind": "task", "id": "task-1", "label": "Release blocker"}
-        ]
-        assert session["captured_at"]
+        assert "strategic_session" not in context
 
         prefs_row = (
             await db_session.execute(
@@ -6757,19 +7254,33 @@ class TestMessages:
         self, client: AsyncClient, db_session
     ):
         """Attachment-only strategic chat turns persist with a small placeholder."""
+        from app.models import ProjectMessageAttachmentUpload
         from app.project_message_projection import project_message_base
 
         project = await _make_project(db_session)
+        attachment_id = uuid.uuid4()
         attachment = {
+            "attachment_id": str(attachment_id),
             "type": "image",
             "mime_type": "image/png",
             "name": "screenshot.png",
             "size_bytes": 4,
-            "url": (
-                "https://storage.googleapis.com/blueprint-agent-artifacts/"
-                "message-attachments/project/att/screenshot.png?X-Goog-Signature=abc"
+            "storage_uri": (
+                "gs://blueprint-agent-artifacts/message-attachments/"
+                f"{project.id}/{attachment_id}/screenshot.png"
             ),
         }
+        db_session.add(ProjectMessageAttachmentUpload(
+            attachment_id=attachment_id,
+            project_id=project.id,
+            actor_user_id=TEST_USER_ID,
+            storage_uri=attachment["storage_uri"],
+            filename="screenshot.png",
+            content_type="image/png",
+            expected_size_bytes=4,
+            expires_at=_utcnow() + timedelta(minutes=15),
+        ))
+        await db_session.commit()
 
         async def _preview(_session, _project_id, _state_response, message):
             return project_message_base(message)
@@ -6815,7 +7326,7 @@ class TestMessages:
                 json={
                     "message_type": "NOTE",
                     "content": "",
-                    "context": {"attachments": [attachment]},
+                    "attachments": [attachment],
                     "idempotency_key": "strategic-session-message-attachment-only-1",
                 },
             )
@@ -6824,12 +7335,22 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "created"
         assert body["message"]["content"] == "Sent attachment."
-        assert body["message"]["context"]["attachments"] == [attachment]
+        assert body["message"]["context"]["attachments"] == [{
+            "attachment_id": str(attachment_id),
+            "type": "image",
+            "mime_type": "image/png",
+            "name": "screenshot.png",
+            "filename": "screenshot.png",
+            "size_bytes": 4,
+        }]
 
         msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
         assert msg is not None
         assert msg.content == "Sent attachment."
-        assert (msg.context or {})["attachments"] == [attachment]
+        assert (msg.context or {})["attachments"] == [{
+            **attachment,
+            "filename": "screenshot.png",
+        }]
 
     @pytest.mark.asyncio
     async def test_create_message_stamps_resident_session_id_when_active(
@@ -6945,6 +7466,64 @@ class TestMessages:
         assert data["feedback"] == 0
 
     @pytest.mark.asyncio
+    async def test_get_message_counts_excludes_internal_rows_from_counts_and_unread(
+        self, client: AsyncClient, db_session
+    ):
+        """Internal high-signal rows cannot inflate the operator badge."""
+        from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+        project = await _make_project(db_session)
+        internal_context = {"audience": "strategist-internal"}
+        for message_type in (
+            MessageType.QUESTION,
+            MessageType.BLOCKER,
+            MessageType.BUG_REPORT,
+            MessageType.FEEDBACK,
+        ):
+            db_session.add(ProjectMessage(
+                project_id=project.id,
+                message_type=message_type,
+                from_type="system",
+                content=f"internal {message_type.value}",
+                status="open",
+                context=internal_context,
+            ))
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="internal high-signal note",
+            status="open",
+            context={
+                "audience": "strategist-internal",
+                "event_type": next(iter(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+            },
+        ))
+        visible_question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="legacy visible question",
+            status="open",
+        )
+        db_session.add(visible_question)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data == {
+            "blocker": 0,
+            "question": 1,
+            "bug_report": 0,
+            "feedback": 0,
+            "high_signal_note": 0,
+            "unread": 1,
+            "needs_operator": 1,
+            "active_alerts": 0,
+        }
+
+    @pytest.mark.asyncio
     async def test_get_message_counts_high_signal_note(self, client: AsyncClient, db_session):
         """NOTE messages with HIGH_SIGNAL_NOTE_EVENT_TYPES event_type are counted in high_signal_note."""
         from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
@@ -6985,6 +7564,51 @@ class TestMessages:
         assert resp.status_code == 200
         data = resp.json()
         assert data["high_signal_note"] == 1, f"expected 1 high_signal_note, got {data['high_signal_note']}"
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_active_alerts(self, client: AsyncClient, db_session):
+        """active_alerts counts undismissed ERROR and WARNING alert rows."""
+        from app.models import Alert, AlertSeverity
+
+        project = await _make_project(db_session)
+
+        # ERROR alert — should be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="test error",
+            message="test error alert",
+        ))
+        # WARNING alert — should be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="test warning",
+            message="test warning alert",
+        ))
+        # Dismissed ERROR alert — should NOT be counted
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="dismissed error",
+            message="dismissed error alert",
+            dismissed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        ))
+        # INFO alert — should NOT be counted (only ERROR and WARNING)
+        db_session.add(Alert(
+            project_id=project.id,
+            severity=AlertSeverity.INFO,
+            title="test info",
+            message="test info alert",
+        ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active_alerts"] == 2, (
+            f"expected 2 active_alerts (ERROR + WARNING), got {data['active_alerts']}"
+        )
 
     @pytest.mark.asyncio
     async def test_get_message_counts_noise_prefs_muted_event_excluded(self, client: AsyncClient, db_session):
@@ -9676,6 +10300,54 @@ class TestNotificationConfigSettings:
             )
 
     @pytest.mark.asyncio
+    async def test_capability_proof_execution_trials_enabled_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """The executed-test earn path defaults on, while its operator kill switch
+        round-trips through PATCH, GET, runtime config, and persisted settings."""
+        from app.models import DeploymentState
+        from app.shared_state import runtime_config as _rc
+
+        original = _rc.get("capability_proof_execution_trials_enabled", True)
+        # The complete discovery -> execution -> ingestion path is active by
+        # default, so pre-existing working capabilities can earn ``proven``.
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["capability_proof_execution_trials_enabled"] is True
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"capability_proof_execution_trials_enabled": False},
+            )
+            assert resp.status_code == 200, resp.text
+
+            body = (await client.get("/api/admin/settings")).json()
+            assert body["capability_proof_execution_trials_enabled"] is False
+            assert _rc.get("capability_proof_execution_trials_enabled") is False
+
+            row = await db_session.get(DeploymentState, 1)
+            assert row is not None
+            assert row.runtime_config_json is not None
+            assert (
+                row.runtime_config_json["capability_proof_execution_trials_enabled"]
+                is False
+            )
+
+            # Non-boolean is rejected.
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"capability_proof_execution_trials_enabled": "yes"},
+            )
+            assert bad.status_code == 400
+        finally:
+            await client.patch(
+                "/api/admin/settings",
+                json={"capability_proof_execution_trials_enabled": bool(original)},
+            )
+
+    @pytest.mark.asyncio
     async def test_promotion_threshold_round_trip(self, client: AsyncClient):
         """promotion_threshold is settable via PATCH, bounded to (0, 1], and
         visible on GET — so calibrating the bar needs no redeploy."""
@@ -10067,6 +10739,105 @@ class TestNotificationConfigSettings:
         finally:
             _app.dependency_overrides.pop(_gcu, None)
             _app.dependency_overrides.pop(_ra, None)
+
+
+class TestCapabilityProofGateCoverageSurface:
+    """GET /api/admin/settings surfaces the live fleet-wide capability-proof
+    coverage ratio the auto-graduation observe/enforce thresholds are compared
+    against, so the operator no longer sets those thresholds blind."""
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_coverage_endpoint_matches_sweep(
+        self, client: AsyncClient, db_session
+    ):
+        """The settings payload's ``capability_proof_gate_coverage`` is exactly
+        what the auto-graduation sweep computes from the same ground truth — the
+        same helper backs both, so the operator sees the number the gate acts on.
+        """
+        from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+        proven_ref = {
+            "kind": "named_test",
+            "ref": "testing/test_x.py::test_x",
+            "proven": True,
+        }
+        # One project, one proven + one unproven non-exempt working cap → 1/2.
+        # Cap A's evidence_refs claim must be corroborated by a platform ledger
+        # entry — compute_fleet_proof_coverage counts only ledger-cleared proofs,
+        # so a self-reported evidence_refs alone grades "unverified", not "proven".
+        db_session.add(
+            Project(
+                name="cov-proj",
+                user_id="u-cov",
+                problem_model={
+                    "capabilities": [
+                        {
+                            "name": "Cap A",
+                            "status": "working",
+                            "evidence_refs": [proven_ref],
+                        },
+                        {
+                            "name": "Cap B",
+                            "status": "working",
+                            "evidence_refs": [],
+                        },
+                    ]
+                },
+                capability_proof_records={
+                    "cap-a": [
+                        {
+                            "proof_kind": "named_test",
+                            "ref": "testing/test_x.py::test_x",
+                            "proved_at": (_utcnow() - timedelta(days=1)).isoformat(),
+                        }
+                    ]
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        payload = resp.json()["capability_proof_gate_coverage"]
+
+        # Endpoint value equals the sweep's own computation (the shared seam),
+        # minus the internal contributing_project_ids list (UUIDs) which the
+        # settings surface intentionally does not expose.
+        full = await compute_fleet_proof_coverage(db_session, 25)
+        expected = {k: v for k, v in full.items() if k != "contributing_project_ids"}
+        assert payload == expected
+        assert "contributing_project_ids" not in payload
+
+        # And it reflects the fleet we built: 1 proven of 2 non-exempt → 0.5.
+        assert payload["total_proven"] == 1
+        assert payload["total_non_exempt_working"] == 2
+        assert payload["coverage_ratio"] == 0.5
+        assert payload["projects_contributing"] == 1
+
+    @pytest.mark.asyncio
+    async def test_capability_proof_coverage_null_when_no_non_exempt(
+        self, client: AsyncClient, db_session
+    ):
+        """With no non-exempt working capabilities the ratio is undefined and the
+        endpoint reports ``coverage_ratio: null`` (not a divide-by-zero / 0.0)."""
+        db_session.add(
+            Project(
+                name="planned-only",
+                user_id="u-planned",
+                problem_model={
+                    "capabilities": [
+                        {"name": "Planned", "status": "planned", "evidence_refs": []},
+                    ]
+                },
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/settings")
+        assert resp.status_code == 200
+        payload = resp.json()["capability_proof_gate_coverage"]
+        assert payload["coverage_ratio"] is None
+        assert payload["total_non_exempt_working"] == 0
 
 
 class TestEvergreenFillSettingsPersist:
@@ -19948,6 +20719,58 @@ class TestRequeueClearsBlockerMetadata:
         # Clean attempt: counter reset like any leaf requeue.
         assert task.attempt_count == 0
 
+    @pytest.mark.asyncio
+    async def test_requeue_preserves_capability_execution_requirement(self, db_session):
+        """Generic manual/bulk retry strips ordinary blocker metadata but must NOT
+        strip the durable capability-execution requirement — otherwise a retry
+        would bypass the execution-authority fence and let the task run without
+        current platform proof. The requirement survives the fresh attempt so the
+        fence re-blocks it at the next dispatch/claim."""
+        from fastapi import BackgroundTasks
+
+        from app.admin_task_mutations import modify_task_apply
+        from app.capability_execution_fence import (
+            CAPABILITY_EXECUTION_REQUIREMENTS_KEY,
+            block_task_for_capability_proof,
+        )
+        from app.task_blocked import BLOCKER_CONTEXT_KEY
+
+        project = await _make_project(db_session)
+        cap_need = {"kind": "capability", "ref": "forged-cap"}
+        task = Task(
+            project_id=project.id,
+            title="Fence-blocked then requeued",
+            payloads=[{"type": "create", "prompt": "x"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-old",
+            context={CAPABILITY_EXECUTION_REQUIREMENTS_KEY: [cap_need]},
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        # The fence parks it BLOCKED with the capability need.
+        block_task_for_capability_proof(task, [cap_need], source="cold dispatch")
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.BLOCKED
+
+        await modify_task_apply(
+            task,
+            {"status": TaskStatus.QUEUED.value},
+            BackgroundTasks(),
+            db_session,
+        )
+        await db_session.refresh(task)
+
+        # Ordinary blocker metadata cleared, but the durable requirement survives.
+        assert task.status == TaskStatus.QUEUED
+        assert BLOCKER_CONTEXT_KEY not in (task.context or {})
+        assert (task.context or {}).get(CAPABILITY_EXECUTION_REQUIREMENTS_KEY) == [
+            cap_need
+        ]
+
 
 class TestManualRequeueGuidance:
     @pytest.mark.asyncio
@@ -20194,6 +21017,134 @@ class TestRequeueStuckTask:
         assert task.last_heartbeat is None
         assert task.attempt_count == 0
         mock_delete_vm.assert_awaited_once_with("stuck-vm-abc123", reason="admin_requeue")
+
+
+class TestTriggerForcePromote:
+    """Router-level coverage for the PLAIN force-promote lever
+    (``POST /projects/{id}/promote/force``): the operator's ``reason`` +
+    ``candidate_sha`` must be threaded through to
+    ``force_promote_current_version`` (which persists ``forced_promote_reason``
+    on the audit trail), and no-op statuses must map to the right HTTP codes.
+    """
+
+    @pytest.mark.asyncio
+    async def test_reason_threaded_to_force_promote(self, db_session, mocker):
+        """The operator justification + explicit candidate_sha are plumbed into
+        force_promote_current_version alongside the acting user as ``actor``."""
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+
+        force = mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "promoted"}),
+        )
+
+        body = _ForcePromoteRequest(
+            candidate_sha="cafef00d" * 5,
+            reason="prod gate false-block — machinery-only fix",
+        )
+        result = await trigger_force_promote(
+            project.id,
+            body=body,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result == {"status": "promoted"}
+        force.assert_awaited_once()
+        kwargs = force.await_args.kwargs
+        assert kwargs["candidate_sha"] == "cafef00d" * 5
+        assert kwargs["reason"] == "prod gate false-block — machinery-only fix"
+        # The audit trail must attribute the force-promote to the acting operator.
+        assert kwargs["actor"] == TEST_USER_ID
+
+    @pytest.mark.asyncio
+    async def test_missing_body_threads_none_reason(self, db_session, mocker):
+        """With no request body the lever still fires, threading reason=None and
+        candidate_sha=None (default: current integration HEAD) — the reason key
+        is always present on the trail, never silently dropped."""
+        from app.routers.admin_operator_triggers import trigger_force_promote
+
+        project = await _make_project(db_session)
+
+        force = mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "promoted"}),
+        )
+
+        result = await trigger_force_promote(
+            project.id,
+            body=None,
+            session=db_session,
+            current_user={"user_id": TEST_USER_ID},
+        )
+
+        assert result == {"status": "promoted"}
+        force.assert_awaited_once()
+        kwargs = force.await_args.kwargs
+        assert kwargs["reason"] is None
+        assert kwargs["candidate_sha"] is None
+        assert kwargs["actor"] == TEST_USER_ID
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_maps_to_404(self, db_session, mocker):
+        """A ``no_open_version`` result surfaces as HTTP 404, not a silent pass."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+        mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(return_value={"status": "no_open_version"}),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_force_promote(
+                project.id,
+                body=_ForcePromoteRequest(reason="x"),
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_promotion_in_flight_maps_to_409(self, db_session, mocker):
+        """A ``promotion_in_flight`` guard result surfaces as HTTP 409 with the
+        blocking PR number embedded in the detail."""
+        from fastapi import HTTPException
+        from app.routers.admin_operator_triggers import (
+            trigger_force_promote,
+            _ForcePromoteRequest,
+        )
+
+        project = await _make_project(db_session)
+        mocker.patch(
+            "app.release_qualifier.force_promote_current_version",
+            new=AsyncMock(
+                return_value={
+                    "status": "promotion_in_flight",
+                    "promotion_pr_number": 4242,
+                }
+            ),
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await trigger_force_promote(
+                project.id,
+                body=_ForcePromoteRequest(reason="x"),
+                session=db_session,
+                current_user={"user_id": TEST_USER_ID},
+            )
+        assert exc_info.value.status_code == 409
+        assert "4242" in exc_info.value.detail
+
 
 
 class TestHotfixScopePreview:
@@ -22198,6 +23149,93 @@ async def test_agent_create_message_idempotency_dedupes(
     ).scalars().all()
     assert len(rows) == 1, f"Expected 1 message row, got {len(rows)}"
     assert rows[0].idempotency_key == "agent-idem-test-key-abc123"
+
+    changed = {
+        **body,
+        "data": {**body["data"], "content": "Different content with the same key."},
+    }
+    collision = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=changed,
+    )
+    assert collision.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_agent_create_message_separates_routine_activity_and_promotes_reply(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project = Project(name="Agent Message Projection", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-agent-msg-projection",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    question = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What did you decide?",
+    )
+    db_session.add_all([task, question])
+    await db_session.commit()
+    token = create_agent_token(
+        str(task.id),
+        "vm-agent-msg-projection",
+        task_type="strategic_review",
+    )
+
+    routine = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "PR merged.",
+                "context": {"event_type": "pr_merged"},
+                "idempotency_key": "agent-routine-1",
+            },
+        },
+    )
+    assert routine.status_code == 200, routine.text
+    routine_row = await db_session.get(
+        ProjectMessage, uuid.UUID(routine.json()["message_id"])
+    )
+    assert routine_row.surface == MessageSurface.ACTIVITY
+    assert isinstance(routine_row.sequence, int)
+    assert routine_row.sequence > 0
+
+    reply = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "I chose the safer rollout.",
+                "context": {"reply_to": str(question.id)},
+                "idempotency_key": "agent-reply-1",
+            },
+        },
+    )
+    assert reply.status_code == 200, reply.text
+    reply_row = await db_session.get(ProjectMessage, uuid.UUID(reply.json()["message_id"]))
+    assert reply_row.surface == MessageSurface.CONVERSATION
+    assert reply_row.reply_to_message_id == question.id
+    await db_session.refresh(question)
+    assert question.handling_state == MessageHandlingState.RESPONDED
+    assert question.handled_by_task_id == task.id
 
 
 class TestTriggerSelfAudit:
@@ -28162,11 +29200,14 @@ class TestTaskPayloadSecretRedaction:
 
         match = next(t for t in body["tasks"] if t["id"] == str(task.id))
         payload = match["payloads"][0]
+        # The list view intentionally returns a slim payload projection
+        # (type / pr_number / spend_cap_usd only — a deferred-column perf
+        # optimization), so command/cwd/base_branch are absent here by design.
+        # Redaction parity for those launch fields is covered by the detail
+        # test (test_operator_task_detail_redacts_registry_password). This test
+        # asserts only that no secret leaks into the list payload / response.
         assert "container_registry_auth" not in payload
         assert "env" not in payload
-        assert payload["command"] == "python run.py"
-        assert payload["cwd"] == "/work"
-        assert payload["base_branch"] == "main"
         assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
         assert "hf_SECRET_ENV_TOKEN" not in resp.text
 
@@ -29237,6 +30278,317 @@ class TestStrategicPendingConfirmDedup:
         assert resp.status_code == 429, resp.text
         assert "cap" in resp.text.lower() or str(PENDING_USER_CONFIRMATION_MAX) in resp.text
 
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_removes_item_by_id(self, db_session):
+        """resolve_pending_confirm clears the strategist's own pending item by id,
+        leaving siblings intact and reporting removed=True."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-clear-me",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+                {
+                    "id": "p-keep",
+                    "type": "access_needed",
+                    "proposal": "Keep me.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ]
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-clear-me"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "resolve_pending_confirm"
+        assert body["removed"] is True
+
+        await db_session.refresh(project)
+        ids = [
+            p["id"]
+            for p in (project.problem_model or {}).get("pending_user_confirmation", [])
+        ]
+        assert ids == ["p-keep"]
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_unknown_id_is_ok_removed_false(
+        self, db_session
+    ):
+        """Clearing an id that is not present is idempotent: ok with removed=False."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-does-not-exist"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["removed"] is False
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_requires_id(self, db_session):
+        """A resolve_pending_confirm with no id is a 400."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {},
+                },
+            )
+        assert resp.status_code == 400, resp.text
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_appends_revision_log_entry(self, db_session):
+        """pending_confirm bumps revision and appends a revision_log entry with
+        pending_confirmation_added containing the confirmation id."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-fixed-id-001",
+                        "type": "credentials_needed",
+                        "proposal": "Need API key.",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) >= 1, "revision must be bumped after pending_confirm"
+        log = pm.get("revision_log", [])
+        assert log, "revision_log must be non-empty after pending_confirm"
+        last_entry = log[-1]
+        assert last_entry.get("changes", {}).get("pending_confirmation_added") == [
+            "p-fixed-id-001"
+        ], f"unexpected revision_log entry: {last_entry}"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_appends_revision_log_entry(self, db_session):
+        """resolve_pending_confirm bumps revision and appends a revision_log entry with
+        pending_confirmation_resolved containing the cleared id when removed=True."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 5,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-clear-me",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-clear-me"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["removed"] is True
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) == 6, f"revision must be bumped to 6, got {pm.get('revision')}"
+        log = pm.get("revision_log", [])
+        assert log, "revision_log must be non-empty after resolve_pending_confirm"
+        last_entry = log[-1]
+        assert last_entry.get("changes", {}).get("pending_confirmation_resolved") == [
+            "p-clear-me"
+        ], f"unexpected revision_log entry: {last_entry}"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_unknown_id_no_revision_log(self, db_session):
+        """When removed=False (unknown id), revision and revision_log are unchanged."""
+        project, task, token = await self._setup(db_session)
+        initial_revision = (project.problem_model or {}).get("revision", 0)
+        initial_log_len = len((project.problem_model or {}).get("revision_log", []))
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-does-not-exist"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["removed"] is False
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("revision", 0) == initial_revision, "revision must not change when removed=False"
+        assert len(pm.get("revision_log", [])) == initial_log_len, "revision_log must not grow when removed=False"
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_preserves_user_provenance(self, db_session):
+        """A pending_confirm add is a collection-only write to the agent-owned
+        confirmation queue: it must NOT restamp last_updated_by as "agent" and
+        thereby erase the "user" provenance a context-only operator edit set.
+        _preserve_operator_intent reads last_updated_by == "user" to protect the
+        operator's context against a later blank-context agent proposal."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        # Simulate a context-only operator edit: user-owned provenance + context.
+        project.problem_model = {
+            "revision": 3,
+            "last_updated_by": "user",
+            "context": {"notes": "operator-set context that must survive"},
+            "pending_user_confirmation": [],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-keep-prov",
+                        "type": "credentials_needed",
+                        "proposal": "Need a key.",
+                    },
+                },
+            )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("last_updated_by") == "user", (
+            "pending_confirm must preserve the operator's 'user' provenance, "
+            f"got {pm.get('last_updated_by')!r}"
+        )
+        assert pm.get("context", {}).get("notes") == "operator-set context that must survive"
+        assert pm.get("revision", 0) == 4, "revision must still be bumped"
+
+    @pytest.mark.asyncio
+    async def test_resolve_pending_confirm_preserves_user_provenance(self, db_session):
+        """A resolve_pending_confirm is likewise a collection-only write: clearing
+        an agent-owned confirmation must not erase the operator's "user"
+        provenance."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+        project.problem_model = {
+            "revision": 7,
+            "last_updated_by": "user",
+            "context": {"notes": "operator-set context that must survive"},
+            "pending_user_confirmation": [
+                {
+                    "id": "p-resolve-prov",
+                    "type": "credentials_needed",
+                    "proposal": "Need a token.",
+                    "rationale": "",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "resolve_pending_confirm",
+                    "data": {"id": "p-resolve-prov"},
+                },
+            )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["removed"] is True
+
+        await db_session.refresh(project)
+        pm = project.problem_model or {}
+        assert pm.get("last_updated_by") == "user", (
+            "resolve_pending_confirm must preserve the operator's 'user' provenance, "
+            f"got {pm.get('last_updated_by')!r}"
+        )
+        assert pm.get("context", {}).get("notes") == "operator-set context that must survive"
+        assert pm.get("revision", 0) == 8, "revision must still be bumped"
+
 
 class TestRecordFindingResolutionViaStrategicOp:
     """POST /api/agent/strategic op=record_finding_resolution — finding ledger write."""
@@ -29385,8 +30737,11 @@ class TestRecordFindingResolutionViaStrategicOp:
 
 # ── Strategic op inventory parity test ────────────────────────────────────────
 # Asserts that every op in STRATEGIC_AGENT_OPS has a real elif handler in
-# admin_agent_ops.py. This is a standalone (no-DB) test so it can run in the
-# fast standalone suite.
+# admin_agent_ops.py AND that every handler (except known internal-only ops)
+# is listed in the inventory. This is a standalone (no-DB) test so it can run
+# in the fast standalone suite.
+
+
 
 def _parse_strategic_op_handlers() -> set[str]:
     """Return the set of payload.op strings that have elif branches in strategic_operation."""
@@ -29416,19 +30771,51 @@ def _parse_strategic_op_handlers() -> set[str]:
     return ops
 
 
-def test_strategic_agent_ops_all_have_real_handlers():
-    """STRATEGIC_AGENT_OPS is a subset of the actual elif handlers in strategic_operation.
+def _load_internal_only_ops() -> set[str]:
+    """Return the set of ops in strategic_ops_manifest.json that are
+    intentionally internal-only (non-null ``internal_reason``).
 
-    Fails when an op is listed in STRATEGIC_AGENT_OPS but has no elif branch in the
-    handler — i.e., the inventory and backend dispatch have diverged.
+    These ops have live handlers in strategic_operation but are deliberately
+    excluded from the surfaced STRATEGIC_AGENT_OPS inventory because they are
+    invoked programmatically (never by the agent CLI).
+    """
+    manifest_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "app",
+        "strategic_ops_manifest.json",
+    )
+    with open(manifest_path) as f:
+        entries = json.load(f)
+    return {e["op"] for e in entries if e.get("internal_reason")}
+
+
+def test_strategic_agent_ops_all_have_real_handlers():
+    """Bidirectional parity: STRATEGIC_AGENT_OPS ↔ strategic_operation handlers.
+
+    Forward direction: every op in the inventory has a real elif handler.
+    Reverse direction: every handler (except known internal-only ops, declared
+    with non-null ``internal_reason`` in strategic_ops_manifest.json) is listed
+    in the inventory.
     """
     from app.routers.admin_agent_ops import STRATEGIC_AGENT_OPS
 
     real_handlers = _parse_strategic_op_handlers()
+    internal_only = _load_internal_only_ops()
+
+    # Forward: ops in inventory but missing handler
     missing = STRATEGIC_AGENT_OPS - real_handlers
     assert not missing, (
         f"STRATEGIC_AGENT_OPS lists ops with no elif handler in strategic_operation: {sorted(missing)}. "
         "Add the handler or remove the op from STRATEGIC_AGENT_OPS."
+    )
+
+    # Reverse: handlers not in inventory and not intentionally internal-only
+    orphans = real_handlers - STRATEGIC_AGENT_OPS - internal_only
+    assert not orphans, (
+        f"Handlers in strategic_operation missing from STRATEGIC_AGENT_OPS: {sorted(orphans)}. "
+        "Add each op to the STRATEGIC_AGENT_OPS frozenset, or mark it as internal-only "
+        "in strategic_ops_manifest.json with a non-null internal_reason."
     )
 
 
@@ -29508,6 +30895,37 @@ def test_plan_subtasks_defaults_missing_fields():
 
 class TestTaskListPlanSubtasksContract:
     """GET /api/admin/tasks drops heavy JSONB blobs and exposes plan_subtasks."""
+
+    @pytest.mark.asyncio
+    async def test_list_hides_backend_managed_unless_explicitly_included(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        normal = Task(project_id=project.id, title="normal", payloads=[])
+        shadow = Task(
+            project_id=project.id,
+            title="shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            archived=True,
+        )
+        db_session.add(normal)
+        db_session.add(shadow)
+        await db_session.commit()
+
+        default = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        # BACKEND_MANAGED_TASK_TYPES is empty now, so the default view no longer
+        # hides the backend-managed shadow row — it matches the debug view below.
+        assert {row["title"] for row in default.json()["tasks"]} == {
+            "normal",
+            "shadow",
+        }
+        debug = await client.get(
+            f"/api/admin/tasks?project_id={project.id}&include_backend_managed=true"
+        )
+        assert {row["title"] for row in debug.json()["tasks"]} == {
+            "normal",
+            "shadow",
+        }
 
     @pytest.mark.asyncio
     async def test_list_omits_heavy_jsonb_fields(self, client: AsyncClient, db_session):
@@ -29604,6 +31022,62 @@ class TestTaskListPlanSubtasksContract:
         assert resp.status_code == 200, resp.text
         t = resp.json()["tasks"][0]
         assert t["fix_loop_summary"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_payloads_strips_large_fields(self, client: AsyncClient, db_session):
+        """payloads in the list response contains only slim display fields — no prompt/research_findings."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{
+                "type": "review",
+                "pr_number": 42,
+                "prompt": "A" * 10000,
+                "research_findings": [{"title": "Finding"}] * 50,
+                "status_log": [{"msg": "step"}] * 200,
+            }],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        t = resp.json()["tasks"][0]
+
+        # task_type is still derived from payloads[0].type
+        assert t["task_type"] == "review"
+
+        # payloads in the list response must be slim — no large fields
+        assert isinstance(t["payloads"], list)
+        payload = t["payloads"][0] if t["payloads"] else {}
+        assert payload.get("type") == "review"
+        assert payload.get("pr_number") == 42
+        assert "prompt" not in payload, "prompt must not appear in list payloads"
+        assert "research_findings" not in payload, "research_findings must not appear in list payloads"
+        assert "status_log" not in payload, "status_log must not appear in list payloads"
+
+    @pytest.mark.asyncio
+    async def test_list_task_type_from_slim_payload_query(self, client: AsyncClient, db_session):
+        """task_type is correctly derived from the slim payload batch query."""
+        project = await _make_project(db_session)
+        for task_type in ("create", "research", "fix", "review"):
+            db_session.add(Task(
+                project_id=project.id,
+                payloads=[{"type": task_type, "prompt": "large prompt " * 100}],
+                title=f"task-{task_type}",
+                status=TaskStatus.QUEUED,
+            ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        by_title = {t["title"]: t for t in resp.json()["tasks"]}
+        for task_type in ("create", "research", "fix", "review"):
+            assert by_title[f"task-{task_type}"]["task_type"] == task_type, (
+                f"task_type mismatch for {task_type}"
+            )
 
 
 class TestStrategistCancelTask:
@@ -29948,7 +31422,7 @@ async def test_get_message_attachment_upload_url_success(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test-image.png", "content_type": "image/png"},
+            json={"filename": "test-image.png", "content_type": "image/png", "size_bytes": 1234},
         )
 
     assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
@@ -29959,13 +31433,22 @@ async def test_get_message_attachment_upload_url_success(
     assert "gs://" in data["storage_uri"]
     assert "message-attachments/" in data["storage_uri"]
     assert data["content_type"] == "image/png"
+    assert data["size_bytes"] == 1234
     assert data["attachment_id"] is not None
     assert len(data["attachment_id"]) > 0
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["method"] == "PUT"
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["content_type"] == "image/png"
+    assert mock_blob.generate_signed_url.call_args_list[0].kwargs["headers"] == {"Content-Length": "1234"}
     assert mock_blob.generate_signed_url.call_args_list[0].kwargs["expiration"].total_seconds() == 900
     assert mock_blob.generate_signed_url.call_args_list[1].kwargs["method"] == "GET"
     assert mock_blob.generate_signed_url.call_args_list[1].kwargs["expiration"].total_seconds() == 3600
+    from app.models import ProjectMessageAttachmentUpload
+    receipt = await db_session.get(
+        ProjectMessageAttachmentUpload, uuid.UUID(data["attachment_id"])
+    )
+    assert receipt is not None
+    assert receipt.expected_size_bytes == 1234
+    assert receipt.actor_user_id == TEST_USER_ID
 
 
 @pytest.mark.asyncio
@@ -29995,7 +31478,7 @@ async def test_get_message_attachment_upload_url_sanitizes_filename_and_content_
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "../../nested\\evil file!!.png"},
+            json={"filename": "../../nested\\evil file!!.png", "size_bytes": 9},
         )
 
     assert resp.status_code == 200, resp.text
@@ -30051,7 +31534,7 @@ async def test_get_message_attachment_upload_url_auth_failure(
             ) as anon:
                 resp = await anon.post(
                     f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-                    json={"filename": "test.png", "content_type": "image/png"},
+                    json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
                 )
     finally:
         app.dependency_overrides.pop(get_current_user, None)
@@ -30078,7 +31561,7 @@ async def test_get_message_attachment_upload_url_nonmember_rejected_before_signi
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png"},
+            json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
         )
 
     assert resp.status_code == 404, resp.text
@@ -30107,7 +31590,7 @@ async def test_get_message_attachment_upload_url_rejects_invalid_content_type(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png\r\nx: y"},
+            json={"filename": "test.png", "content_type": "image/png\r\nx: y", "size_bytes": 9},
         )
 
     assert resp.status_code == 400, resp.text
@@ -30141,10 +31624,113 @@ async def test_get_message_attachment_upload_url_storage_unavailable(
     with patch.object(_app_storage.storage, "Client", return_value=mock_client):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
-            json={"filename": "test.png", "content_type": "image/png"},
+            json={"filename": "test.png", "content_type": "image/png", "size_bytes": 9},
         )
 
     assert resp.status_code == 503, f"Expected 503, got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_get_message_attachment_upload_url_rejects_oversized_declared_body(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    response = await client.post(
+        f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+        json={
+            "filename": "too-large.bin",
+            "content_type": "application/octet-stream",
+            "size_bytes": 50 * 1024 * 1024 + 1,
+        },
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_message_attachment_upload_cleans_unconsumed_object(
+    client: AsyncClient, db_session
+):
+    from app.models import ProjectMessageAttachmentUpload
+
+    project = await _make_project(db_session)
+    attachment_id = uuid.uuid4()
+    storage_uri = (
+        f"gs://bucket/message-attachments/{project.id}/{attachment_id}/orphan.bin"
+    )
+    db_session.add(ProjectMessageAttachmentUpload(
+        attachment_id=attachment_id,
+        project_id=project.id,
+        actor_user_id=TEST_USER_ID,
+        storage_uri=storage_uri,
+        filename="orphan.bin",
+        content_type="application/octet-stream",
+        expected_size_bytes=10,
+        expires_at=_utcnow() + timedelta(minutes=15),
+    ))
+    await db_session.commit()
+
+    with patch(
+        "app.routers.admin_project_strategic_session.delete_storage_uri_best_effort",
+        new=AsyncMock(return_value=True),
+    ) as cleanup:
+        response = await client.delete(
+            f"/api/admin/projects/{project.id}/messages/attachment-uploads/{attachment_id}"
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"status": "deleted", "deleted": True}
+    cleanup.assert_awaited_once_with(storage_uri)
+    assert await db_session.get(ProjectMessageAttachmentUpload, attachment_id) is None
+
+
+@pytest.mark.asyncio
+async def test_upload_url_opportunistically_cleans_bounded_expired_receipts(
+    client: AsyncClient, db_session
+):
+    from unittest.mock import MagicMock
+    from app.models import ProjectMessageAttachmentUpload
+    from app import storage as _app_storage
+
+    project = await _make_project(db_session)
+    expired_id = uuid.uuid4()
+    expired_uri = (
+        f"gs://bucket/message-attachments/{project.id}/{expired_id}/expired.bin"
+    )
+    db_session.add(ProjectMessageAttachmentUpload(
+        attachment_id=expired_id,
+        project_id=project.id,
+        actor_user_id=TEST_USER_ID,
+        storage_uri=expired_uri,
+        filename="expired.bin",
+        content_type="application/octet-stream",
+        expected_size_bytes=10,
+        created_at=_utcnow() - timedelta(minutes=16),
+        expires_at=_utcnow() - timedelta(minutes=1),
+    ))
+    await db_session.commit()
+
+    blob = MagicMock()
+    blob.generate_signed_url.return_value = "https://storage.invalid/signed"
+    bucket = MagicMock()
+    bucket.blob.return_value = blob
+    storage_client = MagicMock()
+    storage_client.bucket.return_value = bucket
+    with (
+        patch.object(_app_storage.storage, "Client", return_value=storage_client),
+        patch(
+            "app.routers.admin_project_strategic_session.delete_storage_uri_best_effort",
+            new=AsyncMock(return_value=True),
+        ) as cleanup,
+    ):
+        response = await client.post(
+            f"/api/admin/projects/{project.id}/messages/attachment-upload-url",
+            json={"filename": "fresh.bin", "size_bytes": 10},
+        )
+
+    assert response.status_code == 200, response.text
+    cleanup.assert_any_await(expired_uri)
+    db_session.expire_all()
+    assert await db_session.get(ProjectMessageAttachmentUpload, expired_id) is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -30667,6 +32253,64 @@ class TestComputeImageBuildTrigger:
         assert body["built"] is True
 
     @pytest.mark.asyncio
+    async def test_async_dispatch_returns_202_with_build_id(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """A real build handed to the off-orchestrator builder returns 202.
+
+        When ``build_project_compute_image`` returns an ``AsyncImageBuildDispatch``
+        (the off-orchestrator VM lane), the endpoint must NOT block for a
+        synchronous build record — it returns 202 with the tracking id so the
+        caller can poll ``/compute-image/status`` for the reaper-finalized pin.
+        The legacy fields stay present (backward compatibility) but unresolved.
+        """
+        from app.compute_backends import AsyncImageBuildDispatch
+
+        build_id = uuid.uuid4()
+
+        async def dispatch_build(*a, **k):
+            return AsyncImageBuildDispatch(
+                build_id=build_id,
+                dep_hash="deadbeef",
+                builder_vm_id="img-build-abc123",
+                status="BUILDING",
+            )
+
+        apt = self._patch_pipeline(monkeypatch, build_fn=dispatch_build)
+        project = await _make_project(db_session, name="ImgBuild Async")
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/compute-image/build"
+        )
+
+        assert resp.status_code == 202, resp.text
+        body = resp.json()
+        assert body["build_id"] == str(build_id)
+        assert body["status"] == "BUILDING"
+        assert body["builder_vm_id"] == "img-build-abc123"
+        assert body["async"] is True
+        assert body["adopted"] is False
+        assert body["dep_hash"] == "deadbeef"
+        # Legacy fields preserved but unresolved — the build has not completed.
+        assert body["pinned_ref"] is None
+        assert body["digest"] is None
+        assert body["built"] is False
+        assert body["already_present"] is False
+        # No ProjectComputeImage pin is written on the async fast-return path.
+        from app.models import ProjectComputeImage
+
+        rows = (
+            await db_session.execute(
+                select(ProjectComputeImage).where(
+                    ProjectComputeImage.project_id == project.id
+                )
+            )
+        ).scalars().all()
+        assert rows == []
+        # The concurrency slot is released once the (fast) dispatch task ends.
+        assert not apt._compute_image_build_semaphore.locked()
+
+    @pytest.mark.asyncio
     async def test_concurrent_build_is_rejected_with_429(
         self, client: AsyncClient, db_session, monkeypatch
     ):
@@ -30954,3 +32598,518 @@ class TestComputeImageBuildTrigger:
         assert resp.status_code == 422, resp.text
         assert "metadata server" in resp.text
         assert not apt._compute_image_build_semaphore.locked()
+
+
+class TestComputeImageStatus:
+    """Read-only baked-image status/drift endpoint (owner-gated)."""
+
+    @staticmethod
+    def _patch_manifest(monkeypatch, *, compute_image=None):
+        """Stub manifest discovery to return the given compute image."""
+        from app.routers import admin_project_tools as apt
+
+        async def fake_manifest(_project):
+            return {
+                "tools": [],
+                "skills": [],
+                "compute": {"image": compute_image},
+                "error": None,
+            }
+
+        monkeypatch.setattr(apt, "_discover_manifest_tools", fake_manifest)
+        return apt
+
+    @pytest.mark.asyncio
+    async def test_status_no_compute_image(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """No compute section in manifest -> no_compute_image_declared."""
+        self._patch_manifest(monkeypatch, compute_image=None)
+        project = await _make_project(db_session, name="NoCI Project")
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"status": "no_compute_image_declared"}
+
+    @pytest.mark.asyncio
+    async def test_status_never_built(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Has compute image but no ProjectComputeImage row -> never_built."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Unbuilt Project")
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        # ``active_builds`` is additive and empty when no async build is in flight.
+        assert resp.json() == {"status": "never_built", "active_builds": []}
+
+    @pytest.mark.asyncio
+    async def test_status_surfaces_in_flight_async_builds(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """PENDING/BUILDING ProjectComputeImageBuild rows appear under active_builds.
+
+        An off-orchestrator build dispatched (202) but not yet finalized by the
+        reaper poll sweep must be visible here so the caller can poll it — and a
+        terminal (SUCCEEDED) row must NOT leak into the in-flight list.
+        """
+        from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+        project = await _make_project(db_session, name="Active Build Project")
+
+        building = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="deadbeef",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            builder_vm_id="img-build-xyz",
+            status=ComputeImageBuildStatus.BUILDING,
+        )
+        # A terminal build for the same image must be excluded.
+        finished = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="cafebabe",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            builder_vm_id="img-build-old",
+            status=ComputeImageBuildStatus.SUCCEEDED,
+        )
+        db_session.add(building)
+        db_session.add(finished)
+        await db_session.commit()
+        await db_session.refresh(building)
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # No ProjectComputeImage pin exists yet, so the durable status is
+        # never_built — but the in-flight build is surfaced alongside it.
+        assert body["status"] == "never_built"
+        assert len(body["active_builds"]) == 1
+        active = body["active_builds"][0]
+        assert active["build_id"] == str(building.id)
+        assert active["status"] == "BUILDING"
+        assert active["dep_hash"] == "deadbeef"
+        assert active["builder_vm_id"] == "img-build-xyz"
+
+    @pytest.mark.asyncio
+    async def test_status_returns_build_record(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Existing ProjectComputeImage row -> full status with is_digest_pinned."""
+        from datetime import timezone
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Built Project")
+        now = datetime.now(timezone.utc)
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="deadbeef12345678",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "a" * 64,
+            digest="sha256:" + "a" * 64,
+            built=True,
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+        assert body["pinned_ref"] == row.pinned_ref
+        assert body["digest"] == row.digest
+        assert body["dep_hash"] == row.dep_hash
+        assert body["tag"] == row.tag
+        assert body["built"] is True
+        assert body["is_digest_pinned"] is True
+        assert body["created_at"] is not None
+        assert body["updated_at"] is not None
+        # No drift when check_drift not requested.
+        assert "drift" not in body
+
+    @pytest.mark.asyncio
+    async def test_status_digest_pinned_true(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Row with non-null digest -> is_digest_pinned True."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="Pinned Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="desdhsh12345678",
+            tag="desdhsh",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "b" * 64,
+            digest="sha256:" + "b" * 64,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["is_digest_pinned"] is True
+
+    @pytest.mark.asyncio
+    async def test_status_mutable_tag_fallback(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Row with null digest -> is_digest_pinned False (mutable tag fallback)."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="MutableTag Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="cafebabe87654321",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj:latest",
+            digest=None,
+            built=False,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["is_digest_pinned"] is False
+        assert body["digest"] is None
+        assert body["status"] == "built"
+
+    @pytest.mark.asyncio
+    async def test_status_owner_required(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Member (not owner) -> 403."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(
+            db_session, name="Member Project", role="member"
+        )
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_status_returns_latest_row(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """Multiple rows for same image -> returns the most recent by updated_at."""
+        from datetime import timedelta, timezone
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="MultiRow Project")
+        old_now = datetime.now(timezone.utc) - timedelta(days=1)
+
+        old_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="oldhash",
+            tag="oldtag",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "c" * 64,
+            digest="sha256:" + "c" * 64,
+            built=True,
+            created_at=old_now,
+            updated_at=old_now,
+        )
+        db_session.add(old_row)
+        new_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="newhash",
+            tag="newtag",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:"
+            + "d" * 64,
+            digest="sha256:" + "d" * 64,
+            built=True,
+        )
+        db_session.add(new_row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["dep_hash"] == "newhash"
+
+    @pytest.mark.asyncio
+    async def test_status_drift_matches(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true with matching hashes -> drifted: false."""
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+        from app.routers import admin_project_tools as apt
+
+        common_hash = "matchhash12345678"
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+
+        async def mock_build(*a, **k):
+            return BuildResult(
+                pinned_ref=(
+                    "us-docker.pkg.dev/p/compute-images/proj:"
+                    + common_hash
+                ),
+                tag=common_hash,
+                dep_hash=common_hash,
+                already_present=True,
+                built=False,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", mock_build
+        )
+
+        project = await _make_project(db_session, name="DriftMatch Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash=common_hash,
+            tag=common_hash,
+            pinned_ref=(
+                "us-docker.pkg.dev/p/compute-images/proj@" + common_hash
+            ),
+            digest="sha256:" + common_hash,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+        drift = body["drift"]
+        assert drift["drifted"] is False
+        assert drift["current_dep_hash"] == common_hash
+        assert drift["stored_dep_hash"] == common_hash
+
+    @pytest.mark.asyncio
+    async def test_status_drift_differs(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true with differing hashes -> drifted: true."""
+        from app.compute_image_build import BuildResult
+        from app.models import ProjectComputeImage
+        from app.routers import admin_project_tools as apt
+
+        stored_hash = "storedhash12345"
+        current_hash = "currenthash67890"
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+
+        async def mock_build_diff(*a, **k):
+            return BuildResult(
+                pinned_ref=(
+                    "us-docker.pkg.dev/p/compute-images/proj:"
+                    + current_hash
+                ),
+                tag=current_hash,
+                dep_hash=current_hash,
+                already_present=True,
+                built=False,
+            )
+
+        monkeypatch.setattr(
+            apt._cb, "build_project_compute_image", mock_build_diff
+        )
+
+        project = await _make_project(db_session, name="DriftDiff Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash=stored_hash,
+            tag=stored_hash,
+            pinned_ref=(
+                "us-docker.pkg.dev/p/compute-images/proj@" + stored_hash
+            ),
+            digest="sha256:" + stored_hash,
+            built=True,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        drift = body["drift"]
+        assert drift["drifted"] is True
+        assert drift["current_dep_hash"] == current_hash
+        assert drift["stored_dep_hash"] == stored_hash
+
+    @pytest.mark.asyncio
+    async def test_status_drift_no_build_section(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true but no build section -> drifted: null + reason."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                # No 'build' key.
+            },
+        )
+        project = await _make_project(db_session, name="DriftNoBuild Project")
+
+        row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="somehash",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj:latest",
+            digest=None,
+            built=False,
+        )
+        db_session.add(row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["drift"]["drifted"] is None
+        assert "reason" in body["drift"]
+
+    @pytest.mark.asyncio
+    async def test_status_drift_never_built(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """check_drift=true but no build record -> status never_built, no drift."""
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+        project = await _make_project(
+            db_session, name="DriftNeverBuilt Project"
+        )
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+            "?check_drift=true"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "never_built"
+        assert "drift" not in body

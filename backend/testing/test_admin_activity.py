@@ -221,6 +221,65 @@ async def test_failed_task_includes_failure_class_and_taxonomy(
 
 
 @pytest.mark.asyncio
+async def test_completed_event_task_type_uses_projected_first_payload(
+    client: AsyncClient, db_session
+):
+    """task_type is read via the SQL-projected payloads[0], not the full array."""
+    project = await _make_project(db_session, name="Activity First-Payload Project")
+    task = Task(
+        project_id=project.id,
+        # Second element carries a different type; only the first must be used.
+        payloads=[{"type": "refactor", "prompt": "x"}, {"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        title="Refactor task",
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+    assert resp.status_code == 200
+    completed = [e for e in resp.json()["events"] if e["type"] == "TASK_COMPLETED"]
+    assert len(completed) == 1
+    assert completed[0]["task_type"] == "refactor"
+
+
+@pytest.mark.asyncio
+async def test_research_finding_count_from_narrow_plan_output_fetch(
+    client: AsyncClient, db_session
+):
+    """RESEARCH_FINDINGS finding_count is computed from the narrowly-fetched
+    plan_output (which is no longer loaded for every terminal feed row)."""
+    project = await _make_project(db_session, name="Activity Research Project")
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "x"}],
+        status=TaskStatus.COMPLETED,
+        title="Research task",
+        context={},
+        plan_output=[{"finding": "a"}, {"finding": "b"}, {"finding": "c"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    db_session.add(
+        Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.RESEARCH_FINDINGS,
+            logs="[]",
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+    assert resp.status_code == 200
+    research = [e for e in resp.json()["events"] if e["type"] == "RESEARCH_FINDINGS"]
+    assert len(research) == 1
+    assert research[0]["task_id"] == str(task.id)
+    assert research[0]["finding_count"] == 3
+
+
+@pytest.mark.asyncio
 async def test_activity_includes_pr_artifact_when_multiple_artifacts_present(
     client: AsyncClient, db_session
 ):

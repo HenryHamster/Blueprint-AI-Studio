@@ -76,6 +76,25 @@ ProofKind = Literal[
                             # but was NEVER executed (structural-only, path-tier)
 ]
 
+#: Every recognized :data:`ProofKind`, as a runtime-checkable set. The
+#: ``ProofKind`` Literal is the documented vocabulary but a type alias cannot be
+#: membership-tested at runtime, so recording seams that must refuse an
+#: unrecognized (e.g. agent-forged) proof kind before minting a proof check
+#: against this set. Keep in lockstep with the ``ProofKind`` Literal above.
+KNOWN_PROOF_KINDS: frozenset[str] = frozenset(
+    {
+        "named_test",
+        "downstream_artifact",
+        "visual",
+        "observable_behavior",
+        "reachability",
+        "operator_attestation",
+        "trial_adoption",
+        "backing_path",
+        "named_test_present",
+    }
+)
+
 #: The kinds whose ``ref`` names a repo file/test path and can therefore be
 #: re-verified against HEAD (file exists / was removed). Other kinds point at
 #: logical ids (criterion keys, artifact ids) that a path check cannot resolve.
@@ -94,6 +113,16 @@ PATH_BACKED_KINDS: frozenset[str] = frozenset(
 #: is not cleared by a self-reported file-existence proof.
 BACKING_ONLY_KINDS: frozenset[str] = frozenset(
     {"backing_path", "named_test_present"}
+)
+
+#: Proof kinds whose validity depends on the execution environment (hardware
+#: configuration, container runtime image) rather than solely on the code tree.
+#: For these kinds, a proof stamped with an ``env_fingerprint`` becomes stale when
+#: the environment changes — even if ``commit_sha`` and TTL still match.  Currently
+#: populated by callers that explicitly supply an ``env_fingerprint`` at recording
+#: time; the set is consulted by :func:`capability_proof._fresh_executed_proof_covers_head`.
+ENVIRONMENT_BOUND_PROOF_KINDS: frozenset[str] = frozenset(
+    {"named_test"}  # execution proofs — environment matters for hardware/container caps
 )
 
 #: Proof kinds that carry NO structural machine-check at all — a human simply
@@ -184,6 +213,10 @@ class EvidenceRef(TypedDict, total=False):
     proven: bool
     source_id: str | None
     recorded_at: str | None
+    # Environment fingerprint for hardware/container-bound proof kinds.
+    # When non-empty, a proof is considered stale if the running environment's
+    # fingerprint differs — even if commit_sha and TTL still match.
+    env_fingerprint: str | None
 
 
 #: How long a machine-checked proof stays trusted before a caller that opts into

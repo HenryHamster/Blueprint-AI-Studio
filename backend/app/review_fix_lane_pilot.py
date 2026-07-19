@@ -1410,7 +1410,9 @@ async def emit_lane_event_message(
     ``pilot_<event_type>_<project_id>`` for project-level pilot events, so each
     lane emits at most one open message per event type and the board never floods.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     if lane_id is not None:
         dedupe_key = f"lane_{event_type}_{lane_id}"
@@ -1430,16 +1432,19 @@ async def emit_lane_event_message(
     if already:
         return
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
             content=f"[LANE-PILOT] {detail}",
-            context={
-                "event_type": event_type,
-                "lane_id": str(lane_id) if lane_id is not None else None,
-                "dedupe_key": dedupe_key,
-            },
+            context=stamp_message_audience(
+                {
+                    "lane_id": str(lane_id) if lane_id is not None else None,
+                    "dedupe_key": dedupe_key,
+                },
+                event_type,
+            ),
         )
     )
 
@@ -1453,7 +1458,9 @@ async def raise_gate_integrity_alert(
     integrity is non-negotiable). Deduplicated on the violation event type so
     repeated detections in a sweep don't spam the board.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     dedupe_key = "review_fix_lane_gate_integrity_violation"
     result = await session.execute(
@@ -1469,15 +1476,16 @@ async def raise_gate_integrity_alert(
     if already:
         return
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.BLOCKER,
             from_type="system",
             content=f"[LANE-PILOT] gate-integrity violation: {detail}",
-            context={
-                "event_type": "review_fix_lane_gate_integrity_violation",
-                "dedupe_key": dedupe_key,
-            },
+            context=stamp_message_audience(
+                {"dedupe_key": dedupe_key},
+                "review_fix_lane_gate_integrity_violation",
+            ),
         )
     )
 

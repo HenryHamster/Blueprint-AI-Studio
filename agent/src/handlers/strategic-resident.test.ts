@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
 
 // ── Hoisted mock sinks ────────────────────────────────────────────────────────
 const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
@@ -11,6 +12,7 @@ const { mockSendWsFrame, mockSendLog } = vi.hoisted(() => ({
 // importing strategic-resident.ts stays light. strategic-resident-lib.js (which
 // owns the pure FrameCoalescer) is left REAL so the queue policy is exercised.
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '',
   strVal: vi.fn((v: unknown) => (typeof v === 'string' ? v : '')),
   sanitize: vi.fn((s: string) => s),
@@ -22,6 +24,8 @@ vi.mock('../index.js', () => ({
   resolveBaseBranch: vi.fn(() => 'main'),
   recordResidentTurnLatency: vi.fn(),
   getResidentTurnLatencyTelemetry: vi.fn(() => null),
+  recordOperatorDecisionCapture: vi.fn(),
+  getOperatorDecisionCaptureTelemetry: vi.fn(() => null),
 }));
 vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn(),
@@ -45,6 +49,7 @@ vi.mock('../prompt.js', () => ({
   writeMessagesHelper: vi.fn(),
   writeSkillHelpers: vi.fn(),
   formatSkills: vi.fn(),
+  formatProjectTools: vi.fn(),
   SHARED_LIFECYCLE_REMAINDER: '',
 }));
 vi.mock('./strategic-helpers.js', () => ({
@@ -55,6 +60,9 @@ vi.mock('./strategic-helpers.js', () => ({
 vi.mock('../providers/runners.js', () => ({
   provisionAmbientHelpers: vi.fn(),
   claudeHelpSupportsPartialMessages: vi.fn(() => true),
+  __resetClaudeCapabilityCacheForTesting: vi.fn(),
+  probeClaudeCapabilities: vi.fn(() => null),
+  stripUnsupportedClaudeOptionalArgs: vi.fn((args: readonly string[]) => [...args]),
 }));
 vi.mock('../providers/resident-session.js', () => ({
   startResidentClaudeSession: vi.fn(),
@@ -68,6 +76,13 @@ vi.mock('./strategic-sections.js', () => ({
     Array.isArray(msgs) && msgs.length > 0
       ? msgs.map((m) => `MSG:${m.content ?? ''}`).join('\n')
       : ''),
+  // Render each recently-answered message so the checkpoint / bootstrap
+  // read-only tail reflects exactly the handled conversation the backend
+  // surfaces at fetch time.
+  formatRecentHandledConversation: vi.fn((msgs: Array<{ content?: string }> | undefined) =>
+    Array.isArray(msgs) && msgs.length > 0
+      ? msgs.map((m) => `HANDLED:${m.content ?? ''}`).join('\n')
+      : ''),
   buildDirectionPortfolioSection: vi.fn(() => ''),
   buildPendingFollowupsSection: vi.fn(() => ''),
 }));
@@ -77,9 +92,14 @@ import {
   SessionStreamer, handleStrategicResident, refreshResidentGitReadToken,
   recloneResidentWorkspace,
 } from './strategic-resident.js';
-import { apiGet, apiPost } from '../index.js';
+import {
+  apiGet, apiPost, recordOperatorDecisionCapture, recordResidentTurnLatency,
+} from '../index.js';
 import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { writePlaybookHelper, buildContextPrefix } from '../prompt.js';
+import { writeStrategicHelpers } from './strategic-helpers.js';
+import { provisionAmbientHelpers } from '../providers/runners.js';
 import { startResidentClaudeSession } from '../providers/resident-session.js';
 import type {
   ResidentSession, ResidentSessionEvent, ResidentTurnResult,
@@ -188,11 +208,16 @@ const mockStartSession = vi.mocked(startResidentClaudeSession);
 const mockWriteGitTokenFile = vi.mocked(writeGitTokenFile);
 const mockSetupGitCredentialHelper = vi.mocked(setupGitCredentialHelper);
 const mockPrepareWorkspaceForRole = vi.mocked(prepareWorkspaceForRole);
+const mockWritePlaybookHelper = vi.mocked(writePlaybookHelper);
+const mockWriteStrategicHelpers = vi.mocked(writeStrategicHelpers);
+const mockProvisionAmbientHelpers = vi.mocked(provisionAmbientHelpers);
+const mockBuildContextPrefix = vi.mocked(buildContextPrefix);
 
 /** A ResidentTurnResult with sane defaults, overridable per test. */
 function turnResult(over: Partial<ResidentTurnResult> = {}): ResidentTurnResult {
   return {
     resultText: '',
+    accumulatedTurnText: '',
     interrupted: false,
     timedOut: false,
     hardTimedOut: false,
@@ -242,7 +267,11 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     mockSendLog.mockReset();
     mockSendWsFrame.mockReset();
     mockSendWsFrame.mockReturnValue(true);
+    // Workspace guard must NOT fire in general-purpose tests (WORKSPACE='' otherwise
+    // always looks vanished). Recovery-specific tests override this spy.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it('primes the compacted session WITH the settled operator decision and WITHOUT the answered message, and marks the message handled before fetching checkpoint state', async () => {
     // The single operator message whose content must NOT survive into the
@@ -258,8 +287,8 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     // Backend-side handled set + a call-order trace shared across the mocks.
     const handledIds: string[] = [];
     const events: string[] = [];
-    let messagePollCount = 0;
     let capturedCheckpoint = '';
+    let messagePollCount = 0;
 
     mockApiGet.mockImplementation((url: string) => {
       // WORKSPACE is stubbed to '' here, so the per-turn "workspace vanished"
@@ -356,13 +385,170 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     expect(capturedCheckpoint).not.toContain('SHOULD_BE_DROPPED_AFTER_HANDLED');
   });
 
+  it('answers an operator message that arrives after an autonomous turn BEFORE paying the compaction restart (operator-first)', async () => {
+    // Regression guard for the pickup-lag fix. An operator message that lands
+    // during an autonomous turn's tail (caught by the post-turn poll) must be
+    // answered ON THE EXISTING session FIRST; the compaction-restart cost is
+    // deferred until after the reply. Before the fix, the autonomous turn's
+    // maybeCompact ran immediately, so a high-token autonomous turn spawned the
+    // fresh subprocess BEFORE the operator's reply — the operator waited the whole
+    // restart. Here the autonomous turn's input tokens ALSO trip the compaction
+    // threshold, so the ONLY thing keeping compaction from front-running the reply
+    // is the operator-first ordering under test.
+    const OPERATOR_MSG = {
+      id: 'msg-op',
+      content: 'operator asks a question mid-autonomous-work',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const events: string[] = [];
+    let capturedCheckpoint = '';
+    let messagePollCount = 0;
+    vi.mocked(recordResidentTurnLatency).mockClear();
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        // Poll #0 = top-of-loop fast path (no message yet); poll #1 = the
+        // post-autonomous-turn poll, which delivers the operator message.
+        const n = messagePollCount++;
+        if (n === 1) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {}, vision: {}, strategic_memory_notes: [],
+          running_update: '', open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // session1 runs BOTH the autonomous turn (call #1) and the operator turn
+    // (call #2) — proving the operator was answered before compaction spawned a
+    // new subprocess. Both turns report high input tokens (trip the 100-token
+    // threshold). session2 is the post-compaction subprocess (dead ⇒ loop exits).
+    let s1Calls = 0;
+    const session1 = makeSession(
+      () => {
+        s1Calls += 1;
+        events.push(s1Calls === 1 ? 'auto' : 'op');
+        return Promise.resolve(turnResult({
+          resultText: s1Calls === 1 ? 'closing tool summary' : 'answered the operator',
+          accumulatedTurnText: s1Calls === 1
+            ? 'TICK-VERDICT: ADVANCED — accumulated tick note survives the closing tool call'
+            : '',
+          inputTokens: 5_000,
+        }));
+      },
+      () => true,
+    );
+    const session2 = makeSession(
+      (text) => {
+        events.push('prime');
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ inputTokens: 0 }));
+      },
+      () => false,
+    );
+    let spawnCount = 0;
+    mockStartSession.mockImplementation(() => {
+      spawnCount += 1;
+      if (spawnCount === 1) return session1;
+      events.push('spawn2');
+      return session2;
+    });
+
+    await handleStrategicResident(
+      'task-of', {
+        project_name: 'Proj',
+        strategic_session_compaction_threshold_tokens: 100,
+        open_messages: [],
+      },
+      { project_metadata: { project_id: 'proj-1' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The operator turn ran on the ORIGINAL session (session1's 2nd sendTurn), and
+    // strictly BEFORE the compaction subprocess was spawned/primed.
+    expect(s1Calls).toBe(2);
+    const iOp = events.indexOf('op');
+    const iSpawn2 = events.indexOf('spawn2');
+    const iPrime = events.indexOf('prime');
+    expect(iOp).toBeGreaterThanOrEqual(0);
+    expect(iSpawn2).toBeGreaterThan(iOp);
+    expect(iPrime).toBeGreaterThan(iSpawn2);
+    expect(capturedCheckpoint).toContain('accumulated tick note survives the closing tool call');
+
+    // The interrupt/post-turn operator path now records pickup-lag telemetry (it
+    // previously passed no created_at → the lag was invisible in the summary).
+    const opLatency = vi.mocked(recordResidentTurnLatency).mock.calls
+      .map((c) => c[0])
+      .find((rec) => rec.kind === 'operator');
+    expect(opLatency).toBeDefined();
+    expect(typeof opLatency?.pickupLagMs).toBe('number');
+    expect(opLatency?.pickupLagMs as number).toBeGreaterThanOrEqual(0);
+  });
+
+  it('restores operatorDecisionCorrectiveNext from the persisted ledger so a full restart still fires the corrective reminder on the next autonomous turn', async () => {
+    // Full-restart durability: a marker-less operator correction set
+    // operatorDecisionCorrectiveNext=true and it was serialized into the durable
+    // exam-ledger blob (task.context._exam_ledger) on the last heartbeat. After a
+    // VM recycle / crash the fresh session must restore that flag and open the
+    // FIRST autonomous tick with the OPERATOR-DECISION CORRECTIVE reminder — before
+    // the fix the flag reset to false and the reminder was silently dropped.
+    let autonomousPrompt = '';
+    let alive = true;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      (text) => {
+        // First (and only) turn is the autonomous tick with the bootstrap prompt
+        // prepended (runTurn prepends it on the first turn). Capture it, then let
+        // the session die so the loop exits on the next iteration.
+        autonomousPrompt = typeof text === 'string' ? text : JSON.stringify(text);
+        alive = false;
+        return Promise.resolve(turnResult({ resultText: 'looked around', inputTokens: 0 }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockImplementation(() => session1);
+
+    await handleStrategicResident(
+      'task-restore',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-1' },
+        // The durable blob a prior session persisted after a marker-less operator
+        // correction: operatorDecisionCorrective=true rides the same channel as the
+        // exam ledger's records/tick/corrective fields.
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [], tick: 4, corrective: false, operatorDecisionCorrective: true,
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The restored flag drove the corrective frame into the first autonomous prompt.
+    expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
+  });
+
   it('re-clones the vanished workspace with a FRESH READ token, never the session-start push token', async () => {
-    // WORKSPACE is stubbed to '' so `${WORKSPACE}/.git` never exists → the per-turn
-    // "workspace vanished" guard fires on the first iteration. This pins the CALL
-    // SITE (not just the helper): the guard must route through
-    // recloneResidentWorkspace, which mints a fresh read-scoped token — not re-use
-    // the push-capable `ghtok` captured at session start (expired by mid-session,
-    // and a standing ambient push credential).
+    // Override the default existsSync=true spy so the workspace-vanish guard fires.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
     mockPrepareWorkspaceForRole.mockReset();
     mockWriteGitTokenFile.mockReset();
 
@@ -375,7 +561,9 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     });
     mockApiPost.mockResolvedValue({ authority_held: true });
 
-    // A single dead session so the loop primes nothing and exits after one guard pass.
+    // Each startResidentClaudeSession call returns a new dead session: startup
+    // session + recovery session (post-guard restart). Both die immediately so the
+    // loop exits after the recovery prime.
     mockStartSession.mockImplementation(() => makeSession(
       () => Promise.resolve(turnResult({ resultText: 'x', inputTokens: 0 })),
       () => false,
@@ -398,6 +586,344 @@ describe('handleStrategicResident — operator-turn compaction includes settled 
     const urls = mockApiGet.mock.calls.map((c) => c[0]);
     expect(urls).toContain('/api/agent/git-read-token');
     expect(urls.some((u) => u.includes('/api/agent/github/token'))).toBe(false);
+  });
+
+  it('re-provisions helper tools and restarts the subprocess after workspace vanish', async () => {
+    // Override existsSync to simulate workspace vanish (guard fires exactly once).
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    mockWritePlaybookHelper.mockReset();
+    mockWriteStrategicHelpers.mockReset();
+    mockProvisionAmbientHelpers.mockReset();
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // Two sessions: session1 from startup, session2 from recovery restart.
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    const session2 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    await handleStrategicResident(
+      'task-recovery', { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'p' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // subprocess restarted: startResidentClaudeSession called once at startup + once for recovery
+    expect(mockStartSession).toHaveBeenCalledTimes(2);
+    // old subprocess was closed before the new one was started
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session1.close).toHaveBeenCalled();
+    // recovery session received the prime (compaction checkpoint)
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+    // helpers were re-provisioned into the recreated checkout (startup + recovery = 2 calls each)
+    expect(mockWritePlaybookHelper.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockWriteStrategicHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(mockProvisionAmbientHelpers.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('stops gracefully when the workspace-recovery prime returns processGone', async () => {
+    // Simulate workspace vanish so the guard fires and the recovery prime runs.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult()),
+      () => true,
+    );
+    const session2 = makeSession(
+      () => Promise.resolve(turnResult({ processGone: true })),
+      () => true,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    // Should resolve without throwing even when the prime fails.
+    await expect(handleStrategicResident(
+      'task-prime-fail', { project_name: 'P', open_messages: [] },
+      { project_metadata: { project_id: 'p' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    )).resolves.toBeUndefined();
+
+    // The prime was the only turn on session2 — no operator/autonomous turns followed.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves the advanced message cursor across workspace reclone', async () => {
+    // Override the default existsSync=true spy so the workspace-vanish guard fires.
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+    const initialCursor = '2026-01-01T00:00:00.000000';
+    const advancedCursor = '2026-07-15T14:00:00.000000Z';
+    const operatorMessage = {
+      id: 'msg-cursor-check',
+      content: 'operator message after the initial cursor',
+      created_at: advancedCursor,
+      from_type: 'user',
+    };
+    let messagePollCount = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        return Promise.resolve({
+          messages: messagePollCount++ === 0 ? [operatorMessage] : [],
+        });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {},
+          vision: {},
+          strategic_memory_notes: [],
+          running_update: '',
+          open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockPrepareWorkspaceForRole.mockClear();
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    let turnCount = 0;
+    const session = makeSession(
+      () => {
+        turnCount += 1;
+        return Promise.resolve(turnResult({
+          resultText: turnCount === 1
+            ? 'acknowledged the operator message'
+            : 'completed one follow-through tick',
+          inputTokens: 50,
+        }));
+      },
+      () => turnCount < 2,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-cursor-reclone',
+      { project_name: 'CursorProj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-cursor' },
+        context: { message_cursor: initialCursor },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    const heartbeatCursors = mockApiPost.mock.calls
+      .filter(([url]) => url.includes('heartbeat'))
+      .map(([, body]) => (body as Record<string, unknown>).message_cursor as string | undefined);
+    const lastCursor = heartbeatCursors.at(-1);
+
+    expect(heartbeatCursors.length).toBeGreaterThan(0);
+    expect(turnCount).toBe(2);
+    expect(mockPrepareWorkspaceForRole.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(lastCursor).toBeDefined();
+    expect(lastCursor).not.toBe(initialCursor);
+    expect(new Date(lastCursor ?? 0).getTime()).toBeGreaterThanOrEqual(
+      new Date(advancedCursor).getTime(),
+    );
+  });
+
+  it('restores the modern operatorDecisionReview object from the persisted exam ledger so OPERATOR-DECISION REVIEW fires with message-id metadata on the first autonomous tick after a full restart', async () => {
+    // Full-restart durability for the modern operatorDecisionReview object path.
+    //
+    // A prior session serialized a PendingOperatorDecisionReview (the modern
+    // format, with messageIds / startedAt / attempts) into task.context._exam_ledger.
+    // After VM recycle the fresh session must:
+    //   1. restore the review object from the durable blob via restoreLedger, and
+    //   2. open the FIRST autonomous tick with the OPERATOR-DECISION REVIEW
+    //      instruction AND the per-review metadata line (message id, attempts).
+    //
+    // This is the direct-object path; the sibling test above covers the legacy
+    // boolean (operatorDecisionCorrective: true → synthetic review) path.
+    let autonomousPrompt = '';
+    let alive = true;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session = makeSession(
+      (text) => {
+        autonomousPrompt = typeof text === 'string' ? text : JSON.stringify(text);
+        alive = false;
+        return Promise.resolve(turnResult({ resultText: 'reviewed the operator exchange', inputTokens: 0 }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockImplementation(() => session);
+
+    await handleStrategicResident(
+      'task-review-restore',
+      { project_name: 'ReviewProj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-review' },
+        // Modern serialized review: an operator exchange with explicit message ids
+        // and one prior attempt is pending classification.
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 5,
+            corrective: false,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-op-review-1', 'msg-op-review-2'],
+              startedAt: '2026-07-15T10:00:00Z',
+              attempts: 1,
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The restored review drove the OPERATOR-DECISION REVIEW frame into the
+    // first autonomous prompt, including the message-id metadata line.
+    expect(autonomousPrompt).toContain('OPERATOR-DECISION REVIEW');
+    expect(autonomousPrompt).toContain('msg-op-review-1');
+  });
+
+  it('compaction checkpoint carries contextPrefix (operator purpose + constraints) from buildContextPrefix', async () => {
+    // Finding: buildBootstrapPrompt receives contextPrefix but CompactionCheckpointContext
+    // formerly had no corresponding field — a compacted session would operate without
+    // the operator purpose / constraints preamble. This test verifies the integration:
+    // contextPrefix from buildContextPrefix flows into the checkpoint primed into the
+    // fresh subprocess.
+    const CONTEXT_PREFIX = 'Operator Purpose: build great software.\nConstraints: do not break prod.\nCurrent focus: stabilize v26.';
+    mockBuildContextPrefix.mockReturnValue(CONTEXT_PREFIX);
+
+    let capturedCheckpoint = '';
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({
+          problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '', open_messages: [],
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    // Session 1: high input tokens to trip compaction (threshold 100).
+    // Session 2: post-compaction subprocess — captures the checkpoint, then dies.
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: 'did some work', inputTokens: 5_000 })),
+      () => true,
+    );
+    const session2 = makeSession(
+      (text) => {
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ resultText: 'primed', inputTokens: 0 }));
+      },
+      () => false, // dead ⇒ loop exits
+    );
+    let spawnCount = 0;
+    mockStartSession.mockImplementation(() => {
+      spawnCount += 1;
+      return spawnCount === 1 ? session1 : session2;
+    });
+
+    await handleStrategicResident(
+      'task-ctx-prefix-compaction',
+      {
+        project_name: 'Proj',
+        open_messages: [],
+        strategic_session_compaction_threshold_tokens: 100,
+      },
+      { project_metadata: { project_id: 'proj-ctx' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The compacted session was primed — it received the checkpoint.
+    expect(capturedCheckpoint.length).toBeGreaterThan(0);
+    // The checkpoint must contain the operator purpose / constraints preamble.
+    expect(capturedCheckpoint).toContain('Operator Purpose: build great software.');
+    expect(capturedCheckpoint).toContain('Constraints: do not break prod.');
+    expect(capturedCheckpoint).toContain('stabilize v26');
+  });
+
+  it('workspace recovery checkpoint carries contextPrefix so the restarted subprocess has operator grounding', async () => {
+    // Finding: the subprocess spawned after workspace recovery was primed with a
+    // compaction checkpoint that lacked contextPrefix — the restored session would
+    // operate without the operator purpose / constraints preamble. This test verifies
+    // contextPrefix flows into the recovery prime.
+    const CONTEXT_PREFIX = 'Operator Purpose: autonomous research.\nConstraints: no prod writes.\nCurrent focus: v26 fix wave.';
+    mockBuildContextPrefix.mockReturnValue(CONTEXT_PREFIX);
+
+    vi.spyOn(fs, 'existsSync').mockReturnValue(false);
+
+    let capturedCheckpoint = '';
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'fresh-read-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockResolvedValue({ authority_held: true });
+
+    const session1 = makeSession(
+      () => Promise.resolve(turnResult({ resultText: '', inputTokens: 0 })),
+      () => false,
+    );
+    const session2 = makeSession(
+      (text) => {
+        capturedCheckpoint = typeof text === 'string' ? text : JSON.stringify(text);
+        return Promise.resolve(turnResult({ resultText: 'primed after recovery', inputTokens: 0 }));
+      },
+      () => false,
+    );
+    mockStartSession
+      .mockReturnValueOnce(session1)
+      .mockReturnValueOnce(session2);
+
+    await handleStrategicResident(
+      'task-ctx-prefix-recovery',
+      { project_name: 'RecoveryProj', open_messages: [] },
+      { project_metadata: { project_id: 'proj-recovery' }, context: {} },
+      'PUSH-CAPABLE-GHTOK', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The recovery subprocess received a prime with the checkpoint.
+    // eslint-disable-next-line @typescript-eslint/unbound-method
+    expect(session2.sendTurn).toHaveBeenCalledTimes(1);
+    // The checkpoint must carry the operator purpose / constraints.
+    expect(capturedCheckpoint).toContain('Operator Purpose: autonomous research.');
+    expect(capturedCheckpoint).toContain('Constraints: no prod writes.');
+    expect(capturedCheckpoint).toContain('v26 fix wave');
   });
 });
 
@@ -454,11 +980,15 @@ describe('refreshResidentGitReadToken — the resident holds no ambient push-cap
 describe('recloneResidentWorkspace — fresh READ-scoped credential at the moment of use', () => {
   beforeEach(() => {
     mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
     mockSendLog.mockReset();
     mockWriteGitTokenFile.mockReset();
     mockSetupGitCredentialHelper.mockReset();
     mockPrepareWorkspaceForRole.mockReset();
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
   });
+  afterEach(() => { vi.restoreAllMocks(); });
 
   it('mints a FRESH read-scoped token and clones with it — never the stale push token', async () => {
     mockApiGet.mockResolvedValue({ token: 'fresh-read-token' });
@@ -491,6 +1021,662 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     expect(mockSetupGitCredentialHelper).toHaveBeenCalledWith('o', 'r', expect.anything());
   });
 
+  it('calls recordOperatorDecisionCapture(true) when operator turn has OPERATOR-DECISION marker', async () => {
+    const OPERATOR_MSG = {
+      id: 'msg-captured',
+      content: 'Use approach Y instead.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({ problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '' });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string) => {
+      if (url.includes('heartbeat')) {
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      if (url.includes('strategic')) {
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    const session = makeSession(
+      () => Promise.resolve(turnResult({
+        resultText: 'I agree, approach Y is better.',
+        accumulatedTurnText: 'OPERATOR-DECISION: use approach Y, not X',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-cap', {}, { project_metadata: { project_id: 'proj-cap' } },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(mockApiPost).toHaveBeenLastCalledWith(
+      expect.stringContaining('heartbeat'),
+      expect.objectContaining({ handled_message_ids: ['msg-captured'] }),
+    );
+    expect(recordOperatorDecisionCapture).toHaveBeenCalledWith('captured');
+  });
+
+  it('keeps an earlier markerless exchange pending when a later marked turn arrives before the corrective tick', async () => {
+    // The later marked turn must not overwrite or consume the first exchange's
+    // durable review, and each completed turn contributes once to marker coverage.
+    const OPERATOR_MSG = {
+      id: 'msg-nomarker',
+      content: 'Try approach Z.',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    const MARKED_MSG = {
+      id: 'msg-marked', content: 'Keep approach Y.',
+      created_at: new Date(Date.now() + 1).toISOString(), from_type: 'user',
+    };
+    let pollCount = 0;
+    let heartbeatNote = '';
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) {
+        const messages = pollCount++ === 0 ? [OPERATOR_MSG]
+          : pollCount === 2 ? [MARKED_MSG] : [];
+        return Promise.resolve({ messages });
+      }
+      if (url.includes('checkpoint-state')) {
+        return Promise.resolve({ problem_model: {}, vision: {}, strategic_memory_notes: [], running_update: '' });
+      }
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        // The operator-turn heartbeat lands BEFORE we stop; capture its serialized
+        // exam ledger so we can prove the corrective flag was armed.
+        if (typeof body?.note === 'string') heartbeatNote = body.note;
+        return Promise.resolve({ authority_held: true, stop_requested: pollCount >= 2 });
+      }
+      if (url.includes('strategic')) {
+        return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    });
+    let turn = 0;
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ resultText: turn++ === 0
+        ? 'OK, will examine approach Z.'
+        : 'Confirmed.\nOPERATOR-DECISION: Keep approach Y.',
+      })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.mocked(recordOperatorDecisionCapture).mockClear();
+
+    await handleStrategicResident(
+      'task-nm', {}, { project_metadata: { project_id: 'proj-nm' } },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(vi.mocked(recordOperatorDecisionCapture).mock.calls).toEqual([
+      ['markerless'], ['captured'],
+    ]);
+    expect(heartbeatNote).toContain('"operatorDecisionCorrective":true');
+    expect(heartbeatNote).toContain('"messageIds":["msg-nomarker"]');
+    expect(heartbeatNote).not.toContain('"messageIds":["msg-marked"]');
+  });
+});
+
+// ── Autonomous corrective tick: recover a missed operator decision, reorder
+// heartbeat vs classification/admission (defects 1, 2, 4). Restoring
+// operatorDecisionCorrective=true from the
+// persisted ledger makes the FIRST autonomous tick the marker-miss corrective.
+describe('handleStrategicResident — autonomous marker-miss corrective loop', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    mockSendLog.mockReset();
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.mocked(recordOperatorDecisionCapture).mockClear();
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+  });
+  afterEach(() => { vi.restoreAllMocks(); });
+
+  /** Build a task whose context restores operatorDecisionCorrective=true so the
+   *  first autonomous tick runs as the marker-miss corrective. */
+  const correctiveTask = (): Record<string, unknown> => ({
+    project_metadata: { project_id: 'proj-corr' },
+    context: {
+      _exam_ledger: JSON.stringify({
+        records: [], tick: 7, corrective: false, operatorDecisionCorrective: true,
+      }),
+    },
+  });
+
+  it('recovers a missed OPERATOR-DECISION from the corrective tick, admits it to the durable register, and the heartbeat carries it (classification+admission run BEFORE the heartbeat)', async () => {
+    const RECOVERED_NOTE = 'operator settled on approach X — was said in chat without the marker';
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        // The corrective autonomous tick recovers the decision the operator
+        // forgot to mark. appliedStrategicOp so no trailing pace-sleep; die so the
+        // loop exits after this single tick's heartbeat has landed.
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: `Re-checked the recent operator conversation.\nOPERATOR-DECISION: ${RECOVERED_NOTE}`,
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr', { project_name: 'Proj', open_messages: [] }, correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // A confirmed miss was recorded (evidence-grounded: recovered on the tick).
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+
+    // Defect 4: the post-turn heartbeat carries BOTH the just-classified exam
+    // record AND the newly recovered decision — proving classification + admission
+    // ran BEFORE the heartbeat (no restart window).
+    const withDecision = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string' && b.decisions_reg.includes(RECOVERED_NOTE)
+        && typeof b.note === 'string',
+    );
+    expect(withDecision).toBeDefined();
+    const reg = JSON.parse(withDecision?.decisions_reg ?? '{}') as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const recovered = reg.entries.find((e) => e.surfaceKey === 'operator:message');
+    expect(recovered).toEqual(
+      expect.objectContaining({ verdict: 'operator', note: RECOVERED_NOTE }),
+    );
+    // The same heartbeat's exam ledger carries the just-pushed record (tick 8).
+    const ledger = JSON.parse(withDecision?.note ?? '{}') as { tick: number };
+    expect(ledger.tick).toBe(8);
+  });
+
+  it('records a capture (true) — NOT a miss — when the corrective tick completes cleanly with no recovered decision', async () => {
+    let alive = true;
+    let heartbeatNote = '';
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (typeof body?.note === 'string') heartbeatNote = body.note;
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false;
+        // Clean completion, no OPERATOR-DECISION marker → the operator's earlier
+        // markerless turn was routine chat; nothing was actually missed.
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent conversation.\nOPERATOR-DECISION-REVIEW: NO-DECISION\nTICK-VERDICT: CLEAR — nothing actionable',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr2', { project_name: 'Proj', open_messages: [] }, correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+    // The corrective was resolved → the flag is cleared in the serialized ledger.
+    expect(heartbeatNote).toContain('"operatorDecisionCorrective":false');
+  });
+
+  it('keeps operatorDecisionCorrectiveNext armed across an INTERRUPTED corrective tick and fires it again on the next autonomous tick', async () => {
+    // Defect 2: the corrective flag must NOT be consumed before the turn succeeds.
+    // Turn 1 is interrupted (no recovery, inconclusive) → record nothing, flag
+    // survives (re-serialized in the heartbeat) → turn 2 re-runs the corrective.
+    let turn = 0;
+    let alive = true;
+    const autonomousPrompts: string[] = [];
+    let interruptedHeartbeatNote = '';
+    // Increment work_state_rev on every heartbeat so the post-turn rev differs
+    // from the liveness rev observed during gating — deterministically firing the
+    // second autonomous tick without waiting on the floor interval.
+    let rev = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        rev += 1;
+        // Capture the exam-ledger note from the FIRST (post-interrupt) heartbeat.
+        if (turn === 1 && typeof body?.note === 'string' && !interruptedHeartbeatNote) {
+          interruptedHeartbeatNote = body.note;
+        }
+        return Promise.resolve({ authority_held: true, work_state_rev: `rev-${rev}` });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      (text) => {
+        turn += 1;
+        autonomousPrompts.push(typeof text === 'string' ? text : JSON.stringify(text));
+        if (turn === 1) {
+          // Interrupted mid-thought before it could recover the decision.
+          return Promise.resolve(turnResult({
+            resultText: 'OPERATOR-DECISION: partial marker must not settle',
+            interrupted: true, sawToolUse: false, inputTokens: 0,
+          }));
+        }
+        // Turn 2: complete cleanly (no recovery) and die so the loop exits.
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Second look — still nothing pending.\nTICK-VERDICT: CLEAR — nothing actionable',
+          appliedStrategicOp: true, inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-corr3',
+      // Small tick intervals keep the between-turn gating wait short.
+      {
+        project_name: 'Proj', open_messages: [],
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.75,
+      },
+      correctiveTask(),
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Two autonomous ticks ran.
+    expect(turn).toBe(2);
+    // Turn 1 was the corrective (restored flag).
+    expect(autonomousPrompts[0]).toContain('OPERATOR-DECISION REVIEW');
+    expect(recordOperatorDecisionCapture).not.toHaveBeenCalled();
+    // Defect 2: the flag survived the interrupt in the serialized ledger…
+    expect(interruptedHeartbeatNote).toContain('"operatorDecisionCorrective":true');
+    // …and re-fired the corrective on the SECOND autonomous tick.
+    expect(autonomousPrompts[1]).toContain('OPERATOR-DECISION REVIEW');
+  }, 10_000);
+
+  it('exhausts review attempts and force-admits exchange text to the durable decisions register, clearing the review and emitting a status', async () => {
+    // The model has failed to classify this operator exchange for
+    // MAX_REVIEW_ATTEMPTS consecutive autonomous ticks. The escape hatch
+    // (strategic-resident.ts ~1450-1492) force-admits the available exchange text
+    // into the durable decisions register so the operator correction is not lost
+    // at restart or compaction, then clears the pending review.
+    const EXCHANGE_TEXT = 'operator prefers approach Z — do not rewrite the table-based path';
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false; // die after this turn so the loop exits after the heartbeat
+        // No OPERATOR-DECISION or OPERATOR-DECISION-REVIEW marker →
+        // classifyOperatorDecisionReview returns kind='pending', triggering the
+        // retain-then-escape-hatch branch.
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent operator exchange. Nothing new.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-exhaust',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-exhaust' },
+        context: {
+          // Seed a review with attempts = MAX_REVIEW_ATTEMPTS - 1 (2) so the
+          // next retain (increment to 3) trips the >=MAX_REVIEW_ATTEMPTS escape
+          // hatch on the first autonomous turn.
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 10,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-exhaust'],
+              exchangeText: EXCHANGE_TEXT,
+              startedAt: '2026-07-17T10:00:00Z',
+              attempts: 2, // MAX_REVIEW_ATTEMPTS - 1
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // (a) The heartbeat's decisions_reg must contain the fallback entry with
+    //     the exchange text prefixed by the "unclassified after N attempts" marker.
+    const withFallback = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string'
+        && b.decisions_reg.includes(EXCHANGE_TEXT)
+        && typeof b.note === 'string',
+    );
+    expect(withFallback).toBeDefined();
+    const reg = JSON.parse((withFallback as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const fallbackEntry = reg.entries.find((e) => e.surfaceKey === 'operator:message');
+    expect(fallbackEntry).toBeDefined();
+    expect(fallbackEntry?.verdict).toBe('operator');
+    expect(fallbackEntry?.note).toContain('[unclassified after 3 attempts]');
+    expect(fallbackEntry?.note).toContain(EXCHANGE_TEXT);
+
+    // (b) The serialized exam ledger in the heartbeat shows the review is cleared.
+    const ledger = JSON.parse((withFallback as Record<string, string>).note) as { operatorDecisionReview: unknown };
+    expect(ledger.operatorDecisionReview).toBeNull();
+
+    // (c) The streamer emitted the escape-hatch status via scheduleDrain. The
+    //     status must pass through the rate-limited async drain queue (one frame
+    //     per STREAM_FLUSH_MS=100), so skip the timed assertion here — the
+    //     decisions-register and ledger assertions above are the authoritative
+    //     evidence that the escape hatch fired correctly.
+    //     (The lib-level test strategic-resident-lib.test.ts covers the inline
+    //     fallback-note construction and admission, and the ``it('id-less
+    //     overflow sentinel: repeated MAX_REVIEW_ATTEMPTS fallback admissions
+    //     produce at most one register entry')`` test verifies the dedup guard.)
+  });
+
+  it('exhausted-attempts fallback with no exchange text produces [exchange text unavailable] in the note', async () => {
+    // Same as above but the pending review has no exchangeText field — the
+    // fallback note must contain the "unavailable" sentinel rather than the
+    // exchange text itself.
+    let alive = true;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        return Promise.resolve({ authority_held: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(
+      () => {
+        alive = false;
+        return Promise.resolve(turnResult({
+          resultText: 'Checked the conversation. No action needed.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => alive,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-exhaust-no-text',
+      { project_name: 'Proj', open_messages: [] },
+      {
+        project_metadata: { project_id: 'proj-exhaust-nt' },
+        context: {
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 10,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: ['msg-no-text'],
+              // no exchangeText field — exchange was too short or unavailable
+              startedAt: '2026-07-17T10:00:00Z',
+              attempts: 2, // MAX_REVIEW_ATTEMPTS - 1
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // The decisions_reg must contain a fallback entry whose note says
+    // "[exchange text unavailable]" instead of any actual exchange text.
+    const withFallback = heartbeatBodies.find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string'
+        && typeof b.note === 'string',
+    );
+    expect(withFallback).toBeDefined();
+    const reg = JSON.parse((withFallback as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const fallbackEntryNote = reg.entries.find((e) => e.surfaceKey === 'operator:message')?.note;
+    expect(fallbackEntryNote).toBeDefined();
+    // The note must use the "unavailable" sentinel, not contain any real text.
+    expect(fallbackEntryNote).toContain('[unclassified after 3 attempts');
+    expect(fallbackEntryNote).toContain('exchange text unavailable');
+    // No actual exchange text in the note.
+    expect(fallbackEntryNote).not.toContain('Checked the conversation');
+
+    // The review is cleared in the serialized ledger.
+    const ledger = JSON.parse((withFallback as Record<string, string>).note) as { operatorDecisionReview: unknown };
+    expect(ledger.operatorDecisionReview).toBeNull();
+  });
+
+  it('id-less overflow sentinel: repeated escape-hatch trips through the handler loop produce at most one decisions-register entry (sentinelKey dedup guard)', async () => {
+    // The id-less overflow sentinel (messageIds:[], overflowed:true) has no stable
+    // message ids, so the same sentinel can re-trip the MAX_REVIEW_ATTEMPTS escape
+    // hatch on every failed autonomous turn. The alreadyAdmitted guard at
+    // strategic-resident.ts:1464-1465 detects a prior sentinel entry by the
+    // sentinel:${startedAt} key embedded in the note and skips re-admission.
+    //
+    // This test exercises the guard through the full handler loop:
+    //   - decisions_reg is pre-seeded with one entry already carrying the sentinel key
+    //     (representing what was admitted on a prior autonomous turn / prior handler run)
+    //   - the exam ledger seeds the id-less overflow sentinel at attempts=1 so two
+    //     autonomous turns are needed: turn 1 retains (2 < MAX_REVIEW_ATTEMPTS=3, no
+    //     escape hatch), turn 2 retains (3 >= MAX_REVIEW_ATTEMPTS, escape hatch fires)
+    //   - on the escape-hatch turn, alreadyAdmitted=true and no second entry is added
+    //   - the final decisions_reg must still carry exactly one sentinel-key entry
+    const STARTED_AT = '2026-07-10T09:00:00Z';
+    const SENTINEL_KEY = `sentinel:${STARTED_AT}`;
+    const EXCHANGE_TEXT = 'operator preferred keeping the table-based layout as-is';
+
+    let turnCount = 0;
+    let hbRev = 0;
+    const heartbeatBodies: Array<Record<string, unknown>> = [];
+
+    // Pre-seed one sentinel entry representing what was admitted on a prior trip.
+    const preSeededDecisionsReg = JSON.stringify({
+      entries: [{
+        atTick: 8,
+        at: STARTED_AT,
+        surfaceKey: 'operator:message',
+        verdict: 'operator',
+        note: `[unclassified after 3 attempts ${SENTINEL_KEY}] ${EXCHANGE_TEXT}`,
+      }],
+    });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) {
+        return Promise.resolve({ token: 'read-scoped-token' });
+      }
+      if (url.includes('/messages?')) return Promise.resolve({ messages: [] });
+      return Promise.resolve(null);
+    });
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('heartbeat')) {
+        if (body) heartbeatBodies.push(body);
+        hbRev += 1;
+        // Increment work_state_rev on every heartbeat so the autonomous-turn
+        // gate fires immediately on the next iteration (world-moved signal).
+        return Promise.resolve({ authority_held: true, work_state_rev: `rev-${hbRev}` });
+      }
+      return Promise.resolve({});
+    });
+
+    // Two turns: neither emits a classification marker so the review is retained,
+    // then on the second turn the escape hatch fires with alreadyAdmitted=true.
+    const session = makeSession(
+      () => {
+        turnCount += 1;
+        return Promise.resolve(turnResult({
+          resultText: 'Reviewed the recent operator batch. Nothing newly actionable.',
+          appliedStrategicOp: true,
+          inputTokens: 0,
+        }));
+      },
+      () => turnCount < 2,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-sentinel-dedup',
+      // Small tick intervals keep the between-turn gating wait short.
+      {
+        project_name: 'Proj', open_messages: [],
+        strategic_session_idle_tick_seconds: 1,
+        strategic_session_message_poll_seconds: 0.75,
+      },
+      {
+        project_metadata: { project_id: 'proj-sentinel-dedup' },
+        context: {
+          // Pre-existing sentinel entry from a prior trip — the guard must block
+          // a second admission of an entry with the same sentinel key.
+          _decisions_reg: preSeededDecisionsReg,
+          // Id-less overflow sentinel at attempts=1: two retains (turns 1 and 2)
+          // are needed before the escape hatch fires (3 >= MAX_REVIEW_ATTEMPTS=3).
+          _exam_ledger: JSON.stringify({
+            records: [],
+            tick: 9,
+            corrective: false,
+            operatorDecisionCorrective: true,
+            operatorDecisionReview: {
+              status: 'pending',
+              messageIds: [],
+              overflowed: true,
+              overflowExchanges: 2,
+              exchangeText: EXCHANGE_TEXT,
+              startedAt: STARTED_AT,
+              attempts: 1, // one retain reaches 2 (no hatch); second reach 3 (hatch)
+            },
+          }),
+        },
+      },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Both turns must have executed.
+    expect(turnCount).toBe(2);
+
+    // (a) The last heartbeat's decisions_reg must contain exactly one entry with
+    //     the sentinel key — the dedup guard blocked the second admission.
+    const lastWithDecisions = [...heartbeatBodies].reverse().find(
+      (b): b is Record<string, unknown> & { decisions_reg: string; note: string } =>
+        typeof b.decisions_reg === 'string' && typeof b.note === 'string',
+    );
+    expect(lastWithDecisions).toBeDefined();
+    const reg = JSON.parse((lastWithDecisions as Record<string, string>).decisions_reg) as {
+      entries: Array<{ surfaceKey: string; verdict: string; note: string }>;
+    };
+    const sentinelEntries = reg.entries.filter(
+      (e) => e.surfaceKey === 'operator:message' && e.note.includes(SENTINEL_KEY),
+    );
+    expect(sentinelEntries).toHaveLength(1);
+
+    // (b) The review is cleared in the serialized ledger (advance returned null
+    //     because coversOverflow:activeOverflowSentinel was passed on the hatch turn).
+    const finalLedger = JSON.parse((lastWithDecisions as Record<string, string>).note) as {
+      operatorDecisionReview: unknown;
+    };
+    expect(finalLedger.operatorDecisionReview).toBeNull();
+  });
+});
+
+describe('recloneResidentWorkspace', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockPrepareWorkspaceForRole.mockReset();
+    mockWriteGitTokenFile.mockReset();
+    mockSetupGitCredentialHelper.mockReset();
+  });
+
   it('throws rather than re-cloning when no read token can be minted', async () => {
     mockApiGet.mockResolvedValue(null);
 
@@ -501,5 +1687,199 @@ describe('recloneResidentWorkspace — fresh READ-scoped credential at the momen
     // parked in the ambient credential file.
     expect(mockPrepareWorkspaceForRole).not.toHaveBeenCalled();
     expect(mockWriteGitTokenFile).not.toHaveBeenCalled();
+  });
+});
+
+// ── Early operator-turn acknowledgment ───────────────────────────────────────
+// When an operator turn runs longer than the configured threshold, the handler
+// must post a durable "on it" message so the operator gets a progress signal
+// during a slow turn rather than silence for the full duration. The ack is
+// suppressed entirely for fast turns (timer is cleared before it fires).
+
+describe('handleStrategicResident — early operator-turn acknowledgment', () => {
+  beforeEach(() => {
+    mockApiGet.mockReset();
+    mockApiPost.mockReset();
+    mockStartSession.mockReset();
+    mockSendLog.mockReset();
+    mockSendWsFrame.mockReset();
+    mockSendWsFrame.mockReturnValue(true);
+    vi.spyOn(fs, 'existsSync').mockReturnValue(true);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('posts an early acknowledgment when the operator turn exceeds the configured threshold', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-slow',
+      content: 'Question that will take a while to answer',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    let resolveTurn!: (r: ResidentTurnResult) => void;
+    const blockedTurnPromise = new Promise<ResidentTurnResult>((resolve) => { resolveTurn = resolve; });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const strategicPosts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        strategicPosts.push(body);
+      }
+      if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(() => blockedTurnPromise, () => true);
+    mockStartSession.mockReturnValue(session);
+
+    // 2s threshold (above the 1s floor) — should fire during the slow turn
+    const handlerDone = handleStrategicResident(
+      'task-early-ack',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 2,
+      },
+      { project_metadata: { project_id: 'proj-ack' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Advance past the threshold — ack timer fires at 2000ms
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // The early ack must have been posted
+    expect(strategicPosts.length).toBeGreaterThanOrEqual(1);
+    expect(JSON.stringify(strategicPosts[0])).toContain('On it');
+
+    // Resolve the slow turn; handler should proceed to the heartbeat and stop
+    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await handlerDone;
+  });
+
+  it('does not post an early ack when the turn completes before the threshold elapses', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-fast',
+      content: 'Quick question',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    const ackPosts: Array<Record<string, unknown>> = [];
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        ackPosts.push(body);
+      }
+      if (url.includes('heartbeat')) return Promise.resolve({ authority_held: true, stop_requested: true });
+      return Promise.resolve({});
+    });
+
+    // Turn resolves immediately — before any 10s timer can fire
+    const session = makeSession(
+      () => Promise.resolve(turnResult({ sentOperatorMessage: true })),
+      () => true,
+    );
+    mockStartSession.mockReturnValue(session);
+
+    await handleStrategicResident(
+      'task-fast-ack',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 10,
+      },
+      { project_metadata: { project_id: 'proj-fast-ack' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Advance well past the 10s threshold to confirm the timer was cancelled, not just unfired
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(ackPosts.length).toBe(0);
+  });
+
+  it('completes normally when the early ack post fails', async () => {
+    vi.useFakeTimers();
+
+    const OPERATOR_MSG = {
+      id: 'msg-ack-fail',
+      content: 'Message where ack will fail',
+      created_at: new Date().toISOString(),
+      from_type: 'user',
+    };
+    let pollCount = 0;
+    let resolveTurn!: (r: ResidentTurnResult) => void;
+    const blockedTurnPromise = new Promise<ResidentTurnResult>((resolve) => { resolveTurn = resolve; });
+
+    mockApiGet.mockImplementation((url: string) => {
+      if (url.includes('/api/agent/git-read-token')) return Promise.resolve({ token: 'read-scoped-token' });
+      if (url.includes('/messages?')) {
+        if (pollCount++ === 0) return Promise.resolve({ messages: [OPERATOR_MSG] });
+        return Promise.resolve({ messages: [] });
+      }
+      return Promise.resolve(null);
+    });
+
+    let heartbeatCount = 0;
+    mockApiPost.mockImplementation((url: string, body?: Record<string, unknown>) => {
+      // Ack post fails — must be non-fatal
+      if (url.includes('/api/agent/strategic') && body?.op === 'create_message') {
+        return Promise.reject(new Error('ack post failed'));
+      }
+      if (url.includes('heartbeat')) {
+        heartbeatCount += 1;
+        return Promise.resolve({ authority_held: true, stop_requested: true });
+      }
+      return Promise.resolve({});
+    });
+
+    const session = makeSession(() => blockedTurnPromise, () => true);
+    mockStartSession.mockReturnValue(session);
+
+    const handlerDone = handleStrategicResident(
+      'task-ack-fail',
+      {
+        project_name: 'P',
+        open_messages: [],
+        strategic_session_operator_ack_threshold_seconds: 2,
+      },
+      { project_metadata: { project_id: 'proj-ack-fail' }, context: {} },
+      'ghtok', 'owner', 'repo', null, { value: '' },
+    );
+
+    // Ack fires at 2s and its post fails (non-fatal)
+    await vi.advanceTimersByTimeAsync(3000);
+
+    // Handler must still complete normally after the ack failure
+    resolveTurn(turnResult({ sentOperatorMessage: true }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await handlerDone;
+
+    // The heartbeat (proof the turn completed) must have been reached
+    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
   });
 });

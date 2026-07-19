@@ -288,6 +288,8 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
   'protection_blocked_review',
   'qualifying',
   'required_check_failed',
+  'rubric_changed',
+  'rubric_provenance_unknown',
 ]);
 // Derived qualification states that mean an audit / promotion run is actively
 // in flight for the current candidate. When the effective status is any of
@@ -323,6 +325,22 @@ const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
  * the burn-down framing itself.
  */
 export function formatCriteriaRubric(versionPhase: Record<string, unknown>): string[] {
+  const parts: string[] = [];
+  parts.push('\n### Acceptance criteria (authored rubric)');
+
+  // Distinguish "the criterion_coverage key was never packed into this version_phase"
+  // (floored out for budget — the packer trims evidence bulk under pressure) from
+  // "the key is present but no criteria exist". Collapsing these two is a trust-surface
+  // bug: it produced a false "None authored yet" line while healthy criteria were live,
+  // and — because thinker.ts §8 authors criteria only when none exist — a
+  // duplicate-authoring hazard. See the packer floor path, which preserves the criteria
+  // list precisely so this stays truthful under budget pressure.
+  const coverageAbsent = !('criterion_coverage' in versionPhase);
+  if (coverageAbsent) {
+    parts.push('_Criteria not shipped this cycle (floored out for budget) — run `./fetch version-phase` to see the live rubric._');
+    return parts;
+  }
+
   const coverageRaw = versionPhase.criterion_coverage;
   const coverage = coverageRaw && typeof coverageRaw === 'object' && !Array.isArray(coverageRaw)
     ? coverageRaw as Record<string, unknown>
@@ -335,12 +353,11 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
     && (c as Record<string, unknown>).status === 'active'
     && typeof (c as Record<string, unknown>).criterion_key === 'string');
 
-  const parts: string[] = [];
-  parts.push('\n### Acceptance criteria (authored rubric)');
-
   if (active.length === 0) {
     // Must be EXPLICIT: thinker.ts §8 authors criteria only when none exist yet, so
-    // "no criteria" and "criteria not rendered" must never look the same.
+    // "no criteria" and "criteria not rendered" must never look the same. The
+    // key-absent (floored-out) case is handled above; reaching here means the key is
+    // present and genuinely empty — no criteria have been authored for this version.
     parts.push('_None authored yet for this version._');
     return parts;
   }
@@ -355,6 +372,7 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
     const stuck = typeof c.stuck_reason === 'string' && c.stuck_reason ? c.stuck_reason : null;
     parts.push(`- \`${key}\`: ${text}${stuck ? ` — **stuck: ${stuck}** (no work maps to this; retract or re-map it)` : ''}`);
   }
+  const activeKeys = new Set(active.map((criterion) => criterion.criterion_key as string));
 
   // WHY the last grade failed — the qualifier computes this per category and it was
   // being discarded here, leaving only an opaque blocker code.
@@ -366,7 +384,9 @@ export function formatCriteriaRubric(versionPhase: Record<string, unknown>): str
   const verdicts = Array.isArray(verdictsRaw) ? verdictsRaw : [];
   const unmet = verdicts.filter((v): v is Record<string, unknown> =>
     !!v && typeof v === 'object' && !Array.isArray(v)
-    && (v as Record<string, unknown>).status !== 'met');
+    && (v as Record<string, unknown>).status !== 'met'
+    && typeof (v as Record<string, unknown>).category_key === 'string'
+    && activeKeys.has((v as Record<string, unknown>).category_key as string));
   if (unmet.length > 0) {
     parts.push('Last grade — categories NOT met (with the grader\'s gap):');
     for (const v of unmet) {

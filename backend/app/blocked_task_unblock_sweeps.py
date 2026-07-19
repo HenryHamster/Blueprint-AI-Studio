@@ -318,11 +318,12 @@ def _clear_blocked_fields(task, *, preserve_first_blocked: bool = False) -> None
     ]
     if not preserve_first_blocked:
         keys.append("_blocked_first_at")
-        # The optimistic-retry budget is preserved across an onset-preserving
-        # requeue (so a transient agent/lifecycle blocker keeps counting toward
-        # its cap), but wiped on a genuine dependency clear so a later, unrelated
-        # block starts with a fresh budget.
+        # The optimistic-retry budget and evidence timestamp are preserved across
+        # an onset-preserving requeue (so a transient agent/lifecycle blocker keeps
+        # counting toward its cap), but wiped on a genuine dependency clear so a
+        # later, unrelated block starts with a fresh budget.
         keys.append("_blocked_optimistic_retries")
+        keys.append("_blocked_last_retry_at")
         # The defer counter and escalation stamp must also survive an
         # onset-preserving (optimistic) requeue: if dispatch re-blocks on the
         # same blocker identity, _record_defer_and_maybe_escalate increments
@@ -525,6 +526,7 @@ async def _classify_blocker_needs(
         capability_need_blocked_by_proof_gate,
         capability_need_proof_status,
         registry_satisfies_capability_need,
+        task_backed_capability_need_blocked_by_proof_gate,
     )
 
     needs = get_blocker_needs(task)
@@ -582,6 +584,21 @@ async def _classify_blocker_needs(
     if working_proof is None:
         working_proof = {}
     working_caps = set(working_proof)
+    project = None
+
+    async def _task_backed_capability_is_held(need):
+        nonlocal project
+        if need.get("kind") != "capability":
+            return False
+        if project is None:
+            from app.models import Project
+            project = await session.get(Project, task.project_id)
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need,
+            getattr(project, "capability_proof_records", None),
+            getattr(project, "problem_model", None),
+            mode=proof_gate_mode,
+        )
 
     # Stranded-parent set so a GENUINE ghost merge does NOT satisfy a completed
     # need. LANDED-IN-BASE-LINEAGE semantics: the ghost-merge exclusion fires ONLY
@@ -603,6 +620,10 @@ async def _classify_blocker_needs(
     for need in needs:
         match = resolve_blocked_need(task, need, active)
         if match is not None:
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             match_id = str(match.id)
             if match_id not in existing_edges and match_id not in disp["edges"]:
                 disp["edges"].append(match_id)
@@ -611,6 +632,10 @@ async def _classify_blocker_needs(
             completed_foundation_for_need(task, need, completed, failed_parents)
             is not None
         ):
+            if await _task_backed_capability_is_held(need):
+                disp["residual"].append(need)
+                disp["proof_gate_held"].append(need)
+                continue
             disp["completed_needs"].append(need)
             continue
         # Durable-knowledge fallback: a dangling kind='task' need whose originating
@@ -1675,11 +1700,41 @@ async def sweep_unblock_blocked_tasks(
                 and not past_deadline
                 and optimistic_used < _BLOCKED_OPTIMISTIC_RETRY_CAP
             ):
+                # Evidence gate for retries 2+: require that task.blocked_at is
+                # more recent than the last retry timestamp, proving the prior
+                # retry dispatched a real VM run that ended by re-blocking.
+                # Retry 1 (optimistic_used == 0) needs no prior evidence.
+                if optimistic_used > 0:
+                    last_retry_at_str = ctx.get("_blocked_last_retry_at")
+                    has_retry_evidence = False
+                    try:
+                        last_retry_at = datetime.fromisoformat(last_retry_at_str)
+                        has_retry_evidence = (
+                            task.blocked_at is not None
+                            and task.blocked_at > last_retry_at
+                        )
+                    except (ValueError, TypeError):
+                        # Missing, malformed, or timezone-incomparable evidence
+                        # is not proof that the previous retry ran.
+                        pass
+                    if not has_retry_evidence:
+                        # No evidence of a VM run since last retry; hold in
+                        # backoff instead of consuming the next retry slot.
+                        attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
+                        ctx["_blocked_recheck_attempts"] = attempts
+                        task.context = ctx
+                        flag_modified(task, "context")
+                        task.recheck_after = now + _next_recheck_delay(attempts)
+                        session.add(task)
+                        await _commit_task_row(_bc_start)
+                        continue
                 ctx["_blocked_optimistic_retries"] = optimistic_used + 1
+                ctx["_blocked_last_retry_at"] = now.isoformat()
                 task.context = ctx
-                # _clear_blocked_fields preserves _blocked_optimistic_retries on
-                # an onset-preserving requeue (it is only wiped on a genuine
-                # dependency clear), so the budget keeps counting across re-blocks.
+                # _clear_blocked_fields preserves _blocked_optimistic_retries and
+                # _blocked_last_retry_at on an onset-preserving requeue (only wiped
+                # on a genuine dependency clear), so the budget and evidence
+                # timestamp keep accumulating across re-blocks.
                 _clear_blocked_fields(task, preserve_first_blocked=True)
                 task.status = TaskStatus.QUEUED
                 task.latest_status_message = (
@@ -1916,6 +1971,40 @@ async def event_driven_unblock_on_knowledge(
     if requeued:
         logger.info(
             "[REAPER] event_driven_unblock_on_knowledge: new knowledge in project %s "
+            "unblocked %d task(s) → QUEUED",
+            project_id,
+            requeued,
+        )
+    return requeued
+
+
+async def event_driven_unblock_on_capability_proof(
+    project_id,
+    session,
+    *,
+    batch_size: int = 50,
+) -> int:
+    """Re-resolve proof-gated BLOCKED tasks after a capability earns proof.
+
+    A newly committed executed-test proof changes the registry answer for every
+    same-project ``kind='capability'`` need, but those tasks may have a future
+    ``recheck_after``. Reuse the shared locked, bounded resolver so only tasks
+    whose *all* needs are now satisfied resume. This event seam is deliberately
+    fail-open: proof persistence remains authoritative if wake-up work fails.
+    """
+    try:
+        requeued = await _event_driven_unblock_project(
+            project_id, session, batch_size=batch_size
+        )
+    except Exception:
+        logger.exception(
+            "[REAPER] event_driven_unblock_on_capability_proof failed for project %s",
+            project_id,
+        )
+        return 0
+    if requeued:
+        logger.info(
+            "[REAPER] event_driven_unblock_on_capability_proof: new proof in project %s "
             "unblocked %d task(s) → QUEUED",
             project_id,
             requeued,

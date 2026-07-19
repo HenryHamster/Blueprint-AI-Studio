@@ -8,6 +8,7 @@ Covers the four new surfaces:
 """
 
 import asyncio
+import os
 import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,24 +29,34 @@ from app.models import (
     Alert,
     AlertSeverity,
     ComputeJob,
+    ComputeJobFile,
     ComputeJobOutcome,
     ComputeJobStatus,
     LocalRunner,
     MessagesNoisePrefs,
     Project,
     ProjectMember,
+    RunnerProjectBinding,
     Task,
     TaskStatus,
     _utcnow,
 )
+from app.runner_project_binding import allowed_project_ids
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.routers.admin_runners import (
     _normalize_gpu_indices_allowed,
     _runner_health,
 )
-from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
+from app.routers.runner import (
+    _FileRangeReader,
+    _MAX_MULTIPART_FIELD_BYTES,
+    _MAX_MULTIPART_PARTS,
+    _parse_heartbeat_timestamp,
+    _parse_multipart_form,
+    _parse_multipart_form_stream,
+)
 from app.runner_config import config_generation, live_safe_config
-from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
@@ -284,6 +295,219 @@ async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session)
     assert refreshed is not None
     assert refreshed is first
     assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
+
+
+@pytest.mark.asyncio
+async def test_runner_project_binding_backfill_and_resolver(db_session):
+    """The allow-list resolver folds in the enrollment project and unions
+    explicit bindings; the backfill produces exactly one row per runner."""
+    from app import runner_project_binding as rpb
+
+    proj_a = await _make_project(db_session, name="Alpha")
+    proj_b = await _make_project(db_session, name="Beta")
+    runner, _token = await _make_runner(db_session, proj_a.id)
+
+    # 1) Freshly enrolled runner with NO binding rows: the resolver still
+    #    reports its enrollment project (implicit anchor membership).
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert allowed == {proj_a.id}
+    assert await rpb.bound_project_ids(db_session, runner.id) == set()
+
+    # 2) Backfill creates exactly one binding row per runner (its enrollment
+    #    project) and is idempotent on a second run.
+    created = await rpb.backfill_enrollment_bindings(db_session)
+    await db_session.commit()
+    assert created == 1
+    rows = (
+        await db_session.execute(
+            select(RunnerProjectBinding).where(
+                RunnerProjectBinding.runner_id == runner.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].project_id == proj_a.id
+    # Idempotent: re-running adds nothing.
+    assert await rpb.backfill_enrollment_bindings(db_session) == 0
+
+    # 3) Adding a second project to the allow-list unions into the resolver.
+    await rpb.add_binding(db_session, runner.id, proj_b.id)
+    await db_session.commit()
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert allowed == {proj_a.id, proj_b.id}
+    assert await rpb.bound_project_ids(db_session, runner.id) == {
+        proj_a.id,
+        proj_b.id,
+    }
+
+    # add_binding is idempotent (unique constraint respected, no duplicate row).
+    await rpb.add_binding(db_session, runner.id, proj_b.id)
+    await db_session.commit()
+    assert await rpb.bound_project_ids(db_session, runner.id) == {
+        proj_a.id,
+        proj_b.id,
+    }
+
+    # 4) Removing the enrollment-project binding does NOT revoke access — the
+    #    resolver folds the enrollment anchor back in regardless.
+    assert await rpb.remove_binding(db_session, runner.id, proj_a.id) is True
+    await db_session.commit()
+    allowed = await rpb.allowed_project_ids(db_session, runner)
+    assert proj_a.id in allowed
+    assert allowed == {proj_a.id, proj_b.id}
+
+
+@pytest.mark.asyncio
+async def test_multi_project_runner_claim_and_authz(client: AsyncClient, db_session):
+    """Operator walkthrough: one runner enrolled under project A, granted project
+    B via the owner-gated endpoint, serves BOTH — while work in a non-allowed
+    project C is rejected server-side, and adding B does NOT create a second
+    per-project GPU/concurrency budget (the ledger stays unified).
+    """
+    proj_a = await _make_project(db_session, name="Alpha")
+    proj_b = await _make_project(db_session, name="Beta")
+    proj_c = await _make_project(db_session, name="Gamma")  # NOT on the allow-list
+    runner, token = await _make_runner(db_session, proj_a.id)
+    _seed_pool_account(TEST_USER_ID)
+    try:
+        # 1) Add project B to the runner's allow-list via the admin endpoint.
+        add_resp = await client.post(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects",
+            json={"project_id": str(proj_b.id)},
+        )
+        assert add_resp.status_code == 200, add_resp.text
+        listed = {p["project_id"] for p in add_resp.json()["projects"]}
+        assert listed == {str(proj_a.id), str(proj_b.id)}
+        # The enrollment project is flagged as the (non-removable) anchor member.
+        enrollment_entry = next(
+            p for p in add_resp.json()["projects"]
+            if p["project_id"] == str(proj_a.id)
+        )
+        assert enrollment_entry["is_enrollment"] is True
+
+        # 2) A project-B task pinned to this runner is returned by next-task, even
+        #    though the runner ENROLLED under project A.
+        task_b = Task(
+            project_id=proj_b.id,
+            payloads=[{"type": "create", "title": "cross-project claim"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task_b)
+        await db_session.commit()
+
+        nt_resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert nt_resp.status_code == 200, nt_resp.text
+        assert nt_resp.json()["task_id"] == str(task_b.id)
+
+        # 3) A compute job in ALLOWED project B is claimable and reportable.
+        job_b = ComputeJob(
+            project_id=proj_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi",
+            },
+        )
+        # 4) A compute job in NON-allowed project C, pinned to the very same
+        #    runner, must NOT be claimable — the allow-list is the authz boundary.
+        job_c = ComputeJob(
+            project_id=proj_c.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo nope",
+            },
+        )
+        db_session.add(job_b)
+        db_session.add(job_c)
+        await db_session.commit()
+
+        ncj_resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ncj_resp.status_code == 200, ncj_resp.text
+        # Only the allowed-project job is handed out — the project-C job is never
+        # returned even though it is pinned to this runner and older/newer ordering
+        # cannot surface it.
+        assert ncj_resp.json()["job_id"] == str(job_b.id)
+
+        # A report against the non-allowed project-C job is rejected (404).
+        report_c = await client.post(
+            f"/api/runner/compute-job/{job_c.id}/report",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"exec_status": "succeeded", "exit_code": 0},
+        )
+        assert report_c.status_code == 404
+
+        # 5) UNIFIED LEDGER: the dispatch cache registers ONE shared snapshot per
+        #    physical box under each allowed project — the SAME object, so pins and
+        #    active counts accrue once and a single GPU cannot be double-booked
+        #    across projects. Adding project B created no second budget.
+        cache = await orch._load_active_runners_cache(db_session)
+        snap_a = next((s for s in cache.get(proj_a.id, []) if s.id == runner.id), None)
+        snap_b = next((s for s in cache.get(proj_b.id, []) if s.id == runner.id), None)
+        assert snap_a is not None and snap_b is not None
+        assert snap_a is snap_b  # one shared ledger, not a per-project copy
+        # The non-allowed project has no candidate for this runner.
+        assert all(s.id != runner.id for s in cache.get(proj_c.id, []))
+
+        # 6) AUTHZ: attaching a project owned by a DIFFERENT account is rejected
+        #    403 even when the caller holds an owner role on it (MVP consent model).
+        cross = Project(name="CrossAccount", user_id="other-account-999")
+        db_session.add(cross)
+        await db_session.commit()
+        await db_session.refresh(cross)
+        db_session.add(
+            ProjectMember(project_id=cross.id, user_id=TEST_USER_ID, role="owner")
+        )
+        await db_session.commit()
+        cross_resp = await client.post(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects",
+            json={"project_id": str(cross.id)},
+        )
+        assert cross_resp.status_code == 403
+
+        # 7) The enrollment project cannot be removed from the allow-list.
+        rm_enroll = await client.delete(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects/{proj_a.id}"
+        )
+        assert rm_enroll.status_code == 409
+
+        # 8) Removing project B revokes cross-project service: after removal a
+        #    project-B job is no longer claimable.
+        rm_b = await client.delete(
+            f"/api/admin/projects/{proj_a.id}/runners/{runner.id}/projects/{proj_b.id}"
+        )
+        assert rm_b.status_code == 200
+        remaining = {p["project_id"] for p in rm_b.json()["projects"]}
+        assert remaining == {str(proj_a.id)}
+
+        job_b2 = ComputeJob(
+            project_id=proj_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi again",
+            },
+        )
+        db_session.add(job_b2)
+        await db_session.commit()
+        ncj_after = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert ncj_after.status_code == 204
+    finally:
+        _clear_pool()
 
 
 # ── Runner health / trust telemetry (pure, no DB) ────────────────────────────
@@ -626,6 +850,141 @@ def test_select_eligible_runner_excludes_gpu_liar_prefers_honest_runner():
     )
 
 
+def test_runner_meets_min_compute_capability_gates_on_reported_arch():
+    """`_runner_meets_min_compute_capability` returns True only when a reported GPU
+    meets the floor; absent/malformed telemetry and a non-positive floor never gate."""
+    from app.runner_eligibility import _runner_meets_min_compute_capability
+
+    # A V100 box (sm_70) reports compute capability 7.0.
+    v100 = _snapshot({"gpu_compute_capabilities": [7.0]})
+    # An L40S box (sm_89) reports 8.9.
+    l40s = _snapshot({"gpu_compute_capabilities": [8.9]})
+
+    # Floor met by the newer arch, not by the older one.
+    assert _runner_meets_min_compute_capability(l40s, 8.0) is True
+    assert _runner_meets_min_compute_capability(v100, 8.0) is False
+    # Exactly-at-floor counts (>= semantics).
+    assert _runner_meets_min_compute_capability(v100, 7.0) is True
+    # Any ONE GPU meeting the floor is enough (mixed fleet on one box).
+    mixed = _snapshot({"gpu_compute_capabilities": [7.0, 8.9]})
+    assert _runner_meets_min_compute_capability(mixed, 8.0) is True
+
+    # A non-positive floor is no floor at all.
+    assert _runner_meets_min_compute_capability(v100, 0.0) is True
+    assert _runner_meets_min_compute_capability(v100, -1.0) is True
+
+    # Absence of telemetry is NOT a disqualification (backward compatible — the
+    # reactive in-sandbox probe remains the safety net for such runners).
+    assert _runner_meets_min_compute_capability(_snapshot({}), 8.0) is True
+    assert (
+        _runner_meets_min_compute_capability(
+            _snapshot({"gpu_compute_capabilities": []}), 8.0
+        )
+        is True
+    )
+    # Malformed telemetry is not trusted to gate.
+    assert (
+        _runner_meets_min_compute_capability(
+            _snapshot({"gpu_compute_capabilities": ["oops"]}), 8.0
+        )
+        is True
+    )
+
+
+def test_coerce_min_compute_capability_defensive():
+    """`_coerce_min_compute_capability` accepts numbers/numeric strings, rejects
+    junk with an honest error, and treats unset/non-positive as no floor."""
+    from app.orchestrator_runner_dispatch import _coerce_min_compute_capability
+
+    assert _coerce_min_compute_capability({}) == (None, None)
+    assert _coerce_min_compute_capability({"min_compute_capability": 8.0}) == (
+        8.0,
+        None,
+    )
+    assert _coerce_min_compute_capability({"min_compute_capability": "7.0"}) == (
+        7.0,
+        None,
+    )
+    # Nested compute_experiment form is read too.
+    assert _coerce_min_compute_capability(
+        {"compute_experiment": {"min_compute_capability": 8.9}}
+    ) == (8.9, None)
+    # Non-positive floor == no floor (not an error).
+    assert _coerce_min_compute_capability({"min_compute_capability": 0}) == (
+        None,
+        None,
+    )
+    # Junk fails THIS task with a naming error, never raises.
+    val, err = _coerce_min_compute_capability({"min_compute_capability": "8.0sm"})
+    assert val is None and err is not None and "8.0sm" in err
+    # bool is rejected explicitly (int subclass would otherwise mean a 1.0 floor).
+    val, err = _coerce_min_compute_capability({"min_compute_capability": True})
+    assert val is None and err is not None
+    # inf is rejected (finite guard).
+    val, err = _coerce_min_compute_capability(
+        {"min_compute_capability": float("inf")}
+    )
+    assert val is None and err is not None
+
+
+def test_select_eligible_runner_excludes_incompatible_gpu_arch():
+    """A runner whose GPU arch is below an image's compute-capability floor is
+    excluded from dispatch; a runner meeting the floor is selected instead."""
+    project_id = uuid.uuid4()
+    v100 = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["Tesla V100"],
+            "gpu_compute_capabilities": [7.0],
+        }
+    )
+    l40s = _snapshot(
+        {
+            "task_types": "all",
+            "has_gpu": True,
+            "gpu_count": 1,
+            "gpu_names": ["L40S"],
+            "gpu_compute_capabilities": [8.9],
+        }
+    )
+    cache = {project_id: [v100, l40s]}
+
+    # An sm_80-floor image routes to the L40S, never the V100.
+    chosen = orch._select_eligible_runner(
+        cache,
+        project_id,
+        "compute_experiment",
+        "gpu",
+        {},
+        min_compute_capability=8.0,
+    )
+    assert chosen is l40s
+
+    # With ONLY the V100 available, an sm_80 image finds no eligible runner (it
+    # holds for compatible hardware rather than dying in the in-sandbox probe).
+    v100_only = {project_id: [v100]}
+    assert (
+        orch._select_eligible_runner(
+            v100_only,
+            project_id,
+            "compute_experiment",
+            "gpu",
+            {},
+            min_compute_capability=8.0,
+        )
+        is None
+    )
+    # Without a floor, the V100 is a perfectly good runner (gate is a no-op).
+    assert (
+        orch._select_eligible_runner(
+            v100_only, project_id, "compute_experiment", "gpu", {}
+        )
+        is v100
+    )
+
+
 class TestRunnerHealthAgentUnavailableReason:
     """_runner_health() surfaces agent_unavailable_reason from capabilities JSONB."""
 
@@ -792,7 +1151,7 @@ class TestAdminRunnerEndpoints:
         assert row is not None
         assert row.capabilities["runner_preset"] == "strategic_local"
         assert row.capabilities["workload"] == "strategic"
-        assert row.capabilities["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert row.capabilities["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         assert row.capabilities["max_concurrent"] == 1
 
     @pytest.mark.asyncio
@@ -1392,6 +1751,264 @@ class TestAdminRunnerEndpoints:
         }
 
 
+# ── Editable multi-project allow-list admin API ──────────────────────────────
+
+
+class TestRunnerAllowedProjectsEndpoints:
+    """The owner-gated, editable runner<->project allow-list endpoints."""
+
+    async def _register_runner(self, client: AsyncClient, project) -> uuid.UUID:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={"hostname": "multi-box"},
+        )
+        assert resp.status_code == 200
+        return uuid.UUID(resp.json()["runner_id"])
+
+    @pytest.mark.asyncio
+    async def test_list_runners_includes_allowed_projects(
+        self, client: AsyncClient, db_session
+    ):
+        """A freshly registered runner shows its enrollment project via the
+        dedicated allow-list endpoint."""
+        project = await _make_project(db_session, name="Home Project")
+        runner_id = await self._register_runner(client, project)
+
+        # Verify the runner appears in the list.
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200
+        rows = resp.json()
+        assert any(r["id"] == str(runner_id) for r in rows)
+
+        # Verify the allow-list via the dedicated endpoint.
+        proj_resp = await client.get(
+            f"/api/admin/projects/{project.id}/runners/{runner_id}/projects"
+        )
+        assert proj_resp.status_code == 200
+        data = proj_resp.json()
+        assert data["enrollment_project_id"] == str(project.id)
+        project_ids = {p["project_id"] for p in data["projects"]}
+        assert project_ids == {str(project.id)}
+
+    @pytest.mark.asyncio
+    async def test_add_project_extends_allow_list_and_get_reflects_it(
+        self, client: AsyncClient, db_session
+    ):
+        """Adding a project the caller owns extends the persisted allow-list."""
+        managing = await _make_project(db_session, name="Managing")
+        target = await _make_project(db_session, name="Target")  # owned by TEST_USER
+        runner_id = await self._register_runner(client, managing)
+
+        add = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert add.status_code == 200
+        ids = {p["project_id"] for p in add.json()["projects"]}
+        assert ids == {str(managing.id), str(target.id)}
+
+        # GET reflects the extended allow-list.
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 200
+        got_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert got_ids == {str(managing.id), str(target.id)}
+
+        # Idempotent: re-adding the same project is a no-op, not a duplicate.
+        again = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert again.status_code == 200
+        assert {p["project_id"] for p in again.json()["projects"]} == {
+            str(managing.id),
+            str(target.id),
+        }
+
+    @pytest.mark.asyncio
+    async def test_edit_runner_allowed_projects_requires_owner_on_target(
+        self, client: AsyncClient, db_session
+    ):
+        """The caller owns the managing project but NOT the target project — the
+        add is rejected 403 so an owner of A cannot silently grant a runner
+        access to B they do not own. Covered for both a member-below-owner and a
+        complete non-member on the target, and no binding is created."""
+        managing = await _make_project(db_session, name="Managing Owned")
+        runner_id = await self._register_runner(client, managing)
+
+        # (a) Caller is a MEMBER (not owner) on the target → 403.
+        member_target = await _make_project(
+            db_session, owner_id="other-owner", name="Member Target"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=member_target.id,
+                user_id=TEST_USER_ID,
+                role="member",
+            )
+        )
+        await db_session.commit()
+        rejected_member = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(member_target.id)},
+        )
+        assert rejected_member.status_code == 403
+
+        # (b) Caller is NOT a member at all on the target → 404, preserving the
+        # project-membership non-disclosure boundary.
+        nonmember_target = await _make_project(
+            db_session, owner_id="other-owner", name="Nonmember Target"
+        )
+        rejected_nonmember = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(nonmember_target.id)},
+        )
+        assert rejected_nonmember.status_code == 404
+
+        # No binding to either target project was created.
+        bindings = (
+            await db_session.execute(
+                select(RunnerProjectBinding.project_id).where(
+                    RunnerProjectBinding.runner_id == runner_id
+                )
+            )
+        ).scalars().all()
+        assert member_target.id not in bindings
+        assert nonmember_target.id not in bindings
+
+    @pytest.mark.asyncio
+    async def test_add_requires_owner_on_managing_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A caller who only holds member on the MANAGING project cannot edit the
+        allow-list even for a target they own."""
+        managing = await _make_project(
+            db_session, owner_id="other-owner", name="Member-Only Managing"
+        )
+        db_session.add(
+            ProjectMember(
+                project_id=managing.id, user_id=TEST_USER_ID, role="member"
+            )
+        )
+        await db_session.commit()
+        runner, _ = await _make_runner(db_session, managing.id)
+        target = await _make_project(db_session, name="Owned Target")
+
+        resp = await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner.id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_remove_project_shrinks_allow_list(
+        self, client: AsyncClient, db_session
+    ):
+        """Removing a project shrinks the allow-list; GET reflects the change."""
+        managing = await _make_project(db_session, name="Managing R")
+        target = await _make_project(db_session, name="Target R")
+        runner_id = await self._register_runner(client, managing)
+        await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+
+        remove = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{target.id}"
+        )
+        assert remove.status_code == 200
+        assert {p["project_id"] for p in remove.json()["projects"]} == {str(managing.id)}
+
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        got_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert got_ids == {str(managing.id)}
+
+    @pytest.mark.asyncio
+    async def test_remove_last_binding_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """The enrollment project cannot be removed from the allow-list (409),
+        and the runner's allow-list survives intact."""
+        managing = await _make_project(db_session, name="Solo Managing")
+        runner_id = await self._register_runner(client, managing)
+
+        resp = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{managing.id}"
+        )
+        assert resp.status_code == 409
+
+        # Allow-list still has the enrollment project.
+        got = await client.get(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 200
+        project_ids = {p["project_id"] for p in got.json()["projects"]}
+        assert str(managing.id) in project_ids
+
+    @pytest.mark.asyncio
+    async def test_remove_project_not_on_allow_list_is_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        managing = await _make_project(db_session, name="Managing NF")
+        target = await _make_project(db_session, name="Target NF")
+        runner_id = await self._register_runner(client, managing)
+        # Add target so removing 'managing' is not blocked by the enrollment-project guard.
+        await client.post(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+            json={"project_id": str(target.id)},
+        )
+        never_bound = uuid.uuid4()
+        resp = await client.delete(
+            f"/api/admin/projects/{managing.id}/runners/{runner_id}"
+            f"/projects/{never_bound}"
+        )
+        assert resp.status_code == 200
+        assert {
+            item["project_id"] for item in resp.json()["projects"]
+        } == {str(managing.id), str(target.id)}
+
+    @pytest.mark.asyncio
+    async def test_allowed_projects_cross_project_runner_404(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner is only reachable through its own project's path — listing or
+        mutating it through an unrelated project 404s."""
+        managing = await _make_project(db_session, name="Owner Managing X")
+        other = await _make_project(db_session, name="Unrelated X")
+        runner_id = await self._register_runner(client, managing)
+
+        got = await client.get(
+            f"/api/admin/projects/{other.id}/runners/{runner_id}/projects"
+        )
+        assert got.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_add_emits_workbench_refetch(
+        self, client: AsyncClient, db_session
+    ):
+        managing = await _make_project(db_session, name="Emit Managing")
+        target = await _make_project(db_session, name="Emit Target")
+        runner_id = await self._register_runner(client, managing)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                f"/api/admin/projects/{managing.id}/runners/{runner_id}/projects",
+                json={"project_id": str(target.id)},
+            )
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "allow_list_updated"
+
+
 # ── Live-safe config channel (heartbeat two-way + PATCH + view) ──────────────
 
 
@@ -1541,6 +2158,80 @@ class TestRunnerConfigChannel:
         assert runner.capabilities["task_types"] == "all"
 
     @pytest.mark.asyncio
+    async def test_config_apply_rejection_reason_persists_and_surfaces(
+        self, client: AsyncClient, db_session
+    ):
+        """A heartbeat reporting a config-apply REJECTION (unrecognized field)
+        persists the reason + offending field(s) under dedicated caps keys and
+        the fleet view surfaces them — but ONLY while the refused generation
+        matches the current desired one; a stale reason is suppressed."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 5},
+        )
+
+        desired_gen = (
+            await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        ).json()["config"]["config_generation"]
+
+        # Daemon refuses the CURRENT desired generation for an unrecognized field.
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "config_apply_status": "rejected",
+                "config_apply_reason": "unrecognized config field(s): retries",
+                "config_rejected_fields": ["retries"],
+                "config_rejected_generation": desired_gen,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        view = (await client.get(f"/api/admin/projects/{project.id}/runners")).json()[0]
+        assert (
+            view["config"]["apply_reason"]
+            == "unrecognized config field(s): retries"
+        )
+        assert view["config"]["config_rejected_fields"] == ["retries"]
+        # Stored under dedicated caps keys, never clobbering the desired subset.
+        await db_session.refresh(runner)
+        assert runner.capabilities["max_concurrent"] == 5
+        assert runner.capabilities["config_rejected_generation"] == desired_gen
+
+        # Operator changes the desired config: the stored rejection is now stale
+        # (its generation no longer matches desired) → suppressed by the view.
+        await client.patch(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}/capabilities",
+            json={"max_concurrent": 3},
+        )
+        view_stale = (
+            await client.get(f"/api/admin/projects/{project.id}/runners")
+        ).json()[0]
+        assert view_stale["config"]["apply_reason"] is None
+        assert view_stale["config"]["config_rejected_fields"] is None
+
+        # A subsequent clean 'applied' heartbeat CLEARS the stored rejection keys.
+        new_gen = view_stale["config"]["config_generation"]
+        await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "config_apply_status": "applied",
+                "applied_config_generation": new_gen,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        await db_session.refresh(runner)
+        assert "config_apply_reason" not in runner.capabilities
+        assert "config_rejected_fields" not in runner.capabilities
+        assert "config_rejected_generation" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_gpu_indices_allowed_patch_validation(
         self, client: AsyncClient, db_session
     ):
@@ -1595,7 +2286,7 @@ class TestRunnerConfigChannel:
         caps = patch.json()["capabilities"]
         assert caps["gpu_indices_allowed"] == [0]
         assert caps["max_concurrent"] == 1
-        assert caps["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert caps["task_types"] == sorted(STRATEGIC_LOCAL_AGENT_TASK_TYPES)
         # The config block reflects the clamped values, not the requested ones.
         assert patch.json()["config"]["desired"]["max_concurrent"] == 1
 
@@ -1808,6 +2499,35 @@ class TestRunnerEndpoints:
             assert resp2.status_code == 204
         finally:
             _clear_pool()
+
+    @pytest.mark.asyncio
+    async def test_draining_runner_does_not_pull_new_task(
+        self, client: AsyncClient, db_session
+    ):
+        """Drain prevents a race from handing new agent work to the host."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session, project.id, status="draining"
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create", "title": "must stay unpulled"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert response.status_code == 204
+        await db_session.refresh(task)
+        assert task.started_at is None
+        assert task.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
     async def test_next_task_returns_credentials_when_pool_account_resolved(
@@ -3307,7 +4027,7 @@ class TestRunnerEndpoints:
 
         hold_timeout = orch._strategic_local_hold_timeout_seconds()
         assert hold_timeout == 900  # documented default; the bound below is vs this
-        assert DECLINE_EXCLUSION_SECONDS < hold_timeout, (
+        assert hold_timeout > DECLINE_EXCLUSION_SECONDS, (
             "a decline exclusion that outlives the Strategic hold timeout evicts "
             "the Resident Strategic Agent to cloud on a single transient decline"
         )
@@ -3701,6 +4421,63 @@ class TestRunnerEndpoints:
         assert health2["degraded"] is False
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_and_bounds_image_cache_by_project(
+        self, client: AsyncClient, db_session
+    ):
+        """Per-project image-cache accounting rides on caps, coerced and bounded."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        # Craft a report with an absurd byte value, a non-numeric count, and more
+        # project buckets than the cap allows — all must be sanitized.
+        absurd = 10 ** 60
+        by_project = {f"proj-{i}": {"bytes": 1000, "image_count": 1} for i in range(70)}
+        by_project["proj-bad"] = {"bytes": absurd, "image_count": "not-a-number"}
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "image_cache_by_project": {
+                    "total_bytes": absurd,
+                    "image_count": 71,
+                    "by_project": by_project,
+                    "unattributed_bytes": -5,
+                    "unattributed_image_count": 2,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        stored = runner.capabilities["image_cache_by_project"]
+        # Absurd byte value clamped to the ceiling, not stored raw.
+        assert stored["total_bytes"] == (1 << 50)
+        assert stored["total_bytes"] < absurd
+        # Negative coerced to 0; the project map is capped.
+        assert stored["unattributed_bytes"] == 0
+        assert len(stored["by_project"]) <= 64
+        # Non-numeric count in a bucket degrades to 0, never raises.
+        for bucket in stored["by_project"].values():
+            assert isinstance(bucket["bytes"], int)
+            assert isinstance(bucket["image_count"], int)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_image_cache_by_project(
+        self, client: AsyncClient, db_session
+    ):
+        """A runner that reports no image cache leaves the field absent, no error."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"disk_free_bytes": 100},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "image_cache_by_project" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_heartbeat_persists_isolation_backends(
         self, client: AsyncClient, db_session
     ):
@@ -3718,11 +4495,15 @@ class TestRunnerEndpoints:
             "enroot_ok": False,
             "systemd_run_ok": True,
         }
+        passthrough = {
+            "apptainer": {"verified": True, "mode": "nv", "reason": "verified"}
+        }
         resp = await client.post(
             "/api/runner/heartbeat",
             json={
                 "version": "v22-15-gabc1234-dirty",
                 "isolation_backends": inventory,
+                "container_gpu_passthrough": passthrough,
                 "agent_backend": "bwrap",
                 "compute_backend": "bwrap",
             },
@@ -3732,6 +4513,7 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.version == "v22-15-gabc1234-dirty"
         assert runner.capabilities["isolation_backends"] == inventory
+        assert runner.capabilities["container_gpu_passthrough"] == passthrough
         assert runner.capabilities["agent_backend"] == "bwrap"
         assert runner.capabilities["compute_backend"] == "bwrap"
 
@@ -3751,6 +4533,7 @@ class TestRunnerEndpoints:
         assert resp.status_code == 200
         await db_session.refresh(runner)
         assert "isolation_backends" not in runner.capabilities
+        assert "container_gpu_passthrough" not in runner.capabilities
         assert "agent_backend" not in runner.capabilities
         assert "compute_backend" not in runner.capabilities
 
@@ -4721,6 +5504,126 @@ def _build_multipart(archive: bytes, file_count: int, total_bytes: int):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
+class TestNextComputeJobDiskFit:
+    """Claim-time disk-fit re-check for container-image compute jobs."""
+
+    async def _make_starting_job(self, session, project_id, runner_id, *, metadata):
+        job = ComputeJob(
+            project_id=project_id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={"runner_target_id": str(runner_id), **metadata},
+        )
+        session.add(job)
+        await session.commit()
+        await session.refresh(job)
+        return job
+
+    @pytest.mark.asyncio
+    async def test_container_image_job_204_when_runner_disk_below_floor(
+        self, client: AsyncClient, db_session
+    ):
+        """A container-image job pinned to a runner whose freshest heartbeat
+        disk_free_bytes is below the fit floor is NOT claimed: the endpoint
+        returns 204 and leaves the job STARTING for re-dispatch."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 1_000_000,  # ~1 MB — far below the multi-GB floor
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"container_image": "my-image:latest", "command": "run.sh"},
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 204
+
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.STARTING, (
+            "job must remain STARTING so it re-dispatches to a runner that fits it"
+        )
+
+    @pytest.mark.asyncio
+    async def test_container_image_job_claimed_when_disk_above_floor(
+        self, client: AsyncClient, db_session
+    ):
+        """A roomy runner still claims the container-image job (200 → RUNNING)."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 500_000_000_000,  # ~500 GB free
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"container_image": "my-image:latest", "command": "run.sh"},
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["job_id"] == str(job.id)
+
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+        # The claim body carries the job's owning project so a multi-project
+        # runner can attribute its image-cache storage back to the right project.
+        assert resp.json()["project_id"] == str(project.id)
+
+    @pytest.mark.asyncio
+    async def test_non_image_job_claimed_despite_low_disk(
+        self, client: AsyncClient, db_session
+    ):
+        """The disk-fit re-check applies ONLY to container-image jobs: a plain
+        job on a low-disk runner is still claimed."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True},
+                "disk_free_bytes": 1_000,
+            },
+        )
+        job = await self._make_starting_job(
+            db_session,
+            project.id,
+            runner.id,
+            metadata={"command": "run.sh"},  # no container_image
+        )
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+
+
 class TestMultipartParser:
     """Unit coverage for the dependency-free multipart parser used by the
     artifact endpoint (avoids requiring python-multipart, which FastAPI File/Form
@@ -4744,6 +5647,149 @@ class TestMultipartParser:
         assert fields == {} and files == {}
 
 
+class TestMultipartStreamParser:
+    """Unit coverage for the memory-bounded streaming multipart parser used by
+    the mid-run viewable endpoint to avoid buffering a multi-hundred-MiB video."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    def test_locates_file_range_and_reads_scalar_fields(self):
+        raw = bytes(range(256)) * 8  # includes CRLF-looking byte sequences
+        body, content_type = _build_multipart(raw, 7, len(raw))
+        fields, file_part = _parse_multipart_form_stream(self._spool(body), content_type)
+        assert fields["file_count"] == b"7"
+        assert fields["total_bytes"] == str(len(raw)).encode()
+        assert file_part is not None
+        assert file_part["name"] == "archive"
+        assert file_part["filename"] == "artifacts.tar.gz"
+        assert file_part["length"] == len(raw)
+
+    def test_range_reader_yields_exact_file_bytes(self):
+        raw = bytes(range(256)) * 8
+        body, content_type = _build_multipart(raw, 1, len(raw))
+        spool = self._spool(body)
+        _fields, file_part = _parse_multipart_form_stream(spool, content_type)
+        reader = _FileRangeReader(spool, file_part["start"], file_part["length"])
+        # Chunked reads (as blob.upload_from_file does) reassemble EXACTLY the
+        # file bytes with no trailing CRLF or boundary framing leaked.
+        out = bytearray()
+        while True:
+            chunk = reader.read(97)  # non-aligned chunk size
+            if not chunk:
+                break
+            out += chunk
+        assert bytes(out) == raw
+
+    def test_matches_in_memory_parser_semantics(self):
+        raw = b"\x00\x01FAKE-MP4" * 32
+        body, content_type = _build_multipart(raw, 2, len(raw))
+        mem_fields, mem_files = _parse_multipart_form(body, content_type)
+        spool = self._spool(body)
+        stream_fields, file_part = _parse_multipart_form_stream(spool, content_type)
+        assert stream_fields == mem_fields
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == mem_files["archive"]
+
+    def test_missing_boundary_returns_none(self):
+        fields, file_part = _parse_multipart_form_stream(
+            self._spool(b"whatever"), "application/json"
+        )
+        assert fields == {} and file_part is None
+
+
+class TestMultipartParserHardening:
+    """Security hardening: oversized fields and excessive boundary counts are rejected."""
+
+    @staticmethod
+    def _spool(body: bytes):
+        import io
+
+        return io.BytesIO(body)
+
+    @staticmethod
+    def _build_viewable_multipart(filename: str, file_bytes: bytes, *, field_overrides=None):
+        """Build a viewable-endpoint multipart body (filename field + file part)."""
+        boundary = "----test-boundary-hardening"
+        crlf = b"\r\n"
+        extra_fields = field_overrides or {}
+        body = bytearray()
+        # optional extra scalar fields (used to inject oversized content)
+        for name, value in extra_fields.items():
+            body += b"--" + boundary.encode() + crlf
+            body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+            body += value + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="filename"' + crlf + crlf
+        body += filename.encode() + crlf
+        body += b"--" + boundary.encode() + crlf
+        body += b'Content-Disposition: form-data; name="file"; filename="plot.png"' + crlf
+        body += b"Content-Type: image/png" + crlf + crlf
+        body += file_bytes + crlf
+        body += b"--" + boundary.encode() + b"--" + crlf
+        return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+    def test_stream_parser_rejects_oversized_non_file_field(self):
+        """A non-file scalar field exceeding _MAX_MULTIPART_FIELD_BYTES raises ValueError."""
+        oversized_value = b"x" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form_stream(self._spool(body), ct)
+
+    def test_in_memory_parser_rejects_oversized_non_file_field(self):
+        """_parse_multipart_form also rejects oversized scalar fields."""
+        oversized_value = b"y" * (_MAX_MULTIPART_FIELD_BYTES + 1)
+        body, ct = self._build_viewable_multipart(
+            "plot.png", b"PNG_BYTES", field_overrides={"extra": oversized_value}
+        )
+        with pytest.raises(ValueError, match=r"non-file field.*exceeds"):
+            _parse_multipart_form(body, ct)
+
+    def test_stream_parser_rejects_too_many_boundaries(self):
+        """A crafted body with more than _MAX_MULTIPART_PARTS boundary markers raises ValueError."""
+        boundary = "----crafted-boundary"
+        crlf = b"\r\n"
+        # Build a body whose boundary string appears far more than max_parts times
+        # without valid multipart structure — this exercises the Pass 1 counter.
+        delimiter = b"--" + boundary.encode()
+        # Each repetition is a minimal delimiter occurrence: delimiter + scalar field
+        body = bytearray()
+        for i in range(_MAX_MULTIPART_PARTS + 2):
+            body += delimiter + crlf
+            body += b'Content-Disposition: form-data; name="f"' + crlf + crlf
+            body += b"v" + crlf
+        body += delimiter + b"--" + crlf
+        ct = f"multipart/form-data; boundary={boundary}"
+        with pytest.raises(ValueError, match=r"more than.*boundary marker"):
+            _parse_multipart_form_stream(self._spool(bytes(body)), ct)
+
+    def test_stream_parser_normal_upload_still_succeeds(self):
+        """A well-formed viewable multipart body is still parsed correctly after hardening."""
+        file_bytes = b"FAKEPNG" * 16
+        body, ct = self._build_viewable_multipart("reward.png", file_bytes)
+        spool = self._spool(body)
+        fields, file_part = _parse_multipart_form_stream(spool, ct)
+        assert fields.get("filename") == b"reward.png"
+        assert file_part is not None
+        assert file_part["length"] == len(file_bytes)
+        # Verify actual file bytes round-trip correctly
+        spool.seek(file_part["start"])
+        assert spool.read(file_part["length"]) == file_bytes
+
+    def test_in_memory_parser_normal_upload_still_succeeds(self):
+        """_parse_multipart_form still works for a well-formed viewable body after hardening."""
+        file_bytes = b"FAKEPNG" * 8
+        body, ct = self._build_viewable_multipart("chart.png", file_bytes)
+        fields, files = _parse_multipart_form(body, ct)
+        assert fields.get("filename") == b"chart.png"
+        assert files.get("file") == file_bytes
+
+
 class TestArtifactUploadEndpoint:
     async def _make_runner_job(self, db_session, *, pinned_runner_id=None):
         project = await _make_project(db_session)
@@ -4759,6 +5805,392 @@ class TestArtifactUploadEndpoint:
         await db_session.commit()
         await db_session.refresh(job)
         return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_resumable_upload_completion_verifies_size_checksum_before_stamp(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {
+                "upload_url": "https://storage.invalid/exact-object-signature",
+                "method": "PUT",
+                "headers": {"Content-Type": "application/gzip"},
+                "expires_at": expires_at.isoformat(),
+                "object_uri": f"gs://bucket/{job_id}/{transfer_id}",
+            }
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        assert authorize.status_code == 200, authorize.text
+        transfer_id = authorize.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 122,
+                "crc32c": "AAAAAA==",
+                "generation": "7",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        mismatch = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert mismatch.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in (job.polling_metadata or {})
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "metadata_mismatch"
+
+        async def fake_verified(job_id, received_transfer_id):
+            result = await fake_verify(job_id, received_transfer_id)
+            result["size"] = 123
+            return result
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verified)
+        # Failed exact-object attempts are final: a fresh authorization is
+        # required because ifGenerationMatch=0 prevents repairing that object.
+        failed_retry = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert failed_retry.status_code == 409
+
+        authorize = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 123, "crc32c": "AAAAAA==", "file_count": 2, "total_bytes": 456},
+        )
+        transfer_id = authorize.json()["transfer_id"]
+        completed = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert completed.status_code == 200, completed.text
+        stamped = completed.json()["runner_artifact"]
+        assert stamped["stored"] is True
+        assert stamped["verified"] is True
+        assert stamped["size"] == 123
+        assert stamped["crc32c"] == "AAAAAA=="
+        assert stamped["generation"] == "7"
+
+        repeated = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "7"},
+        )
+        assert repeated.status_code == 200
+        assert repeated.json()["runner_artifact"] == stamped
+
+    @pytest.mark.asyncio
+    async def test_transfer_authorization_failure_is_finalized_without_open_transaction(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(*_args, **_kwargs):
+            assert not db_session.in_transaction()
+            raise RuntimeError("signBlob unavailable")
+
+        monkeypatch.setattr(
+            "app.storage.authorize_compute_job_artifact_transfer", fake_authorize
+        )
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        transfer = job.polling_metadata["runner_artifact_transfer"]
+        assert transfer["status"] == "failed"
+        assert transfer["failure_reason"] == "authorization_failed"
+
+    @pytest.mark.asyncio
+    async def test_transfer_verification_reload_failure_is_finalized(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        async def fake_verify(*_args):
+            raise RuntimeError("reload unavailable")
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "verification_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_failure_cannot_overwrite_verified_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(*_args):
+            await db_session.refresh(job)
+            artifact = {
+                "uri": f"gs://bucket/{job.id}/{transfer_id}",
+                "generation": "1",
+                "transfer_id": transfer_id,
+            }
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact": artifact,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "verified",
+                },
+            }
+            await db_session.commit()
+            raise RuntimeError("delayed verification failure")
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 503
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "verified"
+
+    @pytest.mark.asyncio
+    async def test_delayed_verification_success_cannot_overwrite_failed_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+
+        async def fake_verify(job_id, received_transfer_id):
+            await db_session.refresh(job)
+            job.polling_metadata = {
+                **job.polling_metadata,
+                "runner_artifact_transfer": {
+                    **job.polling_metadata["runner_artifact_transfer"],
+                    "status": "failed",
+                    "failure_reason": "concurrent_failure",
+                },
+            }
+            await db_session.commit()
+            return {
+                "uri": f"gs://bucket/{job_id}/{received_transfer_id}",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert "runner_artifact" not in job.polling_metadata
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_superseded_transfer_cannot_complete(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        ids = []
+        for size in (10, 11):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/artifact-transfer",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"archive_size": size, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": size},
+            )
+            ids.append(response.json()["transfer_id"])
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": ids[0], "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact_transfer"]["transfer_id"] == ids[1]
+
+    @pytest.mark.asyncio
+    async def test_wrong_pinned_runner_cannot_authorize_transfer(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        other_runner, _ = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(other_runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_runner_cannot_authorize_transfer_in_another_project(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, owner_id="other-owner")
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=other_project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            current = await db_session.get(ComputeJob, job.id)
+            await db_session.refresh(current)
+            current.status = ComputeJobStatus.SUCCEEDED
+            current.polling_metadata = {
+                **current.polling_metadata,
+                "runner_artifact": final_artifact,
+            }
+            await db_session.commit()
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
+        assert job.polling_metadata["runner_artifact_transfer"]["status"] == "failed"
+        assert job.polling_metadata["runner_artifact_transfer"]["failure_reason"] == "evidence_finalized"
+
+    @pytest.mark.asyncio
+    async def test_preissued_transfer_completion_cannot_overwrite_finalized_evidence(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        _project, _runner, token, job = await self._make_runner_job(db_session)
+
+        async def fake_authorize(job_id, transfer_id, *, expires_at):
+            return {"upload_url": "https://storage.invalid", "expires_at": expires_at.isoformat()}
+
+        monkeypatch.setattr("app.storage.authorize_compute_job_artifact_transfer", fake_authorize)
+        authorized = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"archive_size": 10, "crc32c": "AAAAAA==", "file_count": 1, "total_bytes": 10},
+        )
+        transfer_id = authorized.json()["transfer_id"]
+        final_artifact = {
+            "kind": "runner_artifact",
+            "uri": f"gs://bucket/compute-jobs/{job.id}/artifacts/bundle.tar.gz",
+            "stored": True,
+        }
+        await db_session.refresh(job)
+        job.status = ComputeJobStatus.SUCCEEDED
+        job.polling_metadata = {
+            **job.polling_metadata,
+            "runner_artifact": final_artifact,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_verify(job_id, received_transfer_id):
+            return {
+                "uri": f"gs://bucket/compute-jobs/{job_id}/artifacts/transfers/{received_transfer_id}.tar.gz",
+                "size": 10,
+                "crc32c": "AAAAAA==",
+                "generation": "1",
+            }
+
+        monkeypatch.setattr("app.storage.verify_compute_job_artifact_transfer", fake_verify)
+        response = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact-transfer/complete",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"transfer_id": transfer_id, "generation": "1"},
+        )
+        assert response.status_code == 409
+        await db_session.refresh(job)
+        assert job.polling_metadata["runner_artifact"] == final_artifact
 
     @pytest.mark.asyncio
     async def test_upload_stores_artifact_and_links_metadata(
@@ -4974,6 +6406,64 @@ class TestArtifactUploadEndpoint:
         assert job.polling_metadata["runner_artifact"]["file_count"] == 3
 
     @pytest.mark.asyncio
+    async def test_first_bundle_to_terminal_job_triggers_artifact_linkage(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """First bundle upload to a terminal job triggers _link_terminal_artifact.
+
+        When a runner reports terminal status first (the normal race window in
+        local_runner.py) and the monitor finalises the job before the bundle
+        arrives, the /artifact endpoint must call _link_terminal_artifact so that
+        artifact_id and result_reference are backfilled — otherwise the canvas
+        loses the result once live preview synthesis stops.
+        """
+        project, runner, token, job = await self._make_runner_job(db_session)
+        # Finalize the job before the bundle arrives (simulating the race).
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        linkage_calls = []
+
+        async def fake_link(session, j):
+            linkage_calls.append(j.id)
+
+        # Patch via the module the runner endpoint imports at call time.
+        import app.compute_jobs as cj_mod
+
+        monkeypatch.setattr(cj_mod, "_link_terminal_artifact", fake_link)
+
+        body, content_type = _build_multipart(b"\x1f\x8b\x08gz", 3, 77)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        # The bundle metadata must be stamped.
+        assert job.polling_metadata["runner_artifact"]["stored"] is True
+        # _link_terminal_artifact must have been called to backfill artifact_id.
+        assert job.id in linkage_calls
+
+    @pytest.mark.asyncio
     async def test_upload_to_running_job_can_still_be_replaced(
         self, client: AsyncClient, db_session, monkeypatch
     ):
@@ -5038,6 +6528,54 @@ class TestOrchestratorRunnerRouting:
         cache = await orch._load_active_runners_cache(db_session)
         ids = {r.id for r in cache.get(project.id, [])}
         assert ids == {live.id}
+
+    @pytest.mark.asyncio
+    async def test_compute_assignments_attribute_running_job_by_claiming_runner(
+        self, db_session
+    ):
+        """A RUNNING job is counted against the runner that AUTHORITATIVELY claimed
+        it (ran_on_runner_id), not the dispatch reservation pin (runner_target_id).
+
+        - A RUNNING job claimed by R2 but pinned to R1 counts for R2.
+        - A QUEUED job (not yet claimed, ran_on_runner_id NULL) counts for its pin.
+        - A legacy RUNNING job with NULL ran_on_runner_id falls back to its pin.
+        """
+        project = await _make_project(db_session)
+        r1, _ = await _make_runner(db_session, project.id)
+        r2, _ = await _make_runner(db_session, project.id)
+
+        # Claimed-and-running on R2, but the stale dispatch pin still names R1.
+        claimed = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            ran_on_runner_id=r2.id,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        # Reserved-but-unclaimed: no ran_on_runner_id yet, pinned to R1.
+        reserved = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.QUEUED,
+            ran_on_runner_id=None,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        # Legacy RUNNING row predating the column — falls back to its pin (R1).
+        legacy = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            ran_on_runner_id=None,
+            polling_metadata={"runner_target_id": str(r1.id)},
+        )
+        db_session.add_all([claimed, reserved, legacy])
+        await db_session.commit()
+
+        assignments = await orch._load_runner_compute_job_assignments(
+            db_session, [r1.id, r2.id]
+        )
+        assert set(assignments.get(r2.id, [])) == {str(claimed.id)}
+        assert set(assignments.get(r1.id, [])) == {str(reserved.id), str(legacy.id)}
 
     @pytest.mark.asyncio
     async def test_loaded_runner_cache_survives_session_expiry(self, db_session):
@@ -6976,6 +8514,7 @@ class TestLocalRunnerStatusForStrategist:
                     "enroot_ok": False,
                     "systemd_run_ok": False,
                 },
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "cdi"}},
                 "active_task_ids": ["t-1"],
                 "active_compute_job_ids": [],
             },
@@ -7513,6 +9052,88 @@ class TestInputArtifactDownloadEndpoint:
         assert resp.headers["content-type"] == "application/gzip"
 
     @pytest.mark.asyncio
+    async def test_streams_transfer_specific_predecessor_uri_for_legacy_client(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        transfer_id = uuid.uuid4()
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, transfer_id)
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {"stored": True, "verified": True, "uri": artifact_uri},
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_download(uri):
+            assert uri == artifact_uri
+            return b"TRANSFER-BUNDLE"
+
+        monkeypatch.setattr(storage, "download_compute_job_artifact_uri", fake_download)
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"TRANSFER-BUNDLE"
+
+    @pytest.mark.asyncio
+    async def test_direct_download_returns_verified_transfer_metadata(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        from app import storage
+
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        predecessor = await self._make_pinned_job(db_session, project, runner, {})
+        artifact_uri = storage.compute_job_artifact_transfer_uri(predecessor.id, uuid.uuid4())
+        predecessor.polling_metadata = {
+            "runner_target_id": str(runner.id),
+            "runner_artifact": {
+                "stored": True,
+                "verified": True,
+                "uri": artifact_uri,
+                "size": 987,
+                "crc32c": "AAAAAA==",
+                "generation": "42",
+            },
+        }
+        db_session.add(predecessor)
+        await db_session.commit()
+        job = await self._make_pinned_job(
+            db_session, project, runner,
+            {"input_artifact_job_id": str(predecessor.id)},
+        )
+
+        async def fake_sign(uri):
+            assert uri == artifact_uri
+            return "https://storage.invalid/signed-get"
+
+        monkeypatch.setattr(
+            storage, "generate_compute_job_artifact_uri_download_signed_url", fake_sign
+        )
+        resp = await client.get(
+            f"/api/runner/compute-job/{job.id}/input-artifact?direct=true",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "download_url": "https://storage.invalid/signed-get",
+            "expires_in_seconds": 3600,
+            "size": 987,
+            "crc32c": "AAAAAA==",
+            "generation": "42",
+        }
+
+    @pytest.mark.asyncio
     async def test_404_when_no_input_artifact_reference(
         self, client: AsyncClient, db_session
     ):
@@ -7597,7 +9218,20 @@ class TestInputArtifactDownloadEndpoint:
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
         predecessor_id = str(uuid.uuid4())
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "require_durable_artifact": True,
+                }
+            ],
+            status=TaskStatus.IN_PROGRESS,
+        )
+        db_session.add(task)
+        await db_session.flush()
         job = ComputeJob(
+            task_id=task.id,
             project_id=project.id,
             backend=RUNNER_SUBPROCESS_BACKEND_NAME,
             status=ComputeJobStatus.STARTING,
@@ -7616,6 +9250,191 @@ class TestInputArtifactDownloadEndpoint:
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["input_artifact_job_id"] == predecessor_id
+        assert resp.json()["require_durable_artifact"] is True
+
+    @pytest.mark.asyncio
+    async def test_next_compute_job_stamps_ran_on_runner_id(
+        self, client: AsyncClient, db_session
+    ):
+        """Claiming a runner-subprocess compute job via /next-compute-job records
+        the claiming runner as the authoritative ``ran_on_runner_id``."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.STARTING,
+            polling_metadata={
+                "runner_target_id": str(runner.id),
+                "command": "echo hi",
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+        assert job.ran_on_runner_id is None
+
+        resp = await client.post(
+            "/api/runner/next-compute-job",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.status == ComputeJobStatus.RUNNING
+        assert job.ran_on_runner_id == runner.id
+
+    @pytest.mark.asyncio
+    async def test_report_compute_job_backfills_ran_on_runner_id_when_null(
+        self, client: AsyncClient, db_session
+    ):
+        """A report on a job whose ``ran_on_runner_id`` is still NULL (claimed
+        before this column shipped) idempotently backfills the claiming runner."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        assert job.ran_on_runner_id is None
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "succeeded",
+                "artifact_delivery": {
+                    "status": "failed",
+                    "protocol": "direct",
+                    "command_exec_status": "succeeded",
+                    "reason": "x" * 1000,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.ran_on_runner_id == runner.id
+        delivery = job.polling_metadata["artifact_delivery"]
+        assert delivery["command_exec_status"] == "succeeded"
+        assert len(delivery["reason"]) == 256
+
+    @pytest.mark.asyncio
+    async def test_report_compute_job_does_not_overwrite_ran_on_runner_id(
+        self, client: AsyncClient, db_session
+    ):
+        """A report never overwrites a non-null ``ran_on_runner_id`` — the value
+        stamped at claim time is authoritative and stable across reports."""
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        # A distinct, real runner (FK requires a valid localrunner row) already
+        # recorded as the authoritative owner — a later report must not clobber it.
+        other_runner, _ = await _make_runner(db_session, project.id)
+        original_runner_id = other_runner.id
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+            ran_on_runner_id=original_runner_id,
+        )
+        db_session.add(job)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={"exec_status": "running"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        await db_session.refresh(job)
+        assert job.ran_on_runner_id == original_runner_id
+
+
+@pytest.mark.asyncio
+async def test_compute_claim_mints_token_for_claimed_job_project(db_session):
+    """The GitHub installation token minted at claim time must be scoped to the
+    CLAIMED JOB's owning project, not the runner's enrollment project.
+
+    Today the claim filter forces ``job.project_id == runner.project_id`` so the
+    two are always equal and the distinction is a no-op. But the in-flight
+    multi-project allow-list replaces that filter with allow-list membership — at
+    which point a runner enrolled under project A can legitimately claim a job for
+    project B. The repo token clones project B's repo, so it MUST be minted from
+    project B's GitHub installation, never project A's. We stub the claim SELECT
+    (the "claim filter") to yield the cross-project job while exercising the REAL
+    token-minting block that follows.
+    """
+    from fastapi import Response
+
+    from app.routers.runner import next_compute_job
+
+    project_a = await _make_project(db_session, name="Runner Enrollment Project A")
+    project_b = await _make_project(db_session, name="Job Owner Project B")
+    runner, _token = await _make_runner(db_session, project_a.id)
+
+    job = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "command": "python train.py",
+            # repo_clone must be present for the token-minting block to run.
+            "repo_clone": {"url": "https://github.com/acme/repo.git", "ref": "main"},
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Stub the claim query so it returns project B's job to a runner enrolled
+    # under project A — simulating the allow-list having relaxed the project
+    # filter. Everything downstream (token minting) runs for real.
+    class _ClaimResult:
+        def scalars(self):
+            return self
+
+        def all(self):
+            # allowed_project_ids() -> bound_project_ids() runs first and calls
+            # .scalars().all(); an empty allow-list is fine here because the
+            # claim SELECT is stubbed to yield the cross-project job directly.
+            return []
+
+        def first(self):
+            return job
+
+    fake_session = MagicMock()
+    fake_session.execute = AsyncMock(return_value=_ClaimResult())
+    fake_session.add = MagicMock()
+    fake_session.commit = AsyncMock()
+    fake_session.refresh = AsyncMock()
+
+    async def _get(_model, pk):
+        if pk == project_b.id:
+            return project_b
+        if pk == project_a.id:
+            return project_a
+        return None
+
+    fake_session.get = AsyncMock(side_effect=_get)
+
+    token_mock = AsyncMock(return_value="ghs_scoped_to_job_project")
+    with patch("app.branch_cleanup._get_project_github_token", token_mock):
+        resp = await next_compute_job(Response(), runner=runner, session=fake_session)
+
+    # The token minted and returned to the runner comes from project B.
+    assert resp["repo_token"] == "ghs_scoped_to_job_project"
+    assert token_mock.await_count == 1
+    minted_for = token_mock.await_args.args[0]
+    assert minted_for.id == project_b.id, (
+        "repo token must be minted for the CLAIMED JOB's project (B), not the "
+        "runner's enrollment project (A)"
+    )
+    assert minted_for.id != project_a.id
+    # And the Project row was fetched by the job's project id, not the runner's.
+    fake_session.get.assert_awaited_once_with(Project, project_b.id)
 
 
 class TestReportInterimProgressAndLiveOutput:
@@ -8468,6 +10287,223 @@ class TestDirectComputeExperimentDispatch:
         assert await _compute_job_for_task(db_session, task.id) is None
 
     @pytest.mark.asyncio
+    async def test_strict_runner_pin_accepts_nvidia_hook_without_cdi(
+        self, db_session
+    ):
+        """A Docker GPU runner may use the NVIDIA runtime hook when CDI is absent."""
+        project = await _make_project(db_session)
+        docker_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="T4",
+                    container_image="my-image:latest",
+                    runner_target={"runner_id": str(docker_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [docker_runner]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert "runner_pin_hold" not in (task.context or {})
+        assert await _compute_job_for_task(db_session, task.id) is not None
+
+    @pytest.mark.asyncio
+    async def test_strict_runner_pin_accepts_nvidia_hook_for_vram_only_job(
+        self, db_session
+    ):
+        """The NVIDIA runtime hook also satisfies a VRAM-only container request."""
+        project = await _make_project(db_session)
+        docker_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_free_vram_mib": [40960],  # plenty of free VRAM
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": False},
+                "container_gpu_passthrough": {"docker": {"verified": True, "mode": "hook"}},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    vram_gb=8.0,
+                    container_image="my-image:latest",
+                    runner_target={"runner_id": str(docker_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [docker_runner]}, {}
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert "runner_pin_hold" not in (task.context or {})
+        assert await _compute_job_for_task(db_session, task.id) is not None
+
+    @pytest.mark.asyncio
+    async def test_launch_holds_when_no_gpu_arch_compatible_runner(self, db_session):
+        """ACCEPTANCE: an image declaring a min_compute_capability above a runner's
+        advertised gpu_compute_capabilities is NOT dispatched to that runner — the
+        job holds QUEUED with an honest 'awaiting GPU with compute capability >= X.Y'
+        reason instead of being sent and failing the in-sandbox probe."""
+        project = await _make_project(db_session)
+        # A V100 box (sm_70) that is otherwise perfectly eligible: GPU-capable,
+        # container-capable, right task types — only its GPU ARCH is too old.
+        v100_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["Tesla V100"],
+                "gpu_compute_capabilities": [7.0],
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="gpu",
+                    container_image="my-sm80-image:latest",
+                    min_compute_capability=8.0,
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [v100_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        # Honest, arch-specific reason surfaced to the operator.
+        assert "compute capability >= 8.0" in (task.latest_status_message or ""), (
+            f"expected an arch-specific hold reason, got "
+            f"{task.latest_status_message!r}"
+        )
+        # No job was dispatched to the incompatible box.
+        assert await _compute_job_for_task(db_session, task.id) is None
+        # Reuses the bounded-wait container-hold stamp so the existing sweep covers it.
+        assert (task.context or {}).get("awaiting_container_runner_since")
+
+    @pytest.mark.asyncio
+    async def test_strict_pin_holds_when_gpu_arch_incompatible(self, db_session):
+        """A strict pin to a runner whose GPU arch is below the image's floor holds
+        with the incompatible_gpu_arch reason, not a generic not_eligible."""
+        project = await _make_project(db_session)
+        v100_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["Tesla V100"],
+                "gpu_compute_capabilities": [7.0],
+                "max_concurrent": 2,
+                "isolation_backends": {"docker_usable": True, "docker_cdi_gpu": True},
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[
+                _ce_payload(
+                    accelerator="gpu",
+                    container_image="my-sm80-image:latest",
+                    min_compute_capability=8.0,
+                    runner_target={"runner_id": str(v100_runner.id), "strict": True},
+                )
+            ],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [v100_runner]}, {}
+        )
+
+        assert outcome == "held"
+        await db_session.refresh(task)
+        hold = (task.context or {}).get("runner_pin_hold")
+        assert hold is not None
+        assert hold["reason_code"] == "incompatible_gpu_arch", (
+            f"expected 'incompatible_gpu_arch', got {hold['reason_code']}"
+        )
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_launch_pins_arch_compatible_runner(self, db_session):
+        """Sanity: an image floor MET by the runner's GPU arch dispatches normally —
+        the gate is a no-op when the hardware is compatible."""
+        project = await _make_project(db_session)
+        l40s_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": True,
+                "gpu_count": 1,
+                "gpu_names": ["L40S"],
+                "gpu_compute_capabilities": [8.9],
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(accelerator="L4", min_compute_capability=8.0)],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [l40s_runner]}, {}
+        )
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(
+            l40s_runner.id
+        )
+
+    @pytest.mark.asyncio
     async def test_strict_pin_hold_stable_reason_not_rewritten_each_cycle(
         self, db_session
     ):
@@ -8981,3 +11017,2084 @@ async def test_report_compute_job_cross_project_emits_warning(
     assert str(project_a.id) in msg
     assert str(job.id) in msg
     assert str(project_b.id) in msg
+
+
+async def _add_runner_binding(session, runner_id, project_id):
+    """Add one runner<->project allow-list binding row and commit it."""
+    binding = RunnerProjectBinding(runner_id=runner_id, project_id=project_id)
+    session.add(binding)
+    await session.commit()
+    return binding
+
+
+@pytest.mark.asyncio
+async def test_runner_cannot_claim_job_for_non_allowlisted_project(
+    client: AsyncClient, db_session, caplog
+):
+    """Server-side allow-list is a hard job-claim authorization boundary.
+
+    A runner bound to project A must be rejected — at BOTH the claim
+    (/next-compute-job) and report (/compute-job/{id}/report) surfaces — for a
+    compute job in project B that is NOT on its allow-list; the job stays STARTING
+    (never claimed) and a cross-project WARNING fires. Adding B to the allow-list
+    makes the SAME claim succeed (STARTING→RUNNING). Finally, one runner bound to
+    A AND B serves agent tasks from both projects under ONE unified max_concurrent
+    ledger: a third task holds once the unified limit is reached, regardless of
+    which project it belongs to.
+    """
+    import logging
+
+    project_a = await _make_project(db_session, name="Allowlist A")
+    project_b = await _make_project(db_session, name="Allowlist B")
+    # Runner's home is A, with an explicit allow-list binding to A only.
+    runner, token = await _make_runner(
+        db_session,
+        project_a.id,
+        capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+    )
+    await _add_runner_binding(db_session, runner.id, project_a.id)
+    assert await allowed_project_ids(db_session, runner) == {project_a.id}
+
+    # A STARTING compute job in project B, pinned to this runner's id.
+    job_b = ComputeJob(
+        project_id=project_b.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        polling_metadata={"runner_target_id": str(runner.id), "command": "echo b"},
+    )
+    db_session.add(job_b)
+    await db_session.commit()
+    await db_session.refresh(job_b)
+
+    # (1) CLAIM rejected: B is not on the allow-list, so nothing is dispatchable
+    # (204) and the job is NOT transitioned out of STARTING.
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 204, resp.text
+    await db_session.refresh(job_b)
+    assert job_b.status == ComputeJobStatus.STARTING
+
+    # (2) REPORT rejected server-side (404) with a genuine cross-project warning.
+    with caplog.at_level(logging.WARNING, logger="blueprint"):
+        resp = await client.post(
+            f"/api/runner/compute-job/{job_b.id}/report",
+            json={"exec_status": "succeeded", "exit_code": 0},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 404
+    assert any(
+        "Cross-project" in r.getMessage() for r in caplog.records
+    ), "a non-allowlisted-project report must emit the cross-project warning"
+    await db_session.refresh(job_b)
+    # Evidence untouched — the rejected report never stamped an exec status.
+    assert job_b.status == ComputeJobStatus.STARTING
+    assert "runner_exec_status" not in (job_b.polling_metadata or {})
+
+    # (3) Add B to the allow-list → the SAME claim now succeeds (STARTING→RUNNING).
+    await _add_runner_binding(db_session, runner.id, project_b.id)
+    assert await allowed_project_ids(db_session, runner) == {
+        project_a.id,
+        project_b.id,
+    }
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["job_id"] == str(job_b.id)
+    await db_session.refresh(job_b)
+    assert job_b.status == ComputeJobStatus.RUNNING
+
+    # (4) UNIFIED LEDGER: the runner is now fanned into BOTH project buckets, and a
+    # burst of agent tasks across the two projects is sized against ONE
+    # max_concurrent=2 ledger — the third pin is refused no matter its project.
+    cache = await orch._load_active_runners_cache(db_session)
+    assert runner.id in {r.id for r in cache.get(project_a.id, [])}
+    assert runner.id in {r.id for r in cache.get(project_b.id, [])}
+
+    task_a1 = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    task_b1 = Task(
+        project_id=project_b.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    task_a2 = Task(
+        project_id=project_a.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add_all([task_a1, task_b1, task_a2])
+    await db_session.commit()
+
+    pins: dict = {}
+    # First task (project A) pins.
+    assert await orch._try_runner_dispatch(db_session, task_a1, cache, pins) is True
+    # Second task (project B) pins onto the SAME runner — the pin count is shared
+    # across projects, so this is the second unit of the unified ledger.
+    assert await orch._try_runner_dispatch(db_session, task_b1, cache, pins) is True
+    assert pins.get(runner.id) == 2
+    # Third task (project A again) must HOLD: unified limit (2) reached across both
+    # projects — proving the ledger is per-runner, not per-project.
+    assert await orch._try_runner_dispatch(db_session, task_a2, cache, pins) is False
+    await db_session.refresh(task_a2)
+    assert task_a2.status == TaskStatus.QUEUED
+    await db_session.refresh(task_a1)
+    await db_session.refresh(task_b1)
+    assert task_a1.status == TaskStatus.PROVISIONING
+    assert task_b1.status == TaskStatus.PROVISIONING
+
+
+class TestMidRunViewableUpload:
+    """Tests for POST /api/runner/compute-job/{job_id}/viewable.
+
+    Verifies that a RUNNING compute job's mid-run viewable-file upload registers a
+    ``ComputeJobFile`` row and an entry in ``polling_metadata['viewable_files']``
+    (surfaced as the admin API's ``viewable_artifacts``) without setting the terminal
+    guard key ``viewable_file_count``, and that the terminal reconcile produces no
+    duplicate rows.
+    """
+
+    async def _make_running_job(
+        self, db_session, status=ComputeJobStatus.RUNNING, **extra_meta
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        meta = {"runner_target_id": str(runner.id)}
+        meta.update(extra_meta)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=status,
+            polling_metadata=meta,
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @staticmethod
+    def _fake_uri(job_id, safe_name: str) -> str:
+        return (
+            "gs://test-bucket/compute-jobs/"
+            f"{job_id}/artifacts/viewable/{safe_name}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_upload_png_on_running_job_creates_row_and_manifest(
+        self, client, db_session
+    ):
+        """Upload a .png to a RUNNING job → ComputeJobFile row + viewable_files entry."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch("app.storage.upload_compute_job_viewable_file",
+                   return_value=fake_uri):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"fake-png-bytes-12345", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"Expected 200, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["total_viewable_files"] == 1
+        assert body["entry"]["storage_uri"] == fake_uri
+        assert body["entry"]["kind"] == "image"
+        assert body["entry"]["filename"] == safe_name
+
+        # ── ComputeJobFile row exists ────────────────────────────────────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            f"Expected exactly 1 ComputeJobFile row, got {len(rows)}"
+        )
+        assert rows[0].safe_relpath == safe_name
+        assert rows[0].media_type == "image"
+
+        # ── polling_metadata['viewable_files'] contains the entry ────────────
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1, (
+            f"Expected 1 viewable_files entry, got {len(vf)}"
+        )
+        assert vf[0]["storage_uri"] == fake_uri
+
+        # ── viewable_file_count MUST NOT be set (terminal guard key) ─────────
+        assert "viewable_file_count" not in (job.polling_metadata or {}), (
+            "mid-run upload must not set the terminal guard key viewable_file_count"
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_viewable_file_type_rejected(self, client, db_session):
+        """Upload of a .txt file → 422."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            data={"filename": "notes.txt"},
+            files={"file": ("notes.txt", b"not an image", "text/plain")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 422, (
+            f"Expected 422 for non-viewable type, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_generation_retry_keeps_revision(self, client, db_session):
+        """A response-loss retry for one runner generation is idempotent."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Blueprint-Viewable-Revision": "runner-generation-1",
+        }
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", return_value=fake_uri
+        ):
+            first = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+            retry = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"same-bytes", "image/png")},
+                headers=headers,
+            )
+
+        assert first.status_code == 200
+        assert retry.status_code == 200
+        assert first.json()["entry"]["revision"] == "runner-generation-1"
+        assert retry.json()["entry"]["revision"] == "runner-generation-1"
+
+    @pytest.mark.asyncio
+    async def test_invalid_runner_revision_rejected_before_storage(
+        self, client, db_session
+    ):
+        _project, runner, token, job = await self._make_running_job(db_session)
+        with patch("app.storage.upload_compute_job_viewable_file") as upload:
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": "reward.png"},
+                files={"file": ("reward.png", b"bytes", "image/png")},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Blueprint-Viewable-Revision": "bad revision/with spaces",
+                },
+            )
+        assert response.status_code == 422
+        upload.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_oversize_image_rejected(self, client, db_session):
+        """Image exceeding the per-file byte cap → 413."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "huge.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        # Patch the per-image byte cap to a small value so a tiny payload
+        # triggers the limit without allocating 8 MiB of test data.
+        from app.routers import runner as runner_mod
+
+        with patch.object(
+            runner_mod, "_MAX_VIEWABLE_FILE_BYTES", 10
+        ), patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (
+                        safe_name,
+                        b"x" * 100,  # 100 bytes > patched cap of 10
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 413, (
+            f"Expected 413 for oversize file, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_job_rejected(self, client, db_session):
+        """Upload to a terminal job → 409."""
+        _project, runner, token, job = await self._make_running_job(
+            db_session, status=ComputeJobStatus.SUCCEEDED
+        )
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            data={"filename": "reward.png"},
+            files={"file": ("reward.png", b"data", "image/png")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 409, (
+            f"Expected 409 for terminal job, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_winning_during_live_upload_keeps_terminal_object(
+        self, client, db_session
+    ):
+        """A late live upload must never overwrite terminal's canonical object.
+
+        The fake storage write models the precise ordering from the race report:
+        terminal reconciliation publishes its canonical bytes while the live
+        request is stalled, then the stalled write completes.  Staging means the
+        latter can only write an unreferenced object, and the locked re-check
+        returns 409 without promoting it.
+        """
+        from app import storage
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        objects: dict[str, bytes] = {}
+        deleted: list[str] = []
+
+        async def _late_live_upload(job_id, basename, data, content_type):
+            # Terminal owns the canonical generation before the slow live write
+            # returns.  This commit is observable by the endpoint's locked reread.
+            job.status = ComputeJobStatus.SUCCEEDED
+            db_session.add(job)
+            await db_session.commit()
+            objects[safe_name] = b"terminal-generation"
+            objects[basename] = data
+            return storage.compute_job_viewable_uri(job_id, basename)
+
+        async def _delete_staging(job_id, basename):
+            deleted.append(basename)
+            objects.pop(basename, None)
+            return True
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file", new=_late_live_upload
+        ), patch(
+            "app.storage.delete_compute_job_viewable_file", new=_delete_staging
+        ), patch(
+            "app.storage.promote_compute_job_viewable_file",
+            new=AsyncMock(side_effect=AssertionError("terminal upload must not promote")),
+        ):
+            response = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"late-live-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 409, response.text
+        assert objects[safe_name] == b"terminal-generation"
+        assert len(deleted) == 1 and deleted[0].startswith(".staging/")
+
+    @pytest.mark.asyncio
+    async def test_file_cap_enforced(self, client, db_session):
+        """Upload at the 25-file cap → 429."""
+        from app.compute_backends import _MAX_VIEWABLE_FILE_COUNT
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        # Pre-fill viewable_files with `_MAX_VIEWABLE_FILE_COUNT` entries.
+        preexisting = []
+        for i in range(_MAX_VIEWABLE_FILE_COUNT):
+            fname = f"file_{i:03d}.png"
+            furi = self._fake_uri(job.id, fname)
+            preexisting.append({
+                "filename": fname,
+                "storage_uri": furi,
+                "content_type": "image/png",
+                "size_bytes": 100,
+                "kind": "image",
+            })
+        job.polling_metadata = {
+            **(job.polling_metadata or {}),
+            "viewable_files": preexisting,
+        }
+        db_session.add(job)
+        await db_session.commit()
+
+        overflow_name = "overflow.png"
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=self._fake_uri(job.id, overflow_name),
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": overflow_name},
+                files={
+                    "file": (
+                        overflow_name,
+                        b"data",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 429, (
+            f"Expected 429 at file cap, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_large_video_uses_streaming_seam(self, client, db_session):
+        """A video body that rolls past the in-memory spool threshold is uploaded
+        via the STREAMING seam (``upload_compute_job_viewable_stream``) — its bytes
+        are never buffered whole through the in-memory
+        ``upload_compute_job_viewable_file`` path (the OOM vector the review
+        flagged). The streamed file object yields EXACTLY the file part, with no
+        multipart framing leaked, and the recorded size matches the payload."""
+        from app.routers import runner as runner_mod
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "rollout.mp4"
+        fake_uri = self._fake_uri(job.id, safe_name)
+        video_bytes = b"\x00\x01FAKE-MP4-PAYLOAD" * 64  # ~1 KiB, distinctive
+
+        captured: dict = {}
+
+        async def _fake_stream(job_id, basename, fileobj, content_type, *, size=None):
+            # Drain the streamed file object exactly as the GCS resumable upload
+            # does, capturing what actually crosses the seam.
+            captured["read"] = fileobj.read()
+            captured["size"] = size
+            captured["content_type"] = content_type
+            captured["basename"] = basename
+            return fake_uri
+
+        # Shrink the spool threshold so the modest test payload rolls to disk and
+        # takes the streaming branch. The in-memory seam MUST NOT be touched.
+        with patch.object(runner_mod, "_MAX_VIEWABLE_FILE_BYTES", 8), \
+                patch.object(runner_mod, "_MULTIPART_BODY_MARGIN", 8), \
+                patch("app.storage.upload_compute_job_viewable_stream", new=_fake_stream), \
+                patch(
+                    "app.storage.upload_compute_job_viewable_file",
+                    new=AsyncMock(side_effect=AssertionError(
+                        "rolled video must not use the in-memory upload seam"
+                    )),
+                ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, video_bytes, "video/mp4")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"Expected 200 for streamed video, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "video"
+        assert body["entry"]["storage_uri"] == fake_uri
+        assert body["entry"]["size_bytes"] == len(video_bytes)
+
+        # The streamed bytes are EXACTLY the file part — no multipart framing.
+        assert captured["read"] == video_bytes
+        assert captured["size"] == len(video_bytes)
+        assert captured["content_type"] == "video/mp4"
+        assert captured["basename"].startswith(".staging/")
+        assert captured["basename"].endswith(f"/{safe_name}")
+
+        # DB row + manifest recorded with the streamed size.
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1 and vf[0]["size_bytes"] == len(video_bytes)
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1 and rows[0].media_type == "video"
+        assert rows[0].file_size_bytes == len(video_bytes)
+
+    @pytest.mark.asyncio
+    async def test_reupload_same_relpath_advances_revision_and_terminal_reconciles(
+        self, client, db_session
+    ):
+        """Same URI/size advances live revision; terminal replaces it once."""
+        from app import compute_jobs as compute_jobs_mod
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            # Equal-size generations exercise the real defect: storage_uri and
+            # byte length cannot distinguish the overwritten bytes.
+            resp1 = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (
+                        safe_name,
+                        b"version-one",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp1.status_code == 200, (
+                f"First upload failed: {resp1.status_code}: {resp1.text}"
+            )
+            assert resp1.json()["total_viewable_files"] == 1
+            first_revision = resp1.json()["entry"]["revision"]
+            assert resp1.json()["entry"]["live"] is True
+
+            # Second upload: same relpath, same deterministic URI, same size.
+            resp2 = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (
+                        safe_name,
+                        b"version-two",
+                        "image/png",
+                    )
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp2.status_code == 200, (
+                f"Second upload failed: {resp2.status_code}: {resp2.text}"
+            )
+            assert resp2.json()["total_viewable_files"] == 1, (
+                "Re-upload must not increase the manifest count"
+            )
+            second_revision = resp2.json()["entry"]["revision"]
+            assert second_revision != first_revision
+            assert resp2.json()["entry"]["storage_uri"] == fake_uri
+
+        # ── Only ONE ComputeJobFile row ──────────────────────────────────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            f"Re-upload must not create duplicate ComputeJobFile row: got "
+            f"{len(rows)} rows for storage_uri={fake_uri}"
+        )
+
+        # ── Only ONE manifest entry ──────────────────────────────────────────
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1, (
+            f"Expected 1 viewable_files entry after re-upload, got {len(vf)}"
+        )
+        assert vf[0]["revision"] == second_revision
+        assert vf[0]["live"] is True
+
+        # The terminal bundle is authoritative. Its legacy-shaped result has no
+        # revision, so reconciliation must assign a final one, clear ``live``,
+        # replace the manifest in place, and preserve the single signing row.
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"version-two"),
+                "kind": "image",
+            }
+        ]
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts_with_completeness",
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
+        ):
+            final_manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(db_session, job)
+            )
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(final_manifest) == 1
+        assert final_manifest[0]["revision"] != second_revision
+        assert final_manifest[0]["live"] is False
+        await db_session.refresh(job)
+        assert (job.polling_metadata or {})["viewable_files"] == final_manifest
+        final_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(final_rows) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_filename_rejected(self, client, db_session):
+        """Upload without filename → 400."""
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/viewable",
+            # Only the file, no filename field
+            files={"file": ("img.png", b"data", "image/png")},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 400, (
+            f"Expected 400 for missing filename, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_reconcile_no_duplicate_row_for_midrun_file(
+        self, client, db_session
+    ):
+        """Must-hold invariant: mid-run upload then terminal explode ⇒ ONE row.
+
+        Exercises the CROSS-PATH composition the task called out: a file uploaded
+        via the mid-run endpoint (``POST .../viewable``) then reconciled by the
+        terminal ``persist_viewable_files_for_job`` pass. Because the terminal pass
+        recomputes the authoritative superset manifest from the bundle and — for a
+        file already uploaded mid-run — carries the IDENTICAL canonical
+        ``storage_uri``, the SAVEPOINT + UNIQUE(storage_uri) insert in
+        ``_record_viewable_job_files`` is a benign no-op: exactly one
+        ``ComputeJobFile`` row survives for the mid-run relpath, and the terminal
+        guard key ``viewable_file_count`` is stamped.
+        """
+        from app import compute_jobs as compute_jobs_mod
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+        safe_name = "reward_curve.png"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        # ── 1. Mid-run upload via the endpoint (RUNNING job) ─────────────────
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"midrun-png-bytes", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200, (
+            f"Mid-run upload failed: {resp.status_code}: {resp.text}"
+        )
+
+        # One row now exists; the terminal guard key must NOT be set yet.
+        await db_session.refresh(job)
+        assert "viewable_file_count" not in (job.polling_metadata or {}), (
+            "mid-run upload must not stamp the terminal guard key"
+        )
+
+        # ── 2. Job goes terminal, then the terminal viewable pass runs ───────
+        job.status = ComputeJobStatus.SUCCEEDED
+        db_session.add(job)
+        await db_session.commit()
+
+        # The terminal pass recomputes the authoritative superset from the
+        # bundle. Simulate that superset: it INCLUDES the mid-run file (identical
+        # storage_uri — this is what makes the dedup hold) plus a second file the
+        # bundle contained but which was never pushed mid-run.
+        second_name = "rollout.mp4"
+        second_uri = self._fake_uri(job.id, second_name)
+        terminal_manifest = [
+            {
+                "filename": safe_name,
+                "storage_uri": fake_uri,
+                "content_type": "image/png",
+                "size_bytes": len(b"midrun-png-bytes"),
+                "kind": "image",
+            },
+            {
+                "filename": second_name,
+                "storage_uri": second_uri,
+                "content_type": "video/mp4",
+                "size_bytes": 4096,
+                "kind": "video",
+            },
+        ]
+
+        with patch.object(
+            compute_jobs_mod,
+            "persist_viewable_artifacts_with_completeness",
+            new=AsyncMock(return_value=(terminal_manifest, 0, True, 0)),
+        ):
+            manifest, dropped = (
+                await compute_jobs_mod.persist_viewable_files_for_job(
+                    db_session, job
+                )
+            )
+        db_session.add(job)
+        await db_session.commit()
+
+        assert dropped == 0
+        assert len(manifest) == 2, (
+            f"terminal manifest should be the superset (2 files), got {manifest!r}"
+        )
+
+        # ── 3. Exactly ONE ComputeJobFile row for the mid-run relpath ────────
+        rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == fake_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(rows) == 1, (
+            "terminal reconcile must not duplicate the mid-run file's row: got "
+            f"{len(rows)} rows for storage_uri={fake_uri}"
+        )
+
+        # The bundle-only file the terminal pass discovered got its own row.
+        second_rows = (
+            await db_session.execute(
+                select(ComputeJobFile).where(
+                    ComputeJobFile.compute_job_id == job.id,
+                    ComputeJobFile.storage_uri == second_uri,
+                )
+            )
+        ).scalars().all()
+        assert len(second_rows) == 1, (
+            "terminal pass should register the bundle-only file exactly once"
+        )
+
+        # ── 4. Terminal guard key is now stamped ─────────────────────────────
+        await db_session.refresh(job)
+        meta = job.polling_metadata or {}
+        assert meta.get("viewable_file_count") == 2, (
+            f"viewable_file_count must be stamped by the terminal pass, got "
+            f"{meta.get('viewable_file_count')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_pdf_viewable_upload_accepted(self, client, db_session):
+        """PDF files are a supported viewable kind and must be accepted by the endpoint.
+
+        Finding 12: PDF artifacts should be uploadable via the live viewable
+        pipeline (storage.py classifies .pdf as kind='pdf') and the endpoint
+        must store the entry with the correct content_type/kind.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+        safe_name = "report.pdf"
+        fake_uri = self._fake_uri(job.id, safe_name)
+
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp = await client.post(
+                f"/api/runner/compute-job/{job.id}/viewable",
+                data={"filename": safe_name},
+                files={
+                    "file": (safe_name, b"%PDF-1.4 tiny", "application/pdf")
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, (
+            f"PDF viewable upload should be accepted, got {resp.status_code}: {resp.text}"
+        )
+        body = resp.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "pdf"
+        assert body["entry"]["content_type"] == "application/pdf"
+        assert body["entry"]["storage_uri"] == fake_uri
+
+        await db_session.refresh(job)
+        vf = (job.polling_metadata or {}).get("viewable_files", [])
+        assert len(vf) == 1
+        assert vf[0]["kind"] == "pdf"
+
+    @pytest.mark.asyncio
+    async def test_bound_secondary_project_viewable_upload_allowed(
+        self, client, db_session
+    ):
+        """A runner bound to a secondary project can upload viewable files for jobs in that project.
+
+        Finding 5: the live-viewable endpoint must authorize against
+        allowed_project_ids (the runner's enrollment project UNION its explicit
+        bindings), not just runner.project_id. A runner enrolled in project A but
+        explicitly bound to project B must be able to push previews for a job in B.
+        """
+        from app import runner_project_binding as rpb
+
+        # Runner is enrolled in project A.
+        _project_a, runner, token, _job_a = await self._make_running_job(db_session)
+
+        # Create project B and a job in it, pinned to this runner.
+        project_b = await _make_project(db_session, name="ProjectB")
+        job_b = ComputeJob(
+            project_id=project_b.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job_b)
+        await db_session.commit()
+        await db_session.refresh(job_b)
+
+        # Upload to job_b BEFORE binding — must be rejected (runner not on allow-list).
+        safe_name = "reward.png"
+        fake_uri = self._fake_uri(job_b.id, safe_name)
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_before = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_before.status_code == 404, (
+            f"Upload to unbound project should be 404, got {resp_before.status_code}"
+        )
+
+        # Bind the runner to project B.
+        await rpb.add_binding(db_session, runner.id, project_b.id)
+        await db_session.commit()
+
+        # Now upload must succeed.
+        with patch(
+            "app.storage.upload_compute_job_viewable_file",
+            return_value=fake_uri,
+        ):
+            resp_after = await client.post(
+                f"/api/runner/compute-job/{job_b.id}/viewable",
+                data={"filename": safe_name},
+                files={"file": (safe_name, b"px", "image/png")},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_after.status_code == 200, (
+            f"Upload to bound project should succeed, got "
+            f"{resp_after.status_code}: {resp_after.text}"
+        )
+        body = resp_after.json()
+        assert body["ok"] is True
+        assert body["entry"]["kind"] == "image"
+
+
+# ── Capability proof trial: runner job + result ingestion (design 84021e2d §2) ─
+#
+# Slice 2: a `capability_proof_trial` task runs ONLY a working capability's
+# declared covering tests as a targeted runner job; the ingestion completion
+# handler mints a genuine `proven` named_test proof on GREEN and records NOTHING
+# (never demotes) on RED. Everything is dark, gated on the runtime flag.
+
+
+async def _make_trial_project(session, cap_name: str):
+    """A project carrying one working capability with no proof yet."""
+    project = await _make_project(session, name="Proof Trial Project")
+    project.problem_model = {"capabilities": [{"name": cap_name, "status": "working"}]}
+    project.capability_proof_records = {}
+    flag_modified(project, "problem_model")
+    flag_modified(project, "capability_proof_records")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+def _make_trial_task(project, cap_name: str, test_refs, head_sha="deadbeef"):
+    return Task(
+        project_id=project.id,
+        title=f"Capability proof trial: {cap_name}",
+        payloads=[{
+            "type": "capability_proof_trial",
+            "cap": cap_name,
+            "test_refs": test_refs,
+            "head_sha": head_sha,
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+
+
+class _TrialFlag:
+    """Context manager toggling the dark trial flag and restoring it."""
+
+    def __init__(self, value: bool):
+        self.value = value
+        self._prev = None
+
+    def __enter__(self):
+        from app.shared_state import runtime_config
+
+        self._rc = runtime_config
+        self._prev = runtime_config.get("capability_proof_execution_trials_enabled")
+        runtime_config["capability_proof_execution_trials_enabled"] = self.value
+        return self
+
+    def __exit__(self, *exc):
+        if self._prev is None:
+            self._rc.pop("capability_proof_execution_trials_enabled", None)
+        else:
+            self._rc["capability_proof_execution_trials_enabled"] = self._prev
+        return False
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_green_records_proven(db_session):
+    """A GREEN trial result ingestion mints a genuine `proven` named_test proof
+    and the capability reads `proven` (design 84021e2d Slice 2 acceptance seam).
+
+    This exercises the production ingestion handler
+    ``_handle_capability_proof_trial_completion`` end-to-end through the shared
+    proof recorder and the ``working_capability_proof_status`` reader.
+    """
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "language-aware-repo-map"
+    test_refs = ["backend/testing/test_prompt.py::test_map"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="cafef00d")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "cafef00d",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+        "skipped_summary": {"total": 3, "skipped": 0},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+
+    # The capability now reads the genuine `proven` tier.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get(cap) == "proven"
+
+    # A durable executed-named_test proof was recorded in the ledger.
+    entries = project.capability_proof_records[cap]
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["proof_kind"] == "named_test"
+    assert e["executed"] is True
+    assert e["commit_sha"] == "cafef00d"
+    assert e["test_refs"] == test_refs
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_red_records_no_proof(db_session):
+    """A RED trial records NO proof and never demotes; the contradiction is
+    stamped on the task context for strategist visibility only."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # No proof recorded — the capability is NOT proven.
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+    # The red result is surfaced (non-demoting) on the task context.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_definitive_red_revokes_prior_green(db_session):
+    """A definitive RED trial (ran=True, passed=False, could_not_run=False) REVOKES
+    any stale executed-proof ledger entry so the capability cannot keep clearing the
+    enforce gate until the 30-day TTL expires.
+
+    Acceptance: 'a definitive red B blocks the capability'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-red-revoke"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # First stamp a GREEN proof at sha_a (revision A).
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Confirm the capability is now "proven" via the execution proof.
+    assert (project.capability_proof_records or {}).get(cap) or \
+        working_capability_proof_status(project.problem_model).get(cap) == "proven"
+
+    # A RED trial at sha_b (revision B) should revoke the sha_a proof.
+    red = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": True,
+        "passed": False,
+        "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(red), db_session)
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+
+    # The named_test_exec ledger entry must be gone.
+    norm_cap = cap
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(norm_cap) or [])
+        if e.get("task_id") == f"named_test_exec:{norm_cap}"
+    ]
+    assert exec_entries == [], "definitive RED must revoke the stale execution proof"
+
+    # The contradiction is still surfaced.
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction["cap"] == cap
+    assert contradiction["passed"] is False
+    assert contradiction["proof_revoked"] is True
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_indeterminate_result_leaves_proof(db_session):
+    """An indeterminate result (could_not_run=True) must NOT revoke existing proof.
+
+    Acceptance: 'an indeterminate B ... result cannot corrupt the current verdict'.
+    """
+    import json as _json
+
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    from app.capability_proof import record_capability_named_test_execution_proof
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-infra-fail"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="sha_b")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Stamp a GREEN proof at sha_a.
+    record_capability_named_test_execution_proof(
+        project, cap, test_refs, head_sha="sha_a", suite_verifying=True
+    )
+    _flag_modified(project, "capability_proof_records")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Infrastructure failure: could_not_run — indeterminate, should NOT revoke.
+    indeterminate = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "sha_b",
+        "test_refs": test_refs,
+        "ran": False,
+        "passed": False,
+        "could_not_run": True,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(indeterminate), db_session
+        )
+
+    await db_session.refresh(project)
+    records = project.capability_proof_records or {}
+    exec_entries = [
+        e for e in (records.get(cap) or [])
+        if e.get("task_id") == f"named_test_exec:{cap}"
+    ]
+    assert exec_entries, "indeterminate result must NOT revoke the existing proof"
+
+    contradiction = (task.context or {}).get("capability_proof_trial_contradiction")
+    assert contradiction is not None
+    assert contradiction.get("proof_revoked") is False
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_dedup_in_flight(db_session):
+    """enroll_capability_proof_trial returns None when a trial for the same
+    capability is already QUEUED/PROVISIONING/IN_PROGRESS — 'revision B commissions
+    exactly one re-verification'."""
+    from app.capability_proof import enroll_capability_proof_trial
+
+    project = await _make_trial_project(db_session, "dedup-cap")
+
+    # Enroll the first trial.
+    with _TrialFlag(True):
+        first = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha1"
+        )
+    assert first is not None
+    assert first.status == TaskStatus.QUEUED
+
+    # A second enrollment attempt for the same capability must be a no-op.
+    with _TrialFlag(True):
+        second = await enroll_capability_proof_trial(
+            db_session, project, "dedup-cap", ["backend/testing/test_a.py"], "sha2"
+        )
+    assert second is None, "duplicate trial must be blocked by the dedup guard"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_flag_off_records_nothing(db_session):
+    """With the dark flag OFF, even a GREEN trial records nothing."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-darkoff"
+    test_refs = ["backend/testing/test_prompt.py::test_x"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial", "cap": cap, "head_sha": "abc",
+        "test_refs": test_refs, "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(False):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_skipped_suite_records_nothing(db_session):
+    """A green-but-all-skipped (non-verifying) trial records no proof."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "repo-map-skipped"
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, ["backend/testing/test_prompt.py"], head_sha="abc")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    vacuous = {
+        "type": "capability_proof_trial", "cap": cap, "head_sha": "abc",
+        "test_refs": ["backend/testing/test_prompt.py"],
+        "ran": True, "passed": True, "could_not_run": False,
+        "skipped_summary": {"total": 4, "skipped": 4},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(vacuous), db_session)
+
+    await db_session.refresh(project)
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_wrong_cap_rejected(db_session):
+    """A trial result whose cap does not match the enrollment contract records
+    no proof — the runner cannot mint proof for the wrong capability."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "enrolled-capability"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with cap "enrolled-capability"
+    task = _make_trial_task(project, cap, test_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a DIFFERENT cap than what was enrolled.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": "different-capability",
+        "head_sha": "deadbeef",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    # No proof recorded for the wrong cap.
+    status_map = working_capability_proof_status(project.problem_model)
+    assert status_map.get("different-capability") != "proven"
+    assert "different-capability" not in (project.capability_proof_records or {})
+    # And no proof for the enrolled cap either.
+    assert status_map.get(cap) != "proven"
+    assert cap not in (project.capability_proof_records or {})
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_extra_test_refs_rejected(db_session):
+    """A trial result with test_refs that were NOT in the enrollment must NOT
+    mint proof — the runner cannot claim green for refs it was never enrolled to run."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "refs-guard-cap"
+    enrolled_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a specific set of test_refs
+    task = _make_trial_task(project, cap, enrolled_refs)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports extra test_refs not in the enrollment.
+    extra_refs_report = enrolled_refs + ["backend/testing/test_extra.py"]
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "test_refs": extra_refs_report,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+    await db_session.refresh(task)
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "test_refs_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_head_sha_is_rejected(db_session):
+    """A green receipt without the enrolled revision cannot mint a proof."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "missing-sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+
+    receipt_without_sha = {
+        "type": "capability_proof_trial", "cap": cap,
+        "test_refs": test_refs, "ran": True, "passed": True, "could_not_run": False,
+    }
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(receipt_without_sha), db_session
+        )
+
+    await db_session.refresh(project)
+    await db_session.refresh(task)
+    assert cap not in (project.capability_proof_records or {})
+    contradiction = (task.context or {})["capability_proof_trial_contradiction"]
+    assert contradiction["reason"] == "head_sha_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_incomplete_receipt_records_nothing(db_session):
+    """A trial result with an empty test_refs or a proper subset of enrolled refs
+    must NOT mint proof — the agent must report the complete executed suite."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-refs-cap"
+    enrolled_refs = [
+        "backend/testing/test_prompt.py::test_map",
+        "backend/testing/test_prompt.py::test_search",
+    ]
+    project = await _make_trial_project(db_session, cap)
+    task = _make_trial_task(project, cap, enrolled_refs, head_sha="deadbeef")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    base_result = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "deadbeef",
+        "ran": True,
+        "passed": True,
+        "could_not_run": False,
+    }
+
+    # Case 1: empty test_refs — bypasses validation entirely without this fix.
+    empty_refs_result = dict(base_result, test_refs=[])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(empty_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "empty test_refs must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+    # Case 2: proper subset — only one of two enrolled refs reported.
+    partial_refs_result = dict(base_result, test_refs=[enrolled_refs[0]])
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(
+            task, _json.dumps(partial_refs_result), db_session
+        )
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {}), (
+        "partial test_refs subset must not mint proof"
+    )
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_mismatched_head_sha_rejected(db_session):
+    """A trial result whose head_sha differs from the enrollment must NOT mint
+    proof — the runner must execute the enrolled revision."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-guard-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with head_sha "abc123"
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a different sha.
+    wrong = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "def456",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(wrong), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_missing_sha_records_nothing(db_session):
+    """A trial result that omits head_sha must NOT mint proof when the enrollment
+    specified a head_sha — missing executed SHA is a receipt defect."""
+    import json as _json
+
+    from app.capability_registry import working_capability_proof_status
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "incomplete-receipt-cap"
+    test_refs = ["backend/testing/test_prompt.py"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll with a head_sha so the check is active.
+    task = _make_trial_task(project, cap, test_refs, head_sha="abc123")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Agent reports a result WITHOUT head_sha (None / missing).
+    incomplete = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        # head_sha intentionally absent
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(incomplete), db_session)
+
+    await db_session.refresh(project)
+    assert cap not in (project.capability_proof_records or {})
+    assert working_capability_proof_status(project.problem_model).get(cap) != "proven"
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_records_reported_sha_not_enrolled_sha(db_session):
+    """When the enrollment has no head_sha but the agent reports one, the ledger
+    records the agent-reported SHA (the actual executed revision), not an empty
+    string or None."""
+    import json as _json
+
+    from app.task_completion import _handle_capability_proof_trial_completion
+
+    cap = "sha-fallback-cap"
+    test_refs = ["backend/testing/test_prompt.py::test_map"]
+    project = await _make_trial_project(db_session, cap)
+    # Enroll WITHOUT a head_sha (head_sha_enrolled = None).
+    task = Task(
+        project_id=project.id,
+        title=f"Capability proof trial: {cap}",
+        payloads=[{
+            "type": "capability_proof_trial",
+            "cap": cap,
+            "test_refs": test_refs,
+            # deliberately omit head_sha
+        }],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    green = {
+        "type": "capability_proof_trial",
+        "cap": cap,
+        "head_sha": "reported-sha-abc",
+        "test_refs": test_refs,
+        "ran": True, "passed": True, "could_not_run": False,
+        "skipped_summary": {"total": 3, "skipped": 0},
+    }
+
+    with _TrialFlag(True):
+        await _handle_capability_proof_trial_completion(task, _json.dumps(green), db_session)
+
+    await db_session.refresh(project)
+    entries = project.capability_proof_records.get(cap, [])
+    assert len(entries) == 1
+    # The recorded SHA is the agent-reported revision, not None or empty.
+    assert entries[0]["commit_sha"] == "reported-sha-abc"
+
+
+@pytest.mark.asyncio
+async def test_enroll_capability_proof_trial_creates_bounded_task(db_session):
+    """enroll_capability_proof_trial persists a bounded trial task when the flag
+    is on, caps the test-file count, and is a no-op when the flag is off."""
+    from app.capability_proof import (
+        CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS,
+        MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
+        enroll_capability_proof_trial,
+    )
+
+    project = await _make_trial_project(db_session, "enroll-cap")
+
+    # Flag OFF → no-op.
+    with _TrialFlag(False):
+        none_task = await enroll_capability_proof_trial(
+            db_session, project, "enroll-cap", ["backend/testing/test_a.py"], "sha"
+        )
+    assert none_task is None
+
+    # Flag ON → a QUEUED trial task with the bounded launch contract.
+    many_refs = [f"backend/testing/test_{i}.py" for i in range(MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES + 5)]
+    with _TrialFlag(True):
+        task = await enroll_capability_proof_trial(
+            db_session, project, "Enroll Cap", many_refs, "sha123"
+        )
+    assert task is not None
+    assert task.status == TaskStatus.QUEUED
+    payload = task.first_payload
+    assert payload["type"] == "capability_proof_trial"
+    # Capability name normalized to canonical kebab form.
+    assert payload["cap"] == "enroll-cap"
+    # Test-file count hard-capped.
+    assert len(payload["test_refs"]) == MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES
+    assert payload["head_sha"] == "sha123"
+    assert payload["wall_clock_seconds"] == CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS
+
+
+# ── Cross-job resume fail-closed (scripts/local_runner.py) ───────────────────
+
+
+def test_large_checkpoint_round_trip_upload_bundle_resume(tmp_path, monkeypatch):
+    """A >25 MiB tree uses the direct contract and rehydrates byte-for-byte.
+
+    This exercises the dependency-free runner's production archive builder,
+    chunked direct upload, completion handshake, authorized direct download,
+    integrity check, safe extraction, and atomic workspace publication as one
+    seam. A second download with mismatched authoritative CRC32C must leave the
+    destination untouched.
+    """
+    import hashlib
+    import io
+    import json
+    import os
+    import random
+    import shutil
+    import sys
+    from pathlib import Path
+
+    script_candidates = (
+        Path(__file__).parents[2] / "scripts",
+        Path("/repo/scripts"),
+    )
+    scripts_dir = next(path for path in script_candidates if path.is_dir())
+    sys.path.insert(0, str(scripts_dir))
+    import local_runner
+
+    source = tmp_path / "source"
+    source.mkdir()
+    checkpoint = source / "checkpoints" / "epoch-0042.bin"
+    checkpoint.parent.mkdir()
+    rng = random.Random(20260715)
+    remaining = 27 * 1024 * 1024 + 137
+    with checkpoint.open("wb") as output:
+        while remaining:
+            chunk = rng.randbytes(min(1024 * 1024, remaining))
+            output.write(chunk)
+            remaining -= len(chunk)
+    (source / "notes.txt").write_text("resume-me\n", encoding="utf-8")
+
+    stored_bundle = tmp_path / "durable-transfer.tar.gz"
+    contract = {}
+
+    def crc32c_for(path):
+        state = 0xFFFFFFFF
+        with open(path, "rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                state = local_runner._crc32c_update(state, chunk)
+        return local_runner._crc32c_b64(state)
+
+    def fake_post(url, _token, body):
+        if url.endswith("/artifact-transfer/complete"):
+            assert body == {"transfer_id": "transfer-large", "generation": "73"}
+            assert stored_bundle.stat().st_size == contract["archive_size"]
+            assert crc32c_for(stored_bundle) == contract["crc32c"]
+            return 200, {
+                "ok": True,
+                "runner_artifact": {
+                    "stored": True,
+                    "verified": True,
+                    "size": contract["archive_size"],
+                    "crc32c": contract["crc32c"],
+                    "generation": "73",
+                },
+            }
+        assert url.endswith("/artifact-transfer")
+        contract.update(body)
+        return 200, {
+            "ok": True,
+            "transfer_id": "transfer-large",
+            "upload_url": "https://storage.invalid/signed-put",
+            "method": "PUT",
+            "headers": {"Content-Type": "application/gzip"},
+        }
+
+    def fake_stream(url, method, headers, file_path, file_size):
+        assert url == "https://storage.invalid/signed-put"
+        assert method == "PUT"
+        assert headers["Content-Type"] == "application/gzip"
+        assert os.path.getsize(file_path) == file_size
+        shutil.copyfile(file_path, stored_bundle)
+        return 200, {"x-goog-generation": "73"}, b""
+
+    monkeypatch.setattr(local_runner, "_post", fake_post)
+    monkeypatch.setattr(local_runner, "_stream_http_file", fake_stream)
+    delivery = local_runner._upload_artifact(
+        "https://api.invalid", "runner-token", "job-large", str(source)
+    )
+    assert contract["total_bytes"] > 25 * 1024 * 1024
+    assert contract["archive_size"] > 25 * 1024 * 1024
+    assert delivery["status"] == "delivered"
+    assert delivery["verified"] is True
+    assert delivery["crc32c"] == crc32c_for(stored_bundle)
+
+    class Response:
+        def __init__(self, status, stream, content_type):
+            self.status = status
+            self._stream = stream
+            self.headers = {"Content-Type": content_type}
+
+        def read(self, size=-1):
+            return self._stream.read(size)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self._stream.close()
+            return False
+
+    expected_crc = contract["crc32c"]
+
+    def fake_urlopen(request, timeout=None):
+        assert timeout == 120
+        if request.full_url.endswith("input-artifact?direct=true"):
+            metadata = json.dumps(
+                {
+                    "download_url": "https://storage.invalid/signed-get",
+                    "size": stored_bundle.stat().st_size,
+                    "crc32c": expected_crc,
+                    "generation": "73",
+                }
+            ).encode()
+            return Response(200, io.BytesIO(metadata), "application/json")
+        assert request.full_url == "https://storage.invalid/signed-get"
+        return Response(200, stored_bundle.open("rb"), "application/gzip")
+
+    monkeypatch.setattr(local_runner.urllib.request, "urlopen", fake_urlopen)
+    resumed = tmp_path / "resumed"
+    resumed.mkdir()
+    provenance = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(resumed)
+    )
+    assert provenance == {
+        "ok": True,
+        "file_count": 2,
+        "bytes": contract["total_bytes"],
+    }
+
+    def sha256(path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    assert sha256(checkpoint) == sha256(resumed / "checkpoints" / checkpoint.name)
+    assert (resumed / "notes.txt").read_text(encoding="utf-8") == "resume-me\n"
+
+    rejected = tmp_path / "rejected"
+    rejected.mkdir()
+    sentinel = rejected / "keep.txt"
+    sentinel.write_text("untouched", encoding="utf-8")
+    expected_crc = "AAAAAA=="
+    mismatch = local_runner._download_input_artifact(
+        "https://api.invalid", "runner-token", "job-successor", str(rejected)
+    )
+    assert mismatch == {"ok": False, "reason": "integrity_mismatch:crc32c"}
+    assert sentinel.read_text(encoding="utf-8") == "untouched"
+
+
+class TestRunnerResumeFail_Closed:
+    """_run_compute_job fails closed when the input-artifact bundle is unavailable.
+
+    The self-hosted runner previously silently restarted from scratch when
+    _download_input_artifact returned ok=False — discarding weeks of checkpoint
+    progress. The fix: treat a hydration failure as a terminal failure so the
+    operator sees an honest signal rather than a silent from-scratch burn.
+    """
+
+    @staticmethod
+    def _bwrap_caps():
+        import sys
+        import pathlib
+        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        import runner_isolation as iso
+        return iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+
+    @staticmethod
+    def _make_job(**kwargs):
+        base = {
+            "job_id": "test-resume-001",
+            "command": "echo should-not-run",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": None,
+            "container_registry_auth": {},
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_runner_resume_fails_closed_when_bundle_unavailable(self):
+        """A missing predecessor bundle aborts the job — command never starts."""
+        import sys
+        import pathlib
+        import threading
+        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        import local_runner
+        from unittest.mock import patch
+
+        reports = []
+        uploads = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None,
+                        resume_hydration=None, progress=None, **_kw):
+            reports.append({
+                "exec_status": exec_status,
+                "exit_code": exit_code,
+                "command_log": command_log,
+                "resume_hydration": resume_hydration,
+            })
+            return False
+
+        def fake_download(orch_url, token, job_id, artifact_dir):
+            # Model a buggy extractor that left a predecessor fragment. The
+            # terminal finally path must still scrub and suppress its upload.
+            with open(os.path.join(artifact_dir, "partial-checkpoint.pt"), "wb") as fh:
+                fh.write(b"partial predecessor")
+            return {"ok": False, "reason": "http_404"}
+
+        job = self._make_job(input_artifact_job_id="pred-job-001")
+        active: set = {"test-resume-001"}
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_download_input_artifact", fake_download), \
+             patch.object(local_runner, "_upload_artifact", lambda *_args: uploads.append(True)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                active, threading.Lock(),
+                capabilities=self._bwrap_caps(),
+            )
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        assert terminal, "expected a terminal exec_status report"
+        assert terminal[-1]["exec_status"] == "failed", (
+            f"expected 'failed', got '{terminal[-1]['exec_status']}'"
+        )
+        # The failure reason must be visible in the command_log so the operator
+        # can see why the job stopped without digging into runner logs.
+        log_text = (terminal[-1].get("command_log") or {}).get("text", "")
+        assert "input_artifact_rehydration_failed" in log_text, (
+            f"expected rehydration failure marker in command_log, got: {log_text!r}"
+        )
+        # The provenance dict must carry the failure reason through to the report.
+        hydration = terminal[-1].get("resume_hydration") or {}
+        assert hydration.get("reason") == "http_404", (
+            f"expected reason='http_404' in resume_hydration, got: {hydration!r}"
+        )
+        assert uploads == [], "failed hydration must not upload predecessor fragments"
+        # Job must be removed from active_jobs so capacity is released.
+        assert "test-resume-001" not in active
+
+    def test_runner_resume_fails_closed_on_extract_error(self):
+        """An extraction error also aborts the job — command never starts."""
+        import sys
+        import pathlib
+        import threading
+        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        import local_runner
+        from unittest.mock import patch
+
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None,
+                        resume_hydration=None, progress=None, **_kw):
+            reports.append({"exec_status": exec_status})
+            return False
+
+        def fake_download(orch_url, token, job_id, artifact_dir):
+            return {"ok": False, "reason": "extract_error:TarError"}
+
+        job = self._make_job(input_artifact_job_id="pred-job-002")
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_download_input_artifact", fake_download):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                set(), threading.Lock(),
+                capabilities=self._bwrap_caps(),
+            )
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        assert terminal, "expected a terminal exec_status report"
+        assert terminal[-1]["exec_status"] == "failed"
+
+    def test_runner_resume_proceeds_when_bundle_available(self):
+        """Successful proof is repeated on a later durable terminal report."""
+        import sys
+        import pathlib
+        import threading
+        sys.path.insert(0, str(pathlib.Path(__file__).parents[2] / "scripts"))
+        import local_runner
+        from unittest.mock import patch
+
+        reports: list = []
+
+        def fake_report(
+            orch_url, token, job_id, *, exec_status, resume_hydration=None, **_kw
+        ):
+            reports.append(
+                {"exec_status": exec_status, "resume_hydration": resume_hydration}
+            )
+            return False
+
+        def fake_download(orch_url, token, job_id, artifact_dir):
+            return {"ok": True, "file_count": 3, "bytes": 1024}
+
+        job = self._make_job(
+            input_artifact_job_id="pred-job-003",
+            repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+            repo_token="token",
+        )
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_download_input_artifact", fake_download), \
+             patch.object(local_runner, "_clone_repo", return_value=(False, 1)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                set(), threading.Lock(),
+                capabilities=self._bwrap_caps(),
+            )
+
+        assert reports[0]["exec_status"] == "running"
+        terminal = [r for r in reports if r["exec_status"] == "failed"][-1]
+        assert terminal["resume_hydration"] == {
+            "ok": True,
+            "file_count": 3,
+            "bytes": 1024,
+            "resumed_from_job_id": "pred-job-003",
+        }
+
+
+# ---------------------------------------------------------------------------
+# local_runner._scan_viewable_files — scan cap
+# ---------------------------------------------------------------------------
+
+
+class TestScanViewableFilesCap:
+    """_scan_viewable_files respects _VIEWABLE_SCAN_FILE_CAP."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_scan_returns_all_when_under_cap(self, tmp_path):
+        """Fewer files than _VIEWABLE_SCAN_FILE_CAP → all viewable files returned."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for i in range(5):
+            (art / f"plot{i}.png").write_bytes(b"PNG")
+        for i in range(3):
+            (art / f"notes{i}.txt").write_bytes(b"txt")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        assert len(candidates) == 5  # only viewable files in the result
+        relpaths = {c["relpath"] for c in candidates}
+        assert all(r.endswith(".png") for r in relpaths)
+
+    def test_scan_stops_at_cap(self, tmp_path):
+        """When total entries exceed _VIEWABLE_SCAN_FILE_CAP, scan stops early.
+
+        The cap is on total entries (viewable + non-viewable), so a directory
+        flooded with non-viewable files triggers an early return. The returned
+        list must be <= the cap size (it may be smaller since most files are
+        non-viewable). Critically, the function must NOT walk all files.
+        """
+        local_runner = self._import_local_runner()
+        cap = local_runner._VIEWABLE_SCAN_FILE_CAP
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        # Write cap+1 non-viewable files + 1 viewable file.
+        for i in range(cap + 1):
+            (art / f"checkpoint_{i:05d}.bin").write_bytes(b"X")
+        (art / "reward.png").write_bytes(b"PNG")
+
+        walks: list = []
+        real_walk = os.walk
+
+        def counting_walk(*args, **kw):
+            for entry in real_walk(*args, **kw):
+                walks.append(entry[2])  # filenames list per dir
+                yield entry
+
+        with patch("os.walk", side_effect=counting_walk):
+            candidates = local_runner._scan_viewable_files(str(art))
+
+        total_scanned = sum(len(fnames) for fnames in walks)
+        assert total_scanned <= cap + 5, (
+            f"scan walked {total_scanned} entries, expected to stop near cap={cap}"
+        )
+        # The function must return without error even when capped.
+        assert isinstance(candidates, list)
+
+    def test_scan_returns_sorted_candidates(self, tmp_path):
+        """Candidates are sorted by relpath even when the scan is capped."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        for name in ("zzz.png", "aaa.png", "mmm.webp"):
+            (art / name).write_bytes(b"X")
+
+        candidates = local_runner._scan_viewable_files(str(art))
+        relpaths = [c["relpath"] for c in candidates]
+        assert relpaths == sorted(relpaths)
+
+
+# ---------------------------------------------------------------------------
+# local_runner._stream_viewable_files — oversize/count accounting reset
+# ---------------------------------------------------------------------------
+
+
+class TestStreamViewableAccountingReset:
+    """oversize_relpaths and count_cap_relpaths are reset on each scan cycle."""
+
+    @staticmethod
+    def _import_local_runner():
+        import sys
+        import pathlib
+        scripts_dir = pathlib.Path(__file__).parents[2] / "scripts"
+        sys.path.insert(0, str(scripts_dir))
+        import local_runner
+        return local_runner
+
+    def test_oversize_relpaths_reset_per_scan(self, tmp_path):
+        """A file that was oversize in a prior scan is not counted if now gone.
+
+        _stream_viewable_files resets oversize_relpaths at the start of each
+        call so the omission count reflects the CURRENT scan, not cumulative
+        history.  Verifies the reset by calling _stream_viewable_files twice:
+        the first call adds a file to oversize_relpaths; the second call with an
+        empty dir must report 0 oversize files.
+        """
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        image_cap = local_runner._MAX_VIEWABLE_IMAGE_BYTES
+
+        # First scan: one oversized image.
+        oversized = art / "big.png"
+        oversized.write_bytes(b"X" * (image_cap + 1))
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 1, (
+            "first scan should record the oversize file"
+        )
+
+        # Second scan: the file is gone (removed between heartbeats).
+        oversized.unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-acct", str(art), state
+        )
+
+        assert len(state.oversize_relpaths) == 0, (
+            "second scan with no oversize files should reset the counter to 0, "
+            f"got {len(state.oversize_relpaths)}"
+        )
+
+    def test_count_cap_relpaths_reset_per_scan(self, tmp_path):
+        """count_cap_relpaths is cleared at the start of each scan call."""
+        local_runner = self._import_local_runner()
+        art = tmp_path / "artifacts"
+        art.mkdir()
+
+        state = local_runner._ViewableStreamState()
+        # Simulate already-sent 25 files so any new file gets count-capped.
+        for i in range(local_runner._MAX_VIEWABLE_FILE_COUNT):
+            state.sent[f"file{i}.png"] = (0, 0, 0)
+
+        # Write one new viewable file that will be count-capped.
+        (art / "extra.png").write_bytes(b"X")
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 1, (
+            "count-capped file should appear in count_cap_relpaths"
+        )
+
+        # Second scan: the extra file is removed.
+        (art / "extra.png").unlink()
+
+        local_runner._stream_viewable_files(
+            "https://orch.example.com", "tok", "job-cnt", str(art), state
+        )
+
+        assert len(state.count_cap_relpaths) == 0, (
+            "second scan with no new files should reset count_cap_relpaths to 0, "
+            f"got {len(state.count_cap_relpaths)}"
+        )

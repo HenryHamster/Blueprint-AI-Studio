@@ -1071,6 +1071,39 @@ export function buildOpenMessagesText(openMessages: Array<Record<string, unknown
   }).join('\n');
 }
 
+/**
+ * Format the recently-ANSWERED operator conversation tail (backend
+ * `recent_handled_conversation`) into a compact, read-only transcript.
+ *
+ * Every message here is already status handled/resolved — so this is explicitly
+ * NOT an inbox and must NOT be acted on again. It exists only so a correction
+ * the operator just made, that the strategist forgot to capture into the
+ * durable decisions register (the OPERATOR-DECISION marker), survives a restart
+ * or compaction — otherwise the message vanishes from the open feed the instant
+ * it is marked handled and the strategist re-proposes what the operator already
+ * settled. Returns '' when there is nothing to show so the caller omits the
+ * section entirely.
+ *
+ * Mirrors the field access of `buildOpenMessagesText` (type/id/from/content)
+ * but drops the open-inbox age + citation decorations, which do not apply to
+ * already-answered messages.
+ */
+export function formatRecentHandledConversation(
+  messages: Array<Record<string, unknown>>,
+): string {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  return messages
+    .map((m) => {
+      const type = strVal(m.type) || 'message';
+      const from = strVal(m.from) || 'unknown';
+      const id = strVal(m.id);
+      const content = strVal(m.content).slice(0, 5000);
+      const idPart = id ? `id: ${id}, ` : '';
+      return `- [${type}] (${idPart}from: ${from}, answered) ${content}`;
+    })
+    .join('\n');
+}
+
 export function buildDirSummaryText(
   directionsSummary: Array<Record<string, unknown>>,
   authoritativeActiveCount?: number,

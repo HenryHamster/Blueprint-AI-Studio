@@ -103,6 +103,33 @@ async def test_get_and_list(db_session):
 
 
 @pytest.mark.asyncio
+async def test_get_direction_rows_batches(db_session):
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    for i in range(3):
+        await directions_repo.upsert_direction(
+            db_session, project.id, {"id": f"d-{i}", "text": f"t{i}", "status": "active"}
+        )
+    await db_session.commit()
+
+    # Batched fetch returns a dict keyed by direction_key, resolving only the
+    # keys that exist (missing "nope" is silently absent, no error).
+    rows = await directions_repo.get_direction_rows(
+        db_session, project.id, ["d-0", "d-2", "nope"]
+    )
+    assert set(rows.keys()) == {"d-0", "d-2"}
+    assert rows["d-0"].direction_key == "d-0"
+    assert isinstance(rows["d-2"], Direction)
+
+    # Empty / all-falsy input short-circuits to an empty dict.
+    assert await directions_repo.get_direction_rows(db_session, project.id, []) == {}
+    assert await directions_repo.get_direction_rows(
+        db_session, project.id, [None, ""]
+    ) == {}
+
+
+@pytest.mark.asyncio
 async def test_expire_proposals_accessor(db_session):
     from datetime import timedelta
     from app.time_utils import _utcnow
@@ -173,6 +200,44 @@ async def test_dual_write_syncs_on_mutation(db_session):
     assert rows["d-1"].data["research_history"] == [
         {"task_id": "t1", "tasks_created": 2}
     ]
+
+
+@pytest.mark.asyncio
+async def test_unrelated_blob_sync_preserves_normalized_criterion_binding(db_session):
+    version_id = uuid.uuid4()
+    project = make_project(
+        directions=[{"id": "d-1", "text": "a", "status": "active"}]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-1",
+            text="a",
+            status="active",
+            data={
+                "id": "d-1",
+                "text": "a",
+                "status": "active",
+                "criterion_release_version_id": str(version_id),
+            },
+            criterion_keys=["c-11111111"],
+        )
+    )
+    await db_session.commit()
+
+    await with_directions_locked(
+        db_session,
+        project.id,
+        lambda directions: directions[0].update(priority="high"),
+    )
+    await db_session.commit()
+
+    row = (await _table_rows(db_session, project.id))["d-1"]
+    assert row.criterion_keys == ["c-11111111"]
+    assert row.data["criterion_release_version_id"] == str(version_id)
+    assert row.data["priority"] == "high"
 
 
 @pytest.mark.asyncio

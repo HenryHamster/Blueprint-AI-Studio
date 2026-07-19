@@ -794,7 +794,9 @@ async def raise_capability_verdict_notice(
     fires a new notice while repeated re-evaluations of the same standing decided
     verdict are silent.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.message_audience import stamp_message_audience
+    from app.models import MessageType
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_verdict_decided_{cap_name}_{new_verdict}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -821,22 +823,26 @@ async def raise_capability_verdict_notice(
             f"reason={verdict_reason} lift={lift} n_with={n_with} n_without={n_without}"
         )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_verdict_decided",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "prior_verdict": prior_verdict,
-                "new_verdict": new_verdict,
-                "verdict_reason": verdict_reason,
-                "lift": lift,
-                "n_with": n_with,
-                "n_without": n_without,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_verdict_decided",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "prior_verdict": prior_verdict,
+                    "new_verdict": new_verdict,
+                    "verdict_reason": verdict_reason,
+                    "lift": lift,
+                    "n_with": n_with,
+                    "n_without": n_without,
+                },
+                "capability_verdict_decided",
+            ),
         )
     )
 
@@ -911,6 +917,7 @@ async def persist_trial_verdicts_in_transaction(
     )
     async with factory() as session:
         try:
+            proof_recorded = False
             project = (
                 await session.execute(
                     select(Project).where(Project.id == project_id).with_for_update()
@@ -937,7 +944,10 @@ async def persist_trial_verdicts_in_transaction(
                             record_capability_proof_from_trial,
                         )
 
-                        record_capability_proof_from_trial(project, cap_name, entry)
+                        proof_recorded = (
+                            record_capability_proof_from_trial(project, cap_name, entry)
+                            or proof_recorded
+                        )
                     except Exception:
                         logger.exception(
                             "[CAPABILITY_TRIAL] capability proof recording failed for "
@@ -1036,7 +1046,25 @@ async def persist_trial_verdicts_in_transaction(
                 )
             await session.commit()
             verdicts = get_trial_verdicts(project)
-            return dict(verdicts) if isinstance(verdicts, dict) else {}
+            persisted_verdicts = dict(verdicts) if isinstance(verdicts, dict) else {}
+            if proof_recorded:
+                # The trial-adoption proof is durable before waking waiters. The
+                # shared resolver is bounded, idempotent, and all-needs-aware;
+                # keep this best-effort so an immediate wake can never invalidate
+                # the authoritative verdict/proof commit above.
+                try:
+                    from app.reaper_sweeps import (
+                        event_driven_unblock_on_capability_proof,
+                    )
+
+                    await event_driven_unblock_on_capability_proof(project_id, session)
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "[CAPABILITY_TRIAL] event-driven capability-proof unblock "
+                        "failed for project %s (non-fatal)",
+                        project_id,
+                    )
+            return persisted_verdicts
         except Exception:
             await session.rollback()
             raise
@@ -1183,7 +1211,9 @@ async def raise_stalled_trial_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.message_audience import stamp_message_audience
+    from app.models import MessageType
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_stalled_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -1207,23 +1237,27 @@ async def raise_stalled_trial_notice(
         f"— raise holdback_fraction or extend trial window"
     )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_trial_stalled",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "with_7d": with_7d,
-                "without_7d": without_7d,
-                "window_days": window_days,
-                "holdback_fraction": holdback_fraction,
-                "without_assigned": without_assigned,
-                "min_n": min_n,
-                "alternative_projections": alternative_projections,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_trial_stalled",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "with_7d": with_7d,
+                    "without_7d": without_7d,
+                    "window_days": window_days,
+                    "holdback_fraction": holdback_fraction,
+                    "without_assigned": without_assigned,
+                    "min_n": min_n,
+                    "alternative_projections": alternative_projections,
+                },
+                "capability_trial_stalled",
+            ),
         )
     )
     return True
@@ -1335,7 +1369,9 @@ async def raise_ambiguous_lift_escalation_notice(
 
     Returns True when a new notice was written, False when the dedupe key already existed.
     """
-    from app.models import MessageType, ProjectMessage
+    from app.message_audience import stamp_message_audience
+    from app.models import MessageType
+    from app.project_message_creation import build_project_message
 
     dedupe_key = f"capability_trial_ambiguous_lift_escalation_{cap_name}"
     if await _check_open_message_exists(session, project_id, dedupe_key):
@@ -1354,21 +1390,25 @@ async def raise_ambiguous_lift_escalation_notice(
         f"— operator review required: consider expanding trial, adjusting thresholds, or closing"
     )
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=project_id,
             message_type=MessageType.NOTE,
             from_type="system",
             content=content,
-            context={
-                "event_type": "capability_trial_ambiguous_lift_escalation",
-                "dedupe_key": dedupe_key,
-                "cap_name": cap_name,
-                "ambiguous_lift_since": since_str,
-                "lift": lift,
-                "n_with": n_with,
-                "n_without": n_without,
-                "min_n": min_n,
-            },
+            context=stamp_message_audience(
+                {
+                    "event_type": "capability_trial_ambiguous_lift_escalation",
+                    "dedupe_key": dedupe_key,
+                    "cap_name": cap_name,
+                    "ambiguous_lift_since": since_str,
+                    "lift": lift,
+                    "n_with": n_with,
+                    "n_without": n_without,
+                    "min_n": min_n,
+                },
+                "capability_trial_ambiguous_lift_escalation",
+            ),
         )
     )
     return True

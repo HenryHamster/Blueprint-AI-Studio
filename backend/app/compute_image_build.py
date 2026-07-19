@@ -54,6 +54,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -111,6 +112,105 @@ def compute_dependency_hash(inputs: Dict[str, bytes], *, length: int = DEP_HASH_
         hasher.update(per_file.encode("ascii"))
         hasher.update(b"\x00")
     return hasher.hexdigest()[:length]
+
+
+# ── Canonical fingerprint-input assembly ─────────────────────────────────────
+#
+# A compute image's content hash covers ALL inputs that affect the image:
+# Dockerfile, declared dependency files, the parent image, and build-args.
+# Both build_and_push (local build) and remote_build_and_push (Cloud Build) and
+# the cheap-hash reuse check in refresh_project_compute_image must use the same
+# assembly so they cannot produce diverging hashes for identical configs.
+#
+# Fingerprint keys are typed rather than ordinary filenames.  A NUL cannot occur
+# in a repository path, so this namespace prevents dependency filenames such as
+# ``Dockerfile`` or ``__parent_image__`` from overwriting a control input.
+_FINGERPRINT_DOCKERFILE_KEY = "\x00dockerfile"
+_FINGERPRINT_DEP_PREFIX = "\x00dep:"
+_FINGERPRINT_PARENT_KEY = "\x00parent_image"
+_FINGERPRINT_BUILD_ARGS_KEY = "\x00build_args"
+
+# Bare ecosystem manifest files: included in the fingerprint ONLY when no
+# corresponding lockfile is present.  Each entry:
+#   (lockfile_names, bare_manifest_names)
+# If NONE of the lockfile_names appear in the resolved file set, any present
+# bare_manifest_names are added to the hash.  This closes the lockfile-less gap:
+# a project with only package.json or only Pipfile still changes its image hash
+# when those manifests change.
+_BARE_MANIFEST_FALLBACKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    # npm/node: hash package.json when no node lockfile present
+    (
+        ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"),
+        ("package.json",),
+    ),
+    # pipenv: hash Pipfile when Pipfile.lock absent
+    (
+        ("Pipfile.lock",),
+        ("Pipfile",),
+    ),
+    # traditional Python: hash setup.cfg when no pip/pyproject-style file present
+    # (pyproject.toml is in _DEFAULT_DEP_FILES and always wins if present)
+    (
+        (
+            "requirements.txt",
+            "requirements.lock",
+            "uv.lock",
+            "poetry.lock",
+            "Pipfile.lock",
+            "pyproject.toml",
+        ),
+        ("setup.cfg",),
+    ),
+)
+
+
+def bare_manifest_fallback_files(present_lockfiles: frozenset[str]) -> list[str]:
+    """Bare ecosystem manifest candidate filenames when no lockfile is present.
+
+    *present_lockfiles* should contain the resolved set of dependency/lockfiles
+    that exist (i.e. the subset of :data:`_DEFAULT_DEP_FILES` that were found).
+    For each ecosystem group in :data:`_BARE_MANIFEST_FALLBACKS`: if NONE of
+    the group's lockfiles appear in *present_lockfiles*, the group's bare
+    manifest names are returned as candidates.  The caller is responsible for
+    checking whether each candidate actually exists (e.g. via ``os.path.isfile``
+    or by checking that a fetch returned non-None).
+    """
+    result: list[str] = []
+    for lockfiles, bare_manifests in _BARE_MANIFEST_FALLBACKS:
+        if not any(lf in present_lockfiles for lf in lockfiles):
+            result.extend(bare_manifests)
+    return result
+
+
+def assemble_fingerprint_inputs(
+    dockerfile_bytes: bytes,
+    dep_file_bytes: Dict[str, bytes],
+    *,
+    parent: str | None = None,
+    build_args: Dict[str, str] | None = None,
+) -> Dict[str, bytes]:
+    """Canonical fingerprint-input dict for a compute image.
+
+    Produces the ``inputs`` dict that :func:`compute_dependency_hash` should
+    receive.  Both build paths (:func:`build_and_push`,
+    ``remote_build_and_push``) and the cheap-hash check in
+    ``refresh_project_compute_image`` must call this function so the hashes
+    cannot drift from one another.
+
+    *dep_file_bytes* maps each dep file's relative path to its raw bytes.
+    Every category is stored in a NUL-prefixed typed namespace, so metadata and
+    valid reserved-looking dependency filenames cannot overwrite one another.
+    """
+    inputs: Dict[str, bytes] = {_FINGERPRINT_DOCKERFILE_KEY: bytes(dockerfile_bytes)}
+    for key, value in dep_file_bytes.items():
+        inputs[f"{_FINGERPRINT_DEP_PREFIX}{key}"] = bytes(value)
+    if parent:
+        inputs[_FINGERPRINT_PARENT_KEY] = str(parent).encode("utf-8")
+    if build_args:
+        inputs[_FINGERPRINT_BUILD_ARGS_KEY] = json.dumps(
+            dict(sorted(build_args.items())), sort_keys=True
+        ).encode("utf-8")
+    return inputs
 
 
 # ── Credential scanner (no-platform-creds-in-layers security constraint) ─────
@@ -253,7 +353,11 @@ def scan_inputs_for_credentials(
             raise TypeError(f"input {name!r} must be bytes")
         content = bytes(content)
         findings.extend(_scan_content_patterns(name, content))
-        if name in dockerfile_set or name.lower().startswith("dockerfile"):
+        if (
+            name in dockerfile_set
+            or name == _FINGERPRINT_DOCKERFILE_KEY
+            or name.lower().startswith("dockerfile")
+        ):
             findings.extend(_scan_dockerfile_directives(name, content))
     return findings
 
@@ -374,16 +478,184 @@ def _resolve_image_layers(outer: tarfile.TarFile) -> List[Tuple[str, str]]:
     return layers
 
 
+def _read_control_member(outer: tarfile.TarFile, members: Dict[str, tarfile.TarInfo], name: str) -> bytes | None:
+    """Read a small control document (manifest / config JSON) out of *outer*.
+
+    Guarded by the same ``_MAX_CONTROL_DOC_BYTES`` cap as the layer resolver so a
+    hostile archive cannot pass off a multi-GB blob as a config document and
+    reintroduce an unbounded read.
+    """
+    m = members.get(name)
+    if m is None or not m.isfile() or m.size > _MAX_CONTROL_DOC_BYTES:
+        return None
+    fh = outer.extractfile(m)
+    if fh is None:
+        return None
+    return fh.read(_MAX_CONTROL_DOC_BYTES)
+
+
+def _config_env_entries(raw: bytes) -> List[str]:
+    """Extract the ``.config.Env`` (``KEY=VALUE`` strings) from an image config doc.
+
+    Handles both the Docker image config schema and the OCI image config schema —
+    both nest the runtime env under a lowercase ``"config"`` object with an
+    ``"Env"`` list. Returns [] for anything that does not parse or has no Env.
+    """
+    try:
+        doc = json.loads(raw)
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(doc, dict):
+        return []
+    cfg = doc.get("config")
+    if not isinstance(cfg, dict):
+        return []
+    env = cfg.get("Env")
+    if not isinstance(env, list):
+        return []
+    return [e for e in env if isinstance(e, str)]
+
+
+def _resolve_image_config_envs(outer: tarfile.TarFile) -> List[Tuple[str, List[str]]]:
+    """Resolve ``(label, env_entries)`` for every image CONFIG in a docker-save archive.
+
+    The layer scan reads layer FILE bytes for credential patterns, but a platform
+    secret can also be baked into the image's runtime environment — ``ENV
+    RUNNER_TOKEN=…`` inherited from a base image, injected via ``--build-arg`` +
+    ``ENV FOO=$ARG``, or exported by a ``RUN`` step. None of those appear in the
+    project's source Dockerfile (so :func:`_scan_dockerfile_directives` misses
+    them) yet all land in the built image's ``.config.Env``. This resolves that
+    config document so the pre-push gate can scan it.
+
+    Both docker-save layouts are handled:
+      * **Classic** — ``manifest.json`` is ``[{"Config": "<name>", …}]``; the
+        named member is the image config JSON.
+      * **OCI** — ``index.json`` → image-manifest blob → ``manifest["config"]
+        ["digest"]`` → config blob under ``blobs/<algo>/<hex>`` (multi-arch index
+        references are walked recursively).
+
+    Config documents are kilobytes and read under ``_MAX_CONTROL_DOC_BYTES``.
+    Returns [] when no config is found — config scanning is ADDITIVE; the layer
+    resolver is what fails closed on an unscannable archive.
+    """
+    members = {m.name: m for m in outer.getmembers()}
+    configs: List[Tuple[str, List[str]]] = []
+
+    # ── Classic docker-save layout: manifest.json -> Config member ────────────
+    manifest_raw = _read_control_member(outer, members, "manifest.json")
+    if manifest_raw is not None:
+        try:
+            manifest = json.loads(manifest_raw)
+        except (ValueError, UnicodeDecodeError):
+            manifest = None
+        if isinstance(manifest, list):
+            for entry in manifest:
+                if not isinstance(entry, dict):
+                    continue
+                cfg_name = entry.get("Config")
+                if not isinstance(cfg_name, str):
+                    continue
+                raw = _read_control_member(outer, members, cfg_name)
+                if raw is not None:
+                    env = _config_env_entries(raw)
+                    if env:
+                        configs.append((f"config:{cfg_name}", env))
+
+    # ── OCI image layout: index.json -> manifest blob -> config blob ──────────
+    index_bytes = _read_control_member(outer, members, "index.json")
+    if index_bytes is not None:
+        def _blob_path(digest: object) -> Optional[str]:
+            if not isinstance(digest, str) or ":" not in digest:
+                return None
+            algo, _, hexd = digest.partition(":")
+            if not algo or not hexd:
+                return None
+            return f"blobs/{algo}/{hexd}"
+
+        seen: Set[str] = set()
+
+        def _walk(digest: str) -> None:
+            if digest in seen:
+                return
+            seen.add(digest)
+            path = _blob_path(digest)
+            if path is None:
+                return
+            raw = _read_control_member(outer, members, path)
+            if raw is None:
+                return
+            try:
+                doc = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                return
+            if not isinstance(doc, dict):
+                return
+            for sub in doc.get("manifests", []) or []:
+                if isinstance(sub, dict) and isinstance(sub.get("digest"), str):
+                    _walk(sub["digest"])
+            cfg = doc.get("config")
+            if isinstance(cfg, dict):
+                cpath = _blob_path(cfg.get("digest"))
+                if cpath is not None:
+                    craw = _read_control_member(outer, members, cpath)
+                    if craw is not None:
+                        env = _config_env_entries(craw)
+                        if env:
+                            configs.append((f"config-blob:{cpath}", env))
+
+        try:
+            index_doc = json.loads(index_bytes)
+        except (ValueError, UnicodeDecodeError):
+            index_doc = None
+        if isinstance(index_doc, dict):
+            for man in index_doc.get("manifests", []) or []:
+                if isinstance(man, dict) and isinstance(man.get("digest"), str):
+                    _walk(man["digest"])
+
+    return configs
+
+
+def _scan_config_env_for_secrets(label: str, env_entries: Sequence[str]) -> List[str]:
+    """Findings for platform-secret env-var NAMES baked into an image config's Env.
+
+    ``env_entries`` are the build-time-resolved ``KEY=VALUE`` literals from an
+    image config's ``.config.Env``. A key in :data:`_SECRET_ENV_NAMES` carrying a
+    non-empty value is a baked platform credential regardless of how it got there
+    — the whole point of scanning the built image rather than only the source
+    Dockerfile. Reuses the SAME secret-name set as the Dockerfile-directive scan,
+    which the drift-guard test keeps in sync with runner_isolation.
+    """
+    findings: List[str] = []
+    for entry in env_entries:
+        if not isinstance(entry, str) or "=" not in entry:
+            continue
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        if key in _SECRET_ENV_NAMES and value.strip():
+            findings.append(
+                f"{label}: image config Env bakes platform secret {key}"
+            )
+    return findings
+
+
 def scan_image_layers_for_credentials(
     image_ref: str, *, _run=subprocess.run
 ) -> List[str]:
-    """Scan a locally-built image's layers for platform credentials.
+    """Scan a locally-built image's layers AND config env for platform credentials.
 
     Exports the image via ``docker save``, then walks every file in every
     layer tarball and applies the same credential patterns used for build
     inputs.  This catches secrets baked in at build-time (e.g. via
     ``RUN curl http://secrets-server/token > /root/.creds`` or a pip package
     that installs a credential helper) that are invisible in the source inputs.
+
+    It ALSO scans the built image's ``.config.Env`` (see
+    :func:`_resolve_image_config_envs` / :func:`_scan_config_env_for_secrets`)
+    for platform-secret env-var NAMES — a ``RUNNER_TOKEN`` / orchestrator URL
+    baked into the runtime environment via a base image, ``--build-arg``, or a
+    ``RUN`` export does not appear as a credential PATTERN in a layer file nor in
+    the project's source Dockerfile, but is just as much a leaked platform
+    credential in a layer that lands in a shared, readable registry.
 
     **Streaming, never buffered.** ``docker save`` writes STRAIGHT TO A TEMP FILE
     (``-o``) instead of a pipe the parent drains into memory, and layers are read
@@ -489,6 +761,15 @@ def scan_image_layers_for_credentials(
                         pass
                     finally:
                         layer_stream.close()
+
+                # Also scan the built image's CONFIG env: a platform secret can
+                # be baked into ``.config.Env`` (base image, --build-arg, or a
+                # RUN export) without ever appearing as a credential-pattern in a
+                # layer file or in the source Dockerfile.
+                for cfg_label, env_entries in _resolve_image_config_envs(outer):
+                    findings.extend(
+                        _scan_config_env_for_secrets(cfg_label, env_entries)
+                    )
         except tarfile.TarError as exc:
             raise RuntimeError(f"failed to parse docker save output: {exc}") from exc
 
@@ -830,15 +1111,16 @@ def registry_tag_exists(
 ) -> bool:
     """Whether ``registry_repo:tag`` already exists in the registry.
 
-    Uses ``docker manifest inspect`` (works for Artifact Registry with docker
-    credentials configured). Any lookup error (network, auth, absent tag) is
-    treated as "not present" so the caller falls through to a build — the build
-    itself is idempotent-by-hash, so a false negative only costs one rebuild.
+    Uses ``gcloud artifacts docker images describe`` (daemon-free, works on
+    Cloud Run where no docker daemon is available). Any lookup error (no
+    gcloud, auth, network, absent tag) is treated as "not present" so the
+    caller falls through to a build — the build itself is idempotent-by-hash,
+    so a false negative only costs one rebuild.
     """
     ref = f"{registry_repo}:{tag}"
     try:
         proc = _run(
-            ["docker", "manifest", "inspect", ref],
+            ["gcloud", "artifacts", "docker", "images", "describe", ref, "--format=json"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -956,81 +1238,20 @@ def delete_registry_protection_tag(
     return proc.returncode == 0
 
 
-def _resolve_local_digest(
-    registry_repo: str, tag: str, *, _run=subprocess.run
-) -> str | None:
-    """Digest of ``registry_repo:tag`` **as recorded in the LOCAL docker store**.
-
-    ``docker image inspect`` only knows about images this host has built or pulled.
-    On a fresh or pruned host it returns nothing — which is exactly why it must
-    never be the ONLY digest source (see :func:`resolve_registry_digest`).
-    """
-    ref = f"{registry_repo}:{tag}"
-    try:
-        proc = _run(
-            [
-                "docker",
-                "image",
-                "inspect",
-                "--format={{index .RepoDigests 0}}",
-                ref,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    out = (proc.stdout or "").strip()
-    # Format: registry/repo@sha256:...
-    _, sep, digest = out.partition("@")
-    if sep and digest.startswith("sha256:"):
-        return digest
-    return None
-
-
-# Back-compat alias: the old name said "pushed" but only ever read the local store.
-_resolve_pushed_digest = _resolve_local_digest
-
-
-def _descriptor_digest(doc: Any) -> str | None:
-    """Pull ``Descriptor.digest`` out of a ``docker manifest inspect -v`` document."""
-    if isinstance(doc, list):
-        for entry in doc:
-            digest = _descriptor_digest(entry)
-            if digest:
-                return digest
-        return None
-    if not isinstance(doc, dict):
-        return None
-    desc = doc.get("Descriptor")
-    if isinstance(desc, dict):
-        digest = desc.get("digest")
-        if isinstance(digest, str) and digest.startswith("sha256:"):
-            return digest
-    return None
-
-
 def resolve_registry_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:
     """Digest of ``registry_repo:tag`` **as it exists in the REGISTRY**, or None.
 
-    This is the authoritative source, and the one that survives a fresh host: it
-    asks the registry (``docker manifest inspect --verbose``) rather than the local
-    image store. The old fast path resolved the digest of an already-present image
-    from the local store alone, so on any host that had never built/pulled that tag
-    (a fresh orchestrator, or one that had run ``docker system prune``) it resolved
-    to ``None``, returned a tag-only ``pinned_ref``, and the caller persisted
-    ``digest=NULL`` — silently DESTROYING the project's digest pin on a re-trigger
-    with unchanged dependencies.
+    Uses ``gcloud artifacts docker images describe`` (daemon-free, works on
+    Cloud Run). Returns the ``image_summary.digest`` field from the JSON
+    response, or None on any error (no gcloud, auth, network, absent tag,
+    missing key).
     """
     ref = f"{registry_repo}:{tag}"
     try:
         proc = _run(
-            ["docker", "manifest", "inspect", "--verbose", ref],
+            ["gcloud", "artifacts", "docker", "images", "describe", ref, "--format=json"],
             capture_output=True,
             text=True,
             timeout=120,
@@ -1046,16 +1267,22 @@ def resolve_registry_digest(
         doc = json.loads(raw)
     except (ValueError, TypeError):
         return None
-    return _descriptor_digest(doc)
+    if not isinstance(doc, dict):
+        return None
+    summary = doc.get("image_summary")
+    if not isinstance(summary, dict):
+        return None
+    digest = summary.get("digest")
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        return digest
+    return None
 
 
 def _resolve_digest(
     registry_repo: str, tag: str, *, _run=subprocess.run
 ) -> str | None:
-    """Best available digest for a tag: registry first, local store as a fallback."""
-    return resolve_registry_digest(
-        registry_repo, tag, _run=_run
-    ) or _resolve_local_digest(registry_repo, tag, _run=_run)
+    """Digest for a tag, sourced from the registry."""
+    return resolve_registry_digest(registry_repo, tag, _run=_run)
 
 
 @dataclass
@@ -1094,6 +1321,38 @@ class BuildResult:
 
 class CredentialLeakError(RuntimeError):
     """Raised when the credential scanner flags build inputs before push."""
+
+
+def _ignore_git_metadata(_directory: str, names: List[str]) -> Set[str]:
+    """Exclude every Git metadata entry while copying a Docker build context.
+
+    A checkout can have a top-level ``.git`` directory, a worktree ``.git`` file,
+    or nested clone metadata.  None is source code and all can contain an
+    installation token, so exclude the name regardless of its file type or depth.
+    """
+    return {name for name in names if name == ".git"}
+
+
+@contextlib.contextmanager
+def sanitized_build_context(repo_dir: str):
+    """Yield a temporary Docker context containing the working tree, sans Git metadata.
+
+    ``copytree(..., symlinks=True)`` retains ordinary symlinks exactly as they
+    appear in the checkout.  The context is removed even when Docker, layer
+    scanning, or pushing fails.
+    """
+    context_dir = tempfile.mkdtemp(prefix="compute-image-build-")
+    try:
+        shutil.copytree(
+            repo_dir,
+            context_dir,
+            symlinks=True,
+            dirs_exist_ok=True,
+            ignore=_ignore_git_metadata,
+        )
+        yield context_dir
+    finally:
+        shutil.rmtree(context_dir, ignore_errors=True)
 
 
 def build_and_push(
@@ -1137,21 +1396,45 @@ def build_and_push(
     )
     build_args = dict(build_args or {})
 
+    # Security gate: reject build_args that carry platform credentials before
+    # passing them to `docker build --build-arg`.  A secret value in build_args
+    # flows through ARG/ENV into the image config.Env and would be caught by the
+    # post-build layer scan — but only after docker has already run and potentially
+    # cached the secret in a build layer.  Failing here closes that window: the
+    # secret never reaches the docker daemon at all.
+    _secret_arg_violations = [
+        k for k, v in build_args.items() if k in _SECRET_ENV_NAMES and v
+    ]
+    if _secret_arg_violations:
+        raise CredentialLeakError(
+            "build_args contains platform secret keys that must never be passed "
+            "as --build-arg (they would be baked into the image): "
+            + ", ".join(sorted(_secret_arg_violations))
+        )
+
     dockerfile_path = os.path.join(repo_dir, dockerfile)
     if not os.path.isfile(dockerfile_path):
         raise FileNotFoundError(f"Dockerfile not found: {dockerfile_path}")
 
-    # Collect hash inputs: the Dockerfile plus each declared dep file.
-    inputs: Dict[str, bytes] = {}
+    # Collect hash inputs: Dockerfile + each declared dep file + parent + build_args.
+    # assemble_fingerprint_inputs is the single source of truth shared with
+    # remote_build_and_push and refresh_project_compute_image.
     with open(dockerfile_path, "rb") as fh:
-        inputs["Dockerfile"] = fh.read()
+        dockerfile_bytes = fh.read()
+    dep_file_bytes: Dict[str, bytes] = {}
     for rel in dep_files:
         dep_path = os.path.join(repo_dir, rel)
         if not os.path.isfile(dep_path):
             raise FileNotFoundError(f"declared dependency file not found: {dep_path}")
         with open(dep_path, "rb") as fh:
-            inputs[rel] = fh.read()
+            dep_file_bytes[rel] = fh.read()
 
+    inputs = assemble_fingerprint_inputs(
+        dockerfile_bytes,
+        dep_file_bytes,
+        parent=parent,
+        build_args=build_args,
+    )
     dep_hash = compute_dependency_hash(inputs)
     full_repo = f"{registry_repo}/{image_name}"
 
@@ -1204,27 +1487,30 @@ def build_and_push(
     )
     assert_network(network, _run=_run)
 
-    # Build.
-    build_cmd = [
-        "docker",
-        "build",
-        f"--network={network}",
-        "-f",
-        dockerfile_path,
-        "-t",
-        f"{full_repo}:{dep_hash}",
-    ]
-    if parent:
-        build_args.setdefault("PARENT_IMAGE", parent)
-    for k, v in sorted(build_args.items()):
-        build_cmd.extend(["--build-arg", f"{k}={v}"])
-    build_cmd.append(repo_dir)
+    # Build from a separate context, never from the authenticated checkout.
+    # This is intentionally after the hash and pre-build gates: they inspect the
+    # original declared files, while Docker sees only the sanitized copy.
+    with sanitized_build_context(repo_dir) as build_context:
+        build_cmd = [
+            "docker",
+            "build",
+            f"--network={network}",
+            "-f",
+            os.path.join(build_context, dockerfile),
+            "-t",
+            f"{full_repo}:{dep_hash}",
+        ]
+        if parent:
+            build_args.setdefault("PARENT_IMAGE", parent)
+        for k, v in sorted(build_args.items()):
+            build_cmd.extend(["--build-arg", f"{k}={v}"])
+        build_cmd.append(build_context)
 
-    proc = _run(build_cmd, capture_output=True, text=True, timeout=3600)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"docker build failed (exit {proc.returncode}): {(proc.stderr or '')[-2000:]}"
-        )
+        proc = _run(build_cmd, capture_output=True, text=True, timeout=3600)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"docker build failed (exit {proc.returncode}): {(proc.stderr or '')[-2000:]}"
+            )
 
     # Security gate: scan built image layers for credentials BEFORE pushing.
     # This catches secrets baked in at build-time (e.g. via RUN curl or pip
@@ -1250,12 +1536,8 @@ def build_and_push(
             f"docker push failed (exit {push_proc.returncode}): {(push_proc.stderr or '')[-2000:]}"
         )
 
-    # Just-pushed: the local store now HAS the RepoDigest, so it is the cheapest
-    # accurate source; the registry lookup backstops a store that did not record
-    # one (older docker, or a push through a proxy).
-    digest = _resolve_local_digest(
-        full_repo, dep_hash, _run=_run
-    ) or resolve_registry_digest(full_repo, dep_hash, _run=_run)
+    # Just-pushed: resolve the canonical digest from the registry (daemon-free).
+    digest = resolve_registry_digest(full_repo, dep_hash, _run=_run)
     pinned = f"{full_repo}@{digest}" if digest else f"{full_repo}:{dep_hash}"
     return BuildResult(
         pinned_ref=pinned,

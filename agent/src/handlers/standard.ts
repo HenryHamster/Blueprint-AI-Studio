@@ -44,6 +44,7 @@ import {
   discoverAffectedConsumers, type PlaybookEntry, computePromptFingerprint,
   formatProvenanceWarnings, formatAcceptanceEvidence,
   formatSkills, writeSkillHelpers, type TaskSkill,
+  formatProjectTools, type TaskToolContent,
 } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { writeFetchHelper, buildFetchGuidance, PLAN_FETCH_VERBS } from './strategic-helpers.js';
@@ -339,6 +340,7 @@ export interface StandardPromptSections {
   acceptanceEvidenceNotice: string;
   playbookSection: string;
   skillsSection: string;
+  projectToolsSection: string;
   retryContext: string;
   provenanceNotice: string;
   /** buildPrompt() output — carries contextPrefix + rawPrompt (the per-task core). */
@@ -387,6 +389,7 @@ export function assembleStandardPrompt(s: StandardPromptSections): {
     s.acceptanceEvidenceNotice
     + s.playbookSection
     + s.skillsSection
+    + s.projectToolsSection
     + s.retryContext
     + s.provenanceNotice
     + s.corePrompt
@@ -453,6 +456,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
   const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const playbookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const skillsSection = formatSkills(task.skills as TaskSkill[] | undefined);
+  const projectToolsSection = formatProjectTools(task.project_tools as TaskToolContent[] | undefined);
   const retryContext = buildRetryContext(task);
   const firstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const taskTypeFocusBlock = getTaskTypeFocusBlock(taskTypeKey);
@@ -523,6 +527,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     acceptanceEvidenceNotice,
     playbookSection,
     skillsSection,
+    projectToolsSection,
     retryContext,
     provenanceNotice,
     corePrompt: corePromptBody,
@@ -1053,6 +1058,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     analysisContext,
     regressingCategories: reasoningGateCats.length > 0 ? reasoningGateCats : undefined,
     buildConfig,
+    taskCapability: task.task_capability as Partial<Record<'agent_mode' | 'run_shape' | 'output_kind', unknown>> | undefined,
     visualAcceptance: resolveVisualAcceptance(payload, ctx),
     ciFailureSelectors: rawCiSelectors.length > 0 ? rawCiSelectors : undefined,
   });

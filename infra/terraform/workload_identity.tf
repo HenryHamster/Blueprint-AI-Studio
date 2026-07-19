@@ -64,6 +64,49 @@ resource "google_artifact_registry_repository_iam_member" "github_actions_comput
   member     = "serviceAccount:${google_service_account.github_actions_sa[0].email}"
 }
 
+# Orchestrator SA needs artifactregistry.writer on compute_images_repo so it can
+# push newly-built project compute images and manage their protection tags.
+resource "google_artifact_registry_repository_iam_member" "orchestrator_compute_images_writer" {
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# Agent SA needs artifactregistry.reader on compute_images_repo so GCP compute
+# VMs (running as this SA) can pull project-baked compute images from the
+# private Artifact Registry repository.
+resource "google_artifact_registry_repository_iam_member" "agent_compute_images_reader" {
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.agent_sa.email}"
+}
+
+# image_builder_sa needs artifactregistry.writer to push newly-built project
+# compute images. Mirrors orchestrator_compute_images_writer above; scoped to
+# the compute-images repo only — no other roles granted on this SA.
+resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_writer" {
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.image_builder_sa.email}"
+}
+
+# image_builder_sa needs artifactregistry.reader so the builder VM can pull a
+# private base/parent image from the same repo before running docker build.
+# Mirrors agent_compute_images_reader above.
+resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_reader" {
+  project    = google_artifact_registry_repository.compute_images_repo.project
+  location   = google_artifact_registry_repository.compute_images_repo.location
+  repository = google_artifact_registry_repository.compute_images_repo.name
+  role       = "roles/artifactregistry.reader"
+  member     = "serviceAccount:${google_service_account.image_builder_sa.email}"
+}
+
 resource "google_project_iam_member" "github_actions_run_admin" {
   count   = var.enable_cicd ? 1 : 0
   project = var.project_id

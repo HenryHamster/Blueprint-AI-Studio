@@ -55,6 +55,7 @@ FRESH_ATTEMPT_CONTEXT_STRIP_KEYS: frozenset[str] = frozenset(
         "_blocked_escalated",
         "_precondition_escalated_key",
         "_blocked_optimistic_retries",
+        "_blocked_last_retry_at",
         "_retry_after_resets",
         "provision_failures",
         "provision_failures_infra",
@@ -458,7 +459,7 @@ def strip_fresh_attempt_context(
     """
     ctx = dict(context) if isinstance(context, dict) else {}
     for key in FRESH_ATTEMPT_CONTEXT_STRIP_KEYS:
-        if key == "_blocked_optimistic_retries" and preserve_blocked_optimistic_retries:
+        if key in ("_blocked_optimistic_retries", "_blocked_last_retry_at") and preserve_blocked_optimistic_retries:
             continue
         if key in ("failure_class", "failure_category"):
             if (

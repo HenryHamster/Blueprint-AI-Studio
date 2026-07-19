@@ -21,6 +21,7 @@ class TaskType(str, Enum):
     plan = "plan"
     research = "research"
     strategic_review = "strategic_review"
+    strategic_resident_turn = "strategic_resident_turn"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
     qa = "qa"
@@ -43,9 +44,11 @@ class TaskType(str, Enum):
     design = "design"
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
+    capability_proof_trial = "capability_proof_trial"
 
 
 AgentMode = Literal["write", "read_only"]
+ExecutionOwner = Literal["agent", "backend"]
 
 # Closed set of forward evaluation-gate strategy keys. Each TaskType DECLARES
 # which one applies via ``TaskCapability.evaluation``; the pluggable evaluator
@@ -128,6 +131,11 @@ class TaskCapability:
     id: TaskType
     label: str
     agent_mode: AgentMode
+    # Which runtime owns execution. ``agent`` is the normal provision/claim
+    # path; ``backend`` is reserved for bounded control-plane tasks that must
+    # never be handed to an agent process (for example migration-shadow
+    # Resident turns completed by a zero-model backend sweep).
+    execution_owner: ExecutionOwner = "agent"
     default_category: str | None = None
     user_launchable: bool = False
     operator_contract_launchable: bool = False
@@ -343,6 +351,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
+    ),
+    TaskCapability(
+        TaskType.strategic_resident_turn,
+        "Resident Turn",
+        "read_only",
+        execution_owner="agent",
+        default_category="strategic",
+        provider_configurable=True,
+        filter_visible=False,
+        description=(
+            "Run one bounded, checkpoint-derived provider-only Resident turn."
+        ),
+        run_shape="single_agent",
+        output_kind="knowledge",
+        requires_code=False,
+        evaluation_strategy="review_only",
+        cost_ceiling_usd=4.0,
+        evaluation="none",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -714,6 +740,41 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         cost_ceiling_usd=8.0,
         evaluation="code-ci-review",
     ),
+    TaskCapability(
+        TaskType.capability_proof_trial,
+        "Capability Proof Trial",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        # No LLM provider runs — the handler runs a bounded, targeted test suite
+        # (the capability's declared convention-named covering tests) and reports a
+        # pass/fail verdict; it never selects a model/account.
+        provider_configurable=False,
+        # Not operator/strategist-spawnable and not a plan child: it is enrolled
+        # programmatically by a later slice's sweep (via
+        # ``capability_proof.enroll_capability_proof_trial``), never authored by an
+        # agent or operator.
+        description=(
+            "Machine-verified capability-proof trial: run ONLY a working "
+            "capability's declared convention-named covering tests as a targeted "
+            "runner job, decoupled from the merge gate. A green run mints a genuine "
+            "``proven`` named_test proof into the capability-proof ledger; a red run "
+            "records nothing and NEVER demotes an existing proof. Operators can "
+            "pause it with ``capability_proof_execution_trials_enabled``."
+        ),
+        # A single targeted agent run produces the verdict; it needs a code
+        # checkout to run the tests, but opens no PR — its durable product is the
+        # ingested proof, so output_kind is ``none`` and there is no forward merge
+        # gate (``evaluation="none"``). The ingestion completion handler consumes
+        # the reported result.
+        output_kind="none",
+        requires_code=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=2.0,
+        completion_handler="capability_proof_trial",
+        evaluation="none",
+        run_shape="single_agent",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -726,6 +787,16 @@ TASK_CAPABILITY_BY_VALUE: dict[str, TaskCapability] = {
 # Backward-compatible constants consumed by existing code.
 ALL_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value for capability in TASK_CAPABILITIES
+)
+AGENT_EXECUTED_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.execution_owner == "agent"
+)
+BACKEND_MANAGED_TASK_TYPES: frozenset[str] = frozenset(
+    capability.id.value
+    for capability in TASK_CAPABILITIES
+    if capability.execution_owner == "backend"
 )
 READ_ONLY_TASK_TYPES: frozenset[str] = frozenset(
     capability.id.value
@@ -929,6 +1000,11 @@ STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.completion_needs_locked_project
 )
+# Dispatch compatibility is intentionally distinct from legacy strategic-cycle
+# completion membership and its Project lock/handler semantics.
+STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = frozenset(
+    {*STRATEGIC_TASK_TYPES, TaskType.strategic_resident_turn.value}
+)
 # Default autonomous spawn-budget categories. Runtime config may override these
 # sets, but defaults stay registry-owned so new task types are classified from
 # the same catalog that defines their capabilities.
@@ -966,6 +1042,8 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_merge_grade.value,
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
+        TaskType.capability_proof_trial.value,
+        TaskType.strategic_resident_turn.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
@@ -999,7 +1077,9 @@ COMPUTE_SUBSTRATE_TASK_TYPES: frozenset[str] = frozenset(
 # candidates — they never push a branch/PR, never need persistent disk, and
 # are the dominant idle-cost component. The intersection happens in
 # orchestrator.py; this set never imports runtime_config_state.
-CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
+CLOUD_RUN_CANDIDATE_TASK_TYPES: frozenset[str] = (
+    READ_ONLY_TASK_TYPES & AGENT_EXECUTED_TASK_TYPES
+)
 
 
 def runs_on_compute_substrate(task_type: str | TaskType | None) -> bool:
@@ -1052,6 +1132,7 @@ def _capability_to_contract(capability: TaskCapability) -> dict[str, object]:
         # compact tag without each surface re-deriving the default.
         "badge": capability.badge or capability.label,
         "agent_mode": capability.agent_mode,
+        "execution_owner": capability.execution_owner,
         "default_category": capability.default_category,
         "description": capability.description,
         "user_launchable": capability.user_launchable,
@@ -1107,6 +1188,7 @@ def _capability_to_catalog_entry(capability: TaskCapability) -> dict:
         "label": capability.label,
         "description": capability.description,
         "agent_mode": capability.agent_mode,
+        "execution_owner": capability.execution_owner,
         "default_category": capability.default_category,
         "user_launchable": capability.user_launchable,
         "operator_contract_launchable": capability.operator_contract_launchable,

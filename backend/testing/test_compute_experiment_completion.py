@@ -2348,8 +2348,13 @@ async def test_lifecycle_deadline_kill_surfaces_through_task(
 async def test_lifecycle_success_completes_through_task(
     db_session, monkeypatch, _quiet_compute_io
 ):
-    """End-to-end happy path: a job runs to SUCCESS and the task passes the gate."""
-    task = await _make_compute_task(db_session)
+    """End-to-end happy path: a job with a declared criterion runs to SUCCESS."""
+    # Use a task with a success_criterion — criterion-free experiments must not
+    # record clean SUCCESS (they are reclassified as FAILURE by the no-data guard).
+    # declared_metric is NOT forwarded to create_compute_job to avoid triggering the
+    # preflight smoke step (the fake backend has no smoke support); the success_criterion
+    # in the task payload is enough to satisfy _is_criterion_free_experiment.
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.8)
     task.status = TaskStatus.IN_PROGRESS
     db_session.add(task)
     await db_session.commit()
@@ -2362,6 +2367,12 @@ async def test_lifecycle_success_completes_through_task(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Bypass smoke: this test focuses on the job-monitor launch/poll/terminal path.
+    # Dedicated smoke tests cover the preflight gate separately.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
     started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
@@ -2385,6 +2396,7 @@ async def test_lifecycle_success_completes_through_task(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"accuracy": 0.92},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -2397,15 +2409,17 @@ async def test_lifecycle_success_completes_through_task(
         expire_on_commit=False,
         class_=AsyncSession,
     )
-    # Three passes: pre-flight smoke, STARTING→launch, RUNNING→poll-to-terminal.
-    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    # Two passes (smoke bypassed): STARTING→launch, RUNNING→poll-to-terminal.
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await db_session.refresh(job)
     assert job.outcome == ComputeJobOutcome.SUCCESS
 
+    # Use build_compute_result_logs (not _result_from_terminal_job) so that the
+    # accuracy metric stored in polling_metadata["result_metrics"] is flattened
+    # into the result artifact and the criterion evaluator can assess it.
     await _handle_compute_experiment_completion(
-        task, _result_from_terminal_job(job), db_session
+        task, compute_jobs.build_compute_result_logs(job), db_session
     )
 
     await db_session.refresh(task)
@@ -4588,6 +4602,16 @@ async def test_artifact_delivery_record_durable_uri_stamped(
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
     job.completed_at = _utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "runner_artifact": {
+            "stored": True,
+            "verified": True,
+            "size": 123,
+            "crc32c": "AAAAAA==",
+            "generation": "7",
+        },
+    }
     db_session.add(job)
     await db_session.commit()
 
@@ -4604,6 +4628,11 @@ async def test_artifact_delivery_record_durable_uri_stamped(
     assert delivery["delivered"] is True
     assert delivery["durability"] == "durable"
     assert delivery["result_reference"] == gs_uri
+    assert delivery["transfer_status"] == "verified"
+    assert delivery["verified"] is True
+    assert delivery["size"] == 123
+    assert delivery["crc32c"] == "AAAAAA=="
+    assert delivery["generation"] == "7"
     # No logical_key in payload means no Artifact row is created, so artifact_id is absent.
     assert "artifact_id" not in delivery
 
@@ -4662,6 +4691,50 @@ async def test_artifact_delivery_record_absent_stamped(db_session, _quiet_comput
     delivery = task.plan_output["compute_result"]["artifact_delivery"]
     assert delivery["delivered"] is False
     assert delivery["durability"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_artifact_delivery_record_failed_transfer_stamped(
+    db_session, _quiet_compute_io
+):
+    """A finalized direct-transfer failure is distinguishable from no attempt."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "runner_artifact_transfer": {
+            "transfer_id": str(uuid.uuid4()),
+            "status": "failed",
+            "failure_reason": "metadata_mismatch",
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(
+        task,
+        _result_artifact(job_id=str(job.id)),
+        db_session,
+    )
+
+    await db_session.refresh(task)
+    delivery = task.plan_output["compute_result"]["artifact_delivery"]
+    assert delivery["delivered"] is False
+    assert delivery["durability"] == "none"
+    assert delivery["transfer_status"] == "failed"
+    assert delivery["verified"] is False
 
 
 # ── require_durable_artifact Tier 2 gate ───────────────────────────────────

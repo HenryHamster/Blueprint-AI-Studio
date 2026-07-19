@@ -36,6 +36,8 @@ from app.direction_grounding import validate_create_direction_grounding
 from app.finding_deduplication import _STOPWORDS as _SPAWN_STOPWORDS
 from app.models import (
     KnowledgeDocument,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     Project,
     ProjectMessage,
@@ -45,6 +47,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.broadcast import broadcast_to_project
+from app.message_audience import stamp_message_audience
+from app.project_message_creation import build_project_message
+from app.project_message_projection import message_event_payload
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
@@ -979,7 +985,7 @@ async def _link_clustered_bug_messages(
     kind: str,
     identifier: str,
     resolution_text: str,
-) -> int:
+) -> list[ProjectMessage]:
     """Link other open bug-class messages that share the anchor's structured signature."""
     from app.message_convergence import (
         bug_message_cluster_signature as _bug_message_cluster_signature,
@@ -988,7 +994,7 @@ async def _link_clustered_bug_messages(
     )
 
     if _bug_message_cluster_signature(anchor_msg) is None:
-        return 0
+        return []
 
     # Limit to 500 candidates to bound O(N) comparisons on large projects.
     result = await session.execute(
@@ -1000,7 +1006,7 @@ async def _link_clustered_bug_messages(
         .order_by(ProjectMessage.created_at.asc())
         .limit(500)
     )
-    linked = 0
+    linked: list[ProjectMessage] = []
     for candidate in result.scalars().all():
         if candidate.id == anchor_msg.id:
             continue
@@ -1008,8 +1014,11 @@ async def _link_clustered_bug_messages(
             continue
         _link_message_to_outcome(candidate, kind, identifier)
         candidate.resolution = resolution_text
+        candidate.handling_state = MessageHandlingState.RESPONDED
+        candidate.handled_by_task_id = anchor_msg.handled_by_task_id
+        candidate.updated_at = _utcnow()
         session.add(candidate)
-        linked += 1
+        linked.append(candidate)
     return linked
 
 
@@ -4109,12 +4118,39 @@ def _merge_rejected_proposals(vision: dict, batch: list) -> None:
     vision["rejected_proposals"] = _rp[-30:]
 
 
+def strategic_completion_message_count(logs: str) -> int:
+    """Return a bounded reservation covering every fallback message emission."""
+
+    try:
+        parsed = json.loads(logs[:500_000]) if logs else None
+    except (json.JSONDecodeError, ValueError):
+        return 0
+    if not isinstance(parsed, dict):
+        return 0
+    entries = parsed.get("messages")
+    direct_count = sum(
+        1
+        for entry in (entries[:5] if isinstance(entries, list) else [])
+        if isinstance(entry, dict) and str(entry.get("content") or "").strip()
+    )
+    resolved_entries = parsed.get("resolved_messages")
+    if not isinstance(resolved_entries, list) or not resolved_entries:
+        resolved_entries = parsed.get("resolved_message_ids")
+    reply_capacity = (
+        min(len(resolved_entries), 10)
+        if isinstance(resolved_entries, list)
+        else 0
+    )
+    return direct_count + reply_capacity
+
+
 async def _handle_strategic_completion(
     task: Task,
     logs: str,
     session: AsyncSession,
     *,
     project: Project | None = None,
+    message_sequences: list[int] | None = None,
 ):
     """Handle strategic review completion.
 
@@ -4785,6 +4821,20 @@ async def _handle_strategic_completion(
                 for d in (project.directions or [])
                 if d.get("status") not in RETIRED_DIRECTION_STATUSES
             )
+            # Strip agent-owned collections from the proposed problem model when
+            # they are unchanged from the cycle baseline.  The strategic completion
+            # path does not independently edit friction, gaps, capabilities, or
+            # pending_user_confirmation — the agent may echo stale copies that
+            # would overwrite newer concurrent state.  Unchanged collections are
+            # safely preserved through the merge's omission=keep logic inside
+            # apply_agent_update, which also handles the non-trivial gap history
+            # union and per-gap compaction watermarks.
+            if pm_baseline is not None:
+                for _ckey in ("friction", "gaps", "capabilities", "pending_user_confirmation"):
+                    pv = new_problem_model.get(_ckey)
+                    bv = pm_baseline.get(_ckey)
+                    if pv is not None and bv is not None and pv == bv:
+                        new_problem_model.pop(_ckey)
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
@@ -6296,6 +6346,27 @@ async def _handle_strategic_completion(
 
     # Process messages from agent (questions, blockers, notes)
     msgs_created = 0
+    from app.routers.admin_notifications import (
+        ROUTINE_EVENT_TYPES as _ROUTINE_EVENT_TYPES,
+        append_routine_digest as _append_routine_digest,
+    )
+
+    reserved_message_sequences = iter(message_sequences or [])
+    message_events: dict[
+        uuid.UUID, tuple[ProjectMessage, str | None]
+    ] = {}
+
+    def _collect_message_event(
+        message: ProjectMessage,
+        *,
+        status: str | None = None,
+    ) -> None:
+        existing = message_events.get(message.id)
+        # A row created during this completion stays a create event even if the
+        # same bounded pass subsequently mutates it.
+        if existing is not None and existing[1] is None:
+            return
+        message_events[message.id] = (message, status)
     for msg_entry in (parsed.get("messages") or [])[:5]:
         if not isinstance(msg_entry, dict):
             continue
@@ -6311,7 +6382,8 @@ async def _handle_strategic_completion(
             msg_type = MessageType(msg_entry.get("type", "NOTE").upper())
         except ValueError:
             msg_type = MessageType.NOTE
-        _msg_ctx = msg_entry.get("context") or {}
+        _raw_msg_ctx = msg_entry.get("context")
+        _msg_ctx = dict(_raw_msg_ctx) if isinstance(_raw_msg_ctx, dict) else {}
         # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
         # messages: a BUG_REPORT/BLOCKER parsed out of the strategic agent's
         # output that cites code already fixed/refactored away would re-enter the
@@ -6325,8 +6397,46 @@ async def _handle_strategic_completion(
             warning = await compute_message_citation_warning(session, project, content)
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
-        new_msg = ProjectMessage(
+        _event_type = _msg_ctx.get("event_type")
+        _msg_ctx = stamp_message_audience(_msg_ctx, _event_type or "strategic_message")
+        _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
+        _reply_to_id: uuid.UUID | None = None
+        _raw_reply_to = _msg_ctx.get("reply_to")
+        if _raw_reply_to:
+            try:
+                _candidate_reply_id = uuid.UUID(str(_raw_reply_to))
+                _reply_target = await session.get(ProjectMessage, _candidate_reply_id)
+                if _reply_target is not None and _reply_target.project_id == project.id:
+                    _reply_to_id = _candidate_reply_id
+                    _reply_target.handling_state = MessageHandlingState.RESPONDED
+                    _reply_target.handled_by_task_id = task.id
+                    _reply_target.updated_at = _utcnow()
+                    session.add(_reply_target)
+                    _collect_message_event(
+                        _reply_target, status=str(_reply_target.status)
+                    )
+                else:
+                    _msg_ctx.pop("reply_to", None)
+            except (TypeError, ValueError):
+                _msg_ctx.pop("reply_to", None)
+
+        reserved_sequence = next(reserved_message_sequences, None)
+        new_msg = await build_project_message(
+            session,
             project_id=project.id,
+            sequence=reserved_sequence,
+            surface=(
+                MessageSurface.CONVERSATION
+                if _conversation_reply
+                else MessageSurface.ACTIVITY
+            ),
+            handling_state=(
+                MessageHandlingState.RESPONDED
+                if _conversation_reply
+                else MessageHandlingState.PENDING
+            ),
+            handled_by_task_id=task.id if _conversation_reply else None,
+            reply_to_message_id=_reply_to_id,
             message_type=msg_type,
             from_type="strategic",
             from_task_id=task.id,
@@ -6334,13 +6444,8 @@ async def _handle_strategic_completion(
             context=_msg_ctx,
         )
         session.add(new_msg)
-        _event_type = _msg_ctx.get("event_type") if isinstance(_msg_ctx, dict) else None
+        _collect_message_event(new_msg)
         if _event_type:
-            from app.routers.admin_notifications import (
-                ROUTINE_EVENT_TYPES as _ROUTINE_EVENT_TYPES,
-                append_routine_digest as _append_routine_digest,
-            )
-
             if _event_type in _ROUTINE_EVENT_TYPES:
                 _append_routine_digest(project, _event_type, content)
         msgs_created += 1
@@ -6360,7 +6465,26 @@ async def _handle_strategic_completion(
         link_message_to_outcome as _link_message_to_outcome,
     )
 
-    for entry in resolved_entries[:10]:
+    # Batch-fetch all messages upfront to avoid N+1 SELECTs in the loop below.
+    _resolve_batch = resolved_entries[:10]
+    _msg_ids: list[uuid.UUID] = []
+    for _entry in _resolve_batch:
+        try:
+            _raw_id = _entry.get("id") if isinstance(_entry, dict) else str(_entry)
+            _msg_ids.append(uuid.UUID(str(_raw_id)))
+        except (ValueError, TypeError):
+            pass
+    if _msg_ids:
+        _batch_result = await session.execute(
+            select(ProjectMessage).where(ProjectMessage.id.in_(_msg_ids))
+        )
+        _messages_by_id: dict[uuid.UUID, ProjectMessage] = {
+            m.id: m for m in _batch_result.scalars().all()
+        }
+    else:
+        _messages_by_id = {}
+
+    for entry in _resolve_batch:
         try:
             msg_id = entry.get("id") if isinstance(entry, dict) else str(entry)
             resolution_text = (
@@ -6375,7 +6499,7 @@ async def _handle_strategic_completion(
             owned_by_task = (
                 entry.get("owned_by_task") if isinstance(entry, dict) else None
             )
-            msg = await session.get(ProjectMessage, uuid.UUID(str(msg_id)))
+            msg = _messages_by_id.get(uuid.UUID(str(msg_id)))
             # Accept both 'open' and 'linked' so an explicit terminal resolve can
             # always move a linked message to 'resolved' (the operator's escape hatch).
             if (
@@ -6398,6 +6522,9 @@ async def _handle_strategic_completion(
                         rt = rt[:STRATEGIC_RESOLUTION_MAX]
                     _link_message_to_outcome(msg, kind, str(identifier))
                     msg.resolution = rt
+                    msg.handling_state = MessageHandlingState.RESPONDED
+                    msg.handled_by_task_id = task.id
+                    msg.updated_at = _utcnow()
                     session.add(msg)
                     clustered = await _link_clustered_bug_messages(
                         session,
@@ -6407,16 +6534,23 @@ async def _handle_strategic_completion(
                         identifier=str(identifier),
                         resolution_text=rt,
                     )
-                    msgs_resolved += 1 + clustered
+                    _collect_message_event(msg, status=str(msg.status))
+                    for clustered_msg in clustered:
+                        _collect_message_event(
+                            clustered_msg, status=str(clustered_msg.status)
+                        )
+                    msgs_resolved += 1 + len(clustered)
                     logger.info(
                         f"[STRATEGIC] Task {task.id}: linked {msg.message_type} "
                         f"message {msg.id} to {kind}={identifier} "
-                        f"(clustered={clustered})"
+                        f"(clustered={len(clustered)})"
                     )
                 else:
                     # Explicit terminal resolve: operator/strategist dismisses
                     # the message (no ownership info, or not a bug-class type).
                     msg.status = "resolved"
+                    msg.handling_state = MessageHandlingState.RESPONDED
+                    msg.handled_by_task_id = task.id
                     if resolution_text:
                         rt = str(resolution_text)
                         if len(rt) > STRATEGIC_RESOLUTION_MAX:
@@ -6427,7 +6561,9 @@ async def _handle_strategic_completion(
                     else:
                         msg.resolution = "Addressed by strategic review"
                     msg.resolved_at = _utcnow()
+                    msg.updated_at = msg.resolved_at
                     session.add(msg)
+                    _collect_message_event(msg, status=str(msg.status))
                     msgs_resolved += 1
                     if msg.message_type == MessageType.FEEDBACK:
                         try:
@@ -6435,13 +6571,15 @@ async def _handle_strategic_completion(
                                 post_feedback_acknowledgment,
                             )
 
-                            await post_feedback_acknowledgment(
+                            reply = await post_feedback_acknowledgment(
                                 session,
                                 project.id,
                                 msg.id,
                                 msg.resolution or "Addressed by strategic review",
                                 task.id,
+                                sequence=next(reserved_message_sequences, None),
                             )
+                            _collect_message_event(reply)
                         except Exception as _e:  # noqa: BLE001
                             logger.warning(
                                 f"[NOTIFY] Failed to post feedback acknowledgment: {_e}"
@@ -6457,7 +6595,7 @@ async def _handle_strategic_completion(
                             )
 
                             _resident_blob = read_resident_session(project.vision)
-                            await post_question_answer(
+                            reply = await post_question_answer(
                                 session,
                                 project.id,
                                 msg.id,
@@ -6469,7 +6607,9 @@ async def _handle_strategic_completion(
                                     and resident_session_is_active(_resident_blob)
                                     else None
                                 ),
+                                sequence=next(reserved_message_sequences, None),
                             )
+                            _collect_message_event(reply)
                         except Exception as _e:  # noqa: BLE001
                             logger.warning(
                                 f"[NOTIFY] Failed to post question answer: {_e}"
@@ -6539,6 +6679,33 @@ async def _handle_strategic_completion(
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status
+    # Canonical message events are emitted only after the transaction is
+    # durable. Sequence order makes concurrent/reconnecting clients observe the
+    # same conversation/activity projection as cursor pagination.
+    ordered_message_events = sorted(
+        message_events.values(),
+        key=lambda item: (
+            item[0].sequence is None,
+            item[0].sequence if item[0].sequence is not None else 0,
+            str(item[0].id),
+        ),
+    )
+    for message, status in ordered_message_events:
+        try:
+            await broadcast_to_project(
+                str(project.id),
+                "message_created" if status is None else "message_updated",
+                message_event_payload(message, status=status),
+            )
+        except Exception:  # noqa: BLE001
+            # The durable sequence lets reconnect/cursor fetch repair a missed
+            # realtime notification. Never requeue an already-committed
+            # strategic completion because a websocket fanout failed.
+            logger.warning(
+                "[STRATEGIC] Failed to broadcast committed message %s",
+                message.id,
+                exc_info=True,
+            )
     # qualify_request runs post-commit on its own fresh session (see
     # _apply_qualify_request_post_commit) so its slow GitHub I/O never holds this
     # completion's Project lock / connection.

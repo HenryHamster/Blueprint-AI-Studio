@@ -176,7 +176,9 @@ async def _create_handmerge_attention_message(
     The sweep ``sweep_closed_handmerge_prs`` resolves this message automatically
     when it detects the PR has been merged or closed.
     """
+    from app.message_audience import stamp_message_audience
     from app.models import MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
     from sqlmodel import select as _sqlm_select
 
     ikey = f"handmerge:{task.id}"
@@ -191,7 +193,8 @@ async def _create_handmerge_attention_message(
     if existing is not None:
         return
     session.add(
-        ProjectMessage(
+        await build_project_message(
+            session,
             project_id=task.project_id,
             message_type=MessageType.NOTE,
             from_type="system",
@@ -201,11 +204,13 @@ async def _create_handmerge_attention_message(
                 f"({iterations} iterations, {cap_label}); PR left open with mergeable "
                 f"work awaiting manual merge"
             ),
-            context={
-                "event_type": "handmerge_pr_preserved",
-                "pr_number": pr_number,
-                "task_id": str(task.id),
-            },
+            context=stamp_message_audience(
+                {
+                    "pr_number": pr_number,
+                    "task_id": str(task.id),
+                },
+                "handmerge_pr_preserved",
+            ),
             idempotency_key=ikey,
         )
     )

@@ -22,6 +22,9 @@ import {
   recordResidentTurnLatency,
   getResidentTurnLatencyTelemetry,
   resetResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture,
+  getOperatorDecisionCaptureTelemetry,
+  resetOperatorDecisionCaptureTelemetry,
 } from './telemetry.js';
 import { extractJsonObjectDetailed } from './json-extract.js';
 
@@ -29,6 +32,7 @@ beforeEach(() => {
   resetLlmTelemetry();
   resetFormatComplianceTelemetry();
   setCurrentPromptFingerprint(null);
+  resetOperatorDecisionCaptureTelemetry();
 });
 
 describe('errorFingerprint', () => {
@@ -773,5 +777,65 @@ describe('resident turn latency telemetry', () => {
     if (!tel) throw new Error('expected non-null telemetry');
     // Only the 150ms lag is valid; null and negative are skipped
     expect(tel.operator.mean_pickup_lag_ms).toBe(150);
+  });
+});
+
+describe('operator-decision capture telemetry', () => {
+  beforeEach(() => {
+    resetOperatorDecisionCaptureTelemetry();
+  });
+
+  it('returns null when no calls recorded', () => {
+    expect(getOperatorDecisionCaptureTelemetry()).toBeNull();
+  });
+
+  it('accumulates total and captured counts', () => {
+    recordOperatorDecisionCapture(true);
+    recordOperatorDecisionCapture(true);
+    recordOperatorDecisionCapture(false);
+    const tel = getOperatorDecisionCaptureTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.total).toBe(3);
+    expect(tel.captured).toBe(2);
+    expect(tel.missed).toBe(1);
+    expect(tel.capture_rate).toBe(67); // Math.round(2/3 * 100)
+  });
+
+  it('reports 0% capture_rate when nothing captured', () => {
+    recordOperatorDecisionCapture(false);
+    recordOperatorDecisionCapture(false);
+    const tel = getOperatorDecisionCaptureTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.total).toBe(2);
+    expect(tel.captured).toBe(0);
+    expect(tel.missed).toBe(2);
+    expect(tel.capture_rate).toBe(0);
+  });
+
+  it('reports 100% capture_rate when all captured', () => {
+    recordOperatorDecisionCapture(true);
+    const tel = getOperatorDecisionCaptureTelemetry();
+    if (!tel) throw new Error('expected non-null telemetry');
+    expect(tel.total).toBe(1);
+    expect(tel.captured).toBe(1);
+    expect(tel.missed).toBe(0);
+    expect(tel.capture_rate).toBe(100);
+  });
+
+  it('resets all counters', () => {
+    recordOperatorDecisionCapture(true);
+    recordOperatorDecisionCapture(false);
+    resetOperatorDecisionCaptureTelemetry();
+    expect(getOperatorDecisionCaptureTelemetry()).toBeNull();
+  });
+
+  it('snapshot is a copy — mutating it does not affect internal state', () => {
+    recordOperatorDecisionCapture(true);
+    const snap = getOperatorDecisionCaptureTelemetry();
+    if (!snap) throw new Error('expected non-null telemetry');
+    snap.total = 999;
+    const after = getOperatorDecisionCaptureTelemetry();
+    if (!after) throw new Error('expected non-null telemetry');
+    expect(after.total).toBe(1);
   });
 });

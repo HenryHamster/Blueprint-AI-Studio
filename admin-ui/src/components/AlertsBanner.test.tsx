@@ -36,14 +36,30 @@ describe('AlertsBanner', () => {
     vi.clearAllMocks();
   });
 
-  it('renders additive alert metadata fields', () => {
+  it('renders title, message, and a minimal recurrence hint', () => {
     render(<AlertsBanner alerts={[alert]} onDismiss={vi.fn()} />);
 
-    expect(screen.getByText('Domain warm pool')).toBeInTheDocument();
-    expect(screen.getByText('Event capacity warning')).toBeInTheDocument();
-    expect(screen.getByText('Source warm pool')).toBeInTheDocument();
-    expect(screen.getByText('3 occurrences')).toBeInTheDocument();
-    expect(screen.queryByText(/Dedupe/)).not.toBeInTheDocument();
+    expect(screen.getByText('Warm pool saturation')).toBeInTheDocument();
+    expect(screen.getByText('capacity crossed the warning threshold')).toBeInTheDocument();
+    // occurrence_count > 1 → surface the recurrence hint (with last-seen).
+    expect(screen.getByText(/3 occurrences/)).toBeInTheDocument();
+  });
+
+  it('drops the internal taxonomy chips (domain / event_type / source)', () => {
+    render(<AlertsBanner alerts={[alert]} onDismiss={vi.fn()} />);
+
+    // These carried no operator-facing action and were removed in the cleanup.
+    expect(screen.queryByText('Domain warm pool')).not.toBeInTheDocument();
+    expect(screen.queryByText('Event capacity warning')).not.toBeInTheDocument();
+    expect(screen.queryByText('Source warm pool')).not.toBeInTheDocument();
+  });
+
+  it('shows only a last-seen hint when the alert has not recurred', () => {
+    const singleOccurrence = { ...alert, occurrence_count: 1 };
+    render(<AlertsBanner alerts={[singleOccurrence]} onDismiss={vi.fn()} />);
+
+    expect(screen.queryByText(/occurrences/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Last seen/)).toBeInTheDocument();
   });
 
   it('renders acknowledge button when projectId is provided and alert is not acknowledged', () => {

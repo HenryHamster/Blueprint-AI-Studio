@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { computeJobEvidenceTier } from './ComputeJobsPanel.utils';
+import {
+  computeJobEvidenceTier,
+  computeJobEvidenceGroup,
+  computeJobEvidenceTierRank,
+  computeJobViewableArtifacts,
+} from './ComputeJobsPanel.utils';
+import type { ComputeJob } from '../api';
 
 /**
  * `covered` is the tier EvidenceTierBadge renders as "Machine verified".
@@ -73,5 +79,121 @@ describe('computeJobEvidenceTier', () => {
 
   it('no backend and no result is uncovered', () => {
     expect(computeJobEvidenceTier(job({}))).toBe('uncovered');
+  });
+
+  it('prefers the server-provided evidence_tier over client derivation', () => {
+    // A payload whose client-derived tier would be `partial` (operator hardware,
+    // no result) but which carries a canonical server tier must render the
+    // server value — the single source of truth on fresh responses.
+    expect(
+      computeJobEvidenceTier(
+        job({ backend: 'local-bwrap', evidence_tier: 'covered' } as Partial<TierJob>),
+      ),
+    ).toBe('covered');
+  });
+
+  it('falls back to client derivation when server tier is absent/invalid', () => {
+    // Older/cached payloads omit evidence_tier (undefined) — the client rule
+    // still applies for backward compatibility.
+    expect(
+      computeJobEvidenceTier(
+        job({ backend: 'gcp', per_arm_verdicts: A_RESULT, evidence_tier: undefined } as Partial<TierJob>),
+      ),
+    ).toBe('attested');
+  });
+});
+
+/** Full-job factory for the group/rank helpers (they consult `status` via
+ *  isComputeJobActive, so they take a whole ComputeJob rather than the narrow
+ *  Pick that computeJobEvidenceTier accepts). */
+const fullJob = (over: Partial<ComputeJob>): ComputeJob =>
+  ({
+    id: 'job-x',
+    backend: '',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    criterion_verdict: null,
+    per_arm_verdicts: null,
+    ...over,
+  }) as unknown as ComputeJob;
+
+describe('computeJobEvidenceGroup', () => {
+  it('covered (machine-verified) maps to the machine-verified group', () => {
+    expect(
+      computeJobEvidenceGroup(fullJob({ backend: 'local-bwrap', per_arm_verdicts: A_RESULT })),
+    ).toBe('machine-verified');
+  });
+
+  it('every non-covered terminal tier collapses to low-trust', () => {
+    // attested (cloud), partial (operator hw no result), backfilled (result no
+    // execution), uncovered (self-reported) — all NOT machine-verified.
+    expect(computeJobEvidenceGroup(fullJob({ backend: 'gcp', per_arm_verdicts: A_RESULT }))).toBe('low-trust'); // attested
+    expect(computeJobEvidenceGroup(fullJob({ backend: 'local-bwrap' }))).toBe('low-trust'); // partial
+    expect(computeJobEvidenceGroup(fullJob({ backend: '', per_arm_verdicts: A_RESULT }))).toBe('low-trust'); // backfilled
+    expect(computeJobEvidenceGroup(fullJob({}))).toBe('low-trust'); // uncovered
+  });
+
+  it('active jobs have no tier yet — group is null so a tier filter excludes them', () => {
+    expect(computeJobEvidenceGroup(fullJob({ status: 'RUNNING', outcome: null }))).toBeNull();
+    expect(computeJobEvidenceGroup(fullJob({ status: 'QUEUED', outcome: null }))).toBeNull();
+  });
+});
+
+describe('computeJobEvidenceTierRank', () => {
+  it('orders highest-trust (covered) below lowest-trust (uncovered)', () => {
+    const covered = computeJobEvidenceTierRank(fullJob({ backend: 'local-bwrap', per_arm_verdicts: A_RESULT }));
+    const attested = computeJobEvidenceTierRank(fullJob({ backend: 'gcp', per_arm_verdicts: A_RESULT }));
+    const partial = computeJobEvidenceTierRank(fullJob({ backend: 'local-bwrap' }));
+    const backfilled = computeJobEvidenceTierRank(fullJob({ backend: '', per_arm_verdicts: A_RESULT }));
+    const uncovered = computeJobEvidenceTierRank(fullJob({}));
+    expect(covered).toBeLessThan(attested);
+    expect(attested).toBeLessThan(backfilled);
+    expect(backfilled).toBeLessThan(partial);
+    expect(partial).toBeLessThan(uncovered);
+  });
+
+  it('active jobs (no tier) sort consistently last', () => {
+    const active = computeJobEvidenceTierRank(fullJob({ status: 'RUNNING', outcome: null }));
+    const terminal = computeJobEvidenceTierRank(fullJob({}));
+    expect(active).toBe(Number.MAX_SAFE_INTEGER);
+    expect(active).toBeGreaterThan(terminal);
+  });
+
+  it('sorting a mixed set by rank ascending yields covered → uncovered → active', () => {
+    const jobs = [
+      fullJob({ id: 'uncov' }),
+      fullJob({ id: 'active', status: 'RUNNING', outcome: null }),
+      fullJob({ id: 'cov', backend: 'local-bwrap', per_arm_verdicts: A_RESULT }),
+    ];
+    const ordered = [...jobs].sort((a, b) => computeJobEvidenceTierRank(a) - computeJobEvidenceTierRank(b));
+    expect(ordered.map((j) => j.id)).toEqual(['cov', 'uncov', 'active']);
+  });
+});
+
+describe('computeJobViewableArtifacts', () => {
+  const withArtifacts = (viewable: unknown): ComputeJob =>
+    ({ viewable_artifacts: viewable } as unknown as ComputeJob);
+
+  it('keeps a kind:"pdf" entry (previously dropped) alongside image/video', () => {
+    const artifacts = computeJobViewableArtifacts(
+      withArtifacts([
+        { filename: 'loss.png', storage_uri: 'gs://b/0-loss.png', kind: 'image', size_bytes: 10 },
+        { filename: 'report.pdf', storage_uri: 'gs://b/1-report.pdf', kind: 'pdf', size_bytes: 88_000 },
+        { filename: 'rollout.mp4', storage_uri: 'gs://b/2-rollout.mp4', kind: 'video', size_bytes: 20 },
+      ]),
+    );
+    expect(artifacts.map(a => a.kind)).toEqual(['image', 'pdf', 'video']);
+    const pdf = artifacts.find(a => a.kind === 'pdf');
+    expect(pdf).toMatchObject({ name: 'report.pdf', storage_uri: 'gs://b/1-report.pdf', bytes: 88_000 });
+  });
+
+  it('still drops entries with an unknown kind or missing storage_uri', () => {
+    const artifacts = computeJobViewableArtifacts(
+      withArtifacts([
+        { filename: 'x.bin', storage_uri: 'gs://b/x.bin', kind: 'binary', size_bytes: 5 },
+        { filename: 'no-uri.pdf', kind: 'pdf', size_bytes: 5 },
+      ]),
+    );
+    expect(artifacts).toEqual([]);
   });
 });

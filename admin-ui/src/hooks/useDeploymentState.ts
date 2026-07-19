@@ -31,6 +31,7 @@ export function useDeploymentState(
   user: User | null,
   fetchTasksRef: React.MutableRefObject<() => void>,
   selectedProjectId: string | null = null,
+  pollerEnabled = true,
 ) {
   // --- Deploy State ---
   const [deployState, setDeployState] = useState<DeployState | null>(null);
@@ -199,11 +200,11 @@ export function useDeploymentState(
   // non-silent variant (shows loading); subsequent shared-clock ticks are
   // silent. Pauses when the tab is hidden, catches up on return.
   useEffect(() => {
-    if (!user) return;
+    if (!user || !pollerEnabled) return;
     fetchDeployState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [user]);
-  usePoller(() => { fetchDeployState(true); }, { intervalMs: 60_000, enabled: !!user, leading: false, deps: [user] });
+  }, [user, pollerEnabled]);
+  usePoller(() => { fetchDeployState(true); }, { intervalMs: 60_000, enabled: !!user && pollerEnabled, leading: false, deps: [user, pollerEnabled] });
 
   // Auto-clear the failed-rollback affordance once the deploy-state status
   // moves away from what it was when the rollback failed. A successful retry,
@@ -227,7 +228,7 @@ export function useDeploymentState(
     } catch { /* ignore */ }
   };
 
-  usePoller(fetchZoneHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
+  usePoller(fetchZoneHealth, { intervalMs: 60_000, enabled: !!user && pollerEnabled, deps: [user, pollerEnabled] });
 
   // --- Orchestrator Health ---
   const [orchestratorHealth, setOrchestratorHealth] = useState<OrchestratorHealth | null>(null);
@@ -240,7 +241,7 @@ export function useDeploymentState(
     } catch { setOrchestratorHealth(null); }
   };
 
-  usePoller(fetchOrchestratorHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
+  usePoller(fetchOrchestratorHealth, { intervalMs: 60_000, enabled: !!user && pollerEnabled, deps: [user, pollerEnabled] });
 
   // --- Detailed Health ---
   const [detailedHealth, setDetailedHealth] = useState<DetailedHealth | null>(null);
@@ -273,7 +274,7 @@ export function useDeploymentState(
     } catch { setDetailedHealth(null); }
   };
 
-  usePoller(fetchDetailedHealth, { intervalMs: 60_000, enabled: !!user, deps: [user] });
+  usePoller(fetchDetailedHealth, { intervalMs: 60_000, enabled: !!user && pollerEnabled, deps: [user, pollerEnabled] });
 
   // --- Diagnostics ---
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
@@ -292,8 +293,8 @@ export function useDeploymentState(
   }, [user, selectedProjectId]);
   usePoller(fetchDiagnostics, {
     intervalMs: 60_000,
-    enabled: !!user && !!selectedProjectId,
-    deps: [user, selectedProjectId, fetchDiagnostics],
+    enabled: !!user && !!selectedProjectId && pollerEnabled,
+    deps: [user, selectedProjectId, fetchDiagnostics, pollerEnabled],
   });
 
   return {

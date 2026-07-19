@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Activity, ChevronDown, ChevronRight, Monitor, AlertTriangle, HardDrive } from 'lucide-react';
+import { Activity, ChevronDown, ChevronRight, Monitor, AlertTriangle, HardDrive, MemoryStick } from 'lucide-react';
 import type { FleetHealthSummaryResponse } from '../api';
 
 function statusColor(status: string): string {
@@ -56,8 +56,10 @@ export function FleetHealthCard({
     );
   }
 
-  const hasIssues = data.degraded > 0 || data.offline > 0 || data.stale > 0 || data.low_disk > 0;
-  const hasCritical = data.offline > 0 || data.low_disk > 0;
+  const lowMemory = data.low_memory ?? 0;
+  const hasIssues =
+    data.degraded > 0 || data.offline > 0 || data.stale > 0 || data.low_disk > 0 || lowMemory > 0;
+  const hasCritical = data.offline > 0 || data.low_disk > 0 || lowMemory > 0;
 
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3">
@@ -99,6 +101,12 @@ export function FleetHealthCard({
           <span className="text-red-400 inline-flex items-center gap-1">
             <HardDrive className="w-3 h-3" />
             <span className="font-mono font-bold">{data.low_disk}</span> low disk
+          </span>
+        )}
+        {lowMemory > 0 && (
+          <span className="text-red-400 inline-flex items-center gap-1">
+            <MemoryStick className="w-3 h-3" />
+            <span className="font-mono font-bold">{lowMemory}</span> low memory
           </span>
         )}
       </div>
@@ -147,6 +155,9 @@ export function FleetHealthCard({
                           </span>
                           {runner.health?.disk_low && (
                             <HardDrive className="w-3 h-3 text-red-400 shrink-0" aria-label="Low disk" />
+                          )}
+                          {runner.health?.memory_low && (
+                            <MemoryStick className="w-3 h-3 text-red-400 shrink-0" aria-label="Low memory" />
                           )}
                           {runner.health?.consecutive_job_failures != null && runner.health.consecutive_job_failures > 0 && (
                             <span className="text-amber-400/80">

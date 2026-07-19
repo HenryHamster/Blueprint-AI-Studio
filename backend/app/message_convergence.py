@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from fastapi import HTTPException
 from sqlmodel import select
 
+from app.message_audience import OPERATOR_ACTION_NEEDED
 from app.models import MessageType, ProjectMessage
 from app.project_message_projection import enum_value
 from app.time_utils import _utcnow
@@ -168,6 +169,148 @@ def get_message_link(msg: "ProjectMessage") -> dict | None:
     if not isinstance(link, dict):
         return None
     return link
+
+
+# ── Generalized message lifecycle (Stage 2, design d-7c851b3f) ────────────────
+#
+# The bug-class-only convergence machinery above (link_message_to_outcome /
+# LINKED_STATUS / the Step-15 sweep) is generalized here so that ANY 'linked'
+# message — not only BUG_REPORT/BLOCKER — auto-resolves once its recorded
+# _convergence_link target genuinely LANDS, and so the operator-facing
+# needs_action flag is DERIVED (never a schema column). These helpers are the
+# shared decision layer both the generalized linked-resolve sweep and the
+# stale-open decay sweep in reaper_sweeps.py consult, so the two stamp their
+# resolutions and derive needs-action identically.
+
+# Terminal status string for a resolved message.
+RESOLVED_STATUS = "resolved"
+
+# Message types that constitute an operator "needs action" item — mirror of
+# operator_attention._NEEDS_OPERATOR_MESSAGE_TYPES, kept as string values here so
+# this IO-light module stays import-cheap. needs_action is DERIVED, not stored.
+NEEDS_ACTION_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {MessageType.QUESTION.value, MessageType.BLOCKER.value}
+)
+
+# Conversational-era message types that age out under stale-open decay. NOTE
+# and FEEDBACK decay after STALE_OPEN_DECAY_DAYS (14d, 'auto-decayed (stale)').
+# Unanswered QUESTION items use a longer window (STALE_QUESTION_DECAY_DAYS, 30d)
+# and receive the resolution 'stale_unanswered' so operators can distinguish
+# auto-resolved from genuinely-answered questions. BLOCKER is excluded (requires
+# human resolution), and BUG_REPORT is owned by the bug-class convergence sweeps.
+CONVERSATIONAL_DECAY_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {MessageType.NOTE.value, MessageType.FEEDBACK.value, MessageType.QUESTION.value}
+)
+
+
+def _message_type_value(msg: "ProjectMessage") -> str:
+    raw = getattr(msg, "message_type", None)
+    if raw is None:
+        return ""
+    return raw.value if hasattr(raw, "value") else str(raw)
+
+
+def _message_status_value(msg: "ProjectMessage") -> str:
+    raw = getattr(msg, "status", None)
+    if raw is None:
+        return ""
+    return raw.value if hasattr(raw, "value") else str(raw)
+
+
+def derive_needs_action(msg: "ProjectMessage") -> bool:
+    """Return True when *msg* is an unresolved operator needs-action item.
+
+    ``needs_action`` is DERIVED (never persisted): a message needs operator
+    action when either (a) its ``message_type`` is QUESTION or BLOCKER, or
+    (b) its audience context is ``operator-action-needed``; AND it has not been
+    terminally resolved. This is the single source of truth consumed by both
+    the in-memory attention model and the audience-routing layer.
+    """
+    if _message_status_value(msg) == RESOLVED_STATUS:
+        return False
+    if _message_type_value(msg) in NEEDS_ACTION_MESSAGE_TYPES:
+        return True
+    context = msg.context if isinstance(msg.context, dict) else {}
+    return context.get("audience") == OPERATOR_ACTION_NEEDED
+
+
+def mark_message_resolved(
+    msg: "ProjectMessage", now: "datetime", resolution: str
+) -> None:
+    """Terminally resolve a message and stamp its audit trail in place.
+
+    Mutates ``msg.status``/``resolution``/``resolved_at``/``context``; does NOT
+    ``session.add()`` or commit — the caller owns those. Shared by the
+    generalized linked-resolve and stale-decay sweeps so every auto-resolution
+    records the same ``_convergence_converged_at`` audit key.
+    """
+    msg.status = RESOLVED_STATUS
+    msg.resolution = resolution
+    msg.resolved_at = now
+    ctx = dict(msg.context or {})
+    ctx["_convergence_converged_at"] = now.isoformat()
+    msg.context = ctx
+
+
+async def linked_outcome_landed_resolution(
+    session: "AsyncSession", msg: "ProjectMessage", *, now: "datetime"
+) -> str | None:
+    """Audit string when *msg*'s ``_convergence_link`` target genuinely LANDED, else None.
+
+    Generalizes the positive (convergence) half of
+    ``sweep_converge_linked_bug_messages`` to ANY linked message: a linked
+    outcome counts as resolved only when it actually *lands* —
+
+      - Direction: ``status == 'completed'``
+      - Task:      ``landed_signal.is_merged_completion(task)`` (COMPLETED + merged)
+
+    An outcome that ended WITHOUT landing (failed/cancelled/retired/…), is still
+    in-flight, missing, or malformed returns ``None`` — fail-safe, leaving the
+    message untouched so manual resolve and stale-decay remain the fallback.
+    ``now`` is accepted for signature parity with the sweep helpers and future
+    time-bounded checks; the landing decision itself is time-independent.
+    """
+    from app.landed_signal import is_merged_completion
+    from app.models import Direction, Task
+
+    link = get_message_link(msg)
+    if not link:
+        return None
+    kind = link.get("kind")
+    outcome_id = link.get("id")
+    if not kind or not outcome_id:
+        return None
+
+    if kind == "direction":
+        dir_row = (
+            (
+                await session.execute(
+                    select(Direction).where(
+                        Direction.project_id == msg.project_id,
+                        Direction.direction_key == str(outcome_id),
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if dir_row is not None and (dir_row.status or "active") == "completed":
+            return f"Owning direction '{outcome_id}' completed"
+        return None
+
+    if kind == "task":
+        try:
+            task_uuid = uuid.UUID(str(outcome_id))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        task = await session.get(Task, task_uuid)
+        if task is None:
+            return None
+        if is_merged_completion(task):
+            return f"Owning task '{outcome_id}' completed and PR merged"
+        return None
+
+    return None
 
 
 _HEX_RE = re.compile(r"^[0-9a-f]*$")

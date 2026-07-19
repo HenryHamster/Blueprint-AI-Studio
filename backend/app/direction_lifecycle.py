@@ -659,6 +659,8 @@ async def _process_direction_lifecycle(
     session: AsyncSession,
     busy_direction_ids: set,
     now: datetime,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> list:
     """Acquire project-row lock, then delegate to the inner lifecycle worker.
 
@@ -675,6 +677,10 @@ async def _process_direction_lifecycle(
                 project.id,
             )
             return []
+        if expected_legacy_generation is not None:
+            from app.notification_dispatch import begin_deferred_external_notifications
+
+            begin_deferred_external_notifications(session)
         pending_retired_memory: list[tuple[dict, str]] = []
         # Reload directions inside the lock so we read the latest committed
         # state and cannot overwrite a concurrent write that committed between
@@ -686,6 +692,7 @@ async def _process_direction_lifecycle(
             busy_direction_ids,
             now,
             pending_retired_memory=pending_retired_memory,
+            expected_legacy_generation=expected_legacy_generation,
         )
     if pending_retired_memory:
         from app.strategic_completion import record_retired_direction_memory
@@ -708,7 +715,16 @@ async def _process_direction_lifecycle(
             )
             raise
         if locked:
-            await session.commit()
+            if expected_legacy_generation is None:
+                await session.commit()
+            else:
+                from app.strategic_resident_transition_locks import (
+                    commit_legacy_authorized,
+                )
+
+                await commit_legacy_authorized(
+                    session, project.id, expected_legacy_generation
+                )
         else:
             logger.warning(
                 "[LIFECYCLE] Vision lock not acquired (project missing?) while flushing "
@@ -725,6 +741,7 @@ async def _process_direction_lifecycle_locked(
     now: datetime,
     *,
     pending_retired_memory: list[tuple[dict, str]] | None = None,
+    expected_legacy_generation: int | None = None,
 ) -> list:
     """Prune dead directions, auto-recover paused ones, and return eligible active directions.
 
@@ -864,6 +881,7 @@ async def _process_direction_lifecycle_locked(
         session.add(
             Alert(
                 project_id=project.id,
+                event_type="research.direction_auto_completed",
                 severity=AlertSeverity.INFO,
                 title="Direction auto-retired (lifetime burn)",
                 message=(
@@ -953,6 +971,7 @@ async def _process_direction_lifecycle_locked(
             session.add(
                 Alert(
                     project_id=project.id,
+                    event_type="research.direction_auto_completed",
                     severity=AlertSeverity.INFO,
                     title="Direction auto-retired (outcome scaffolding)",
                     message=(
@@ -1044,6 +1063,7 @@ async def _process_direction_lifecycle_locked(
             session.add(
                 Alert(
                     project_id=project.id,
+                    event_type="research.escalation_delivery_failed",
                     severity=AlertSeverity.ERROR,
                     title="Escalation notification delivery failed",
                     message=(
@@ -1318,6 +1338,7 @@ async def _process_direction_lifecycle_locked(
                 session.add(
                     Alert(
                         project_id=project.id,
+                        event_type="research.diagnosis_stalled",
                         severity=AlertSeverity.WARNING,
                         title="Direction diagnosis stalled",
                         message=(
@@ -1750,6 +1771,7 @@ async def _process_direction_lifecycle_locked(
                 session.add(
                     Alert(
                         project_id=project.id,
+                        event_type="research.churn_retirement_recommended",
                         severity=AlertSeverity.INFO,
                         title="Direction churn-retirement recommended",
                         message=(
@@ -1814,6 +1836,7 @@ async def _process_direction_lifecycle_locked(
 
                 alert = Alert(
                     project_id=project.id,
+                    event_type="research.direction_auto_completed",
                     severity=AlertSeverity.INFO,
                     title="Direction auto-retired",
                     message=(
@@ -2083,5 +2106,14 @@ async def _process_direction_lifecycle_locked(
                 project.id,
                 exc,
             )
-        await session.commit()
+        if expected_legacy_generation is None:
+            await session.commit()
+        else:
+            from app.strategic_resident_transition_locks import (
+                commit_legacy_authorized,
+            )
+
+            await commit_legacy_authorized(
+                session, project.id, expected_legacy_generation
+            )
     return active_directions

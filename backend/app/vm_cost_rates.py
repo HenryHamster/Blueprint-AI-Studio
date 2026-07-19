@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Any, Tuple
+
+from sqlalchemy import and_, case, func, or_
 
 logger = logging.getLogger(__name__)
 
@@ -385,3 +387,106 @@ def get_compute_rate_per_second(
     base_rate = base_hourly[1] if spot else base_hourly[0]
     surcharge_rate = surcharge_hourly[1] if spot else surcharge_hourly[0]
     return (base_rate + surcharge_rate) / 3600
+
+
+# ---------------------------------------------------------------------------
+# SQL-side cost aggregation
+#
+# These builders return SQLAlchemy expressions that compute a task's total VM
+# cost entirely in the database, so cost dashboards can SUM/GROUP BY without
+# hydrating thousands of JSONB-heavy Task rows into Python (the dominant cost
+# of the old row-loading loops).  The per-row value mirrors
+# ``models.get_task_total_vm_cost_usd`` exactly:
+#
+#     COALESCE(vm_runtime_cost_banked_db, 0) + current_attempt_cost
+#
+# where ``current_attempt_cost = max(0, runtime_seconds) * rate`` and ``rate``
+# is the per-second rate for the task's (machine_type, spot) pair.
+#
+# Accuracy caveat: the per-second rate CASE covers every explicitly priced
+# machine type (the e2 CPU shapes and the Cloud Run sentinels).  A task on an
+# unpriced/unknown machine type falls back to the default e2-standard-2 rate,
+# matching ``_resolve_rate_entry``'s fallback.  GPU shapes are not priced here
+# (they are not surfaced by these cost widgets).
+# ---------------------------------------------------------------------------
+
+
+def _vm_rate_per_second_sql_case(task_cls: Any):
+    """Return a SQLAlchemy ``case()`` for the per-second VM rate of each row.
+
+    Mirrors :func:`get_vm_rate_per_second`: a NULL ``vm_machine_type`` resolves
+    to the default (``MACHINE_TYPE`` env default, which is
+    ``DEFAULT_MACHINE_TYPE``), Cloud Run sentinels use their fixed shape rate
+    (spot has no meaning there), and every other machine type uses its
+    on-demand vs. spot rate.
+    """
+    machine_type = func.coalesce(task_cls.vm_machine_type, DEFAULT_MACHINE_TYPE)
+    whens: list = []
+    # Cloud Run sentinels: fixed per-second rate, spot-agnostic.
+    for cr_type in _CLOUD_RUN_SHAPES:
+        whens.append((machine_type == cr_type, get_cloud_run_rate_for_machine_type(cr_type)))
+    # CPU (e2) shapes: distinct on-demand vs. spot per-second rate.
+    for mtype, (on_demand_hourly, spot_hourly) in VM_COST_RATES.items():
+        whens.append(
+            (and_(machine_type == mtype, task_cls.vm_spot.is_(True)), spot_hourly / 3600.0)
+        )
+        whens.append((machine_type == mtype, on_demand_hourly / 3600.0))
+    default_on_demand, default_spot = VM_COST_RATES[DEFAULT_MACHINE_TYPE]
+    return case(
+        *whens,
+        else_=case(
+            (task_cls.vm_spot.is_(True), default_spot / 3600.0),
+            else_=default_on_demand / 3600.0,
+        ),
+    )
+
+
+def _runtime_seconds_sql(task_cls: Any, dialect_name: str):
+    """Return VM runtime seconds (``vm_stopped_at - vm_provisioned_at``).
+
+    NULL when either endpoint is NULL (no current attempt), matching
+    ``get_task_current_attempt_vm_cost_usd`` which returns 0 in that case.
+    """
+    if dialect_name == "postgresql":
+        return func.extract(
+            "epoch", task_cls.vm_stopped_at - task_cls.vm_provisioned_at
+        )
+    # SQLite (test harness fallback): julianday() days -> seconds.
+    return (
+        func.julianday(task_cls.vm_stopped_at)
+        - func.julianday(task_cls.vm_provisioned_at)
+    ) * 86400.0
+
+
+def vm_cost_sql_expr(dialect_name: str):
+    """SQLAlchemy expression for a Task's total VM cost (banked + current attempt).
+
+    Numerically equal to ``models.get_task_total_vm_cost_usd`` per row. Rows with
+    no cost evidence evaluate to 0 here; callers that must exclude them entirely
+    (rather than count them at $0) should also apply :func:`vm_cost_evidence_filter`.
+    """
+    from app.models import Task  # local import avoids models<->vm_cost_rates cycle
+
+    runtime_seconds = _runtime_seconds_sql(Task, dialect_name)
+    rate = _vm_rate_per_second_sql_case(Task)
+    # Only positive runtime contributes (mirrors the max(0, …) / <=0 guard).
+    current_attempt_cost = case((runtime_seconds > 0, runtime_seconds * rate), else_=0.0)
+    return func.coalesce(Task.vm_runtime_cost_banked_db, 0.0) + current_attempt_cost
+
+
+def vm_cost_evidence_filter():
+    """SQL predicate for "this task has VM cost evidence".
+
+    Mirrors ``models.get_task_total_vm_cost_usd_or_none``'s ``has_evidence`` gate
+    (a positive banked amount OR a provisioning window), i.e. the rows for which
+    that helper returns a value rather than ``None``.
+    """
+    from app.models import Task  # local import avoids models<->vm_cost_rates cycle
+
+    return or_(
+        and_(
+            Task.vm_runtime_cost_banked_db.isnot(None),
+            Task.vm_runtime_cost_banked_db > 0,
+        ),
+        Task.vm_provisioned_at.isnot(None),
+    )

@@ -16,6 +16,7 @@ import {
   buildFeedbackSection,
   buildQuestionSection,
   buildOpenMessagesText,
+  formatRecentHandledConversation,
   buildDirSummaryText,
   buildDirHealthSummary,
   buildDirectionPortfolioSection,
@@ -1052,6 +1053,49 @@ describe('buildOpenMessagesText', () => {
     expect(result).toContain('⚠ STALE — cited code gone on HEAD.');
     expect(result).not.toContain('files ');
     expect(result).not.toContain('symbols ');
+  });
+});
+
+describe('formatRecentHandledConversation', () => {
+  it('returns empty string for empty / non-array input', () => {
+    expect(formatRecentHandledConversation([])).toBe('');
+    // Defensive: a non-array should not throw.
+    expect(formatRecentHandledConversation(undefined as unknown as Array<Record<string, unknown>>)).toBe('');
+  });
+
+  it('formats each message as an "answered" (read-only) line with type/id/from', () => {
+    const result = formatRecentHandledConversation([
+      { id: 'h1', type: 'FEEDBACK', content: 'drop the caching idea', from: 'user' },
+    ]);
+    expect(result).toContain('[FEEDBACK]');
+    expect(result).toContain('id: h1');
+    expect(result).toContain('from: user');
+    expect(result).toContain('answered');
+    expect(result).toContain('drop the caching idea');
+    // It is NOT an open inbox — no open-age / staleness decorations.
+    expect(result).not.toContain('open ');
+    expect(result).not.toContain('STALE');
+  });
+
+  it('preserves order and joins one line per message', () => {
+    const result = formatRecentHandledConversation([
+      { id: 'a', type: 'NOTE', content: 'first', from: 'user' },
+      { id: 'b', type: 'NOTE', content: 'second', from: 'strategic' },
+    ]);
+    const lines = result.split('\n');
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain('first');
+    expect(lines[1]).toContain('second');
+    expect(lines[1]).toContain('from: strategic');
+  });
+
+  it('tolerates missing id/type/from without throwing', () => {
+    const result = formatRecentHandledConversation([{ content: 'bare' }]);
+    expect(result).toContain('[message]');
+    expect(result).toContain('from: unknown');
+    expect(result).toContain('bare');
+    // No id → the "id:" prefix is omitted entirely.
+    expect(result).not.toContain('id:');
   });
 });
 

@@ -226,7 +226,7 @@ runtime_config: Dict = {
     ),
     # Max registered checks run per tick (backstop against an over-grown registry).
     "metrics_integrity_sweep_max_checks": int(
-        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "25")
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "50")
     ),
     # Max projects scanned per per-project check (bounds the scan fan-out).
     "metrics_integrity_sweep_max_projects": int(
@@ -247,16 +247,16 @@ runtime_config: Dict = {
     # (i.e. from a version at least min_versions_back back) AND older than
     # min_age_days. Mode mirrors metrics_integrity_sweep_mode exactly:
     #   off     — never supersede.
-    #   observe — measure the would-be resolutions + log, mutate nothing (default).
-    #   enforce — stamp the eligible messages resolved.
+    #   observe — measure the would-be resolutions + log, mutate nothing.
+    #   enforce — stamp the eligible messages resolved (default).
     # Unresolved BUG_REPORT/BLOCKER messages are ALWAYS left open (a bug does not
     # become fixed just because a version promoted).
     "message_supersession_mode": os.getenv(
-        "MESSAGE_SUPERSESSION_MODE", "observe"
+        "MESSAGE_SUPERSESSION_MODE", "enforce"
     ).lower()
-    if os.getenv("MESSAGE_SUPERSESSION_MODE", "observe").lower()
+    if os.getenv("MESSAGE_SUPERSESSION_MODE", "enforce").lower()
     in ("off", "observe", "enforce")
-    else "observe",
+    else "enforce",
     # A message must be at least this many days old to be superseded (safety margin).
     "message_supersession_min_age_days": int(
         os.getenv("MESSAGE_SUPERSESSION_MIN_AGE_DAYS", "14")
@@ -332,6 +332,15 @@ runtime_config: Dict = {
             "CAPABILITY_PROOF_GATE_AUTO_GRADUATION_ENFORCE_THRESHOLD", "0.95"
         )
     ),
+    # Machine-verified capability-proof earn path: gates the bounded,
+    # executed-named_test trial dispatch/enrollment.  Default ON now that the
+    # complete path is wired (discovery -> targeted execution -> green-result
+    # ingestion -> proven evidence). Operators retain the PATCH/env kill switch
+    # for a fleet that needs to pause trial dispatch.
+    "capability_proof_execution_trials_enabled": os.getenv(
+        "CAPABILITY_PROOF_EXECUTION_TRIALS_ENABLED", "true"
+    ).lower()
+    in ("1", "true", "yes"),
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -1383,9 +1392,6 @@ _DORMANT_MODE_KNOBS = {
     "metrics_integrity_sweep_mode": (
         "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
     ),
-    "message_supersession_mode": (
-        "Message supersession measuring stale-message backlog but not resolving them"
-    ),
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"
     ),
@@ -1506,6 +1512,11 @@ def _read_promotion_policy_file() -> dict | None:
                 )
             except (TypeError, ValueError):
                 pass
+        # Slice 3 (design 245212a4): seed the deployed-side env-preflight gate
+        # flag so _policy_from_runtime_config() carries it and the short-circuit
+        # path (runtime_config has promotion_threshold) does NOT silently drop it.
+        if "env_preflight_enabled" in parsed:
+            result["env_preflight_enabled"] = bool(parsed["env_preflight_enabled"])
         return result
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         logger.warning(
@@ -1542,6 +1553,8 @@ def _seed_promotion_policy() -> None:
         runtime_config["merge_grade_block_threshold"] = policy[
             "merge_grade_block_threshold"
         ]
+    if "env_preflight_enabled" in policy:
+        runtime_config["env_preflight_enabled"] = policy["env_preflight_enabled"]
 
 
 _seed_promotion_policy()
@@ -2269,6 +2282,11 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "capability_proof_gate_auto_graduation_enabled",
                         bool(config_json["capability_proof_gate_auto_graduation_enabled"]),
+                    )
+                if "capability_proof_execution_trials_enabled" in config_json:
+                    _set(
+                        "capability_proof_execution_trials_enabled",
+                        bool(config_json["capability_proof_execution_trials_enabled"]),
                     )
                 for _cap_grad_float_key in (
                     "capability_proof_gate_auto_graduation_observe_threshold",

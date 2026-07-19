@@ -4,7 +4,9 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
   apiGet, apiPost, persistAndPostStatus, resolveBaseBranch,
   recordResidentTurnLatency, getResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture, getOperatorDecisionCaptureTelemetry,
 } from '../index.js';
+import { restoreOperatorDecisionCaptureTelemetry } from '../telemetry.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
   buildContextPrefix, configureResidentAgentPermissions,
@@ -22,6 +24,7 @@ import {
 import {
   buildDirSummaryText,
   buildOpenMessagesText,
+  formatRecentHandledConversation,
 } from './strategic-sections.js';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
@@ -31,15 +34,18 @@ import {
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads, parseTickVerdict,
+  classifyOperatorDecisionReview, mergePendingOperatorDecisionReview,
+  retainPendingOperatorDecisionReview, advancePendingOperatorDecisionReview, MAX_REVIEW_ATTEMPTS,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   serializeLedger, restoreLedger, refreshSurfaceCatalog,
   compactionThreshold, formatDirectionGroundingText, buildCompactionCheckpoint,
-  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict,
+  decisionsRegisterText, DECISIONS_REGISTER_CAP, isSettledDecisionVerdict, admitDecisionEntry,
   serializeDecisionsReg, restoreDecisionsReg, parseOperatorDecision, OPERATOR_DECISION_VERDICT,
   formatStrategicMemoryNotes, formatCheckpointState, resolveCheckpointGrounding,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord, type ContentBlock,
   type CompactionCheckpointContext, type DecisionsRegisterEntry,
+  type PendingOperatorDecisionReview,
   type CheckpointGrounding, type CheckpointStateResponse,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
@@ -384,6 +390,11 @@ export async function handleStrategicResident(
     ? directionCounts.active : undefined;
   const openMessages = Array.isArray(payload.open_messages)
     ? payload.open_messages as Array<Record<string, unknown>> : [];
+  // Recently-answered operator conversation tail (status handled/resolved).
+  // Read-only, non-actionable — surfaced so a marker-less operator correction
+  // survives a full session restart. Absent on older backends → [] (no section).
+  const recentHandledConversation = Array.isArray(payload.recent_handled_conversation)
+    ? payload.recent_handled_conversation as Array<Record<string, unknown>> : [];
   const retiredDirections = Array.isArray(payload.retired_directions_summary)
     ? payload.retired_directions_summary as Array<Record<string, unknown>> : [];
   const stagedDirections = Array.isArray(payload.staged_directions)
@@ -423,6 +434,28 @@ export async function handleStrategicResident(
       .join('\n');
   })();
 
+  // Format the project's built-in tool content (notes markdown, whiteboard
+  // summary) for the bootstrap context. Mirrors skillsText: reads the
+  // best-effort `project_tools` array the backend claim injects (each entry is
+  // {slug, title, kind, text}); empty/absent → '' so the section is a no-op.
+  const toolContentText = ((): string => {
+    const raw = task.project_tools;
+    if (!Array.isArray(raw) || raw.length === 0) return '';
+    return raw
+      .filter((e): e is Record<string, unknown> => e !== null && typeof e === 'object' && !Array.isArray(e))
+      .map((e) => {
+        const slug = strVal(e.slug);
+        const title = strVal(e.title) || slug;
+        const kind = strVal(e.kind);
+        const text = strVal(e.text).trim();
+        if (!text) return '';
+        const heading = `### ${title}${kind ? ` (${kind})` : ''}`;
+        return `${heading}\n${text}`;
+      })
+      .filter(Boolean)
+      .join('\n\n');
+  })();
+
   // ── Durable decisions register ──────────────────────────────────────────
   // Full-fidelity cross-tick memory of settled decisions, preserved across
   // compaction AND full session restarts (VM recycles, process crashes) so
@@ -437,22 +470,33 @@ export async function handleStrategicResident(
     typeof ctx._decisions_reg === 'string' ? ctx._decisions_reg : undefined,
   ) ?? [];
 
+  // Static session-start grounding texts. Hoisted to consts so the SAME value
+  // feeds both the bootstrap prompt and the compaction checkpoint (see
+  // buildCheckpointContext) — the checkpoint would otherwise drop these three
+  // sections, letting a post-compaction session re-derive settled facts or
+  // re-propose already-retired/staged directions.
+  const stagedDirectionsText = buildStagedDirectionsText(stagedDirections);
+  const retiredDirectionsText = buildRetiredContextText(retiredDirections);
+  const previousDecisionOutcomesText = buildPriorDecisionsText(previousDecisionOutcomes);
+
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
     projectName: strVal(payload.project_name, 'this project'),
     problemModelJson,
     runningUpdate: typeof payload.running_update === 'string' ? payload.running_update : '',
     directionsText: buildDirSummaryText(directionsSummary, authoritativeActive),
-    stagedDirectionsText: buildStagedDirectionsText(stagedDirections),
-    retiredDirectionsText: buildRetiredContextText(retiredDirections),
-    previousDecisionOutcomesText: buildPriorDecisionsText(previousDecisionOutcomes),
+    stagedDirectionsText,
+    retiredDirectionsText,
+    previousDecisionOutcomesText,
     strategicMemoryNotesText,
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
+    recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
     sessionId,
     fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
     priorSessionContextText,
     skillsText,
+    toolContentText,
     decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
   });
 
@@ -481,6 +525,11 @@ export async function handleStrategicResident(
   // Set after an unevidenced idle claim (CLEAR with no tool use, or a missing/
   // garbled marker): the next tick opens with an examine-before-CLEAR correction.
   let correctiveNextTick = restoredLedger?.corrective ?? false;
+  // Markerless replies create a durable review; legacy boolean blobs restore
+  // into the same state via restoreLedger.
+  let operatorDecisionReview: PendingOperatorDecisionReview | null =
+    restoredLedger?.operatorDecisionReview ?? null;
+  restoreOperatorDecisionCaptureTelemetry(restoredLedger?.operatorDecisionCapture);
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
 
@@ -516,7 +565,14 @@ export async function handleStrategicResident(
       'project — never this execution environment or this prompt.',
     ].join(' ');
 
-    const examLedgerJson = serializeLedger(examRecords, examTick, correctiveNextTick);
+    const examLedgerJson = serializeLedger(
+      examRecords,
+      examTick,
+      correctiveNextTick,
+      operatorDecisionReview !== null,
+      operatorDecisionReview,
+      getOperatorDecisionCaptureTelemetry(),
+    );
 
     const recentRecords = examRecords.slice(-10);
     const recentInteractions = recentRecords.length > 0
@@ -530,6 +586,9 @@ export async function handleStrategicResident(
       `Focus rotation: ${currentFocus.map(f => f.key).join(', ') || '(none)'}`,
       openFound.length > 0 ? `Open leads (${openFound.length}): ${openFound.map(f => `${f.surfaceKey}: ${f.note.slice(0, 120)}`).join('; ')}` : '',
       `Corrective next tick: ${correctiveNextTick}`,
+      operatorDecisionReview
+        ? `Operator-decision review pending: ${1 + (operatorDecisionReview.queuedExchanges?.length ?? 0)} explicit exchange(s)${operatorDecisionReview.overflowed ? ' plus unresolved overflow' : ''}; current has ${operatorDecisionReview.messageIds.length} message id(s), ${operatorDecisionReview.attempts} attempt(s)`
+        : '',
       `Previous turn agenda-continue: ${previousTurnAgendaContinue}`,
       `Compaction count: ${compactionCount + 1}`,
     ].filter(Boolean).join('\n');
@@ -550,6 +609,7 @@ export async function handleStrategicResident(
         strategicMemoryNotesText,
         runningUpdate: strVal(payload.running_update),
         openMessagesText: buildOpenMessagesText(openMessages),
+        recentHandledConversationText: formatRecentHandledConversation(recentHandledConversation),
       },
       refreshedGrounding,
     );
@@ -559,13 +619,25 @@ export async function handleStrategicResident(
       visionJson: grounding.visionJson,
       strategicMemoryNotesText: grounding.strategicMemoryNotesText,
       openMessagesText: grounding.openMessagesText,
+      recentHandledConversationText: grounding.recentHandledConversationText,
       priorSessionContextText: priorSessionContextText || undefined,
       directionsText: refreshedDirectionGrounding
         ? formatDirectionGroundingText(refreshedDirectionGrounding) || undefined
         : buildDirSummaryText(directionsSummary, authoritativeActive) || undefined,
       runningUpdate: grounding.runningUpdate,
       decisionsRegisterText: decisionsRegisterText(decisionsReg, DECISIONS_REGISTER_CAP),
+      // Static session-start grounding — same snapshot forward every checkpoint
+      // (no refetch): retired/staged/prior-decision context the bootstrap shows.
+      retiredDirectionsText: retiredDirectionsText || undefined,
+      stagedDirectionsText: stagedDirectionsText || undefined,
+      previousDecisionOutcomesText: previousDecisionOutcomesText || undefined,
       groundingRefreshed: refreshedGrounding !== null,
+      // Session-static bootstrap sections: operator purpose/constraints preamble,
+      // project skills, and tool content.  These are never server-refreshed so
+      // the same session-start values carry forward on every checkpoint.
+      contextPrefix: contextPrefix || undefined,
+      skillsText: skillsText || undefined,
+      toolContentText: toolContentText || undefined,
     };
   };
   // An operator turn just completed → run an autonomous turn to act on it.
@@ -579,6 +651,11 @@ export async function handleStrategicResident(
   // Pacing for the "watching" ephemeral status line emitted while gated-idle so
   // deliberate quiet looks different from a dark/crashed session.
   let lastWatchingEmitAt = 0;
+  // Set true when workspace vanish has been handled for the current vanish event
+  // so the guard does not restart the subprocess again on the NEXT iteration
+  // (which would still see no .git if the recovery clone hasn't fully landed yet).
+  // Reset to false when .git is observed, arming the guard for the next event.
+  let workspaceVanishHandled = false;
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
@@ -731,6 +808,13 @@ export async function handleStrategicResident(
           ? state.open_messages as Array<Record<string, unknown>>
           : [];
         refreshedGrounding.openMessagesText = buildOpenMessagesText(refreshedOpenMsgs);
+        // Same treatment for the recently-answered conversation tail: format from
+        // the fresh checkpoint-state response so a correction the operator made
+        // mid-session (now handled) survives the compaction restart.
+        const refreshedRecentHandled = Array.isArray(state.recent_handled_conversation)
+          ? state.recent_handled_conversation as Array<Record<string, unknown>>
+          : [];
+        refreshedGrounding.recentHandledConversationText = formatRecentHandledConversation(refreshedRecentHandled);
         sendLog(ws, '[resident] compaction grounding refreshed from checkpoint-state endpoint\n');
       }
     } catch (e) {
@@ -801,19 +885,42 @@ export async function handleStrategicResident(
   // is instructed (bootstrap prompt) to end such a turn with an OPERATOR-DECISION
   // marker; when present we record it here BEFORE the operator-turn heartbeat so
   // it is serialized into task.context._decisions_reg on that same heartbeat.
-  const recordOperatorDecision = (r: ResidentTurnResult): void => {
-    const note = parseOperatorDecision(r.resultText);
-    if (!note) return;
-    decisionsReg.push({
+  const recordOperatorDecision = (
+    r: ResidentTurnResult,
+    messageIds: string[],
+    exchangeText: string,
+  ): void => {
+    if (r.interrupted || r.timedOut || r.hardTimedOut || r.processGone) {
+      operatorDecisionReview = mergePendingOperatorDecisionReview(
+        operatorDecisionReview,
+        messageIds,
+        new Date().toISOString(),
+        exchangeText,
+      );
+      streamer.status('operator turn incomplete — durable decision review remains pending');
+      return;
+    }
+    const note = parseOperatorDecision(r.resultText)
+      ?? parseOperatorDecision(r.accumulatedTurnText);
+    if (note === null) {
+      recordOperatorDecisionCapture('markerless');
+      operatorDecisionReview = mergePendingOperatorDecisionReview(
+        operatorDecisionReview,
+        messageIds,
+        new Date().toISOString(),
+        exchangeText,
+      );
+      streamer.status('operator turn awaits durable decision/no-decision review');
+      return;
+    }
+    recordOperatorDecisionCapture('captured');
+    admitDecisionEntry(decisionsReg, {
       atTick: examTick,
       at: new Date().toISOString(),
       surfaceKey: 'operator:message',
       verdict: OPERATOR_DECISION_VERDICT,
       note,
-    });
-    if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
-      decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
-    }
+    }, DECISIONS_REGISTER_CAP);
     streamer.status('operator correction recorded to durable decisions register');
   };
 
@@ -859,7 +966,14 @@ export async function handleStrategicResident(
     session.touch();
     // Serialize the current exam ledger into the note so the backend persists it;
     // a restart will restore it from task.context._exam_ledger.
-    const note = serializeLedger(examRecords, examTick, correctiveNextTick);
+    const note = serializeLedger(
+      examRecords,
+      examTick,
+      correctiveNextTick,
+      operatorDecisionReview !== null,
+      operatorDecisionReview,
+      getOperatorDecisionCaptureTelemetry(),
+    );
     const body: Record<string, unknown> = {
       session_id: sessionId, task_id: taskId, progress, note,
       // Send the current cursor so the backend persists it; a restart will
@@ -880,6 +994,10 @@ export async function handleStrategicResident(
     const latencySummary = getResidentTurnLatencyTelemetry();
     if (latencySummary !== null) {
       body.turn_latency_summary = latencySummary;
+    }
+    const opDecisionSummary = getOperatorDecisionCaptureTelemetry();
+    if (opDecisionSummary !== null) {
+      body.operator_decision_summary = opDecisionSummary;
     }
     try {
       const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, body) as SessionHeartbeatResponse;
@@ -990,6 +1108,87 @@ export async function handleStrategicResident(
   }
   gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
 
+  // Pickup lag for an operator turn: ms from the MOST RECENT operator message's
+  // server-side created_at to now. Server-absolute timestamps avoid agent-VM /
+  // backend clock drift inflating the value. Returns null when no usable
+  // created_at is present. Shared by every operator entry point so the metric is
+  // computed identically wherever a reply starts.
+  const computePickupLagMs = (msgs: ResidentInboundMessage[]): number | null => {
+    const now = Date.now();
+    let maxCreatedMs = 0;
+    for (const m of msgs) {
+      if (typeof m.created_at === 'string') {
+        const t = new Date(m.created_at).getTime();
+        if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
+      }
+    }
+    if (maxCreatedMs <= 0) return null;
+    const lag = now - maxCreatedMs;
+    return lag >= 0 ? lag : null;
+  };
+
+  // Run one operator turn end-to-end with OPERATOR-FIRST ordering: stream the
+  // reply, persist it, record any settled decision, heartbeat (marking the
+  // consumed messages handled), and only THEN pay any context-compaction cost.
+  // Shared by all THREE operator entry points — the top-of-loop fast path, an
+  // autonomous-turn interrupt, and a message that lands during a turn's tail — so
+  // none of them can regress into compacting ahead of the operator's reply. That
+  // ordering is what removes the measured compaction-restart pickup penalty: the
+  // operator no longer waits a full Claude-subprocess restart before their reply
+  // even starts. Returns 'stop' when the loop must break, 'continue' otherwise.
+  const handleOperatorTurn = async (
+    msgs: ResidentInboundMessage[],
+  ): Promise<'stop' | 'continue'> => {
+    const pickupLagMs = computePickupLagMs(msgs);
+    // Threshold-gated early acknowledgment: start a timer that fires after
+    // cfg.operatorAckThresholdMs so the operator sees a progress signal during
+    // slow turns. If the turn completes before the threshold, the timer is
+    // cancelled and no ack is posted. A threshold of 0 disables the ack.
+    let ackTimer: ReturnType<typeof setTimeout> | null = null;
+    if (cfg.operatorAckThresholdMs > 0) {
+      ackTimer = setTimeout(() => {
+        const ackText = msgs.length === 1
+          ? `On it — working on your message (this may take a moment).`
+          : `On it — working on ${msgs.length} messages (this may take a moment).`;
+        apiPost('/api/agent/strategic', {
+          task_id: taskId,
+          op: 'create_message',
+          data: { type: 'NOTE', content: ackText },
+        }).catch((e: unknown) => {
+          sendLog(ws, `[resident] early acknowledgment failed (non-fatal): ${String(e)}\n`);
+        });
+      }, cfg.operatorAckThresholdMs);
+    }
+    const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
+    if (ackTimer !== null) clearTimeout(ackTimer);
+    if (turnWedgedSession(r)) return 'stop';
+    await persistReply(r);
+    // Collect the ids of the messages we just consumed so the backend can mark
+    // them handled — they stop counting as open backlog and won't be re-delivered
+    // to a restarted session.
+    const consumedIds = msgs
+      .map((m) => m.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    // Capture any operator-settled correction into the durable register BEFORE the
+    // heartbeat so it is serialized in this same round-trip.
+    recordOperatorDecision(
+      r,
+      consumedIds,
+      msgs.map(message => message.content?.trim() ?? '').filter(Boolean).join('\n\n'),
+    );
+    const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
+    if (hb?.stop_requested) return 'stop';
+    if (r.processGone) { stopReason = 'session_process_exited'; return 'stop'; }
+    // Compaction runs ONLY after the reply is streamed and the handled-marking
+    // heartbeat has landed — so a compaction on this turn primes the fresh session
+    // WITH the settled decision and WITHOUT the just-answered message, and the
+    // operator never waits a subprocess restart before their reply starts.
+    if (await maybeCompact(r)) return 'stop';
+    // A just-finished operator turn arms one autonomous follow-through tick.
+    operatorTurnJustCompleted = true;
+    return 'continue';
+  };
+
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   try {
     for (;;) {
@@ -1002,10 +1201,52 @@ export async function handleStrategicResident(
       // minutes (so a re-clone deep into a multi-hour session would just throw).
       // See recloneResidentWorkspace.
       if (!fs.existsSync(`${WORKSPACE}/.git`)) {
-        sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
-        streamer.status('workspace vanished — re-cloning');
-        await recloneResidentWorkspace(ws, owner, repo, baseBranch);
-        sendLog(ws, '[resident] workspace restored\n');
+        if (!workspaceVanishHandled) {
+          workspaceVanishHandled = true;
+          sendLog(ws, '[resident] workspace vanished — re-cloning before next turn\n');
+          streamer.status('workspace vanished — re-cloning');
+          await recloneResidentWorkspace(ws, owner, repo, baseBranch);
+          sendLog(ws, '[resident] workspace restored\n');
+
+          // Re-provision all generated helper tools into the recreated checkout.
+          // They were written into the deleted directory inode and are gone.
+          writePlaybookHelper(taskId);
+          writeMessagesHelper(taskId);
+          writeSkillHelpers(task.skills as Record<string, unknown>[] | undefined);
+          configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
+          writeStrategicHelpers(taskId, projectId, WORKSPACE);
+          provisionAmbientHelpers(taskId, WORKSPACE);
+          sendLog(ws, '[resident] workspace recovery — helper tools re-provisioned\n');
+
+          // Restart the subprocess so its cwd points to the new directory inode.
+          // The live subprocess is still attached to the deleted inode.
+          session.close();
+          const recoverySession = startResidentClaudeSession({
+            model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
+          });
+          recoverySession.onEvent(onSessionEvent);
+          session = recoverySession;
+
+          // Prime with the compaction checkpoint to carry pre-loss decision context.
+          streamer.status('workspace recovery — priming restarted subprocess with checkpoint');
+          try {
+            const primeResult = await recoverySession.sendTurn(
+              buildCompactionCheckpoint(buildCheckpointContext()),
+            );
+            if (primeResult.processGone) {
+              sendLog(ws, '[resident] FATAL: recovery subprocess died during checkpoint prime\n');
+              stopReason = 'workspace_recovery_prime_failed';
+              break;
+            }
+            sendLog(ws, '[resident] workspace recovery complete — subprocess restarted and primed\n');
+          } catch (e) {
+            sendLog(ws, `[resident] FATAL: workspace recovery prime threw: ${String(e)}\n`);
+            stopReason = 'workspace_recovery_prime_failed';
+            break;
+          }
+        }
+      } else {
+        workspaceVanishHandled = false;
       }
 
       if (!session.isAlive()) {
@@ -1013,48 +1254,14 @@ export async function handleStrategicResident(
         break;
       }
 
-      // 1. Fast path: any pending operator message pre-empts everything.
+      // 1. Fast path: any pending operator message pre-empts everything. The
+      // operator reply is streamed and its lease-renewing heartbeat lands BEFORE
+      // any context compaction (handleOperatorTurn enforces that ordering), so a
+      // compaction never sits on the critical path ahead of the reply.
       const msgs = await pollMessages();
       if (msgs.length > 0) {
         streamer.status('operator message received — responding');
-        // Measure pickup lag: time from when the MOST RECENT operator message
-        // was created (server-side) to now. Uses server-absolute created_at
-        // timestamps so agent-VM / backend clock drift doesn't inflate the lag.
-        const pickupLagMs = (() => {
-          const now = Date.now();
-          let maxCreatedMs = 0;
-          for (const m of msgs) {
-            if (typeof m.created_at === 'string') {
-              const t = new Date(m.created_at).getTime();
-              if (Number.isFinite(t) && t > maxCreatedMs) maxCreatedMs = t;
-            }
-          }
-          if (maxCreatedMs <= 0) return null;
-          const lag = now - maxCreatedMs;
-          return lag >= 0 ? lag : null;
-        })();
-        const r = await runTurn(combineOperatorMessages(msgs), true, pickupLagMs);
-        if (turnWedgedSession(r)) break;
-        await persistReply(r);
-        // Collect the ids of the messages we just consumed so the backend can
-        // mark them handled — they stop counting as open backlog and won't be
-        // re-delivered to a restarted session.
-        const consumedIds = msgs.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-        // Capture any operator-settled correction into the durable register
-        // BEFORE the heartbeat so it is serialized in this same round-trip.
-        recordOperatorDecision(r);
-        const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
-        if (hb?.stop_requested) break;
-        if (r.processGone) { stopReason = 'session_process_exited'; break; }
-        // Check context-window pressure AFTER the decision is registered and the
-        // handled-marking heartbeat has landed. Compacting earlier would build the
-        // checkpoint from decisionsReg before this turn's OPERATOR-DECISION is
-        // pushed AND fetch checkpoint-state open_messages before the backend marks
-        // the just-answered message handled — priming the fresh session blind to
-        // the settled decision and re-surfacing the answered message as still-open.
-        if (await maybeCompact(r)) break;
-        // A just-finished operator turn arms one autonomous follow-through tick.
-        operatorTurnJustCompleted = true;
+        if (await handleOperatorTurn(msgs) === 'stop') break;
         continue;
       }
 
@@ -1127,8 +1334,21 @@ export async function handleStrategicResident(
       const recentRecords = examRecords.slice(-6);
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
+      // Only a recovered decision or NO-DECISION may clear this snapshot.
+      const reviewForTurn = operatorDecisionReview;
       lastAutonomousTurnAt = Date.now();
-      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn, decisionsRegisterText(decisionsReg)), false);
+      const turnPromise = runTurn(
+        buildAutonomousPrompt(
+          focus,
+          recentRecords,
+          openFound,
+          corrective,
+          cfg.maxOpsPerTurn,
+          decisionsRegisterText(decisionsReg),
+          reviewForTurn ?? false,
+        ),
+        false,
+      );
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
 
@@ -1139,30 +1359,26 @@ export async function handleStrategicResident(
       // dead-man's switch stays progress-gated).
       const r = await turnPromise;
       if (turnWedgedSession(r)) break;
-      // Check context-window pressure after the turn: compact if needed.
-      if (await maybeCompact(r)) break;
-      const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
-      // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
-      // writes are already folded into the rev we compare against next iteration.
-      // Recording it pre-turn would leave lastAutonomousWorkStateRev behind the
-      // heartbeat's updated currentWorkStateRev, causing the gate to fire again on
-      // the loop's own applied ops (self-echo).
-      lastAutonomousWorkStateRev = currentWorkStateRev;
-      if (hb?.stop_requested || watch.kind === 'stop') break;
-      if (r.processGone) { stopReason = 'session_process_exited'; break; }
+      // ResidentSession reports a child that closed without a terminal result as
+      // processGone while leaving interrupted false and returning any partial
+      // streamed text. Treat both signals identically for classification: partial
+      // markers from a dead child are not completed autonomous outcomes.
+      const turnInterrupted = r.interrupted || r.timedOut || r.hardTimedOut || r.processGone;
 
       // Update the examination ledger from the turn's TICK-VERDICT. Interrupted
       // turns (operator preemption via watch.kind === 'message', authority suspend
-      // via watch.kind === 'suspend', or stall watchdog) never emit a TICK-VERDICT
-      // marker; classifyTickOutcome records them as `interrupted` (non-corrective)
-      // so the ledger captures the event without raising a false violation.
+      // via watch.kind === 'suspend', stall watchdog, or subprocess exit) do not
+      // have a completed TICK-VERDICT; classifyTickOutcome records them as
+      // `interrupted` (non-corrective) so the ledger captures the event without
+      // raising a false violation or admitting partial output.
       const upd = classifyTickOutcome({
         resultText: r.resultText,
+        accumulatedTurnText: r.accumulatedTurnText,
         sawToolUse: r.sawToolUse,
         focus,
         atTick: examTick,
         at: new Date().toISOString(),
-        interrupted: r.interrupted,
+        interrupted: turnInterrupted,
       });
       examRecords.push(upd.record);
       if (examRecords.length > EXAM_RECORDS_CAP) {
@@ -1176,48 +1392,149 @@ export async function handleStrategicResident(
       // autonomous<->operator boundary where interrupts cluster. They remain in
       // the exam ledger (examRecords) above; only the durable register skips them.
       if (isSettledDecisionVerdict(upd.record.verdict)) {
-        const fullTickVerdict = parseTickVerdict(r.resultText);
-        decisionsReg.push({
+        const fullTickVerdict = parseTickVerdict(r.resultText)
+          ?? parseTickVerdict(r.accumulatedTurnText);
+        admitDecisionEntry(decisionsReg, {
           atTick: upd.record.atTick,
           at: upd.record.at,
           surfaceKey: upd.record.surfaceKey,
           verdict: upd.record.verdict,
           note: fullTickVerdict?.note ?? upd.record.note,
-        });
-        if (decisionsReg.length > DECISIONS_REGISTER_CAP) {
-          decisionsReg.splice(0, decisionsReg.length - DECISIONS_REGISTER_CAP);
-        }
+        }, DECISIONS_REGISTER_CAP);
       }
       correctiveNextTick = upd.corrective;
       previousTurnAgendaContinue = upd.agendaContinue;
       if (upd.statusNote) streamer.status(upd.statusNote);
 
+      // Resolve the operator-decision review requested by THIS turn. A recovered
+      // decision is admitted before the heartbeat. Marker-coverage telemetry was
+      // already recorded exactly once on the original operator turn; corrective
+      // outcomes must not rewrite or double-count it. Every unresolved result
+      // retains and advances the durable pending review.
+      if (reviewForTurn !== null) {
+        const reviewOutcome = classifyOperatorDecisionReview({
+          resultText: r.resultText,
+          accumulatedTurnText: r.accumulatedTurnText,
+          interrupted: turnInterrupted,
+        });
+        // A normal outcome covers exactly one explicit exchange. Once the
+        // queue has compacted into the id-less overflow sentinel, accept only
+        // an explicit whole-batch outcome; otherwise one recovered fact could
+        // silently discard every omitted operator exchange.
+        const activeOverflowSentinel = reviewForTurn.overflowed === true
+          && reviewForTurn.messageIds.length === 0
+          && (reviewForTurn.queuedExchanges?.length ?? 0) === 0;
+        // Batch markers classify only the id-less overflow sentinel. In
+        // particular, never let one consume an explicit current exchange while
+        // leaving the batch itself armed behind it.
+        const resolvesReview = reviewOutcome.coversOverflow === true
+          ? activeOverflowSentinel
+          : reviewForTurn.messageIds.length > 0 || reviewForTurn.overflowed !== true;
+        if (reviewOutcome.kind === 'recovered' && reviewOutcome.note && resolvesReview) {
+          admitDecisionEntry(decisionsReg, {
+            atTick: examTick,
+            at: upd.record.at,
+            surfaceKey: 'operator:message',
+            verdict: OPERATOR_DECISION_VERDICT,
+            note: reviewOutcome.note,
+          }, DECISIONS_REGISTER_CAP);
+          operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
+            coversOverflow: reviewOutcome.coversOverflow,
+          });
+          streamer.status('operator decision recovered into durable decisions register');
+        } else if (reviewOutcome.kind === 'no-decision' && resolvesReview) {
+          operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
+            coversOverflow: reviewOutcome.coversOverflow,
+          });
+          streamer.status('operator exchange confirmed routine/no-decision — review cleared');
+        } else {
+          const retained = retainPendingOperatorDecisionReview(reviewForTurn);
+          if (retained.attempts >= MAX_REVIEW_ATTEMPTS) {
+            // The model has repeatedly failed to emit a valid classification marker.
+            // Rather than silently losing the operator's exchange at restart or
+            // compaction, admit the available exchange text as a best-effort entry
+            // and advance past this review so the queue can drain.
+            //
+            // Id-less overflow sentinels have no stable message ids so the same
+            // sentinel can re-trip this branch on every failed autonomous turn.
+            // Guard against crowding the register with duplicate eviction-protected
+            // entries: skip admission if an equivalent fallback entry is already
+            // present (identified by the sentinel's startedAt timestamp in the note).
+            const sentinelKey = activeOverflowSentinel ? `sentinel:${reviewForTurn.startedAt}` : null;
+            const alreadyAdmitted = sentinelKey !== null
+              && decisionsReg.some(e => e.verdict === OPERATOR_DECISION_VERDICT && e.note.includes(sentinelKey));
+            const fallbackNote = reviewForTurn.exchangeText
+              ? `[unclassified after ${retained.attempts} attempts${sentinelKey ? ` ${sentinelKey}` : ''}] ${reviewForTurn.exchangeText}`
+              : `[unclassified after ${retained.attempts} attempts${sentinelKey ? ` ${sentinelKey}` : ''} — exchange text unavailable]`;
+            if (!alreadyAdmitted) {
+              admitDecisionEntry(decisionsReg, {
+                atTick: examTick,
+                at: upd.record.at,
+                surfaceKey: 'operator:message',
+                verdict: OPERATOR_DECISION_VERDICT,
+                note: fallbackNote,
+              }, DECISIONS_REGISTER_CAP);
+            }
+            // Pass coversOverflow:true when the current review IS the id-less
+            // overflow sentinel (activeOverflowSentinel) — advancePending returns
+            // `current` unchanged when messageIds is empty and coversOverflow is
+            // falsy, so without this the sentinel never clears and every subsequent
+            // autonomous turn re-trips the same escape hatch.
+            operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
+              coversOverflow: activeOverflowSentinel || reviewOutcome.coversOverflow,
+            });
+            streamer.status(`operator-decision review admitted after ${retained.attempts} failed attempts — exchange text recorded as fallback`);
+          } else {
+            operatorDecisionReview = retained;
+            streamer.status(reviewOutcome.statusNote
+              ?? 'operator-decision overflow needs an explicit whole-batch classification — durable review remains pending');
+          }
+        }
+      }
+
+      // The post-turn heartbeat is the commit point for the complete autonomous
+      // state transition: tick verdict, exam ledger, decisions register, review,
+      // agenda, corrective state, and capture telemetry are all classified first.
+      // Compaction remains later so the operator-first ordering is unchanged.
+      const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
+      // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
+      // writes are already folded into the rev we compare against next iteration.
+      // Recording it pre-turn would leave lastAutonomousWorkStateRev behind the
+      // heartbeat's updated currentWorkStateRev, causing the gate to fire again on
+      // the loop's own applied ops (self-echo).
+      lastAutonomousWorkStateRev = currentWorkStateRev;
+      if (hb?.stop_requested || watch.kind === 'stop') break;
+      if (r.processGone) { stopReason = 'session_process_exited'; break; }
+
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;
 
-      // Handle any operator message that interrupted the autonomous turn.
-      if (watch.kind === 'message') {
-        streamer.status('operator message received (interrupted autonomous work)');
-        const or = await runTurn(combineOperatorMessages(watch.messages), true);
-        if (turnWedgedSession(or)) break;
-        await persistReply(or);
-        // Extract the ids of the messages we just consumed so the backend can mark
-        // them handled — same as the fast-path operator-message pre-emption above.
-        const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
-        // Capture any operator-settled correction into the durable register
-        // BEFORE the heartbeat so it is serialized in this same round-trip.
-        recordOperatorDecision(or);
-        const hb2 = await heartbeat(true, consumedIds);
-        if (hb2?.stop_requested) break;
-        if (or.processGone) { stopReason = 'session_process_exited'; break; }
-        // Compact only AFTER the decision is registered and the handled-marking
-        // heartbeat has landed — identical ordering invariant as the fast path
-        // above, so a compaction on this interrupt turn primes the fresh session
-        // WITH the settled decision and WITHOUT the just-answered message.
-        if (await maybeCompact(or)) break;
-        operatorTurnJustCompleted = true;
+      // OPERATOR-FIRST: answer any operator message BEFORE paying the compaction
+      // restart. Two message sources are handled the same way:
+      //   - watch.kind === 'message': a message that pre-empted this autonomous
+      //     turn (caught by watchTurn's fast poll and already interrupted above);
+      //   - a message that landed during the turn's tail / the heartbeat above,
+      //     caught by this extra poll.
+      // handleOperatorTurn streams the reply and lands its lease-renewing
+      // heartbeat FIRST, then compacts — so the operator never waits a full Claude
+      // subprocess restart before their reply starts. Compacting here (as the loop
+      // used to, right after the autonomous turn) was the dominant contributor to
+      // the called-out operator pickup lag.
+      const pendingMsgs = watch.kind === 'message'
+        ? watch.messages
+        : await pollMessages();
+      if (pendingMsgs.length > 0) {
+        streamer.status(watch.kind === 'message'
+          ? 'operator message received (interrupted autonomous work)'
+          : 'operator message received — responding');
+        if (await handleOperatorTurn(pendingMsgs) === 'stop') break;
         continue;
       }
+
+      // No operator waiting → safe to pay the compaction cost now. Deferred to
+      // here (from immediately after the turn) so the operator-message check above
+      // always wins the race for the critical path.
+      if (await maybeCompact(r)) break;
 
       // Non-advancing turn (no strategic op applied) → pace so we don't hot-loop
       // the API, at the fast message-poll cadence so a just-arrived operator

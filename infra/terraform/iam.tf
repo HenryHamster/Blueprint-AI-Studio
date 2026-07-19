@@ -134,6 +134,25 @@ resource "google_service_account_iam_member" "orchestrator_act_as_agent" {
 }
 
 # ------------------------------------------------------------------------------
+# Image Builder Service Account — leaf identity for off-orchestrator docker builds
+# Only capability: push/pull on the compute-images Artifact Registry repo.
+# No orchestrator, GitHub, LLM, or runner credentials are reachable from this SA.
+# ------------------------------------------------------------------------------
+resource "google_service_account" "image_builder_sa" {
+  account_id   = "image-builder-sa"
+  display_name = "Image Builder SA (throwaway builder VM identity)"
+  description  = "Leaf SA for off-orchestrator compute-image builds. Holds only AR writer+reader on compute-images repo."
+}
+
+# Grant Orchestrator SA permission to attach image_builder_sa to throwaway builder VMs.
+# Mirrors orchestrator_act_as_agent above; no new project-level roles are granted.
+resource "google_service_account_iam_member" "orchestrator_act_as_image_builder" {
+  service_account_id = google_service_account.image_builder_sa.name
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${google_service_account.orchestrator_sa.email}"
+}
+
+# ------------------------------------------------------------------------------
 # Artifact Bucket (payloads, credentials, screenshots)
 # ------------------------------------------------------------------------------
 resource "google_storage_bucket" "artifacts" {
@@ -142,8 +161,55 @@ resource "google_storage_bucket" "artifacts" {
   force_destroy               = false
   uniform_bucket_level_access = true
 
+  # Viewable media objects at compute-jobs/*/artifacts/viewable/* are indexed by
+  # durable ComputeJobFile DB rows and must outlive the 7-day bundle reap so the
+  # strategic canvas keeps rendering plots/images/videos for jobs older than 7 days.
+  # They are intentionally matched by NO rule below (not .tar.gz, not tasks/,
+  # viewport-shots/, viewport-failures/, or message-attachments/).
+
+  # Bundle tarballs (compute-jobs/<id>/artifacts/bundle.tar.gz) and transfer
+  # tarballs (compute-jobs/<id>/artifacts/transfers/<id>.tar.gz) are ephemeral.
   lifecycle_rule {
-    condition { age = 7 }
+    condition {
+      age            = 7
+      matches_suffix = [".tar.gz"]
+    }
+    action { type = "Delete" }
+  }
+
+  # Task payload objects uploaded by orchestrator and agent VMs.
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["tasks/"]
+    }
+    action { type = "Delete" }
+  }
+
+  # Viewport task screenshots captured during code-change review runs.
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["viewport-shots/"]
+    }
+    action { type = "Delete" }
+  }
+
+  # Viewport failure baseline screenshots (viewport_evidence.py canonical uploads).
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["viewport-failures/"]
+    }
+    action { type = "Delete" }
+  }
+
+  # Operator message attachment uploads (admin_project_strategic_session.py).
+  lifecycle_rule {
+    condition {
+      age            = 7
+      matches_prefix = ["message-attachments/"]
+    }
     action { type = "Delete" }
   }
 }

@@ -8,7 +8,20 @@ vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
   authGet: vi.fn(async () => ({ ok: true, json: async () => ({}) })),
   dismissPendingConfirmation: vi.fn(async () => {}),
+  grantCapabilityProofExemption: vi.fn(async () => ({
+    status: 'granted',
+    capability_name: 'x',
+    exempt_capabilities: ['x'],
+  })),
+  revokeCapabilityProofExemption: vi.fn(async () => ({
+    status: 'revoked',
+    capability_name: 'x',
+    removed: 1,
+    exempt_capabilities: [],
+  })),
 }));
+
+import { grantCapabilityProofExemption, revokeCapabilityProofExemption } from '../api';
 
 function makeProblemModel(overrides: Partial<ProblemModel> = {}): ProblemModel {
   return {
@@ -282,5 +295,113 @@ describe('ProblemModelViewer — proof coverage meter', () => {
 
     const value = host!.querySelector('[data-testid="proof-coverage-value"]');
     expect(value!.textContent).toBe('2/2 (100%)');
+  });
+});
+
+describe('ProblemModelViewer — capability proof exemption controls', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+  let confirmSpy: ReturnType<typeof vi.spyOn> | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => { r.unmount(); }); root = null; }
+    if (host) { host.remove(); host = null; }
+    if (confirmSpy) { confirmSpy.mockRestore(); confirmSpy = null; }
+    vi.clearAllMocks();
+  });
+
+  async function renderWith(pm: ProblemModel, onUpdated: (patched: ProblemModel) => void) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<ProblemModelViewer problemModel={pm} {...defaultProps} onUpdated={onUpdated} />);
+    });
+  }
+
+  function toggleFor(name: string): HTMLButtonElement | null {
+    return host!.querySelector(`[data-testid="capability-exempt-toggle-${name}"]`);
+  }
+
+  test('working non-exempt capability shows a Grant control; exempt shows Revoke', async () => {
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'cap-grantable', status: 'working', proof_status: 'unproven' },
+        { name: 'cap-exempt', status: 'working', proof_exempt: true, proof_status: 'unproven' },
+      ],
+    });
+    await renderWith(pm, noop);
+    expect(toggleFor('cap-grantable')!.textContent).toContain('Grant exemption');
+    expect(toggleFor('cap-exempt')!.textContent).toContain('Revoke exemption');
+  });
+
+  test('partial and planned capabilities have no exemption control', async () => {
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'cap-partial', status: 'partial', proof_status: 'unproven' },
+        { name: 'cap-planned', status: 'planned', proof_status: 'unproven' },
+      ],
+    });
+    await renderWith(pm, noop);
+    expect(toggleFor('cap-partial')).toBeNull();
+    expect(toggleFor('cap-planned')).toBeNull();
+  });
+
+  test('granting confirms, calls the grant helper, and flips proof_exempt in onUpdated', async () => {
+    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const onUpdated = vi.fn();
+    const pm = makeProblemModel({
+      capabilities: [
+        { name: 'cap-grantable', status: 'working', proof_status: 'unproven' },
+        { name: 'cap-other', status: 'working', proof_status: 'proven' },
+      ],
+    });
+    await renderWith(pm, onUpdated);
+    await act(async () => {
+      toggleFor('cap-grantable')!.click();
+    });
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+    expect(grantCapabilityProofExemption).toHaveBeenCalledWith('proj-test-1', 'cap-grantable');
+    expect(onUpdated).toHaveBeenCalledTimes(1);
+    const patched = onUpdated.mock.calls[0][0] as ProblemModel;
+    const target = patched.capabilities!.find(c => c.name === 'cap-grantable');
+    const other = patched.capabilities!.find(c => c.name === 'cap-other');
+    expect(target!.proof_exempt).toBe(true);
+    // Only the target capability is flipped; siblings are untouched.
+    expect(other!.proof_exempt).toBeFalsy();
+  });
+
+  test('cancelling the grant confirmation does not call the helper or onUpdated', async () => {
+    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const onUpdated = vi.fn();
+    const pm = makeProblemModel({
+      capabilities: [{ name: 'cap-grantable', status: 'working', proof_status: 'unproven' }],
+    });
+    await renderWith(pm, onUpdated);
+    await act(async () => {
+      toggleFor('cap-grantable')!.click();
+    });
+    expect(grantCapabilityProofExemption).not.toHaveBeenCalled();
+    expect(onUpdated).not.toHaveBeenCalled();
+  });
+
+  test('revoking calls the revoke helper (no confirm) and flips proof_exempt to false', async () => {
+    confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const onUpdated = vi.fn();
+    const pm = makeProblemModel({
+      capabilities: [{ name: 'cap-exempt', status: 'working', proof_exempt: true, proof_status: 'unproven' }],
+    });
+    await renderWith(pm, onUpdated);
+    await act(async () => {
+      toggleFor('cap-exempt')!.click();
+    });
+    // Revoke is not destructive-ish — no confirmation prompt.
+    expect(confirmSpy).not.toHaveBeenCalled();
+    expect(revokeCapabilityProofExemption).toHaveBeenCalledWith('proj-test-1', 'cap-exempt');
+    const patched = onUpdated.mock.calls[0][0] as ProblemModel;
+    const target = patched.capabilities!.find(c => c.name === 'cap-exempt');
+    expect(target!.proof_exempt).toBe(false);
   });
 });

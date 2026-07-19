@@ -174,7 +174,7 @@ describe('buildMigrationConflictGuidance', () => {
     );
   });
 
-  it('consumes a reserved revision verbatim instead of deriving max+1', () => {
+  it('uses checkout head when reservation anchor is stale', () => {
     const out = buildMigrationConflictGuidance(
       {
         detected: true,
@@ -184,14 +184,19 @@ describe('buildMigrationConflictGuidance', () => {
       'backend/alembic/versions/',
       'backend/app/main.py',
       'EXPECTED_SCHEMA_REVISION',
-      { provisionalRevision: '0061', provisionalDownRevision: '0060' },
+      { provisionalRevision: '0607', provisionalDownRevision: '0530' },
     );
     expect(out).toMatch(/reserved revision/i);
     // Reserved id is used verbatim — NOT the max+1 ("0052") of the base chain.
-    expect(out).toMatch(/0061_add_foo\.py/);
-    expect(out).toMatch(/revision = "0061"/);
-    expect(out).toMatch(/down_revision = "0060"/);
-    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0061"/);
+    expect(out).toMatch(/0607_add_foo\.py/);
+    expect(out).toMatch(/revision = "0607"/);
+    expect(out).toMatch(/current base ref/i);
+    expect(out).toMatch(/down_revision.*base head/i);
+    expect(out).toMatch(/advisory parent `0530`.*MUST NOT win/i);
+    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0607"/);
+    expect(out).toMatch(/already exists on the base ref/i);
+    expect(out).toMatch(/not greater than the base head/i);
+    expect(out).not.toMatch(/down_revision = "0530"/);
     expect(out).not.toMatch(/0052/);
   });
 });
@@ -223,16 +228,22 @@ describe('extractReservedMigrationRevision', () => {
 });
 
 describe('buildReservedRevisionGuidance', () => {
-  it('instructs verbatim use of the reserved id and bans max+1/autogenerate numbering', () => {
+  it('uses the freshly cloned checkout head over a stale advisory parent', () => {
     const out = buildReservedRevisionGuidance({
-      provisionalRevision: '0153',
-      provisionalDownRevision: '0151',
+      provisionalRevision: '0607',
+      provisionalDownRevision: '0530',
     });
     expect(out).toMatch(/Reserved migration revision/);
-    expect(out).toMatch(/backend\/alembic\/versions\/0153_<short_description>\.py/);
-    expect(out).toMatch(/revision = "0153"/);
-    expect(out).toMatch(/down_revision = "0151"/);
-    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0153"/);
+    expect(out).toMatch(/backend\/alembic\/versions\/0607_<short_description>\.py/);
+    expect(out).toMatch(/revision = "0607"/);
+    expect(out).toMatch(/actual pre-new-migration chain head/i);
+    expect(out).toMatch(/freshly cloned\/rebased checkout/i);
+    expect(out).toMatch(/Set `down_revision` to that actual head/i);
+    expect(out).toMatch(/advisory parent is `0530`; use it only if the actual head cannot be determined/i);
+    expect(out).toMatch(/EXPECTED_SCHEMA_REVISION = "0607"/);
+    expect(out).toMatch(/already exists in the checkout's pre-existing migration chain/i);
+    expect(out).toMatch(/not greater than the actual head/i);
+    expect(out).not.toMatch(/down_revision = "0530"/);
     expect(out).toMatch(/no max\+1/);
   });
 

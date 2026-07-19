@@ -32,7 +32,6 @@ from app.models import (
     ArtifactType,
     Alert,
     AlertSeverity,
-    ProjectStatus,
     TaskWakeRegistration,
     WakeAction,
     WakeDeliveryState,
@@ -283,8 +282,9 @@ from app.task_lifecycle_github_helpers import (  # noqa: E402, F401, RUF100
 async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     """Return True if any QUEUED/PROVISIONING/IN_PROGRESS/EVALUATING task is a design_doc_update or strategic_review.
 
-    Takes a FOR UPDATE lock on the project row so the check+spawn is transactionally
-    atomic. Without it, two concurrent callers (e.g. design_doc completion chaining
+    Takes a FOR NO KEY UPDATE lock on the project row so the check+spawn is transactionally
+    atomic while remaining compatible with Task FK KEY SHARE inserts. Without it,
+    two concurrent callers (e.g. design_doc completion chaining
     to phase 2 and an autonomous-research tick) can both read "none active" in the
     same window and each insert a duplicate strategic task.
 
@@ -310,7 +310,11 @@ async def _has_active_strategic_task(project_id, session: AsyncSession) -> bool:
     result = await session.execute(
         select(Project.id)
         .where(Project.id == project_id)
-        .with_for_update(skip_locked=True)
+        # SQLAlchemy renders key_share=True (without read=True) as
+        # ``FOR NO KEY UPDATE`` on PostgreSQL: strategic spawners still
+        # serialize with each other, while ordinary Task FK inserts and
+        # conversation sends can take KEY SHARE without convoying.
+        .with_for_update(skip_locked=True, key_share=True)
     )
     if result.first() is None:
         # Row missing or held — fail safe. The other holder will spawn (or
@@ -1488,13 +1492,16 @@ async def _process_post_commit(
         _handle_self_audit_completion,
         _handle_memo_completion,
         _handle_repo_bootstrap_completion,
+        _handle_capability_proof_trial_completion,
         _try_recover_memo_from_parse_failure,
         _record_remediation_if_terminal,
     )
     from app.strategic_completion import (
         _handle_strategic_completion,
         _record_strategic_task_failure,
+        strategic_completion_message_count,
     )
+    from app.project_message_creation import reserve_project_message_sequences
     from app.research_completion import _handle_research_completion
     from app.knowledge_completion import (
         _handle_design_completion,
@@ -1527,11 +1534,38 @@ async def _process_post_commit(
         # comes purely from Project-before-Task being universal, not from holding
         # the row across the whole unit.)
         _peek_row = (
-            await session.execute(select(Task.project_id).where(Task.id == task_id))
+            await session.execute(
+                select(Task.project_id, Task.payloads).where(Task.id == task_id)
+            )
         ).first()
         if _peek_row is None:
             return {"status": "accepted"}
         _peek_project_id = _peek_row[0]
+        _peek_payloads = _peek_row[1] if isinstance(_peek_row[1], list) else []
+        _peek_task_type = (
+            str((_peek_payloads[0] or {}).get("type") or "")
+            if _peek_payloads and isinstance(_peek_payloads[0], dict)
+            else ""
+        )
+        _peek_capability = get_task_capability(_peek_task_type)
+        _peek_completion_handler = (
+            _peek_capability.completion_handler if _peek_capability else None
+        )
+        preallocated_strategic_message_sequences: list[int] = []
+        if _peek_completion_handler == "strategic":
+            message_count = strategic_completion_message_count(payload.logs or "")
+            if message_count:
+                preallocated_strategic_message_sequences = (
+                    await reserve_project_message_sequences(
+                        session,
+                        _peek_project_id,
+                        count=message_count,
+                        lock_timeout_ms=1_500,
+                    )
+                )
+                # Reservation gaps are harmless. Commit immediately so the
+                # counter row is never held while acquiring Project -> Task.
+                await session.commit()
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -5723,6 +5757,11 @@ async def _process_post_commit(
                     from app import pause_clock
 
                     ci_loop = review_loop.copy()
+                    # Per-episode respawn budget: a fix completion starts a fresh
+                    # review-wait episode.  Reset the backstop's per-episode count
+                    # so a respawn consumed in an earlier episode (e.g. a superseded
+                    # review) does not permanently exhaust the budget.
+                    ci_loop.pop("review_wait_respawn_count", None)
                     ci_loop["ci_waiting"] = True
                     ci_loop["review_approved"] = True
                     ci_loop["ci_wait_started"] = _utcnow().isoformat()
@@ -5781,80 +5820,120 @@ async def _process_post_commit(
                         _sr = (task.context or {}).get(SPAWN_REASON_KEY, "unknown")
                         _is_transient = _sr == SPAWN_REASON_DEFERRED
 
-                        # Use reason-specific messaging. For terminal failures
-                        # (cap, stuck, merged, etc.) the PR needs human attention;
-                        # for transient deferrals (lock contention) the backstop
-                        # will retry the spawn automatically.
-                        task.latest_status_message = (
-                            f"Fix applied for PR #{pr_number} but review spawn "
-                            f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _sr + ')'}"
-                        )
-                        if not _is_transient:
-                            task.requires_approval = True
-                        session.add(task)
+                        if _is_transient:
+                            # Transient deferral (e.g. in-flight peer holds the
+                            # spawn lock): create a specific alert and retry once.
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix deferred "
+                                "for PR #%s (reason=%s) — retrying once",
+                                pr_number,
+                                _sr,
+                            )
+                            from app.alert_dispatch import _maybe_create_failure_alert
 
-                        # Always create a WARNING alert with the specific spawn
-                        # reason so operators see the failure immediately, not
-                        # just a generic "iteration cap" message.
-                        _alert_reason_label = (
-                            "deferred" if _is_transient else _sr
-                        )
-                        alert_title = (
-                            f"PR #{pr_number} stalled — review spawn {_alert_reason_label}"
-                        )
-                        existing_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.severity == AlertSeverity.WARNING,
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.title == alert_title,
+                            await _maybe_create_failure_alert(
+                                task,
+                                session,
+                                f"Review spawn after fix for PR #{pr_number} "
+                                f"deferred ({_sr}) — retrying",
+                            )
+                            await asyncio.sleep(5)
+                            # Re-fetch the task in case the spawn call rolled back
+                            # the session and expired the ORM instance.
+                            _reloaded = await session.get(Task, task.id)
+                            if _reloaded is not None:
+                                task = _reloaded
+                            review_task, _ = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                pr_number,
+                                branch,
+                                base_branch,
+                                original_task_id=original_task_id,
+                            )
+                            if review_task:
+                                logger.info(
+                                    "[REVIEW PIPELINE] Spawned review after fix "
+                                    "(retry) for PR #%s → task %s",
+                                    pr_number,
+                                    review_task.id,
+                                )
+
+                        if not review_task:
+                            # Terminal failure: cap, stuck cycle, already merged,
+                            # or retry also failed. Escalate with accurate reason.
+                            _spawn_reason_label = _sr.replace("_", " ").title()
+                            task.latest_status_message = (
+                                f"Fix applied for PR #{pr_number} but review spawn "
+                                f"{'deferred (concurrent spawn)' if _is_transient else 'failed (' + _spawn_reason_label + ')'}"
+                            )
+                            if not _is_transient:
+                                task.requires_approval = True
+                            session.add(task)
+
+                            # Always create a WARNING alert with the specific spawn
+                            # reason so operators see the failure immediately, not
+                            # just a generic "iteration cap" message.
+                            _alert_reason_label = (
+                                "deferred" if _is_transient else _spawn_reason_label
+                            )
+                            alert_title = (
+                                f"PR #{pr_number} stalled — review spawn {_alert_reason_label}"
+                            )
+                            existing_alert = (
+                                (
+                                    await session.execute(
+                                        select(Alert).where(
+                                            Alert.project_id == task.project_id,
+                                            Alert.severity == AlertSeverity.WARNING,
+                                            Alert.dismissed_at.is_(None),
+                                            Alert.title == alert_title,
+                                        )
                                     )
                                 )
+                                .scalars()
+                                .first()
                             )
-                            .scalars()
-                            .first()
-                        )
-                        if not existing_alert:
-                            _alert_msg = (
-                                f"Fix was applied to PR #{pr_number} but the "
-                                f"review spawn failed (reason: {_sr}). "
-                                + (
-                                    "The spawn was deferred due to concurrent "
-                                    "activity; the next CI cycle will retry."
-                                    if _is_transient
-                                    else "Manual intervention may be required."
+                            if not existing_alert:
+                                _alert_msg = (
+                                    f"Fix was applied to PR #{pr_number} but the "
+                                    f"review spawn failed (reason: {_sr}). "
+                                    + (
+                                        "The spawn was deferred due to concurrent "
+                                        "activity; the next CI cycle will retry."
+                                        if _is_transient
+                                        else "Manual intervention may be required."
+                                    )
                                 )
-                            )
-                            alert = Alert(
-                                project_id=task.project_id,
-                                severity=AlertSeverity.WARNING,
-                                title=alert_title,
-                                message=_alert_msg,
-                                task_id=task.id,
-                            )
-                            session.add(alert)
-                            await session.commit()
-                            await broadcast_to_project(
-                                str(task.project_id),
-                                "alert_created",
-                                {
-                                    "alert_id": str(alert.id),
-                                    "severity": "WARNING",
-                                    "title": alert.title,
-                                },
-                            )
-                        else:
-                            await session.commit()
+                                alert = Alert(
+                                    project_id=task.project_id,
+                                    severity=AlertSeverity.WARNING,
+                                    title=alert_title,
+                                    message=_alert_msg,
+                                    task_id=task.id,
+                                )
+                                session.add(alert)
+                                await session.commit()
+                                await broadcast_to_project(
+                                    str(task.project_id),
+                                    "alert_created",
+                                    {
+                                        "alert_id": str(alert.id),
+                                        "severity": "WARNING",
+                                        "title": alert.title,
+                                    },
+                                )
+                            else:
+                                await session.commit()
 
-                        logger.warning(
-                            "[REVIEW PIPELINE] Review spawn after fix returned None "
-                            "for PR #%s (reason: %s)%s",
-                            pr_number,
-                            _sr,
-                            " — transient, will retry" if _is_transient else "",
-                        )
+                            logger.warning(
+                                "[REVIEW PIPELINE] Review spawn after fix returned None "
+                                "for PR #%s (reason: %s)%s",
+                                pr_number,
+                                _sr,
+                                " — transient, will retry" if _is_transient else "",
+                            )
 
                         # For transient deferrals, mark the CI task so the next
                         # backstop cycle detects this as a recent unresolved
@@ -5926,8 +6005,13 @@ async def _process_post_commit(
                     "web_research": _handle_web_research_completion,
                     "design": _handle_design_completion,
                     "repo_bootstrap": _handle_repo_bootstrap_completion,
+                    "capability_proof_trial": _handle_capability_proof_trial_completion,
                 }
-                _capability = get_task_capability(task_type)
+                _capability = (
+                    _peek_capability
+                    if task_type == _peek_task_type
+                    else get_task_capability(task_type)
+                )
                 _handler_name = _capability.completion_handler if _capability else None
                 if _handler_name:
                     _handler = _completion_handlers[_handler_name]
@@ -5940,7 +6024,15 @@ async def _process_post_commit(
                     # docs/concurrency.md); passing it lets the handler skip its
                     # own re-acquisition. None propagates the legacy
                     # bounded-retry path inside the handler (defensive only).
-                    if _capability.completion_needs_locked_project:
+                    if _handler_name == "strategic":
+                        await _handler(
+                            task,
+                            _handler_logs,
+                            session,
+                            project=locked_project,
+                            message_sequences=preallocated_strategic_message_sequences,
+                        )
+                    elif _capability.completion_needs_locked_project:
                         await _handler(
                             task, _handler_logs, session, project=locked_project
                         )
@@ -6297,160 +6389,6 @@ async def _process_post_commit(
                     task = await _rollback_and_refetch_task()
                     if task is None:
                         return {"status": "accepted"}
-
-        # 7. Project State Aggregation
-        # Only consider executable tasks (those with a VM) for aggregation.
-        # Parent/logical tasks are updated to match the project outcome.
-        #
-        # 2026-05-05 fix: a QUEUED leaf task waiting on warm-handoff also has
-        # ``vm_instance_id=None`` (the warm target VM is in ``warm_target_vm_id``,
-        # the real ``vm_instance_id`` is set only at claim). Without the QUEUED
-        # exclusion below, an aggregation pass triggered by a sibling completing
-        # will sweep that QUEUED task into ``parent_tasks`` and force-FAIL it
-        # with "Project aggregation: child task failed" — the task never even
-        # ran. Real parent/logical tasks (research, plan) sit in EVALUATING
-        # after children spawn, never in QUEUED. Production incident: task
-        # 582a0210 force-failed at 19:47:30 while waiting on a warm-handoff
-        # from sibling 609b380c on agent-vm-540ee.
-        # Column-selective scan — avoids loading large JSONB context blobs for
-        # every task on every completion event.
-        all_tasks_stmt = select(
-            Task.id, Task.status, Task.vm_instance_id
-        ).where(Task.project_id == task.project_id)
-        all_task_rows = (await session.execute(all_tasks_stmt)).all()
-        executable_statuses = [r.status for r in all_task_rows if r.vm_instance_id]
-        # A PARKED task is live work waiting on an external wake; park_task
-        # clears vm_instance_id=None on park, so it is already invisible to
-        # ``executable_statuses``. This guard provides defence-in-depth: without
-        # it, any PARKED task that somehow retained a vm_instance_id (e.g. in a
-        # future code path that parks without calling park_task) would still be
-        # excluded. Without this guard a finite project could
-        # converge COMPLETED/FAILED while a parked child is still waiting to be
-        # woken — an early-converge. Treat any live PARKED child as in-flight so
-        # the all-terminal guard below cannot trip while one exists.
-        has_parked_task = any(r.status == TaskStatus.PARKED for r in all_task_rows)
-        _parent_task_ids = [
-            r.id
-            for r in all_task_rows
-            if not r.vm_instance_id
-            and r.status
-            not in [
-                TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
-                # PARKED leaf is live work awaiting an external wake, not a
-                # parent/logical task — never force-fail it on project rollup.
-                TaskStatus.PARKED,
-                TaskStatus.COMPLETED,
-                TaskStatus.FAILED,
-                TaskStatus.CANCELLED,
-            ]
-        ]
-        # Fetch full ORM objects only for parent tasks — needed for mutation.
-        parent_tasks = (
-            (
-                await session.execute(
-                    select(Task).where(Task.id.in_(_parent_task_ids))
-                )
-            )
-            .scalars()
-            .all()
-            if _parent_task_ids
-            else []
-        )
-
-        project_stmt = select(Project).where(Project.id == task.project_id)
-        project = (await session.execute(project_stmt)).scalars().first()
-
-        if (
-            project
-            and not project.autonomous_enabled
-            and project.status != ProjectStatus.CANCELLED
-            and executable_statuses
-        ):
-            # 2026-06-02 fix: live autonomous projects must NEVER be flipped to a
-            # terminal status by this aggregation. Autonomous projects spawn work
-            # in waves on a timer; between one wave draining and the next being
-            # created there is a window where every task is briefly terminal. If
-            # that mix is all-{COMPLETED, CANCELLED} (common — tasks are routinely
-            # CANCELLED for benign reasons like dedup, scope-empty, supersession,
-            # graceful reassignment, and keep their VM id), the all-terminal branch
-            # below would flip the project to a terminal CANCELLED/COMPLETED/FAILED
-            # status. Because the autonomous engine selects work purely by the
-            # ``autonomous_enabled`` flag and never consults project status, the
-            # project keeps running while displaying a terminal status to the
-            # operator, and nothing ever moves it back. Terminal-status aggregation
-            # applies only to FINITE (non-autonomous) projects. The all-terminal
-            # guard below was originally meant to make this a no-op for autonomous
-            # projects, but the wave-drain window defeats it; gating on
-            # ``not autonomous_enabled`` is the correct, explicit fix.
-            #
-            # 2026-05-05 fix: only transition project status when ALL executable
-            # tasks are terminal. Previously the ``any FAILED`` branch fired
-            # any time an old FAILED row sat in ``executable_statuses`` (which
-            # spans every task that ever had a VM, including stale FAILED
-            # tasks not yet auto-archived for up to 7 days). For autonomous
-            # projects with continuous work, that pinned the project at FAILED
-            # forever and re-fired the parent-aggregation sweep on every new
-            # task transition. Requiring all-terminal makes the aggregation a
-            # no-op for autonomous projects (always something in flight) while
-            # preserving finite-project semantics.
-            # BLOCKED counts as terminal-for-now here: in a FINITE project the
-            # all-terminal guard only trips when nothing is in flight, so a
-            # remaining BLOCKED child has no in-project producer left to clear
-            # its precondition and will never un-block on its own. Excluding it
-            # would hang the project forever (previously these were FAILED rows
-            # caught by the `any FAILED` branch); including it preserves the old
-            # rollup, mapping a stuck BLOCKED child to a FAILED project outcome.
-            all_terminal = not has_parked_task and all(
-                s
-                in (
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                    TaskStatus.CANCELLED,
-                    TaskStatus.BLOCKED,
-                )
-                for s in executable_statuses
-            )
-            new_project_status = None
-            if all_terminal:
-                # The pipeline never auto-sets CANCELLED: a cancelled child is
-                # benign (dedup / scope-empty / supersession / reassignment), not
-                # a project cancellation. An all-terminal mix completes unless a
-                # genuine failure (FAILED, or a stuck BLOCKED child that can no
-                # longer un-block) is present. CANCELLED stays an explicit
-                # operator decision (the /cancel endpoint).
-                new_project_status = (
-                    ProjectStatus.FAILED
-                    if any(
-                        s in (TaskStatus.FAILED, TaskStatus.BLOCKED)
-                        for s in executable_statuses
-                    )
-                    else ProjectStatus.COMPLETED
-                )
-
-            if new_project_status:
-                project.status = new_project_status
-                session.add(project)
-                # Update parent/logical tasks to match the project outcome.
-                # new_project_status is only COMPLETED or FAILED — the pipeline
-                # never auto-sets CANCELLED.
-                terminal_task_status = (
-                    TaskStatus.COMPLETED
-                    if new_project_status == ProjectStatus.COMPLETED
-                    else TaskStatus.FAILED
-                )
-                for pt in parent_tasks:
-                    pt.status = terminal_task_status
-                    if terminal_task_status == TaskStatus.FAILED:
-                        pt.latest_status_message = (
-                            "Project aggregation: child task failed"
-                        )
-                    else:
-                        pt.latest_status_message = "Project completed"
-                    session.add(pt)
-                await session.commit()
-                await broadcast_to_project(
-                    str(project.id), "project_updated", {"status": new_project_status}
-                )
 
         # Audit W2 (D2/D4): backstop for the synchronous strategic chain.
         # If a strategic task (design_doc_update or strategic_review) reached

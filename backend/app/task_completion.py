@@ -239,6 +239,21 @@ async def _stamp_compute_result_resource(
         return resource
     if job.result_reference:
         resource["result_reference"] = job.result_reference
+    runner_artifact = (job.polling_metadata or {}).get("runner_artifact")
+    transfer = (job.polling_metadata or {}).get("runner_artifact_transfer")
+    if isinstance(runner_artifact, dict):
+        resource["artifact_delivery_report"] = {
+            "status": "verified" if runner_artifact.get("verified") is True else "legacy",
+            "verified": runner_artifact.get("verified") is True,
+            "size": runner_artifact.get("size"),
+            "crc32c": runner_artifact.get("crc32c"),
+            "generation": runner_artifact.get("generation"),
+        }
+    elif isinstance(transfer, dict):
+        resource["artifact_delivery_report"] = {
+            "status": transfer.get("status", "attempted"),
+            "verified": False,
+        }
     if job.artifact_id is None:
         return resource
 
@@ -429,6 +444,13 @@ def _derive_artifact_delivery_record(resource: dict) -> dict:
         record["artifact_id"] = artifact_id
     if result_reference is not None:
         record["result_reference"] = result_reference
+    report = resource.get("artifact_delivery_report")
+    if isinstance(report, dict):
+        record["transfer_status"] = report.get("status")
+        record["verified"] = report.get("verified") is True
+        for key in ("size", "crc32c", "generation"):
+            if report.get(key) is not None:
+                record[key] = report[key]
     return record
 
 
@@ -3703,6 +3725,313 @@ async def _maybe_spawn_sweep_aggregate_followon(
         len(sibling_rows),
     )
     return child
+
+
+def _parse_capability_proof_trial_result(task: Task, logs: str) -> dict | None:
+    """Extract a ``capability_proof_trial`` agent-reported result dict.
+
+    The agent's bespoke handler reports
+    ``{cap, head_sha, test_refs, ran, passed, skipped_summary, could_not_run}``.
+    We accept it from either the durable ``task.plan_output`` (a dict) or the raw
+    reported ``logs`` (JSON, optionally wrapped under a
+    ``capability_proof_trial_result`` key). Returns the result dict, or ``None``
+    when nothing parseable is present. Never raises.
+    """
+    po = getattr(task, "plan_output", None)
+    if isinstance(po, dict) and ("ran" in po or po.get("type") == "capability_proof_trial"):
+        return po
+    if isinstance(logs, str) and logs.strip():
+        try:
+            parsed = json.loads(logs)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict):
+            inner = parsed.get("capability_proof_trial_result")
+            if isinstance(inner, dict):
+                return inner
+            if "ran" in parsed or parsed.get("type") == "capability_proof_trial":
+                return parsed
+    return None
+
+
+async def _handle_capability_proof_trial_completion(
+    task: Task, logs: str, session: AsyncSession
+) -> None:
+    """Ingest a ``capability_proof_trial``'s executed-test result into the ledger.
+
+    Slice 2 of the machine-verified capability-proof earn path (design 84021e2d).
+    The agent handler runs ONLY a capability's declared convention-named covering
+    tests as a targeted runner job and reports
+    ``{cap, head_sha, test_refs, ran, passed, skipped_summary, could_not_run}``.
+    This handler is the INGESTION half:
+
+      * On a GREEN result (:func:`ci_resolution.capability_proof_trial_is_green` —
+        the tests actually ran and passed and the suite verified something), it
+        mints the genuine ``proven`` named_test proof via
+        :func:`record_capability_named_test_execution_proof`.
+      * On a RED / skipped / could-not-run result, per design §7 it NEVER demotes:
+        no proof is recorded; the contradiction is stamped on ``task.context`` for
+        strategist visibility only (it does NOT touch the capability's
+        proof-scoring evidence_refs, so an existing ``proven`` is untouched).
+
+    **Receipt completeness requirement**: a GREEN receipt must identify the
+    *complete* enrolled test suite (``test_refs`` must equal the enrolled set
+    exactly — neither a strict subset nor a superset) and the *actual checkout
+    revision* (``head_sha`` must match the enrolled SHA when one was specified).
+    Any mismatch records NO proof.  The recorded ``commit_sha`` uses the
+    agent-reported ``head_sha`` (actual executed revision) in preference to the
+    enrollment-time estimate, falling back to the enrolled SHA only when the
+    agent omitted it.
+
+    Operator-disableable + fail-open: the
+    ``capability_proof_execution_trials_enabled`` runtime flag defaults to True,
+    and any parse/lookup/record error leaves the capability at its existing proof,
+    never worse. Non-raising (the post-commit dispatcher already guards, but the
+    contract here is explicitly no-raise so a malformed trial can never strand the
+    surrounding commit).
+    """
+    try:
+        if not _runtime_config.get("capability_proof_execution_trials_enabled", False):
+            logger.info(
+                "[CAP_TRIAL] flag off — ingestion skipped for task %s", task.id
+            )
+            return
+
+        from app.capability_proof import (  # noqa: PLC0415
+            record_capability_named_test_execution_proof,
+        )
+        from app.ci_resolution import (  # noqa: PLC0415
+            capability_proof_trial_is_green,
+        )
+
+        result = _parse_capability_proof_trial_result(task, logs)
+        if result is None:
+            logger.warning(
+                "[CAP_TRIAL] no parseable trial result for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        cap = result.get("cap")
+        if not isinstance(cap, str) or not cap.strip():
+            logger.warning(
+                "[CAP_TRIAL] trial result for task %s missing 'cap' — ingesting nothing",
+                task.id,
+            )
+            return
+        head_sha = result.get("head_sha")
+        refs = [
+            r for r in (result.get("test_refs") or []) if isinstance(r, str) and r.strip()
+        ]
+
+        project = await session.get(Project, task.project_id)
+        if project is None:
+            logger.warning(
+                "[CAP_TRIAL] project %s gone for trial task %s — ingesting nothing",
+                task.project_id,
+                task.id,
+            )
+            return
+
+        async def _record_receipt_contradiction(reason: str) -> None:
+            """Persist an auditable rejection without changing proof state.
+
+            A receipt-contract failure is neither a test failure nor authority to
+            revoke an existing proof.  It must nevertheless be visible to the
+            stalled-trial health surface rather than disappearing into logs.
+            """
+            ctx = dict(task.context or {})
+            ctx["capability_proof_trial_contradiction"] = {
+                "reason": reason,
+                "ran": bool(result.get("ran")),
+                "passed": bool(result.get("passed")),
+                "could_not_run": bool(result.get("could_not_run")),
+                "recorded_at": _utcnow().isoformat(),
+            }
+            task.context = ctx
+            flag_modified(task, "context")
+            await session.commit()
+
+        # --- Validate agent-reported result against enrollment contract ---
+        # The enrollment (task.first_payload) is the orchestrator-authored contract
+        # written by enroll_capability_proof_trial. The agent must not be able to
+        # mint proof for a different cap, unenrolled test_refs, or a revision that
+        # was never enrolled. On ANY mismatch, record NO proof and surface the
+        # contradiction on the task context for strategist visibility (mirroring the
+        # non-green fail-open branch).
+        from app.capability_registry import normalize_capability_name as _norm_cap  # noqa: PLC0415
+
+        enrolled = task.first_payload
+        if not isinstance(enrolled, dict):
+            logger.warning(
+                "[CAP_TRIAL] no enrollment payload for task %s — ingesting nothing",
+                task.id,
+            )
+            return
+
+        cap_enrolled = _norm_cap(enrolled.get("cap"))
+        if not cap_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] enrollment for task %s missing valid 'cap' — ingesting nothing",
+                task.id,
+            )
+            return
+
+        refs_enrolled = [
+            r for r in (enrolled.get("test_refs") or []) if isinstance(r, str) and r.strip()
+        ]
+        head_sha_enrolled = (
+            enrolled.get("head_sha") if isinstance(enrolled.get("head_sha"), str) else None
+        )
+        env_fingerprint_enrolled = (
+            enrolled.get("env_fingerprint")
+            if isinstance(enrolled.get("env_fingerprint"), str) and enrolled.get("env_fingerprint")
+            else None
+        )
+
+        # (1) Capability name must normalize-equal the enrolled name.
+        cap_normalized = _norm_cap(cap)
+        if not cap_normalized or cap_normalized != cap_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] capability mismatch for task %s — "
+                "reported=%r normalized=%r enrolled=%r — ingesting nothing",
+                task.id,
+                cap,
+                cap_normalized,
+                cap_enrolled,
+            )
+            await _record_receipt_contradiction("capability_mismatch")
+            return
+
+        # (2) The receipt must name exactly the enrolled target set.  A subset
+        #     would let a compromised runner omit a hard test, then have its
+        #     green aggregate recorded as though the complete suite had run.
+        #     Belt-and-suspenders: guard empty refs explicitly.
+        reported_refs_set = set(refs)
+        enrolled_refs_set = set(refs_enrolled)
+        if not refs or reported_refs_set != enrolled_refs_set:
+            extra = sorted(reported_refs_set - enrolled_refs_set)
+            missing = sorted(enrolled_refs_set - reported_refs_set)
+            logger.warning(
+                "[CAP_TRIAL] test_refs mismatch for task %s — "
+                "extra=%s missing=%s — ingesting nothing",
+                task.id,
+                extra,
+                missing,
+            )
+            await _record_receipt_contradiction("test_refs_mismatch")
+            return
+
+        # (3) Reported head_sha must exactly match the enrolled revision.  In
+        #     particular, an empty/missing reported SHA cannot turn an enrolled
+        #     revision-bound trial into an unbound proof receipt.
+        reported_sha = head_sha if isinstance(head_sha, str) else None
+        if head_sha_enrolled and reported_sha != head_sha_enrolled:
+            logger.warning(
+                "[CAP_TRIAL] head_sha mismatch for task %s — "
+                "reported=%s, enrolled=%s — ingesting nothing",
+                task.id,
+                reported_sha,
+                head_sha_enrolled,
+            )
+            await _record_receipt_contradiction("head_sha_mismatch")
+            return
+
+        # --- Enrollment validated — use enrolled values for recording ---
+        # Prefer reported_sha (the actual executed revision) over the enrollment-time
+        # estimate; fall back to head_sha_enrolled when the agent omits head_sha.
+        commit_sha_to_record = reported_sha or head_sha_enrolled
+        if capability_proof_trial_is_green(result):
+            recorded = record_capability_named_test_execution_proof(
+                project,
+                cap_enrolled,
+                refs_enrolled,
+                commit_sha_to_record,
+                suite_verifying=True,
+                env_fingerprint=env_fingerprint_enrolled,
+            )
+            if recorded:
+                await session.commit()
+                logger.info(
+                    "[CAP_TRIAL] GREEN trial — recorded proven named_test proof for "
+                    "cap=%s (task %s, sha=%s, refs=%s)",
+                    cap_enrolled,
+                    task.id,
+                    commit_sha_to_record,
+                    refs_enrolled,
+                )
+                # The proof is durable before waking waiters. The shared resolver
+                # locks a bounded project slice and resumes only all-needs-satisfied
+                # tasks; its event wrapper is fail-open so proof ingestion stays
+                # authoritative even if an immediate wake cannot run.
+                from app.reaper_sweeps import (
+                    event_driven_unblock_on_capability_proof,
+                )
+
+                await event_driven_unblock_on_capability_proof(task.project_id, session)
+            else:
+                logger.info(
+                    "[CAP_TRIAL] GREEN trial for cap=%s (task %s) but recorder minted "
+                    "nothing (empty refs / unnormalizable / vacuous) — no proof",
+                    cap_enrolled,
+                    task.id,
+                )
+            return
+
+        # Non-green: NEVER demote on ambiguity (design §7). Surface the
+        # contradiction on the task context for the strategist. A definitive RED
+        # (tests actually ran and failed, not an infrastructure failure) also
+        # REVOKES any stale executed-proof ledger entry so a capability known
+        # broken at HEAD cannot keep clearing the enforce gate until the 30-day
+        # TTL expires.
+        is_definitive_red = (
+            bool(result.get("ran"))
+            and not bool(result.get("could_not_run"))
+            and not bool(result.get("passed"))
+        )
+        revoked = False
+        if is_definitive_red:
+            from app.capability_proof import (
+                revoke_stale_execution_proof,
+            )
+            revoked = revoke_stale_execution_proof(project, cap_enrolled)
+
+        ctx = dict(task.context or {})
+        ctx["capability_proof_trial_contradiction"] = {
+            "cap": cap_enrolled,
+            "head_sha": head_sha_enrolled,
+            "test_refs": refs_enrolled,
+            "ran": bool(result.get("ran")),
+            "passed": bool(result.get("passed")),
+            "could_not_run": bool(result.get("could_not_run")),
+            "proof_revoked": revoked,
+            "recorded_at": _utcnow().isoformat(),
+        }
+        task.context = ctx
+        flag_modified(task, "context")
+        await session.commit()
+        logger.info(
+            "[CAP_TRIAL] non-green trial for cap=%s (task %s) — "
+            "definitive_red=%s proof_revoked=%s",
+            cap_enrolled,
+            task.id,
+            is_definitive_red,
+            revoked,
+        )
+    except Exception:  # noqa: BLE001 — ingestion must fail open, never raise
+        logger.warning(
+            "[CAP_TRIAL] ingestion failed for task %s (fail-open — capability left "
+            "at existing proof)",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CAP_TRIAL] rollback after ingestion failure also failed",
+                exc_info=True,
+            )
 
 
 async def _handle_compute_experiment_completion(

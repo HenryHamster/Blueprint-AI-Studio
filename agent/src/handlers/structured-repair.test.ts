@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   sendLog: vi.fn(),
   runClaudeCode: vi.fn(),
 }));
@@ -9,12 +10,14 @@ vi.mock('../telemetry.js', () => ({
   buildPromptSizeTelemetry: vi.fn(),
   getLlmTelemetry: vi.fn(),
   recordFormatRepairTokens: vi.fn(),
+  restoreOperatorDecisionCaptureTelemetry: vi.fn(),
 }));
 
 vi.mock('../prompt.js', () => ({
   DEFAULT_TOOL_GUIDANCE: '',
   SHARED_LIFECYCLE_REMAINDER: '',
   formatSkills: vi.fn(() => ''),
+  formatProjectTools: vi.fn(() => ''),
   writeSkillHelpers: vi.fn(),
 }));
 

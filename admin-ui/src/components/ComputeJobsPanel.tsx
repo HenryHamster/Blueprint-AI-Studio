@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen, Search, List } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, resolveArtifactDownloadUrl, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { ComputeArtifactGallery } from './ComputeArtifactGallery';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
@@ -21,9 +22,9 @@ import {
   computeJobProjectedSpend,
   computeJobMargin,
   computeJobExecutionLocation,
-  computeJobViewableArtifacts,
-  fmtBytes,
   computeJobEvidenceTier,
+  computeJobEvidenceGroup,
+  computeJobEvidenceTierRank,
   computeJobImagePinStatus,
   fmtUsd,
   fmtCountdown,
@@ -31,15 +32,6 @@ import {
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
-
-// Signed artifact URLs expire after ~60 minutes; treat anything older than
-// 50 minutes as stale and re-resolve instead of handing out a dead link.
-const SIGNED_PREVIEW_FRESH_MS = 50 * 60 * 1000;
-
-type PreviewResolution =
-  | { state: 'resolving' }
-  | { state: 'resolved'; url: string; resolvedAt: number }
-  | { state: 'error' };
 
 const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
@@ -384,6 +376,13 @@ function SweepKnowledgeGroupsSection({
 
   const verdictLabel = (met: boolean | null | undefined) => met === true ? 'MET' : met === false ? 'NOT MET' : 'UNMEASURED';
   const gradeLabel = (grade: string | null | undefined) => grade === 'acceptance' ? 'accepted' : grade === 'measured_only' ? 'measured' : '—';
+  const provenanceLabel = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
+    const backend = doc.run_provenance?.executing_backend;
+    if (!backend) return null;
+    const { label } = computeJobExecutionLocation(backend);
+    const host = doc.run_provenance?.runner_hostname ?? doc.run_provenance?.runner_target_id;
+    return host ? `${label} · ${host}` : label;
+  };
   const armEvidence = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
     const verdicts = doc.per_arm_verdicts ? Object.entries(doc.per_arm_verdicts) : [];
     if (verdicts.length === 0) return doc.criterion?.metric ?? '—';
@@ -427,7 +426,7 @@ function SweepKnowledgeGroupsSection({
                 <button
                   type="button"
                   onClick={() => toggleCompare(sweepId)}
-                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
+                  className="min-h-[44px] min-w-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
                   data-testid="sweep-knowledge-compare-toggle"
                 >
                   <LayoutGrid className="w-3 h-3" />
@@ -442,6 +441,7 @@ function SweepKnowledgeGroupsSection({
                     <tr>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Verdict</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Tier / Provenance</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Criterion</th>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Evidence</th>
                       <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
@@ -464,6 +464,16 @@ function SweepKnowledgeGroupsSection({
                           )}
                         </td>
                         <td className="py-0.5 pr-3 text-neutral-400">{verdictLabel(doc.criterion_met)} / {gradeLabel(doc.compute_acceptance_grade)}</td>
+                        <td className="py-0.5 pr-3" data-testid="sweep-knowledge-tier-cell">
+                          <div className="flex flex-col gap-0.5">
+                            <EvidenceTierBadge tier={doc.evidence_tier} />
+                            {provenanceLabel(doc) && (
+                              <span className="text-neutral-500 text-ui-xs truncate max-w-36" data-testid="sweep-knowledge-provenance-label">
+                                {provenanceLabel(doc)}
+                              </span>
+                            )}
+                          </div>
+                        </td>
                         <td className="py-0.5 pr-3 text-neutral-400">{doc.criterion ? `${doc.criterion.metric} ${doc.criterion.operator} ${doc.criterion.threshold}` : '—'}</td>
                         <td className="py-0.5 pr-3 text-neutral-400 max-w-xs truncate">{armEvidence(doc)}</td>
                         <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
@@ -489,6 +499,7 @@ function SweepKnowledgeGroupsSection({
                         doc.arm_label ?? doc.title
                       )}
                     </span>
+                    <EvidenceTierBadge tier={doc.evidence_tier} />
                     {doc.criterion_met !== undefined && (
                       <span className={`shrink-0 rounded border px-1 py-0.5 text-ui-xs ${doc.criterion_met === true ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : doc.criterion_met === false ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
                         {verdictLabel(doc.criterion_met)}
@@ -861,10 +872,13 @@ function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
     successMetric: sc?.metric ?? '',
     successOperator: (sc?.operator as ComputeSuccessOperator) ?? '>=',
     successThreshold: sc?.threshold != null ? String(sc.threshold) : '',
+    setupStep: lp.setup_step ?? '',
+    noProgressTimeoutSeconds: lp.no_progress_timeout_seconds != null ? String(lp.no_progress_timeout_seconds) : '',
+    inputArtifactJobId: lp.input_artifact_job_id ?? '',
   };
 }
 
-type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend';
+type TableSortKey = 'name' | 'status' | 'criterion' | 'cost' | 'runtime' | 'backend' | 'tier';
 
 const TABLE_COL_LABELS: Record<TableSortKey, string> = {
   name: 'Name',
@@ -873,9 +887,10 @@ const TABLE_COL_LABELS: Record<TableSortKey, string> = {
   cost: 'Cost',
   runtime: 'Runtime',
   backend: 'Backend',
+  tier: 'Tier',
 };
 
-function CompactJobsTable({
+export function CompactJobsTable({
   jobs,
   sortConfig,
   onSort,
@@ -910,6 +925,7 @@ function CompactJobsTable({
             const spent = computeJobSpent(job);
             const runtimeSec = computeJobRuntimeSec(job);
             const { label: backendLabel } = computeJobExecutionLocation(job.backend ?? '');
+            const runnerName = job.runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
             const cv = job.criterion_verdict;
             const sc = job.success_criterion;
             return (
@@ -955,8 +971,31 @@ function CompactJobsTable({
                 <td className="py-1.5 pr-3 text-neutral-400 whitespace-nowrap">
                   {runtimeSec != null ? fmtDuration(runtimeSec) : active ? 'running' : '—'}
                 </td>
-                <td className="py-1.5 text-neutral-400 max-w-xs truncate">
-                  {backendLabel}
+                <td className="py-1.5 pr-3 text-neutral-400 max-w-xs">
+                  <span className="flex items-center gap-1.5 flex-wrap min-w-0">
+                    <span className="truncate">{backendLabel}</span>
+                    {runnerName && (
+                      <span
+                        className="text-neutral-300 truncate max-w-[10rem]"
+                        title={job.runner?.hostname ?? job.runner_target_id ?? undefined}
+                        data-testid="compact-table-runner"
+                      >
+                        · {runnerName}
+                      </span>
+                    )}
+                    {job.input_artifact_job_id && (
+                      <span
+                        className="text-emerald-500 shrink-0"
+                        title={`Resumed from ${job.input_artifact_job_id}`}
+                        data-testid="compact-table-resume"
+                      >
+                        ↻
+                      </span>
+                    )}
+                  </span>
+                </td>
+                <td className="py-1.5 pr-3 whitespace-nowrap">
+                  {!active ? <EvidenceTierBadge tier={computeJobEvidenceTier(job)} /> : <span className="text-neutral-600">—</span>}
                 </td>
               </tr>
             );
@@ -1008,10 +1047,6 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
-  // Signed preview URLs for viewable artifacts, keyed by `${jobId}:${storageUri}`.
-  // Resolved lazily on gallery expand and cached for the session; entries are
-  // re-resolved on click / media error once the signed URL goes stale.
-  const [previewUrls, setPreviewUrls] = useState<Record<string, PreviewResolution>>({});
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
     `compute-ask-state:${projectId}`,
@@ -1020,6 +1055,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   );
   const [searchText, setSearchText] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'completed' | 'failed'>('all');
+  const [tierFilter, setTierFilter] = useState<'all' | 'machine-verified' | 'low-trust'>('all');
   const [viewMode, setViewMode] = useState<'card' | 'table'>('card');
   const [sortConfig, setSortConfig] = useState<{ key: TableSortKey; dir: 'asc' | 'desc' } | null>(null);
 
@@ -1041,8 +1077,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     } else if (statusFilter === 'failed') {
       result = result.filter((job) => !isComputeJobActive(job) && job.outcome !== null && job.outcome !== 'SUCCESS');
     }
+    // Evidence tier only exists for TERMINAL jobs (active jobs render no badge and
+    // return group `null`), so any non-`all` tier narrowing is inherently a filter
+    // over finished results and drops active jobs.
+    if (tierFilter !== 'all') {
+      result = result.filter((job) => computeJobEvidenceGroup(job) === tierFilter);
+    }
     return result;
-  }, [jobs, searchText, statusFilter]);
+  }, [jobs, searchText, statusFilter, tierFilter]);
 
   const displayJobs = useMemo(() => {
     if (!sortConfig) return filteredJobs;
@@ -1057,6 +1099,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       } else if (sortConfig.key === 'cost') cmp = (computeJobSpent(a) ?? 0) - (computeJobSpent(b) ?? 0);
       else if (sortConfig.key === 'runtime') cmp = (computeJobRuntimeSec(a) ?? 0) - (computeJobRuntimeSec(b) ?? 0);
       else if (sortConfig.key === 'backend') cmp = (a.backend ?? '').localeCompare(b.backend ?? '');
+      else if (sortConfig.key === 'tier') cmp = computeJobEvidenceTierRank(a) - computeJobEvidenceTierRank(b);
       return sortConfig.dir === 'asc' ? cmp : -cmp;
     });
   }, [filteredJobs, sortConfig]);
@@ -1075,60 +1118,6 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     });
   }, []);
 
-  const resolvePreviewUrl = useCallback(async (key: string, storageUri: string): Promise<string | null> => {
-    if (!projectId) return null;
-    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolving' } }));
-    try {
-      const url = await resolveArtifactDownloadUrl(projectId, storageUri);
-      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'resolved', url, resolvedAt: Date.now() } }));
-      return url;
-    } catch {
-      setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
-      return null;
-    }
-  }, [projectId]);
-
-  const markPreviewError = useCallback((key: string) => {
-    setPreviewUrls((prev) => ({ ...prev, [key]: { state: 'error' } }));
-  }, []);
-
-  const toggleArtifactGallery = useCallback((job: ComputeJob) => {
-    const galleryKey = `gallery-${job.id}`;
-    const wasExpanded = expandedDocIds.has(galleryKey);
-    toggleDocExpanded(galleryKey);
-    if (wasExpanded) return;
-    // Lazy resolution: sign URLs only when the operator expands this job's
-    // gallery, and only for entries without a live resolution in flight.
-    for (const art of computeJobViewableArtifacts(job)) {
-      const key = `${job.id}:${art.storage_uri}`;
-      const cached = previewUrls[key];
-      if (cached?.state === 'resolving' || cached?.state === 'resolved') continue;
-      void resolvePreviewUrl(key, art.storage_uri);
-    }
-  }, [expandedDocIds, toggleDocExpanded, previewUrls, resolvePreviewUrl]);
-
-  const openPreviewFullSize = useCallback(async (key: string, storageUri: string) => {
-    const cached = previewUrls[key];
-    if (cached?.state === 'resolved' && Date.now() - cached.resolvedAt < SIGNED_PREVIEW_FRESH_MS) {
-      window.open(cached.url, '_blank', 'noopener,noreferrer');
-      return;
-    }
-    // Stale or errored cache — re-resolve, keeping a pending tab open across
-    // the async gap so popup blockers don't eat the navigation (same pattern
-    // as ResolvedReferenceLink in TaskCard).
-    const pendingTab = window.open('', '_blank');
-    const url = await resolvePreviewUrl(key, storageUri);
-    if (!url) {
-      pendingTab?.close();
-      return;
-    }
-    if (pendingTab) {
-      pendingTab.opener = null;
-      pendingTab.location.replace(url);
-    } else {
-      window.open(url, '_blank', 'noopener,noreferrer');
-    }
-  }, [previewUrls, resolvePreviewUrl]);
 
   const load = useCallback(
     async (signal?: AbortSignal, appendOffset?: number) => {
@@ -1231,15 +1220,19 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   }, [projectId]);
 
   // Auto-fetch durable knowledge docs for terminal jobs that have a knowledge_document_id.
+  // Guards stale responses with a cancelled flag so a project switch never
+  // inserts old-project documents alongside new-project documents.
   useEffect(() => {
     if (!projectId) return;
+    let cancelled = false;
     for (const job of jobs) {
       const docId = job.knowledge_document_id;
       if (!docId || isComputeJobActive(job) || knowledgeDocs[job.id]) continue;
       fetchKnowledgeDocument(projectId, docId).then((doc) => {
-        setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
+        if (!cancelled) setKnowledgeDocs((prev) => ({ ...prev, [job.id]: doc }));
       }).catch(() => {/* non-fatal */});
     }
+    return () => { cancelled = true; };
   }, [jobs, projectId, knowledgeDocs]);
 
   // Local 1s clock drives the live deadline countdowns between polls, plus the
@@ -1457,14 +1450,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         </div>
       )}
 
-      {lifetimeSummary && lifetimeSummary.total_jobs > 0 && (
+      {lifetimeSummary && (lifetimeSummary.total_jobs_all_time ?? lifetimeSummary.total_jobs) > 0 && (
         <div
           className="mb-2 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
           data-testid="compute-lifetime-summary"
         >
           <span className="text-neutral-500 text-xs uppercase tracking-widest">Lifetime</span>
           <span>
-            <span className="text-neutral-500">total</span> {lifetimeSummary.total_jobs}
+            <span className="text-neutral-500">total</span> {lifetimeSummary.total_jobs_all_time ?? lifetimeSummary.total_jobs}
           </span>
           {lifetimeSummary.total_spend_usd > 0 && (
             <span>
@@ -1546,7 +1539,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       <ExperimentSweepSummary jobs={jobs} />
 
-      {(jobs.length > 0 || searchText || statusFilter !== 'all') && (
+      {(jobs.length > 0 || searchText || statusFilter !== 'all' || tierFilter !== 'all') && (
         <div className="mb-2 flex flex-wrap items-center gap-2" data-testid="compute-jobs-filters">
           <div className="relative flex-1 min-w-0 max-w-xs">
             <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-500 pointer-events-none" />
@@ -1569,6 +1562,26 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 data-testid={`compute-status-${s}`}
               >
                 {s === 'all' ? 'All' : s === 'active' ? 'Active' : s === 'completed' ? 'Completed' : 'Failed'}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center gap-0.5" data-testid="compute-tier-filter">
+            {(['all', 'machine-verified', 'low-trust'] as const).map((t) => (
+              <button
+                key={t}
+                type="button"
+                onClick={() => setTierFilter(t)}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${tierFilter === t ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-tier-${t}`}
+                title={
+                  t === 'all'
+                    ? 'Show all evidence tiers'
+                    : t === 'machine-verified'
+                      ? 'Only machine-verified results (executed and verified on operator hardware)'
+                      : 'Only low-trust results (attested / backfilled / partial / self-reported)'
+                }
+              >
+                {t === 'all' ? 'All tiers' : t === 'machine-verified' ? 'Machine verified' : 'Low trust'}
               </button>
             ))}
           </div>
@@ -1652,6 +1665,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       );
                     }
                     return null;
+                  })()}
+                  {(() => {
+                    const inputJobId = job.input_artifact_job_id;
+                    if (!inputJobId) return null;
+                    const truncated = inputJobId.length > 8 ? inputJobId.slice(0, 8) + '…' : inputJobId;
+                    const prov = job.resume_provenance;
+                    const ok = prov?.ok === true;
+                    const reason = typeof prov?.reason === 'string' ? prov.reason : null;
+                    const fileCount = typeof prov?.file_count === 'number' ? prov.file_count : null;
+                    const resumedFrom = typeof prov?.resumed_from_job_id === 'string' ? prov.resumed_from_job_id : null;
+                    const displayId = resumedFrom ?? truncated;
+                    return (
+                      <div
+                        className={`text-ui-sm font-mono mt-0.5 ${ok ? 'text-emerald-400' : reason ? 'text-amber-400' : 'text-sky-400'}`}
+                        data-testid="compute-resume-provenance"
+                      >
+                        resumed from{' '}
+                        <span
+                          className={ok ? 'text-emerald-200' : reason ? 'text-amber-200' : 'text-sky-200'}
+                        >
+                          {displayId}
+                        </span>
+                        {ok && fileCount != null && <> · {fileCount} files</>}
+                        {reason && <> · {reason}</>}
+                      </div>
+                    );
                   })()}
                   {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
@@ -1820,6 +1859,94 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       </div>
                     )}
                   </>
+                );
+              })()}
+              {(() => {
+                if (!active) return null;
+                // Older backends only send watchdog_active. Preserve that display
+                // while preferring the additive, honest state when available.
+                if (job.watchdog_state == null && job.watchdog_active == null) return null;
+                const timeoutSec = job.no_progress_timeout_seconds;
+                const lastProgressAt = job.last_progress_at;
+                const inertReason = job.watchdog_inert_reason;
+                const watchdogState = job.watchdog_state
+                  ?? (job.watchdog_active ? 'protected' : 'legacy_unprotected');
+                const protectedNow = watchdogState === 'protected';
+                const stateLabel = watchdogState === 'warming_up'
+                  ? 'Warming up'
+                  : watchdogState === 'insufficient_history'
+                    ? 'Insufficient history'
+                    : watchdogState === 'stale_telemetry'
+                      ? 'Stale telemetry'
+                      : watchdogState === 'inert'
+                        ? 'Inert'
+                        : 'Unprotected';
+                const stateExplanation = watchdogState === 'warming_up'
+                  ? 'Watchdog will not currently cut this job: its observation window is still warming up.'
+                  : watchdogState === 'insufficient_history'
+                    ? 'Watchdog will not currently cut this job: there is not enough trustworthy receipt-time history.'
+                    : watchdogState === 'stale_telemetry'
+                      ? 'Watchdog will not currently cut this job: progress telemetry is stale.'
+                      : watchdogState === 'inert'
+                        ? `Watchdog will not currently cut this job: ${inertReason ?? 'not_configured'}. A stalled run may continue until its wall-clock deadline.`
+                        : inertReason
+                          ? `Watchdog will not currently cut this job: ${inertReason}. A stalled run may continue until its wall-clock deadline.`
+                          : null;
+                let lastProgressAgo: string | null = null;
+                if (lastProgressAt) {
+                  const diffSec = Math.max(0, Math.round((nowMs - new Date(lastProgressAt).getTime()) / 1000));
+                  lastProgressAgo = fmtDuration(diffSec) + ' ago';
+                }
+                return (
+                  <div className="mb-1.5" data-testid="compute-watchdog-status">
+                    {protectedNow ? (
+                      <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
+                        <span
+                          className="rounded border border-emerald-500/40 bg-emerald-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-emerald-300"
+                          data-testid="compute-watchdog-protected"
+                        >
+                          Protected
+                        </span>
+                        {timeoutSec != null && (
+                          <span className="text-neutral-500 font-mono">
+                            cut at {fmtDuration(timeoutSec)} no-progress
+                          </span>
+                        )}
+                        {lastProgressAgo && (
+                          <span className="text-neutral-500 font-mono">
+                            · last progress {lastProgressAgo}
+                          </span>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <div className="flex flex-wrap items-center gap-1.5 text-ui-sm">
+                          <span
+                            className="rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 text-ui-xs font-semibold text-amber-300"
+                            data-testid="compute-watchdog-unprotected"
+                          >
+                            {stateLabel}
+                          </span>
+                          {lastProgressAgo && (
+                            <span className="text-neutral-500 font-mono">
+                              · last progress {lastProgressAgo}
+                            </span>
+                          )}
+                        </div>
+                        {stateExplanation && (
+                          <div
+                            className="mt-1 rounded border border-amber-500/30 bg-amber-500/8 px-2 py-1.5 text-ui-sm text-amber-200"
+                            data-testid="compute-watchdog-inert-warning"
+                          >
+                            <div className="flex items-start gap-1.5">
+                              <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                              <span>{stateExplanation}</span>
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
                 );
               })()}
               {(() => {
@@ -2194,92 +2321,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   </ResolvedReferenceLink>
                 </div>
               )}
-              {(() => {
-                const artifacts = computeJobViewableArtifacts(job);
-                if (artifacts.length === 0) return null;
-                const galleryKey = `gallery-${job.id}`;
-                const galleryExpanded = expandedDocIds.has(galleryKey);
-                return (
-                  <div className="mt-1.5" data-testid="compute-artifact-gallery">
-                    <div className="flex items-center gap-1.5 mb-0.5 text-ui-sm text-neutral-500 font-mono">
-                      <span>Artifacts</span>
-                      <button
-                        type="button"
-                        onClick={() => toggleArtifactGallery(job)}
-                        className="min-h-[44px] rounded border border-neutral-700 bg-neutral-800 px-1 py-0.5 text-ui-xs text-sky-400 hover:text-sky-300"
-                        data-testid="compute-artifact-gallery-toggle"
-                      >
-                        {galleryExpanded ? 'Hide previews' : `Show previews (${artifacts.length})`}
-                      </button>
-                    </div>
-                    {galleryExpanded && (
-                      <div className="flex flex-wrap gap-2">
-                        {artifacts.map((art) => {
-                          const key = `${job.id}:${art.storage_uri}`;
-                          const resolution = previewUrls[key];
-                          const sizeLabel = fmtBytes(art.bytes);
-                          const caption = (
-                            <div className="max-w-[10rem] truncate text-ui-xs text-neutral-500 font-mono" title={art.name}>
-                              {art.name}{sizeLabel ? ` · ${sizeLabel}` : ''}
-                            </div>
-                          );
-                          if (resolution?.state === 'resolved') {
-                            return (
-                              <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
-                                {art.kind === 'video' ? (
-                                  <video
-                                    controls
-                                    preload="metadata"
-                                    src={resolution.url}
-                                    onError={() => markPreviewError(key)}
-                                    className="h-24 max-w-[16rem] rounded border border-neutral-800 bg-neutral-950"
-                                    data-testid="compute-artifact-video"
-                                  />
-                                ) : (
-                                  <button
-                                    type="button"
-                                    onClick={() => { void openPreviewFullSize(key, art.storage_uri); }}
-                                    title={`Open ${art.name} full-size in a new tab`}
-                                    className="rounded border border-neutral-800 bg-neutral-950 hover:border-sky-500/50"
-                                    data-testid="compute-artifact-thumbnail"
-                                  >
-                                    <img
-                                      src={resolution.url}
-                                      alt={art.name}
-                                      loading="lazy"
-                                      onError={() => markPreviewError(key)}
-                                      className="h-24 w-auto max-w-[16rem] rounded object-contain"
-                                    />
-                                  </button>
-                                )}
-                                {caption}
-                              </div>
-                            );
-                          }
-                          return (
-                            <div key={key} className="flex flex-col gap-0.5" data-testid="compute-viewable-artifact">
-                              <button
-                                type="button"
-                                onClick={() => { void resolvePreviewUrl(key, art.storage_uri); }}
-                                disabled={resolution?.state === 'resolving'}
-                                className="flex h-24 w-32 items-center justify-center rounded border border-neutral-800 bg-neutral-950 px-1 text-center text-ui-xs text-neutral-500 hover:border-sky-500/50 disabled:opacity-70"
-                                data-testid="compute-artifact-placeholder"
-                              >
-                                {resolution?.state === 'resolving'
-                                  ? 'resolving…'
-                                  : resolution?.state === 'error'
-                                    ? 'preview unavailable — retry'
-                                    : 'load preview'}
-                              </button>
-                              {caption}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
+              <ComputeArtifactGallery testIdPrefix="compute" projectId={projectId} job={job} />
               {(() => {
                 const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
                 if (!metrics) return null;

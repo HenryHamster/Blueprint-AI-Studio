@@ -354,12 +354,15 @@ const progressSeriesJobs: ComputeJob[] = [
 
 let jobsToReturn: ComputeJob[] = stressJobs;
 
+let sweepGroupsToReturn: import('../api').ComputeSweepGroupsResponse = { sweep_groups: {} };
+
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
   return {
     ...actual,
     fetchComputeJobs: vi.fn(async () => jobsToReturn),
     fetchComputeJobsPaged: vi.fn(async () => ({ jobs: jobsToReturn, hasMore: false })),
+    fetchComputeSweepGroups: vi.fn(async () => sweepGroupsToReturn),
     killComputeJob: vi.fn(async () => stressJobs[0]),
     analyzeComputeJob: vi.fn(),
     resolveArtifactDownloadUrl: vi.fn(async () => 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='),
@@ -561,6 +564,8 @@ describe('ComputeJobsPanel — viewport regression', () => {
         if (!nameHeader) throw new Error('Name sort header not found');
         const costHeader = host.querySelector('[data-testid="jobs-table-sort-cost"]');
         if (!costHeader) throw new Error('Cost sort header not found');
+        const backendHeader = host.querySelector('[data-testid="jobs-table-sort-backend"]');
+        if (!backendHeader) throw new Error('Backend sort header not found');
         // Criterion chips should render for both jobs
         const chips = host.querySelectorAll('[data-testid="compact-table-criterion-chip"]');
         if (chips.length < 2) throw new Error(`Expected at least 2 criterion chips, got ${chips.length}`);
@@ -568,6 +573,36 @@ describe('ComputeJobsPanel — viewport regression', () => {
         const text = host.textContent ?? '';
         if (!text.includes('met')) throw new Error('met criterion chip not rendered');
         if (!text.includes('unmet')) throw new Error('unmet criterion chip not rendered');
+        // Evidence badge should render for terminal jobs (gcp_compute_engine → Attested)
+        if (!text.includes('Attested')) throw new Error('Evidence badge not rendered in compact table');
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders the evidence-tier filter control in the filter bar at 1280px', async () => {
+    jobsToReturn = criterionJobs;
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const tierFilter = host.querySelector('[data-testid="compute-tier-filter"]');
+        if (!tierFilter) throw new Error('compute-tier-filter not rendered in filter bar');
+        // Both coarse groupings the operator triages on must be visible.
+        if (!host.querySelector('[data-testid="compute-tier-machine-verified"]')) {
+          throw new Error('machine-verified tier filter option not rendered');
+        }
+        if (!host.querySelector('[data-testid="compute-tier-low-trust"]')) {
+          throw new Error('low-trust tier filter option not rendered');
+        }
       },
       { waitMs: 60 },
     );
@@ -626,6 +661,162 @@ describe('ComputeJobsPanel — viewport regression', () => {
         if (slots.length < 2) throw new Error(`Expected 2 gallery slots, got ${slots.length}`);
       },
       { waitMs: 120 },
+    );
+  });
+
+  test('renders watchdog protection badge on active job at 1280px', async () => {
+    jobsToReturn = [
+      {
+        id: 'job-watchdog-protected',
+        project_id: 'proj-1',
+        task_id: 'task-watchdog-1',
+        backend: 'local-gpu',
+        external_compute_id: null,
+        machine_type: 'a3-highgpu-1g',
+        status: 'RUNNING',
+        terminal_reason: null,
+        outcome: null,
+        accelerator_type: 'H100',
+        accelerator_count: 1,
+        spend_cap_usd: 50.0,
+        wall_clock_deadline: new Date(Date.now() + 20 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 3_600_000).toISOString(),
+        updated_at: new Date(Date.now() - 60_000).toISOString(),
+        started_at: new Date(Date.now() - 3_590_000).toISOString(),
+        completed_at: null,
+        last_polled_at: new Date(Date.now() - 60_000).toISOString(),
+        accrued_cost_usd: 3.5,
+        final_cost_usd: null,
+        result_reference: null,
+        task_title: 'compute_experiment: RL training — watchdog protected',
+        task_type: 'compute_experiment',
+        experiment: 'rl-reward-v3',
+        watchdog_active: true,
+        watchdog_state: 'protected',
+        no_progress_timeout_seconds: 1800,
+        last_progress_at: new Date(Date.now() - 300_000).toISOString(),
+        progress_series: [
+          { t: new Date(Date.now() - 3_000_000).toISOString(), name: 'reward', value: 0.05 },
+          { t: new Date(Date.now() - 2_400_000).toISOString(), name: 'reward', value: 0.15 },
+          { t: new Date(Date.now() - 1_800_000).toISOString(), name: 'reward', value: 0.28 },
+          { t: new Date(Date.now() - 1_200_000).toISOString(), name: 'reward', value: 0.41 },
+          { t: new Date(Date.now() - 600_000).toISOString(), name: 'reward', value: 0.55 },
+        ],
+      },
+      {
+        id: 'job-watchdog-unprotected',
+        project_id: 'proj-1',
+        task_id: 'task-watchdog-2',
+        backend: 'local-gpu',
+        external_compute_id: null,
+        machine_type: 'a3-highgpu-1g',
+        status: 'RUNNING',
+        terminal_reason: null,
+        outcome: null,
+        accelerator_type: 'H100',
+        accelerator_count: 1,
+        spend_cap_usd: 100.0,
+        wall_clock_deadline: new Date(Date.now() + 23 * 3_600_000).toISOString(),
+        created_at: new Date(Date.now() - 7_200_000).toISOString(),
+        updated_at: new Date(Date.now() - 120_000).toISOString(),
+        started_at: new Date(Date.now() - 7_190_000).toISOString(),
+        completed_at: null,
+        last_polled_at: new Date(Date.now() - 120_000).toISOString(),
+        accrued_cost_usd: 8.2,
+        final_cost_usd: null,
+        result_reference: null,
+        task_title: 'compute_experiment: RL training — no metric declared, watchdog inert',
+        task_type: 'compute_experiment',
+        experiment: 'rl-reward-v4',
+        watchdog_active: false,
+        watchdog_state: 'inert',
+        watchdog_inert_reason: 'no_declared_metric',
+        no_progress_timeout_seconds: null,
+        last_progress_at: null,
+      },
+    ];
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('Protected')) throw new Error('Protected badge not rendered');
+        if (!text.includes('Inert')) throw new Error('Inert badge not rendered');
+        if (!text.includes('no_declared_metric')) throw new Error('inert reason not rendered');
+        if (!text.includes('Watchdog will not currently cut')) throw new Error('watchdog warning not rendered');
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders sweep comparison table with evidence tier badge and provenance at 1280px', async () => {
+    jobsToReturn = [];
+    sweepGroupsToReturn = {
+      sweep_groups: {
+        'sw-vp-tier': [
+          {
+            id: 'doc-vp-1',
+            title: 'accuracy sweep run A',
+            summary: 'Covered on operator hardware',
+            compute_acceptance_grade: 'acceptance' as const,
+            criterion_met: true,
+            criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+            arm_label: 'run-a',
+            created_at: new Date(Date.now() - 600_000).toISOString(),
+            evidence_tier: 'covered' as const,
+            run_provenance: { executing_backend: 'local-subprocess', runner_hostname: 'host-vp', runner_target_id: null },
+          },
+          {
+            id: 'doc-vp-2',
+            title: 'accuracy sweep run B',
+            summary: 'Cloud attested',
+            compute_acceptance_grade: 'measured_only' as const,
+            criterion_met: false,
+            criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+            arm_label: 'run-b',
+            created_at: new Date(Date.now() - 700_000).toISOString(),
+            evidence_tier: 'attested' as const,
+            run_provenance: null,
+          },
+        ],
+      },
+    };
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('Sweep comparisons')) throw new Error('Sweep comparisons section not rendered');
+        const compareBtn = host.querySelector('[data-testid="sweep-knowledge-compare-toggle"]') as HTMLButtonElement | null;
+        if (!compareBtn) throw new Error('sweep-knowledge-compare-toggle not found');
+        await act(async () => { compareBtn.click(); });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 30)); });
+        const table = host.querySelector('[data-testid="sweep-knowledge-comparison-table"]');
+        if (!table) throw new Error('sweep-knowledge-comparison-table not rendered after Compare click');
+        const tableText = table.textContent ?? '';
+        if (!tableText.includes('Machine verified')) throw new Error('EvidenceTierBadge "Machine verified" not rendered in comparison table');
+        if (!tableText.includes('Attested')) throw new Error('EvidenceTierBadge "Attested" not rendered in comparison table');
+        const provLabels = table.querySelectorAll('[data-testid="sweep-knowledge-provenance-label"]');
+        if (provLabels.length === 0) throw new Error('sweep-knowledge-provenance-label not rendered in comparison table');
+        if (!(provLabels[0].textContent ?? '').includes('host-vp')) throw new Error('runner hostname not shown in provenance label');
+      },
+      { waitMs: 80 },
     );
   });
 

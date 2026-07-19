@@ -19,6 +19,8 @@ Re-exported symbols:
   _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
   _sweep_runner_deactivated_escalations,
   _check_low_disk_runners, _check_low_memory_runners,
+  _check_low_disk_vms, _check_low_memory_vms,
+  _VM_LOW_DISK_THRESHOLD_BYTES_DEFAULT, _VM_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT,
   _check_fleet_no_healthy_runner,
   _check_degraded_runners, _check_idle_gpu_runners
 """
@@ -30,7 +32,8 @@ from datetime import timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import LocalRunner
+from app.models import LocalRunner, Task, TaskStatus
+from app.runner_project_binding import allowed_project_ids_by_runner
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -52,6 +55,24 @@ _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
 # Default free-memory floor (bytes) below which a live runner is considered low-
 # memory.  512 MB — configurable at runtime via ``runner_low_memory_threshold_bytes``.
 _RUNNER_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT = 536_870_912  # 512 MiB
+
+# Default free-disk floor (bytes) below which a GCE task VM is considered low-disk.
+# 1 GB — configurable at runtime via ``vm_low_disk_threshold_bytes``. Mirrors the
+# runner floor so warm-pool VMs get the same proactive capacity warnings.
+_VM_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
+
+# Default free-memory floor (bytes) below which a GCE task VM is considered low-
+# memory (approaching OOM).  512 MB — configurable at runtime via
+# ``vm_low_memory_threshold_bytes``.
+_VM_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT = 536_870_912  # 512 MiB
+
+# Only agent task VMs (``vm_instance_id`` prefixed ``agent-vm-``) are swept for
+# resource pressure. Runner-pinned tasks (``runner:<id>``) run on operator
+# hardware already covered by the runner sweeps, and compute-job VMs
+# (``compute-job-vm-*``) are not Task rows — so this prefix is exclusive.
+_VM_TASK_INSTANCE_PREFIX = "agent-vm-"
+
+_MB_TO_BYTES = 1024 * 1024
 
 # Retention window (days) for RunnerHeartbeatSnapshot time-series rows. The
 # table is append-only on every heartbeat, so it must be periodically trimmed.
@@ -621,6 +642,215 @@ async def _check_low_memory_runners(session: AsyncSession) -> None:
                 )
 
 
+def _active_task_vm_rows_query():
+    """Select active agent task VMs with reported heartbeat metrics.
+
+    Shared by the low-disk and low-memory VM sweeps. Restricts to non-terminal
+    task statuses (PROVISIONING/IN_PROGRESS/EVALUATING) with an ``agent-vm-``
+    instance id — so runner-pinned (``runner:``) and terminal-status tasks are
+    excluded — and only rows that have reported ``last_metrics_json`` at least
+    once.
+    """
+    return select(
+        Task.id,
+        Task.project_id,
+        Task.vm_instance_id,
+        Task.last_metrics_json,
+    ).where(
+        Task.status.in_(
+            [
+                TaskStatus.PROVISIONING,
+                TaskStatus.IN_PROGRESS,
+                TaskStatus.EVALUATING,
+            ]
+        ),
+        Task.vm_instance_id.is_not(None),
+        Task.vm_instance_id.like(f"{_VM_TASK_INSTANCE_PREFIX}%"),
+        Task.last_metrics_json.is_not(None),
+    )
+
+
+async def _check_low_disk_vms(session: AsyncSession) -> None:
+    """Detect active GCE task VMs whose free disk is low and alert/resolve.
+
+    Reads ``disk_free_mb`` from each active agent task VM's already-persisted
+    ``Task.last_metrics_json`` (reported every heartbeat) and, for those below
+    the configurable byte floor, raises (or dedups) a WARNING alert. Resolves
+    alerts for VMs whose disk recovered, that stopped reporting, or whose task
+    left an active state. The Task-based twin of :func:`_check_low_disk_runners`.
+
+    Called from :func:`_check_degraded_runners` so it shares the 300s cadence.
+    """
+    from app.alert_dispatch import (
+        _VM_LOW_DISK_EVENT_TYPE,
+        _maybe_create_vm_low_disk_alert,
+        _resolve_vm_low_disk_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "vm_low_disk_threshold_bytes", _VM_LOW_DISK_THRESHOLD_BYTES_DEFAULT
+        )
+    )
+
+    rows = (await session.execute(_active_task_vm_rows_query())).all()
+
+    low_disk_vm_ids: set[str] = set()
+    for task_id, project_id, vm_instance_id, metrics in rows:
+        disk_free_mb = (metrics or {}).get("disk_free_mb")
+        if disk_free_mb is None:
+            continue
+        disk_free_bytes = int(float(disk_free_mb) * _MB_TO_BYTES)
+        if disk_free_bytes >= threshold:
+            continue
+        low_disk_vm_ids.add(vm_instance_id)
+        try:
+            await _maybe_create_vm_low_disk_alert(
+                session,
+                project_id=project_id,
+                vm_instance_id=vm_instance_id,
+                task_id=task_id,
+                disk_free_bytes=disk_free_bytes,
+                threshold_bytes=threshold,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create low-disk alert for VM %s", vm_instance_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after VM low-disk alert create failed for %s",
+                    vm_instance_id,
+                )
+
+    # Resolve alerts for VMs whose disk recovered / stopped reporting / task ended.
+    open_low_disk = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _VM_LOW_DISK_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_low_disk:
+        if not dedupe_key:
+            continue
+        vm_instance_id = dedupe_key.split(":", 1)[-1]
+        if vm_instance_id in low_disk_vm_ids:
+            continue
+        try:
+            await _resolve_vm_low_disk_alert(session, project_id_row, vm_instance_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve low-disk alert for VM %s", vm_instance_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after VM low-disk alert resolve failed for %s",
+                    vm_instance_id,
+                )
+
+
+async def _check_low_memory_vms(session: AsyncSession) -> None:
+    """Detect active GCE task VMs approaching OOM and alert/resolve.
+
+    Derives free memory from each active agent task VM's already-persisted
+    ``Task.last_metrics_json`` as ``cgroup_limit_mb - cgroup_mb`` (reported every
+    heartbeat) and, for those below the configurable byte floor, raises (or
+    dedups) a WARNING alert BEFORE the kernel OOM-kills the VM. Resolves alerts
+    for VMs whose memory recovered, that stopped reporting, or whose task left an
+    active state. The Task-based twin of :func:`_check_low_memory_runners`.
+
+    Called from :func:`_check_degraded_runners` so it shares the 300s cadence.
+    """
+    from app.alert_dispatch import (
+        _VM_LOW_MEMORY_EVENT_TYPE,
+        _maybe_create_vm_low_memory_alert,
+        _resolve_vm_low_memory_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "vm_low_memory_threshold_bytes", _VM_LOW_MEMORY_THRESHOLD_BYTES_DEFAULT
+        )
+    )
+
+    rows = (await session.execute(_active_task_vm_rows_query())).all()
+
+    low_memory_vm_ids: set[str] = set()
+    for task_id, project_id, vm_instance_id, metrics in rows:
+        metrics = metrics or {}
+        cgroup_mb = metrics.get("cgroup_mb")
+        cgroup_limit_mb = metrics.get("cgroup_limit_mb")
+        # Need BOTH the usage and the limit to derive headroom; a VM reporting
+        # neither (or only one) is skipped rather than mis-classified.
+        if cgroup_mb is None or cgroup_limit_mb is None:
+            continue
+        free_mb = float(cgroup_limit_mb) - float(cgroup_mb)
+        # A negative/zero limit is nonsensical (unset cgroup); don't alert on it.
+        if float(cgroup_limit_mb) <= 0:
+            continue
+        memory_free_bytes = int(max(free_mb, 0.0) * _MB_TO_BYTES)
+        if memory_free_bytes >= threshold:
+            continue
+        low_memory_vm_ids.add(vm_instance_id)
+        try:
+            await _maybe_create_vm_low_memory_alert(
+                session,
+                project_id=project_id,
+                vm_instance_id=vm_instance_id,
+                task_id=task_id,
+                memory_free_bytes=memory_free_bytes,
+                threshold_bytes=threshold,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create low-memory alert for VM %s", vm_instance_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after VM low-memory alert create failed for %s",
+                    vm_instance_id,
+                )
+
+    # Resolve alerts for VMs whose memory recovered / stopped reporting / task ended.
+    open_low_memory = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _VM_LOW_MEMORY_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_low_memory:
+        if not dedupe_key:
+            continue
+        vm_instance_id = dedupe_key.split(":", 1)[-1]
+        if vm_instance_id in low_memory_vm_ids:
+            continue
+        try:
+            await _resolve_vm_low_memory_alert(session, project_id_row, vm_instance_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve low-memory alert for VM %s", vm_instance_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after VM low-memory alert resolve failed for %s",
+                    vm_instance_id,
+                )
+
+
 async def _check_fleet_no_healthy_runner(
     session: AsyncSession,
     degraded_runner_ids: set[uuid.UUID],
@@ -642,42 +872,41 @@ async def _check_fleet_no_healthy_runner(
         _maybe_create_fleet_no_healthy_runner_alert,
         _resolve_fleet_no_healthy_runner_alert,
     )
+    from app.models import Alert
+    from app.runner_health_alerts import _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE
 
     now = _utcnow()
     cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
 
     # Single pass over all registered runners to classify per-project health.
-    all_rows = (
-        await session.execute(
-            select(
-                LocalRunner.id,
-                LocalRunner.project_id,
-                LocalRunner.status,
-                LocalRunner.last_seen_at,
-            )
-        )
-    ).all()
+    all_rows = (await session.execute(select(LocalRunner))).scalars().all()
+    memberships = await allowed_project_ids_by_runner(session, all_rows)
 
     projects_with_runners: set[uuid.UUID] = set()
     projects_with_healthy: set[uuid.UUID] = set()
     offline_by_project: dict[uuid.UUID, int] = {}
     degraded_by_project: dict[uuid.UUID, int] = {}
 
-    for runner_id, project_id, status, last_seen_at in all_rows:
-        projects_with_runners.add(project_id)
+    for runner in all_rows:
+        runner_id = runner.id
         is_live = (
-            status == "active"
-            and last_seen_at is not None
-            and last_seen_at > cutoff
+            runner.status == "active"
+            and runner.last_seen_at is not None
+            and runner.last_seen_at > cutoff
         )
-        if is_live and runner_id not in degraded_runner_ids:
-            projects_with_healthy.add(project_id)
-        elif is_live:
-            degraded_by_project[project_id] = degraded_by_project.get(project_id, 0) + 1
-        else:
-            offline_by_project[project_id] = offline_by_project.get(project_id, 0) + 1
+        for project_id in memberships[runner_id]:
+            projects_with_runners.add(project_id)
+            if is_live and runner_id not in degraded_runner_ids:
+                projects_with_healthy.add(project_id)
+            elif is_live:
+                degraded_by_project[project_id] = degraded_by_project.get(project_id, 0) + 1
+            else:
+                offline_by_project[project_id] = offline_by_project.get(project_id, 0) + 1
 
-    for project_id in projects_with_runners - projects_with_healthy:
+    # The set of projects that currently warrant an open alert.
+    currently_unhealthy = projects_with_runners - projects_with_healthy
+
+    for project_id in currently_unhealthy:
         try:
             await _maybe_create_fleet_no_healthy_runner_alert(
                 session,
@@ -698,7 +927,19 @@ async def _check_fleet_no_healthy_runner(
                     project_id,
                 )
 
-    for project_id in projects_with_healthy:
+    # Resolve alerts for projects that are now healthy OR have lost all runner
+    # bindings (project removed from projects_with_runners), so the alert doesn't
+    # stay permanently open after a binding removal.
+    open_fleet_alerts = (
+        await session.execute(
+            select(Alert.project_id).where(
+                Alert.event_type == _FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    projects_to_resolve = {pid for pid in open_fleet_alerts if pid not in currently_unhealthy}
+    for project_id in projects_to_resolve:
         try:
             await _resolve_fleet_no_healthy_runner_alert(session, project_id)
         except Exception:
@@ -869,6 +1110,20 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
         await _cleanup_stale_heartbeat_snapshots(session)
     except Exception:
         logger.exception("[RUNNERS] Failed to trim stale heartbeat snapshots")
+
+    # 11. Proactive low-disk alert: GCE task VMs reporting disk below the floor.
+    # Warm-pool VM resource-monitoring parity with the runner sweeps above.
+    try:
+        await _check_low_disk_vms(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep low-disk task-VM alerts")
+
+    # 12. Proactive low-memory alert: GCE task VMs approaching OOM (cgroup headroom
+    # below the floor) — surfaced before the kernel OOM-kills the VM.
+    try:
+        await _check_low_memory_vms(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep low-memory task-VM alerts")
 
 
 async def _check_stale_token_runners(session: AsyncSession) -> None:

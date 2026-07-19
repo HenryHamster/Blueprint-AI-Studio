@@ -708,6 +708,133 @@ async def test_heartbeat_helper_renews_lease(db_session):
     assert blob["last_progress_at"] is not None
 
 
+async def _operator_decision_notices(db_session, project_id):
+    """All operator-decision low-capture strategist-internal notices for a project."""
+    res = await db_session.execute(
+        select(ProjectMessage).where(ProjectMessage.project_id == project_id)
+    )
+    return [
+        m
+        for m in res.scalars().all()
+        if (m.context or {}).get("event_type") == "operator_decision.capture_rate_low"
+    ]
+
+
+def test_operator_decision_capture_chronically_low_predicate():
+    """The chronic-low predicate requires enough samples AND a below-floor rate."""
+    # Below the sample floor — never chronic, even at 0%.
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 3, "captured": 0, "missed": 3, "capture_rate": 0}
+    ) is False
+    # Enough samples, rate below floor — chronic.
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 2, "missed": 3, "capture_rate": 40}
+    ) is True
+    # Enough samples, rate at/above floor — not chronic (and a recovery).
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 3, "missed": 2, "capture_rate": 60}
+    ) is False
+    assert srs._operator_decision_capture_recovered(
+        {"total": 5, "captured": 3, "missed": 2, "capture_rate": 60}
+    ) is True
+    # Malformed / null-rate summaries are neither low nor recovered.
+    assert srs._operator_decision_capture_chronically_low(None) is False
+    assert srs._operator_decision_capture_chronically_low(
+        {"total": 5, "captured": 0, "missed": 5, "capture_rate": None}
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_surfaces_operator_decision_summary(db_session):
+    """A heartbeat's operator_decision_summary round-trips through the snapshot."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+
+    summary = {"total": 6, "captured": 5, "missed": 1, "capture_rate": 83}
+    await renew_resident_session_lease(
+        db_session,
+        project,
+        session_id=snapshot["session_id"],
+        task_id=snapshot["task_id"],
+        progress=True,
+        operator_decision_summary=summary,
+    )
+    fresh = await db_session.get(Project, project.id)
+    snap = resident_session_snapshot(fresh.vision)
+    assert snap["operator_decision_summary"] == summary
+    # A healthy rate emits NO strategist-internal notice.
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_operator_decision_capture_low_rate_emits_strategist_internal_notice(
+    db_session,
+):
+    """A chronically-low capture rate emits exactly one STRATEGIST_INTERNAL notice.
+
+    Asserts the full policy: no emit below the sample floor, no emit above the
+    low-rate threshold, exactly one emit on the low crossing (with a
+    strategist-internal / non-operator-visible audience), dedup across repeated
+    low heartbeats, and re-arming after a recovery.
+    """
+    from app.message_audience import STRATEGIST_INTERNAL, is_operator_visible
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+
+    async def _beat(summary):
+        proj = await db_session.get(Project, project.id)
+        return await renew_resident_session_lease(
+            db_session,
+            proj,
+            session_id=snapshot["session_id"],
+            task_id=snapshot["task_id"],
+            progress=True,
+            operator_decision_summary=summary,
+        )
+
+    # Below the sample floor: low rate but too few turns → no notice.
+    await _beat({"total": 2, "captured": 0, "missed": 2, "capture_rate": 0})
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+    # Enough samples but above the threshold → no notice.
+    await _beat({"total": 6, "captured": 5, "missed": 1, "capture_rate": 83})
+    assert await _operator_decision_notices(db_session, project.id) == []
+
+    # Chronic low: enough samples AND below the threshold → exactly one notice.
+    await _beat({"total": 6, "captured": 2, "missed": 4, "capture_rate": 33})
+    notices = await _operator_decision_notices(db_session, project.id)
+    assert len(notices) == 1
+    notice = notices[0]
+    # Strategist-internal: bookkeeping only, must NOT reach the operator.
+    assert notice.from_type == "system"
+    assert notice.context.get("audience") == STRATEGIST_INTERNAL
+    assert is_operator_visible(notice.context["audience"]) is False
+    assert notice.context.get("capture_rate") == 33
+    assert notice.context.get("session_id") == snapshot["session_id"]
+
+    # Still low on the next heartbeat → deduped, no second notice.
+    await _beat({"total": 8, "captured": 2, "missed": 6, "capture_rate": 25})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 1
+
+    # Recovery above the floor re-arms the notice for a later crossing …
+    await _beat({"total": 10, "captured": 9, "missed": 1, "capture_rate": 90})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 1
+    # … a new low crossing fires a second, distinct notice.
+    await _beat({"total": 12, "captured": 4, "missed": 8, "capture_rate": 33})
+    assert len(await _operator_decision_notices(db_session, project.id)) == 2
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_helper_mismatch_rejected(db_session):
     from fastapi import HTTPException
@@ -3737,6 +3864,82 @@ async def test_heartbeat_returns_active_direction_ids(db_session):
 
 
 @pytest.mark.asyncio
+async def test_checkpoint_state_surfaces_recent_handled_conversation(
+    client: AsyncClient, db_session, enable_strategic_session_flag
+):
+    """The checkpoint-state endpoint carries a recently-ANSWERED operator
+    conversation tail so a correction the operator made — now marked handled and
+    gone from the open feed — survives a compaction restart.
+
+    Invariants asserted:
+      * a handled operator message appears in recent_handled_conversation but NOT
+        in open_messages (the two feeds are disjoint by status);
+      * an OPEN message appears in open_messages but NOT in the handled tail;
+      * a `system` (internal bookkeeping) message is excluded from the tail even
+        when handled — the tail is operator conversation only.
+    """
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project, vm="agent-vm-rh")
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    await db_session.refresh(task)
+
+    # A handled operator message — the just-answered correction. Marked handled so
+    # it has dropped out of the open feed entirely.
+    handled = await _make_operator_message(
+        db_session, project, content="actually, drop the caching idea"
+    )
+    handled.status = "handled"
+    db_session.add(handled)
+    # A still-open operator message — belongs in open_messages, not the tail.
+    still_open = await _make_operator_message(
+        db_session, project, content="what is the ETA on the runner fix?"
+    )
+    # A handled SYSTEM message — internal bookkeeping, must never reach the tail.
+    sys_msg = ProjectMessage(
+        project_id=project.id,
+        from_type="system",
+        content="internal: cycle rollover bookkeeping",
+        status="handled",
+        message_type=MessageType.NOTE,
+    )
+    db_session.add(sys_msg)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/strategic-session/checkpoint-state",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert "recent_handled_conversation" in body, (
+        "checkpoint-state must include recent_handled_conversation key"
+    )
+    tail = body["recent_handled_conversation"]
+    assert isinstance(tail, list)
+    tail_ids = {m["id"] for m in tail}
+    tail_contents = {m["content"] for m in tail}
+    open_ids = {m["id"] for m in body["open_messages"]}
+
+    # The handled operator correction is in the tail, and NOT in the open feed.
+    assert str(handled.id) in tail_ids
+    assert "actually, drop the caching idea" in tail_contents
+    assert str(handled.id) not in open_ids
+
+    # The still-open message is in the open feed, and NOT in the handled tail.
+    assert str(still_open.id) in open_ids
+    assert str(still_open.id) not in tail_ids
+
+    # The handled system message is internal bookkeeping — excluded from the tail.
+    assert str(sys_msg.id) not in tail_ids
+    assert "internal: cycle rollover bookkeeping" not in tail_contents
+
+
+@pytest.mark.asyncio
 async def test_checkpoint_state_endpoint_returns_current_data(
     client: AsyncClient, db_session, enable_strategic_session_flag
 ):
@@ -3935,6 +4138,27 @@ async def test_checkpoint_state_applies_agent_view_trim(
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in body["vision"], (
         "internal continuation blob must be stripped from refreshed vision"
     )
+
+
+def test_agent_visible_vision_excludes_backend_ledgers():
+    """Strategic prompts receive only operator-visible vision fields."""
+    from app.strategic_local_runner import _agent_visible_vision
+
+    vision = {
+        "purpose": "Make research projects easier to run",
+        "revision": 42,
+        "_rejected_agent_edits": [{"content": "obsolete update"}],
+        "_research_spawn_counted_ids": ["research-id"],
+        "_recently_retired_directions": [{"id": "direction-id"}],
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {"secret": "internal-only"},
+    }
+
+    visible = _agent_visible_vision(vision)
+
+    assert visible["purpose"] == vision["purpose"]
+    assert visible["revision"] == vision["revision"]
+    assert not any(key.startswith("_") for key in visible)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in visible
 
 
 # ---------------------------------------------------------------------------
@@ -4406,6 +4630,129 @@ async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session)
     assert stored["operator"]["count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_resident_session_snapshot_includes_turn_latency_summary(db_session):
+    """``resident_session_snapshot`` projects ``turn_latency_summary`` to the API."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    latency = {
+        "operator": {
+            "count": 3, "mean_turn_ms": 2500, "max_turn_ms": 4500,
+            "mean_ttft_ms": 400, "interrupted_count": 0, "total_tool_calls": 7,
+            "total_tool_call_duration_ms": 1200, "mean_inter_token_ms": 85,
+            "mean_pickup_lag_ms": 320,
+        },
+        "autonomous": {
+            "count": 5, "mean_turn_ms": 8000, "max_turn_ms": 15000,
+            "mean_ttft_ms": None, "interrupted_count": 2, "total_tool_calls": 12,
+            "total_tool_call_duration_ms": 3500, "mean_inter_token_ms": None,
+            "mean_pickup_lag_ms": None,
+        },
+    }
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        turn_latency_summary=latency,
+    )
+
+    fresh = await db_session.get(Project, project.id)
+    snap = resident_session_snapshot(fresh.vision)
+    assert snap is not None
+    assert "turn_latency_summary" in snap
+    assert snap["turn_latency_summary"]["operator"]["count"] == 3
+    assert snap["turn_latency_summary"]["operator"]["mean_turn_ms"] == 2500
+    assert snap["turn_latency_summary"]["operator"]["max_turn_ms"] == 4500
+    assert snap["turn_latency_summary"]["autonomous"]["count"] == 5
+    assert snap["turn_latency_summary"]["autonomous"]["mean_turn_ms"] == 8000
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_operator_decision_summary(db_session):
+    """A heartbeat carrying ``operator_decision_summary`` stores it on the session blob."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    op_summary = {
+        "total": 4,
+        "captured": 3,
+        "missed": 1,
+        "capture_rate": 75,
+    }
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        operator_decision_summary=op_summary,
+    )
+
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_operator_decision_summary")
+    assert isinstance(stored, dict), f"Expected dict, got {stored!r}"
+    assert stored["total"] == 4
+    assert stored["captured"] == 3
+    assert stored["missed"] == 1
+    assert stored["capture_rate"] == 75
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_operator_decision_summary_leaves_blob_unchanged(db_session):
+    """A heartbeat without ``operator_decision_summary`` succeeds and leaves any
+    pre-existing ``_operator_decision_summary`` on the blob untouched."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat: persist a summary.
+    op_summary = {"total": 2, "captured": 1, "missed": 1, "capture_rate": 50}
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        operator_decision_summary=op_summary,
+    )
+
+    # Second heartbeat: no summary (liveness only).
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+    )
+    assert result["stop_requested"] is False
+
+    # The blob still has the first summary (liveness heartbeat did not erase it).
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_operator_decision_summary")
+    assert isinstance(stored, dict)
+    assert stored["total"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Restart continuity — memory notes and session summary survive into the
 # NEXT resident session's bootstrap.
@@ -4717,3 +5064,295 @@ async def test_heartbeat_returns_direction_grounding(db_session):
     # Each entry has exactly the three expected keys.
     for entry in grounding:
         assert set(entry.keys()) == {"id", "text", "status"}
+
+
+# ---------------------------------------------------------------------------
+# Combined durability: all fields persisted simultaneously + multi-hop restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_all_durability_fields_persisted_simultaneously(db_session):
+    """A single heartbeat that carries decisions_reg, message_cursor, AND the
+    exam ledger (via note) persists ALL three independently into the session blob
+    AND into task.context — no field silently drops when the others are present.
+
+    This exercises the atomicity of the combined write path that the live agent
+    exercises at every turn end: a single heartbeat call carries the whole
+    operator-correction + cursor + ledger trio.
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    decisions_reg = (
+        '{"version": 1, "decisions": ['
+        '{"id": "d-1", "tick": 3, "summary": "prefer strategy A"}'
+        "]}"
+    )
+    cursor = "2026-07-10T09:30:00.000000"
+    exam_ledger = _json.dumps(
+        {
+            "records": [{"tick": 3, "surface": "direction:d-1"}],
+            "tick": 3,
+            "corrective": False,
+        }
+    )
+
+    # Establish a baseline lease.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+
+    # One heartbeat with all three fields together.
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=cursor,
+        decisions_reg=decisions_reg,
+        note=exam_ledger,           # exam ledger is serialized into `note`
+    )
+    assert result["authority_held"] is True
+
+    # --- blob: all three fields present -----------------------------------------
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+
+    assert blob.get("_message_cursor") == cursor, (
+        "message_cursor must be written to blob even when decisions_reg is also present"
+    )
+    stored_reg = _json.loads(blob["_decisions_reg"])
+    assert stored_reg["decisions"][0]["summary"] == "prefer strategy A", (
+        "decisions_reg must be written to blob even when message_cursor is also present"
+    )
+    assert blob.get("_exam_ledger") == exam_ledger, (
+        "exam ledger must be written to blob even when decisions_reg+cursor are also present"
+    )
+
+    # --- task.context: all three fields present ----------------------------------
+    fresh_task = await db_session.get(Task, task.id)
+    ctx = fresh_task.context or {}
+
+    assert ctx.get("message_cursor") == cursor, (
+        "message_cursor must be mirrored to task.context"
+    )
+    assert "_decisions_reg" in ctx, (
+        "decisions_reg must be mirrored to task.context"
+    )
+    ctx_reg = _json.loads(ctx["_decisions_reg"])
+    assert ctx_reg["decisions"][0]["summary"] == "prefer strategy A"
+    assert "_exam_ledger" in ctx, (
+        "exam ledger must be mirrored to task.context"
+    )
+
+
+@pytest.mark.asyncio
+async def test_decisions_reg_survives_session_without_update(db_session):
+    """Decisions register written in session A persists in the blob and is
+    carried forward to session C even when session B never updates it.
+
+    This closes the three-hop durability gap: the blob (project.vision) is the
+    authoritative source; a session that happens to see no new operator decisions
+    passes decisions_reg=None in its heartbeats without overwriting the stored
+    value. The restart path reads from the blob, not from the previous task.
+
+    Sequence:
+      Session A  →  heartbeat(decisions_reg=<value>)  →  blob updated
+      Session B  →  heartbeat(decisions_reg=None)      →  blob UNCHANGED
+      Session C  →  started: task.context must carry the value from session A
+    """
+    project = await _make_project_with_member(db_session)
+    await _make_live_local_runner(db_session, project)
+
+    decisions_reg_a = (
+        '{"version": 1, "decisions": ['
+        '{"id": "d-orig", "tick": 1, "summary": "operator approved the research plan"}'
+        "]}"
+    )
+
+    # ── Session A: write decisions_reg ──────────────────────────────────────────
+    task_a = await _make_strategic_review_task(db_session, project)
+    snap_a = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap_a["session_id"],
+        task_id=snap_a["task_id"], progress=True,
+    )
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap_a["session_id"],
+        task_id=snap_a["task_id"],
+        progress=False,
+        decisions_reg=decisions_reg_a,
+    )
+
+    # Mark session A's task terminal so session B can start fresh.
+    task_a = await db_session.get(Task, task_a.id)
+    task_a.status = TaskStatus.COMPLETED
+    db_session.add(task_a)
+    task_b_row = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # ── Session B: restart — heartbeats send NO decisions_reg ──────────────────
+    project = await db_session.get(Project, project.id)
+    snap_b = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_b["session_id"] != snap_a["session_id"]
+
+    # Session B does a normal liveness heartbeat with no decisions_reg — simulates
+    # a session that observed no operator corrections during its lifetime.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap_b["session_id"],
+        task_id=snap_b["task_id"], progress=False,
+        decisions_reg=None,          # explicitly absent
+    )
+
+    # Mark session B's task terminal so session C can start fresh.
+    task_b_row = await db_session.get(Task, task_b_row.id)
+    task_b_row.status = TaskStatus.COMPLETED
+    db_session.add(task_b_row)
+    task_c_row = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # ── Session C: start — must carry decisions_reg from session A ─────────────
+    project = await db_session.get(Project, project.id)
+    snap_c = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap_c["session_id"] != snap_b["session_id"]
+
+    fresh_task_c = await db_session.get(Task, task_c_row.id)
+    ctx_c = fresh_task_c.context or {}
+    assert "_decisions_reg" in ctx_c, (
+        "decisions_reg from session A must survive two restarts into session C's task.context"
+    )
+    import json as _json
+    reg = _json.loads(ctx_c["_decisions_reg"])
+    assert len(reg["decisions"]) == 1
+    assert reg["decisions"][0]["id"] == "d-orig", (
+        "the exact operator correction from session A must be in session C's context"
+    )
+    assert reg["decisions"][0]["summary"] == "operator approved the research plan"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat field-isolation: IF-guard write semantics
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_cursor_not_overwritten_by_ledger_only_heartbeat(db_session):
+    """When a second heartbeat carries only the exam ledger (no message_cursor),
+    the cursor written by the first heartbeat is preserved in the session blob.
+
+    The ``renew_resident_session_lease`` code writes each field only when the
+    caller supplies it (IF-guard pattern).  A ledger-only heartbeat must not
+    silently clear a durable cursor that a prior heartbeat committed."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    CURSOR = "2026-07-15T09:00:00.000000"
+
+    # Heartbeat 1: write cursor, no exam ledger.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=CURSOR,
+    )
+
+    # Heartbeat 2: write exam ledger only — deliberately omits cursor.
+    LEDGER = _json.dumps({"records": [], "tick": 2, "corrective": False})
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        note=LEDGER,
+    )
+
+    # The cursor from heartbeat 1 must still be present.
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    assert blob.get("_message_cursor") == CURSOR, (
+        "cursor must be preserved when a subsequent ledger-only heartbeat runs"
+    )
+    # Exam ledger was also written (not silent).
+    assert blob.get("_exam_ledger") == LEDGER
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_exam_ledger_not_overwritten_by_cursor_only_heartbeat(db_session):
+    """When a second heartbeat carries only a message_cursor (no exam ledger),
+    the exam ledger written by the first heartbeat is preserved in the session blob.
+
+    Mirrors the field-isolation guarantee above for the reverse write order:
+    a cursor-only heartbeat must not silently clear a durable exam ledger."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    LEDGER = _json.dumps(
+        {"records": [{"surfaceKey": "direction:d-1", "atTick": 1, "at": "2026-07-15T09:00:00Z",
+                      "verdict": "clear", "note": "no issues found"}],
+         "tick": 1, "corrective": False}
+    )
+
+    # Heartbeat 1: write exam ledger, no cursor.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        note=LEDGER,
+    )
+
+    CURSOR = "2026-07-15T10:30:00.000000"
+
+    # Heartbeat 2: write cursor only — deliberately omits exam ledger.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=CURSOR,
+    )
+
+    # The exam ledger from heartbeat 1 must still be present.
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    assert blob.get("_exam_ledger") == LEDGER, (
+        "exam ledger must be preserved when a subsequent cursor-only heartbeat runs"
+    )
+    # Cursor was also written (not silent).
+    assert blob.get("_message_cursor") == CURSOR

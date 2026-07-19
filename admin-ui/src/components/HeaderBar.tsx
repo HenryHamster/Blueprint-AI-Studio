@@ -1,7 +1,10 @@
+import { memo } from 'react';
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Search, Settings, Bell } from 'lucide-react';
+import { Activity, Microscope, BookOpen, Command, MoreHorizontal, Search, Settings } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
+import { AccountMenu } from './AccountMenu';
+import type { StoredAccount } from '../accountManager';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
 import type { FailingTaskTypeEntry } from '../types/diagnostics';
@@ -22,15 +25,22 @@ export interface HeaderBarProps {
   openMessageCount: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
-  alertCount?: number;
-  alertMaxSeverity?: 'ERROR' | 'WARNING' | 'INFO' | null;
-  showAlertsPopover?: boolean;
-  onToggleAlertsPopover?: () => void;
+  activeAlerts?: number;
   onOpenNewTaskModal: () => void;
   onOpenSettings: () => void;
+  /** Sign out the active account only. */
   onSignOut: () => void;
   onNewProject?: () => void;
   userEmail: string;
+  /** Multi-account switcher state. When omitted, the menu shows only the current account + sign out. */
+  accounts?: StoredAccount[];
+  activeAccountId?: string | null;
+  /** Begin Google sign-in for an additional account. */
+  onAddAccount?: () => void;
+  /** Switch the active account. */
+  onSwitchAccount?: (id: string) => void;
+  /** Sign out of every signed-in account. */
+  onSignOutAll?: () => void;
   wsRef: RefObject<WebSocket | null>;
   apiHealthy: boolean;
   wsConnected: boolean;
@@ -58,6 +68,7 @@ export interface PrimaryTabNavProps {
   openMessageCount?: number;
   newSinceLastVisitCount?: number;
   needsAttentionCount?: number;
+  activeAlerts?: number;
   className?: string;
   placement?: 'header' | 'mobile';
 }
@@ -66,12 +77,13 @@ function tabLabel(tab: PrimaryTab): string {
   return tab === 'chat' ? 'Chat' : tab.charAt(0).toUpperCase() + tab.slice(1);
 }
 
-export function PrimaryTabNav({
+export const PrimaryTabNav = memo(function PrimaryTabNav({
   activeTab,
   onTabChange,
   openMessageCount = 0,
   newSinceLastVisitCount = 0,
   needsAttentionCount = 0,
+  activeAlerts = 0,
   className = '',
   placement = 'header',
 }: PrimaryTabNavProps) {
@@ -115,15 +127,21 @@ export function PrimaryTabNav({
                 {badgeCount > 99 ? '99+' : badgeCount}
               </span>
             )}
+            {activeAlerts > 0 && (
+              <span
+                className="ml-1 inline-flex h-2 w-2 shrink-0 rounded-full bg-red-500"
+                title={`${activeAlerts} active alert${activeAlerts !== 1 ? 's' : ''}`}
+              />
+            )}
           </button>
         );
       })}
     </nav>
   );
-}
+});
 
 
-export function HeaderBar(props: HeaderBarProps) {
+export const HeaderBar = memo(function HeaderBar(props: HeaderBarProps) {
   const {
     tasks,
     onRefresh,
@@ -135,6 +153,7 @@ export function HeaderBar(props: HeaderBarProps) {
     onOpenSettings,
     openMessageCount,
     newSinceLastVisitCount,
+    activeAlerts,
     wsRef,
     apiHealthy,
     wsConnected,
@@ -269,32 +288,11 @@ export function HeaderBar(props: HeaderBarProps) {
             openMessageCount={openMessageCount}
             newSinceLastVisitCount={newSinceLastVisitCount}
             needsAttentionCount={props.needsAttentionCount}
+            activeAlerts={activeAlerts}
           />
 
           {/* Desktop icon cluster */}
           <div className="workbench-control hidden items-center gap-0.5 rounded-md border p-0.5 md:flex">
-            {/* Alerts — only when active alerts exist */}
-            {(props.alertCount ?? 0) > 0 && (
-              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
-              <button
-                onClick={props.onToggleAlertsPopover}
-                title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
-                className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${
-                  props.showAlertsPopover
-                    ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
-                      : props.alertMaxSeverity === 'WARNING' ? 'text-yellow-300 bg-yellow-500/10'
-                      : 'text-blue-400 bg-blue-500/10')
-                    : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
-                }`}
-              >
-                <span className={`w-2 h-2 rounded-full ${
-                  props.alertMaxSeverity === 'ERROR' ? 'bg-red-500' :
-                  props.alertMaxSeverity === 'WARNING' ? 'bg-yellow-400' : 'bg-blue-500'
-                }`} />
-                <Bell className="w-3.5 h-3.5" />
-                <span>{props.alertCount}</span>
-              </button>
-            )}
             {/* Health pill — expands/collapses the full OrchestratorHealthBar */}
             {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
@@ -314,16 +312,23 @@ export function HeaderBar(props: HeaderBarProps) {
           >
             <Settings className="h-3.5 w-3.5" />
           </button>
-          <button
-            onClick={props.onSignOut}
-            title={props.userEmail ? `Sign out ${props.userEmail}` : 'Sign out'}
-            className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-500 transition-colors hover:bg-red-950/20 hover:text-red-300 md:inline-flex"
-          >
-            <LogOut className="h-3.5 w-3.5" />
-          </button>
+          <AccountMenu
+            variant="desktop"
+            accounts={props.accounts ?? []}
+            activeAccountId={props.activeAccountId ?? null}
+            currentEmail={props.userEmail}
+            onAddAccount={props.onAddAccount ?? (() => {})}
+            onSwitchAccount={props.onSwitchAccount ?? (() => {})}
+            onSignOut={props.onSignOut}
+            onSignOutAll={props.onSignOutAll ?? props.onSignOut}
+          />
 
-          {/* Mobile-only autonomy control */}
-          <div className="md:hidden flex items-center mr-1">
+          {/* Autonomy status + control — a single responsive instance shared by
+              desktop and mobile (one source of truth). Previously this was gated
+              behind `md:hidden`, so desktop (>=768px) never mounted it and lost
+              the control entirely; rendering it here restores a first-class,
+              discoverable home at every width. */}
+          <div className="flex items-center mr-1 md:mr-0" data-testid="header-autonomy-control">
             <AutonomousStatus
               onRefreshTasks={onRefresh}
               wsRef={wsRef}
@@ -402,13 +407,17 @@ export function HeaderBar(props: HeaderBarProps) {
                   <Settings className="w-4 h-4 shrink-0" />
                   <span>Runtime settings</span>
                 </button>
-                <button
-                  onClick={() => { props.onSignOut(); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-400 hover:bg-red-950/20 hover:text-red-300"
-                >
-                  <LogOut className="w-4 h-4 shrink-0" />
-                  <span>Sign out</span>
-                </button>
+                <AccountMenu
+                  variant="mobile"
+                  accounts={props.accounts ?? []}
+                  activeAccountId={props.activeAccountId ?? null}
+                  currentEmail={props.userEmail}
+                  onAddAccount={props.onAddAccount ?? (() => {})}
+                  onSwitchAccount={props.onSwitchAccount ?? (() => {})}
+                  onSignOut={props.onSignOut}
+                  onSignOutAll={props.onSignOutAll ?? props.onSignOut}
+                  onAfterAction={() => setShowMobileMenu(false)}
+                />
               </div>
             )}
           </div>
@@ -417,4 +426,4 @@ export function HeaderBar(props: HeaderBarProps) {
       </header>
     </div>
   );
-}
+});

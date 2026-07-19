@@ -26,10 +26,13 @@ from app.source_ref_validation import (
 from app.research_completion import (
     _DOWNGRADED_VERIFICATION_BASIS,
     _HIGH_EVIDENCE_BASES,
+    _NO_DELIVERED_OUTPUT_TERMINAL_REASON,
     VALID_VERIFICATION_BASES,
     _annotate_capability_declarations,
     _apply_structural_actionability_downgrade,
     _build_salvage_payload,
+    _declares_delivered_output_deliverable,
+    _delivered_output_present,
     _handle_research_completion,
     _reconcile_verification_basis,
     _record_research_survival_signal,
@@ -639,6 +642,207 @@ async def test_salvage_activity_context_recorded_on_parent_task(db_session, mock
         "filter_breakdown should include salvaged count"
     )
     assert _fb["salvaged"] == 1
+
+
+class TestDeclaresDeliveredOutputDeliverable:
+    """_declares_delivered_output_deliverable: conservative message/report predicate."""
+
+    def _task(self, *, description="", payload=None, context=None):
+        return _Task(
+            project_id=uuid.uuid4(),
+            title="t",
+            description=description,
+            payloads=[payload or {"type": "research"}],
+            context=context or {},
+            status=TaskStatus.COMPLETED,
+        )
+
+    def test_prose_sent_message_deliverable_declared(self):
+        task = self._task(
+            description="The deliverable of THIS task is a SENT MESSAGE, not a green task status."
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_prose_message_report_deliverable_declared(self):
+        task = self._task(
+            description=(
+                "A task declaring a message/report deliverable that finishes with "
+                "zero messages sent and no report written is recorded as failed."
+            )
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_structured_deliverable_kind_declared(self):
+        task = self._task(payload={"type": "research", "deliverable_kind": "report"})
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_structured_requires_delivered_output_flag(self):
+        task = self._task(context={"requires_delivered_output": True})
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_acceptance_evidence_observable_behavior_declared(self):
+        task = self._task(
+            payload={
+                "type": "research",
+                "acceptance_evidence": {
+                    "kind": "observable_behavior",
+                    "description": "the declared deliverable is a report and it is written",
+                },
+            }
+        )
+        assert _declares_delivered_output_deliverable(task) is True
+
+    def test_ordinary_research_not_flagged(self):
+        # Mentions 'report' and 'message' incidentally but declares no deliverable.
+        task = self._task(
+            description=(
+                "Analyze the messaging subsystem and report on latency in the "
+                "codebase; produce findings."
+            )
+        )
+        assert _declares_delivered_output_deliverable(task) is False
+
+    def test_empty_task_not_flagged(self):
+        assert _declares_delivered_output_deliverable(self._task()) is False
+
+
+class TestNoOutputDowngrade:
+    """Zero-findings deliver task with no message/report is FAILED, not green COMPLETED."""
+
+    async def _run_empty(self, db_session, mocker, task):
+        from test_autonomous_research import _patch_research_externals
+
+        # Production invokes this post-completion handler after the task has
+        # entered COMPLETED; only an explicit quality downgrade changes it.
+        task.status = TaskStatus.COMPLETED
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[]
+        )
+        await _handle_research_completion(task, "", db_session)
+        await db_session.refresh(task)
+
+    @_pytest.mark.asyncio
+    async def test_declared_deliverable_zero_output_downgrades_to_failed(
+        self, db_session, mocker
+    ):
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput01"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE, not a green task status."
+        db_session.add(task)
+        await db_session.commit()
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.FAILED, (
+            "a declared message/report deliverable producing nothing must FAIL"
+        )
+        assert task.latest_status_message == _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+
+    @_pytest.mark.asyncio
+    async def test_plain_research_zero_findings_stays_completed(
+        self, db_session, mocker
+    ):
+        # No declared deliverable — an honest empty finding set stays green.
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput02"
+        )
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.COMPLETED
+        assert task.latest_status_message == (
+            "Research completed with no actionable findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_capacity_degraded_declared_deliverable_zero_output_fails(
+        self, db_session, mocker
+    ):
+        # Reproduces the a70fe988 signature: degraded provider capacity + a
+        # declared deliverable + zero output → non-green terminal, not SUCCESS.
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput03"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE."
+        db_session.add(task)
+        await db_session.commit()
+
+        mocker.patch(
+            "app.research_completion._check_capacity_degradation",
+            return_value="provider capacity/rate-limit error",
+        )
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.FAILED
+        assert task.latest_status_message.startswith(
+            _NO_DELIVERED_OUTPUT_TERMINAL_REASON
+        )
+        assert "provider capacity" in task.latest_status_message
+
+    @_pytest.mark.asyncio
+    async def test_declared_deliverable_with_message_sent_stays_completed(
+        self, db_session, mocker
+    ):
+        # Zero findings BUT the task sent a ProjectMessage — output WAS delivered.
+        from app.models import ProjectMessage
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput04"
+        )
+        task.description = "The deliverable of THIS task is a SENT MESSAGE."
+        db_session.add(task)
+        message = ProjectMessage(
+            project_id=_project.id,
+            from_task_id=task.id,
+            from_type="agent",
+            content="Here is the frank state-of-internals report you asked for.",
+        )
+        db_session.add(message)
+        await db_session.commit()
+
+        await self._run_empty(db_session, mocker, task)
+
+        assert task.status == TaskStatus.COMPLETED, (
+            "a delivered message must keep the task green even with zero findings"
+        )
+
+    @_pytest.mark.asyncio
+    async def test_delivered_output_present_detects_message_and_document(
+        self, db_session
+    ):
+        from app.models import KnowledgeDocument, ProjectMessage
+
+        _project, direction, task = await _grader_project_and_task(
+            db_session, "d-nooutput05"
+        )
+        assert await _delivered_output_present(task, db_session) is False
+
+        db_session.add(
+            ProjectMessage(
+                project_id=_project.id, from_task_id=task.id, content="sent"
+            )
+        )
+        await db_session.commit()
+        assert await _delivered_output_present(task, db_session) is True
+
+        # Also detects a written report (KnowledgeDocument) alone.
+        _project2, _d2, task2 = await _grader_project_and_task(
+            db_session, "d-nooutput06"
+        )
+        assert await _delivered_output_present(task2, db_session) is False
+        db_session.add(
+            KnowledgeDocument(
+                project_id=_project2.id,
+                source_task_id=task2.id,
+                title="Report",
+                summary="s",
+                body="b",
+            )
+        )
+        await db_session.commit()
+        assert await _delivered_output_present(task2, db_session) is True
 
 
 class TestDedupFilteredFindingsAddedToSalvage:
@@ -6704,6 +6908,140 @@ async def test_apply_post_spawn_state_no_degradation_on_clean_task(db_session, m
 
 
 @_pytest.mark.asyncio
+async def test_apply_post_spawn_state_records_quality_grader_verdict(db_session):
+    """apply_post_spawn_state must fold quality_grader_verdict from task.context
+    into the direction's research_history entry when the verdict is present."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-pass"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": True,
+            "reason": "findings are well-grounded",
+            "grader_task_id": "grader-aaa",
+            "strategy": "forward-quality",
+        },
+    }
+    finding = _make_finding("QG verdict finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" in last_entry, (
+        f"quality_grader_verdict missing from history entry: {last_entry}"
+    )
+    assert last_entry["quality_grader_verdict"]["passed"] is True
+    assert last_entry["quality_grader_verdict"]["reason"] == "findings are well-grounded"
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_records_quality_grader_failed_verdict(db_session):
+    """apply_post_spawn_state must record a failed quality_grader_verdict too."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-fail"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        QUALITY_GRADER_VERDICT_KEY: {
+            "passed": False,
+            "reason": "findings lack actionable evidence",
+            "grader_task_id": "grader-bbb",
+            "strategy": "forward-quality",
+        },
+    }
+    finding = _make_finding("QG verdict failed finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv-fail")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" in last_entry
+    assert last_entry["quality_grader_verdict"]["passed"] is False
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_omits_quality_grader_when_absent(db_session):
+    """apply_post_spawn_state must NOT add quality_grader_verdict when the task
+    context has no quality grader result (legacy or ungraded research)."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_finding
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-qgv-absent"
+    )
+
+    task.context = {
+        **(task.context or {}),
+        "direction_id": direction["id"],
+        # No QUALITY_GRADER_VERDICT_KEY
+    }
+    task.context.pop(QUALITY_GRADER_VERDICT_KEY, None)
+    finding = _make_finding("No QG finding", direction_id=direction["id"])
+    task.plan_output = [finding]
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [finding],
+        [],
+        [(0, finding, "hash-qgv-absent")],
+        [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(_project)
+
+    history = _project.directions[0].get("research_history", [])
+    assert history, "expected a history entry"
+    last_entry = history[-1]
+    assert "quality_grader_verdict" not in last_entry, (
+        f"quality_grader_verdict should not be present when absent from task context: {last_entry}"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_capacity_degradation_no_false_positive_on_clean_task(
     db_session, mocker
 ):
@@ -7145,6 +7483,216 @@ async def test_batch_findings_share_single_foundation_via_capability(
         assert str(foundation_child.id) in (by_title[dep_title].depends_on or []), (
             f"{dep_title} must depend on the single shared foundation"
         )
+
+
+@_pytest.mark.asyncio
+@_pytest.mark.parametrize(
+    ("mode", "has_fresh_proof", "expect_blocked"),
+    [
+        ("enforce", False, True),
+        ("enforce", True, False),
+        ("observe", False, False),
+        ("off", False, False),
+    ],
+)
+async def test_spawn_task_backed_capability_provider_honors_proof_gate(
+    db_session, mocker, mode, has_fresh_proof, expect_blocked
+):
+    """Same-batch advertised providers are gated only for unproven capabilities."""
+    from datetime import datetime, timedelta, timezone
+    from app.shared_state import runtime_config as _rc
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, f"d-task-provider-{mode}-{has_fresh_proof}"
+    )
+    cap = "off-registry-provider-cap"
+    if has_fresh_proof:
+        project.capability_proof_records = {
+            cap: [
+                {
+                    "proof_kind": "named_test",
+                    "proved_at": (
+                        datetime.now(timezone.utc) - timedelta(days=1)
+                    ).isoformat(),
+                }
+            ]
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+    provider = _make_finding(title="Build provider", direction_id=direction["id"])
+    provider["provides_capability"] = cap
+    dependent = _make_finding(title="Use provider", direction_id=direction["id"])
+    dependent["prerequisite"] = {"kind": "capability", "ref": cap}
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = mode
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[provider, dependent],
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    by_title = {child.title: child for child in children}
+    foundation, child = by_title["Build provider"], by_title["Use provider"]
+    assert (child.status == TaskStatus.BLOCKED) is expect_blocked
+    if expect_blocked:
+        assert get_blocker_needs(child) == [{"kind": "capability", "ref": cap}]
+        assert str(foundation.id) not in (child.depends_on or [])
+    else:
+        assert str(foundation.id) in (child.depends_on or [])
+
+
+@_pytest.mark.asyncio
+@_pytest.mark.parametrize(
+    ("provider_status", "expect_edge"),
+    [
+        (TaskStatus.IN_PROGRESS, True),
+        (TaskStatus.COMPLETED, False),
+    ],
+)
+async def test_task_backed_capability_provider_resumes_after_trial_adoption_proof(
+    db_session, mocker, provider_status, expect_edge
+):
+    """A durable trial adoption immediately resumes a proof-gated dependent."""
+    from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
+    from app.shared_state import runtime_config as _rc
+    from app.task_blocked import get_blocker_needs
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    cap = f"proof-resume-{provider_status.value.lower()}"
+    project, direction, task = await _grader_project_and_task(
+        db_session, f"d-task-provider-resume-{provider_status.value.lower()}"
+    )
+    provider = _make_finding(title="Build proof provider", direction_id=direction["id"])
+    provider["provides_capability"] = cap
+    dependent = _make_finding(title="Use proof provider", direction_id=direction["id"])
+    dependent["prerequisite"] = {"kind": "capability", "ref": cap}
+
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings",
+            return_value=[provider, dependent],
+        )
+        await _handle_research_completion(task, "", db_session)
+
+        children = (
+            (
+                await db_session.execute(
+                    _select(_Task).where(_Task.parent_task_id == task.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        by_title = {child.title: child for child in children}
+        foundation = by_title["Build proof provider"]
+        child = by_title["Use proof provider"]
+        assert child.status == TaskStatus.BLOCKED
+        assert get_blocker_needs(child) == [{"kind": "capability", "ref": cap}]
+        assert str(foundation.id) not in (child.depends_on or [])
+
+        foundation.status = provider_status
+        if provider_status == TaskStatus.COMPLETED:
+            foundation.context = {**(foundation.context or {}), "pr_merged": True}
+        db_session.add(foundation)
+        await db_session.commit()
+
+        await persist_trial_verdicts_in_transaction(
+            db_session,
+            project.id,
+            pending_verdicts=[
+                (
+                    cap,
+                    {
+                        "verdict": "adopt",
+                        "lift": 0.2,
+                        "n_with": 4,
+                        "n_without": 4,
+                        "verdict_reason": "platform trial passed",
+                    },
+                )
+            ],
+        )
+        await db_session.refresh(child)
+        assert child.status == TaskStatus.QUEUED
+        assert get_blocker_needs(child) == []
+        assert (str(foundation.id) in (child.depends_on or [])) is expect_edge
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+
+@_pytest.mark.asyncio
+async def test_spawn_task_prerequisite_bypasses_task_backed_capability_gate(
+    db_session, mocker
+):
+    """Enforce still wires an ordinary task prerequisite to its active provider."""
+    from app.shared_state import runtime_config as _rc
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    project, direction, task = await _grader_project_and_task(
+        db_session, "d-task-provider-task"
+    )
+    foundation = _Task(
+        project_id=project.id,
+        title="Active task foundation",
+        status=TaskStatus.IN_PROGRESS,
+        context={"provides_capability": "unproven-provider-cap"},
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(foundation)
+    await db_session.commit()
+    finding = _make_finding(title="Use active task", direction_id=direction["id"])
+    finding["prerequisite"] = {"kind": "task", "ref": str(foundation.id)}
+    saved_mode = _rc.get("capability_proof_gate_mode")
+    try:
+        _rc["capability_proof_gate_mode"] = "enforce"
+        _patch_research_externals(mocker)
+        mocker.patch(
+            "app.research_completion._parse_research_findings", return_value=[finding]
+        )
+        await _handle_research_completion(task, "", db_session)
+    finally:
+        if saved_mode is None:
+            _rc.pop("capability_proof_gate_mode", None)
+        else:
+            _rc["capability_proof_gate_mode"] = saved_mode
+
+    child = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert child.status != TaskStatus.BLOCKED
+    assert str(foundation.id) in (child.depends_on or [])
 
 
 @_pytest.mark.asyncio
@@ -7820,10 +8368,11 @@ async def _spawn_child_under_enforce(
     direction_key: str,
     capabilities: list[dict],
     proof_records: dict | None,
+    mode: str = "enforce",
 ):
     """Spawn one finding whose prerequisite names ``budgeted-compute-job-substrate``
-    through the REAL research-completion path with the proof gate in ENFORCE mode,
-    and return the spawned child task.
+    through the REAL research-completion path with the proof gate in ``mode``
+    (default ``"enforce"``), and return the spawned child task.
 
     ``capabilities`` is written to ``project.problem_model`` (AGENT-WRITABLE) and
     ``proof_records`` to ``project.capability_proof_records`` (the PLATFORM-ONLY
@@ -7853,7 +8402,7 @@ async def _spawn_child_under_enforce(
 
     saved_mode = _rc.get("capability_proof_gate_mode")
     try:
-        _rc["capability_proof_gate_mode"] = "enforce"
+        _rc["capability_proof_gate_mode"] = mode
         _patch_research_externals(mocker)
         mocker.patch(
             "app.research_completion._parse_research_findings", return_value=[finding]
@@ -8107,6 +8656,52 @@ async def test_bare_proof_exempt_blocks_spawn_under_enforce(db_session, mocker):
 
     assert child.status == TaskStatus.BLOCKED, (
         "an unattributed proof_exempt must never clear the gate"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_observe_mode_surfaces_unverified_capability_on_spawn(
+    db_session, mocker
+):
+    """OBSERVE mode, spawn-time seam. A prerequisite naming a ``working``
+    capability with NO proven evidence resolves as satisfied-by-the-codebase (the
+    dependent is NOT gated), but the unproven status is surfaced DURABLY on the
+    spawned child's context — not merely logged — so an operator can see the
+    unproven foundation without re-deriving it from logs.
+
+    This exercises ``spawn_capability_gate_disposition``'s ``"surface"`` branch
+    end-to-end through the real research-completion path.
+    """
+    from app.research_completion import SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY
+
+    child = await _spawn_child_under_enforce(
+        db_session,
+        mocker,
+        direction_key="d-prq-observe",
+        capabilities=[_self_declared_working_cap()],
+        proof_records={},  # empty ledger — the self-report is unproven
+        mode="observe",
+    )
+
+    # OBSERVE never gates: the dependent spawns (not BLOCKED on the capability).
+    assert child.status != TaskStatus.BLOCKED, (
+        "observe mode must never gate the dependent — it only surfaces the "
+        "unverified status"
+    )
+
+    # The unverified status is durably surfaced on the child's context.
+    surfaced = (child.context or {}).get(SPAWN_CAPABILITY_PROOF_UNVERIFIED_KEY) or []
+    assert surfaced, (
+        "observe mode must surface the unverified capability on the spawned "
+        "dependent's context, not only in a log line"
+    )
+    entry = surfaced[0]
+    assert entry["kind"] == "capability"
+    assert entry["ref"] == "budgeted-compute-job-substrate"
+    # A self-declared-only proof grades ``unverified`` under corroboration (no
+    # platform ledger entry), so the surfaced status is a non-``proven`` tier.
+    assert entry["proof_status"] not in (None, "proven"), (
+        f"surfaced proof_status must be a non-proven tier, got {entry['proof_status']!r}"
     )
 
 

@@ -309,6 +309,7 @@ EXPECTED_TYPES = {
     "plan",
     "research",
     "strategic_review",
+    "strategic_resident_turn",
     "design_doc_update",
     "security_audit",
     "qa",
@@ -331,6 +332,7 @@ EXPECTED_TYPES = {
     "design",
     "repo_bootstrap",
     "salvage_bundle",
+    "capability_proof_trial",
 }
 
 

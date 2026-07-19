@@ -27,8 +27,10 @@ from app.capability_registry import (
     compose_capability_markers,
     exempt_capability_names,
     normalize_capability_name,
+    working_capability_proof_status,
 )
 from app.evidence_primitive import (
+    KNOWN_PROOF_KINDS,
     EvidenceRef,  # noqa: F401 — imported for shape doc
     classify_evidence_tiered,
 )
@@ -40,11 +42,15 @@ __all__ = [
     "carry_proof_records_for_consolidation",
     "commission_proof_earn_loop",
     "enrich_problem_model_capability_proofs",
+    "enroll_capability_proof_trial",
     "record_capability_backing_path_proof",
+    "record_capability_named_test_execution_proof",
     "record_capability_named_test_proof",
     "record_capability_proof",
     "record_capability_proof_from_trial",
     "record_gap_evidence",
+    "resolve_no_backing_paths_gap",
+    "revoke_stale_execution_proof",
     "should_record_capability_proof",
 ]
 
@@ -62,6 +68,15 @@ _PROOF_KIND_DOWNSTREAM_ARTIFACT = "downstream_artifact"
 _PROOF_KIND_TRIAL_ADOPTION = "trial_adoption"
 _PROOF_KIND_BACKING_PATH = "backing_path"
 _MAX_PROOF_ENTRIES_PER_CAPABILITY = 10
+
+#: Hard cap on how many covering test files one ``capability_proof_trial`` may
+#: execute. Bounds the runner job so a capability that (mis)declares a huge
+#: backing surface cannot fan out into an unbounded targeted test run.
+MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES = 10
+#: Wall-clock timeout (seconds) carried in the trial launch contract. The agent
+#: handler runs ONLY the targeted covering tests under this bound; a trial that
+#: exceeds it is a no-op (records nothing), never a demotion.
+CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS = 900
 
 # Context key where we read the acceptance verdict.
 _CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
@@ -129,11 +144,20 @@ def _append_evidence_refs_to_capabilities(
     project: Any,
     cap_names: list[str],
     ref_entry: dict[str, Any],
+    *,
+    replace: bool = False,
 ) -> None:
     """Append an EvidenceRef-shaped entry to each matching Capability's evidence_refs.
 
     Fail-open: if problem_model is missing or malformed, logs a warning and
     returns without raising. The proof is still recorded in capability_proof_records.
+
+    By default a ref whose ``source_id`` already exists on a capability is left
+    untouched (dedup). When ``replace=True`` (used by the freshness-replacing
+    executed-named_test recorder) a matching ref is instead OVERWRITTEN in place
+    with the fresh ``ref_entry`` — carrying its new ``recorded_at`` / ``commit_sha``
+    — so the ledger holds exactly one up-to-date executed ref per capability
+    rather than a stale duplicate.
     """
     try:
         pm = getattr(project, "problem_model", None)
@@ -155,10 +179,19 @@ def _append_evidence_refs_to_capabilities(
             refs: list = cap.setdefault("evidence_refs", [])
             # Dedup by source_id.
             source_id = ref_entry.get("source_id")
-            if source_id and any(
-                isinstance(r, dict) and r.get("source_id") == source_id
-                for r in refs
-            ):
+            existing_idx: int | None = None
+            if source_id:
+                for _i, _r in enumerate(refs):
+                    if isinstance(_r, dict) and _r.get("source_id") == source_id:
+                        existing_idx = _i
+                        break
+            if existing_idx is not None:
+                # A ref with this source_id already exists. In freshness-replace
+                # mode overwrite it in place with the fresh timestamps/commit_sha;
+                # otherwise leave the prior ref untouched (dedup).
+                if replace:
+                    refs[existing_idx] = dict(ref_entry)
+                    updated = True
                 continue
             refs.append(dict(ref_entry))
             if len(refs) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
@@ -207,6 +240,16 @@ def enrich_problem_model_capability_proofs(
     if not isinstance(capabilities, list):
         return dict(problem_model)
 
+    # Canonical names of ``working`` capabilities carrying an AUTHORIZED (platform-
+    # recorded) operator exemption — the only exemption the agent cannot forge (a
+    # bare agent-writable ``proof_exempt`` flag does NOT authorize). Surface it on
+    # each matching capability so the display path (coverage meter denominator,
+    # Exempt badge, Revoke-exemption button) agrees with the ledger-aware auto-
+    # graduation coverage rather than diverging after a page reload. Uses the same
+    # alias-aware gate carve-out set as coverage (:func:`exempt_capability_names`),
+    # so an exemption recorded against an absorbed name marks the survivor exempt.
+    ledger_exempt = exempt_capability_names(problem_model, proof_records)
+
     annotated = dict(problem_model)
     annotated_caps: list[Any] = []
     for entry in capabilities:
@@ -215,6 +258,16 @@ def enrich_problem_model_capability_proofs(
             continue
         entry2 = dict(entry)
         cap_name = entry2.get("name")
+        # Drive proof_exempt AUTHORITATIVELY from the ledger, not the agent-writable
+        # flag. Set it True for a ledger-backed exemption AND False otherwise, so an
+        # unauthorized agent-written ``proof_exempt: true`` (no platform record) is
+        # cleared rather than surfaced. Leaving a forged flag in place would diverge
+        # the coverage-meter denominator (ProblemModelViewer.tsx:481, which excludes
+        # proof_exempt caps) from the ledger-aware backend auto-graduation rule
+        # (audit finding #9 ignores the agent flag) and render a dead-end Revoke-
+        # exemption button whose revoke returns removed:0.
+        if isinstance(cap_name, str):
+            entry2["proof_exempt"] = normalize_capability_name(cap_name) in ledger_exempt
         entries = (
             _proof_entries_for_capability(proof_records, cap_name)
             if isinstance(cap_name, str)
@@ -256,8 +309,11 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
     """Record a proof entry on project for each capability the task provides.
 
     Reads the ``code_acceptance_verdict`` from ``task.context`` and, if it is
-    proven, stamps a bounded proof entry into
-    ``project.capability_proof_records[cap_name]``.
+    proven AND its ``kind`` is a recognized proof kind, stamps a bounded proof
+    entry into ``project.capability_proof_records[cap_name]``. A verdict whose
+    ``kind`` is unrecognized (e.g. a self-authored value on a task that declared
+    no acceptance evidence, so the platform never overwrote it) mints nothing —
+    it must never launder into a gate-clearing proof.
 
     Returns the list of normalized capability names that received a proof entry
     (empty when no proof was recorded).
@@ -291,6 +347,26 @@ def record_capability_proof(task: Any, project: Any) -> list[str]:
     task_id = str(getattr(task, "id", "") or "")
     proved_at = _utcnow().isoformat()
     proof_kind = _proof_kind_from_verdict(verdict)
+    # Refuse to mint a proof from an UNRECOGNIZED proof kind. ``verdict`` is read
+    # from ``task.context`` — agent-writable JSONB that the platform overwrites
+    # only when the task declared acceptance evidence (record_code_acceptance_
+    # verdict no-ops otherwise). A task that declares none can therefore carry a
+    # self-authored ``code_acceptance_verdict`` with ``proven=True`` and a forged
+    # ``kind`` (e.g. "self_reflection"); ``classify_evidence_tiered`` treats any
+    # non-machine-but-unrecognized kind as full ``proven`` (an unlabeled proof is
+    # never silently demoted), so such a record would clear the enforce gate with
+    # nothing verified behind it. Only a kind in the recognized proof vocabulary
+    # may mint a durable proof record. A missing/blank kind is NOT rejected here:
+    # ``_proof_kind_from_verdict`` already normalizes it to the ``named_test``
+    # default (preserving the legacy unlabeled-proof behavior).
+    if proof_kind not in KNOWN_PROOF_KINDS:
+        logger.warning(
+            "[CAPABILITY_PROOF] refusing proof for task %s: unrecognized "
+            "proof_kind=%r (not in the recognized proof vocabulary)",
+            task_id,
+            proof_kind,
+        )
+        return []
     proof_ref = _extract_proof_ref(verdict) or ""
     commit_sha = context.get("merge_commit_sha") or context.get("commit_sha") or ""
 
@@ -352,25 +428,25 @@ def record_capability_proof_from_trial(
     project: Any,
     cap_name: str,
     entry: dict[str, Any],
-) -> None:
+) -> bool:
     """Record a bounded proof entry when a trial reaches an evidence-grounded ADOPT verdict.
 
     Called from persist_trial_verdicts_in_transaction after a successful adopt
     verdict is written. The dedup key ``trial:<normalized_cap_name>`` ensures a
     standing ADOPT does not produce duplicate proof entries on re-evaluation.
 
-    Non-raising: all errors are logged at WARNING level so they cannot roll back
-    the surrounding session commit.
+    Returns ``True`` when a new entry was recorded and ``False`` for a non-adopt
+    verdict, an invalid capability name, or an already-recorded adoption.
     """
     from app.time_utils import _utcnow
 
     verdict = entry.get("verdict")
     if verdict not in ("adopt", "ADOPT"):
-        return
+        return False
 
     norm = normalize_capability_name(cap_name)
     if not norm:
-        return
+        return False
 
     # Stable dedup key: one proof record per capability trial adoption.
     dedup_task_id = f"trial:{norm}"
@@ -392,7 +468,7 @@ def record_capability_proof_from_trial(
 
     entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
     if any(e.get("task_id") == dedup_task_id for e in entries):
-        return
+        return False
 
     entries.append(proof_entry)
     if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
@@ -418,6 +494,7 @@ def record_capability_proof_from_trial(
             "recorded_at": proved_at,
         },
     )
+    return True
 
 
 def record_capability_backing_path_proof(project: Any, cap_name: str) -> bool:
@@ -619,6 +696,589 @@ def record_capability_named_test_proof(
     return True
 
 
+def record_capability_named_test_execution_proof(
+    project: Any,
+    cap_name: str,
+    test_refs: list[str],
+    head_sha: str | None = None,
+    *,
+    suite_verifying: bool = True,
+    env_fingerprint: str | None = None,
+) -> bool:
+    """Record a bounded GENUINE ``named_test``-tier (``proven``) proof from an
+    actual test EXECUTION.
+
+    Slice 1 of the machine-verified capability-proof earn path (design doc
+    84021e2d). Unlike :func:`record_capability_named_test_proof` — which mints the
+    structural-only ``named_test_present`` tier from STATIC file-existence
+    discovery (a convention-named test exists at HEAD and imports the backing
+    module, but is never run; graded ``path_proven``) — this recorder stamps the
+    genuine ``named_test`` proof kind from an *executed* covering suite. Because
+    ``named_test`` is NOT in :data:`~app.evidence_primitive.BACKING_ONLY_KINDS`,
+    both :func:`classify_evidence_tiered` and
+    :func:`~app.capability_registry._ledger_proof_status` grade the resulting
+    ledger ``proven`` — so a fresh execution proof clears the enforce gate and
+    :func:`~app.capability_registry.ledger_corroborated_proof_status`
+    CORROBORATES (does not demote) it. This is the ONLY automated path that mints
+    ``proven`` outside the merge gate (:func:`record_capability_proof`).
+
+    Like every recorder in this module it writes to the SAME durable
+    ``project.capability_proof_records`` ledger and appends the SAME EvidenceRef
+    shape (via :func:`_append_evidence_refs_to_capabilities`).
+
+    **Freshness re-verification** (the one behavioural difference vs. the other
+    recorders): the dedup key ``named_test_exec:<normalized_cap_name>`` is used to
+    REPLACE any prior entry with fresh ``proved_at`` / ``recorded_at`` and the
+    current ``commit_sha=head_sha``, rather than returning ``False`` on a dedup
+    hit. This lets :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` (applied in
+    :func:`~app.capability_registry.working_capability_proof_status`) age out a
+    stale green so the capability drops below ``proven`` and is re-dispatched by a
+    later trial. The appended EvidenceRef is replaced in place too
+    (``replace=True``) so the ledger carries exactly one fresh executed ref.
+
+    **Vacuous-green rejection**: a green run that verified nothing is not proof.
+    The caller signals a skipped/empty suite via ``suite_verifying=False`` (cf.
+    ``_suite_is_non_verifying`` in :mod:`app.ci_resolution`); the recorder itself
+    additionally refuses empty ``test_refs``. In either case nothing is recorded.
+
+    Non-raising: all errors are logged at WARNING level so they can never crash
+    the caller.
+
+    Returns ``True`` when a fresh proof was recorded (newly inserted OR replacing
+    a prior stale entry with the same dedup key), ``False`` when the capability
+    name cannot be normalized, ``test_refs`` is empty, or the executed suite did
+    not actually verify anything (``suite_verifying=False``).
+    """
+    from app.time_utils import _utcnow
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record executed named-test proof — "
+            "capability name %r could not be normalized",
+            cap_name,
+        )
+        return False
+
+    if not suite_verifying:
+        logger.warning(
+            "[CAPABILITY_PROOF] refusing vacuous executed named-test proof for "
+            "cap=%s — the executed suite verified nothing (skipped/empty)",
+            norm,
+        )
+        return False
+
+    refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+    if not refs:
+        logger.warning(
+            "[CAPABILITY_PROOF] cannot record executed named-test proof for "
+            "cap=%s — no covering test refs supplied",
+            norm,
+        )
+        return False
+
+    # Stable dedup key: one executed named-test proof per capability. Distinct
+    # prefix from the STATIC ``named_test_present:`` earn so the two coexist.
+    dedup_task_id = f"named_test_exec:{norm}"
+    proved_at = _utcnow().isoformat()
+    proof_ref = ",".join(refs)
+    commit_sha = head_sha if isinstance(head_sha, str) else ""
+
+    proof_entry: dict[str, Any] = {
+        "task_id": dedup_task_id,
+        "proved_at": proved_at,
+        "recorded_at": proved_at,
+        "proof_kind": _PROOF_KIND_NAMED_TEST,
+        "proof_ref": proof_ref,
+        "test_refs": refs,
+        "executed": True,
+        "commit_sha": commit_sha,
+    }
+    _env_fp = env_fingerprint if isinstance(env_fingerprint, str) and env_fingerprint else None
+    if _env_fp:
+        proof_entry["env_fingerprint"] = _env_fp
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            project.capability_proof_records = {}
+    except Exception:  # noqa: BLE001 — recording must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read capability_proof_records on project",
+            exc_info=True,
+        )
+        return False
+
+    entries: list[dict] = list(project.capability_proof_records.get(norm) or [])
+    # Freshness re-verification: REPLACE any prior entry with this dedup key
+    # (fresh timestamps + current commit_sha) instead of deduping it away, so a
+    # stale green ages out under PROOF_FRESHNESS_TTL and gets re-dispatched.
+    entries = [e for e in entries if e.get("task_id") != dedup_task_id]
+    entries.append(proof_entry)
+    if len(entries) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
+        entries = entries[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
+    project.capability_proof_records[norm] = entries
+    try:
+        flag_modified(project, "capability_proof_records")
+    except Exception:  # noqa: BLE001 — recording must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] flag_modified failed for capability_proof_records",
+            exc_info=True,
+        )
+        return False
+
+    logger.info(
+        "[CAPABILITY_PROOF] recorded EXECUTED named-test (proven tier) proof for "
+        "cap=%s refs=%s sha=%s",
+        norm,
+        refs,
+        commit_sha,
+    )
+
+    _ref_entry: dict[str, Any] = {
+        "kind": _PROOF_KIND_NAMED_TEST,
+        "ref": proof_ref,
+        "proven": True,
+        "source_id": dedup_task_id,
+        "recorded_at": proved_at,
+        "executed": True,
+        "commit_sha": commit_sha,
+    }
+    if _env_fp:
+        _ref_entry["env_fingerprint"] = _env_fp
+    _append_evidence_refs_to_capabilities(
+        project,
+        [norm],
+        _ref_entry,
+        replace=True,
+    )
+    return True
+
+
+def revoke_stale_execution_proof(project: Any, cap_name: str) -> bool:
+    """Remove all ``named_test``-tier ledger entries (and their evidence_refs) for
+    ``cap_name`` after a definitive RED trial proves the capability broken at HEAD.
+
+    Called from :func:`app.task_completion._handle_capability_proof_trial_completion`
+    when a trial ran to completion and failed (``ran=True``, ``passed=False``,
+    ``could_not_run=False``). Without this revocation the old green proof (written at
+    an earlier revision) keeps clearing the enforce gate until the 30-day TTL expires
+    — even though the capability is demonstrably broken at the current HEAD.
+
+    Removes ALL ``proof_kind == "named_test"`` entries — both the executed-proof
+    entry (``task_id=named_test_exec:<cap>``) and any older merge-gate proofs
+    (``proof_kind=named_test``, ``task_id=<uuid>``). The merge-gate proof is minted
+    by ``record_capability_proof`` when a PR passes acceptance evidence; a definitive
+    RED at current HEAD supersedes it regardless of the SHA at which it was minted.
+
+    Non-raising: all errors are logged at WARNING level so a revocation failure can
+    never strand the surrounding commit or prevent the contradiction from being
+    recorded.
+
+    Returns ``True`` when at least one entry was present and removed, ``False`` when
+    no named_test proof existed (nothing to revoke) or on error.
+    """
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return False
+
+    try:
+        if not isinstance(getattr(project, "capability_proof_records", None), dict):
+            return False
+
+        dedup_task_id = f"named_test_exec:{norm}"
+        existing = list(project.capability_proof_records.get(norm) or [])
+        # Supersede ALL named_test proof records on a definitive RED — both the
+        # executed-proof entry (task_id=named_test_exec:<cap>) and older merge-gate
+        # proofs (proof_kind=named_test, task_id=<uuid>). The merge-gate proof
+        # remains authoritative under the old code until its 30-day TTL; a RED
+        # trial running at HEAD overrides it immediately.
+        pruned = [
+            e for e in existing
+            if not (
+                isinstance(e, dict)
+                and (
+                    e.get("task_id") == dedup_task_id
+                    or e.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+                )
+            )
+        ]
+        if len(pruned) == len(existing):
+            # No executed-proof entry or merge-gate named_test proof was present.
+            return False
+
+        project.capability_proof_records[norm] = pruned
+        try:
+            flag_modified(project, "capability_proof_records")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[CAPABILITY_PROOF] revoke: flag_modified failed for capability_proof_records",
+                exc_info=True,
+            )
+            return False
+
+        # Mirror the revocation into problem_model evidence_refs so the
+        # tier-1 proof_status no longer sees any named_test ref.
+        try:
+            pm = getattr(project, "problem_model", None)
+            if isinstance(pm, dict):
+                caps = pm.get("capabilities")
+                if isinstance(caps, list):
+                    ref_removed = False
+                    for cap in caps:
+                        if not isinstance(cap, dict):
+                            continue
+                        cap_nm = cap.get("name")
+                        if not isinstance(cap_nm, str):
+                            continue
+                        if normalize_capability_name(cap_nm) != norm:
+                            continue
+                        refs = cap.get("evidence_refs")
+                        if not isinstance(refs, list):
+                            continue
+                        new_refs = [
+                            r for r in refs
+                            if not (
+                                isinstance(r, dict)
+                                and (
+                                    r.get("source_id") == dedup_task_id
+                                    or r.get("kind") == _PROOF_KIND_NAMED_TEST
+                                )
+                            )
+                        ]
+                        if len(new_refs) < len(refs):
+                            cap["evidence_refs"] = new_refs
+                            ref_removed = True
+                    if ref_removed:
+                        flag_modified(project, "problem_model")
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[CAPABILITY_PROOF] revoke: failed to remove evidence_ref from problem_model",
+                exc_info=True,
+            )
+
+        logger.info(
+            "[CAPABILITY_PROOF] revoked stale named_test proofs for cap=%s (definitive RED)",
+            norm,
+        )
+        return True
+
+    except Exception:  # noqa: BLE001 — revocation must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] revoke_stale_execution_proof failed for cap=%r",
+            cap_name,
+            exc_info=True,
+        )
+        return False
+
+
+async def _default_read_head_sha() -> str | None:
+    """Resolve the current verification-branch HEAD SHA (or ``None``).
+
+    Thin default injectable for the earn-loop trial cadence guard; delegates to
+    :func:`app.source_ref_validation.resolve_head_commit`, which returns ``None``
+    when HEAD is indeterminate (no creds + no checkout, or any API/git error).
+    """
+    from app.source_ref_validation import resolve_head_commit
+
+    return await resolve_head_commit()
+
+
+def _fresh_executed_proof_covers_head(
+    project: Any,
+    cap_name: str,
+    head_sha: str | None,
+    now: Any = None,
+    *,
+    env_fingerprint: str | None = None,
+) -> bool:
+    """Whether a GREEN *executed* named_test proof for ``cap_name`` already covers
+    the current HEAD.
+
+    This is the idempotence / cadence guard for earn-loop trial enrollment
+    (design §3.4): a fresh trial is NOT re-enrolled when the executed proof
+    (dedup key ``named_test_exec:<cap>``) is still within
+    :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` **and** its stored
+    ``commit_sha`` matches ``head_sha``. Returns ``False`` — the re-verify signal —
+    when the proof aged past the TTL, its ``commit_sha`` differs from ``head_sha``,
+    HEAD is indeterminate, or no executed proof exists.
+    """
+    from app.evidence_primitive import PROOF_FRESHNESS_TTL, _ref_is_expired
+    from app.time_utils import _utcnow
+
+    norm = normalize_capability_name(cap_name)
+    if not norm:
+        return False
+    # HEAD indeterminate → we cannot assert coverage of the current tree; allow
+    # re-enroll rather than silently suppress on an unknown SHA.
+    if not isinstance(head_sha, str) or not head_sha:
+        return False
+    records = getattr(project, "capability_proof_records", None)
+    if not isinstance(records, dict):
+        return False
+    exec_dedup_id = f"named_test_exec:{norm}"
+    _now = now or _utcnow()
+    for entry in records.get(norm) or []:
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("task_id", "")
+        proof_kind = entry.get("proof_kind", "")
+        commit_sha_val = entry.get("commit_sha", "")
+        # Accept a direct executed-proof entry OR a merge-gate named_test proof
+        # with a non-empty commit_sha — the latter avoids unnecessary trial
+        # enrollment when the capability was already proven at HEAD by the merge
+        # gate (record_capability_proof) and its commit_sha matches head_sha.
+        is_exec_entry = task_id == exec_dedup_id
+        is_merge_gate_proof = (
+            proof_kind == _PROOF_KIND_NAMED_TEST
+            and isinstance(commit_sha_val, str)
+            and bool(commit_sha_val)
+        )
+        if not (is_exec_entry or is_merge_gate_proof):
+            continue
+        if entry.get("commit_sha") != head_sha:
+            # Proof exists but for a DIFFERENT tree — re-verify.
+            continue
+        if _ref_is_expired(entry, _now, PROOF_FRESHNESS_TTL):
+            # Aged past the TTL — the genuine re-verification loop.
+            continue
+        # Environment-binding check: when both the stored proof and the caller
+        # supply a non-empty fingerprint, a mismatch means the hardware or
+        # container image changed — force re-verification even if the code tree
+        # and TTL are unchanged.
+        stored_fp = entry.get("env_fingerprint")
+        if (
+            stored_fp
+            and isinstance(stored_fp, str)
+            and env_fingerprint
+            and isinstance(env_fingerprint, str)
+            and stored_fp != env_fingerprint
+        ):
+            continue
+        return True
+    return False
+
+
+async def _maybe_enroll_proof_trial(
+    session: Any,
+    project: Any,
+    raw_name: str,
+    canonical: str,
+    test_refs: list[str],
+    *,
+    read_head_sha: Any = None,
+    now: Any = None,
+    env_fingerprint: str | None = None,
+) -> str | None:
+    """Decide whether a discovered-covered capability enrolls a proof trial.
+
+    Shared by both discovery points (:func:`commission_proof_earn_loop` and the
+    ``check_capability_proof_gate_gap`` self-heal). Returns:
+
+    * ``"enrolled"`` — a bounded ``capability_proof_trial`` Task was persisted;
+      the caller counts the cap under ``named_test_executed`` (it is EARNING the
+      real ``proven`` tier via execution, not the static ``named_test_present``).
+    * ``"fresh"`` — a fresh green executed proof already covers HEAD
+      (:func:`_fresh_executed_proof_covers_head`); nothing to re-verify this
+      sweep. The caller does NOT downgrade to a static proof.
+    * ``None`` — the execution-trials flag is disabled or enrollment
+      degraded to a no-op; the caller falls back to the UNCHANGED static
+      ``named_test_present`` / ``backing_path`` (``path_proven``) recording.
+
+    Non-raising: any error degrades to ``None`` so the legacy static path always
+    remains available.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if not (_rc or {}).get("capability_proof_execution_trials_enabled", False):
+            return None
+        if session is None:
+            return None
+
+        _resolve = read_head_sha or _default_read_head_sha
+        try:
+            head_sha = await _resolve()
+        except Exception:  # noqa: BLE001 — HEAD resolution failure is non-fatal
+            head_sha = None
+
+        if _fresh_executed_proof_covers_head(
+            project, canonical, head_sha, now=now, env_fingerprint=env_fingerprint
+        ):
+            return "fresh"
+
+        task = await enroll_capability_proof_trial(
+            session, project, raw_name or canonical, test_refs,
+            head_sha=head_sha, env_fingerprint=env_fingerprint,
+        )
+        return "enrolled" if task is not None else None
+    except Exception:  # noqa: BLE001 — enrollment decision must degrade, never raise
+        logger.warning(
+            "[CAP_TRIAL] _maybe_enroll_proof_trial degraded for cap=%s",
+            canonical,
+            exc_info=True,
+        )
+        return None
+
+
+async def enroll_capability_proof_trial(
+    session: Any,
+    project: Any,
+    cap_name: str,
+    test_refs: list[str],
+    head_sha: str | None = None,
+    env_fingerprint: str | None = None,
+) -> Any:
+    """Create + persist a ``capability_proof_trial`` Task for one capability.
+
+    Slice 2 of the machine-verified capability-proof earn path (design 84021e2d).
+    The trial is a bounded, targeted runner job: the agent handler runs ONLY the
+    passed ``test_refs`` (the capability's declared convention-named covering
+    tests), and on a green run the ingestion completion handler mints a genuine
+    ``proven`` named_test proof (:func:`record_capability_named_test_execution_proof`).
+
+    This is the ENROLL half, called by the proof-earn sweep and on-demand
+    discovery. It is gated on the ``capability_proof_execution_trials_enabled``
+    runtime flag (default True); with the operator kill switch off it is a no-op
+    returning ``None``.
+
+    Bounded launch contract (design §3.2 / §6.2): ``test_refs`` is normalized and
+    capped to :data:`MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES`, and a wall-clock
+    timeout (:data:`CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS`) is stamped into the
+    payload. A trial that cannot be built cleanly (flag off, unnormalizable
+    capability name, or no usable test refs) is a no-op returning ``None`` — never
+    a raise, never a fabricated proof.
+
+    Returns the persisted Task on success, or ``None`` on any no-op/degraded path.
+    Non-raising: any error is logged at WARNING level and yields ``None`` so a
+    caller (a future sweep) can never be crashed by enrollment.
+    """
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if not (_rc or {}).get("capability_proof_execution_trials_enabled", False):
+            return None
+
+        norm = normalize_capability_name(cap_name)
+        if not norm:
+            logger.warning(
+                "[CAP_TRIAL] cannot enroll trial — capability name %r could not be "
+                "normalized",
+                cap_name,
+            )
+            return None
+
+        refs = [r for r in (test_refs or []) if isinstance(r, str) and r.strip()]
+        if not refs:
+            logger.warning(
+                "[CAP_TRIAL] cannot enroll trial for cap=%s — no usable test refs",
+                norm,
+            )
+            return None
+        refs = refs[:MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES]
+        # Belt-and-suspenders: MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES must never
+        # be 0, but guard defensively so a misconfigured constant can't produce
+        # a fabricated empty proof.
+        if not refs:
+            logger.warning(
+                "[CAP_TRIAL] cannot enroll trial for cap=%s — refs empty after cap "
+                "(MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES=%d)",
+                norm,
+                MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
+            )
+            return None
+
+        from sqlalchemy import select
+
+        from app.models import Task, TaskStatus
+
+        # Dedup guard: only block re-enrollment when an in-flight (non-terminal)
+        # trial exists.  Terminal states (COMPLETED, FAILED) deliberately do NOT
+        # block a fresh enrollment so a completed trial can be re-run after a new
+        # commit lands.  Note: a narrow TOCTOU window exists — two concurrent
+        # sweeps that both miss the in-flight check can both enroll; this is
+        # tolerated (idempotent proof recording handles the duplicate) and only
+        # risks one extra runner job per capability per sweep cycle.
+        project_id = getattr(project, "id", None)
+        in_flight_statuses = [
+            TaskStatus.QUEUED,
+            TaskStatus.PROVISIONING,
+            TaskStatus.IN_PROGRESS,
+            TaskStatus.EVALUATING,
+        ]
+        try:
+            existing_q = await session.execute(
+                select(Task.id).where(
+                    Task.project_id == project_id,
+                    Task.status.in_(in_flight_statuses),
+                    Task.payloads.contains(
+                        [{"type": "capability_proof_trial", "cap": norm}]
+                    ),
+                ).limit(1)
+            )
+            if existing_q.scalar_one_or_none() is not None:
+                logger.info(
+                    "[CAP_TRIAL] skipping duplicate enrollment for cap=%s — "
+                    "a trial is already in-flight",
+                    norm,
+                )
+                return None
+        except Exception:  # noqa: BLE001 — dedup failure is non-fatal; enroll anyway
+            logger.warning(
+                "[CAP_TRIAL] dedup check failed for cap=%s — proceeding with enroll",
+                norm,
+                exc_info=True,
+            )
+
+        _enroll_fp = (
+            env_fingerprint if isinstance(env_fingerprint, str) and env_fingerprint else None
+        )
+        payload: dict[str, Any] = {
+            "type": "capability_proof_trial",
+            "cap": norm,
+            "test_refs": refs,
+            "head_sha": head_sha if isinstance(head_sha, str) else None,
+            "max_test_files": MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES,
+            "wall_clock_seconds": CAPABILITY_PROOF_TRIAL_WALL_CLOCK_SECONDS,
+        }
+        if _enroll_fp:
+            payload["env_fingerprint"] = _enroll_fp
+        task = Task(
+            project_id=getattr(project, "id", None),
+            title=f"Capability proof trial: {norm}",
+            description=(
+                f"Run the declared covering tests for capability '{norm}' as a "
+                "targeted runner job; a green run mints a proven named_test proof."
+            ),
+            payloads=[payload],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        logger.info(
+            "[CAP_TRIAL] enrolled trial task %s for cap=%s refs=%s sha=%s",
+            task.id,
+            norm,
+            refs,
+            head_sha,
+        )
+        return task
+    except Exception:  # noqa: BLE001 — enrollment must degrade, never raise
+        logger.warning(
+            "[CAP_TRIAL] failed to enroll capability_proof_trial for cap=%r",
+            cap_name,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "[CAP_TRIAL] rollback after enroll failure also failed", exc_info=True
+            )
+        return None
+
+
 def record_gap_evidence(task: Any, project: Any) -> None:
     """Stamp EvidenceRef entries onto the Gap linked to this task's direction.
 
@@ -707,6 +1367,35 @@ def record_gap_evidence(task: Any, project: Any) -> None:
         )
 
 
+def _absorption_forward_marker(
+    survivor_norm: str, abs_norm: str, proved_at: str
+) -> dict[str, Any]:
+    """Build the durable, PLATFORM-authored forwarding marker left under an absorbed
+    capability's ledger key after its real proof/exemption entries are moved onto
+    the survivor's key by :func:`carry_proof_records_for_consolidation`.
+
+    This marker is the trustworthy record of a GENUINE rename: it is written only
+    from the model-write consolidation path (which required the absorbed capability
+    to actually be deleted), never by an agent editing ``problem_model``. It carries
+    :data:`~app.capability_registry.CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND`, so every
+    machine-proof and exemption pass filters it out — it never itself becomes proof or
+    an exemption — and :func:`~app.capability_registry.platform_recorded_alias_map`
+    reads it to reconstruct the absorbed→survivor relationship the authority seams use
+    in place of the agent-writable ``absorbs`` field.
+    """
+    from app.capability_registry import CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND
+
+    return {
+        "task_id": f"absorbed_into:{abs_norm}",
+        "proof_kind": CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
+        "survivor": survivor_norm,
+        "absorbed": abs_norm,
+        "proof_ref": survivor_norm,
+        "proved_at": proved_at,
+        "commit_sha": "",
+    }
+
+
 def carry_proof_records_for_consolidation(
     capabilities_consolidated: list[dict[str, Any]],
     proof_records: dict[str, Any],
@@ -715,14 +1404,30 @@ def carry_proof_records_for_consolidation(
 
     For each {survivor, absorbed[...]} consolidation event, all proof entries
     keyed under absorbed names are merged into the survivor's list, deduped by
-    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted), and
-    the absorbed keys are removed.
+    task_id, capped at _MAX_PROOF_ENTRIES_PER_CAPABILITY (oldest evicted). Each
+    absorbed key is then REPLACED with a single platform-authored FORWARDING marker
+    (:func:`_absorption_forward_marker`) recording the survivor it merged into —
+    rather than being popped empty. Because this carry runs ONLY from the genuine,
+    destructive model-write consolidation path (the ``capabilities_consolidated``
+    diff, emitted only when a survivor's ``absorbs`` names a JUST-DELETED
+    capability), the marker is a trustworthy record of a real rename. The authority
+    seams read it via :func:`~app.capability_registry.platform_recorded_alias_map`
+    instead of the agent-writable ``problem_model.absorbs`` list, so a survivor's
+    proof/exemption forwards to the old name only after a genuine consolidation —
+    never because an agent merely declares ``absorbs: [proven-or-exempt-name]``.
+
+    A pre-existing forwarding marker under an absorbed key is NOT carried onto the
+    survivor as proof (it is not evidence of anything); only real proof/exemption
+    entries move.
 
     Returns a NEW dict — does not mutate the input.  Callers are responsible for
     flag_modified on the JSONB column after assigning the result.
     """
     if not capabilities_consolidated or not isinstance(proof_records, dict):
         return proof_records
+
+    from app.capability_registry import _entry_is_absorption_forward
+    from app.time_utils import _utcnow
 
     result = dict(proof_records)
     for event in capabilities_consolidated:
@@ -738,19 +1443,32 @@ def carry_proof_records_for_consolidation(
 
         merged: list[dict[str, Any]] = list(result.get(survivor_norm) or [])
         seen_task_ids: set[str] = {e.get("task_id", "") for e in merged}
+        proved_at = _utcnow().isoformat()
 
         for abs_name in absorbed_names:
             abs_norm = normalize_capability_name(abs_name)
-            if not abs_norm:
+            # A self-referential absorb (survivor absorbs its own name) would corrupt
+            # the survivor's own ledger — skip it and never mark the survivor as
+            # forwarding to itself.
+            if not abs_norm or abs_norm == survivor_norm:
                 continue
             for entry in result.get(abs_norm) or []:
                 if not isinstance(entry, dict):
+                    continue
+                # A prior consolidation's forwarding marker is a pointer, not proof;
+                # do not launder it onto the survivor as an evidence entry.
+                if _entry_is_absorption_forward(entry):
                     continue
                 tid = entry.get("task_id", "")
                 if tid not in seen_task_ids:
                     merged.append(entry)
                     seen_task_ids.add(tid)
-            result.pop(abs_norm, None)
+            # Leave a durable forwarding marker under the absorbed key instead of
+            # popping it, so the platform-recorded alias map can resolve a dependent
+            # naming the old absorbed capability to the survivor's moved proof.
+            result[abs_norm] = [
+                _absorption_forward_marker(survivor_norm, abs_norm, proved_at)
+            ]
 
         if len(merged) > _MAX_PROOF_ENTRIES_PER_CAPABILITY:
             merged = merged[-_MAX_PROOF_ENTRIES_PER_CAPABILITY:]
@@ -906,6 +1624,123 @@ async def _read_file_at_head(path: str, repo_root: str = "/tmp/workspace") -> st
             "[CAPABILITY_PROOF] failed to read %s at HEAD", path, exc_info=True
         )
         return None
+
+
+async def _read_file_on_branch(
+    path: str,
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    branch: str,
+    project_id: str | None = None,
+) -> str | None:
+    """Return the contents of ``path`` on ``owner/repo@branch``, or ``None``.
+
+    GitHub-backed twin of :func:`_read_file_at_head` for a backend with no local
+    checkout (production runs under ``/app`` with no ``/tmp/workspace``). Reads
+    the file text from the project's real integration-branch tree via the cached
+    snapshot reader (:func:`app.github_repo_snapshot.file_text_on_branch`).
+
+    ``None`` on any indeterminacy — snapshot unavailable, path absent, or a
+    present-but-unreadable blob — so the caller degrades to a lower proof tier
+    exactly as it does when a local checkout is missing. Never raises.
+    """
+    if not path or not isinstance(path, str):
+        return None
+    try:
+        from app.github_repo_snapshot import file_text_on_branch
+
+        exists, text = await file_text_on_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] failed to read %s on branch %s", path, branch,
+            exc_info=True,
+        )
+        return None
+    # exists is tri-state (True/False/None); only a definitely-present file with
+    # readable text yields content — absent/indeterminate/unreadable all degrade.
+    if exists is not True:
+        return None
+    return text
+
+
+async def _resolve_head_access(session: Any, project: Any):
+    """Return ``(verify_path, read_head)`` bound to the project's real source.
+
+    The capability-proof earn loop validates source references against HEAD. In
+    production the backend image runs under ``/app`` with no ``/tmp/workspace``
+    checkout, so the local-git helpers (:func:`_path_exists_at_head`,
+    :func:`_read_file_at_head`) resolve indeterminate and every earn attempt
+    stalls. When a ``session`` and ``project`` are available this resolves the
+    project's GitHub integration-branch context (the SAME
+    :func:`app.source_ref_validation.resolve_branch_verification_context` the
+    design-doc grounding path uses) and returns reader callables backed by the
+    cached branch-tree snapshot.
+
+    Falls back to the local-checkout helpers when no session/project is supplied
+    or the project's GitHub credentials do not resolve — preserving local
+    validation whenever a real checkout is explicitly available (the agent VM).
+    Both callables keep the tri-state ``True``/``False``/``None`` contract, so
+    an unavailable snapshot degrades conservatively and never over-claims proof.
+    """
+    from app.source_ref_validation import _path_exists_at_head
+
+    local = (_path_exists_at_head, _read_file_at_head)
+    if session is None or project is None:
+        return local
+
+    try:
+        from app.source_ref_validation import resolve_branch_verification_context
+
+        ctx = await resolve_branch_verification_context(session, project)
+    except Exception:  # noqa: BLE001 — advisory earn path must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] branch verification context resolution failed; "
+            "falling back to local HEAD",
+            exc_info=True,
+        )
+        return local
+
+    token = ctx.get("token")
+    owner = ctx.get("owner")
+    repo = ctx.get("repo")
+    branch = ctx.get("branch")
+    project_id = ctx.get("project_id")
+    if not (token and owner and repo and branch):
+        # No authorized repo credentials — fall back to local git HEAD.
+        return local
+
+    from app.source_ref_validation import _file_exists_in_repo_branch
+
+    async def _verify(path: str) -> bool | None:
+        return await _file_exists_in_repo_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+
+    async def _read(path: str) -> str | None:
+        return await _read_file_on_branch(
+            path,
+            token=token,
+            owner=owner,
+            repo=repo,
+            branch=branch,
+            project_id=project_id,
+        )
+
+    return (_verify, _read)
 
 
 async def _named_tests_covering_paths(
@@ -1095,6 +1930,156 @@ async def _discover_candidate_backing_paths(
     return verified
 
 
+async def resolve_no_backing_paths_gap(
+    cap_name: str,
+    *,
+    raw_name: str | None = None,
+    verify_path=None,
+    read_head=None,
+    session: Any = None,
+    read_head_sha=None,
+    now: Any = None,
+    project: Any = None,
+) -> dict[str, Any]:
+    """Attempt to resolve a proof gap for a working capability with no backing_paths.
+
+    Performs automated discovery of candidate backing paths by deriving search
+    tokens from the capability name and scanning the HEAD file tree. When
+    candidates are found:
+
+    * If a convention-named test file for EVERY candidate exists at HEAD and
+      imports it, a ``named_test_present`` proof is recorded (``path_proven``
+      tier).  Under the execution-trials flag an actual trial is enrolled instead,
+      earning the eventual ``proven`` tier.
+    * Otherwise, if candidates exist at HEAD but lack test coverage, a
+      ``backing_path`` proof is recorded (``path_proven`` tier).
+
+    When no candidates are found at all, returns ``resolved=False`` so the caller
+    can report the cap as needing manual backing-path assignment.
+
+    All IO callables are injectable so the function is unit-testable without a
+    git checkout. Never raises: any error degrades to ``{"resolved": False}``.
+
+    Returns
+    -------
+    A dict with the following keys:
+        resolved (bool): True when a proof was recorded (or trial enrolled).
+        proof_kind (str | None): ``"named_test_present"``, ``"backing_path"``,
+            or ``None`` when unresolved.
+        trial_enrolled (bool): True when an execution trial was enrolled.
+        named_test_earned (bool): True when a ``named_test_present`` proof was
+            recorded (as opposed to the ``backing_path`` fallback).
+        trial_fresh (bool): True when a fresh executed proof already covers HEAD.
+        discovery_suggestions (list[str]): Candidate paths discovered, if any.
+    """
+    from app.source_ref_validation import _path_exists_at_head
+
+    _verify = verify_path or _path_exists_at_head
+    _read_head = read_head or _read_file_at_head
+
+    try:
+        candidates = await _discover_candidate_backing_paths(
+            cap_name, verify_path=_verify,
+        )
+    except Exception:  # noqa: BLE001 — discovery must degrade, never raise
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: discovery "
+            "failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        candidates = []
+
+    if not candidates:
+        return {
+            "resolved": False,
+            "proof_kind": None,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": [],
+        }
+
+    try:
+        test_refs = await _named_tests_covering_paths(
+            candidates, verify_path=_verify, read_head=_read_head
+        )
+    except Exception:  # noqa: BLE001 — test discovery failure is non-fatal
+        logger.warning(
+            "[CAPABILITY_PROOF] resolve_no_backing_paths_gap: named-test "
+            "discovery failed for cap=%s",
+            cap_name,
+            exc_info=True,
+        )
+        test_refs = []
+
+    if test_refs:
+        trial_outcome = await _maybe_enroll_proof_trial(
+            session,
+            project,
+            raw_name or cap_name,
+            cap_name,
+            test_refs,
+            read_head_sha=read_head_sha,
+            now=now,
+        )
+        if trial_outcome == "enrolled":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": True,
+                "named_test_earned": False,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+        if trial_outcome == "fresh":
+            return {
+                "resolved": True,
+                "proof_kind": None,
+                "trial_enrolled": False,
+                "named_test_earned": False,
+                "trial_fresh": True,
+                "discovery_suggestions": candidates,
+            }
+
+        recorded = record_capability_named_test_proof(
+            project, raw_name or cap_name, test_refs
+        )
+        if recorded:
+            return {
+                "resolved": True,
+                "proof_kind": _PROOF_KIND_NAMED_TEST_PRESENT,
+                "trial_enrolled": False,
+                "named_test_earned": True,
+                "trial_fresh": False,
+                "discovery_suggestions": candidates,
+            }
+
+    # Fallback: backing_path proof when candidates exist but no covering test.
+    recorded = record_capability_backing_path_proof(
+        project, raw_name or cap_name
+    )
+    if recorded:
+        return {
+            "resolved": True,
+            "proof_kind": _PROOF_KIND_BACKING_PATH,
+            "trial_enrolled": False,
+            "named_test_earned": False,
+            "trial_fresh": False,
+            "discovery_suggestions": candidates,
+        }
+
+    # Dedup or recording failure — cap stays unresolved but suggestions exist.
+    return {
+        "resolved": False,
+        "proof_kind": None,
+        "trial_enrolled": False,
+        "named_test_earned": False,
+        "trial_fresh": False,
+        "discovery_suggestions": candidates,
+    }
+
+
 async def commission_proof_earn_loop(
     project: Any,
     demand_result: dict[str, Any],
@@ -1102,6 +2087,9 @@ async def commission_proof_earn_loop(
     *,
     verify_path=None,
     read_head=None,
+    session: Any = None,
+    read_head_sha=None,
+    now: Any = None,
 ) -> dict[str, Any]:
     """Earn proof for demanded unproven working capabilities.
 
@@ -1130,9 +2118,14 @@ async def commission_proof_earn_loop(
        (:func:`record_capability_backing_path_proof`, also ``path_proven``).
 
     3. For each demanded unproven capability that has NO ``backing_paths``:
-       no automated verification is possible — the gap is reported in the
-       return summary so callers (reaper sweeps, advisory hint builders) can
-       surface it.
+       automated discovery is attempted via :func:`resolve_no_backing_paths_gap`:
+       search tokens derived from the capability name locate candidate files at
+       HEAD; when candidates are found and a covering test exists, a
+       ``named_test_present`` (path_proven) proof is recorded (or an execution
+       trial enrolled); when candidates exist but lack test coverage, a
+       ``backing_path`` (path_proven) proof is recorded.  Caps that cannot be
+       auto-resolved (no discoverable candidates) are reported in the return
+       summary so callers can surface the gap.
 
     Parameters
     ----------
@@ -1155,13 +2148,34 @@ async def commission_proof_earn_loop(
         contents of a test file (or ``None`` when indeterminate).  Defaults to
         :func:`_read_file_at_head`.  Injected for testability so the
         named_test-present branch can be exercised without a git checkout.
+    session:
+        Async DB session.  When supplied AND the
+        ``capability_proof_execution_trials_enabled`` runtime flag is ON, a
+        capability whose covering tests are discovered ENROLLS a bounded
+        ``capability_proof_trial`` (executed → genuine ``proven`` tier) instead of
+        recording the static ``named_test_present`` proof.  When ``None`` (or the
+        flag is off), behaviour is byte-for-byte the legacy ``path_proven`` path.
+    read_head_sha:
+        Async callable ``() -> str | None`` returning the current HEAD SHA, used
+        for the trial cadence/idempotence guard (re-enroll only when HEAD moved or
+        the executed proof aged out).  Defaults to :func:`_default_read_head_sha`;
+        injected for testability.
+    now:
+        Reference time for the executed-proof freshness check; defaults to
+        :func:`app.time_utils._utcnow`.
 
     Returns
     -------
     A summary dict:
     ``{"total_demanded_unproven": int, "earned": int, "no_backing_paths": list[str],
       "still_unproven": list[str], "path_proven_stuck": list[str],
-      "named_test_earned": list[str]}``.
+      "named_test_earned": list[str], "named_test_executed": list[str],
+      "execution_proven": list[str]}``.
+    ``named_test_executed`` is the subset of caps that enrolled a real execution
+    trial this sweep (flag on) — the path that earns the ``proven`` tier.
+    ``execution_proven`` is the subset of caps that already carry a fresh green
+    executed proof covering HEAD — these caps currently clear the enforce gate and
+    did not need re-enrollment this sweep.
     Total entries found, count of newly-recorded proofs (named_test_present +
     backing_path), capability names with no backing_paths, remaining unproven
     names (failed path check), already-recorded (stuck) names that were not newly
@@ -1169,7 +2183,8 @@ async def commission_proof_earn_loop(
     ``named_test_present`` proof (a convention test file is present at HEAD).
     NOTE: both recorded tiers are graded ``path_proven`` — neither clears the
     enforce gate; a capability reaches ``proven`` only via a real green
-    merge-test acceptance verdict (:func:`record_capability_proof`).
+    merge-test acceptance verdict (:func:`record_capability_proof`). Caps in
+    ``execution_proven`` already cleared the gate via a prior real execution.
     """
     from app.capability_demand import compute_unproven_demanded_capabilities
     from app.source_ref_validation import (
@@ -1177,13 +2192,89 @@ async def commission_proof_earn_loop(
         _path_exists_at_head,
     )
 
-    _verify = verify_path or _path_exists_at_head
-    _read_head = read_head or _read_file_at_head
+    # Resolve the HEAD readers. When the caller injects neither hook (the
+    # production path), bind them to the project's real source: GitHub
+    # integration branch when credentials resolve, else the local checkout.
+    # This lets a backend with no /tmp/workspace checkout (prod runs under
+    # /app) still validate source references. An explicitly-injected hook (unit
+    # tests) is always honoured verbatim and never triggers credential
+    # resolution.
+    if verify_path is None and read_head is None:
+        _verify, _read_head = await _resolve_head_access(session, project)
+    else:
+        _verify = verify_path or _path_exists_at_head
+        _read_head = read_head or _read_file_at_head
 
     # Step 1: compute the intersection.
     demanded_unproven = compute_unproven_demanded_capabilities(
-        demand_result, problem_model
+        demand_result,
+        problem_model,
+        getattr(project, "capability_proof_records", None),
+        now=now,
     )
+    # A still-fresh executed proof can clear the ordinary proof gate while being
+    # bound to an older revision. Keep such demanded capabilities in the earn
+    # loop when execution trials are enabled so the cadence guard below can
+    # re-enroll them after HEAD moves (or the proof ages out). Without this
+    # revision-aware supplement, the initial gate-status intersection filters
+    # them out before _maybe_enroll_proof_trial can compare commit_sha to HEAD.
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        _trials_enabled = bool(
+            session is not None
+            and (_rc or {}).get("capability_proof_execution_trials_enabled", False)
+        )
+    except Exception:  # noqa: BLE001 - optional trial path must degrade safely
+        _trials_enabled = False
+
+    if _trials_enabled:
+        _resolve_sha = read_head_sha or _default_read_head_sha
+        try:
+            _current_head_sha = await _resolve_sha()
+        except Exception:  # noqa: BLE001 - indeterminate HEAD permits re-verification
+            _current_head_sha = None
+
+        _records = getattr(project, "capability_proof_records", None)
+        _already = {
+            normalize_capability_name(entry.get("ref"))
+            for entry in demanded_unproven
+            if isinstance(entry, dict)
+        }
+        _working_names = set(
+            working_capability_proof_status(
+                problem_model, now=now, proof_records=_records
+            )
+        )
+        for _demand in (demand_result.get("demands") or []):
+            if not isinstance(_demand, dict) or _demand.get("kind") != "capability":
+                continue
+            _cap = normalize_capability_name(_demand.get("ref"))
+            if not _cap or _cap in _already or _cap not in _working_names:
+                continue
+            _entries = _records.get(_cap) if isinstance(_records, dict) else None
+            _has_revision_bound_proof = any(
+                isinstance(_entry, dict)
+                and (
+                    _entry.get("task_id") == f"named_test_exec:{_cap}"
+                    or (
+                        _entry.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+                        and isinstance(_entry.get("commit_sha"), str)
+                        and bool(_entry.get("commit_sha"))
+                    )
+                )
+                for _entry in (_entries or [])
+            )
+            if (
+                _has_revision_bound_proof
+                and not _fresh_executed_proof_covers_head(
+                    project, _cap, _current_head_sha, now=now
+                )
+            ):
+                _candidate = dict(_demand)
+                _candidate["proof_status"] = "revision_stale"
+                demanded_unproven.append(_candidate)
+                _already.add(_cap)
     if not demanded_unproven:
         return {
             "total_demanded_unproven": 0,
@@ -1192,12 +2283,16 @@ async def commission_proof_earn_loop(
             "still_unproven": [],
             "path_proven_stuck": [],
             "named_test_earned": [],
+            "named_test_executed": [],
+            "execution_proven": [],
         }
 
-    # Step 1b: defensive filter — skip exempt capabilities (they classify as
-    # "proven" via working_capability_proof_status, so they should never appear
-    # in demanded_unproven, but this is a belt-and-suspenders guard).
-    _exempt = exempt_capability_names(problem_model)
+    # Step 1b: defensive filter — skip platform-exempt capabilities (the
+    # authoritative grade already clears them, so they should never appear in
+    # demanded_unproven, but this is a belt-and-suspenders guard).
+    _exempt = exempt_capability_names(
+        problem_model, getattr(project, "capability_proof_records", None)
+    )
     if _exempt:
         demanded_unproven = [
             e
@@ -1212,6 +2307,8 @@ async def commission_proof_earn_loop(
                 "still_unproven": [],
                 "path_proven_stuck": [],
                 "named_test_earned": [],
+                "named_test_executed": [],
+                "execution_proven": [],
             }
 
     # Build a lookup: canonical-name -> (raw_name, backing_paths).
@@ -1234,6 +2331,8 @@ async def commission_proof_earn_loop(
 
     earned_names: list[str] = []
     named_test_earned: list[str] = []
+    named_test_executed: list[str] = []
+    execution_proven: list[str] = []
     no_backing_paths: list[str] = []
     still_unproven: list[str] = []
     path_proven_stuck: list[str] = []
@@ -1246,7 +2345,28 @@ async def commission_proof_earn_loop(
 
         raw_name, backing_paths = cap_backing.get(canonical, (None, []))
         if not backing_paths:
-            no_backing_paths.append(canonical)
+            # Try automated discovery + auto-resolve for caps without backing_paths.
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                if gap_result.get("trial_fresh"):
+                    execution_proven.append(canonical)
+                else:
+                    earned_names.append(canonical)
+                    if gap_result.get("named_test_earned"):
+                        named_test_earned.append(canonical)
+                    if gap_result.get("trial_enrolled"):
+                        named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Filter to file-like paths.
@@ -1255,7 +2375,29 @@ async def commission_proof_earn_loop(
             if isinstance(p, str) and _looks_like_file_path(p)
         ]
         if not file_paths:
-            no_backing_paths.append(canonical)
+            # Same discovery + auto-resolve for caps whose declared paths are
+            # not file-like (no automated verification possible from them).
+            gap_result = await resolve_no_backing_paths_gap(
+                canonical,
+                raw_name=raw_name or canonical,
+                verify_path=_verify,
+                read_head=_read_head,
+                session=session,
+                read_head_sha=read_head_sha,
+                now=now,
+                project=project,
+            )
+            if gap_result.get("resolved"):
+                if gap_result.get("trial_fresh"):
+                    execution_proven.append(canonical)
+                else:
+                    earned_names.append(canonical)
+                    if gap_result.get("named_test_earned"):
+                        named_test_earned.append(canonical)
+                    if gap_result.get("trial_enrolled"):
+                        named_test_executed.append(canonical)
+            else:
+                no_backing_paths.append(canonical)
             continue
 
         # Verify every path at HEAD.  A single None (indeterminate) or False
@@ -1282,6 +2424,31 @@ async def commission_proof_earn_loop(
                 file_paths, verify_path=_verify, read_head=_read_head
             )
             if test_refs:
+                # Slice 3 (design 84021e2d): under the execution-trials flag, a
+                # discovered-covered cap ENROLLS a bounded capability_proof_trial
+                # that actually RUNS the covering tests — a green run mints the
+                # real ``proven`` tier. Cadence-guarded: no fresh trial when a
+                # green executed proof already covers HEAD; re-enroll when it aged
+                # out or HEAD moved. Flag-off / degraded / no-session falls through
+                # to the UNCHANGED static ``named_test_present`` recording below.
+                trial_outcome = await _maybe_enroll_proof_trial(
+                    session,
+                    project,
+                    raw_name or canonical,
+                    canonical,
+                    test_refs,
+                    read_head_sha=read_head_sha,
+                    now=now,
+                )
+                if trial_outcome == "enrolled":
+                    named_test_executed.append(canonical)
+                    continue
+                if trial_outcome == "fresh":
+                    # A fresh green executed proof already covers HEAD — nothing
+                    # to re-verify. Do NOT downgrade to the static proof.
+                    execution_proven.append(canonical)
+                    continue
+
                 recorded = record_capability_named_test_proof(
                     project, raw_name or canonical, test_refs
                 )
@@ -1312,12 +2479,15 @@ async def commission_proof_earn_loop(
     logger.info(
         "[CAPABILITY_PROOF] commission_proof_earn_loop: "
         "total_demanded_unproven=%d earned=%d named_test_earned=%d "
-        "no_backing_paths=%d still_unproven=%d",
+        "named_test_executed=%d no_backing_paths=%d still_unproven=%d "
+        "execution_proven=%d",
         len(demanded_unproven),
         len(earned_names),
         len(named_test_earned),
+        len(named_test_executed),
         len(no_backing_paths),
         len(still_unproven),
+        len(execution_proven),
     )
 
     return {
@@ -1327,4 +2497,6 @@ async def commission_proof_earn_loop(
         "still_unproven": still_unproven,
         "path_proven_stuck": path_proven_stuck,
         "named_test_earned": named_test_earned,
+        "named_test_executed": named_test_executed,
+        "execution_proven": execution_proven,
     }

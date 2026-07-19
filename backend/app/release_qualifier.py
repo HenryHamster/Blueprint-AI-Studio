@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import uuid
@@ -91,10 +92,7 @@ from app.acceptance_gate import (
     classify_merged_acceptance_context,
     classify_undeclared_reason,
 )
-from app.acceptance_criteria import (
-    get_active_criteria_rubric,
-    get_version_coverage_summary,
-)
+from app.acceptance_criteria import get_criteria_for_version, get_version_coverage_summary
 
 # Per-(sha, category) goal-verdict ledger (goal-verification redesign).  A SIBLING
 # module owns this file; it may not be present in every checkout during the
@@ -220,6 +218,7 @@ from app.release_scoring import (
     _reconcile_audit_with_challenge,
     _score_audit,
     _score_completion_debt_pressure,
+    _score_env_preflight,
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
@@ -260,9 +259,20 @@ from app.release_qualifier_sweep import (
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
+    _reconcile_hotfix_audit_trail,  # noqa: F401
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )
-from app.migration_apply_gate import run_migration_apply_gate
+from app.migration_apply_gate import (
+    MIGRATION_APPLY_SCRATCH_ENV,
+    preflight_migration_apply_scratch,
+    run_migration_apply_gate,
+)
+from app.env_preflight_evidence import sanitize_env_preflight_artifact
+from app.qualification_dimensions import (
+    LEDGER_DIMENSION_KEYS,
+    MUTABLE_DIMENSION_KEYS,
+    PROMOTION_REQUIRED_DIMENSIONS,
+)
 from app.rollup_migration_validation import (
     check_qualification_migration_identity,
 )
@@ -303,6 +313,30 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
 
+# Explicit enumeration of every dimension written by _dual_write_dimension_results.
+# This constant is asserted == LEDGER_DIMENSION_KEYS at module load so any drift
+# between the spec list and the registry is caught at import time (no DB needed),
+# rather than only when _dual_write_dimension_results executes against a real session.
+_DUAL_WRITE_SPEC_DIMENSIONS: frozenset[str] = frozenset({
+    "ci",
+    "audit",
+    "test_erosion",
+    "smoketest",
+    "challenge",
+    "migration_identity",
+    "migration_apply",
+    "merge_grade",
+    "acceptance_window",
+    "debt_pressure",
+    "capability_proof",
+    "env_preflight",
+})
+assert _DUAL_WRITE_SPEC_DIMENSIONS == LEDGER_DIMENSION_KEYS, (
+    f"_DUAL_WRITE_SPEC_DIMENSIONS ({_DUAL_WRITE_SPEC_DIMENSIONS}) != "
+    f"LEDGER_DIMENSION_KEYS ({LEDGER_DIMENSION_KEYS}); "
+    f"extra: {_DUAL_WRITE_SPEC_DIMENSIONS - LEDGER_DIMENSION_KEYS}, "
+    f"missing: {LEDGER_DIMENSION_KEYS - _DUAL_WRITE_SPEC_DIMENSIONS}"
+)
 
 _NEVER_GRADED_GAP = (
     "No merge-grade verdict exists for this candidate — the acceptance contract "
@@ -310,6 +344,204 @@ _NEVER_GRADED_GAP = (
     "non-contentless goal)."
 )
 
+_RUBRIC_PROVENANCE_VERSION = 1
+_MAX_RUBRIC_DIFF_KEYS = 20
+
+def _canonicalize_rubric(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    canonical: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("criterion_key") or item.get("category_key") or "").strip()
+        if not key or key in seen:
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        canonical.append({"criterion_key": key, "text": text})
+        seen.add(key)
+    return canonical
+
+def _rubric_fingerprint(snapshot: list[dict[str, str]]) -> str:
+    encoded = json.dumps(
+        _canonicalize_rubric(snapshot),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+def _qualification_attempt_id(
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any] | None = None,
+) -> str | None:
+    raw = (qual or {}).get("qualification_attempt_id")
+    if raw is None:
+        raw = (version.last_qualification or {}).get("qualification_attempt_id")
+    return str(raw) if raw not in (None, "") else None
+
+def _rubric_provenance(
+    snapshot: list[dict[str, str]],
+    *,
+    source: str,
+    qualification_attempt_id: str | None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _RUBRIC_PROVENANCE_VERSION,
+        "source": source,
+        "fingerprint": _rubric_fingerprint(snapshot),
+        "criteria": snapshot,
+        "qualification_attempt_id": qualification_attempt_id,
+    }
+
+def _rubric_detail_provenance(detail: Any) -> dict[str, Any] | None:
+    if not isinstance(detail, dict):
+        return None
+    nested = detail.get("rubric_provenance")
+    if isinstance(nested, dict):
+        return nested
+    if isinstance(detail.get("fingerprint"), str) and isinstance(
+        detail.get("criteria"), list
+    ):
+        return detail
+    return None
+
+def _rubric_dimension_reusable(
+    detail: Any,
+    *,
+    fingerprint: str,
+    qualification_attempt_id: str | None,
+) -> bool:
+    provenance = _rubric_detail_provenance(detail)
+    if provenance is None or provenance.get("fingerprint") != fingerprint:
+        return False
+    # A rubric-bound fact proves a particular qualification attempt, not merely
+    # a rubric's contents.  Older projections may not yet carry the first-class
+    # attempt id; fail closed in that rolling state rather than letting a
+    # same-SHA re-drive silently borrow a prior blind grade.
+    stored_attempt_id = provenance.get("qualification_attempt_id")
+    if qualification_attempt_id is None or stored_attempt_id in (None, ""):
+        return False
+    return stored_attempt_id == qualification_attempt_id
+
+async def _snapshot_qualification_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    rows = await get_criteria_for_version(session, version.id)
+    active = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in rows
+            if row.status == "active"
+        ]
+    )
+    lifecycle = [
+        {
+            "criterion_key": str(row.criterion_key),
+            "status": str(row.status),
+        }
+        for row in rows
+        if row.criterion_key
+    ]
+    return active, lifecycle
+
+async def _resolve_launched_rubric(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+) -> tuple[list[dict[str, str]] | None, dict[str, Any] | None, str | None]:
+    if isinstance(qual.get("rubric_snapshot"), list):
+        snapshot = _canonicalize_rubric(qual["rubric_snapshot"])
+        fingerprint = _rubric_fingerprint(snapshot)
+        stored = qual.get("rubric_fingerprint")
+        if stored not in (None, fingerprint):
+            return None, None, "stored_rubric_fingerprint_mismatch"
+        return (
+            snapshot,
+            _rubric_provenance(
+                snapshot,
+                source="attempt_projection",
+                qualification_attempt_id=_qualification_attempt_id(version, qual),
+            ),
+            None,
+        )
+
+    task_id = qual.get("merge_grade_task_id")
+    if task_id:
+        try:
+            task = await session.get(Task, uuid.UUID(str(task_id)))
+        except (TypeError, ValueError, AttributeError):
+            task = None
+        payload = task.first_payload if task is not None else None
+        if isinstance(payload, dict) and isinstance(payload.get("categories"), list):
+            snapshot = _canonicalize_rubric(payload["categories"])
+            return (
+                snapshot,
+                _rubric_provenance(
+                    snapshot,
+                    source="legacy_merge_grade_task_payload",
+                    qualification_attempt_id=_qualification_attempt_id(version, qual),
+                ),
+                None,
+            )
+        return None, None, "merge_grade_task_payload_has_no_rubric"
+
+    return None, None, "pending_attempt_has_no_rubric_snapshot_or_grade_payload"
+
+def _bounded_rubric_drift(
+    launched: list[dict[str, str]],
+    live: list[dict[str, str]],
+    launched_lifecycle: Any,
+    live_lifecycle: list[dict[str, str]],
+) -> dict[str, Any] | None:
+    launched_by_key = {row["criterion_key"]: row["text"] for row in launched}
+    live_by_key = {row["criterion_key"]: row["text"] for row in live}
+    prior_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in (launched_lifecycle or [])
+        if isinstance(row, dict) and row.get("criterion_key")
+    }
+    live_status = {
+        str(row.get("criterion_key")): str(row.get("status"))
+        for row in live_lifecycle
+        if row.get("criterion_key")
+    }
+    added = [key for key in live_by_key if key not in launched_by_key]
+    removed = [key for key in launched_by_key if key not in live_by_key]
+    changed = [
+        key
+        for key in launched_by_key.keys() & live_by_key.keys()
+        if launched_by_key[key] != live_by_key[key]
+    ]
+    if not added and not removed and not changed:
+        return None
+    changes: list[dict[str, str]] = []
+    for key in added:
+        kind = (
+            "reinstated"
+            if prior_status.get(key) in {"retracted", "superseded"}
+            else "added"
+        )
+        changes.append({"criterion_key": key, "change": kind})
+    for key in removed:
+        status = live_status.get(key)
+        kind = status if status in {"retracted", "superseded"} else "removed"
+        changes.append({"criterion_key": key, "change": kind})
+    changes.extend(
+        {"criterion_key": key, "change": "changed"} for key in changed
+    )
+    bounded_changes = changes[:_MAX_RUBRIC_DIFF_KEYS]
+    return {
+        "added_keys": added[:_MAX_RUBRIC_DIFF_KEYS],
+        "removed_keys": removed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changed_keys": changed[:_MAX_RUBRIC_DIFF_KEYS],
+        "changes": bounded_changes,
+        "total_changes": len(changes),
+        "truncated": len(changes) > len(bounded_changes),
+        "launched_fingerprint": _rubric_fingerprint(launched),
+        "live_fingerprint": _rubric_fingerprint(live),
+    }
 
 def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any]]:
     """Fail-CLOSED verdicts for a candidate that was NEVER graded.
@@ -338,7 +570,6 @@ def _never_graded_category_verdicts(active_keys: set[str]) -> list[dict[str, Any
         for key in sorted(k for k in active_keys if k)
     ]
 
-
 def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
     """Coerce a category-verdict row read back from the ledger into a plain dict.
 
@@ -355,8 +586,12 @@ def _coerce_ledger_category_verdict(v: Any) -> dict[str, Any]:
         "status": getattr(v, "status", None),
         "tier": getattr(v, "tier", "judged"),
         "gap": getattr(v, "gap", None),
+        "grader_run_id": (
+            str(getattr(v, "grader_run_id", ""))
+            if getattr(v, "grader_run_id", None)
+            else None
+        ),
     }
-
 
 def _fail_closed_category_verdicts(
     active_keys: set[str | None],
@@ -377,7 +612,6 @@ def _fail_closed_category_verdicts(
         for k in sorted(k for k in active_keys if k)
     ]
     return verdicts or None
-
 
 def _is_audited_surface_path(path: str) -> bool:
     """True when a file is part of the code surface a release audit judges.
@@ -402,7 +636,6 @@ def _is_audited_surface_path(path: str) -> bool:
         return False
     return not p.endswith(".md")
 
-
 def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
     """Content hash of the audited code surface at a candidate ref.
 
@@ -417,16 +650,11 @@ def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
     None when the tree is unavailable — fail-open: no reuse, the normal
     SHA-keyed cache path applies.
     """
-    if not tree_entries:
-        return None
-    relevant = sorted(
-        (str(e["path"]), str(e["sha"]))
-        for e in tree_entries
-        if isinstance(e, dict)
-        and e.get("sha")
-        and e.get("path")
-        and _is_audited_surface_path(str(e["path"]))
-    )
+    return _audited_surface_hash_from_map(audited_surface_path_map(tree_entries))
+
+def _audited_surface_hash_from_map(surface: dict[str, str]) -> str | None:
+    """Hash an already-normalized audited-surface map."""
+    relevant = sorted(surface.items())
     if not relevant:
         return None
     h = hashlib.sha256()
@@ -437,10 +665,319 @@ def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
         h.update(b"\n")
     return h.hexdigest()
 
+def audited_surface_path_map(tree_entries: list[dict] | None) -> dict[str, str]:
+    """Return the durable ``path -> blob_sha`` identity of an audited tree."""
+    if not tree_entries:
+        return {}
+    return {
+        str(entry["path"]): str(entry["sha"])
+        for entry in tree_entries
+        if isinstance(entry, dict)
+        and entry.get("sha")
+        and entry.get("path")
+        and _is_audited_surface_path(str(entry["path"]))
+    }
+
+def _changed_audited_surface_paths(
+    prior: dict[str, str],
+    current: dict[str, str],
+) -> list[str]:
+    """Return added, removed, or blob-changed audited paths."""
+    return sorted(
+        path
+        for path in set(prior) | set(current)
+        if prior.get(path) != current.get(path)
+    )
+
+def _audit_detail_surface_map(detail: Any) -> dict[str, str] | None:
+    """Read and validate a persisted per-path audited-surface identity."""
+    if not isinstance(detail, dict):
+        return None
+    raw = detail.get("audited_surface_paths")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    normalized: dict[str, str] = {}
+    for path, blob_sha in raw.items():
+        if not isinstance(path, str) or not path or not isinstance(blob_sha, str):
+            return None
+        if not blob_sha:
+            return None
+        normalized[path] = blob_sha
+    return normalized
+
+def _audit_detail_is_delta_reusable(detail: Any) -> bool:
+    """True when detail contains a complete, path-addressable audit fact."""
+    complete = bool(
+        _audit_detail_surface_map(detail)
+        and isinstance(detail, dict)
+        and not detail.get("audit_findings_truncated")
+        and not detail.get("excluded_audit_findings_truncated")
+        and isinstance(detail.get("audit_findings"), list)
+        and isinstance(detail.get("excluded_audit_findings"), list)
+    )
+    if not complete:
+        return False
+    return all(
+        _audit_finding_path(finding)
+        for finding in [
+            *detail.get("audit_findings", []),
+            *detail.get("excluded_audit_findings", []),
+        ]
+    )
+
+def _audit_report_raw_findings(report: Any) -> list[Any]:
+    if not isinstance(report, dict):
+        return []
+    findings = report.get("findings")
+    if not isinstance(findings, list):
+        findings = report.get("issues")
+    return list(findings) if isinstance(findings, list) else []
+
+def _audit_finding_identity(finding: Any) -> str:
+    if not isinstance(finding, dict):
+        return f"text:{finding!s}"
+    # A surface key identifies a file/blob, not a unique finding.
+    for key in ("key",):
+        value = str(finding.get(key) or "").strip()
+        if value:
+            return f"{key}:{value}"
+    return "|".join(
+        (
+            str(finding.get("file") or finding.get("path") or "").lower(),
+            str(finding.get("severity") or finding.get("level") or "").lower(),
+            str(
+                finding.get("summary")
+                or finding.get("description")
+                or finding.get("title")
+                or finding.get("text")
+                or ""
+            ).strip(),
+        )
+    )
+
+def _audit_finding_path(finding: Any) -> str | None:
+    if not isinstance(finding, dict):
+        return None
+    path = str(finding.get("file") or finding.get("path") or "").strip()
+    return path or None
+
+def _reviewed_audit_paths(report: Any) -> set[str]:
+    """Return the paths explicitly superseded by a scoped audit report."""
+    if not isinstance(report, dict):
+        return set()
+    reviewed = report.get("reviewed_paths")
+    if not isinstance(reviewed, dict):
+        scope = report.get("audit_scope")
+        reviewed = scope.get("reviewed_paths") if isinstance(scope, dict) else None
+    if isinstance(reviewed, dict):
+        return {
+            str(path)
+            for path, verdict in reviewed.items()
+            if isinstance(path, str)
+            and path
+            and str(verdict or "").lower() in {"clean", "finding"}
+        }
+    scope = report.get("audit_scope")
+    changed = scope.get("changed_paths") if isinstance(scope, dict) else None
+    if not isinstance(changed, list):
+        return set()
+    return {str(path) for path in changed if isinstance(path, str) and path}
+
+def _audit_report_confirms_incremental_base(report: Any, expected_base_sha: str) -> bool:
+    scope = report.get("audit_scope") if isinstance(report, dict) else None
+    return bool(
+        isinstance(scope, dict)
+        and scope.get("mode") == "incremental"
+        and expected_base_sha
+        and str(scope.get("effective_base_sha") or "").strip() == expected_base_sha
+    )
+
+def _carried_finding_as_report_item(
+    finding: dict[str, Any],
+    *,
+    verified: bool,
+) -> dict[str, Any]:
+    """Restore a compact ledger finding to a scoreable report item."""
+    item = dict(finding)
+    if verified:
+        # Higher-severity findings only entered the durable audit fact after
+        # verification/challenge. Preserve that established trust when the
+        # unchanged path is carried into a later scoped report.
+        item["verification_note"] = (
+            "Carried from a prior verified per-path audit dimension fact."
+        )
+    else:
+        item.pop("verification_note", None)
+    return item
+
+def _merge_scoped_audit_report_with_prior_fact(
+    scored_report: dict[str, Any] | None,
+    original_report: dict[str, Any] | None,
+    prior_detail: Any,
+    *,
+    expected_base_sha: str | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Merge unchanged-path facts into a freshly reviewed delta report.
+
+    The agent-authored ``reviewed_paths`` map is authoritative when present;
+    otherwise ``audit_scope.changed_paths`` is the superseded set. Paths in that
+    set are replaced by the fresh result (including an explicit clean result).
+    Findings on every other path are carried from the durable prior audit fact.
+    """
+    if not isinstance(scored_report, dict) or not isinstance(original_report, dict):
+        return scored_report, original_report
+    if not _audit_detail_is_delta_reusable(prior_detail):
+        return scored_report, original_report
+    if not _audit_report_confirms_incremental_base(
+        original_report, str(expected_base_sha or "").strip()
+    ):
+        return scored_report, original_report
+    reviewed_paths = _reviewed_audit_paths(original_report)
+    if not reviewed_paths:
+        # Missing scope means the agent either performed a full fallback or
+        # emitted an older report. In both cases, do not compose an inferred delta.
+        return scored_report, original_report
+
+    prior_verified = prior_detail.get("audit_findings") or []
+    prior_excluded = prior_detail.get("excluded_audit_findings") or []
+    fresh_verified = _extract_audit_findings(scored_report)
+    fresh_excluded = _extract_excluded_audit_findings(original_report)
+    fresh_identities = {
+        _audit_finding_identity(finding)
+        for finding in [*fresh_verified, *fresh_excluded]
+    }
+
+    def _carry(findings: list[Any], *, verified: bool) -> list[dict[str, Any]]:
+        carried: list[dict[str, Any]] = []
+        seen = set(fresh_identities)
+        for finding in findings:
+            path = _audit_finding_path(finding)
+            if not isinstance(finding, dict) or not path or path in reviewed_paths:
+                continue
+            identity = _audit_finding_identity(finding)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            carried.append(_carried_finding_as_report_item(finding, verified=verified))
+        return carried
+
+    carried_verified = _carry(prior_verified, verified=True)
+    carried_excluded = _carry(prior_excluded, verified=False)
+    merged_scored = {
+        **scored_report,
+        "findings": [
+            *_audit_report_raw_findings(scored_report),
+            *carried_verified,
+        ],
+    }
+    merged_original = {
+        **original_report,
+        "findings": [
+            *_audit_report_raw_findings(original_report),
+            *carried_excluded,
+        ],
+    }
+    return merged_scored, merged_original
+
+def _merge_scoped_test_erosion_with_prior_fact(
+    report: dict[str, Any], prior_detail: Any, *, prior_blocked: bool
+) -> tuple[float | None, dict[str, Any] | None]:
+    """Compose cumulative erosion for an agent-confirmed incremental audit.
+
+    Sums deltas losslessly and detects restored test files via the current
+    scope's ``changed_paths``: a prior-deleted file that fell within the
+    current scoped diff but is NOT in current's ``deleted_test_files`` is
+    considered restored, dropping it from the cumulative list.  Prior blocking
+    is only preserved when at least one prior-deleted file remains present.
+    """
+    current = report.get("computed_test_erosion")
+    if not isinstance(current, dict):
+        current = report.get("test_erosion")
+    current = dict(current) if isinstance(current, dict) else {}
+    prior = dict(prior_detail) if isinstance(prior_detail, dict) else {}
+    merged = dict(current)
+
+    # Lossless delta summation: both prior and current now store ALL numerical
+    # deltas (positive and negative) so the cumulative sum is correct.
+    for field in ("test_count_delta", "assertion_delta"):
+        old, new = prior.get(field, 0), current.get(field, 0)
+        if all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in (old, new)
+        ):
+            merged[field] = old + new
+
+    # Build the set of paths examined in this scoped incremental diff.
+    _scope = report.get("audit_scope") if isinstance(report, dict) else None
+    _changed_paths: set[str] = set()
+    if isinstance(_scope, dict):
+        _raw = _scope.get("changed_paths")
+        if isinstance(_raw, list):
+            _changed_paths = {str(p) for p in _raw if isinstance(p, str) and p}
+
+    current_deleted = {
+        str(p) for p in current.get("deleted_test_files", []) if str(p)
+    }
+
+    # Carry forward prior-deleted files UNLESS they were restored (i.e. fell
+    # within this scope's changed paths but are NOT in current's deletions).
+    prior_deleted = [
+        str(p) for p in prior.get("deleted_test_files", []) if str(p)
+    ]
+    merged_deleted: list[str] = []
+    prior_still_present = False
+    for path in prior_deleted:
+        if path in _changed_paths and path not in current_deleted:
+            continue  # restored in this scoped diff
+        merged_deleted.append(path)
+        prior_still_present = True
+
+    for path in sorted(current_deleted):
+        if path not in merged_deleted:
+            merged_deleted.append(path)
+
+    if merged_deleted:
+        merged["deleted_test_files"] = merged_deleted
+
+    merged_report = {**report, "computed_test_erosion": merged}
+    _, score = _score_audit(merged_report)
+    if prior_blocked and prior_still_present:
+        score = None
+    return score, merged if merged else None
+
+def _audit_dimension_detail(
+    *,
+    surface_paths: Any,
+    audit_findings: list[dict[str, Any]],
+    excluded_audit_findings: list[dict[str, Any]],
+    findings_meta: dict[str, Any],
+    audit_missing_reason: str | None,
+    audit_scope: Any,
+) -> dict[str, Any]:
+    """Build the durable, complete per-path audit fact payload."""
+    return {
+        "audited_surface_paths": (
+            dict(surface_paths) if isinstance(surface_paths, dict) else {}
+        ),
+        "audit_findings": audit_findings,
+        "excluded_audit_findings": excluded_audit_findings,
+        "audit_findings_total": findings_meta.get("audit_findings_total", 0),
+        "audit_findings_truncated": bool(findings_meta.get("audit_findings_truncated")),
+        "excluded_audit_findings_total": findings_meta.get(
+            "excluded_audit_findings_total", 0
+        ),
+        "excluded_audit_findings_truncated": bool(
+            findings_meta.get("excluded_audit_findings_truncated")
+        ),
+        "audit_missing_reason": audit_missing_reason,
+        "audit_scope": audit_scope,
+    }
 
 def _incremental_audit_base_sha(
     prior_qualification: dict[str, Any] | None,
     candidate_sha: str,
+    *,
+    prior_audit_candidate_sha: str | None = None,
 ) -> str | None:
     """Return the prior fully-cleared audit SHA eligible as a delta baseline.
 
@@ -453,6 +990,11 @@ def _incremental_audit_base_sha(
     ``QualificationDimensionResult.detail`` JSON. This branch intentionally
     stores it in ``last_qualification`` until that ledger is backmerged.
     """
+    ledger_sha = str(prior_audit_candidate_sha or "").strip()
+    if ledger_sha and ledger_sha != candidate_sha:
+        # The agent treats this as a hint and independently verifies ancestry
+        # and range resolvability before selecting its incremental two-dot diff.
+        return ledger_sha
     if not isinstance(prior_qualification, dict):
         return None
     if prior_qualification.get("status") not in {
@@ -477,7 +1019,6 @@ def _incremental_audit_base_sha(
     if prior_qualification.get("excluded_audit_findings_total") not in (0, None):
         return None
     return prior_sha
-
 
 def _promotion_failed_reuse_eligible(
     qual: dict[str, Any] | None, candidate_diff_hash: str | None
@@ -508,7 +1049,6 @@ def _promotion_failed_reuse_eligible(
     prior_hash = qual.get("candidate_diff_hash")
     return bool(candidate_diff_hash and prior_hash and candidate_diff_hash == prior_hash)
 
-
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
 # The hardcoded fallback rubric (_DEFAULT_POLICY) and the scoring math live in
@@ -518,7 +1058,6 @@ def _promotion_failed_reuse_eligible(
 # promotion_policy.yaml lives at backend/promotion_policy.yaml — two parents up
 # from this file (backend/app/release_qualifier.py).
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "promotion_policy.yaml"
-
 
 def _policy_from_runtime_config() -> dict[str, Any] | None:
     """Return the live promotion rubric from runtime_config, or None.
@@ -563,6 +1102,12 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(_v)
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag.  Threaded through the rubric so a fleet-level runtime_config
+        # arm reaches _finalize_qualification's policy fallback.
+        _epf = _runtime_config.get("env_preflight_enabled")
+        if _epf is not None:
+            result["env_preflight_enabled"] = bool(_epf)
         return result
     except Exception as exc:  # noqa: BLE001 — fall back to the file/default on any failure
         logger.warning(
@@ -571,7 +1116,6 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
             exc,
         )
         return None
-
 
 # A project's per-project promotion threshold is clamped to this floor so a
 # project can never set a near-zero bar that silently disables its own gate.
@@ -583,7 +1127,6 @@ _MIN_AUDIT_WEIGHT = 0.2
 # Margin by which the threshold is clamped above (1 - audit_weight) so a
 # zero-audit candidate strictly fails the composite (audit can always veto).
 _AUDIT_VETO_MARGIN = 0.05
-
 
 def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
     """Resolve a per-project promotion rubric from ``Project.build_config``.
@@ -658,13 +1201,11 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         )
         return None
 
-
 # The operator-facing graduation gate for the completion-debt pressure signal.
 # ``completion_debt_weight_mode`` is a real runtime_config key (default
 # "observe"); only "enforce" lets the configured completion_debt weight reach
 # the composite blend.
 _COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
-
 
 def _resolve_completion_debt_weight_mode() -> str:
     """Return the live ``completion_debt_weight_mode`` (default "observe").
@@ -674,7 +1215,6 @@ def _resolve_completion_debt_weight_mode() -> str:
     """
     mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
     return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
-
 
 def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:
     """Mode-gate a resolved policy's ``weights["completion_debt"]`` blend factor.
@@ -715,7 +1255,6 @@ def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]
     gated["weights"] = weights
     return gated
 
-
 def _resolve_policy_with_provenance(
     project: Project | None = None,
 ) -> tuple[dict[str, Any], str, str | None]:
@@ -743,7 +1282,6 @@ def _resolve_policy_with_provenance(
         merged["threshold"] = overrides["threshold"]
         return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
     return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
-
 
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
     """Resolve the FLEET promotion rubric (no per-project override): live
@@ -798,6 +1336,10 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag from the on-disk rubric (default False when absent).
+        if "env_preflight_enabled" in parsed:
+            result["env_preflight_enabled"] = bool(parsed["env_preflight_enabled"])
         return result, "yaml_file", None
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         error = f"{exc.__class__.__name__}: {exc}"
@@ -815,7 +1357,6 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             "hardcoded_defaults",
             error,
         )
-
 
 def _load_policy(project: Project | None = None) -> dict[str, Any]:
     """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
@@ -849,7 +1390,6 @@ def _load_policy(project: Project | None = None) -> dict[str, Any]:
     policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
 
-
 def _resolve_configured_completion_debt_weight(
     project: Project | None = None,
 ) -> float:
@@ -876,7 +1416,6 @@ def _resolve_configured_completion_debt_weight(
     fleet_policy, _, _ = _resolve_fleet_policy_with_provenance()
     return coerce_completion_debt_weight(fleet_policy["weights"])
 
-
 # Terminal task statuses — a qualifier child in any of these has finished
 # (whether it succeeded, failed, was cancelled, or is BLOCKED on a precondition
 # and so will not progress without intervention). BLOCKED is included so a
@@ -896,7 +1435,6 @@ _INFRA_FAILURE_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
         TaskStatus.BLOCKED,
     }
 )
-
 
 async def _qualification_in_flight(
     session: AsyncSession,
@@ -970,7 +1508,6 @@ async def _qualification_in_flight(
     # status == "pending" but every child already terminated → not in flight.
     return any(r.status not in _TERMINAL_STATUSES for r in rows)
 
-
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
     *,
@@ -1027,46 +1564,59 @@ def _promotion_in_flight_result(
         return result
     return None
 
+def _coerce_qualification_attempt_id(value: Any) -> uuid.UUID | None:
+    """Return a UUID attempt identity, accepting legacy string projections."""
+    if value is None:
+        return None
+    try:
+        return uuid.UUID(str(value))
+    except (ValueError, TypeError, AttributeError):
+        return None
 
-async def _increment_qualification_attempts(
+def _qualification_attempt_for_record(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+) -> uuid.UUID:
+    """Resolve identity, deriving a stable UUID5 for partial legacy backfills."""
+    explicit = _coerce_qualification_attempt_id(
+        record.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(
+        getattr(version, "active_qualification_attempt_id", None)
+    )
+    if explicit is not None:
+        return explicit
+    legacy_key = ":".join(
+        (
+            str(version.id),
+            str(record.get("candidate_sha") or "unknown"),
+            str(record.get("started_at") or "unknown"),
+        )
+    )
+    return uuid.uuid5(uuid.NAMESPACE_URL, f"blueprint:qualification:{legacy_key}")
+
+async def _record_attempt_projection_atomic(
     session: AsyncSession,
     version_id: uuid.UUID,
+    *,
+    attempt_id: uuid.UUID,
+    retry_episode: int,
+    is_new_attempt: bool,
 ) -> None:
-    """Atomically bump ``qualification_attempts`` on a ReleaseVersion row.
-
-    Audit R4 MEDIUM — the ``no_credentials`` / ``sha_error`` early-return
-    paths in ``run_qualification`` run BEFORE the ``ReleaseVersion`` FOR UPDATE
-    lock is taken, so a read-modify-write
-    (``version.qualification_attempts = (version.qualification_attempts or 0) + 1``)
-    is vulnerable to a lost update: two concurrent callers (strategic
-    ``qualify_request`` + admin ``POST /qualify``) both read the same value and
-    write back the same ``+1``.
-
-    This issues a single atomic SQL ``UPDATE ... SET qualification_attempts =
-    qualification_attempts + 1`` — the increment happens in the database
-    relative to the row's current value, so concurrent callers can never lose
-    an increment.  ``COALESCE`` is used so a (defensively) NULL counter still
-    increments cleanly to 1.  Dialect-agnostic: works on both Postgres and the
-    SQLite test fixtures.
-
-    The caller's later ``session.commit()`` persists this; the in-memory
-    instance's ``qualification_attempts`` attribute is expired by the
-    ``update()`` statement's session synchronization and lazily reloads on next
-    access (the early-return callers do not read it back).
-    """
+    """Atomically publish identity and distinct lifetime/retry accounting."""
+    values: dict[str, Any] = {
+        "active_qualification_attempt_id": attempt_id,
+        "qualification_retry_episode": max(0, int(retry_episode)),
+    }
+    if is_new_attempt:
+        values["qualification_attempts"] = (
+            sa_func.coalesce(release_version.ReleaseVersion.qualification_attempts, 0)
+            + 1
+        )
     await session.execute(
         update(release_version.ReleaseVersion)
         .where(release_version.ReleaseVersion.id == version_id)
-        .values(
-            qualification_attempts=(
-                sa_func.coalesce(
-                    release_version.ReleaseVersion.qualification_attempts, 0
-                )
-                + 1
-            )
-        )
+        .values(**values)
     )
-
 
 # ---------------------------------------------------------------------------
 # Qualifier-scoped CI resolution — the real-green-build gate.
@@ -1090,7 +1640,6 @@ async def _increment_qualification_attempts(
 # candidate carries no checks of its own.  The shared helper's global
 # fail-open behaviour is unchanged for every other caller.
 # ---------------------------------------------------------------------------
-
 
 async def _resolve_candidate_ci(
     token: str,
@@ -1361,7 +1910,6 @@ async def _resolve_candidate_ci(
         "detail": "no check-runs on candidate or associated PR heads",
     }
 
-
 async def _annotate_absent_ci_integration_topology(
     *,
     token: str,
@@ -1425,7 +1973,6 @@ async def _annotate_absent_ci_integration_topology(
         topology["detail"] = "integration topology check was indeterminate"
     return {**ci_resolution, "integration_branch_topology": topology}
 
-
 def _ci_required_for_finalize(
     project: Project | None,
     ci_resolution: dict[str, Any],
@@ -1448,7 +1995,6 @@ def _ci_required_for_finalize(
     if topology.get("candidate_reachable_from_integration") is not True:
         return True
     return not proceed_on_no_checks(project, integration_branch)
-
 
 async def _resolve_ci_at_finalize(
     session: AsyncSession,
@@ -1540,11 +2086,9 @@ async def _resolve_ci_at_finalize(
         return False, degenerate_resolution
 
 
-
 # ---------------------------------------------------------------------------
 # run_qualification — the coordinator (phase 1: spawn).
 # ---------------------------------------------------------------------------
-
 
 async def _is_target_absorbed(
     token: str,
@@ -1566,7 +2110,6 @@ async def _is_target_absorbed(
     return await github.is_ancestor_of(
         token, owner, repo, target_head, candidate_sha, project_id=project_id
     )
-
 
 async def _check_lts_sync_gate(
     session: AsyncSession,
@@ -1699,7 +2242,6 @@ async def _check_lts_sync_gate(
     )
     return {"status": "deferred_unsynced", "candidate_sha": candidate_sha}
 
-
 async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -1707,6 +2249,9 @@ async def run_qualification(
     *,
     session_factory=None,
     allow_synchronous_reuse_promote: bool = False,
+    qualification_attempt_id: uuid.UUID | str | None = None,
+    retry_episode: int = 0,
+    retry_episode_cap: int | None = None,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -1776,6 +2321,13 @@ async def run_qualification(
     ``"no_credentials"``, ``"sha_error"``, ``"spawn_failed"``).  The caller
     commits the session.
     """
+    continued_attempt_id = _coerce_qualification_attempt_id(
+        qualification_attempt_id
+    )
+    attempt_id = continued_attempt_id or uuid.uuid4()
+    is_new_attempt = continued_attempt_id is None
+    retry_episode = max(0, int(retry_episode or 0))
+
     # Guard 1: only qualify a stabilize-phase candidate.  Cheap, no I/O — do
     # it before resolving credentials so a wrong-phase call is a pure no-op.
     # The phase is re-checked under the row lock further down (after the
@@ -1839,6 +2391,9 @@ async def run_qualification(
             "status": "error",
             "error": "no_credentials",
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
@@ -1848,8 +2403,18 @@ async def run_qualification(
         # (strategic qualify_request + admin POST /qualify) could otherwise
         # both read the same attempts value and write back the same +1,
         # losing one increment.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "no_credentials"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "no_credentials",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
     token, owner, repo = resolved
 
     # 2. Snapshot the candidate SHA — integration branch HEAD.  Audit C3: this
@@ -1873,14 +2438,27 @@ async def run_qualification(
             "error": "sha_error",
             "detail": f"{type(exc).__name__}: {exc}"[:300],
             "started_at": _utcnow().isoformat(),
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         flag_modified(version, "last_qualification")
         session.add(version)
         # Audit R4 MEDIUM: atomic SQL increment — see the no_credentials path
         # above.  This early return is also pre-lock, so a read-modify-write
         # would be vulnerable to a lost update under concurrent callers.
-        await _increment_qualification_attempts(session, version.id)
-        return {"status": "sha_error"}
+        await _record_attempt_projection_atomic(
+            session,
+            version.id,
+            attempt_id=attempt_id,
+            retry_episode=retry_episode,
+            is_new_attempt=is_new_attempt,
+        )
+        return {
+            "status": "sha_error",
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+        }
 
     # 3. CI check on the candidate SHA (cheap, orchestrator-side).  Done before
     #    the row lock — it is read-only external I/O.  This resolves CI through
@@ -1917,15 +2495,15 @@ async def run_qualification(
         _pre_lock_qual.get("status") in _CONCLUSIVE_VERDICT_STATUSES
         and _pre_lock_qual.get("candidate_sha") == candidate_sha
     )
-    candidate_diff_hash = (
+    candidate_tree_entries = (
         None
         if _same_sha_conclusive
-        else compute_audited_surface_hash(
-            await github.list_repo_tree_paths_at_ref(
-                token, owner, repo, candidate_sha, project_id=str(project_id)
-            )
+        else await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    candidate_audited_surface = audited_surface_path_map(candidate_tree_entries)
+    candidate_diff_hash = compute_audited_surface_hash(candidate_tree_entries)
 
     # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
     #     is behind the promotion target — it would fail the promotion merge and
@@ -2133,6 +2711,28 @@ async def run_qualification(
     # shows the coverage gate would no longer fire (a retracted/superseded
     # criterion cleared the wedge) — the acceptance-contract safety valve.
     prior_qual = version.last_qualification or {}
+    if continued_attempt_id is not None:
+        projected_attempt_id = _coerce_qualification_attempt_id(
+            prior_qual.get("qualification_attempt_id")
+        ) or _coerce_qualification_attempt_id(
+            version.active_qualification_attempt_id
+        )
+        if (
+            projected_attempt_id is not None
+            and projected_attempt_id != continued_attempt_id
+        ):
+            logger.info(
+                "[RELEASE_QUALIFIER] refusing stale retry attempt %s for v%d; "
+                "active attempt is %s",
+                continued_attempt_id,
+                version.version_number,
+                projected_attempt_id,
+            )
+            return {
+                "status": "stale_qualification_attempt",
+                "qualification_attempt_id": str(continued_attempt_id),
+                "active_qualification_attempt_id": str(projected_attempt_id),
+            }
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
         prior_status == "not_promoted"
@@ -2291,6 +2891,23 @@ async def run_qualification(
             "smoketest_enabled", _runtime_config.get("smoketest_enabled")
         )
     )
+    # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
+    # DARK — env_preflight_enabled defaults False.  Resolve with the same source
+    # precedence as the promotion rubric: per-project build_config override, then
+    # the fleet runtime_config flag, then the promotion_policy.yaml default, then
+    # False.  Record it on the pending qual so _finalize_qualification scores
+    # against the flag state in force when the run STARTED, not a value that
+    # flipped mid-run.  When False the judge is fully inert (no boot_prereq_missing
+    # blocker, no env_preflight sub_score, default promotion behaviour unchanged).
+    _env_preflight_build = (project.build_config or {}).get("env_preflight_enabled")
+    if _env_preflight_build is not None:
+        env_preflight_enabled = bool(_env_preflight_build)
+    elif _runtime_config.get("env_preflight_enabled") is not None:
+        env_preflight_enabled = bool(_runtime_config.get("env_preflight_enabled"))
+    else:
+        env_preflight_enabled = bool(
+            _load_policy(project).get("env_preflight_enabled", False)
+        )
     audit_task_id: str | None = None
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
@@ -2306,6 +2923,101 @@ async def run_qualification(
     # _finalize_qualification).  Contentless == empty for this purpose.
     version_goal = (version.goal or "").strip()
     _merge_grade_goal_usable = bool(version_goal) and not is_contentless_goal(version_goal)
+    # Freeze the exact ordered acceptance contract BEFORE consulting reusable
+    # facts or spawning the blind grader.
+    rubric_snapshot, rubric_lifecycle_snapshot = await _snapshot_qualification_rubric(
+        session, version
+    )
+    # An acceptance rubric and every fact derived from it belong to this exact
+    # launch, not just to a version or candidate SHA.  Use the durable attempt
+    # UUID established at the start of this run so finalization, task payloads,
+    # and ledger provenance all share one identity.
+    rubric_provenance = _rubric_provenance(
+        rubric_snapshot,
+        source="qualification_launch",
+        qualification_attempt_id=str(attempt_id),
+    )
+    rubric_fingerprint = rubric_provenance["fingerprint"]
+    # Cross-SHA audit reuse is keyed by the audit dimension's own durable
+    # per-path surface identity, not by the mutable last_qualification blob.
+    # A byte-identical surface copies the resolved audit/test facts to this
+    # candidate with explicit reuse provenance. A changed surface retains the
+    # prior candidate only as an agent-verified incremental-base hint.
+    prior_audit_fact = (
+        await _load_latest_prior_audit_dimension(session, version, candidate_sha)
+        if candidate_audited_surface
+        else None
+    )
+    prior_audit_candidate_sha: str | None = None
+    changed_audited_paths: list[str] = []
+    if prior_audit_fact is not None:
+        prior_surface = _audit_detail_surface_map(prior_audit_fact.detail)
+        prior_surface_hash = (
+            _audited_surface_hash_from_map(prior_surface) if prior_surface else None
+        )
+        source_sha = str(prior_audit_fact.candidate_sha or "")
+        source_challenge = await _load_dimension_result(
+            session, version, source_sha, "challenge"
+        )
+        prior_fact_confirmed = prior_audit_fact.status != "failed" or (
+            source_challenge is not None and source_challenge.status == "passed"
+        )
+        if (
+            prior_surface
+            and prior_surface_hash == prior_audit_fact.audited_surface_hash
+            and source_sha
+            and prior_fact_confirmed
+            and _audit_detail_is_delta_reusable(prior_audit_fact.detail)
+        ):
+            changed_audited_paths = _changed_audited_surface_paths(
+                prior_surface, candidate_audited_surface
+            )
+            prior_audit_candidate_sha = source_sha
+            if not changed_audited_paths:
+                source_erosion = await _load_dimension_result(
+                    session, version, source_sha, "test_erosion"
+                )
+                if (
+                    source_erosion is not None
+                    and source_erosion.status in _LEDGER_RESOLVED_STATUSES
+                ):
+                    await _carry_dimension_fact_to_candidate(
+                        session, version, prior_audit_fact, candidate_sha, attempt_id
+                    )
+                    await _carry_dimension_fact_to_candidate(
+                        session, version, source_erosion, candidate_sha, attempt_id
+                    )
+                    if (
+                        source_challenge is not None
+                        and source_challenge.status in _LEDGER_RESOLVED_STATUSES
+                    ):
+                        await _carry_dimension_fact_to_candidate(
+                            session,
+                            version,
+                            source_challenge,
+                            candidate_sha,
+                            attempt_id,
+                        )
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d candidate %s reused audit surface "
+                        "verbatim from candidate %s (0 audited paths changed)",
+                        version.version_number,
+                        candidate_sha[:8],
+                        source_sha[:8],
+                    )
+                else:
+                    # An audit child also owns test erosion. Without both facts,
+                    # the task must run so finalize cannot compose a partial child.
+                    prior_audit_candidate_sha = None
+            else:
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d candidate %s delta-scoping audit from "
+                    "%s across %d changed audited path(s)",
+                    version.version_number,
+                    candidate_sha[:8],
+                    source_sha[:8],
+                    len(changed_audited_paths),
+                )
     # Consult the per-dimension fact ledger before spawning children (Phase 1
     # ledger reuse).  On a re-drive at the same candidate_sha, dimensions that
     # already resolved (passed/failed/blocked) in a prior finalize are carried
@@ -2318,12 +3030,38 @@ async def run_qualification(
     )
     resolved_dims: dict[str, dict[str, Any]] = {}
     for dim, row in prior_dim_results.items():
+        # Mutable gates are re-measured on every same-SHA re-drive.  Their old
+        # ledger facts stay durable, but must not be composed or marked reused:
+        # finalize writes the current measurement back to that one row.
+        if dim in MUTABLE_DIMENSION_KEYS:
+            continue
         if row.status in _LEDGER_RESOLVED_STATUSES:
+            if dim == "merge_grade" and not _rubric_dimension_reusable(
+                row.detail,
+                fingerprint=rubric_fingerprint,
+                qualification_attempt_id=str(attempt_id),
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d candidate %s refusing merge-grade "
+                    "reuse: stored attempt/rubric provenance does not match "
+                    "the newly launched rubric %s",
+                    version.version_number,
+                    candidate_sha[:8],
+                    rubric_fingerprint[:12],
+                )
+                continue
             resolved_dims[dim] = {
                 "status": row.status,
                 "sub_score": row.sub_score,
                 "blocker": row.blocker,
                 "detail": row.detail,
+                "origin_attempt_id": (
+                    str(row.origin_attempt_id) if row.origin_attempt_id else None
+                ),
+                "reused_by_attempt_id": str(attempt_id),
+                "producing_task_id": (
+                    str(row.producing_task_id) if row.producing_task_id else None
+                ),
             }
     # Audit-challenge parity on reuse: a stored audit fact with status "failed"
     # carries a finding-driven DEDUCTION that is only trustworthy once the
@@ -2378,15 +3116,31 @@ async def run_qualification(
         )
         resolved_dims.pop("audit", None)
         resolved_dims.pop("test_erosion", None)
+    await _mark_dimensions_reused_by_attempt(
+        session,
+        [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
+        attempt_id,
+    )
     # A child task is needed only when NOT ALL of its produced dimensions are
     # already resolved.  audit task → {audit, test_erosion}; smoketest task →
     # {smoketest}; merge_grade task → {merge_grade}.
     _audit_needed = not (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
-    _smoketest_needed = smoketest_enabled and "smoketest" not in resolved_dims
+    # The qualifier-smoketest child is the evidence producer for BOTH the
+    # smoketest score AND the candidate-side env-preflight evidence (Slice 2,
+    # design 245212a4).  Spawn it when EITHER subsystem is enabled so the
+    # env-preflight gate is independently enforceable without smoketest.
+    _smoketest_needed = (smoketest_enabled or env_preflight_enabled) and "smoketest" not in resolved_dims
     _merge_grade_needed = (
         _merge_grade_goal_usable and "merge_grade" not in resolved_dims
+    )
+    incremental_audit_base_sha = _incremental_audit_base_sha(
+        prior_qual,
+        candidate_sha,
+        prior_audit_candidate_sha=(
+            prior_audit_candidate_sha if changed_audited_paths else None
+        ),
     )
     if resolved_dims:
         logger.info(
@@ -2400,6 +3154,20 @@ async def run_qualification(
             _smoketest_needed,
             _merge_grade_needed,
         )
+    # The ReleaseVersion row is locked here, so lifetime/new-attempt accounting
+    # and the active projection advance atomically with the pending/error write.
+    version.active_qualification_attempt_id = attempt_id
+    version.qualification_retry_episode = retry_episode
+    if is_new_attempt:
+        version.qualification_attempts = (version.qualification_attempts or 0) + 1
+    # Attempt contract: freeze promotion policy and capability-proof mode BEFORE
+    # the first child-spawn await so a mid-flight operator/config change cannot
+    # compose children spawned under one contract with a verdict computed under
+    # another.  Legacy records that predate the freeze fall back to live values.
+    _spawn_policy_snapshot = _load_policy(project)
+    _spawn_capability_proof_mode = str(
+        _runtime_config.get("capability_proof_gate_mode", "off") or "off"
+    ).strip().lower()
     try:
         if _audit_needed:
             audit_task = await _spawn_release_audit_task(
@@ -2409,7 +3177,8 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
-                audit_base_sha=_incremental_audit_base_sha(prior_qual, candidate_sha),
+                qualification_attempt_id=attempt_id,
+                audit_base_sha=incremental_audit_base_sha,
                 version_goal=version.goal,
             )
             audit_task_id = str(audit_task.id)
@@ -2419,10 +3188,9 @@ async def run_qualification(
             # diff per ACTIVE acceptance-criterion CATEGORY, so pass the rubric
             # (stable ``criterion_key`` + text) into the payload.  The agent keys
             # its per-category verdicts back on these keys.
-            _mg_criteria = await get_active_criteria_rubric(session, version.id)
             _mg_categories = [
                 {"category_key": c.get("criterion_key"), "text": c.get("text")}
-                for c in _mg_criteria
+                for c in rubric_snapshot
                 if c.get("criterion_key")
             ]
             merge_grade_task = await _spawn_release_merge_grade_task(
@@ -2432,9 +3200,11 @@ async def run_qualification(
                 base_branch=promotion_target,
                 diff_range=diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 version_goal=version_goal,
                 merged_pr_numbers=merged_pr_numbers,
                 categories=_mg_categories,
+                rubric_fingerprint=rubric_fingerprint,
             )
             merge_grade_task_id = str(merge_grade_task.id)
         if _smoketest_needed:
@@ -2443,6 +3213,7 @@ async def run_qualification(
                 project_id,
                 version_id=version.id,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
             )
             smoketest_task_id = str(smoketest_task.id)
     except Exception as exc:  # noqa: BLE001 — spawn failure must not raise out
@@ -2461,18 +3232,51 @@ async def run_qualification(
             "ci_green": ci_green,
             "ci_state": ci_state,
             "started_at": started_at,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": retry_episode,
+            "retry_episode_cap": retry_episode_cap,
         }
         # Read-modify-write is safe here (unlike the no_credentials / sha_error
         # early returns, which run pre-lock and use the atomic
-        # _increment_qualification_attempts): this site runs UNDER the
+        # _record_attempt_projection_atomic): this site runs UNDER the
         # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent
         # caller can interleave a lost update.
-        version.qualification_attempts = (version.qualification_attempts or 0) + 1
         flag_modified(version, "last_qualification")
         session.add(version)
         return {"status": "spawn_failed"}
 
     audit_challenge_spawn_pending = _audit_needed
+
+    # When the smoketest dimension is already resolved from a prior finalize
+    # (same candidate SHA) but env-preflight is enabled, carry forward the
+    # prior child's task_id so _finalize_qualification can re-read the
+    # SMOKETEST_RESULT artifact for env-preflight evidence.  Without this
+    # the evidence is lost and the boot_prereq_evidence_missing block fires
+    # spuriously on a same-SHA re-drive.
+    if env_preflight_enabled and "smoketest" in resolved_dims and not smoketest_task_id:
+        smoketest_task_id = prior_qual.get("smoketest_task_id")
+
+    # Unconditionally produce candidate-side env-preflight evidence (Slice 2,
+    # design 245212a4).  Decoupled from the smoketest child task: this is a
+    # cheap pure-content introspection of the candidate tree done via the
+    # GitHub contents API (no VM required), so it must not depend on
+    # ``smoketest_enabled``.  A failure to fetch the source is caught and
+    # treated as "evidence unavailable" — the env-preflight judge (Slice 3)
+    # handles the None by either pass-through (judge disabled) or
+    # ``boot_prereq_evidence_missing`` (judge enabled, fail-closed).
+    env_preflight_evidence: dict[str, Any] | None = None
+    try:
+        env_preflight_evidence = await _build_env_preflight_evidence_for_candidate(
+            session, project, token, owner, repo, candidate_sha
+        )
+    except Exception:  # noqa: BLE001 — GitHub API I/O can fail in many ways (network, HTTP, parse); evidence absence is handled gracefully by the Slice-3 judge.
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to build env-preflight evidence for "
+            "v%d candidate %s — evidence unavailable",
+            version.version_number,
+            candidate_sha[:8],
+            exc_info=True,
+        )
 
     # 6. Stamp the pending qualification record.  smoketest_task_id is None
     #    when the smoketest subsystem is disabled — maybe_finalize_qualification
@@ -2482,12 +3286,28 @@ async def run_qualification(
     #    finalization was a quality verdict / dry-run / non-infra outcome).
     version.last_qualification = {
         "status": "pending",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
+        "retry_episode_cap": retry_episode_cap,
         "candidate_sha": candidate_sha,
         "candidate_diff_hash": candidate_diff_hash,
-        "audit_base_sha": _incremental_audit_base_sha(prior_qual, candidate_sha),
+        "audited_surface_paths": candidate_audited_surface or None,
+        "audit_base_sha": incremental_audit_base_sha,
+        "prior_audit_candidate_sha": (
+            prior_audit_candidate_sha if changed_audited_paths else None
+        ),
+        "changed_audited_paths": changed_audited_paths or None,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
+        # Slice 3 (design 245212a4): dark-by-default deployed-side env-preflight
+        # judge flag, captured at spawn so finalize scores against the in-force state.
+        "env_preflight_enabled": env_preflight_enabled,
+        # Candidate-side env-preflight evidence artifact, produced unconditionally
+        # (decoupled from the smoketest child).  Pure-content presence-only shape
+        # — names and scopes only, never values.  None when the evidence could not
+        # be fetched from the candidate tree (caught and handled in finalize).
+        "env_preflight_evidence": env_preflight_evidence,
         "started_at": started_at,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
@@ -2496,6 +3316,10 @@ async def run_qualification(
         "audit_challenge_spawn_pending": audit_challenge_spawn_pending,
         "smoketest_task_id": smoketest_task_id,
         "merge_grade_task_id": merge_grade_task_id,
+        "rubric_snapshot": rubric_snapshot,
+        "rubric_fingerprint": rubric_fingerprint,
+        "rubric_lifecycle_snapshot": rubric_lifecycle_snapshot,
+        "rubric_provenance": rubric_provenance,
         "prior_infra_streak": prior_infra_streak,
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
@@ -2504,18 +3328,32 @@ async def run_qualification(
         "keyless_requalification_consumed_at": prior_qual.get(
             "keyless_requalification_consumed_at"
         ),
+        # Slice 4 (design 245212a4): OWNER-armed one-shot acknowledgment that the
+        # missing boot prerequisite will be bound in the same deploy revision.
+        # Carried forward from the prior verdict (base_record REPLACES
+        # last_qualification, so an armed ack must survive re-qualification) so it
+        # is still armed when this finalize scores env-preflight.  Consumed by
+        # _finalize_qualification only once it actually overrides a
+        # boot_prereq_missing block.
+        "ack_env_will_be_bound": prior_qual.get("ack_env_will_be_bound"),
         # Dimensions already resolved (passed/failed/blocked) for this
         # candidate_sha from a prior finalize — carried forward from the
         # per-dimension ledger so _finalize_qualification can compose from
         # them without re-running their gates.
         "resolved_dimensions": resolved_dims if resolved_dims else None,
+        # Attempt contract: freeze the version goal, promotion policy, and
+        # capability-proof mode at spawn so mid-flight configuration changes
+        # cannot compose children spawned under one contract with a verdict
+        # computed under another.
+        "version_goal": version_goal,
+        "promotion_policy_snapshot": _spawn_policy_snapshot,
+        "capability_proof_mode": _spawn_capability_proof_mode,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
-    # _increment_qualification_attempts): this site runs UNDER the
+    # _record_attempt_projection_atomic): this site runs UNDER the
     # ReleaseVersion FOR UPDATE row lock taken above, so no concurrent caller
     # can interleave a lost update.
-    version.qualification_attempts = (version.qualification_attempts or 0) + 1
     flag_modified(version, "last_qualification")
     session.add(version)
 
@@ -2534,10 +3372,13 @@ async def run_qualification(
     )
     return {
         "status": "spawned",
+        "qualification_attempt_id": str(attempt_id),
+        "retry_episode": retry_episode,
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
+        "env_preflight_enabled": env_preflight_enabled,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
@@ -2546,7 +3387,6 @@ async def run_qualification(
         "smoketest_task_id": smoketest_task_id,
         "merge_grade_task_id": merge_grade_task_id,
     }
-
 
 # ---------------------------------------------------------------------------
 # _finalize_qualification — phase 2: collect + decide.
@@ -2572,6 +3412,20 @@ _AUDIT_CHALLENGE_BINDING_HOLDS: frozenset[str] = frozenset(
         "audit_challenge_empty_verdicts",
     }
 )
+
+def _advance_qualification_retry_episode(
+    version: release_version.ReleaseVersion,
+    record: dict[str, Any],
+    *,
+    cap: int,
+) -> dict[str, Any]:
+    episode = int(record.get("retry_episode") or 0) + 1
+    version.qualification_retry_episode = episode
+    return {
+        **record,
+        "retry_episode": episode,
+        "retry_episode_cap": cap,
+    }
 
 # Human-readable rendering of the compute_composite() hard-blocker codes.
 _BLOCKER_LABELS: dict[str, str] = {
@@ -2599,6 +3453,16 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the merged diffs 'misses' the version goal per the blind merge-grade "
         "and the merge_grade_block_threshold is armed"
     ),
+    "boot_prereq_missing": (
+        "a boot/env prerequisite the candidate declares is absent from the "
+        "deploy-target environment (presence-only): bind the missing secret(s) "
+        "in the deploy target before promotion"
+    ),
+    "boot_prereq_evidence_missing": (
+        "the candidate produced no boot/env-prerequisite evidence, so the boot "
+        "gate cannot be certified — ensure the evidence producer runs on the "
+        "candidate tree"
+    ),
     # NOTE: ``uncorroborated_attestation`` was retired with the attestation gate
     # it labeled (replaced by the per-category goal-verification gate, whose
     # block surfaces as ``criterion_coverage_incomplete``).  It has no emitter
@@ -2606,7 +3470,6 @@ _BLOCKER_LABELS: dict[str, str] = {
     # operator-facing vocabulary, so it is intentionally absent here.  Do not
     # re-add a label without an emitter — see test_blocker_labels_have_emitters.
 }
-
 
 def _primary_findings_for_challenge_retry(
     audit_report: dict[str, Any] | None,
@@ -2659,7 +3522,6 @@ def _primary_findings_for_challenge_retry(
     primary_findings.sort(key=lambda d: _SEVERITY_RANK.get(d["severity"], 99))
     return primary_findings
 
-
 def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) -> bool:
     """Return True when the completed audit task is pinned to the candidate."""
     if task is None or task.status != TaskStatus.COMPLETED or not candidate_sha:
@@ -2669,7 +3531,6 @@ def _audit_task_matches_candidate(task: Task | None, candidate_sha: str | None) 
         return context_sha == candidate_sha
     payload_sha = str((task.first_payload or {}).get("candidate_sha") or "").strip()
     return bool(payload_sha and payload_sha == candidate_sha)
-
 
 def _build_audit_leg_proof(
     *,
@@ -2727,7 +3588,6 @@ def _build_audit_leg_proof(
         "reconciliation_status": reconciliation_status,
         "reconciliation_reason": reconciliation_reason,
     }
-
 
 async def _resolve_migration_identity_at_finalize(
     session: AsyncSession,
@@ -2846,7 +3706,6 @@ async def _resolve_migration_identity_at_finalize(
         )
         return ("defer", f"migration-identity gate error: {exc}")
 
-
 def _migration_apply_timeout_detail(detail: str | None) -> bool:
     """Return whether detail starts with one stable migration watchdog code."""
 
@@ -2854,7 +3713,6 @@ def _migration_apply_timeout_detail(detail: str | None) -> bool:
         return False
     code = detail.partition(":")[0].strip()
     return code.startswith("migration_apply_") and code.endswith("_timeout")
-
 
 def _migration_apply_infra_error(detail: str | None) -> str:
     """Preserve stable timeout codes; retain the legacy code for other defers."""
@@ -2866,7 +3724,6 @@ def _migration_apply_infra_error(detail: str | None) -> str:
         if detail
         else "migration_apply_check_unavailable"
     )
-
 
 async def _resolve_migration_apply_at_finalize(
     session: AsyncSession,
@@ -2914,8 +3771,20 @@ async def _resolve_migration_apply_at_finalize(
         if resolved is None:
             return ("ok", None)
         token, owner, repo = resolved
+        scratch_preflight = preflight_migration_apply_scratch(
+            os.getenv(MIGRATION_APPLY_SCRATCH_ENV)
+        )
+        if scratch_preflight.status == "absent":
+            # Config-absent: record as "skipped" so a skipped gate can never read
+            # as a passed gate.  Not "defer" (transient infra) and not "ok" (gate
+            # actually ran & passed) — this is a permanent config choice meaning
+            # the gate was never attempted.
+            return ("skipped", "scratch_database_not_configured")
+        if scratch_preflight.status != "ready" or scratch_preflight.target is None:
+            return ("defer", scratch_preflight.detail)
         prod_engine = resolve_async_engine(session)
-        scratch_db_url = os.getenv("MIGRATION_APPLY_SCRATCH_DATABASE_URL")
+        scratch_db_url = scratch_preflight.target
+
         try:
             verdict, detail = await run_migration_apply_gate(
                 prod_engine=prod_engine,
@@ -2985,7 +3854,6 @@ async def _resolve_migration_apply_at_finalize(
             exc,
         )
         return ("defer", f"migration-apply gate error: {exc}")
-
 
 async def _compute_acceptance_window_aggregate(
     session: AsyncSession,
@@ -3094,7 +3962,6 @@ async def _compute_acceptance_window_aggregate(
         "acceptance_window_inferred_test_cochange_task_ids": inferred_task_ids,
     }
 
-
 async def _collect_verified_merge_test_evidence(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3144,7 +4011,6 @@ async def _collect_verified_merge_test_evidence(
             else:
                 seam_files.add(p.strip())
     return {"test_files": sorted(test_files), "seam_files": sorted(seam_files)}
-
 
 async def _guard_ci_unresolved_promotion_in_flight(
     session: AsyncSession,
@@ -3315,7 +4181,6 @@ async def _guard_ci_unresolved_promotion_in_flight(
         "managed_check_wait": is_migration_pr,
     }
 
-
 async def _merged_pr_numbers_for_version(
     session: AsyncSession,
     version_obj: release_version.ReleaseVersion,
@@ -3355,7 +4220,6 @@ async def _merged_pr_numbers_for_version(
         if isinstance(pn, int) and pn > 0 and pn not in pr_numbers:
             pr_numbers.append(pn)
     return sorted(pr_numbers)
-
 
 async def _candidate_already_on_main_at_finalize(
     session: AsyncSession,
@@ -3402,7 +4266,6 @@ async def _candidate_already_on_main_at_finalize(
         )
         return False
 
-
 async def _count_project_actionable_open_completion_debt(
     session: AsyncSession, project_id: Any
 ) -> int:
@@ -3421,7 +4284,6 @@ async def _count_project_actionable_open_completion_debt(
     )
     return int((await session.execute(stmt)).scalar_one() or 0)
 
-
 async def _upsert_dimension_result(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3434,6 +4296,8 @@ async def _upsert_dimension_result(
     detail: Any | None = None,
     producing_task_id: Any | None = None,
     audited_surface_hash: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
+    reused_by_attempt_ids: list[str] | None = None,
 ) -> None:
     """Best-effort UPSERT of ONE per-(candidate_sha, dimension) qualification fact.
 
@@ -3469,6 +4333,7 @@ async def _upsert_dimension_result(
     _sub_score: float | None = None
     if isinstance(sub_score, (int, float)) and not isinstance(sub_score, bool):
         _sub_score = float(sub_score)
+    _origin_uuid = _coerce_qualification_attempt_id(origin_attempt_id)
 
     try:
         async with session.begin_nested():
@@ -3482,6 +4347,18 @@ async def _upsert_dimension_result(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                # Preserve an older producer only when the start path explicitly
+                # marked this fact as reused by the active attempt.  Otherwise a
+                # resolved write is a genuine recomputation with a new origin.
+                if (
+                    dimension not in MUTABLE_DIMENSION_KEYS
+                    and existing.status in _LEDGER_RESOLVED_STATUSES
+                    and _origin_uuid is not None
+                    and existing.origin_attempt_id != _origin_uuid
+                    and str(_origin_uuid)
+                    in {str(value) for value in (existing.reused_by_attempt_ids or [])}
+                ):
+                    return
                 # Never downgrade a resolved fact (passed/failed/blocked) to a
                 # non-resolved status (e.g. "unavailable" from an infra failure
                 # in a different gate or a failed _load_prior_dimension_results).
@@ -3507,6 +4384,10 @@ async def _upsert_dimension_result(
                 existing.audited_surface_hash = audited_surface_hash
                 existing.detail = detail
                 existing.producing_task_id = _producing_uuid
+                if _origin_uuid is not None:
+                    existing.origin_attempt_id = _origin_uuid
+                if reused_by_attempt_ids is not None:
+                    existing.reused_by_attempt_ids = reused_by_attempt_ids
                 existing.computed_at = _utcnow()
                 session.add(existing)
             else:
@@ -3522,6 +4403,8 @@ async def _upsert_dimension_result(
                         audited_surface_hash=audited_surface_hash,
                         detail=detail,
                         producing_task_id=_producing_uuid,
+                        origin_attempt_id=_origin_uuid,
+                        reused_by_attempt_ids=reused_by_attempt_ids,
                     )
                 )
             await session.flush()
@@ -3533,7 +4416,6 @@ async def _upsert_dimension_result(
             getattr(version, "version_number", "?"),
             exc,
         )
-
 
 # Per-dimension ledger status vocabulary (design doc "From Batch Attempts to a
 # Per-Dimension Fact Ledger", section 3).  A dimension is RESOLVED when its gate
@@ -3552,8 +4434,12 @@ _PROMOTION_EXPLICIT_NON_APPLICABLE_STATUSES: dict[str, frozenset[str]] = {
     "merge_grade": frozenset(
         {"not_applicable", "superseded_exempt", "already_on_main_exempt"}
     ),
+    # When no scratch DB is configured the apply gate is permanently skipped
+    # (not transiently deferred).  Record as an explicit non-applicable so
+    # the promotion ledger-completeness check does not treat the missing
+    # gate as an infra hold that blocks the release indefinitely.
+    "migration_apply": frozenset({"scratch_database_not_configured"}),
 }
-
 
 def _ledger_fact_satisfies_promotion(
     dimension: str,
@@ -3576,20 +4462,12 @@ def _ledger_fact_satisfies_promotion(
         dimension, frozenset()
     )
 
-
 # Gates that must every one have a terminal fact at the SAME candidate_sha before
 # a promotion may compose from the ledger — the informational dimensions
 # (challenge / acceptance_window / debt_pressure) never gate promotion and are
 # excluded.  smoketest is required only when the run had it enabled (audit H3).
-_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = (
-    "ci",
-    "audit",
-    "test_erosion",
-    "migration_identity",
-    "migration_apply",
-    "merge_grade",
-)
-
+# Sourced from the canonical dimension registry (see qualification_dimensions).
+_PROMOTION_REQUIRED_DIMENSIONS: tuple[str, ...] = PROMOTION_REQUIRED_DIMENSIONS
 
 async def _load_prior_dimension_results(
     session: AsyncSession,
@@ -3630,6 +4508,138 @@ async def _load_prior_dimension_results(
         return {}
     return {r.dimension: r for r in rows}
 
+async def _load_dimension_result(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+    dimension: str,
+) -> QualificationDimensionResult | None:
+    """Load one durable dimension fact at an exact candidate SHA."""
+    if not candidate_sha:
+        return None
+    try:
+        return (
+            await session.execute(
+                select(QualificationDimensionResult).where(
+                    QualificationDimensionResult.release_version_id == version.id,
+                    QualificationDimensionResult.candidate_sha == candidate_sha,
+                    QualificationDimensionResult.dimension == dimension,
+                )
+            )
+        ).scalar_one_or_none()
+    except Exception as exc:  # noqa: BLE001 -- reuse is best-effort
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to load %s dimension for v%s/%s "
+            "(non-fatal -- falling back to full audit): %s",
+            dimension,
+            getattr(version, "version_number", "?"),
+            candidate_sha[:8],
+            exc,
+        )
+        return None
+
+async def _load_latest_prior_audit_dimension(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str,
+) -> QualificationDimensionResult | None:
+    """Return the newest complete cross-SHA audit fact usable as a delta base."""
+    try:
+        rows = (
+            (
+                await session.execute(
+                    select(QualificationDimensionResult)
+                    .where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.dimension == "audit",
+                        QualificationDimensionResult.candidate_sha.is_not(None),
+                        QualificationDimensionResult.candidate_sha != candidate_sha,
+                        QualificationDimensionResult.status.in_(("passed", "failed")),
+                    )
+                    .order_by(QualificationDimensionResult.computed_at.desc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001 -- reuse is best-effort
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to load prior audit dimension for v%s "
+            "(non-fatal -- falling back to full audit): %s",
+            getattr(version, "version_number", "?"),
+            exc,
+        )
+        return None
+    return next(
+        (
+            row
+            for row in rows
+            if row.audited_surface_hash
+            and row.candidate_sha
+            and _audit_detail_is_delta_reusable(row.detail)
+        ),
+        None,
+    )
+
+async def _carry_dimension_fact_to_candidate(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    source: QualificationDimensionResult,
+    candidate_sha: str,
+    attempt_id: uuid.UUID,
+) -> None:
+    """Copy a reusable fact to a new candidate while preserving ownership."""
+    reused = [
+        str(value)
+        for value in (source.reused_by_attempt_ids or [])
+        if _coerce_qualification_attempt_id(value) is not None
+    ]
+    attempt_text = str(attempt_id)
+    if attempt_text not in reused:
+        reused.append(attempt_text)
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        source.dimension,
+        status=source.status,
+        sub_score=source.sub_score,
+        blocker=source.blocker,
+        detail=source.detail,
+        producing_task_id=source.producing_task_id,
+        audited_surface_hash=source.audited_surface_hash,
+        origin_attempt_id=source.origin_attempt_id,
+        reused_by_attempt_ids=reused,
+    )
+
+async def _mark_dimensions_reused_by_attempt(
+    session: AsyncSession,
+    rows: list[QualificationDimensionResult],
+    attempt_id: uuid.UUID,
+) -> None:
+    """Best-effort append reuse provenance without changing fact ownership."""
+    if not rows:
+        return
+    try:
+        async with session.begin_nested():
+            attempt_text = str(attempt_id)
+            for row in rows:
+                reused = [
+                    str(value)
+                    for value in (row.reused_by_attempt_ids or [])
+                    if _coerce_qualification_attempt_id(value) is not None
+                ]
+                if attempt_text not in reused:
+                    row.reused_by_attempt_ids = [*reused, attempt_text]
+                    session.add(row)
+            await session.flush()
+    except Exception as exc:  # noqa: BLE001 -- ledger provenance is failure-isolated
+        logger.warning(
+            "[RELEASE_QUALIFIER] failed to mark dimension reuse for attempt %s "
+            "(non-fatal -- additive ledger provenance only): %s",
+            attempt_id,
+            exc,
+        )
 
 async def _record_infra_dimension_unavailable(
     session: AsyncSession,
@@ -3639,6 +4649,7 @@ async def _record_infra_dimension_unavailable(
     *,
     infra_error: str,
     signature: str | None = None,
+    origin_attempt_id: uuid.UUID | str | None = None,
 ) -> int:
     """Mark ONE dimension 'unavailable' in the ledger on an infrastructure failure.
 
@@ -3704,9 +4715,9 @@ async def _record_infra_dimension_unavailable(
             "infra_failure_signature": signature,
             "consecutive_infra_errors": new_streak,
         },
+        origin_attempt_id=origin_attempt_id,
     )
     return new_streak
-
 
 async def _promotion_dimension_ledger_complete(
     session: AsyncSession,
@@ -3735,7 +4746,6 @@ async def _promotion_dimension_ledger_complete(
         if dim not in prior or not _ledger_fact_satisfies_promotion(dim, prior[dim])
     ]
     return (not missing, missing)
-
 
 async def _dual_write_dimension_results(
     session: AsyncSession,
@@ -3800,7 +4810,7 @@ async def _dual_write_dimension_results(
     def _mig_status(verdict: Any) -> str:
         if verdict == "block":
             return "blocked"
-        if verdict == "defer":
+        if verdict in ("defer", "skipped"):
             return "unavailable"
         if verdict in ("ok", "pass"):
             return "passed"
@@ -3845,6 +4855,25 @@ async def _dual_write_dimension_results(
     else:  # enforce
         _cp_status = "blocked" if blocker == "capability_proof_gate_blocked" else "passed"
 
+    # env_preflight ledger status (Slice 3, design 245212a4): mirror the deployed-
+    # side judge semantics used by the state resolver.  DARK by default → the judge
+    # is inert, so no manifest is scored and the row is ``unavailable``.  When the
+    # judge is enabled: a live boot-prereq block (boot_prereq_missing /
+    # boot_prereq_evidence_missing) surfaces via the composite blocker as
+    # ``blocked``; a recorded positive sub_score is ``passed``; a None score (no
+    # candidate manifest seen) is ``unavailable``.  env_preflight is MUTABLE — it is
+    # re-measured live every drive and its reused ledger row is never composed, so
+    # this spec always upserts the freshly-measured fact.
+    _epf_enabled = bool(base_record.get("env_preflight_enabled"))
+    _epf_blocker = _own_blocker({"boot_prereq_missing", "boot_prereq_evidence_missing"})
+    _epf_score = _score("env_preflight")
+    if _epf_blocker is not None:
+        _epf_status = "blocked"
+    elif _epf_enabled and _epf_score is not None and _epf_score > 0.0:
+        _epf_status = "passed"
+    else:
+        _epf_status = "unavailable"
+
     specs: list[dict[str, Any]] = [
         {
             "dimension": "ci",
@@ -3860,11 +4889,15 @@ async def _dual_write_dimension_results(
             "sub_score": audit_score,
             "blocker": _own_blocker({"audit_missing"}),
             "audited_surface_hash": base_record.get("candidate_diff_hash"),
-            "detail": {
-                "audit_missing_reason": base_record.get("audit_missing_reason"),
-                "audit_findings_total": base_record.get("audit_findings_total"),
-                "excluded_audit_findings_total": base_record.get("excluded_audit_findings_total"),
-            },
+            "detail": _audit_dimension_detail(
+                surface_paths=base_record.get("audited_surface_paths"),
+                audit_findings=base_record.get("audit_findings") or [],
+                excluded_audit_findings=base_record.get("excluded_audit_findings")
+                or [],
+                findings_meta=base_record,
+                audit_missing_reason=base_record.get("audit_missing_reason"),
+                audit_scope=base_record.get("audit_scope"),
+            ),
             "producing_task_id": base_record.get("audit_task_id"),
         },
         {
@@ -3913,6 +4946,12 @@ async def _dual_write_dimension_results(
             "detail": {
                 "verdict": base_record.get("migration_apply_safety"),
                 "detail": base_record.get("migration_apply_safety_detail"),
+                **(
+                    {"status": base_record.get("migration_apply_safety_detail")}
+                    if base_record.get("migration_apply_safety") == "skipped"
+                    and base_record.get("migration_apply_safety_detail")
+                    else {}
+                ),
             },
             "producing_task_id": None,
         },
@@ -3958,7 +4997,32 @@ async def _dual_write_dimension_results(
             "detail": _cp_detail,
             "producing_task_id": None,
         },
+        {
+            "dimension": "env_preflight",
+            "status": _epf_status,
+            # Presence-only sub_score, recorded only when the judge is enabled so a
+            # dark run carries no score into the ledger.
+            "sub_score": _epf_score if _epf_enabled else None,
+            "blocker": _epf_blocker,
+            # Slice 3 verdict blob: {required:[{name,scope}], missing:[names],
+            # deploy_target_scope} — presence-only, None when the judge was disabled
+            # or no candidate manifest was seen.
+            "detail": base_record.get("env_preflight_verdict"),
+            "producing_task_id": None,
+        },
     ]
+
+    # Fail-fast: every dimension in the canonical ledger-backed registry must have a
+    # spec entry here.  A future ledger dimension added to the registry but omitted
+    # from the specs list would silently never be persisted — this assertion ensures
+    # the dual-write writer stays synchronised with LEDGER_DIMENSION_KEYS.
+    spec_dimension_set = {s["dimension"] for s in specs}
+    assert spec_dimension_set == LEDGER_DIMENSION_KEYS, (
+        f"dual-write spec dimensions ({spec_dimension_set}) != "
+        f"LEDGER_DIMENSION_KEYS ({LEDGER_DIMENSION_KEYS}); "
+        f"extra: {spec_dimension_set - LEDGER_DIMENSION_KEYS}, "
+        f"missing: {LEDGER_DIMENSION_KEYS - spec_dimension_set}"
+    )
 
     try:
         await session.flush()
@@ -3972,7 +5036,10 @@ async def _dual_write_dimension_results(
         return
 
     for spec in specs:
-        if spec["dimension"] in prior_resolved:
+        if (
+            spec["dimension"] in prior_resolved
+            and spec["dimension"] not in MUTABLE_DIMENSION_KEYS
+        ):
             # Already resolved (passed/failed/blocked) for this candidate tree in
             # an earlier finalize — reuse the stored fact, do NOT re-record or
             # overwrite it.  This is the read-side composition: a re-check after a
@@ -4001,8 +5068,183 @@ async def _dual_write_dimension_results(
             detail=_detail,
             producing_task_id=spec["producing_task_id"],
             audited_surface_hash=spec.get("audited_surface_hash"),
+            origin_attempt_id=base_record.get("qualification_attempt_id"),
         )
 
+async def _build_env_preflight_evidence_for_candidate(
+    session: AsyncSession,
+    project: Project,
+    token: str,
+    owner: str,
+    repo: str,
+    candidate_sha: str,
+) -> dict[str, Any] | None:
+    """Build env-preflight evidence from the candidate tree via the GitHub API.
+
+    Reads ``backend/app/required_runtime_env.py`` and
+    ``backend/testing/smoketest.yaml`` from the candidate SHA through the GitHub
+    contents API (cheap, no VM needed) and produces the same pure-content artifact
+    as :func:`build_env_preflight_evidence`.
+
+    Returns ``None`` when either source file is missing or unreadable — the
+    caller treats this as "evidence unavailable", which triggers
+    ``boot_prereq_evidence_missing`` when the env-preflight judge is enabled.
+
+    Uses the in-memory content cache (10-minute TTL) so repeated reads of the
+    same file at the same ref on the same orchestrator avoid redundant API calls.
+    """
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    required_runtime_py = await github.get_file_text_at_ref(
+        "backend/app/required_runtime_env.py",
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=candidate_sha,
+        project_id=str(project.id),
+        use_content_cache=True,
+    )
+    smoketest_yaml = await github.get_file_text_at_ref(
+        "backend/testing/smoketest.yaml",
+        token=token,
+        owner=owner,
+        repo=repo,
+        ref=candidate_sha,
+        project_id=str(project.id),
+        use_content_cache=True,
+    )
+    return build_env_preflight_from_source(
+        required_runtime_env_py_source=required_runtime_py,
+        smoketest_yaml_source=smoketest_yaml,
+    )
+
+def _deployed_env_presence_snapshot(
+    env_preflight_artifact: dict[str, Any] | None,
+) -> dict[str, bool]:
+    """Presence-only ``{name: bool}`` snapshot of the DEPLOYED process's environ.
+
+    Slice 3 (design 245212a4).  This runs in ``_finalize_qualification``, which
+    executes inside the deployed prod Cloud Run orchestrator — so the deployed
+    process's OWN ``os.environ`` is a faithful presence-proxy of the deploy-target
+    env.  We snapshot only the names the candidate declared it needs (from the
+    candidate-side ``env_preflight`` content artifact) plus the Cloud Run signal
+    (``K_REVISION``) so :func:`_score_env_preflight` can derive the deploy-target
+    scope.
+
+    PRESENCE-ONLY HARD RULE: every value is ``bool(os.getenv(name))`` — the env
+    VALUE is NEVER read, compared, logged, or persisted.  A key maps to ``True``
+    iff the variable is set to a non-empty string in this process.
+    """
+    from app.required_runtime_env import CLOUD_RUN_SIGNAL_ENV
+
+    names: set[str] = {CLOUD_RUN_SIGNAL_ENV}
+    if isinstance(env_preflight_artifact, dict):
+        for entry in env_preflight_artifact.get("required_env") or []:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str) and name:
+                    names.add(name)
+    # PRESENCE-ONLY: bool(...) — never the value itself.
+    return {name: bool(os.getenv(name)) for name in names}
+
+async def _record_rubric_provenance_outcome(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    *,
+    status: str,
+    rubric_provenance: dict[str, Any] | None,
+    rubric_drift: dict[str, Any] | None = None,
+    provenance_error: str | None = None,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Hold an attempt whose launched acceptance contract cannot finalize."""
+    finalized_at = _utcnow().isoformat()
+    verdict_status = "rubric_unknown" if status == "rubric_provenance_unknown" else status
+    record: dict[str, Any] = {
+        "status": status,
+        "candidate_sha": qual.get("candidate_sha"),
+        "candidate_diff_hash": qual.get("candidate_diff_hash"),
+        "audited_surface_paths": qual.get("audited_surface_paths"),
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "confidence": 0.0,
+        "sub_scores": {},
+        "blocker": status,
+        "threshold": (policy or {}).get("threshold"),
+        "started_at": qual.get("started_at"),
+        "finalized_at": finalized_at,
+        "audit_task_id": qual.get("audit_task_id"),
+        "smoketest_task_id": qual.get("smoketest_task_id"),
+        "merge_grade_task_id": qual.get("merge_grade_task_id"),
+        "rubric_snapshot": (
+            rubric_provenance.get("criteria") if rubric_provenance else None
+        ),
+        "rubric_fingerprint": (
+            rubric_provenance.get("fingerprint") if rubric_provenance else None
+        ),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+        # Deliberately absent: this attempt never gates on live categories and
+        # never fabricates verdicts for categories outside its launched rubric.
+        "category_verdicts": None,
+        "residual_uncaptured_gap": None,
+        "merge_grade": {
+            "status": status,
+            "blocked": True,
+            "rubric_provenance": rubric_provenance,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+        "merge_grade_status": verdict_status,
+        "merge_grade_coverage": None,
+        "merge_grade_biggest_gap": None,
+    }
+    version.last_qualification = record
+    flag_modified(version, "last_qualification")
+    release_version.set_version_phase(
+        version,
+        "stabilize",
+        reasoning=(
+            f"qualification v{version.version_number}: acceptance rubric changed "
+            "while the blind grade was in flight; launch a fresh grade"
+            if status == "rubric_changed"
+            else f"qualification v{version.version_number}: launched rubric provenance unknown"
+        ),
+    )
+    session.add(version)
+    await _record_qualification_verdict(
+        session,
+        version,
+        record,
+        terminal_status=verdict_status,
+        would_promote=False,
+        promotion_enabled=resolve_project_promotion_enabled(version.project_id),
+    )
+    await _notify_operator(
+        session,
+        version,
+        "release_rubric_changed" if status == "rubric_changed" else "release_rubric_unknown",
+        (
+            f"v{version.version_number} was not promoted because its acceptance "
+            "rubric changed while the blind merge-grade was in flight. A fresh "
+            "grade will use the new rubric."
+            if status == "rubric_changed"
+            else f"v{version.version_number} was held because the pending grade's "
+            "rubric provenance could not be reconstructed. A fresh grade is required."
+        ),
+        extra={
+            "blocker": status,
+            "rubric_drift": rubric_drift,
+            "rubric_provenance_error": provenance_error,
+        },
+    )
+    return {
+        "status": status,
+        "blocker": status,
+        "rubric_drift": rubric_drift,
+        "rubric_provenance_error": provenance_error,
+    }
 
 async def _finalize_qualification(
     session: AsyncSession,
@@ -4038,6 +5280,27 @@ async def _finalize_qualification(
     session afterwards.  Returns a result dict.
     """
     qual = dict(version.last_qualification or {})
+    attempt_id = _qualification_attempt_for_record(version, qual)
+    qual["qualification_attempt_id"] = str(attempt_id)
+    version.active_qualification_attempt_id = attempt_id
+    if "retry_episode" not in qual:
+        qual["retry_episode"] = int(
+            getattr(version, "qualification_retry_episode", 0) or 0
+        )
+    # Attempt contract: read values frozen at spawn so mid-flight configuration
+    # changes do not compose children spawned under one contract with a verdict
+    # computed under another.  Legacy records that predate the freeze fall back
+    # to the live values so existing finalizes continue to work.
+    _frozen_version_goal: str = (
+        str(qual["version_goal"]).strip()
+        if "version_goal" in qual
+        else (version.goal or "").strip()
+    )
+    _frozen_capability_proof_mode: str | None = (
+        str(qual["capability_proof_mode"]).strip().lower()
+        if "capability_proof_mode" in qual
+        else None
+    )
     candidate_sha = qual.get("candidate_sha")
     audit_task_id = qual.get("audit_task_id")
     challenge_task_id = qual.get("challenge_task_id")
@@ -4055,7 +5318,14 @@ async def _finalize_qualification(
     # per-dimension ledger.  When a dimension is present here its gate evaluation
     # is composed from the ledger rather than re-run, and its child task may not
     # have been spawned (the spawn coordinator skipped it).
-    resolved_dims: dict[str, dict[str, Any]] = qual.get("resolved_dimensions") or {}
+    # Defensive compatibility for attempts written before mutable dimensions
+    # were excluded at spawn: never let a persisted legacy reuse marker suppress
+    # the current CI/migration measurement during finalize.
+    resolved_dims: dict[str, dict[str, Any]] = {
+        dim: fact
+        for dim, fact in (qual.get("resolved_dimensions") or {}).items()
+        if dim not in MUTABLE_DIMENSION_KEYS
+    }
 
     # Re-resolve CI for the candidate commit NOW rather than reusing the
     # boolean frozen at spawn — a candidate whose checks were merely pending
@@ -4082,10 +5352,88 @@ async def _finalize_qualification(
             session, version, candidate_sha, "ci",
             status="passed" if ci_green else "blocked",
             detail=ci_resolution if isinstance(ci_resolution, dict) else None,
+            origin_attempt_id=attempt_id,
         )
 
     _policy_project = await session.get(Project, version.project_id)
-    policy = _load_policy(_policy_project)
+    # Prefer the promotion policy frozen at spawn; fall back to the live policy
+    # for legacy records that predate the attempt-contract freeze.
+    policy = qual.get("promotion_policy_snapshot") or _load_policy(_policy_project)
+
+    # Derive whether enforce mode was active at spawn from the frozen (or fallback)
+    # policy.  _apply_completion_debt_weight_mode baked the freeze-time mode into
+    # weights.completion_debt, so a present positive value means enforce was active
+    # when the policy was captured.  Used below for debt-scoring fallback (line 6393)
+    # and the enforce preview gate (line 6584) so mid-flight knob changes cannot
+    # omit the fail-closed debt score or produce metadata under the wrong contract.
+    _frozen_cd_weight: float = float(
+        (policy.get("weights") or {}).get("completion_debt", 0.0) or 0.0
+    )
+    _frozen_cd_was_enforce: bool = _frozen_cd_weight > 0.0
+
+    # Resolve env_preflight_enabled EARLY — before the child-terminal-status
+    # checks and artifact reads — so both can reference it.  The flag was
+    # captured on the pending record at spawn; legacy records predating it
+    # default to the policy fallback.
+    env_preflight_enabled = bool(
+        qual.get("env_preflight_enabled", policy.get("env_preflight_enabled", False))
+    )
+
+    # Resolve the launch contract before checking child infrastructure state.
+    # Rubric drift is authoritative for this attempt: a lifecycle/text change
+    # must be recorded even if a required child also failed while it ran.
+    (
+        launched_rubric,
+        rubric_provenance,
+        rubric_provenance_error,
+    ) = await _resolve_launched_rubric(session, version, qual)
+    if launched_rubric is None or rubric_provenance is None:
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_provenance_unknown",
+            rubric_provenance=None,
+            provenance_error=rubric_provenance_error,
+            policy=policy,
+        )
+
+    live_criterion_rows = await get_criteria_for_version(session, version.id)
+    live_rubric = _canonicalize_rubric(
+        [
+            {"criterion_key": row.criterion_key, "text": row.text}
+            for row in live_criterion_rows
+            if row.status == "active"
+        ]
+    )
+    live_lifecycle = [
+        {"criterion_key": str(row.criterion_key), "status": str(row.status)}
+        for row in live_criterion_rows
+        if row.criterion_key
+    ]
+    rubric_drift = _bounded_rubric_drift(
+        launched_rubric,
+        live_rubric,
+        qual.get("rubric_lifecycle_snapshot"),
+        live_lifecycle,
+    )
+    if rubric_drift is not None:
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s rubric changed while the "
+            "blind merge-grade was in flight: %s",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            rubric_drift,
+        )
+        return await _record_rubric_provenance_outcome(
+            session,
+            version,
+            qual,
+            status="rubric_changed",
+            rubric_provenance=rubric_provenance,
+            rubric_drift=rubric_drift,
+            policy=policy,
+        )
 
     # --- Infra-failure detection: check required child terminal statuses ------
     # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
@@ -4131,7 +5479,9 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
-                        version_goal=version.goal,
+                        qualification_attempt_id=attempt_id,
+                        audit_base_sha=fp.get("audit_base_sha"),
+                        version_goal=_frozen_version_goal,
                     )
                     new_count = rl_respawn_count + 1
                     updated_qual = {
@@ -4139,6 +5489,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_rl_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4186,7 +5539,9 @@ async def _finalize_qualification(
                         base_branch=new_base_branch,
                         diff_range=new_diff_range,
                         candidate_sha=candidate_sha,
-                        version_goal=version.goal,
+                        qualification_attempt_id=attempt_id,
+                        audit_base_sha=fp.get("audit_base_sha"),
+                        version_goal=_frozen_version_goal,
                     )
                     new_count = infra_respawn_count + 1
                     updated_qual = append_infra_failure_child_event(
@@ -4202,6 +5557,9 @@ async def _finalize_qualification(
                         "audit_task_id": str(new_audit_task.id),
                         "audit_infra_respawn_count": new_count,
                     }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
                     version.last_qualification = updated_qual
                     flag_modified(version, "last_qualification")
                     session.add(version)
@@ -4251,7 +5609,11 @@ async def _finalize_qualification(
             )
 
     _smoke_task_obj: Task | None = None
-    if smoketest_enabled and smoketest_task_id:
+    # A FAILED/CANCELLED/BLOCKED child is an infra failure regardless of
+    # which subsystem spawned it (smoketest OR env-preflight).  Check the
+    # terminal status before reading artifacts so the quality-verdict path
+    # only sees COMPLETED children.
+    if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
         try:
             _smoke_task_obj = await session.get(Task, uuid.UUID(str(smoketest_task_id)))
             if (
@@ -4316,10 +5678,24 @@ async def _finalize_qualification(
     _audit_and_erosion_resolved = (
         "audit" in resolved_dims and "test_erosion" in resolved_dims
     )
+    _resolved_audit_detail: dict[str, Any] = {}
+    _prior_delta_audit_row = None
+    _prior_delta_erosion_row = None
+    _prior_delta_sha = str(qual.get("prior_audit_candidate_sha") or "").strip()
+    if _prior_delta_sha and not _audit_and_erosion_resolved:
+        _prior_delta_audit_row = await _load_dimension_result(
+            session, version, _prior_delta_sha, "audit"
+        )
+        _prior_delta_erosion_row = await _load_dimension_result(
+            session, version, _prior_delta_sha, "test_erosion"
+        )
     if _audit_and_erosion_resolved:
         audit_report = None
         audit_score = resolved_dims["audit"].get("sub_score")
         test_erosion_score = resolved_dims["test_erosion"].get("sub_score")
+        _resolved_audit_detail_raw = resolved_dims["audit"].get("detail")
+        if isinstance(_resolved_audit_detail_raw, dict):
+            _resolved_audit_detail = _resolved_audit_detail_raw
         # A resolved test_erosion fact with status "blocked" carries the
         # hard-blocker sentinel (sub_score None == test_file_deleted); it must
         # propagate as None so compute_composite re-raises the block, never
@@ -4331,10 +5707,17 @@ async def _finalize_qualification(
             and resolved_dims["test_erosion"].get("status") != "blocked"
         ):
             test_erosion_score = 1.0
-        audit_findings: list[dict[str, Any]] = []
-        excluded_audit_findings: list[dict[str, Any]] = []
-        test_erosion_detail: dict[str, Any] = {}
-        audit_missing_reason: str | None = None
+        audit_findings = list(_resolved_audit_detail.get("audit_findings") or [])
+        excluded_audit_findings = list(
+            _resolved_audit_detail.get("excluded_audit_findings") or []
+        )
+        _resolved_erosion_detail = resolved_dims["test_erosion"].get("detail")
+        test_erosion_detail = (
+            dict(_resolved_erosion_detail)
+            if isinstance(_resolved_erosion_detail, dict)
+            else {}
+        )
+        audit_missing_reason = _resolved_audit_detail.get("audit_missing_reason")
     else:
         audit_report: dict[str, Any] | None = None
         if audit_task_id:
@@ -4366,7 +5749,27 @@ async def _finalize_qualification(
                 session, version, qual, "audit_report_missing"
             )
 
+        if _prior_delta_audit_row is not None:
+            audit_report, _ = _merge_scoped_audit_report_with_prior_fact(
+                audit_report,
+                audit_report,
+                _prior_delta_audit_row.detail,
+                expected_base_sha=_prior_delta_sha,
+            )
         audit_score, test_erosion_score = _score_audit(audit_report)
+        test_erosion_detail = _extract_test_erosion_detail(audit_report)
+        if (
+            _prior_delta_erosion_row is not None
+            and isinstance(audit_report, dict)
+            and _audit_report_confirms_incremental_base(audit_report, _prior_delta_sha)
+        ):
+            test_erosion_score, test_erosion_detail = (
+                _merge_scoped_test_erosion_with_prior_fact(
+                    audit_report,
+                    _prior_delta_erosion_row.detail,
+                    prior_blocked=_prior_delta_erosion_row.status == "blocked",
+                )
+            )
         # Carry the findings (not just the score) into last_qualification so the
         # strategic agent can target them — otherwise the audit sub-score, usually
         # the binding constraint, is opaque to the loop.
@@ -4380,7 +5783,6 @@ async def _finalize_qualification(
         # Carry the specific test-erosion detail (deleted files / negative deltas)
         # so the agent can target it when test-erosion is the binding constraint,
         # the same way it sees audit_findings.
-        test_erosion_detail = _extract_test_erosion_detail(audit_report)
         audit_missing_reason = _audit_missing_reason(audit_report)
         if audit_missing_reason == "parseable_but_unscoreable":
             return await _handle_infra_failure(
@@ -4421,23 +5823,36 @@ async def _finalize_qualification(
         session, version, candidate_sha, "audit",
         status=_audit_status,
         sub_score=audit_score,
+        detail=_audit_dimension_detail(
+            surface_paths=qual.get("audited_surface_paths"),
+            audit_findings=audit_findings,
+            excluded_audit_findings=excluded_audit_findings,
+            findings_meta=_audit_findings_carry_meta(audit_report),
+            audit_missing_reason=audit_missing_reason,
+            audit_scope=(audit_report or {}).get("audit_scope"),
+        ),
         producing_task_id=audit_task_id,
+        audited_surface_hash=qual.get("candidate_diff_hash"),
+        origin_attempt_id=attempt_id,
     )
     _te_status = "blocked" if test_erosion_score is None else "passed"
     await _upsert_dimension_result(
         session, version, candidate_sha, "test_erosion",
         status=_te_status,
         sub_score=test_erosion_score,
+        detail=test_erosion_detail,
         producing_task_id=audit_task_id,
+        origin_attempt_id=attempt_id,
     )
 
     # --- Read the smoketest result -----------------------------------------
-    # Audit H3: only when the smoketest subsystem was enabled — a disabled run
-    # spawned no qualifier-smoketest child, so there is no SMOKETEST_RESULT to
-    # read and smoketest_score stays None (compute_composite drops the
-    # dimension rather than hard-blocking on it).  When the smoketest dimension
-    # is already resolved from a prior finalize at this candidate_sha, compose
-    # from the ledger (the smoketest child was not re-spawned).
+    # Read the SMOKETEST_RESULT whenever the qualifier-smoketest child was
+    # spawned — whether for smoketest scoring, env-preflight evidence, or both.
+    # Audit H3: when smoketest is disabled the smoketest SCORE is dropped (the
+    # child may still have run for env-preflight evidence).  When the smoketest
+    # dimension is already resolved from a prior finalize at this candidate_sha,
+    # compose the SCORE from the ledger but still re-read the artifact for
+    # env-preflight evidence when enabled.
     if "smoketest" in resolved_dims:
         smoketest_result = None
         _smoke_score = resolved_dims["smoketest"].get("sub_score")
@@ -4454,9 +5869,26 @@ async def _finalize_qualification(
         else:
             smoketest_score = _smoke_score if _smoke_score is not None else 1.0
         smoketest_detail = resolved_dims["smoketest"].get("detail") or {}
+        # Also read the SMOKETEST_RESULT artifact for env-preflight evidence
+        # when env_preflight is enabled.  The artifact still exists from the
+        # prior finalize that resolved the smoketest dimension; smoketest_task_id
+        # was carried forward by run_qualification for this purpose.
+        if env_preflight_enabled and smoketest_task_id:
+            try:
+                smoketest_result = await _latest_artifact_logs(
+                    session,
+                    uuid.UUID(str(smoketest_task_id)),
+                    ArtifactType.SMOKETEST_RESULT,
+                )
+            except (ValueError, TypeError):
+                pass
     else:
         smoketest_result: dict[str, Any] | None = None
-        if smoketest_enabled and smoketest_task_id:
+        # Read the SMOKETEST_RESULT when EITHER smoketest or env-preflight
+        # was enabled (both use the same qualifier-smoketest child to
+        # produce the artifact).  When neither was enabled the child was
+        # never spawned and smoketest_task_id is None.
+        if (smoketest_enabled or env_preflight_enabled) and smoketest_task_id:
             try:
                 smoketest_result = await _latest_artifact_logs(
                     session,
@@ -4469,6 +5901,10 @@ async def _finalize_qualification(
                     smoketest_task_id,
                     version.version_number,
                 )
+        # smoketest_report_missing is gated to smoketest_enabled: when the
+        # child ran ONLY for env-preflight, a missing artifact surfaces as
+        # the deterministic boot_prereq_evidence_missing block, never an
+        # infra-failure retry loop (the v22 migration-gate lesson).
         if (
             smoketest_enabled
             and smoketest_task_id
@@ -4484,6 +5920,62 @@ async def _finalize_qualification(
         # so the agent can target it when smoketest is the binding constraint.
         smoketest_detail = _extract_smoketest_detail(smoketest_result)
 
+    # Candidate-side env-preflight evidence (Slice 2, design 245212a4).
+    # ``run_qualification`` now produces this artifact unconditionally via
+    # the GitHub contents API (decoupled from the smoketest child) and stores
+    # it as ``qual["env_preflight_evidence"]``.  Read that first; fall back to
+    # the SMOKETEST_RESULT-carried artifact for backward compatibility with
+    # qualification runs that predate the decoupling.
+    # None when no evidence was produced (smoketest artifact also absent).
+    _env_preflight_raw = qual.get("env_preflight_evidence")
+    if _env_preflight_raw is None and isinstance(smoketest_result, dict):
+        _env_preflight_raw = smoketest_result.get("env_preflight")
+    env_preflight = sanitize_env_preflight_artifact(_env_preflight_raw)
+
+    # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
+    # default.  The flag was resolved above (before the smoketest result read)
+    # so the deployment-time checks in this section (env_preflight_score,
+    # env_preflight_missing, ack_override) can reference it.  When the flag is
+    # False every downstream use is inert (score/missing ignored, no
+    # boot_prereq_missing blocker, no sub_score, no verdict blob).
+    env_preflight_score, env_preflight_missing, env_preflight_scope = (
+        _score_env_preflight(
+            env_preflight, _deployed_env_presence_snapshot(env_preflight)
+        )
+    )
+    # Presence-only verdict blob — recorded ONLY when the judge is enabled, so a
+    # dark run leaves last_qualification byte-for-byte unchanged.  ``required`` is
+    # the candidate-declared [{name, scope}] list; ``missing`` is NAMES only.
+    env_preflight_verdict: dict[str, Any] | None = None
+    if env_preflight_enabled and isinstance(env_preflight, dict):
+        env_preflight_verdict = {
+            "required": env_preflight.get("required_env") or [],
+            "missing": env_preflight_missing,
+            "deploy_target_scope": env_preflight_scope,
+        }
+
+    # Slice 4 (design 245212a4): OWNER-armed ack that the missing boot
+    # prerequisite will be bound in the same deploy revision.  The override
+    # applies ONLY when the env-preflight judge is enabled AND it actually found
+    # a missing prerequisite (otherwise there is nothing to override and the ack
+    # stays armed for a later run).  It suppresses exactly the boot_prereq_missing
+    # block inside compute_composite and NO other gate.  Presence-only: the ack
+    # marker carries who/when, never any env value.
+    _env_ack = qual.get("ack_env_will_be_bound")
+    env_preflight_ack_override = bool(
+        _env_ack and env_preflight_enabled and env_preflight_missing
+    )
+    env_preflight_ack_applied: dict[str, Any] | None = None
+    if env_preflight_ack_override and isinstance(_env_ack, dict):
+        env_preflight_ack_applied = {
+            "actor": _env_ack.get("actor"),
+            "acknowledged_at": _env_ack.get("acknowledged_at"),
+            "overridden_blocker": "boot_prereq_missing",
+            # Presence-only: NAMES of the acknowledged-missing prerequisites,
+            # never any value.
+            "missing": [str(n) for n in env_preflight_missing],
+        }
+
     # Persist smoketest to the per-dimension ledger immediately so it
     # survives a later-gate infra failure before _dual_write_dimension_results.
     # _upsert_dimension_result handles a None candidate_sha with a silent no-op.
@@ -4498,6 +5990,7 @@ async def _finalize_qualification(
         status=_smoke_status,
         sub_score=smoketest_score,
         producing_task_id=smoketest_task_id,
+        origin_attempt_id=attempt_id,
     )
     primary_findings = _primary_findings_for_challenge_retry(audit_report)
 
@@ -4532,9 +6025,10 @@ async def _finalize_qualification(
                 base_branch=challenge_base_branch,
                 diff_range=challenge_diff_range,
                 candidate_sha=candidate_sha,
+                qualification_attempt_id=attempt_id,
                 primary_audit_task_id=audit_task_id,
                 primary_findings=primary_findings,
-                version_goal=version.goal,
+                version_goal=_frozen_version_goal,
             )
         except PayloadTooLargeError as _spawn_exc:
             logger.warning(
@@ -4658,9 +6152,10 @@ async def _finalize_qualification(
                                         base_branch=_chal_base_branch,
                                         diff_range=_chal_diff_range,
                                         candidate_sha=candidate_sha,
+                                        qualification_attempt_id=attempt_id,
                                         primary_audit_task_id=audit_task_id,
                                         primary_findings=_chal_primary_findings,
-                                        version_goal=version.goal,
+                                        version_goal=_frozen_version_goal,
                                     )
                                 )
                             except PayloadTooLargeError as _chal_exc:
@@ -4690,6 +6185,9 @@ async def _finalize_qualification(
                                     ),
                                     "challenge_infra_respawn_count": _chal_new_count,
                                 }
+                                version.last_qualification = _advance_qualification_retry_episode(
+                                    version, version.last_qualification, cap=_MAX_AUDIT_RL_RESPAWNS
+                                )
                                 flag_modified(version, "last_qualification")
                                 session.add(version)
                                 await session.flush()
@@ -4800,9 +6298,10 @@ async def _finalize_qualification(
                     base_branch=_early_base_branch,
                     diff_range=_early_diff_range,
                     candidate_sha=candidate_sha,
+                    qualification_attempt_id=attempt_id,
                     primary_audit_task_id=audit_task_id,
                     primary_findings=primary_findings,
-                    version_goal=version.goal,
+                    version_goal=_frozen_version_goal,
                 )
             except PayloadTooLargeError as _early_exc:
                 logger.warning(
@@ -4826,6 +6325,9 @@ async def _finalize_qualification(
                         primary_findings
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -4911,9 +6413,10 @@ async def _finalize_qualification(
                         base_branch=retry_base_branch,
                         diff_range=retry_diff_range,
                         candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
                         primary_audit_task_id=audit_task_id,
                         primary_findings=primary_findings,
-                        version_goal=version.goal,
+                        version_goal=_frozen_version_goal,
                     )
                 except PayloadTooLargeError as _spawn_exc:
                     logger.warning(
@@ -4957,6 +6460,9 @@ async def _finalize_qualification(
                         else {}
                     ),
                 }
+                version.last_qualification = _advance_qualification_retry_episode(
+                    version, version.last_qualification, cap=_MAX_AUDIT_CHALLENGE_BINDING_RESPAWNS
+                )
                 flag_modified(version, "last_qualification")
                 session.add(version)
                 await session.flush()
@@ -4988,18 +6494,64 @@ async def _finalize_qualification(
     # empty findings lists from the ledger are authoritative, and re-scoring
     # against a None report would overwrite them with a default 1.0.
     if not _audit_and_erosion_resolved:
-        audit_score, test_erosion_score = _score_audit(_audit_report_scored)
+        _audit_report_for_excluded = audit_report
+        prior_audit_candidate_sha = qual.get("prior_audit_candidate_sha")
+        if prior_audit_candidate_sha:
+            prior_audit_row = await _load_dimension_result(
+                session,
+                version,
+                str(prior_audit_candidate_sha),
+                "audit",
+            )
+            if prior_audit_row is not None:
+                (
+                    _audit_report_scored,
+                    _audit_report_for_excluded,
+                ) = _merge_scoped_audit_report_with_prior_fact(
+                    _audit_report_scored,
+                    audit_report,
+                    prior_audit_row.detail,
+                    expected_base_sha=str(prior_audit_candidate_sha),
+                )
+        audit_score, _delta_test_erosion_score = _score_audit(_audit_report_scored)
+        if prior_audit_candidate_sha:
+            prior_erosion_row = await _load_dimension_result(
+                session, version, str(prior_audit_candidate_sha), "test_erosion"
+            )
+            if (
+                prior_erosion_row is not None
+                and isinstance(audit_report, dict)
+                and _audit_report_confirms_incremental_base(
+                    audit_report, str(prior_audit_candidate_sha)
+                )
+            ):
+                test_erosion_score, test_erosion_detail = (
+                    _merge_scoped_test_erosion_with_prior_fact(
+                        audit_report,
+                        prior_erosion_row.detail,
+                        prior_blocked=prior_erosion_row.status == "blocked",
+                    )
+                )
+            else:
+                test_erosion_score = _delta_test_erosion_score
+        else:
+            test_erosion_score = _delta_test_erosion_score
         # Carry the confirmed (actionable) findings into last_qualification so the
         # strategic agent can target them.  Use reconciled report when available so
         # refuted findings are not surfaced as actionable blockers.
         audit_findings = _extract_audit_findings(_audit_report_scored)
+        excluded_audit_findings = _extract_excluded_audit_findings(
+            _audit_report_for_excluded
+        )
         # Pre-cap totals + truncation flags for both carried lists. Verified meta is
         # computed on the reconciled report (matches audit_findings just above);
         # excluded meta on the original report (matches excluded_audit_findings,
         # which is derived from audit_report — the unverified-primary gap is
         # independent of challenge reconciliation).
         _verified_findings_meta = _audit_findings_carry_meta(_audit_report_scored)
-        _excluded_findings_meta = _audit_findings_carry_meta(audit_report)
+        _excluded_findings_meta = _audit_findings_carry_meta(
+            _audit_report_for_excluded
+        )
         # Build the reconciliation record on the RECONCILED report so
         # findings_derived_score agrees with the applied audit_score.  The challenge
         # synthesis is derived from the binding verdict artifact (new gate) — kept
@@ -5074,18 +6626,40 @@ async def _finalize_qualification(
             session, version, candidate_sha, "audit",
             status=_reconciled_audit_status,
             sub_score=audit_score,
+            detail=_audit_dimension_detail(
+                surface_paths=qual.get("audited_surface_paths"),
+                audit_findings=audit_findings,
+                excluded_audit_findings=excluded_audit_findings,
+                findings_meta={
+                    **_verified_findings_meta,
+                    **_excluded_findings_meta,
+                },
+                audit_missing_reason=audit_missing_reason,
+                audit_scope=(audit_report or {}).get("audit_scope"),
+            ),
             producing_task_id=audit_task_id,
+            audited_surface_hash=qual.get("candidate_diff_hash"),
+            origin_attempt_id=attempt_id,
         )
     else:
         # audit+test_erosion resolved from ledger — reconciliation fields are
         # not meaningful (no challenge ran, no audit report exists).
         _verified_findings_meta = {
-            "audit_findings_total": 0,
-            "audit_findings_truncated": False,
+            "audit_findings_total": _resolved_audit_detail.get(
+                "audit_findings_total", len(audit_findings)
+            ),
+            "audit_findings_truncated": bool(
+                _resolved_audit_detail.get("audit_findings_truncated")
+            ),
         }
         _excluded_findings_meta = {
-            "excluded_audit_findings_total": 0,
-            "excluded_audit_findings_truncated": False,
+            "excluded_audit_findings_total": _resolved_audit_detail.get(
+                "excluded_audit_findings_total",
+                len(excluded_audit_findings),
+            ),
+            "excluded_audit_findings_truncated": bool(
+                _resolved_audit_detail.get("excluded_audit_findings_truncated")
+            ),
         }
         audit_reconciliation: dict[str, Any] = {}
         challenger_refuted_audit_findings = []
@@ -5101,7 +6675,23 @@ async def _finalize_qualification(
     # identity surfaces the same way as any other finalize-time infra failure
     # (no verdict recorded, returned to stabilize, retried by the next cycle).
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): if a prior finalize already resolved this
+    # dimension at the same candidate_sha, reuse the stored verdict and skip the
+    # live GitHub fetch — only 'passed'/'blocked' rows appear in resolved_dims
+    # (_LEDGER_RESOLVED_STATUSES excludes 'unavailable'), so a prior defer never
+    # short-circuits the live gate.
+    if "migration_identity" in resolved_dims:
+        _mi_ledger = resolved_dims["migration_identity"]
+        migration_verdict = "block" if _mi_ledger["status"] == "blocked" else "pass"
+        migration_detail = (_mi_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_identity=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _mi_ledger["status"],
+        )
+    elif _pre_gates is not None:
         migration_verdict = _pre_gates["migration_verdict"]
         migration_detail = _pre_gates["migration_detail"]
     else:
@@ -5121,6 +6711,23 @@ async def _finalize_qualification(
             else "migration_identity_check_unavailable",
         )
     migration_collision = migration_verdict == "block"
+    # Eager-write migration_identity so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_identity",
+        status="blocked" if migration_collision else "passed",
+        sub_score=None,
+        blocker="migration_identity_collision" if migration_collision else None,
+        detail={
+            "verdict": migration_verdict,
+            "detail": migration_detail,
+            "execution_site": "eager_write",
+        },
+        origin_attempt_id=attempt_id,
+    )
 
     # --- Deterministic scratch-DB migration-APPLY safety gate ---------------
     # Complementary to the filename-identity check above: replay the candidate's
@@ -5134,7 +6741,19 @@ async def _finalize_qualification(
     # Thread the exact SHA snapped into last_qualification through this gate;
     # do not re-derive it from any live checkout state.
     # Pre-computed by _finalize_locked_version pre-lock (SITE B lock-window fix).
-    if _pre_gates is not None:
+    # Phase 1b (read-side cutover): same pattern as migration_identity above.
+    if "migration_apply" in resolved_dims:
+        _ma_ledger = resolved_dims["migration_apply"]
+        apply_verdict = "block" if _ma_ledger["status"] == "blocked" else "pass"
+        apply_detail = (_ma_ledger.get("detail") or {}).get("detail")
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s reusing ledger "
+            "migration_apply=%s (skip live gate)",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            _ma_ledger["status"],
+        )
+    elif _pre_gates is not None:
         apply_verdict = _pre_gates["apply_verdict"]
         apply_detail = _pre_gates["apply_detail"]
     else:
@@ -5146,20 +6765,49 @@ async def _finalize_qualification(
             session,
             version,
             qual,
+
             _migration_apply_infra_error(apply_detail),
         )
     migration_apply_blocked = apply_verdict == "block"
+    if apply_verdict == "skipped":
+        # Gate was never attempted (scratch DB not configured).  Record as
+        # "unavailable" so a skipped gate can never read as a passed gate.
+        _ma_status = "unavailable"
+        _ma_blocker = None
+    else:
+        _ma_status = "blocked" if migration_apply_blocked else "passed"
+        _ma_blocker = "migration_apply_drift" if migration_apply_blocked else None
+    # Eager-write migration_apply so a later gate's infra failure cannot
+    # discard this verdict before _dual_write_dimension_results is reached.
+    _ma_detail: dict[str, Any] = {
+        "verdict": apply_verdict,
+        "detail": apply_detail,
+        "execution_site": "eager_write",
+    }
+    if apply_verdict == "skipped" and apply_detail:
+        # Include an explicit status so _ledger_fact_satisfies_promotion can
+        # recognise this as a permanent non-applicable outcome rather than a
+        # transient infra hold — keeps the ledger-completeness check from
+        # stalling promotion on a deliberately skipped gate.
+        _ma_detail["status"] = apply_detail
+    await _upsert_dimension_result(
+        session,
+        version,
+        candidate_sha,
+        "migration_apply",
+        status=_ma_status,
+        sub_score=None,
+        blocker=_ma_blocker,
+        detail=_ma_detail,
+        origin_attempt_id=attempt_id,
+    )
 
-    # Acceptance-criteria coverage summary + the ACTIVE-criteria rubric.  Computed
-    # once here (before the merge-grade block) so the rubric can be threaded into
-    # the per-category grade below.  ``criterion_coverage`` is still persisted for
-    # observability / back-compat; ``active_categories`` are the CATEGORIES the
-    # goal-verification redesign grades the merged diff against.
+    # Keep today's coverage summary for observability; gate on launched rubric.
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     active_categories: list[dict[str, Any]] = [
         {"category_key": c.get("criterion_key"), "text": c.get("text")}
-        for c in (criterion_coverage.get("criteria") or [])
-        if c.get("status") == "active" and c.get("criterion_key")
+        for c in launched_rubric
+        if c.get("criterion_key")
     ]
 
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
@@ -5223,7 +6871,7 @@ async def _finalize_qualification(
             else None
         )
         merge_grade_cert = evaluate_merge_grade(
-            version.goal,
+            _frozen_version_goal,
             merge_grade_artifact,
             active_categories or None,
             _verified_merge_evidence,
@@ -5270,6 +6918,11 @@ async def _finalize_qualification(
             return await _handle_infra_failure(
                 session, version, qual, "merge_grade_grader_lacks_category_verdicts"
             )
+
+    merge_grade_cert = {
+        **merge_grade_cert,
+        "rubric_provenance": rubric_provenance,
+    }
 
     ci_state = ci_resolution.get("state", _CI_RED)
     ci_required = True
@@ -5329,7 +6982,9 @@ async def _finalize_qualification(
             session, version, candidate_sha, "merge_grade",
             status=_mg_ledger_status,
             sub_score=_mg_coverage if isinstance(_mg_coverage, (int, float)) and not isinstance(_mg_coverage, bool) else None,
+            detail=merge_grade_cert,
             producing_task_id=merge_grade_task_id,
+            origin_attempt_id=attempt_id,
         )
 
     # --- Goal-verification per-category ledger (redesign) -------------------
@@ -5380,8 +7035,12 @@ async def _finalize_qualification(
         # only guards the case where a grade DID run but its verdicts cannot be
         # trusted (absent for active keys, or the read raised).
         _merge_grade_ran = bool(merge_grade_task_id) or ("merge_grade" in resolved_dims)
+        _expected_grader_run_id = merge_grade_task_id or resolved_dims.get(
+            "merge_grade", {}
+        ).get("producing_task_id")
+        if _expected_grader_run_id is not None:
+            _expected_grader_run_id = str(_expected_grader_run_id)
         _fresh_category_verdicts = merge_grade_cert.get("category_verdicts")
-        _ledger_write_failed = False
         if _fresh_category_verdicts is not None:
             # Fresh grade this finalize: write each category verdict + the residual.
             try:
@@ -5396,15 +7055,16 @@ async def _finalize_qualification(
                         gap=_v.get("gap"),
                         citations=_v.get("citations") or [],
                         grader_run_id=merge_grade_task_id,
+                        qualification_attempt_id=attempt_id,
                     )
                 await _category_ledger.upsert_residual(
                     session,
                     version.id,
                     candidate_sha,
                     merge_grade_cert.get("residual_uncaptured_gap"),
+                    qualification_attempt_id=attempt_id,
                 )
             except Exception:  # noqa: BLE001 — ledger write failure must not crash finalize
-                _ledger_write_failed = True
                 logger.warning(
                     "[RELEASE_QUALIFIER] v%d failed to persist per-category "
                     "goal-verification verdicts to the ledger — gating on the "
@@ -5412,12 +7072,9 @@ async def _finalize_qualification(
                     "finalize",
                     version.version_number,
                 )
-        if _ledger_write_failed:
-            # FIX 2 — fail CLOSED.  Persistence hiccupped, so a ledger read-back
-            # would see stale/absent rows and (via a None gate input) SKIP the
-            # category gate entirely, letting a ``not_met`` candidate promote.  The
-            # freshly-computed in-memory grade is authoritative: feed it to the gate
-            # directly (filtered to the active keys, exactly like the read-back).
+        if _fresh_category_verdicts is not None:
+            # Gate on fresh evidence directly; this also fails closed if the
+            # best-effort ledger write hiccupped or older same-SHA rows exist.
             # Fail-open state 1/3: the write failed AND the freshly-computed
             # verdicts do not cover any currently-active criterion (e.g. the
             # grader only graded now-retracted categories).  Absent evidence for
@@ -5437,7 +7094,8 @@ async def _finalize_qualification(
             # the re-drive path where no fresh artifact was re-evaluated).
             try:
                 _ledger_verdicts = await _category_ledger.get_category_verdicts(
-                    session, version.id, candidate_sha
+                    session, version.id, candidate_sha,
+                    qualification_attempt_id=attempt_id,
                 )
                 # FIX 1 — filter to the CURRENTLY-ACTIVE criterion keys.  The ledger
                 # returns EVERY row for the (version, sha) pair, including a
@@ -5456,6 +7114,13 @@ async def _finalize_qualification(
                     for cv in (
                         _coerce_ledger_category_verdict(_v)
                         for _v in (_ledger_verdicts or [])
+                        if _expected_grader_run_id is None
+                        or str(
+                            _v.get("grader_run_id")
+                            if isinstance(_v, dict)
+                            else getattr(_v, "grader_run_id", None)
+                        )
+                        == _expected_grader_run_id
                     )
                     if cv.get("category_key") in _active_keys
                 ] or (
@@ -5464,7 +7129,8 @@ async def _finalize_qualification(
                     else None
                 )
                 _gate_residual = await _category_ledger.get_residual(
-                    session, version.id, candidate_sha
+                    session, version.id, candidate_sha,
+                    qualification_attempt_id=attempt_id,
                 )
             except Exception:  # noqa: BLE001 — a read failure fails CLOSED (below)
                 # Fail-open state 3/3: the ledger read itself raised, so the
@@ -5529,7 +7195,8 @@ async def _finalize_qualification(
         capability_proof_gate_release_status as _cp_release_status,
     )
 
-    _capability_proof_mode = str(
+    # Prefer the mode frozen at spawn; fall back to live config for legacy records.
+    _capability_proof_mode = _frozen_capability_proof_mode or str(
         _runtime_config.get("capability_proof_gate_mode", "off") or "off"
     ).strip().lower()
     capability_proof_blocked, capability_proof_detail = _cp_release_status(
@@ -5593,7 +7260,7 @@ async def _finalize_qualification(
         _debt_pressure_score: float | None = _score_completion_debt_pressure(
             _completion_debt_scoring_snapshot
         )
-    elif _resolve_completion_debt_weight_mode() == "enforce":
+    elif _frozen_cd_was_enforce:
         # In enforce mode a failed debt-snapshot read must NOT inflate confidence
         # by silently dropping the (1 - w_debt) down-scaling inside
         # compute_composite.  Use 0.0 (maximum-debt worst case) so the composite
@@ -5623,6 +7290,15 @@ async def _finalize_qualification(
         merge_grade_exempt=_merge_grade_exempt,
         debt_pressure_score=_debt_pressure_score,
         capability_proof_blocked=capability_proof_blocked,
+        # Slice 3 (design 245212a4): DARK-by-default deployed-side env-preflight
+        # judge.  Score/missing are ignored entirely when env_preflight_enabled
+        # is False, preserving byte-for-byte default promotion behaviour.
+        env_preflight_enabled=env_preflight_enabled,
+        env_preflight_score=env_preflight_score,
+        env_preflight_missing=env_preflight_missing,
+        # Slice 4: OWNER-armed one-shot override of the boot_prereq_missing block
+        # (scoped to that blocker only — see _env_ack above).
+        env_preflight_ack_override=env_preflight_ack_override,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -5681,7 +7357,14 @@ async def _finalize_qualification(
         "audit_findings": audit_findings,
         # Agent-authored, backend-preserved explanation of delta selection or
         # full fallback. Kept schema-free and shaped for later dimension detail.
-        "audit_scope": (audit_report or {}).get("audit_scope"),
+        "audit_scope": (
+            (audit_report or {}).get("audit_scope")
+            or (
+                _resolved_audit_detail.get("audit_scope")
+                if _audit_and_erosion_resolved
+                else None
+            )
+        ),
         "excluded_audit_findings": excluded_audit_findings,
         # Pre-cap totals + truncation flags so consumers can tell whether the
         # carried lists above are complete or were clipped at _MAX_CARRIED_FINDINGS.
@@ -5701,6 +7384,33 @@ async def _finalize_qualification(
         "challenger_refuted_audit_findings": challenger_refuted_audit_findings,
         "test_erosion_detail": test_erosion_detail,
         "smoketest_detail": smoketest_detail,
+        # Candidate-side env-preflight evidence (Slice 2, design 245212a4):
+        # pure-content {required_env, startup_check_names, manifest_source}
+        # introspected from the candidate tree. Stored UNCHANGED — no gating,
+        # never read by compute_composite or the promotion decision. None when
+        # the smoketest child produced no such artifact.
+        "env_preflight": env_preflight,
+        # Slice 3 (design 245212a4): the deployed-side judge flag + verdict blob.
+        # env_preflight_enabled is read back by the state resolver to render the
+        # env_preflight dimension (not_applicable when dark).  env_preflight_verdict
+        # is {required:[{name,scope}], missing:[names], deploy_target_scope} —
+        # presence-only, None when the judge was disabled or no manifest was seen.
+        "env_preflight_enabled": env_preflight_enabled,
+        "env_preflight_verdict": env_preflight_verdict,
+        # Slice 4 (design 245212a4): OWNER-armed one-shot ack that the missing
+        # boot prerequisite will be bound in the same deploy revision.
+        #   * ack_env_will_be_bound — the ARMED marker.  Carried forward UNCHANGED
+        #     while it has not yet overridden a block (so it stays armed across
+        #     re-qualification), and CLEARED to None the run it actually overrides
+        #     one — a one-shot bypass, never sticky.
+        #   * env_preflight_ack_applied — audit record of the applied override
+        #     (actor / acknowledged_at / overridden_blocker + presence-only missing
+        #     NAMES); None when no override was applied this run.  Presence-only: no
+        #     env VALUE is ever recorded.
+        "ack_env_will_be_bound": (
+            None if env_preflight_ack_override else qual.get("ack_env_will_be_bound")
+        ),
+        "env_preflight_ack_applied": env_preflight_ack_applied,
         "audit_missing_reason": audit_missing_reason,
         "audit_reconciliation": audit_reconciliation,
         "migration_safety": migration_verdict,
@@ -5708,6 +7418,12 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "criterion_coverage": criterion_coverage,
+        # Attempt-scoped acceptance contract (coverage above remains live).
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "rubric_snapshot": launched_rubric,
+        "rubric_fingerprint": rubric_provenance.get("fingerprint"),
+        "rubric_provenance": rubric_provenance,
+        "rubric_drift": None,
         # Goal-verification redesign: the per-category verdicts + residual that
         # drove the gate this finalize (sha-keyed; None when no rubric / ledger
         # absent / exempt).  Persisted so the CI-unresolved-recovery recompute in
@@ -5742,7 +7458,7 @@ async def _finalize_qualification(
     # completion_debt_weight_mode knob with accumulated evidence rather than
     # flying blind.  Has no effect on the live composite.
     if (
-        _resolve_completion_debt_weight_mode() != "enforce"
+        not _frozen_cd_was_enforce
         and composite["blocker"] is None
         and _debt_pressure_score is not None
     ):
@@ -5786,6 +7502,46 @@ async def _finalize_qualification(
     # or rolls back the qualification.  Runs before the decision branch so all
     # three terminal paths (not_promoted / dry_run / promote) are covered once.
     await _dual_write_dimension_results(session, version, base_record, composite)
+
+    # --- Discharge hotfix-deploy backfill debt on a passing normal gate ------
+    # The operator hotfix-deploy channel opens a hotfix_deploy_pending_backfill
+    # completion-debt row (see _record_hotfix_audit_trail) recording that a
+    # fast-tracked release-machinery promotion bypassed the audit/scoring gate
+    # and is owed re-qualification by the NORMAL gate.  This IS that gate: when
+    # the composite clears the audit/scoring bar (promote=True) the owed
+    # re-qualification has demonstrably happened, so resolve any open
+    # hotfix-deploy backfill debt for this project — otherwise the row is
+    # write-only and drags the debt-pressure sub-score down forever.  Fire on
+    # gate-pass (composite.promote), NOT on merge-land: a pass is robust to a
+    # descendant SHA and to a later dry-run/merge-conflict, and it mirrors the
+    # "gate cleared" semantics the debt records.  Best-effort — never raises,
+    # never alters the decision below.
+    if composite["promote"]:
+        try:
+            from app.completion_debt import aresolve_hotfix_deploy_backfill_debts
+
+            _discharged = await aresolve_hotfix_deploy_backfill_debts(
+                session,
+                version.project_id,
+                reason=(
+                    f"re-qualified by normal gate at "
+                    f"{(candidate_sha or '')[:8]} (v{version.version_number})"
+                ),
+            )
+            if _discharged:
+                logger.info(
+                    "[RELEASE_QUALIFIER] v%d discharged %d hotfix-deploy backfill "
+                    "debt row(s) on passing normal gate",
+                    version.version_number,
+                    _discharged,
+                )
+        except Exception:  # noqa: BLE001 — discharge must never break finalize
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d failed to discharge hotfix-deploy "
+                "backfill debt",
+                version.version_number,
+                exc_info=True,
+            )
 
     # --- Decide -------------------------------------------------------------
     if not composite["promote"]:
@@ -5862,6 +7618,16 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
+            # The env-preflight blocker carries the specific missing var NAMES so
+            # the operator sees WHICH prerequisite is absent, not just the generic
+            # label.  Presence-only: names only, never values.
+            if (
+                composite["blocker"] == "boot_prereq_missing"
+                and env_preflight_missing
+            ):
+                blocker_label = (
+                    f"{blocker_label} — missing: {', '.join(env_preflight_missing)}"
+                )
             # Tag the blocker with WHERE its check runs so the operator sees
             # whether a fix on automain takes effect pre-promotion (candidate-side)
             # or is inert until this version itself promotes (deployed-side).
@@ -6024,11 +7790,9 @@ async def _finalize_qualification(
         base_record=base_record,
     )
 
-
 # ---------------------------------------------------------------------------
 # maybe_finalize_qualification — task-completion hook (coordination glue).
 # ---------------------------------------------------------------------------
-
 
 async def _required_children_terminal(
     session: AsyncSession,
@@ -6058,7 +7822,10 @@ async def _required_children_terminal(
     smoketest_resolved = "smoketest" in resolved_dims
     merge_grade_resolved = "merge_grade" in resolved_dims
 
-    smoketest_required = bool(qual.get("smoketest_enabled", True))
+    smoketest_required = bool(
+        qual.get("smoketest_enabled", True)
+        or qual.get("env_preflight_enabled", False)
+    )
     audit_task_id_raw = qual.get("audit_task_id")
     challenge_task_id_raw = qual.get("challenge_task_id")
     smoketest_task_id_raw = qual.get("smoketest_task_id")
@@ -6140,6 +7907,37 @@ async def _required_children_terminal(
         else None
     )
 
+    # Strict matching begins once the JSON projection carries identity.  A
+    # partially-backfilled legacy pending row may have only the typed column
+    # while its already-running children have no attempt key; keep that window
+    # readable/finalizable until the projection backfill converges.
+    active_attempt_id = _coerce_qualification_attempt_id(
+        qual.get("qualification_attempt_id")
+    )
+    if active_attempt_id is not None:
+        for leg, task in (
+            ("audit", audit_task),
+            ("smoketest", smoketest_task),
+            ("challenge", challenge_task),
+            ("merge_grade", merge_grade_task),
+        ):
+            if task is None:
+                continue
+            child_attempt_id = _coerce_qualification_attempt_id(
+                (task.context or {}).get("qualification_attempt_id")
+            )
+            if child_attempt_id != active_attempt_id:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] finalize-gate: v%d %s child %s belongs "
+                    "to attempt %s, active attempt is %s -- not ready",
+                    version.version_number,
+                    leg,
+                    task.id,
+                    child_attempt_id,
+                    active_attempt_id,
+                )
+                return False
+
     if (
         (not audit_resolved and audit_task is None)
         or (smoketest_required and not smoketest_resolved and smoketest_task is None)
@@ -6190,7 +7988,6 @@ async def _required_children_terminal(
         else "not_spawned",
     )
     return True
-
 
 async def _maybe_reconcile_after_promotion_conflict(
     version_id: uuid.UUID,
@@ -6246,7 +8043,6 @@ async def _maybe_reconcile_after_promotion_conflict(
             exc,
         )
 
-
 # Qualification outcomes after which the strategic agent should re-plan: a
 # settled verdict (a promote, any flavour of miss, or a terminal infra
 # failure). Excludes the in-flight (``pending_auto_merge``), transient
@@ -6262,7 +8058,6 @@ _STRATEGIC_RETRIGGER_STATUSES: frozenset[str] = frozenset(
         "infra_failure",
     }
 )
-
 
 async def _maybe_trigger_strategic_after_qualification(
     version_id: uuid.UUID,
@@ -6369,12 +8164,12 @@ async def _maybe_trigger_strategic_after_qualification(
             exc,
         )
 
-
 async def _finalize_in_dedicated_session(
     version_id: uuid.UUID,
     *,
     session_factory=None,
     timeout_now: datetime | None = None,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Run the finalize→promote chain for ``version_id`` on a DEDICATED session.
 
@@ -6437,7 +8232,12 @@ async def _finalize_in_dedicated_session(
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
         try:
-            result = await _finalize_locked_version(session, version_id, timeout_now)
+            result = await _finalize_locked_version(
+                session,
+                version_id,
+                timeout_now,
+                expected_attempt_id=expected_attempt_id,
+            )
         except Exception:
             # Roll back this dedicated session's partial work before unwinding.
             # In production each dedicated session is independent and the
@@ -6470,7 +8270,6 @@ async def _finalize_in_dedicated_session(
         version_id, result, session_factory=session_factory
     )
     return result
-
 
 async def _reattempt_promotion_failed_locked(
     session: AsyncSession,
@@ -6566,7 +8365,6 @@ async def _reattempt_promotion_failed_locked(
     await session.commit()
     return result
 
-
 async def _reattempt_promotion_failed_in_dedicated_session(
     version_id: uuid.UUID,
     candidate_sha: str,
@@ -6642,7 +8440,6 @@ async def _reattempt_promotion_failed_in_dedicated_session(
         )
     return result
 
-
 # ---------------------------------------------------------------------------
 # Operator FORCE-PROMOTE — skip the audit gate, still open the PR + wait for CI.
 # ---------------------------------------------------------------------------
@@ -6658,6 +8455,7 @@ _FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
         "version_not_found",
         "not_open",
         "promotion_in_flight",
+        "ci_not_green",
     }
 )
 
@@ -6740,7 +8538,6 @@ async def _force_promote_locked(
     await session.commit()
     return result
 
-
 async def _force_promote_in_dedicated_session(
     version_id: uuid.UUID,
     candidate_sha: str,
@@ -6782,7 +8579,6 @@ async def _force_promote_in_dedicated_session(
             version_id, result, session_factory=session_factory
         )
     return result
-
 
 async def force_promote_current_version(
     session: AsyncSession,
@@ -6831,6 +8627,23 @@ async def force_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI for the candidate before opening the promotion PR.
+    # Both bypass channels skip the AUDIT gate only, not CI; relying on branch
+    # protection alone fails open when protection is absent or misconfigured.
+    ci_green, ci_resolution = await _resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] FORCE-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id,
+            version.version_number,
+            candidate_sha[:8],
+            ci_resolution.get("state"),
+            actor,
+            reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s — SKIPPING the audit/qualify gate (CI still gates the "
@@ -6851,11 +8664,6 @@ async def force_promote_current_version(
     )
 
 
-# Stable facade for the narrow operator-approved release-machinery lane.
-from app.release_hotfix_promotion import (
-    check_hotfix_scope_preview as check_hotfix_scope_preview,
-    hotfix_promote_current_version as hotfix_promote_current_version,
-)
 
 def _qualification_timeout_age_seconds(
     version: release_version.ReleaseVersion,
@@ -6882,11 +8690,12 @@ def _qualification_timeout_age_seconds(
         return None
     return (timeout_now - timeout_clock).total_seconds()
 
-
 async def _finalize_locked_version(
     session: AsyncSession,
     version_id: uuid.UUID,
     timeout_now: datetime | None,
+    *,
+    expected_attempt_id: uuid.UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """Lock + finalize one version within an already-open dedicated session.
 
@@ -6928,6 +8737,23 @@ async def _finalize_locked_version(
         return None
     peek_qual = peek.last_qualification or {}
     if peek_qual.get("status") != "pending":
+        return None
+    expected_attempt_uuid = _coerce_qualification_attempt_id(expected_attempt_id)
+    active_attempt_uuid = _coerce_qualification_attempt_id(
+        peek_qual.get("qualification_attempt_id")
+    ) or _coerce_qualification_attempt_id(peek.active_qualification_attempt_id)
+    if (
+        expected_attempt_uuid is not None
+        and active_attempt_uuid is not None
+        and expected_attempt_uuid != active_attempt_uuid
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize ignored completion from stale attempt "
+            "%s; v%d active attempt is %s",
+            expected_attempt_uuid,
+            peek.version_number,
+            active_attempt_uuid,
+        )
         return None
     peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
     pre_timeout_age_seconds = (
@@ -7094,7 +8920,6 @@ async def _finalize_locked_version(
     await session.commit()
     return result
 
-
 async def maybe_finalize_qualification(
     completed_task: Task,
     *,
@@ -7175,5 +9000,24 @@ async def maybe_finalize_qualification(
         return None
 
     return await _finalize_in_dedicated_session(
-        version_id, session_factory=session_factory
+        version_id,
+        session_factory=session_factory,
+        expected_attempt_id=context.get("qualification_attempt_id"),
     )
+
+
+# ── Deferred re-export: break the release_qualifier ⟷ release_hotfix_promotion
+# circular import ─────────────────────────────────────────────────────────────
+# release_hotfix_promotion imports many symbols from THIS module at its own top
+# level (_FORCE_PROMOTE_NOOP_STATUSES, promote, compute_audited_surface_hash,
+# …). If we imported it at the top of release_qualifier, rhp would run while
+# this module was only partially initialized and fail to find those names. By
+# importing it at the very bottom — after every symbol rhp needs is defined —
+# rhp sees a fully-initialized release_qualifier. The two names remain
+# module-level attributes so `release_qualifier.hotfix_promote_current_version`
+# / `.check_hotfix_scope_preview` keep working for admin_hotfix_promote.
+from app.release_hotfix_promotion import (  # noqa: E402
+    _record_hotfix_audit_trail as _record_hotfix_audit_trail,
+    check_hotfix_scope_preview as check_hotfix_scope_preview,
+    hotfix_promote_current_version as hotfix_promote_current_version,
+)

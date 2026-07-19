@@ -8,7 +8,9 @@ from httpx import ASGITransport, AsyncClient
 
 from app.payload_schemas import TaskType, validate_task_payload
 from app.task_capabilities import (
+    AGENT_EXECUTED_TASK_TYPES,
     ALL_TASK_TYPES,
+    BACKEND_MANAGED_TASK_TYPES,
     agent_capability_slice,
     CODE_REVIEW_GATED_TASK_TYPES,
     COMPLETION_HANDLER_BY_TASK_TYPE,
@@ -48,6 +50,13 @@ def test_task_capability_modes_partition_all_known_types():
     assert WRITE_TASK_TYPES
     assert READ_ONLY_TASK_TYPES.isdisjoint(WRITE_TASK_TYPES)
     assert READ_ONLY_TASK_TYPES | WRITE_TASK_TYPES == ALL_TASK_TYPES
+
+
+def test_task_capability_execution_owners_partition_all_known_types():
+    assert AGENT_EXECUTED_TASK_TYPES
+    assert not BACKEND_MANAGED_TASK_TYPES
+    assert AGENT_EXECUTED_TASK_TYPES.isdisjoint(BACKEND_MANAGED_TASK_TYPES)
+    assert AGENT_EXECUTED_TASK_TYPES | BACKEND_MANAGED_TASK_TYPES == ALL_TASK_TYPES
 
 
 def test_task_capability_ui_subsets_only_reference_known_types():
@@ -122,6 +131,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "web_research": "web_research",
         "design": "design",
         "repo_bootstrap": "repo_bootstrap",
+        "capability_proof_trial": "capability_proof_trial",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {
@@ -155,9 +165,15 @@ def test_strategic_task_types_match_legacy_tuple():
 
 
 def test_strategic_local_runner_preset_tracks_registry():
+    from app.task_capabilities import STRATEGIC_LOCAL_AGENT_TASK_TYPES
     from app.routers import admin_runners
 
-    assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(STRATEGIC_TASK_TYPES)
+    assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(
+        STRATEGIC_LOCAL_AGENT_TASK_TYPES
+    )
+    assert STRATEGIC_LOCAL_AGENT_TASK_TYPES == (
+        STRATEGIC_TASK_TYPES | {"strategic_resident_turn"}
+    )
 
 
 def test_strategic_phase_ordering_is_registry_declared():
@@ -511,6 +527,7 @@ _CATALOG_FIELDS = {
     "label",
     "description",
     "agent_mode",
+    "execution_owner",
     "default_category",
     "user_launchable",
     "operator_contract_launchable",
@@ -542,6 +559,7 @@ def test_task_type_catalog_covers_every_capability_with_all_fields():
     for entry in catalog:
         assert set(entry.keys()) == _CATALOG_FIELDS, entry["id"]
         assert entry["agent_mode"] in {"write", "read_only"}
+        assert entry["execution_owner"] in {"agent", "backend"}
         assert entry["run_shape"] in _VALID_RUN_SHAPES, entry["id"]
         assert entry["output_kind"] in _VALID_OUTPUT_KINDS, entry["id"]
         assert entry["evaluation_strategy"] in _VALID_EVAL_STRATEGIES, entry["id"]
@@ -579,6 +597,7 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "label": "Compute Experiment",
         "description": by_id["compute_experiment"]["description"],
         "agent_mode": "read_only",
+        "execution_owner": "agent",
         "default_category": "ops",
         "user_launchable": False,
         "operator_contract_launchable": True,
@@ -592,6 +611,12 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
+    assert by_id["strategic_resident_turn"]["execution_owner"] == "agent"
+    assert by_id["strategic_resident_turn"]["filter_visible"] is False
+    assert by_id["strategic_resident_turn"]["provider_configurable"] is True
+    assert by_id["strategic_resident_turn"]["user_launchable"] is False
+    assert by_id["strategic_resident_turn"]["requires_code"] is False
+    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 4.0
     # Panel review is a multi-agent workflow producing a verdict artifact with a
     # higher cost ceiling than the normal review path and is now launchable
     # because the executable workflow is live.
@@ -752,7 +777,7 @@ def test_agent_handler_dispatch_matches_backend_registry():
         "`handlers` object-literal format likely changed; fix the parser"
     )
 
-    registered = {t.value for t in TaskType}
+    registered = set(AGENT_EXECUTED_TASK_TYPES)
 
     missing_handler = registered - handler_types
     assert not missing_handler, (

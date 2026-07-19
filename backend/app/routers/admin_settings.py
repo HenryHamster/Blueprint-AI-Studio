@@ -112,6 +112,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "capability_proof_gate_auto_graduation_enabled",
         "capability_proof_gate_auto_graduation_observe_threshold",
         "capability_proof_gate_auto_graduation_enforce_threshold",
+        "capability_proof_execution_trials_enabled",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -243,6 +244,67 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "direction_lifetime_min_merge_rate",
         "direction_review_recommendation_threshold",
     }
+)
+
+# Operator-selectable notification event universe.  Only events in this set
+# may appear in ``notification_config.enabled_events``; the external-webhook
+# audience registry (``_WEBHOOK_EVENT_AUDIENCE`` in ``message_audience``) must
+# contain a matching entry for every event here, or ``route_external_webhook_event``
+# silently fails closed and the operator never receives it.
+# Completeness is guarded by ``test_message_audience.test_valid_notification_events_all_present_in_webhook_registry``.
+_VALID_NOTIFICATION_EVENTS = frozenset(
+    [
+        "TASK_FAILED",
+        "TASK_COMPLETED",
+        "APPROVAL_NEEDED",
+        "DEPLOY_HEALTH_ALERT",
+        "PR_MERGED",
+        "BUDGET_EXCEEDED",
+        "AUTO_FIX_SPAWNED",
+        "AUTO_FIX_MERGED",
+        "AUTO_FIX_ESCALATED",
+        "REMEDIATION_ESCALATED",
+        "DIRECTION_MILESTONE",
+        # Residual remediation lifecycle (mirrors AUTO_FIX_*).
+        # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
+        # severity and joins the default-on list per the
+        # direction-milestone-webhook-pattern playbook.
+        "RESIDUAL_FIX_SPAWNED",
+        "RESIDUAL_FIX_MERGED",
+        "RESIDUAL_FIX_ESCALATED",
+        # Recovery event: operator manually unsuspends a suspended fingerprint.
+        # Opt-in only (not in default list) — informational, not urgent.
+        "RESIDUAL_FIX_UNSUSPENDED",
+        # Escalation fired when a case is deferred by audit too many times.
+        "RESIDUAL_FIX_AUDIT_DEFERRED",
+        # Direction auto-paused for lifetime burn (non-merging finished
+        # tasks beyond the rolling-window threshold). BLOCKER severity /
+        # manual-intervention-required, so it joins the default-on list.
+        "DIRECTION_BURN_PAUSE",
+        # No-CI repo merged a PR without test verification (UNVERIFIED-merge
+        # fallback). The operator who turned off required CI checks needs to
+        # know when a merge proceeds without tests, so it is default-on.
+        "MERGE_UNVERIFIED",
+        # A task was held out of dispatch for a DELIBERATE spend/budget
+        # decision (requires_approval + approval_hold_reason="spend_budget").
+        # CREATED fires when the hold is first seen; EXPIRING fires once as
+        # the configured spend_approval_timeout_hours window nears its end.
+        # Both are operator-actionable, so they join the default-on list.
+        "SPEND_HOLD_CREATED",
+        "SPEND_HOLD_EXPIRING",
+        # Runner-health fleet incidents dispatched by runner_health_alerts.
+        # These are operator-actionable outages (a runner or the whole
+        # fleet is down, out of disk, or an outage has aged past the
+        # re-page threshold), so they join the default-on list below.
+        "RUNNER_DEACTIVATED",
+        "RUNNER_DEGRADED",
+        "RUNNER_DEGRADED_ESCALATED",
+        "RUNNER_FLEET_OFFLINE",
+        "RUNNER_LOW_DISK",
+        "RUNNER_OUTAGE_ESCALATED",
+        "RUNNER_LOCAL_HOLD",
+        "RUNNER_CONTAINER_HOLD",
+    ]
 )
 
 logger = logging.getLogger(__name__)
@@ -387,6 +449,69 @@ async def get_settings(
     max_plan_accounts = await list_authoritative_max_plan_accounts(
         session, current_user["user_id"]
     )
+
+    # Surface the current fleet-wide capability-proof coverage ratio that the
+    # auto-graduation observe/enforce thresholds are compared against, so the
+    # operator can see where the gate stands rather than setting thresholds
+    # blind. Best-effort: a failure here must never break the settings load.
+    capability_proof_gate_coverage: dict = {
+        "coverage_ratio": None,
+        "total_proven": 0,
+        "total_non_exempt_working": 0,
+        "projects_contributing": 0,
+        "num_projects": 0,
+        "trial_eligible_unproven": 0,
+    }
+    try:
+        from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+        _cov = await compute_fleet_proof_coverage(
+            session,
+            int(_runtime_config.get("metrics_integrity_sweep_max_projects", 25)),
+        )
+        # Expose only the scalar coverage summary — the internal
+        # ``contributing_project_ids`` list (UUIDs, used by the graduation
+        # notifier) is not part of the operator-facing settings surface.
+        capability_proof_gate_coverage = {
+            "coverage_ratio": _cov["coverage_ratio"],
+            "total_proven": _cov["total_proven"],
+            "total_non_exempt_working": _cov["total_non_exempt_working"],
+            "projects_contributing": _cov["projects_contributing"],
+            "num_projects": _cov["num_projects"],
+            "trial_eligible_unproven": _cov.get("trial_eligible_unproven", 0),
+            # Surface whether the coverage sample is truncated — the
+            # auto-graduation guard already refuses to advance to enforce
+            # when fleet_capped is True, so the operator needs visibility.
+            "fleet_capped": _cov.get("fleet_capped", False),
+            "fleet_total": _cov.get("fleet_total", 0),
+        }
+    except Exception:
+        logger.warning(
+            "failed to compute fleet capability-proof coverage for settings",
+            exc_info=True,
+        )
+
+    # Projection: how many capabilities would be trial-eligible if the
+    # execution-trials flag were enabled. Best-effort; must never break load.
+    capability_proof_trial_projection: dict = {
+        "trial_eligible": 0,
+        "unproven_working": 0,
+        "projects_contributing": 0,
+        "num_projects": 0,
+    }
+    try:
+        from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+        capability_proof_trial_projection = await compute_trial_eligibility_projection(
+            session,
+            int(_runtime_config.get("metrics_integrity_sweep_max_projects", 25)),
+        )
+    except Exception:
+        logger.warning(
+            "failed to compute capability-proof trial eligibility projection",
+            exc_info=True,
+        )
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -456,11 +581,16 @@ async def get_settings(
                 "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
             )
         ),
+        "capability_proof_gate_coverage": capability_proof_gate_coverage,
+        "capability_proof_trial_projection": capability_proof_trial_projection,
+        "capability_proof_execution_trials_enabled": bool(
+            _runtime_config.get("capability_proof_execution_trials_enabled", False)
+        ),
         "metrics_integrity_sweep_interval_minutes": int(
             _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
         ),
         "metrics_integrity_sweep_max_checks": int(
-            _runtime_config.get("metrics_integrity_sweep_max_checks", 25)
+            _runtime_config.get("metrics_integrity_sweep_max_checks", 30)
         ),
         "metrics_integrity_sweep_max_projects": int(
             _runtime_config.get("metrics_integrity_sweep_max_projects", 25)
@@ -1191,6 +1321,14 @@ async def _apply_settings(
                 detail="capability_proof_gate_auto_graduation_enabled must be a boolean",
             )
         _runtime_config["capability_proof_gate_auto_graduation_enabled"] = val
+    if "capability_proof_execution_trials_enabled" in payload:
+        val = payload["capability_proof_execution_trials_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="capability_proof_execution_trials_enabled must be a boolean",
+            )
+        _runtime_config["capability_proof_execution_trials_enabled"] = val
     for _cap_grad_key, _cap_grad_default in (
         ("capability_proof_gate_auto_graduation_observe_threshold", 0.5),
         ("capability_proof_gate_auto_graduation_enforce_threshold", 0.95),
@@ -3018,60 +3156,6 @@ async def _apply_settings(
                     status_code=400,
                     detail=f"notification_config.webhook_url is not allowed: {reason}",
                 )
-        _VALID_NOTIFICATION_EVENTS = frozenset(
-            [
-                "TASK_FAILED",
-                "TASK_COMPLETED",
-                "APPROVAL_NEEDED",
-                "DEPLOY_HEALTH_ALERT",
-                "PR_MERGED",
-                "BUDGET_EXCEEDED",
-                "AUTO_FIX_SPAWNED",
-                "AUTO_FIX_MERGED",
-                "AUTO_FIX_ESCALATED",
-                "REMEDIATION_ESCALATED",
-                "DIRECTION_MILESTONE",
-                # Residual remediation lifecycle (mirrors AUTO_FIX_*).
-                # SPAWNED/MERGED are noisier — opt-in only. ESCALATED is BLOCKER
-                # severity and joins the default-on list per the
-                # direction-milestone-webhook-pattern playbook.
-                "RESIDUAL_FIX_SPAWNED",
-                "RESIDUAL_FIX_MERGED",
-                "RESIDUAL_FIX_ESCALATED",
-                # Recovery event: operator manually unsuspends a suspended fingerprint.
-                # Opt-in only (not in default list) — informational, not urgent.
-                "RESIDUAL_FIX_UNSUSPENDED",
-                # Escalation fired when a case is deferred by audit too many times.
-                "RESIDUAL_FIX_AUDIT_DEFERRED",
-                # Direction auto-paused for lifetime burn (non-merging finished
-                # tasks beyond the rolling-window threshold). BLOCKER severity /
-                # manual-intervention-required, so it joins the default-on list.
-                "DIRECTION_BURN_PAUSE",
-                # No-CI repo merged a PR without test verification (UNVERIFIED-merge
-                # fallback). The operator who turned off required CI checks needs to
-                # know when a merge proceeds without tests, so it is default-on.
-                "MERGE_UNVERIFIED",
-                # A task was held out of dispatch for a DELIBERATE spend/budget
-                # decision (requires_approval + approval_hold_reason="spend_budget").
-                # CREATED fires when the hold is first seen; EXPIRING fires once as
-                # the configured spend_approval_timeout_hours window nears its end.
-                # Both are operator-actionable, so they join the default-on list.
-                "SPEND_HOLD_CREATED",
-                "SPEND_HOLD_EXPIRING",
-                # Runner-health fleet incidents dispatched by runner_health_alerts.
-                # These are operator-actionable outages (a runner or the whole
-                # fleet is down, out of disk, or an outage has aged past the
-                # re-page threshold), so they join the default-on list below.
-                "RUNNER_DEACTIVATED",
-                "RUNNER_DEGRADED",
-                "RUNNER_DEGRADED_ESCALATED",
-                "RUNNER_FLEET_OFFLINE",
-                "RUNNER_LOW_DISK",
-                "RUNNER_OUTAGE_ESCALATED",
-                "RUNNER_LOCAL_HOLD",
-                "RUNNER_CONTAINER_HOLD",
-            ]
-        )
         enabled_events = val.get(
             "enabled_events",
             [
@@ -3646,6 +3730,13 @@ async def _apply_settings(
                     "capability_proof_gate_auto_graduation_enforce_threshold": float(
                         _runtime_config.get(
                             "capability_proof_gate_auto_graduation_enforce_threshold", 0.95
+                        )
+                    ),
+                    # Persist the Slice-1 dark executed-named_test trials flag so an
+                    # operator enable survives a Cloud Run restart.
+                    "capability_proof_execution_trials_enabled": bool(
+                        _runtime_config.get(
+                            "capability_proof_execution_trials_enabled", False
                         )
                     ),
                     "adversarial_spawn_gate_infra_failure_mode": str(

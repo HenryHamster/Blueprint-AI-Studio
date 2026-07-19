@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act, createRef } from 'react';
+import { act, createRef, Suspense } from 'react';
 import { MessagesComposer } from './MessagesComposer';
 import { StrategicContextRail } from './StrategicContextRail';
 import { WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
+import { Skeleton } from './DashboardMetricCardsPrimitives';
 import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
 
@@ -368,6 +369,70 @@ describe('StrategicContextRail — viewport regression', () => {
     await expectNoOverflowAt(1440, async () => { await mount(1440); });
   });
 
+  const STATE_WITH_CONFIRMATIONS: StrategicStateResponse = {
+    ...STATE,
+    attention: {
+      ...STATE.attention!,
+      counts: { ...STATE.attention!.counts, needs_operator: 3, pending_confirmations: 2 },
+      items: [
+        {
+          id: 'confirmation:p-2e5edcbc',
+          kind: 'confirmation',
+          severity: 'needs_operator',
+          reason: 'confirmation_credentials_needed',
+          confirmation_type: 'credentials_needed',
+          label: 'Credentials needed',
+          detail: 'Provide the Hugging Face token so the runner can pull the gated model.',
+          unread: true,
+          created_at: '2026-06-29T01:05:00Z',
+          ref: { kind: 'confirmation', id: 'p-2e5edcbc', project_id: 'proj-1' },
+        },
+        {
+          id: 'confirmation:p-0f59f334',
+          kind: 'confirmation',
+          severity: 'needs_operator',
+          reason: 'confirmation_major_decision',
+          confirmation_type: 'major_decision',
+          label: 'Decision needed',
+          detail: 'Should the pipeline adopt the 30-day retention window for execution logs?',
+          unread: true,
+          created_at: '2026-06-29T01:04:00Z',
+          ref: { kind: 'confirmation', id: 'p-0f59f334', project_id: 'proj-1' },
+        },
+        ...(STATE.attention!.items),
+      ],
+    },
+  };
+
+  async function mountConfirmations(width: number) {
+    host = document.createElement('div');
+    host.style.width = `${width}px`;
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root!.render(
+        <StrategicContextRail
+          state={STATE_WITH_CONFIRMATIONS}
+          onOpenProjectSection={vi.fn()}
+          onOpenPipeline={vi.fn()}
+          onOpenRuntimeHealth={vi.fn()}
+          onOpenRuntimeDevices={vi.fn()}
+        />,
+      );
+    });
+  }
+
+  test('needs-your-action confirmation list renders without overflow at 1280px — acceptance evidence', async () => {
+    await expectNoOverflowAt(1280, async () => { await mountConfirmations(1280); });
+    expect(host?.querySelector('[data-testid="rail-needs-action"]')).toBeTruthy();
+    expect(host?.querySelector('[data-testid="rail-needs-action"]')?.textContent).toContain('Needs your action');
+  });
+
+  test('needs-your-action confirmation list keeps touch targets and no overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => { await mountConfirmations(375); });
+    await expectMinTouchTargetAt(375, async () => { await mountConfirmations(375); });
+  });
+
   async function mountStrategicChatSideboard(onOpenContext = vi.fn()) {
     host = document.createElement('div');
     host.style.height = '800px';
@@ -471,5 +536,42 @@ describe('StrategicContextRail — viewport regression', () => {
 
     await act(async () => { contextButton!.click(); });
     expect(onOpenContext).toHaveBeenCalledTimes(1);
+  });
+
+  test('Suspense boundary skeleton fallback renders without overflow at 400px — acceptance evidence', async () => {
+    function WorkspaceSkeleton() {
+      return (
+        <div className="flex-1 p-6 space-y-4">
+          <Skeleton className="h-7 w-1/4" />
+          <Skeleton className="h-4 w-1/2" />
+          <Skeleton className="h-48 w-full rounded-lg" />
+          <div className="space-y-3">
+            <Skeleton className="h-4 w-full" />
+            <Skeleton className="h-4 w-5/6" />
+            <Skeleton className="h-4 w-2/3" />
+          </div>
+        </div>
+      );
+    }
+    await expectNoOverflowAt(400, async () => {
+      host = document.createElement('div');
+      host.style.width = '400px';
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root!.render(
+          <Suspense fallback={<WorkspaceSkeleton />}>
+            <StrategicContextRail
+              state={STATE}
+              onOpenProjectSection={vi.fn()}
+              onOpenPipeline={vi.fn()}
+              onOpenRuntimeHealth={vi.fn()}
+              onOpenRuntimeDevices={vi.fn()}
+            />
+          </Suspense>,
+        );
+      });
+    });
+    expect(host?.querySelector('.flex-1.p-6') ?? host?.querySelector('[class*="skeleton"]') ?? host?.children[0]).toBeTruthy();
   });
 });

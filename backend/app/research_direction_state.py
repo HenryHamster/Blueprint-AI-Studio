@@ -25,10 +25,11 @@ from app.models import (
     ArtifactType,
     MessageType,
     Project,
-    ProjectMessage,
     Task,
     TaskStatus,
 )
+from app.message_audience import stamp_message_audience
+from app.project_message_creation import build_project_message
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import (
     _fold_evicted_into_aggregate,
@@ -52,6 +53,7 @@ from app.task_evaluators import (
 )
 from app.shared_state import runtime_config as _runtime_config
 from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_evaluators import QUALITY_GRADER_VERDICT_KEY
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -325,6 +327,7 @@ async def _maybe_autocomplete_exhausted_direction(
         Alert(
             project_id=task.project_id,
             severity=AlertSeverity.INFO,
+            event_type="research.direction_auto_completed",
             title="Direction auto-completed",
             message=(
                 f"Direction '{d.get('text', did)[:80]}' was auto-completed: {reason}."
@@ -628,6 +631,7 @@ async def apply_post_spawn_state(
                     _dir_grade_dist = grade_dist_by_dir.get(did)
                     _dir_basis_dist = basis_dist_by_dir.get(did)
                     _dir_challenge_summary = challenge_summary_by_dir.get(did)
+                    _qg_verdict = (task.context or {}).get(QUALITY_GRADER_VERDICT_KEY)
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
@@ -665,6 +669,12 @@ async def apply_post_spawn_state(
                             {"finding_challenge_summary": _dir_challenge_summary}
                             if _dir_challenge_summary
                             and _dir_challenge_summary.get("challenged_findings")
+                            else {}
+                        ),
+                        **(
+                            {"quality_grader_verdict": _qg_verdict}
+                            if isinstance(_qg_verdict, dict)
+                            and "passed" in _qg_verdict
                             else {}
                         ),
                         "filter_breakdown": {
@@ -782,6 +792,7 @@ async def apply_post_spawn_state(
                             _deadlock_alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.WARNING,
+                                event_type="research.dedup_deadlock",
                                 title="Dedup deadlock detected",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
@@ -796,7 +807,8 @@ async def apply_post_spawn_state(
                                 task_id=task.id,
                             )
                             session.add(_deadlock_alert)
-                            _deadlock_msg = ProjectMessage(
+                            _deadlock_msg = await build_project_message(
+                                session,
                                 project_id=task.project_id,
                                 message_type=MessageType.BUG_REPORT,
                                 from_type="agent",
@@ -815,11 +827,14 @@ async def apply_post_spawn_state(
                                     + "Consider resetting the direction or waiting for "
                                     "blocked tasks to complete."
                                 ),
-                                context={
-                                    "source": "dedup_deadlock",
-                                    "direction_id": did,
-                                    "consecutive_empty_cycles": _consec,
-                                },
+                                context=stamp_message_audience(
+                                    {
+                                        "source": "dedup_deadlock",
+                                        "direction_id": did,
+                                        "consecutive_empty_cycles": _consec,
+                                    },
+                                    "research.dedup_deadlock",
+                                ),
                             )
                             session.add(_deadlock_msg)
                             logger.warning(
@@ -891,6 +906,7 @@ async def apply_post_spawn_state(
                             _af_alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.WARNING,
+                                event_type="research.already_fixed_deadlock",
                                 title="Already-fixed deadlock detected",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' (id: {did}) has "
@@ -902,7 +918,8 @@ async def apply_post_spawn_state(
                                 task_id=task.id,
                             )
                             session.add(_af_alert)
-                            _af_msg = ProjectMessage(
+                            _af_msg = await build_project_message(
+                                session,
                                 project_id=task.project_id,
                                 message_type=MessageType.BUG_REPORT,
                                 from_type="agent",
@@ -915,11 +932,14 @@ async def apply_post_spawn_state(
                                     f"done on HEAD). Consider resetting the direction's scope "
                                     f"or retiring it if the goal is fully achieved."
                                 ),
-                                context={
-                                    "source": "already_fixed_deadlock",
-                                    "direction_id": did,
-                                    "consecutive_noop_cycles": _af_consec,
-                                },
+                                context=stamp_message_audience(
+                                    {
+                                        "source": "already_fixed_deadlock",
+                                        "direction_id": did,
+                                        "consecutive_noop_cycles": _af_consec,
+                                    },
+                                    "research.already_fixed_deadlock",
+                                ),
                             )
                             session.add(_af_msg)
                             logger.warning(
@@ -1016,6 +1036,7 @@ async def apply_post_spawn_state(
                             alert = Alert(
                                 project_id=task.project_id,
                                 severity=AlertSeverity.INFO,
+                                event_type="research.direction_auto_completed",
                                 title="Direction auto-completed",
                                 message=(
                                     f"Direction '{d.get('text', did)[:80]}' was auto-completed: "
@@ -1554,16 +1575,20 @@ async def _apply_terminal_transition(
 
             await with_directions_locked(session, task.project_id, _apply_zero_note)
         elif project:
-            msg = ProjectMessage(
+            msg = await build_project_message(
+                session,
                 project_id=task.project_id,
                 message_type=MessageType.NOTE,
                 from_type="agent",
                 from_task_id=task.id,
                 content=note,
-                context={
-                    "source": "research_zero_children",
-                    "direction_id": str(direction_id),
-                },
+                context=stamp_message_audience(
+                    {
+                        "source": "research_zero_children",
+                        "direction_id": str(direction_id),
+                    },
+                    "research.zero_children",
+                ),
             )
             session.add(msg)
 

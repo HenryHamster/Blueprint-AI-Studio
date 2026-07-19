@@ -240,11 +240,13 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
   }
 
   useEffect(() => {
+    let cancelled = false;
     const qs = projectId ? `?hours=24&top_n=10&project_id=${encodeURIComponent(projectId)}` : '?hours=24&top_n=10';
     apiFetch(`/api/admin/residual-fingerprints${qs}`)
       .then(r => r.ok ? r.json() : null)
-      .then((data: ResidualFingerprintsData | null) => { if (data) setResiduals(data); })
+      .then((data: ResidualFingerprintsData | null) => { if (!cancelled && data) setResiduals(data); })
       .catch(() => {});
+    return () => { cancelled = true; };
   }, [projectId]);
 
   if (loading) {

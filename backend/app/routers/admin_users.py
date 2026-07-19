@@ -12,6 +12,7 @@ from app.database import get_session
 from app.models import AllowedUser, ProjectMember
 from app.auth import get_current_user, require_admin
 from app.admin import _get_user_project, _get_user_project_with_role
+from app.task_locking import lock_project_or_429
 
 router = APIRouter(
     prefix="/api/admin", tags=["admin-users"], dependencies=[Depends(get_current_user)]
@@ -132,6 +133,7 @@ async def add_project_member(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
+    await lock_project_or_429(session, project_id)
 
     # Look up user by email in AllowedUser table
     allowed = (
@@ -194,8 +196,15 @@ async def update_project_member(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
+    await lock_project_or_429(session, project_id)
 
-    member = await session.get(ProjectMember, member_id)
+    member = (
+        await session.execute(
+            select(ProjectMember)
+            .where(ProjectMember.id == member_id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
     if not member or member.project_id != project_id:
         raise HTTPException(status_code=404, detail="Member not found")
     if member.role == "owner":
@@ -228,6 +237,22 @@ async def remove_project_member(
         await _get_user_project_with_role(
             project_id, current_user["user_id"], session, "owner"
         )
+
+    await lock_project_or_429(session, project_id)
+    member = (
+        await session.execute(
+            select(ProjectMember)
+            .where(
+                ProjectMember.id == member_id,
+                ProjectMember.project_id == project_id,
+            )
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if member is None:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if member.role == "owner":
+        raise HTTPException(status_code=400, detail="Cannot remove the project owner")
 
     await session.delete(member)
     await session.commit()

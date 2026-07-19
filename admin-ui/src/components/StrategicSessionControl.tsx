@@ -182,6 +182,51 @@ export interface StrategicSessionControlProps {
    */
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
+  /**
+   * Operator-decision capture telemetry for the live resident session (mirrors
+   * `operator_decision_summary` on the session snapshot). When present, a small
+   * "op-decision capture: N/M (X%)" chip renders in Workday mode so the operator
+   * can see whether operator corrections are reaching the durable decisions
+   * register; a chronically-low rate is toned as a warning. Absent/null hides
+   * the chip entirely (no operator turns processed / legacy session).
+   */
+  operatorDecisionSummary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
+  /**
+   * Per-kind turn-latency telemetry for the live resident session (mirrors
+   * `turn_latency_summary` on the session snapshot). When present, a small chip
+   * renders in Workday mode showing rolling mean/max turn times for operator
+   * and/or autonomous turns so the operator can see the session's responsiveness.
+   * Absent/null hides the chip entirely (no turns recorded / legacy session).
+   */
+  turnLatencySummary?: {
+    operator: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+    autonomous: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+  } | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -832,6 +877,122 @@ function residentSessionView(
   };
 }
 
+/**
+ * capture_rate (integer percent) below this is toned as a warning in the chip.
+ * Mirrors the backend enforcement floor (`OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT`
+ * in `strategic_resident_session.py`) so the operator-visible signal and the
+ * strategist-internal notice agree on what "chronically low" means.
+ */
+const OPERATOR_DECISION_LOW_RATE_PCT = 60;
+
+interface OperatorDecisionCaptureView {
+  tone: Tone;
+  label: string;
+  detail: string;
+}
+
+/**
+ * Build the operator-decision capture chip view from the session summary, or
+ * `null` when there is nothing to show (absent summary, or no operator turns
+ * measured yet). The chip is warning-toned when the rate is at/below the low
+ * floor and neutral otherwise.
+ */
+function operatorDecisionCaptureView(
+  summary:
+    | { total: number; captured: number; missed: number; capture_rate: number | null }
+    | null
+    | undefined,
+): OperatorDecisionCaptureView | null {
+  if (!summary || typeof summary.total !== 'number' || summary.total <= 0) return null;
+  const { total, captured, capture_rate } = summary;
+  const rate = typeof capture_rate === 'number' ? capture_rate : null;
+  const low = rate !== null && rate < OPERATOR_DECISION_LOW_RATE_PCT;
+  const ratePart = rate !== null ? ` (${rate}%)` : '';
+  return {
+    tone: low ? 'warning' : 'neutral',
+    label: `Op-decision capture: ${captured}/${total}${ratePart}`,
+    detail: low
+      ? 'Capture chronically low — operator corrections may not be reaching the durable decisions register'
+      : 'Operator corrections captured into the durable decisions register',
+  };
+}
+
+/**
+ * Per-kind turn-latency statistics shape (mirrors the agent telemetry).
+ */
+interface TurnLatencyKindSummary {
+  count: number;
+  mean_turn_ms: number | null;
+  max_turn_ms: number;
+  mean_ttft_ms: number | null;
+  interrupted_count: number;
+  total_tool_calls: number;
+  total_tool_call_duration_ms: number;
+  mean_inter_token_ms: number | null;
+  mean_pickup_lag_ms: number | null;
+}
+
+interface TurnLatencyView {
+  tone: Tone;
+  label: string;
+  detail: string;
+}
+
+/**
+ * Build a human-readable summary string from one kind's stats.
+ * E.g. "3 turns, avg 42s, max 87s".
+ */
+function formatTurnLatencyKind(stats: TurnLatencyKindSummary): string {
+  const { count, mean_turn_ms, max_turn_ms } = stats;
+  if (typeof count !== 'number' || count <= 0) return '';
+  const parts: string[] = [`${count} turn${count !== 1 ? 's' : ''}`];
+  if (typeof mean_turn_ms === 'number' && mean_turn_ms > 0) {
+    parts.push(`avg ${(mean_turn_ms / 1000).toFixed(1)}s`);
+  }
+  if (typeof max_turn_ms === 'number' && max_turn_ms > 0) {
+    parts.push(`max ${(max_turn_ms / 1000).toFixed(1)}s`);
+  }
+  return parts.length > 0 ? parts.join(', ') : '';
+}
+
+/**
+ * Build the turn-latency chip view from the session summary, or `null` when
+ * there is nothing to show (absent summary, or no turns measured yet).
+ * Shows operator turn latency; falls back to autonomous when no operator
+ * turns exist but autonomous do.
+ */
+function turnLatencyView(
+  summary:
+    | {
+        operator: TurnLatencyKindSummary;
+        autonomous: TurnLatencyKindSummary;
+      }
+    | null
+    | undefined,
+): TurnLatencyView | null {
+  if (!summary) return null;
+  const { operator: op, autonomous: au } = summary;
+  const opText = formatTurnLatencyKind(op);
+  const auText = formatTurnLatencyKind(au);
+  if (!opText && !auText) return null;
+
+  // Prefer showing operator latency; fall back to autonomous.
+  if (opText) {
+    return {
+      tone: op.mean_turn_ms && op.mean_turn_ms > 120_000 ? 'warning' : 'neutral',
+      label: `Operator: ${opText}`,
+      detail: auText
+        ? `Autonomous: ${auText}`
+        : 'Operator turn latency — measured across this session',
+    };
+  }
+  return {
+    tone: 'neutral',
+    label: `Autonomous: ${auText}`,
+    detail: 'Autonomous turn latency — measured across this session',
+  };
+}
+
 function StatusDot({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClasses[tone].dot}`} aria-hidden="true" />;
 }
@@ -852,6 +1013,8 @@ export function StrategicSessionControl({
   sessionBusy = false,
   sessionRunners = null,
   sessionSelectedRunnerId = null,
+  operatorDecisionSummary = null,
+  turnLatencySummary = null,
   onSelectRunner,
   onStartSession,
   onStopSession,
@@ -909,6 +1072,8 @@ export function StrategicSessionControl({
     Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState)) || showDevicePicker
   );
   const SessionIcon = sessionView.Icon;
+  const captureView = operatorDecisionCaptureView(operatorDecisionSummary);
+  const latencyView = turnLatencyView(turnLatencySummary);
 
   const runner = runnerStatus
     ? (() => {
@@ -1008,6 +1173,40 @@ export function StrategicSessionControl({
                 </span>
               )}
             </span>
+            {captureView && (
+              <span
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                } ${toneClasses[captureView.tone].border} ${toneClasses[captureView.tone].bg}`}
+                role="status"
+                aria-label={`${captureView.label} — ${captureView.detail}`}
+                title={`${captureView.label} — ${captureView.detail}`}
+              >
+                <StatusDot tone={captureView.tone} />
+                {!compact && (
+                  <span className={`truncate text-xs font-semibold ${toneClasses[captureView.tone].text}`}>
+                    {captureView.label}
+                  </span>
+                )}
+              </span>
+            )}
+            {latencyView && (
+              <span
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                } ${toneClasses[latencyView.tone].border} ${toneClasses[latencyView.tone].bg}`}
+                role="status"
+                aria-label={`${latencyView.label} — ${latencyView.detail}`}
+                title={`${latencyView.label} — ${latencyView.detail}`}
+              >
+                <StatusDot tone={latencyView.tone} />
+                {!compact && (
+                  <span className={`truncate text-xs font-semibold ${toneClasses[latencyView.tone].text}`}>
+                    {latencyView.label}
+                  </span>
+                )}
+              </span>
+            )}
             {showDevicePicker && (
               <label
                 className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border border-neutral-800 bg-neutral-950/70 px-2 ${

@@ -163,6 +163,14 @@ def _onboard_patches(build_config=None, default_branch="main"):
             new_callable=AsyncMock,
             return_value=default_branch,
         ),
+        # Onboarding seeds a commitless repo with its first commit before it
+        # reads the tree, so the trunk it stores actually exists. A no-op here:
+        # these tests onboard repos that already have commits.
+        patch(
+            "app.github.ensure_repo_initialized",
+            new_callable=AsyncMock,
+            return_value=False,
+        ),
     )
 
 
@@ -172,10 +180,10 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Onboarding a non-self-repo, non-empty project spawns a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"language": "python", "repo_is_empty": False}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "external-repo"},
@@ -212,14 +220,47 @@ class TestRepoBootstrapOnboardSpawn:
         assert (bt.context or {}).get("bootstrap_reason") == "first_cycle"
 
     @pytest.mark.asyncio
+    async def test_onboard_persists_greenfield_self_heal_without_spawn(
+        self, client: AsyncClient, db_session
+    ):
+        """Onboarding commits a successful no-task self-heal before returning."""
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                side_effect=[
+                    {"language": None},
+                    {"language": None, "repo_is_empty": True, "source_file_count": 0},
+                ],
+            ),
+            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
+            patch("app.github.get_repo_default_branch", new_callable=AsyncMock, return_value="main"),
+            patch("app.github.ensure_repo_initialized", new_callable=AsyncMock, return_value=False),
+            patch("app.github.repo_has_commits", new_callable=AsyncMock, return_value=True),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "onboard-greenfield"},
+            )
+
+        assert resp.status_code == 200
+        project = await db_session.get(Project, resp.json()["project_id"])
+        assert project is not None
+        assert project.build_config["repo_is_empty"] is True
+        tasks = (
+            await db_session.execute(select(Task).where(Task.project_id == project.id))
+        ).scalars().all()
+        assert not [task for task in tasks if (task.first_payload or {}).get("type") == "repo_bootstrap"]
+
+    @pytest.mark.asyncio
     async def test_self_repo_does_not_spawn_bootstrap(
         self, client: AsyncClient, db_session
     ):
         """Onboarding a self-repo project must NOT spawn a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"language": "python", "repo_is_empty": False}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={
@@ -277,10 +318,10 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Onboarding a repo_is_empty=True project must NOT spawn a repo_bootstrap task."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={"repo_is_empty": True}
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "empty-repo"},
@@ -312,14 +353,14 @@ class TestRepoBootstrapOnboardSpawn:
         self, client: AsyncClient, db_session
     ):
         """Re-onboarding with bootstrap_completed_at set must NOT spawn a second bootstrap."""
-        detect_patch, token_patch, branch_patch = _onboard_patches(
+        detect_patch, token_patch, branch_patch, seed_patch = _onboard_patches(
             build_config={
                 "language": "python",
                 "repo_is_empty": False,
                 "bootstrap_completed_at": "2026-01-01T00:00:00",
             }
         )
-        with detect_patch, token_patch, branch_patch:
+        with detect_patch, token_patch, branch_patch, seed_patch:
             resp = await client.post(
                 "/api/admin/projects/onboard",
                 json={"github_owner": "acme", "github_repo": "already-bootstrapped"},
@@ -2730,6 +2771,36 @@ class TestBootstrapRetryEndpoint:
         body = resp.json()
         assert body["state"] == "not_eligible", f"Unexpected state: {body}"
 
+    @pytest.mark.asyncio
+    async def test_retry_endpoint_persists_greenfield_self_heal_without_spawn(
+        self, client: AsyncClient, db_session
+    ):
+        """A no-task greenfield classification is durable after request close."""
+        project = _make_external_project(
+            db_session,
+            name="acme/retry-greenfield",
+            build_config={"language": "python"},
+            add_membership=True,
+        )
+        await db_session.commit()
+
+        with (
+            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
+            patch("app.github.repo_has_commits", new_callable=AsyncMock, return_value=True),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"repo_is_empty": True, "source_file_count": 0, "has_ci": False},
+            ),
+        ):
+            resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/retry")
+
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "not_eligible"
+        await db_session.refresh(project)
+        assert project.build_config["repo_is_empty"] is True
+        assert project.build_config["source_file_count"] == 0
+
 
 class TestBootstrapRecoveryAndStrategicGate:
     """Tests proving the strategic gate re-engages after a recovery spawn."""
@@ -3077,6 +3148,59 @@ class TestBootstrapSweepDirect:
         assert len(total_bootstrap) == 0, (
             f"No bootstrap tasks should be spawned when all projects are completed, "
             f"got {len(total_bootstrap)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_sweep_reselects_exhausted_project_with_undetermined_emptiness(
+        self, db_session
+    ):
+        """A stranded legacy project (undetermined repo_is_empty) that already
+        hit recovery-exhausted is re-selected by the sweep so the emptiness
+        self-heal can run — while an exhausted project with a DETERMINED
+        non-empty signal stays excluded (the exhaustion guards still bind it)."""
+        from app.recovery_sweeps import _sweep_bootstrap_recovery
+        from app.repo_bootstrap import BootstrapSpawnResult
+
+        undetermined = _make_external_project(
+            db_session,
+            name="acme/legacy-stranded",
+            build_config={
+                "language": None,
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        determined = _make_external_project(
+            db_session,
+            name="acme/determined-stranded",
+            build_config={
+                "language": "python",
+                "repo_is_empty": False,
+                "bootstrap_recovery_state": "exhausted",
+                "bootstrap_recovery_exhausted_at": "2026-01-01T00:00:00",
+            },
+        )
+        await db_session.flush()
+        await db_session.commit()
+
+        seen_ids = []
+
+        async def _capture(project, session, **kwargs):
+            seen_ids.append(project.id)
+            return BootstrapSpawnResult(outcome="not_eligible", reason="captured")
+
+        with patch(
+            "app.repo_bootstrap.spawn_bootstrap_task", side_effect=_capture
+        ):
+            await _sweep_bootstrap_recovery()
+
+        assert undetermined.id in seen_ids, (
+            "an exhausted project with an undetermined repo_is_empty must be "
+            "re-selected so its emptiness self-heal can run"
+        )
+        assert determined.id not in seen_ids, (
+            "an exhausted project with a determined non-empty signal must stay "
+            "excluded by the exhaustion guards"
         )
 
     @pytest.mark.asyncio
@@ -3523,6 +3647,34 @@ class TestBootstrapRefresh:
         resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
         assert resp.status_code == 200
         assert resp.json()["state"] == "not_eligible"
+
+    @pytest.mark.asyncio
+    async def test_refresh_endpoint_persists_greenfield_self_heal_without_spawn(
+        self, client: AsyncClient, db_session
+    ):
+        project = _make_external_project(
+            db_session,
+            name="acme/refresh-greenfield",
+            build_config={"language": "python"},
+            add_membership=True,
+        )
+        await db_session.commit()
+
+        with (
+            patch("app.github.get_repo_installation_token", new_callable=AsyncMock, return_value="tok"),
+            patch("app.github.repo_has_commits", new_callable=AsyncMock, return_value=True),
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"repo_is_empty": True, "source_file_count": 0, "has_ci": False},
+            ),
+        ):
+            resp = await client.post(f"/api/admin/projects/{project.id}/bootstrap/refresh")
+
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "not_eligible"
+        await db_session.refresh(project)
+        assert project.build_config["repo_is_empty"] is True
 
     @pytest.mark.asyncio
     async def test_refresh_endpoint_owner_gated(self, client: AsyncClient, db_session):

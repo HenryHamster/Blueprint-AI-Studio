@@ -4,6 +4,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import WebSocket from 'ws';
+import { enforceNodeVersion } from './node-preflight.js';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
@@ -75,6 +76,7 @@ import {
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
   type ValidationCommand, type ProviderRunner, type ProviderRunErrorReport,
+  type ProviderRunOptions,
 } from './providers/runners.js';
 
 export {
@@ -88,7 +90,7 @@ export {
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
-export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport };
+export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport, ProviderRunOptions };
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -568,6 +570,11 @@ function parseSecretFileMode(raw: unknown): number {
   return 0o600;
 }
 
+// The backend's VM-startup materializer applies the same normalization before
+// writing ~/.claude.json. Fleet runners materialize a returned credential
+// manifest in-process instead, so keep the invariant here as well: an omitted
+// config becomes a minimal non-secret onboarding/trust config, while a valid
+// operator-supplied object retains all of its other settings.
 function normalizeClaudeConfigContent(
   filePath: string,
   content: string,
@@ -609,6 +616,8 @@ function normalizeClaudeConfigContent(
     }
     return JSON.stringify(normalizedConfig);
   } catch {
+    // Preserve malformed operator configuration exactly; replacing it would
+    // discard account-supplied state and hide its validation error.
     return content;
   }
 }
@@ -1273,6 +1282,21 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   try { fs.unlinkSync(resultPath); } catch { /* ignore — file already gone */ }
   clearPendingStatusFlags(taskId);
   return result;
+}
+
+export async function persistResidentTurnFailure(
+  taskId: string,
+  projectId: string,
+  reason: string,
+  failureCategory: FailureCategory,
+): Promise<void> {
+  await apiPost('/api/agent/resident-turn/fail', {
+    task_id: taskId,
+    project_id: projectId,
+    failure_id: `resident-turn:${taskId}:failure`,
+    reason: reason.slice(0, 5_000),
+    failure_category: failureCategory,
+  });
 }
 
 // Phase 0 telemetry — start-of-role timestamp captured by main() after a
@@ -2169,6 +2193,8 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   clearFileTreeCache();
   // Per-task resident-session turn-latency telemetry.
   resetResidentTurnLatencyTelemetry();
+  // Per-task operator-decision capture telemetry.
+  resetOperatorDecisionCaptureTelemetry();
   // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
   // df reading rather than reusing the prior task's cached values.
   _dfCacheTimestamp = 0;
@@ -3005,6 +3031,41 @@ async function refreshCloneToken(args: string[], taskId: string): Promise<boolea
  *  fresh token and rewrite the clone URL before retrying — a token baked in at
  *  role start can expire during a long queue/provision delay, and every plain
  *  retry would otherwise reuse the same dead token. */
+/**
+ * Git's complaint when the requested branch is not on the remote. The text is
+ * word-for-word identical whether the branch was deleted or the repository has
+ * no commits at all, so this pattern alone cannot tell those two apart.
+ */
+const GIT_BRANCH_MISSING = /remote branch .* not found in upstream|could not find remote branch|couldn't find remote ref/i;
+
+/**
+ * Pull the clone URL out of an assembled `git clone` argv. Scans from the right
+ * so the repo URL wins over `-c credential.https://github.com.helper=...`, which
+ * merely *contains* a URL rather than being one.
+ */
+function extractCloneUrl(args: string[]): string | null {
+  for (let i = args.length - 1; i >= 0; i--) {
+    const a = args[i];
+    if (a.startsWith('https://') || a.startsWith('git@')) return a;
+  }
+  return null;
+}
+
+/**
+ * True when the remote advertises zero refs — i.e. the repository has no commits.
+ * This is the only way to distinguish an empty repo from a deleted branch, and a
+ * false positive would be worse than no answer, so an unanswerable probe reports
+ * "not empty" rather than guessing.
+ */
+async function remoteHasNoCommits(cloneUrl: string): Promise<boolean> {
+  try {
+    const refs = await gitAsync(['ls-remote', '--heads', cloneUrl], '.', 30_000);
+    return refs.trim() === '';
+  } catch {
+    return false;
+  }
+}
+
 export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEOUT): Promise<void> {
   const taskId = process.env.TASK_ID || '';
   for (let attempt = 0; attempt < CLONE_MAX_RETRIES; attempt++) {
@@ -3013,8 +3074,27 @@ export async function cloneWithRetry(args: string[], timeoutMs = GIT_CLONE_TIMEO
       await gitAsync(args, '.', timeoutMs);
       return;
     } catch (e) {
-      if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const rawMsg = e instanceof Error ? e.message : String(e);
+
+      // A commitless repo is a deterministic failure: no branch will materialize
+      // on retry, so burning the remaining attempts only delays a diagnosis that
+      // is already available. Probe the remote and fail immediately with the real
+      // reason — left to git's ambiguous text, the backend classifies this as
+      // BRANCH_GONE ("Branch deleted (PR merged before clone)"), which is the
+      // wrong story and reads as a benign race instead of an unseeded repo.
+      if (GIT_BRANCH_MISSING.test(rawMsg)) {
+        const cloneUrl = extractCloneUrl(args);
+        if (cloneUrl && await remoteHasNoCommits(cloneUrl)) {
+          throw new Error(
+            'Clone failed: the repository has no commits, so its default branch does not exist yet. '
+            + 'Blueprint seeds an initial commit when a project is onboarded — this repo was never seeded. '
+            + 'Push any commit to the default branch (or re-onboard the project) to fix. '
+            + `Original git error: ${sanitize(rawMsg)}`
+          );
+        }
+      }
+
+      if (attempt === CLONE_MAX_RETRIES - 1) throw e;
       const delay = CLONE_RETRY_BASE_DELAY * Math.pow(2, attempt);
       const isAuthError = GIT_CLONE_AUTH_ERROR.test(rawMsg);
       log(`Git clone failed (attempt ${attempt + 1}/3)${isAuthError ? ' [auth]' : ''}, retrying in ${delay / 1000}s: ${sanitize(rawMsg)}`);
@@ -3220,6 +3300,9 @@ import {
   recordResidentTurnLatency,
   getResidentTurnLatencyTelemetry,
   resetResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture,
+  getOperatorDecisionCaptureTelemetry,
+  resetOperatorDecisionCaptureTelemetry,
 } from './telemetry.js';
 export {
   errorFingerprint,
@@ -3242,6 +3325,9 @@ export {
   recordResidentTurnLatency,
   getResidentTurnLatencyTelemetry,
   resetResidentTurnLatencyTelemetry,
+  recordOperatorDecisionCapture,
+  getOperatorDecisionCaptureTelemetry,
+  resetOperatorDecisionCaptureTelemetry,
 };
 
 // ── Divergence detection helpers ─────────────────────────────────────────────
@@ -3456,6 +3542,10 @@ async function completeStartup(
 
 // ── Main ────────────────────────────────────────────────────────────────────
 export async function main() {
+  // Check Node version before anything else so an incompatible runtime fails
+  // with a clear, actionable message instead of an opaque startup error.
+  enforceNodeVersion();
+
   let _pendingExitCode = 0;
   // Start forensic instrumentation as early as possible. The lag monitor + exit
   // markers don't depend on auth or task claim, so we want them recording from
@@ -3761,6 +3851,8 @@ interface WarmContinuationDeps {
   materializeClaimCredentialState: typeof materializeClaimCredentialState;
   performWarmRetarget: typeof performWarmRetarget;
   resolveVmInstanceId: (allowJwtFallback: boolean) => string | null;
+  /** Production-only pre-poll guard; injectable so unit tests need no disk. */
+  isWorkspaceValid?: () => boolean;
 }
 
 const warmContinuationDeps: WarmContinuationDeps = {
@@ -3774,6 +3866,7 @@ const warmContinuationDeps: WarmContinuationDeps = {
     if (vmInstanceId) return vmInstanceId;
     return allowJwtFallback ? decodeJwtVmInstanceId(AGENT_TOKEN) : null;
   },
+  isWorkspaceValid: () => fs.existsSync(path.join(WORKSPACE, '.git')),
 };
 
 function parkPollTimeoutMs(parkDirective: ParkDirective): number {
@@ -3790,6 +3883,13 @@ export async function continueWarmContinuation(
   },
   deps: WarmContinuationDeps = warmContinuationDeps,
 ): Promise<{ action: 'continue' | 'exit' }> {
+  // A failed clone removes WORKSPACE before its error is reported. Never let a
+  // later warm poll claim an unrelated task into that invalid handoff: it
+  // cannot survive resetForNextRole and should be cold-provisioned instead.
+  if (deps.isWorkspaceValid && !deps.isWorkspaceValid()) {
+    log(`Warm continuation declined: workspace is invalid (missing ${path.join(WORKSPACE, '.git')})`);
+    return { action: 'exit' };
+  }
   const vmInstanceId = deps.resolveVmInstanceId(!!opts.parkDirective);
   if (!vmInstanceId) {
     return { action: 'exit' };
@@ -3897,12 +3997,19 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   // first recordToolUse() call after this point. setup_secs = the gap.
   roleClaimTimestamp = Date.now();
   const taskId = strVal(task.task_id);
-  process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
-  setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
-  _inWarmPollWindow = false;     // We're back in active role execution
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload: Record<string, unknown> = payloads[0] ?? {};
   const taskType = strVal(payload.type, 'create');
+  const claimAgentToken = requireClaimAgentToken(taskType, strVal(task.agent_token));
+  if (claimAgentToken) {
+    activateClaimedRole(
+      { taskId, agentToken: claimAgentToken },
+      'resident claim token rotation failed',
+    );
+  }
+  process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
+  setCrashReportTaskId(taskId);  // Decoupled crash identity — survives the poll-window TASK_ID clear
+  _inWarmPollWindow = false;     // We're back in active role execution
   const model = payload.model ? strVal(payload.model) : (process.env.LLM_MODEL || undefined);
   const effort = payload.effort ? strVal(payload.effort) : undefined;
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
@@ -3944,41 +4051,45 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   sendLog(ws, `Agent started (VM: ${VM_INSTANCE_ID}, type: ${taskType})\n`);
 
   try {
-    // Get GitHub credentials
+    // Load the published task-capability contract before any handler runs.
+    statusRef.value = 'Loading task-capability contract...';
+    await ensureTaskCapabilityContractLoaded();
+
+    let ghToken = '';
+    let owner = '';
+    let repo = '';
+    const credentialFreeResidentTurn = !taskRequiresGithubCredentials(taskType);
+    // Get GitHub credentials only for repository-backed tasks. Resident turns
+    // are deliberately provider-only: no GitHub token, clone, or workspace.
     // Timeout must cover the backend's worst case for get_github_token_for_task:
     // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
     // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
     // backoff. The same path is already covered at 240s for the PR-create call
     // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
     // beyond token minting). Any failure here is infrastructure, not a code fault.
-    statusRef.value = 'Fetching GitHub credentials...';
-    let ghRes: { data: { token: string; owner: string; repo: string } };
-    try {
-      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
-    } catch (e) {
-      const err = e instanceof Error ? e : new Error(String(e));
-      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
-      throw err;
+    if (!credentialFreeResidentTurn) {
+      statusRef.value = 'Fetching GitHub credentials...';
+      let ghRes: { data: { token: string; owner: string; repo: string } };
+      try {
+        ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+      } catch (e) {
+        const err = e instanceof Error ? e : new Error(String(e));
+        (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+        throw err;
+      }
+      ({ token: ghToken, owner, repo } = ghRes.data);
+      log(`GitHub: ${owner}/${repo}`);
     }
-    const { token: ghToken, owner, repo } = ghRes.data;
-    log(`GitHub: ${owner}/${repo}`);
-
-    // Load the published task-capability contract before any handler runs. The
-    // agent token is valid here (the github/token fetch above just succeeded
-    // with it), and the guard makes this a once-per-VM cost. configureAgentPermissions
-    // / isReadOnlyTaskType throw until this completes, so a missing or incomplete
-    // contract fails the role loudly here rather than silently mis-granting write
-    // permissions to a read-only task.
-    statusRef.value = 'Loading task-capability contract...';
-    await ensureTaskCapabilityContractLoaded();
 
     // Seed the GitHub token file immediately so bash helpers can use it from
     // the first invocation. Then schedule proactive refreshes every 45 min
     // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
     // so force_refresh=false hits the cache at zero GitHub API cost).
-    ensureGithubTokenFileEnv();
-    writeGithubTokenFile(ghToken);
-    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+    if (!credentialFreeResidentTurn) {
+      ensureGithubTokenFileEnv();
+      writeGithubTokenFile(ghToken);
+      scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
+    }
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //
@@ -4076,11 +4187,17 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Keep heartbeat alive during retries so the reaper doesn't kill us mid-report.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        await persistAndPostStatus(taskId, {
-          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-          logs: sanitize(`Fatal error: ${errMsg}`),
-          failure_category: failureCategory,
-        });
+        if (taskType === 'strategic_resident_turn') {
+          const projectId = strVal(projectMetadata?.project_id);
+          if (!projectId) throw new Error('Resident claim is missing project_id');
+          await persistResidentTurnFailure(taskId, projectId, safeErr, failureCategory);
+        } else {
+          await persistAndPostStatus(taskId, {
+            task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+            logs: sanitize(`Fatal error: ${errMsg}`),
+            failure_category: failureCategory,
+          });
+        }
         break; // Success — stop retrying
       } catch (e) {
         const postErr = e instanceof Error ? e.message : String(e);
@@ -4118,6 +4235,17 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
 
   return { taskId, prNumber, baseBranch: baseBranchForReset, parkDirective: null };
+}
+
+export function taskRequiresGithubCredentials(taskType: string): boolean {
+  return taskType !== 'strategic_resident_turn';
+}
+
+export function requireClaimAgentToken(taskType: string, token: string): string {
+  if (taskType === 'strategic_resident_turn' && !token) {
+    throw new Error('resident claim token rotation failed: missing agent_token');
+  }
+  return token;
 }
 
 // Global crash handlers — report errors via heartbeat before dying.

@@ -2932,6 +2932,23 @@ def _open_message(dedupe_key: str):
     return msg
 
 
+@pytest.fixture
+def _mock_notice_message_builder(monkeypatch):
+    """Keep notice unit tests focused on notice content, not DB sequencing."""
+
+    async def _build_message(_session, **values):
+        message = MagicMock()
+        for key, value in values.items():
+            setattr(message, key, value)
+        return message
+
+    monkeypatch.setattr(
+        "app.project_message_creation.build_project_message",
+        _build_message,
+    )
+
+
+@pytest.mark.usefixtures("_mock_notice_message_builder")
 class TestRaiseCapabilityVerdictNotice:
     """Unit tests for raise_capability_verdict_notice using mock sessions."""
 
@@ -3848,7 +3865,7 @@ def test_adopt_verdict_records_capability_proof():
     }
 
     with patch("app.capability_proof.flag_modified"):
-        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+        assert record_capability_proof_from_trial(project, "repo_map", adopt_entry)
 
     # Entry recorded under normalized cap name.
     assert "repo-map" in project.capability_proof_records
@@ -3870,7 +3887,9 @@ def test_adopt_verdict_records_capability_proof():
 
     # Re-evaluation is idempotent — no duplicate entry.
     with patch("app.capability_proof.flag_modified"):
-        record_capability_proof_from_trial(project, "repo_map", adopt_entry)
+        assert not record_capability_proof_from_trial(
+            project, "repo_map", adopt_entry
+        )
     assert len(project.capability_proof_records["repo-map"]) == 1
 
 
@@ -4028,6 +4047,7 @@ class TestIsTrialStalled:
 # ── persist_stalled_trial_notices_in_transaction ──────────────────────────────
 
 
+@pytest.mark.usefixtures("_mock_notice_message_builder")
 class TestPersistStalledTrialNotices:
     """Tests for raise_stalled_trial_notice and persist_stalled_trial_notices_in_transaction."""
 
@@ -4579,6 +4599,7 @@ class TestRecordTrialVerdictAmbiguousLiftSince:
 # ── raise_ambiguous_lift_escalation_notice ───────────────────────────────────
 
 
+@pytest.mark.usefixtures("_mock_notice_message_builder")
 class TestRaiseAmbiguousLiftEscalationNotice:
     """Tests for raise_ambiguous_lift_escalation_notice and persist_ambiguous_lift_escalations_in_transaction."""
 

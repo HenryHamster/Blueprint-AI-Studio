@@ -110,7 +110,7 @@ build {
       "sudo npm install -g --include=optional @anthropic-ai/claude-code@2.1.197 @openai/codex@0.144.1 @google/gemini-cli",
       "claude_version=$(claude --version | awk '{print $1}'); test \"$claude_version\" = 2.1.197 || { echo \"Claude Code 2.1.197 required for fleet config compatibility; got $claude_version\" >&2; exit 1; }",
       "codex_version=$(codex --version | awk '{print $NF}'); test \"$codex_version\" = 0.144.1 || { echo \"Codex CLI 0.144.1 required for GPT-5.6 models; got $codex_version\" >&2; exit 1; }",
-      "sudo apt-get install -y python3-pip",
+      "sudo apt-get install -y python3-pip python3-venv postgresql",
       "# Pin the baked system pytest stack to EXACTLY backend/requirements.txt's versions.",
       "# This install was previously unpinned, so a rebuild silently drifted to pytest 9.1.1.",
       "# pytest privatized console_main -> _console_main after 7.x, so the 9.x system console",
@@ -146,6 +146,11 @@ build {
   provisioner "file" {
     source      = "../../agent/package-lock.json"
     destination = "/opt/agent/package-lock.json"
+  }
+
+  provisioner "file" {
+    source      = "../../scripts/project-verification-probe.sh"
+    destination = "/tmp/project-verification-probe.sh"
   }
 
   # Upload the backend deps build context (Dockerfile + requirements.txt) so the
@@ -210,6 +215,13 @@ build {
       "# scripts/test-backend.sh's local fast path performs (docker image inspect).",
       "sudo docker image inspect \"blueprint-backend-test-deps:$REQHASH\" >/dev/null || { echo 'FATAL: baked deps image not resolvable after build' >&2; exit 1; }",
       "echo PACKER_BACKEND_DEPS_INSPECT_OK",
+      "# The write-agent bwrap boundary deliberately has no Docker socket. Bake",
+      "# the same pinned backend dependencies into a read-only venv so its",
+      "# sanctioned targeted-test harness can run against a private PostgreSQL",
+      "# process entirely inside the sandbox.",
+      "sudo python3 -m venv /opt/blueprint-backend-venv",
+      "sudo /opt/blueprint-backend-venv/bin/pip install --no-cache-dir -r /tmp/backend-deps-ctx/requirements.txt",
+      "sudo /opt/blueprint-backend-venv/bin/python -c 'import fastapi, asyncpg, pytest; print(\"PACKER_BACKEND_SANDBOX_VENV_OK\")'",
       "sudo rm -rf /tmp/backend-deps-ctx"
     ]
   }
@@ -249,6 +261,7 @@ build {
       "# Tolerate an empty/unknown value so a local/dev bake never fails here.",
       "SOURCE_SHA='${var.source_git_sha}'; [ -n \"$SOURCE_SHA\" ] || SOURCE_SHA=unknown; echo \"AGENT_SOURCE_SHA=$SOURCE_SHA\" | sudo tee /opt/agent/AGENT_SOURCE_SHA && echo PACKER_SOURCE_SHA_OK",
       "sudo chown -R agent:agent /opt/agent",
+      "sudo install -D -o root -g root -m 0755 /tmp/project-verification-probe.sh /opt/agent/bin/project-verification-probe.sh",
       "sudo touch /etc/agent.env",
       "sudo chmod 644 /etc/agent.env",
       "echo '[Unit]' | sudo tee /etc/systemd/system/blueprint-agent.service",
@@ -368,6 +381,17 @@ build {
       "# registration, or a broken dispatch path would cause a non-zero exit and fail",
       "# the bake before the image is tagged. Prints PACKER_MEMO_LIFECYCLE_OK on success.",
       "sudo -u agent -H bash -lc 'cd /opt/agent && node --import tsx ./src/handlers/memo-bake-smoke-lifecycle.ts'"
+    ]
+  }
+
+  # Final verification gate: the image is taggable only after the production
+  # agent user functionally runs Ruff and a live sandbox PostgreSQL sidecar/client
+  # path. Presence of binaries, images, or a root-reachable daemon is not proof.
+  provisioner "shell" {
+    inline = [
+      "set -eu",
+      "sudo -u agent -H timeout --signal=TERM --kill-after=5s 120s /opt/agent/bin/project-verification-probe.sh all",
+      "echo PACKER_PROJECT_VERIFICATION_V1_OK"
     ]
   }
 }

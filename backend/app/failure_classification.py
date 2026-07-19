@@ -181,6 +181,16 @@ BLOCKED_PRECONDITION = "BLOCKED_PRECONDITION"
 # merge. The respawn already skips merged PRs gracefully (review_pipeline); this
 # only stops the FIRST attempt from being mislabeled a code defect.
 BRANCH_GONE = "BRANCH_GONE"
+# The repository has no commits at all, so its default branch does not exist and
+# nothing can be cloned from it. Git reports this with the SAME text as a deleted
+# branch ("Remote branch <trunk> not found in upstream origin"), so without this
+# class it lands in BRANCH_GONE and is shown to operators as "Branch deleted (PR
+# merged before clone)" — a benign, transient-sounding lie about a permanent,
+# structural condition. Distinct class so the reason is the truth: the repo was
+# never seeded. Blueprint seeds empty repos at onboarding
+# (`ensure_repo_initialized`); seeing this class means that seed did not happen
+# or was undone, which is an operator fix, not something a retry can resolve.
+REPO_UNINITIALIZED = "REPO_UNINITIALIZED"
 # Agent completed the task but the PR branch was already deleted (merged and
 # auto-deleted), so there was nothing to review or fix. Similar to SCOPE_EMPTY
 # (task had no work to do), routed to that class so it doesn't consume retry
@@ -215,6 +225,10 @@ REASSIGNED = "REASSIGNED"
 # message still routes to RATE_LIMIT (block + cooldown) -- that path is unchanged.
 # Lowercase to match the literal failure_category string the agent posts.
 NO_PROGRESS_TIMEOUT = "no_progress_timeout"
+# Compute backends persist this exact terminal reason when their watchdog cuts a
+# command.  Keeping it adjacent to the canonical failure class prevents backend
+# emitters and the completion taxonomy from drifting apart.
+NO_PROGRESS_TIMEOUT_TERMINAL_REASON = NO_PROGRESS_TIMEOUT
 # Agent process is alive (fresh heartbeat) but has made no tool or LLM progress
 # for longer than the scope-aware threshold (8 min small / 12 min medium /
 # 18 min large). Detected by the reaper's progress-staleness sweep, which
@@ -308,7 +322,7 @@ def classify_compute_terminal_reason(
       they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
       CODE_ERROR)
     - reason contains "cancelled" or "operator" → ADMIN_CANCEL
-    - reason contains "no_progress_timeout" → NO_PROGRESS_TIMEOUT
+    - reason contains ``NO_PROGRESS_TIMEOUT_TERMINAL_REASON`` → NO_PROGRESS_TIMEOUT
       (job was cut early by the no-progress watchdog — a configurable platform
       kill, not a code defect)
     - default → CODE_ERROR (genuine command/work defect)
@@ -323,7 +337,7 @@ def classify_compute_terminal_reason(
             return AGENT_TIMEOUT
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
-        if "no_progress_timeout" in lower:
+        if NO_PROGRESS_TIMEOUT_TERMINAL_REASON in lower:
             return NO_PROGRESS_TIMEOUT
     return CODE_ERROR
 
@@ -641,6 +655,54 @@ _BRANCH_GONE_PATTERNS: tuple[str, ...] = (
 )
 
 
+# Signatures emitted when the remote repository has no commits at all. The agent
+# probes the remote (`git ls-remote`) on a missing-branch clone failure and says
+# so explicitly, because git's own error text cannot tell an empty repo apart
+# from a deleted branch; the GitHub API phrasings are matched too.
+_REPO_UNINITIALIZED_PATTERNS: tuple[str, ...] = (
+    "repository has no commits",
+    "this repository is empty",
+    "git repository is empty",
+)
+
+
+# Signature emitted by the agent's clone-delivery guard (verifyCloneDelivered in
+# agent/src/prompts/discovery.ts) when the DURABLE signal says the repo is NOT
+# empty (repo_is_empty === false) but the freshly-cloned working tree is
+# empty/near-empty. This is the specific "durable-vs-live disagreement" that a
+# stale ``repo_is_empty=False`` on a genuinely empty repo produces on EVERY task
+# — distinct from an ordinary transient clone_failed (network blip, partial
+# fetch) so the report path can self-heal the durable signal instead of looping
+# clone_failed forever. Cross-language contract: the substring must stay in sync
+# with the message thrown in discovery.ts (branch (2) of verifyCloneDelivered).
+_CLONE_DELIVERY_DISAGREEMENT_PATTERNS: tuple[str, ...] = (
+    "the clone did not deliver the expected content",
+)
+
+
+def is_clone_delivery_disagreement(combined: str) -> bool:
+    """True when a clone_failed report is the durable/live emptiness disagreement.
+
+    Matches the ``verifyCloneDelivered`` message emitted when the stored
+    ``repo_is_empty=False`` contradicts an empty cloned tree — the signature of
+    a STALE durable signal — and NOT a generic transient clone failure (missing
+    HEAD, wrong checkout, network error). Case-insensitive; safe on empty/None.
+    """
+    if not combined:
+        return False
+    lowered = combined.lower()
+    return any(kw in lowered for kw in _CLONE_DELIVERY_DISAGREEMENT_PATTERNS)
+
+
+def _is_repo_uninitialized(combined: str) -> bool:
+    """True when the failure text shows the remote repo has zero commits.
+
+    Must be checked BEFORE :func:`_is_branch_gone`: an empty repo's clone error
+    also matches the branch-gone patterns, and the more specific cause wins.
+    """
+    return any(kw in combined for kw in _REPO_UNINITIALIZED_PATTERNS)
+
+
 def _is_branch_gone(combined: str) -> bool:
     """True when the failure text shows the target branch/ref no longer exists.
 
@@ -667,6 +729,7 @@ INFRA_CLASSES: frozenset[str] = frozenset(
         SCOPE_OVERFLOW,
         BLOCKED_PRECONDITION,
         BRANCH_GONE,
+        REPO_UNINITIALIZED,
         AGENT_STALLED,
         SCOPE_EMPTY,
         REASSIGNED,
@@ -725,6 +788,7 @@ ALL_FAILURE_CLASSES: tuple[str, ...] = (
     SCOPE_OVERFLOW,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
+    REPO_UNINITIALIZED,
     SCOPE_EMPTY,
     REASSIGNED,
     NO_PROGRESS_TIMEOUT,
@@ -2527,6 +2591,13 @@ def _classify_failure_class(
     # clone a generic "fatal" CODE_ERROR, and we must override that to a
     # budget-exempt, visible class so no debug/remediation spawns and no retry
     # slot is burned on a branch that will not reappear.
+    # Checked before branch-gone: a commitless repo fails the clone with the same
+    # "Remote branch ... not found in upstream origin" text as a deleted branch,
+    # so branch-gone would swallow it and report a permanent setup gap as a
+    # benign merged-PR race. The specific cause must win over the generic one.
+    if _is_repo_uninitialized(_classify_combined_lower):
+        return REPO_UNINITIALIZED
+
     if _is_branch_gone(_classify_combined_lower):
         return BRANCH_GONE
 

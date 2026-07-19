@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import type WebSocket from 'ws';
-import { sendLog, WORKSPACE } from '../index.js';
+import { sendLog, WORKSPACE, apiPost } from '../index.js';
 import type { BuildConfig, FailureCategory } from '../index.js';
 import { GREENFIELD_SOURCE_FILE_THRESHOLD } from '../constants.js';
 
@@ -100,12 +100,23 @@ export function buildFileTree(ws: WebSocket | null): string {
 // only these (plus dotfiles) is a fresh project to bootstrap, not a codebase to
 // read and improve. Extension-based so it is language-agnostic.
 const NON_SOURCE_EXT = /\.(md|markdown|json|ya?ml|toml|cfg|ini|txt|lock|lockb)$/i;
-// Common config/manifest basenames with no telling extension.
+// Common config/manifest basenames with no telling extension. Kept in exact
+// like-for-like alignment with the backend's `_NON_SOURCE_FILE_BASENAMES`
+// (backend/app/routers/admin_onboard.py) so the durable onboarding count and
+// this live count classify the same tree identically. Dot-prefixed entries
+// (e.g. .gitmodules, .pre-commit-config.yaml) are already dropped by the
+// dotfile skip below, so only the non-dotfile basenames need listing here.
 const NON_SOURCE_BASENAMES = new Set([
-  'license', 'notice', 'authors', 'codeowners', 'dockerfile', 'makefile',
-  'procfile', '.gitignore', '.gitattributes', '.dockerignore', '.editorconfig',
-  '.npmrc', '.nvmrc', '.prettierrc', '.eslintrc',
+  'license', 'licence', 'notice', 'authors', 'codeowners', 'dockerfile',
+  'makefile', 'procfile', 'go.mod', '.gitignore', '.gitattributes',
+  '.dockerignore', '.editorconfig', '.npmrc', '.nvmrc', '.prettierrc',
+  '.eslintrc',
 ]);
+// Basename PREFIXES that mark a scaffolding file regardless of extension
+// (e.g. README, README.rst, CONTRIBUTING, CHANGELOG, SECURITY). Mirrors the
+// backend's `_NON_SOURCE_FILE_PREFIXES` so a bare README/SECURITY (no
+// telling extension) is excluded on both sides.
+const NON_SOURCE_PREFIXES = ['readme', 'contributing', 'changelog', 'security'];
 
 /**
  * Counts the real source files in the cloned working tree, excluding
@@ -129,6 +140,7 @@ export function countSourceFiles(): number | null {
       // Dotfiles (e.g. .gitignore, .env) and dot-prefixed config are scaffolding.
       if (base.startsWith('.')) continue;
       if (NON_SOURCE_BASENAMES.has(base)) continue;
+      if (NON_SOURCE_PREFIXES.some(prefix => base.startsWith(prefix))) continue;
       if (NON_SOURCE_EXT.test(base)) continue;
       count++;
     }
@@ -188,6 +200,35 @@ export function isGreenfieldRepo(task: Record<string, unknown>): boolean {
 }
 
 /**
+ * Citation-steering guidance for design/research tasks running on a GREENFIELD
+ * (empty / near-empty) repo, gated on the identical `isGreenfieldRepo` predicate
+ * every other greenfield gate consults so they can never disagree.
+ *
+ * The knowledge/design grounding gate (backend `_design_grounding_miss`) accepts
+ * web-only citations and only FAILS when cited FILE paths do not resolve in the
+ * working tree. On a greenfield repo the target files the design describes do not
+ * exist yet, so a design agent that follows the default "cite the actual files"
+ * instruction emits invented file paths that cannot resolve — and the whole doc
+ * is discarded as ungrounded. This paragraph steers the agent to cite EXTERNAL /
+ * WEB sources instead and to NOT invent repo file paths, so a greenfield design
+ * grounds on the web and passes the gate.
+ *
+ * Returns the guidance block ONLY when the repo is greenfield; mature-repo agents
+ * get `''` so the default file-citation posture is unchanged and the paragraph
+ * never appears as noise. The leading/trailing blank lines keep spacing when the
+ * block is interpolated between other prompt sections.
+ */
+export function buildGreenfieldCitationGuidance(task: Record<string, unknown>): string {
+  if (!isGreenfieldRepo(task)) return '';
+  return `\n# GREENFIELD CITATION MODE (this repo is empty / near-empty)
+The files this design describes do NOT exist in the repository yet, so you CANNOT cite them. The grounding gate machine-checks every FILE citation against the working tree and DISCARDS a design whose file citations all point at not-yet-created paths.
+- Cite EXTERNAL / WEB sources instead: https:// URLs to language/framework docs, specifications, RFCs, standards, or prior-art projects that justify the design. Web citations satisfy the grounding gate on their own.
+- Do NOT invent repository file paths (e.g. src/…, backend/…) for files that do not exist on disk — an unresolvable file citation fails the gate. It is fine to NAME planned files in the body prose, just do not put them in source_citations.
+- You MAY cite the few real scaffolding/config files that already exist (verify with ls first) — but the web sources should carry the grounding.
+- Ground the design in the design-doc specs, the project goal, and the cited web sources rather than in code that is not there yet.\n`;
+}
+
+/**
  * Positively confirms that the clone actually delivered the expected working
  * tree BEFORE any greenfield conclusion is allowed. A clone can exit 0 yet leave
  * an empty or near-empty tree — a partial clone, a wrong/empty checkout, or a
@@ -209,7 +250,7 @@ export function isGreenfieldRepo(task: Record<string, unknown>): boolean {
  * ref or an unreadable `git ls-files` (countSourceFiles → null) is NOT treated as
  * a clone failure on its own — only an explicit durable/live disagreement is.
  */
-export function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): void {
+export async function verifyCloneDelivered(task: Record<string, unknown>, branch?: string): Promise<void> {
   const cloneFailure = (message: string): Error & { failureCategory: FailureCategory } => {
     const err = new Error(message) as Error & { failureCategory: FailureCategory };
     err.failureCategory = 'clone_failed';
@@ -248,10 +289,33 @@ export function verifyCloneDelivered(task: Record<string, unknown>, branch?: str
   // returning null means the scan could not run; we do NOT claim a clone failure
   // on a failed scan (only on a confirmed empty tree paired with a non-empty
   // durable signal).
+  //
+  // The comparison is LIKE-FOR-LIKE: countSourceFiles() applies the exact same
+  // "real source" exclusion rules as the backend classifier that produced
+  // task.source_file_count, so a divergence is a genuine clone shortfall rather
+  // than a rules mismatch. When the backend persisted its authoritative count
+  // (task.source_file_count), quote it in the failure so the durable/live
+  // disagreement is explicit; fall back to the bare boolean for configs
+  // predating that field.
   if (task.repo_is_empty === false) {
     const sourceFileCount = countSourceFiles();
     if (sourceFileCount !== null && sourceFileCount <= GREENFIELD_SOURCE_FILE_THRESHOLD) {
-      throw cloneFailure(`clone_failed: durable onboarding signal says the repo is NOT empty, but the cloned tree has only ${sourceFileCount} source file(s) — the clone did not deliver the expected content`);
+      // Self-heal: report the live-empty observation to the backend so it can
+      // re-run authoritative detection and flip the stale repo_is_empty=False
+      // signal.  This breaks the infinite clone_failed loop: the first task
+      // fails as expected (a durable/live disagreement IS a clone problem), but
+      // the backend re-detects and the NEXT task sees the corrected signal.
+      // Best-effort — never let a reporting failure suppress the clone_failed.
+      try {
+        await apiPost('/api/agent/build-config-discovery', { observed_repo_is_empty: true });
+      } catch { /* best-effort; do not mask the real clone_failed below */ }
+      const durableCount = typeof task.source_file_count === 'number'
+        ? task.source_file_count
+        : null;
+      const durableBasis = durableCount !== null
+        ? `the onboarding scan counted ${durableCount} source file(s)`
+        : 'the durable onboarding signal says the repo is NOT empty';
+      throw cloneFailure(`clone_failed: ${durableBasis}, but the cloned tree has only ${sourceFileCount} source file(s) under the same exclusion rules — the clone did not deliver the expected content`);
     }
   }
 }

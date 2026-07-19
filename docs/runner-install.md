@@ -62,9 +62,10 @@ rate-limit classification.
 
 ## 1. Enroll a runner
 
-In the admin UI go to **Settings → Runners → Register runner**. Choose a preset
-(`default`, `strategic`, etc.) and click **Register**. Copy the one-time token
-shown — it is never displayed again.
+In the admin UI, open the **Runtime** tab and the **Devices and runners**
+section, then click **Enroll runner**. Choose a preset (`default` or
+`strategic_local`) and enroll the runner. Copy the one-time token shown — it is
+never displayed again.
 
 ---
 
@@ -171,11 +172,22 @@ and never deletes your credential files under `~/.blueprint`.
 
 ## 4. Restart-on-crash
 
-The unit uses `Restart=on-failure`, which means systemd restarts the runner
-whenever it exits non-zero. The runner calls `os._exit(1)` (via its internal
-`_die()` helper) on fatal conditions such as a revoked token or a thread supervisor
-failure. That non-zero exit triggers a restart. A normal shutdown (SIGTERM, Ctrl-C)
-exits `0` and is **not** restarted.
+The unit uses `Restart=always`, which restarts the runner whenever it exits, for
+any reason. Two exit paths depend on this:
+
+- **Crash / fatal condition** — the runner calls `os._exit(1)` (via its internal
+  `_die()` helper) on a revoked token or a thread-supervisor failure; systemd
+  relaunches it.
+- **Self-update** — after pulling a newer version the runner exits `0` and trusts
+  its supervisor to relaunch the fresh binary. `Restart=on-failure` would NOT
+  restart that clean exit-0, silently leaving the self-updated runner dead until
+  a manual restart — which is why the unit ships `Restart=always`.
+
+A deliberate `systemctl stop` (or `Ctrl-C` in the foreground) still stays stopped:
+systemd never applies the restart policy to an operator-initiated stop. A burst
+cap (`StartLimitIntervalSec=60` / `StartLimitBurst=3`) stops a persistent failure
+from restarting forever; run `systemctl reset-failed blueprint-runner.service`
+after fixing the root cause.
 
 Default restart delay is 5 seconds (`RestartSec=5`). Adjust in the unit file if
 needed.
@@ -252,6 +264,13 @@ Exit code `0` means the orchestrator is reachable, the token is valid, and at
 least one task class is claimable. Non-zero means something is misconfigured —
 read the preflight output for details.
 
+`--check` reports **all** detected problems in one pass. If both
+`BLUEPRINT_RUNNER_TOKEN` and `BLUEPRINT_ORCHESTRATOR_URL` are missing (and any
+diagnostic probe fails), it prints the full list together and exits non-zero,
+rather than stopping at the first missing variable — so you can fix everything
+at once instead of one-fix-rerun at a time. (Normal boot without `--check`
+still fails fast on the first missing prerequisite.)
+
 The preflight now also checks for missing agent Node.js dependencies. If the
 agent source (`agent/src/index.ts`) exists on this host but `npm install` was
 never run, you will see:
@@ -288,6 +307,7 @@ heartbeat advertises the repaired CLI. `--check` itself performs no download.
 ## 8. Re-enrollment
 
 If the runner token is revoked or lost and you cannot recover it from
-`~/.blueprint/runner_token`, re-enroll via the admin UI (Settings → Runners →
-Register runner). This mints a new token and a new runner identity. Run the new
-token through the first-launch step above to persist it.
+`~/.blueprint/runner_token`, re-enroll via the admin UI: open the **Runtime**
+tab, go to **Devices and runners**, and click **Enroll runner**. This mints a
+new token and a new runner identity. Run the new token through the first-launch
+step above to persist it.

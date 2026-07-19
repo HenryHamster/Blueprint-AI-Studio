@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import DateTime, case, cast, func, text, or_
+from sqlalchemy import select as sa_select
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -31,7 +32,11 @@ from app.models import (
 )
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user, require_admin
-from app.vm_cost_rates import VM_COST_RATES
+from app.vm_cost_rates import (
+    VM_COST_RATES,
+    vm_cost_evidence_filter,
+    vm_cost_sql_expr,
+)
 from app.shared_state import (
     get_project_integration_branch,
     get_project_promotion_target,
@@ -349,19 +354,30 @@ def _task_completed_at(task: Task) -> datetime:
 
 
 def _task_completed_at_sql(*, dialect_name: str):
-    """SQL expression mirroring _derive_completed_at for windowed scans."""
+    """SQL expression mirroring ``_derive_completed_at`` for windowed scans.
+
+    Prefers the durable ``completed_at`` column (centrally stamped on terminal
+    transitions and immune to post-terminal ``status_log`` audit writes), then
+    the parseable ``status_log`` tail, then ``created_at`` — the exact fallback
+    chain of ``_derive_completed_at``.  Used as the authoritative windowing key
+    for the cost widgets that aggregate entirely in SQL.
+    """
 
     if dialect_name == "postgresql":
         projected_completed_at = Task.status_log[-1]["t"].astext
         return cast(
-            case(
-                (
-                    projected_completed_at.op("~")(
-                        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+            func.coalesce(
+                Task.completed_at,
+                case(
+                    (
+                        projected_completed_at.op("~")(
+                            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                        ),
+                        cast(projected_completed_at, DateTime()),
                     ),
-                    cast(projected_completed_at, DateTime()),
+                    else_=None,
                 ),
-                else_=Task.created_at,
+                Task.created_at,
             ),
             DateTime(),
         )
@@ -534,6 +550,147 @@ async def get_task_cost_breakdown(
     if window != "all":
         cutoff = _utcnow() - timedelta(milliseconds=_TASK_COST_WINDOW_MS[window])
 
+    dialect_name = resolve_dialect_name(session)
+    if dialect_name == "postgresql":
+        # Fast path: cap the newest ``max_tasks`` terminal rows by created_at,
+        # then window/evidence-filter and aggregate cost entirely in SQL. No
+        # JSONB-heavy rows (context/payloads/status_log) are hydrated into
+        # Python — that per-row materialization was the dominant cost.
+        cost_sql = vm_cost_sql_expr(dialect_name)
+        completed_at_sql = _task_completed_at_sql(dialect_name=dialect_name)
+        type_sql = func.coalesce(Task.payloads[0]["type"].astext, "create")
+        direction_id_sql = func.coalesce(
+            Task.context["direction_id"].astext,
+            Task.payloads[0]["current_direction_id"].astext,
+        )
+        direction_text_sql = func.nullif(
+            func.coalesce(
+                Task.context["direction_text"].astext,
+                Task.payloads[0]["direction_text"].astext,
+                "",
+            ),
+            "",
+        )
+        base_filters = [
+            Task.status.in_(
+                [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
+            )
+        ]
+        if project_id is not None:
+            base_filters.append(Task.project_id == project_id)
+
+        capped = (
+            sa_select(
+                Task.id.label("task_id"),
+                Task.title.label("task_title"),
+                type_sql.label("task_type"),
+                direction_id_sql.label("direction_id"),
+                direction_text_sql.label("direction_text"),
+                completed_at_sql.label("completed_at"),
+                cost_sql.label("cost"),
+                vm_cost_evidence_filter().label("has_evidence"),
+            )
+            .where(*base_filters)
+            .order_by(Task.created_at.desc())
+            .limit(max_tasks)
+            .subquery("capped")
+        )
+        c = capped.c
+        row_filters = [c.has_evidence.is_(True)]
+        if cutoff is not None:
+            row_filters.append(c.completed_at >= cutoff)
+
+        # ``truncated`` reflects the created_at cap BEFORE window/evidence
+        # filtering — identical semantics to ``len(tasks) >= max_tasks``.
+        capped_count = (
+            await session.execute(sa_select(func.count()).select_from(capped))
+        ).scalar_one()
+
+        type_rows = (
+            await session.execute(
+                sa_select(
+                    c.task_type, func.count(), func.coalesce(func.sum(c.cost), 0.0)
+                )
+                .where(*row_filters)
+                .group_by(c.task_type)
+            )
+        ).all()
+        direction_key = func.coalesce(c.direction_id, "unassigned")
+        dir_rows = (
+            await session.execute(
+                sa_select(
+                    direction_key,
+                    func.count(),
+                    func.coalesce(func.sum(c.cost), 0.0),
+                    func.max(c.direction_text),
+                )
+                .where(*row_filters)
+                .group_by(direction_key)
+            )
+        ).all()
+        top_rows = (
+            await session.execute(
+                sa_select(
+                    c.task_id,
+                    c.task_title,
+                    c.task_type,
+                    c.direction_id,
+                    c.completed_at,
+                    c.cost,
+                )
+                .where(*row_filters)
+                .order_by(c.cost.desc(), c.completed_at.asc(), c.task_title.asc())
+                .limit(top_n)
+            )
+        ).all()
+
+        task_type_breakdown = [
+            {
+                "task_type": tt,
+                "task_count": int(cnt),
+                "estimated_cost_usd": round(float(cost), 2),
+            }
+            for tt, cnt, cost in sorted(type_rows, key=lambda r: (-float(r[2]), r[0]))
+        ]
+        direction_breakdown = [
+            {
+                "direction_id": None if key == "unassigned" else key,
+                "direction_text": text_val or None,
+                "task_count": int(cnt),
+                "estimated_cost_usd": round(float(cost), 2),
+            }
+            for key, cnt, cost, text_val in sorted(
+                dir_rows, key=lambda r: (-float(r[2]), r[0])
+            )
+        ]
+        top_tasks = [
+            {
+                "task_id": str(task_id),
+                "task_title": task_title,
+                "task_type": task_type,
+                "direction_id": direction_id,
+                "completed_at": completed_at.isoformat(),
+                "estimated_cost_usd": round(float(cost), 2),
+            }
+            for task_id, task_title, task_type, direction_id, completed_at, cost in top_rows
+        ]
+        return {
+            "project_id": str(project_id) if project_id else None,
+            "window": window,
+            "window_ms": _TASK_COST_WINDOW_MS[window] if window != "all" else None,
+            "window_start": cutoff.isoformat() if cutoff else None,
+            "task_count": sum(item["task_count"] for item in task_type_breakdown),
+            "max_tasks": max_tasks,
+            "truncated": capped_count >= max_tasks,
+            "total_estimated_cost_usd": round(
+                sum(float(cost) for _, _, cost in type_rows), 2
+            ),
+            "task_type_breakdown": task_type_breakdown,
+            "direction_breakdown": direction_breakdown,
+            "top_tasks": top_tasks,
+        }
+
+    # SQLite fallback (test harness without Postgres): compute per-row in Python.
     filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED])
     ]
@@ -692,53 +849,31 @@ async def get_spend_burn_rate(
     dialect_name = resolve_dialect_name(session)
     cutoff = _utcnow() - timedelta(days=window_days)
     terminal_at_sql = _task_completed_at_sql(dialect_name=dialect_name)
+    cost_sql = vm_cost_sql_expr(dialect_name)
     filters = [
         Task.status.in_(
             [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ),
         terminal_at_sql >= cutoff,
+        # Only tasks with cost evidence contribute, matching the prior
+        # ``get_task_total_vm_cost_usd_or_none() is None`` skip.
+        vm_cost_evidence_filter(),
     ]
     if project_id is not None:
         filters.append(Task.project_id == project_id)
 
-    tasks = (
-        (
-            await session.execute(
-                select(Task)
-                .options(
-                    load_only(
-                        Task.id,
-                        Task.status,
-                        Task.created_at,
-                        Task.completed_at,
-                        Task.status_log,
-                        Task.context,
-                        Task.vm_provisioned_at,
-                        Task.vm_stopped_at,
-                        Task.vm_spot,
-                        Task.vm_runtime_cost_banked_db,
-                        raiseload=True,
-                    )
-                )
-                .where(*filters)
-                .order_by(terminal_at_sql.desc(), Task.created_at.desc())
-                .limit(5000)
-            )
+    # Sum cost and count in SQL — no row hydration, and the exact window is
+    # aggregated (the old 5000-row cap could silently drop spend past the cap).
+    agg = (
+        await session.execute(
+            sa_select(
+                func.coalesce(func.sum(cost_sql), 0.0),
+                func.count(),
+            ).where(*filters)
         )
-        .scalars()
-        .all()
-    )
-
-    total_cost = 0.0
-    task_count = 0
-    for task in tasks:
-        if _task_completed_at(task) < cutoff:
-            continue
-        cost = get_task_total_vm_cost_usd_or_none(task)
-        if cost is None:
-            continue
-        total_cost += cost
-        task_count += 1
+    ).one()
+    total_cost = float(agg[0] or 0.0)
+    task_count = int(agg[1] or 0)
 
     # Derive the daily rate and 30-day forecast from the SAME rounded window
     # cost we report, so the three figures stay internally consistent (an

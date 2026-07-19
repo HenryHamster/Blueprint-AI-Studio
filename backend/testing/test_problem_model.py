@@ -57,6 +57,9 @@ from app.problem_model import (
     reconcile_gap_staffing_raw,
     reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
+    ConfirmationResolutionSignals,
+    PendingConfirmation,
+    auto_clear_resolved_confirmations,
 )
 
 
@@ -3356,6 +3359,33 @@ def test_explicit_deletions_remove_named_agent_owned_entries():
     assert diff.get("friction_deleted") == ["f-gone"]
 
 
+def test_pending_user_confirmation_deletion_is_auditable_in_diff():
+    """A strategist clearing a pending confirmation via _deletions must be
+    auditable — the deletion surfaces in the structured revision-log diff so it
+    is not an invisible mutation (Stage 2 lifecycle, design d-7c851b3f)."""
+    current = {
+        "revision": 1,
+        "pending_user_confirmation": [
+            {
+                "id": "p-creds",
+                "type": "credentials_needed",
+                "proposal": "need a token",
+                "created_at": "2026-06-01T00:00:00",
+            },
+            {
+                "id": "p-keep",
+                "type": "access_needed",
+                "proposal": "keep me",
+                "created_at": "2026-06-01T00:00:00",
+            },
+        ],
+    }
+    proposed = {"_deletions": {"pending_user_confirmation": ["p-creds"]}}
+    new_raw, diff = apply_agent_update(current, proposed, "2026-06-03T00:00:00")
+    assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p-keep"}
+    assert diff.get("pending_user_confirmation_deleted") == ["p-creds"]
+
+
 def test_deletions_removes_archived_gap_by_id():
     current = {
         "revision": 1,
@@ -3422,6 +3452,103 @@ def test_merge_empty_proposed_preserves_agent_owned_collections():
     assert {g["id"] for g in new_raw["gaps"]} == {"g1"}
     assert {f["id"] for f in new_raw["friction"]} == {"f1"}
     assert {p["id"] for p in new_raw["pending_user_confirmation"]} == {"p1"}
+
+
+def test_friction_status_monotonic_stale_echo_does_not_regress():
+    """Regression: a stale concurrent write echoing a friction entry with status
+    'active' must NOT regress a terminal status (resolved or mitigated) back to
+    'active'.  Reproduces the revs-1332-1341 stale-echo sequence: resolved
+    tracker regressed to active by a concurrent write, then re-resolved.
+
+    Three sub-scenarios:
+      1. Resolved → stale active → still resolved (monotonic).
+      2. Mitigated → stale active → still mitigated (monotonic).
+      3. Active → resolved → works (forward progress not blocked)."""
+    # --- Sub-scenario 1: resolved is not regressed ---
+    current = {
+        "revision": 10,
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "resolved",
+                "description": "Fixed by retry logic.",
+                "mitigations_tried": ["added retry", "increased timeout"],
+            }
+        ],
+    }
+    proposed = {
+        "friction": [
+            {
+                "id": "f-1",
+                "name": "flaky CI",
+                "status": "active",
+            }
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-07-17T12:00:00")
+    fr = new_raw["friction"][0]
+    assert fr["status"] == "resolved", (
+        f"Expected 'resolved' (monotonic), got '{fr['status']}'"
+    )
+    # Durable fields the stale echo omitted (description, mitigations_tried)
+    # must still be preserved when the floor is NOT applied — a stale echo
+    # just omits the field, which is NOT the same as a blank under floor marker.
+    assert fr["name"] == "flaky CI"
+    assert fr["id"] == "f-1"
+
+    # --- Sub-scenario 2: mitigated is not regressed ---
+    current2 = {
+        "revision": 11,
+        "friction": [
+            {
+                "id": "f-2",
+                "name": "slow builds",
+                "status": "mitigated",
+                "description": "Build cache reduced time by 40%.",
+            }
+        ],
+    }
+    proposed2 = {
+        "friction": [
+            {
+                "id": "f-2",
+                "name": "slow builds",
+                "status": "active",
+            }
+        ],
+    }
+    new_raw2, _ = apply_agent_update(current2, proposed2, "2026-07-17T12:00:00")
+    fr2 = new_raw2["friction"][0]
+    assert fr2["status"] == "mitigated", (
+        f"Expected 'mitigated' (monotonic), got '{fr2['status']}'"
+    )
+
+    # --- Sub-scenario 3: forward progress from active still works ---
+    current3 = {
+        "revision": 12,
+        "friction": [
+            {
+                "id": "f-3",
+                "name": "flakey test",
+                "status": "active",
+            }
+        ],
+    }
+    proposed3 = {
+        "friction": [
+            {
+                "id": "f-3",
+                "name": "flakey test",
+                "status": "resolved",
+            }
+        ],
+    }
+    new_raw3, _ = apply_agent_update(current3, proposed3, "2026-07-17T12:00:00")
+    fr3 = new_raw3["friction"][0]
+    assert fr3["status"] == "resolved", (
+        f"Expected 'resolved' (forward progress), got '{fr3['status']}'"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -4018,6 +4145,7 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     name resolve through ``working_capability_names`` +
     ``registry_satisfies_capability_need``."""
     from app.capability_registry import (
+        PLATFORM_WORKING_CAPABILITIES,
         registry_satisfies_capability_need,
         working_capability_names,
     )
@@ -4049,9 +4177,17 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     assert names == ["ci-pipeline"]
 
     # working_capability_names folds the absorbed aliases in alongside the
-    # survivor's own name.
+    # survivor's own name. It also ALWAYS includes the always-working
+    # PLATFORM_WORKING_CAPABILITIES (foundation capabilities unrelated to this
+    # consolidation), so the survivor + its three absorbed aliases are exactly
+    # the project-model contribution on top of the platform set.
     working = working_capability_names(new_raw)
-    assert working == {"ci-pipeline", "ci-poll", "ci-resolve", "ci-fix-spawn"}
+    assert working == {
+        "ci-pipeline",
+        "ci-poll",
+        "ci-resolve",
+        "ci-fix-spawn",
+    } | PLATFORM_WORKING_CAPABILITIES
 
     # Each absorbed old name resolves as satisfied-by-the-codebase through the
     # exact helper pair the blocked-resume matcher uses.
@@ -5799,3 +5935,155 @@ def test_evidence_primitive_phase1_gap_evidence_refs_downstream_consumer():
     ev_proven = gap_evidence_status(closed_gap_proven)
     assert ev_proven == "proven"
     assert claim_contradicts_evidence("closed", ev_proven) is False
+
+
+# ---------------------------------------------------------------------------
+# Auto-clear moot pending confirmations
+# ---------------------------------------------------------------------------
+
+
+def _pending(pid: str, ptype: str, proposal: str = "", rationale: str = ""):
+    return PendingConfirmation(
+        id=pid, type=ptype, proposal=proposal, rationale=rationale
+    )
+
+
+def test_auto_clear_credentials_needed_when_llm_ready():
+    """A credentials_needed item referencing LLM creds clears when the owner's
+    LLM account is runtime-ready — and revision/log are stamped like the
+    operator dismiss endpoint."""
+    model = ProblemModel(
+        revision=4,
+        pending_user_confirmation=[
+            _pending(
+                "p-cred",
+                "credentials_needed",
+                proposal="Add an Anthropic Claude OAuth token so the pool can run.",
+            )
+        ],
+    )
+    signals = ConfirmationResolutionSignals(llm_credentials_ready=True)
+    cleared = auto_clear_resolved_confirmations(model, signals, "2026-07-14T00:00:00")
+    assert cleared == ["p-cred"]
+    assert model.pending_user_confirmation == []
+    assert model.revision == 5
+    assert model.last_updated == "2026-07-14T00:00:00"
+    assert model.last_updated_by == "user"
+    assert len(model.revision_log) == 1
+    entry = model.revision_log[0]
+    assert entry.revision == 5
+    assert entry.changes["auto_cleared_pending_confirmations"] == ["p-cred"]
+
+
+def test_credentials_needed_left_when_llm_not_ready():
+    """Fail-closed: no positive credential signal -> item stays, byte-identical."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-cred", "credentials_needed", proposal="Need a Claude API key.")
+        ],
+    )
+    before = model.model_dump()
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(llm_credentials_ready=False), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert model.model_dump() == before  # no revision bump, no log entry
+
+
+def test_credentials_needed_left_when_text_unrelated():
+    """Positive LLM signal but the ask is about a DIFFERENT secret -> left in place."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending(
+                "p-hf",
+                "credentials_needed",
+                proposal="Need a HuggingFace dataset download token for the experiment.",
+            )
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(llm_credentials_ready=True), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert [p.id for p in model.pending_user_confirmation] == ["p-hf"]
+
+
+def test_auto_clear_access_needed_when_repo_ready():
+    """An access_needed item referencing repo/github access clears when a live
+    repo token proves access is granted."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending(
+                "p-access",
+                "access_needed",
+                proposal="Grant the GitHub app access to the repository.",
+            )
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(repo_access_ready=True), "2026-07-14T00:00:00"
+    )
+    assert cleared == ["p-access"]
+    assert model.pending_user_confirmation == []
+
+
+def test_access_needed_left_when_repo_not_ready():
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-access", "access_needed", proposal="Need github repo access.")
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model, ConfirmationResolutionSignals(repo_access_ready=False), "2026-07-14T00:00:00"
+    )
+    assert cleared == []
+    assert [p.id for p in model.pending_user_confirmation] == ["p-access"]
+
+
+def test_intent_change_and_major_decision_never_auto_cleared():
+    """Human-decision items are NEVER auto-removed, even with every signal set."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-intent", "intent_change", proposal="Pivot to a Claude API product."),
+            _pending("p-major", "major_decision", proposal="Migrate the github repo."),
+        ],
+    )
+    cleared = auto_clear_resolved_confirmations(
+        model,
+        ConfirmationResolutionSignals(
+            llm_credentials_ready=True, repo_access_ready=True
+        ),
+        "2026-07-14T00:00:00",
+    )
+    assert cleared == []
+    assert {p.id for p in model.pending_user_confirmation} == {"p-intent", "p-major"}
+
+
+def test_auto_clear_is_idempotent_and_mixed():
+    """Clears only the eligible/resolved item; second run is a no-op."""
+    model = ProblemModel(
+        pending_user_confirmation=[
+            _pending("p-cred", "credentials_needed", proposal="Anthropic OAuth token needed."),
+            _pending("p-intent", "intent_change", proposal="Change the focus."),
+        ],
+    )
+    signals = ConfirmationResolutionSignals(llm_credentials_ready=True)
+    first = auto_clear_resolved_confirmations(model, signals, "2026-07-14T00:00:00")
+    assert first == ["p-cred"]
+    rev_after_first = model.revision
+    second = auto_clear_resolved_confirmations(model, signals, "2026-07-14T01:00:00")
+    assert second == []
+    assert model.revision == rev_after_first  # no spurious bump on the no-op
+    assert [p.id for p in model.pending_user_confirmation] == ["p-intent"]
+
+
+def test_auto_clear_empty_model_is_noop():
+    model = ProblemModel()
+    before = model.model_dump()
+    cleared = auto_clear_resolved_confirmations(
+        model,
+        ConfirmationResolutionSignals(llm_credentials_ready=True, repo_access_ready=True),
+        "2026-07-14T00:00:00",
+    )
+    assert cleared == []
+    assert model.model_dump() == before

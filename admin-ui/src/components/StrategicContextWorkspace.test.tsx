@@ -639,4 +639,105 @@ describe('StrategicContextWorkspace', () => {
     const { host } = mount();
     expect(host.querySelector('[data-testid="strategic-context-workspace-integrity"]')).toBeNull();
   });
+
+  test('renders inline viewable thumbnails on an artifact-evidence row when present', () => {
+    const contextPackage = STATE.context_package!;
+    const artifacts = contextPackage.evidence!.artifacts!;
+    const stateWithPreview = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          ...contextPackage.evidence,
+          artifacts: {
+            ...artifacts,
+            items: [
+              {
+                ...artifacts.items[0],
+                viewable_previews: [
+                  {
+                    url: 'https://storage.example.com/rollout.png?sig=baked',
+                    kind: 'image',
+                    filename: 'rollout.png',
+                    storage_uri: 'gs://bucket/proj/rollout.png',
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    } as StrategicStateResponse;
+
+    // projectId omitted → uses the baked URL directly (no signed-URL fetch).
+    const { host } = mount({ state: stateWithPreview });
+    const strip = host.querySelector('[data-testid="strategic-artifact-viewable-previews"]');
+    expect(strip).not.toBeNull();
+    const img = strip?.querySelector('img');
+    expect(img).not.toBeNull();
+    expect(img!.getAttribute('src')).toContain('sig=baked');
+  });
+
+  test('renders no viewable-preview strip on an artifact-evidence row without previews', () => {
+    const { host } = mount();
+    const artifactsSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(artifactsSection).not.toBeNull();
+    expect(artifactsSection?.querySelector('[data-testid="strategic-artifact-viewable-previews"]')).toBeNull();
+  });
+
+  test('evidence section shows durable total count when available items equal total', () => {
+    // STATE fixture has total:1 for both knowledge and artifacts, items.length=1 each → total=2.
+    const { host } = mount();
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    // No truncation marker — displayed count equals total.
+    expect(evidenceSection?.textContent).not.toContain('showing');
+    expect(evidenceSection?.textContent).not.toContain('of');
+  });
+
+  test('evidence section shows "showing N of M" when durable total exceeds rendered items', () => {
+    const contextPackage = STATE.context_package!;
+    const stateWithTruncation = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          knowledge: {
+            total: 10,
+            pending_count: 0,
+            items: contextPackage.evidence!.knowledge!.items,
+          },
+          artifacts: {
+            total: 25,
+            items: contextPackage.evidence!.artifacts!.items,
+          },
+        },
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state: stateWithTruncation });
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    // knowledge.items.length(1) + artifacts.items.length(1) = 2 displayed; total = 10+25 = 35.
+    expect(evidenceSection?.textContent).toContain('showing 2 of 35');
+  });
+
+  test('evidence section shows live count alongside total when running jobs present', () => {
+    const contextPackage = STATE.context_package!;
+    const stateWithLive = {
+      ...STATE,
+      context_package: {
+        ...contextPackage,
+        evidence: {
+          knowledge: { total: 1, items: contextPackage.evidence!.knowledge!.items },
+          artifacts: { total: 3, live_count: 2, items: contextPackage.evidence!.artifacts!.items },
+        },
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state: stateWithLive });
+    const evidenceSection = host.querySelector('[data-testid="strategic-context-workspace-evidence"]');
+    expect(evidenceSection).not.toBeNull();
+    expect(evidenceSection?.textContent).toContain('2 live');
+  });
 });

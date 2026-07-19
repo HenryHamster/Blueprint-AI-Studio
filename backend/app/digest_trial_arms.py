@@ -23,6 +23,13 @@ from app.models import Task, TaskStatus
 from app.time_utils import _utcnow
 
 
+# A small amount of unattributed spend should not erase an otherwise useful
+# arm-level cost signal.  Below this coverage, however, an average would be
+# misleading because too much of the arm's spend is unknown.
+TRIAL_ARM_COST_MIN_PRICED_COVERAGE = 0.90
+TRIAL_ARM_COST_UNPRICED_MODEL_PAIR_LIMIT = 10
+
+
 def _json_truthy(value: Any) -> bool:
     """Normalize a JSON-extracted boolean across dialects.
 
@@ -316,8 +323,9 @@ async def compute_trial_arm_cost_delta(
 
     Returns ``{"with_avg_cost_usd": float|None, "without_avg_cost_usd": float|None,
     "cost_delta": float|None}`` where ``cost_delta = with_avg - without_avg``
-    (negative means the WITH arm is cheaper).  Fields are ``None`` when an arm
-    has no tasks, no priced token data, or unpriced token-bearing LLM attempts.
+    (negative means the WITH arm is cheaper). Averages are calculated over
+    fully priced tasks and are ``None`` when priced-task coverage is below
+    ``TRIAL_ARM_COST_MIN_PRICED_COVERAGE`` or an arm has no priced tasks.
     """
     from app.llm_cost_attribution import (  # avoid circular at module load
         LLM_TOKEN_PRICING,
@@ -525,6 +533,7 @@ async def compute_trial_arm_cost_delta(
     current_stmt = (
         select(
             arm_expr,
+            Task.id,
             Task.provider,
             Task.model,
             func.sum(current_input_for_pricing_expr),
@@ -534,13 +543,14 @@ async def compute_trial_arm_cost_delta(
             func.sum(current_token_bearing_expr),
         )
         .where(*filters)
-        .group_by(arm_expr, Task.provider, Task.model)
+        .group_by(arm_expr, Task.id, Task.provider, Task.model)
     )
     current_rows = (await session.execute(current_stmt)).all()
 
     banked_stmt = (
         select(
             arm_expr,
+            Task.id,
             banked_provider_expr,
             banked_model_expr,
             func.sum(banked_input_expr),
@@ -552,7 +562,7 @@ async def compute_trial_arm_cost_delta(
         .select_from(Task)
         .join(banked_attempt, true())
         .where(*filters, has_banked_history_expr)
-        .group_by(arm_expr, banked_provider_expr, banked_model_expr)
+        .group_by(arm_expr, Task.id, banked_provider_expr, banked_model_expr)
     )
     banked_rows = (await session.execute(banked_stmt)).all()
 
@@ -586,6 +596,9 @@ async def compute_trial_arm_cost_delta(
     with_priced_token_rows = without_priced_token_rows = 0
     with_unpriced_task_ids: set[str] = set()
     without_unpriced_task_ids: set[str] = set()
+    unpriced_model_pairs: set[tuple[str | None, str | None]] = set()
+    with_task_costs: dict[str, float] = {}
+    without_task_costs: dict[str, float] = {}
 
     def _has_pricing(provider: Any, model: Any) -> bool:
         if not provider or not model:
@@ -596,6 +609,9 @@ async def compute_trial_arm_cost_delta(
         for arm_val, task_id, provider, model, token_bearing_count in rows:
             if int(token_bearing_count or 0) <= 0 or _has_pricing(provider, model):
                 continue
+            unpriced_model_pairs.add(
+                (str(provider).lower() if provider else None, str(model).lower() if model else None)
+            )
             if _json_truthy(arm_val):
                 with_unpriced_task_ids.add(str(task_id))
             else:
@@ -607,6 +623,7 @@ async def compute_trial_arm_cost_delta(
 
         for (
             arm_val,
+            task_id,
             provider,
             model,
             in_tok,
@@ -639,11 +656,15 @@ async def compute_trial_arm_cost_delta(
                     )
             if _json_truthy(arm_val):
                 if cost is not None:
-                    with_cost += cost
+                    with_task_costs[str(task_id)] = (
+                        with_task_costs.get(str(task_id), 0.0) + cost
+                    )
                     with_priced_token_rows += token_bearing_count
             else:
                 if cost is not None:
-                    without_cost += cost
+                    without_task_costs[str(task_id)] = (
+                        without_task_costs.get(str(task_id), 0.0) + cost
+                    )
                     without_priced_token_rows += token_bearing_count
 
     _accumulate_attempt_rows(current_rows)
@@ -651,18 +672,38 @@ async def compute_trial_arm_cost_delta(
     _mark_unpriced_task_rows(current_unpriced_rows)
     _mark_unpriced_task_rows(banked_unpriced_rows)
 
+    with_priced_task_count = max(with_task_count - len(with_unpriced_task_ids), 0)
+    without_priced_task_count = max(
+        without_task_count - len(without_unpriced_task_ids), 0
+    )
+    with_priced_coverage_fraction = (
+        with_priced_task_count / with_task_count if with_task_count else 0.0
+    )
+    without_priced_coverage_fraction = (
+        without_priced_task_count / without_task_count if without_task_count else 0.0
+    )
+    # Exclude an entire task if any of its attempts are unpriced: including a
+    # partial task cost would make the nominally "priced" average understate it.
+    with_cost = sum(
+        cost for task_id, cost in with_task_costs.items() if task_id not in with_unpriced_task_ids
+    )
+    without_cost = sum(
+        cost
+        for task_id, cost in without_task_costs.items()
+        if task_id not in without_unpriced_task_ids
+    )
     with_avg = (
-        round(with_cost / with_task_count, 6)
-        if with_task_count > 0
+        round(with_cost / with_priced_task_count, 6)
+        if with_priced_task_count > 0
         and with_priced_token_rows > 0
-        and not with_unpriced_task_ids
+        and with_priced_coverage_fraction >= TRIAL_ARM_COST_MIN_PRICED_COVERAGE
         else None
     )
     without_avg = (
-        round(without_cost / without_task_count, 6)
-        if without_task_count > 0
+        round(without_cost / without_priced_task_count, 6)
+        if without_priced_task_count > 0
         and without_priced_token_rows > 0
-        and not without_unpriced_task_ids
+        and without_priced_coverage_fraction >= TRIAL_ARM_COST_MIN_PRICED_COVERAGE
         else None
     )
     cost_delta = (
@@ -676,4 +717,15 @@ async def compute_trial_arm_cost_delta(
         "cost_delta": cost_delta,
         "with_unpriced_task_count": len(with_unpriced_task_ids),
         "without_unpriced_task_count": len(without_unpriced_task_ids),
+        "with_priced_task_count": with_priced_task_count,
+        "without_priced_task_count": without_priced_task_count,
+        "with_priced_coverage_fraction": with_priced_coverage_fraction,
+        "without_priced_coverage_fraction": without_priced_coverage_fraction,
+        "unpriced_model_pairs": [
+            {"provider": provider, "model": model}
+            for provider, model in sorted(
+                unpriced_model_pairs,
+                key=lambda pair: (pair[0] or "", pair[1] or ""),
+            )[:TRIAL_ARM_COST_UNPRICED_MODEL_PAIR_LIMIT]
+        ],
     }

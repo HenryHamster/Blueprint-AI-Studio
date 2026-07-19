@@ -13,17 +13,24 @@
 #   persisted to ~/.blueprint/runner_token, so the service picks the token up
 #   from there on every subsequent start with nothing baked into this unit.
 #
-# RESTART-ON-CRASH:
-#   Restart=on-failure restarts the runner whenever it exits non-zero. The
-#   runner calls os._exit(1) (via _die()) on fatal conditions (revoked token,
-#   supervisor-detected fatal errors), so systemd sees a non-zero exit and
-#   restarts automatically. Normal SIGTERM shutdown exits 0 and is NOT restarted.
+# RESTART — crash recovery AND self-update:
+#   Restart=always restarts the runner whenever it exits, for ANY reason. Two
+#   exit paths depend on this:
+#     * crash / fatal condition — the runner calls os._exit(1) (via _die()) on a
+#       revoked token or a supervisor-detected fatal error; systemd relaunches it.
+#     * self-update — after pulling a newer version the runner exits 0 and trusts
+#       its supervisor to relaunch the fresh binary (see _reexec_after_update,
+#       which os._exit(0)s once it detects it is a systemd service unit). Under
+#       Restart=on-failure that clean exit-0 is NOT restarted, so a self-updating
+#       runner silently stays dead until a manual restart — hence `always`.
+#   A deliberate operator `systemctl --user stop` is still honored: systemd never
+#   applies the restart policy to an operator-initiated stop, so it stays stopped.
 #
 #   A burst cap (StartLimitIntervalSec=60 / StartLimitBurst=3) prevents a
-#   persistent-crash condition (full disk, revoked token, broken isolation
-#   binary) from restarting forever at 5 s intervals — after 3 restarts within
-#   60 s systemd moves the unit to a terminal failed state. To recover after
-#   fixing the root cause, run:  systemctl --user reset-failed blueprint-runner.service
+#   persistent failure (full disk, revoked token, broken isolation binary) from
+#   restarting forever at 5 s intervals — after 3 restarts within 60 s systemd
+#   moves the unit to a terminal failed state. To recover after fixing the root
+#   cause, run:  systemctl --user reset-failed blueprint-runner.service
 #
 # VIEWING LOGS:
 #   journalctl --user -u blueprint-runner.service -f
@@ -39,7 +46,7 @@ StartLimitBurst=3
 [Service]
 Type=simple
 ExecStart=@PYTHON@ @LOCAL_RUNNER@
-Restart=on-failure
+Restart=always
 RestartSec=5
 # Load credentials and config from a 0600 file outside the repo (`-` = optional).
 EnvironmentFile=-@ENV_FILE@

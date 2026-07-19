@@ -227,6 +227,19 @@ def annotate_capability_proof_status(
     return annotated
 
 
+#: Platform capabilities fully implemented at runtime.  Registered here so
+#: prerequisite refs to these names resolve in the blocked-resume sweep and
+#: missing-foundation demand surface without requiring a per-project vocabulary
+#: entry in ``problem_model.capabilities``.
+PLATFORM_WORKING_CAPABILITIES: frozenset[str] = frozenset(
+    {
+        "project-custom-tool-registry",
+        "qualification-dimension-ledger",
+        "multi-project-runner",
+    }
+)
+
+
 def working_capability_names(problem_model: object) -> set[str]:
     """Return canonical names of registry capabilities declared ``working``.
 
@@ -244,8 +257,16 @@ def working_capability_names(problem_model: object) -> set[str]:
     spawn-time resolver (``research_completion``) and the blocked-resume matcher
     (``reaper_sweeps``) consume this set via
     :func:`registry_satisfies_capability_need`, so neither needs its own edit.
+
+    Platform-owned capabilities (``PLATFORM_WORKING_CAPABILITIES``) are always
+    included regardless of the project model, mirroring the demand filter in
+    :mod:`app.capability_demand`. Without this, a prerequisite naming a platform
+    capability is blocked at both spawn and blocked-resume while the demand
+    surface suppresses it — a permanent, invisible block with no repair path.
     """
-    working: set[str] = set()
+    # Platform capabilities are always working — include them first so the
+    # project model can only add to this set, never subtract.
+    working: set[str] = set(PLATFORM_WORKING_CAPABILITIES)
     for raw_name, status, absorbs in _iter_capability_entries(problem_model):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
@@ -283,6 +304,30 @@ def registry_satisfies_capability_need(
 #: pass (:func:`_ledger_machine_proof_entries`) and takes effect solely through the
 #: exemption set (:func:`platform_exempt_capability_names`).
 CAPABILITY_EXEMPTION_PROOF_KIND = "operator_exemption"
+
+
+#: The ``proof_kind`` of a PLATFORM-AUTHORED consolidation FORWARDING marker left
+#: under an absorbed capability's ledger key by
+#: :func:`app.capability_proof.carry_proof_records_for_consolidation` when a genuine
+#: consolidation MOVES the absorbed name's real proof/exemption entries onto the
+#: survivor's ledger key.
+#:
+#: THIS IS THE TRUSTWORTHY RECORD OF A GENUINE RENAME. A consolidation is
+#: destructive and platform-materialized: it is emitted only when the survivor's
+#: ``absorbs`` names a capability DELETED in the same authored write (the
+#: ``capabilities_consolidated`` diff in :mod:`app.problem_model`), and the carry
+#: helper is reachable only from that model-write path. Unlike the agent-writable
+#: ``problem_model.capabilities[].absorbs`` field, this marker cannot be forged to
+#: transfer another capability's cleared status.
+#:
+#: The marker is NOT itself proof or an exemption: it is filtered out of every
+#: machine-proof grading pass (:func:`_ledger_machine_proof_entries`) and is not an
+#: exemption (:func:`_entry_is_exemption`), so a capability whose ledger holds ONLY a
+#: forwarding marker still grades ``unproven`` / non-exempt on its own key. It exists
+#: solely to reconstruct the platform-recorded alias relationship
+#: (:func:`platform_recorded_alias_map`) that authority seams use in place of the
+#: agent-writable ``absorbs`` list.
+CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND = "absorbed_into"
 
 
 #: Source ``type`` values that represent a deliberate operator or strategic-agent
@@ -362,19 +407,130 @@ def _entry_is_exemption(entry: Mapping) -> bool:
     )
 
 
+def _entry_is_absorption_forward(entry: Mapping) -> bool:
+    """True iff a ledger entry is a platform-authored consolidation FORWARDING marker.
+
+    A forwarding marker records that the absorbed name it is keyed under was
+    genuinely consolidated into ``entry["survivor"]`` (its real proof/exemption
+    entries were MOVED onto the survivor's ledger key). It is neither a machine
+    proof nor an exemption: it must never grade a capability ``proven`` or exempt on
+    its own key, so every machine-proof and exemption pass filters it out. It is read
+    ONLY by :func:`platform_recorded_alias_map` to reconstruct the trustworthy,
+    platform-recorded absorbed→survivor relationship (the replacement for the
+    agent-writable ``problem_model.absorbs`` field as a source of authority).
+    """
+    kind = entry.get("proof_kind")
+    return (
+        isinstance(kind, str)
+        and kind.strip().lower() == CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND
+    )
+
+
 def _ledger_machine_proof_entries(proof_records: object, cap_name: object) -> list[dict]:
-    """Ledger entries for ``cap_name`` EXCLUDING operator-exemption records.
+    """Ledger entries for ``cap_name`` EXCLUDING operator-exemption and
+    consolidation-forwarding records.
 
     An exemption record authorizes clearing the gate *without* machine proof; it is
-    not itself evidence of anything being verified. Filtering it here keeps the two
-    routes strictly separate — a capability is cleared either because the platform
-    ledger holds a real machine proof (``corroborated``) or because the operator
-    recorded an exemption (``exempt_cleared``), never by laundering the latter into
-    the former on a badge, an earn-loop decision, or a corroboration pass.
+    not itself evidence of anything being verified. A consolidation-forwarding marker
+    (:func:`_entry_is_absorption_forward`) is a pointer to the survivor, not proof of
+    anything either. Filtering both here keeps the routes strictly separate — a
+    capability is cleared either because the platform ledger holds a real machine
+    proof (``corroborated``) or because the operator recorded an exemption
+    (``exempt_cleared``), never by laundering an exemption or a bare forwarding
+    marker into machine proof on a badge, an earn-loop decision, or a corroboration
+    pass. In particular a name whose ledger holds ONLY a forwarding marker grades
+    ``unproven`` here — it derives no proof from the survivor it points at.
     """
     return [
-        e for e in _ledger_entries(proof_records, cap_name) if not _entry_is_exemption(e)
+        e
+        for e in _ledger_entries(proof_records, cap_name)
+        if not _entry_is_exemption(e) and not _entry_is_absorption_forward(e)
     ]
+
+
+def platform_recorded_alias_map(proof_records: object) -> dict[str, str]:
+    """Build ``{absorbed_name: terminal_survivor_name}`` from PLATFORM forwarding markers.
+
+    THE PLATFORM-AUTHORED REPLACEMENT for the former ``_alias_to_survivor_map``, which read
+    the agent-writable ``problem_model.capabilities[].absorbs`` list. This reads only
+    :data:`CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND` markers in the platform-only
+    ``project.capability_proof_records`` ledger — records an agent cannot write and
+    that exist ONLY after a genuine, destructive consolidation
+    (:func:`app.capability_proof.carry_proof_records_for_consolidation`). An agent
+    declaring ``absorbs: [proven-or-exempt-name]`` without a real deletion leaves NO
+    marker, so it contributes nothing here and inherits no cleared status.
+
+    Absorbed→survivor chains are resolved to their TERMINAL survivor (with cycle
+    protection), so after ``x`` was absorbed into ``y`` and later ``y`` into ``z``,
+    both ``x`` and ``y`` map to ``z`` — where the moved proof/exemption now lives.
+
+    Returns ``{}`` for a missing / malformed / marker-free ledger, so alias-aware
+    callers fall through to direct ledger lookups exactly as they did before any
+    consolidation.
+    """
+    if not isinstance(proof_records, dict):
+        return {}
+    direct: dict[str, str] = {}
+    for raw_key, entries in proof_records.items():
+        absorbed = normalize_capability_name(raw_key)
+        if not absorbed or not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, Mapping) or not _entry_is_absorption_forward(entry):
+                continue
+            survivor = normalize_capability_name(entry.get("survivor"))
+            if survivor and survivor != absorbed:
+                direct[absorbed] = survivor
+            break
+    resolved: dict[str, str] = {}
+    for absorbed in direct:
+        seen: set[str] = set()
+        cur = absorbed
+        while cur in direct and cur not in seen:
+            seen.add(cur)
+            cur = direct[cur]
+        resolved[absorbed] = cur
+    return resolved
+
+
+def _survivor_forwarded_absorbed(proof_records: object) -> dict[str, list[str]]:
+    """Reverse of :func:`platform_recorded_alias_map`: ``{survivor: [absorbed...]}``.
+
+    Deterministic (absorbed names sorted) so the authority seams fold a survivor's
+    platform-recorded absorbed old names in a stable order.
+    """
+    rev: dict[str, set[str]] = {}
+    for absorbed, survivor in platform_recorded_alias_map(proof_records).items():
+        rev.setdefault(survivor, set()).add(absorbed)
+    return {survivor: sorted(names) for survivor, names in rev.items()}
+
+
+def platform_recorded_alias_cluster(proof_records: object, name: str) -> set[str]:
+    """Return ``name`` and every canonical/absorbed alias connected to it via
+    PLATFORM forwarding markers.
+
+    The platform-authored replacement for the former ``_capability_alias_cluster`` (which
+    walked the agent-writable ``absorbs`` graph). Connectivity comes only from
+    :func:`platform_recorded_alias_map`, so a survivor named by an agent-declared
+    ``absorbs`` with no genuine consolidation forms a cluster of just itself and
+    inherits nothing across the seam.
+    """
+    norm = normalize_capability_name(name)
+    if not norm:
+        return set()
+    adjacency: dict[str, set[str]] = {}
+    for absorbed, survivor in platform_recorded_alias_map(proof_records).items():
+        adjacency.setdefault(absorbed, set()).add(survivor)
+        adjacency.setdefault(survivor, set()).add(absorbed)
+    cluster: set[str] = {norm}
+    stack = [norm]
+    while stack:
+        cur = stack.pop()
+        for neighbor in adjacency.get(cur, ()):
+            if neighbor not in cluster:
+                cluster.add(neighbor)
+                stack.append(neighbor)
+    return cluster
 
 
 def platform_exempt_capability_names(proof_records: object) -> set[str]:
@@ -587,20 +743,26 @@ def working_capability_proof_status(
 
         now = _utcnow()
     ledger_exempt = platform_exempt_capability_names(proof_records)
+    # PLATFORM-recorded absorbed old names per survivor. This REPLACES folding the
+    # agent-writable ``absorbs`` list (finding: an agent declaring ``absorbs:
+    # [exempt-name]`` with no genuine consolidation could otherwise fold that name
+    # in and inherit its exemption). A survivor now folds ONLY names it genuinely
+    # absorbed — recorded by a platform forwarding marker in the ledger — plus its
+    # own canonical name.
+    forwarded_absorbed = _survivor_forwarded_absorbed(proof_records)
     out: dict[str, EvidenceStatus] = {}
-    for raw_name, status, absorbs, evidence_refs, backing_paths, proof_exempt, source in _iter_capability_evidence_entries(
+    for raw_name, status, _absorbs, evidence_refs, backing_paths, proof_exempt, source in _iter_capability_evidence_entries(
         problem_model
     ):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        names = [
-            n
-            for n in (
-                normalize_capability_name(raw_name),
-                *_normalized_absorbed_names(absorbs),
-            )
-            if n
-        ]
+        canonical = normalize_capability_name(raw_name)
+        names: list[str] = []
+        if canonical:
+            names.append(canonical)
+            for absorbed in forwarded_absorbed.get(canonical, ()):
+                if absorbed not in names:
+                    names.append(absorbed)
         # AUTHORIZED exemption: the platform-only ledger records an operator
         # exemption for this capability (or for a name it absorbed). Honored
         # regardless of the agent-writable ``proof_exempt`` flag — the operator's
@@ -639,6 +801,16 @@ def working_capability_proof_status(
         for name in names:
             if name not in out:
                 out[name] = proof_status
+        # Register agent-declared absorbs aliases that have no platform forwarding
+        # marker so they appear as "unproven" rather than absent. Without this, a
+        # need naming such an alias returns proof_status=None from
+        # capability_need_proof_status, and capability_need_blocked_by_proof_gate
+        # treats None as a free pass (not blocked) — clearing enforce mode with
+        # zero verification. A platform-forwarded alias is already in the map via
+        # forwarded_absorbed above and is not overwritten (if alias not in out).
+        for alias in _normalized_absorbed_names(_absorbs):
+            if alias not in out:
+                out[alias] = "unproven"
     return out
 
 
@@ -678,11 +850,16 @@ def exempt_capability_names(
     ledger_exempt = platform_exempt_capability_names(proof_records)
     if not ledger_exempt:
         return set()
+    # PLATFORM-recorded absorbed names per survivor — NOT the agent-writable
+    # ``absorbs`` list. A survivor is exempt only via its OWN ledger key or a name it
+    # genuinely absorbed (recorded by a forwarding marker), never because it merely
+    # declares ``absorbs: [exempt-name]``.
+    forwarded_absorbed = _survivor_forwarded_absorbed(proof_records)
     exempt: set[str] = set()
     for (
         raw_name,
         status,
-        absorbs,
+        _absorbs,
         _evidence_refs,
         _backing_paths,
         _proof_exempt,
@@ -690,17 +867,16 @@ def exempt_capability_names(
     ) in _iter_capability_evidence_entries(problem_model):
         if not (isinstance(status, str) and status.strip().lower() == "working"):
             continue
-        names = [
-            n
-            for n in (
-                normalize_capability_name(raw_name),
-                *_normalized_absorbed_names(absorbs),
-            )
-            if n
-        ]
-        # Alias-aware, exactly as working_capability_names: an exemption recorded
-        # against an absorbed old name still exempts the surviving capability, and
-        # the survivor's aliases all resolve as exempt.
+        canonical = normalize_capability_name(raw_name)
+        if not canonical:
+            continue
+        names: list[str] = [canonical]
+        for absorbed in forwarded_absorbed.get(canonical, ()):
+            if absorbed not in names:
+                names.append(absorbed)
+        # An exemption recorded against a genuinely-absorbed old name still exempts
+        # the surviving capability, and the survivor's platform-recorded aliases all
+        # resolve as exempt so a dependent naming an old absorbed name clears too.
         if any(n in ledger_exempt for n in names):
             exempt.update(names)
     return exempt
@@ -795,8 +971,63 @@ def capability_need_blocked_by_proof_gate(
     return proof_status != "proven"
 
 
+def task_backed_capability_need_blocked_by_proof_gate(
+    need: Mapping,
+    proof_records: object,
+    problem_model: object,  # retained for signature stability; alias source is now the ledger
+    *,
+    mode: _GateMode = "off",
+) -> bool:
+    """Gate an exact task-backed capability provider on platform proof only.
+
+    The absorbed/alias relationship is derived from PLATFORM-recorded consolidation
+    forwarding markers in ``proof_records`` (:func:`platform_recorded_alias_cluster`),
+    NOT from the agent-writable ``problem_model.absorbs`` list — so ``problem_model``
+    is no longer consulted here. It is kept in the signature so the two positional
+    callers (the spawn-time resolver and the blocked-resume sweep) need no edit.
+    """
+    if (
+        mode != "enforce"
+        or not isinstance(need, Mapping)
+        or need.get("kind") != "capability"
+    ):
+        return False
+    name = normalize_capability_name(need.get("ref"))
+    if not name:
+        return False
+    # Derive the alias cluster from PLATFORM forwarding markers, not the
+    # agent-writable ``absorbs`` list: an agent declaring ``absorbs:
+    # [proven-name]`` without a genuine consolidation forms a cluster of just
+    # itself and inherits no ledger proof/exemption across this seam.
+    names = platform_recorded_alias_cluster(proof_records, name)
+    if names & platform_exempt_capability_names(proof_records):
+        return False
+    from app.time_utils import _utcnow
+
+    return _ledger_proof_status_for_names(proof_records, names, now=_utcnow()) != "proven"
+
+
+def _ledger_proof_status_for_names(
+    proof_records: object, names: Iterable[str], *, now: datetime | None = None
+) -> EvidenceStatus:
+    """Grade machine proofs across one canonical/absorbed namespace."""
+    synthetic = [
+        {
+            "kind": entry.get("proof_kind"),
+            "proven": True,
+            "recorded_at": entry.get("proved_at") or entry.get("recorded_at"),
+        }
+        for name in names
+        for entry in _ledger_machine_proof_entries(proof_records, name)
+    ]
+    if not synthetic:
+        return "unproven"
+    return classify_evidence_tiered(synthetic, now=now)
+
+
 def _ledger_proof_status(
-    proof_records: object, cap_name: str
+    proof_records: object, cap_name: str,
+    now: datetime | None = None,
 ) -> EvidenceStatus:
     """Classify a capability's PLATFORM-recorded proof ledger into an EvidenceStatus.
 
@@ -811,6 +1042,13 @@ def _ledger_proof_status(
     platform-verified proof from an agent's self-reported ``evidence_refs`` /
     ``proof_exempt`` claim on the problem_model.
 
+    **Freshness.** When ``now`` is supplied, each ledger entry's ``proved_at``
+    is carried into the synthetic ref as ``recorded_at`` so ``classify_evidence_tiered``
+    drops stale proofs before grading. A ref with a missing/unparseable
+    ``proved_at`` is treated as indeterminate and never expires, so every legacy
+    ledger entry that predates timestamped proof records classifies as it always
+    did.
+
     Operator-exemption records are EXCLUDED (:func:`_ledger_machine_proof_entries`):
     an exemption authorizes clearing the gate *without* machine proof and must never
     be laundered into machine proof. A capability whose ledger holds only an
@@ -819,18 +1057,24 @@ def _ledger_proof_status(
     ``exempt_cleared`` audit buckets stay honest about WHY each capability cleared.
     """
     synthetic = [
-        {"kind": e.get("proof_kind"), "proven": True}
+        {
+            "kind": e.get("proof_kind"),
+            "proven": True,
+            "recorded_at": e.get("proved_at") or e.get("recorded_at"),
+        }
         for e in _ledger_machine_proof_entries(proof_records, cap_name)
     ]
     if not synthetic:
         return "unproven"
-    return classify_evidence_tiered(synthetic)
+    return classify_evidence_tiered(synthetic, now=now)
 
 
 def ledger_corroborated_proof_status(
     proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
     proof_records: object,
     exempt_names: Iterable[str] = (),
+    now: datetime | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> dict[str, EvidenceStatus]:
     """Demote every ``proven`` capability the PLATFORM ledger does not corroborate.
 
@@ -860,6 +1104,20 @@ def ledger_corroborated_proof_status(
       any tier other than ``proven``, it blocks
       :func:`capability_need_blocked_by_proof_gate` exactly as an unproven claim does.
 
+    **Freshness.** ``now`` is threaded to :func:`_ledger_proof_status` so a stale
+    ledger proof older than :data:`~app.evidence_primitive.PROOF_FRESHNESS_TTL` no
+    longer corroborates a self-declared ``proven`` claim at the enforce gate. A
+    missing ``now`` means no freshness evaluation — the stored-flag-only behaviour
+    unchanged from the legacy corroboration pass.
+
+    **Alias-aware.** When ``alias_map`` is provided and a name fails direct ledger
+    corroboration, the pass checks whether the name was absorbed by a surviving
+    capability and retries the survivor's ledger key. This prevents a dependent
+    blocked on an absorbed old name from being stranded by a ledger that stores
+    proof only under the survivor's canonical name, while a self-declared
+    ``proven`` claim on a non-absorbed name is never accidentally corroborated
+    by a coincidentally-named ledger entry.
+
     Shared verbatim by all THREE gate seams (the release qualifier via
     :func:`capability_proof_gate_release_status`, the spawn-time prerequisite
     resolver in :mod:`app.research_completion`, and the blocked-resume sweep in
@@ -873,12 +1131,35 @@ def ledger_corroborated_proof_status(
     if not isinstance(proof_status_by_name, Mapping):
         return {}
     exempt = {n for n in exempt_names if isinstance(n, str)}
+    # Reverse alias map: survivor → [absorbed, ...] so a survivor name whose proof
+    # lives only under an absorbed alias key in the ledger (pre-rename record) is
+    # still corroborated. Built once per call, empty when alias_map is absent.
+    reverse_map: dict[str, list[str]] = {}
+    if alias_map:
+        for absorbed, survivor in alias_map.items():
+            reverse_map.setdefault(survivor, []).append(absorbed)
     out: dict[str, EvidenceStatus] = {}
     for name, status in proof_status_by_name.items():
         if (
             status != "proven"
             or name in exempt
-            or _ledger_proof_status(proof_records, name) == "proven"
+            or _ledger_proof_status(proof_records, name, now=now) == "proven"
+        ):
+            out[name] = status
+            continue
+        # Forward alias retry: if this name was absorbed by a surviving capability,
+        # check the survivor's ledger key instead of the alias's own (which
+        # may not exist in the platform ledger).
+        if alias_map and name in alias_map:
+            survivor = alias_map[name]
+            if _ledger_proof_status(proof_records, survivor, now=now) == "proven":
+                out[name] = status
+                continue
+        # Reverse alias retry: if this name IS a survivor, also check its absorbed
+        # alias keys — proof recorded before a rename lives under the old name.
+        if reverse_map and name in reverse_map and any(
+            _ledger_proof_status(proof_records, absorbed, now=now) == "proven"
+            for absorbed in reverse_map[name]
         ):
             out[name] = status
             continue
@@ -890,6 +1171,7 @@ def fold_ledger_proof_upgrades(
     proof_status_by_name: Mapping[str, EvidenceStatus] | dict,
     proof_records: object,
     now: datetime | None = None,
+    alias_map: dict[str, str] | None = None,
 ) -> dict[str, EvidenceStatus]:
     """Upgrade an ``evidence_refs``-derived proof map with the durable proof ledger.
 
@@ -906,6 +1188,13 @@ def fold_ledger_proof_upgrades(
     ``working``), and a tier-2 status is applied only when it is strictly stronger
     than the tier-1 status, so a ledger proof never REGRESSES a capability the
     evidence_refs classify more highly.
+
+    **Alias-aware.** When ``alias_map`` is provided, an absorbed alias name whose
+    own ledger key has no proof entries is retried against the survivor's ledger
+    key. This keeps the fold pass in sync with the alias-aware corroboration pass
+    in :func:`ledger_corroborated_proof_status`, so a ledger-only proof (tier-1
+    append was lost) on the survivor also upgrades the alias — preventing a
+    dependent blocked on the old name from staying gated.
 
     Freshness parity with tier-1: each record's ``proved_at`` is carried into the
     synthetic ref as ``recorded_at`` and ``now`` is threaded into the tiered
@@ -936,13 +1225,17 @@ def fold_ledger_proof_upgrades(
             continue
         # Operator-exemption records are not machine proof and must not upgrade a
         # capability here (an exemption clears only via the exemption carve-out).
+        # Determine the ledger key to check: for an absorbed alias, use the
+        # survivor's ledger key so a ledger-only proof on the survivor also
+        # upgrades the alias.
+        ledger_key = alias_map.get(name, name) if alias_map else name
         synthetic = [
             {
                 "kind": e.get("proof_kind"),
                 "proven": True,
-                "recorded_at": e.get("proved_at"),
+                "recorded_at": e.get("proved_at") or e.get("recorded_at"),
             }
-            for e in _ledger_machine_proof_entries(proof_records, name)
+            for e in _ledger_machine_proof_entries(proof_records, ledger_key)
         ]
         if not synthetic:
             continue
@@ -989,20 +1282,29 @@ def consumer_gate_proof_status(
 
     ``proof_records`` is the project's ``capability_proof_records`` column; ``None``
     / a missing column is treated as an EMPTY ledger (nothing corroborates), which
-    fails CLOSED. This deliberately differs from
-    :func:`capability_proof_gate_release_status`, where ``proof_records=None`` means
-    "the caller did not supply the ledger" and preserves the legacy
-    problem_model-only derivation; here the caller ALWAYS supplies the project's
-    column, so ``None`` genuinely means "this project has no recorded proofs".
+    fails CLOSED, matching :func:`capability_proof_gate_release_status`.
     """
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
     proof_map = working_capability_proof_status(
         problem_model, now=now, proof_records=proof_records
     )
-    proof_map = fold_ledger_proof_upgrades(proof_map, proof_records, now=now)
+    # Alias resolution is PLATFORM-recorded (forwarding markers in the ledger), not
+    # derived from the agent-writable ``problem_model.absorbs`` list: only a genuine
+    # consolidation leaves a marker, so an agent declaring ``absorbs:
+    # [proven-or-exempt-name]`` cannot forge an absorbed→survivor edge here.
+    alias_map = platform_recorded_alias_map(proof_records)
+    proof_map = fold_ledger_proof_upgrades(
+        proof_map, proof_records, now=now, alias_map=alias_map
+    )
     return ledger_corroborated_proof_status(
         proof_map,
         proof_records,
         exempt_capability_names(problem_model, proof_records),
+        now=now,
+        alias_map=alias_map,
     )
 
 
@@ -1010,17 +1312,15 @@ def capability_proof_gate_release_status(
     problem_model: object,
     mode: str | None,
     proof_records: object = None,
+    now: datetime | None = None,
 ) -> tuple[bool, dict]:
     """Derive the release-qualifier capability-proof dimension: ``(blocked, detail)``.
 
     This is the release-qualification enforcement point of the capability proof
     gate — the third seam alongside the spawn-time resolver and the
-    blocked-resume sweep. Extracted here as a single IO-free primitive so the
-    qualifier's promotion decision derives from the SAME tiered proof map
-    (:func:`working_capability_proof_status`) and exemption set
-    (:func:`exempt_capability_names`) the other two seams use, rather than
-    re-implementing the "unproven working capability blocks promotion" rule in
-    the 5k-line qualifier where it can silently drift.
+    blocked-resume sweep. It delegates the decision to
+    :func:`consumer_gate_proof_status`, the same ledger-backed grade those other
+    seams consume, while retaining release-specific audit detail.
 
     Behaviour:
 
@@ -1083,51 +1383,36 @@ def capability_proof_gate_release_status(
     if not problem_model:
         detail["error"] = "no problem_model"
         return False, detail
-    proof_map = working_capability_proof_status(
-        problem_model, proof_records=proof_records
+    if now is None:
+        from app.time_utils import _utcnow
+
+        now = _utcnow()
+    declared_proof_map = working_capability_proof_status(
+        problem_model, now=now, proof_records=proof_records
+    )
+    proof_map = consumer_gate_proof_status(
+        problem_model, proof_records, now=now
     )
     # The carve-out set: PLATFORM-recorded operator exemptions only (finding #9).
     # An agent-declared proof_exempt/source never lands here, so it cannot skip the
     # corroboration pass below.
     exempt_set = exempt_capability_names(problem_model, proof_records)
-    # Base (problem_model-derived) unproven set: a capability the agent-authored view
-    # already reports as not-proven.
+    # The authoritative unproven set includes both absent ledger proof and an
+    # uncorroborated agent-authored claim, while allowing a ledger-only proof to
+    # clear exactly as it does at spawn and blocked-resume.
     unproven = [name for name, status in proof_map.items() if status != "proven"]
 
-    # Corroboration pass (finding #1): every capability the base map treats as
-    # cleared ("proven") must be backed by a machine-verified PLATFORM ledger
-    # entry — not just a self-reported evidence_ref / proof_exempt flag on the
-    # problem_model. Uncorroborated "proven" caps are demoted to blocked. Runs
-    # UNCONDITIONALLY: proof_records=None is an empty ledger (nothing corroborates),
-    # never a licence to trust the problem_model on its own.
-    #
-    # EXCEPT a platform-recorded exemption (finding #2): an operator-granted
-    # exemption clears BY ITS AUTHORIZATION, not by machine proof, and the earn loop
-    # deliberately never mints a ledger proof entry for an exempt capability.
-    # Requiring one would demote every exemption to unproven and block promotion —
-    # nullifying the grant. Such a capability is skipped here (neither corroborated
-    # nor uncorroborated; it is audited under ``exempt_cleared`` / ``exempt_names``).
-    #
-    # The corroboration rule itself lives in ledger_corroborated_proof_status, which
-    # the two CONSUMER seams also call (via consumer_gate_proof_status) — one
-    # implementation, so this seam and they cannot drift apart. A "proven" capability
-    # the ledger refuses comes back demoted; that demotion IS the uncorroborated set.
-    corroborated_map = ledger_corroborated_proof_status(
-        proof_map, proof_records, exempt_set
-    )
+    # Retain release-specific provenance detail by comparing the declared map to
+    # the authoritative result. The decision itself is already complete above.
     uncorroborated: list[str] = [
         name
-        for name, status in proof_map.items()
-        if status == "proven" and corroborated_map.get(name) != "proven"
+        for name, status in declared_proof_map.items()
+        if status == "proven" and proof_map.get(name) != "proven"
     ]
-    if uncorroborated:
-        unproven = sorted(set(unproven) | set(uncorroborated))
-    uncorroborated_set = set(uncorroborated)
     corroborated = [
         name
         for name, status in proof_map.items()
         if status == "proven"
-        and name not in uncorroborated_set
         and name not in exempt_set
     ]
     detail["corroborated"] = sorted(corroborated)

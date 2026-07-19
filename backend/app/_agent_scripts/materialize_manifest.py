@@ -107,6 +107,7 @@ def _normalize_materialized_file_content(
         return content
     if not isinstance(parsed, dict):
         return content
+    parsed["hasCompletedOnboarding"] = True
     projects = parsed.get("projects")
     if not isinstance(projects, dict):
         projects = {}

@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
   apiGet: vi.fn().mockResolvedValue({ documents: [] }),
 }));

@@ -11,13 +11,14 @@ Covers:
 """
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from app.capability_proof import (
     _MAX_PROOF_ENTRIES_PER_CAPABILITY,
     _PROOF_KIND_BACKING_PATH,
+    _PROOF_KIND_NAMED_TEST,
     _PROOF_KIND_NAMED_TEST_PRESENT,
     _PROOF_KIND_TRIAL_ADOPTION,
     _candidate_test_paths,
@@ -33,7 +34,9 @@ from app.capability_proof import (
     carry_proof_records_for_consolidation,
     commission_proof_earn_loop,
     enrich_problem_model_capability_proofs,
+    resolve_no_backing_paths_gap,
     record_capability_backing_path_proof,
+    record_capability_named_test_execution_proof,
     record_capability_named_test_proof,
     record_capability_proof,
     record_capability_proof_from_trial,
@@ -41,7 +44,10 @@ from app.capability_proof import (
     should_record_capability_proof,
 )
 from app.capability_registry import (
+    _ledger_proof_status,
     capability_need_blocked_by_proof_gate,
+    ledger_corroborated_proof_status,
+    platform_recorded_alias_map,
     registry_capability_evidence_refs_map,
     working_capability_proof_status,
 )
@@ -216,6 +222,29 @@ class TestRecordCapabilityProof:
 
         assert recorded == []
         assert project.capability_proof_records == {}
+
+    def test_proof_not_recorded_when_no_verdict_in_context(self):
+        """A task with capability marker but NO acceptance verdict must NOT mint a proof.
+
+        record_code_acceptance_verdict no-ops (returns None, writes nothing) on
+        tasks that declared no acceptance evidence. Without the spawn-level block
+        on "code_acceptance_verdict", a malicious agent could forge a verdict
+        directly into the spawned child's JSONB context. This test proves that
+        without the forged verdict key in context, record_capability_proof cannot
+        mint a proof — confirming the spawn-level block is the correct defense.
+        """
+        task = _make_task(
+            provides_capability="language-aware-repo-map",
+            # No verdict — the agent-forge scenario when the block is in place.
+        )
+        project = _make_project()
+
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            recorded = record_capability_proof(task, project)
+
+        assert recorded == []
+        assert project.capability_proof_records == {}
+        mock_fm.assert_not_called()
 
     def test_proof_capped_per_capability(self):
         cap = "language-aware-repo-map"
@@ -593,6 +622,35 @@ class TestCapabilityProofViews:
         # no proof records → unproven
         assert caps["cap-empty"]["proof_status"] == "unproven"
 
+    def test_enrich_drives_proof_exempt_authoritatively_from_ledger(self):
+        """enrich must set proof_exempt from the ledger, not the agent-writable flag.
+
+        A working capability whose exemption is recorded in the platform ledger
+        becomes proof_exempt=True; a working capability with a FORGED
+        ``proof_exempt: true`` and NO ledger record is cleared to False. Otherwise
+        the coverage-meter denominator (which excludes proof_exempt caps) would
+        diverge from the ledger-aware auto-graduation rule (finding #9), and the
+        Revoke-exemption button would dead-end (revoke removes nothing).
+        """
+        problem_model = {
+            "capabilities": [
+                # Ledger-backed exemption → must surface proof_exempt=True.
+                {"name": "ledger-exempt", "status": "working"},
+                # Forged agent flag, NO ledger record → must be cleared to False.
+                {"name": "forged-exempt", "status": "working", "proof_exempt": True},
+            ]
+        }
+        enriched = enrich_problem_model_capability_proofs(
+            problem_model, _platform_exemption_ledger("ledger-exempt")
+        )
+        caps = {c["name"]: c for c in enriched["capabilities"]}
+        assert caps["ledger-exempt"]["proof_exempt"] is True, (
+            "a ledger-recorded exemption must surface proof_exempt=True"
+        )
+        assert caps["forged-exempt"]["proof_exempt"] is False, (
+            "an agent-written proof_exempt with no ledger record must be cleared"
+        )
+
     def test_enrich_empty_evidence_refs_falls_back_to_proof_records(self):
         """enrich with evidence_refs=[] must fall through to proof_records, not 'unproven'.
 
@@ -783,6 +841,24 @@ def _make_proof_entry(task_id: str, proof_ref: str = "test_foo.py") -> dict:
     }
 
 
+def _fwd_marker(survivor: str, absorbed: str) -> dict:
+    """A platform-authored consolidation forwarding marker, as written under an
+    absorbed capability's ledger key by ``carry_proof_records_for_consolidation``.
+
+    Only this platform record (never the agent-writable ``problem_model.absorbs``
+    field) establishes an absorbed→survivor alias edge for the authority seams.
+    """
+    return {
+        "task_id": f"absorbed_into:{absorbed}",
+        "proof_kind": "absorbed_into",
+        "survivor": survivor,
+        "absorbed": absorbed,
+        "proof_ref": survivor,
+        "proved_at": "2026-06-01T00:00:00",
+        "commit_sha": "",
+    }
+
+
 class TestCarryProofRecordsForConsolidation:
     def test_consolidation_carries_proof_records_to_survivor(self):
         """Absorbed entries are merged onto the survivor and their keys removed."""
@@ -797,10 +873,17 @@ class TestCarryProofRecordsForConsolidation:
 
         result = carry_proof_records_for_consolidation(consolidated, proof_records)
 
-        # Absorbed keys removed.
-        assert "old-cap-a" not in result
-        assert "old-cap-b" not in result
-        # Survivor now holds merged entries.
+        # Absorbed keys are REPLACED with a platform-authored forwarding marker
+        # (pointing at the survivor), not popped — so the platform-recorded alias
+        # map can still resolve a dependent naming the old name to the survivor.
+        for old in ("old-cap-a", "old-cap-b"):
+            assert len(result[old]) == 1
+            marker = result[old][0]
+            assert marker["proof_kind"] == "absorbed_into"
+            assert marker["survivor"] == "survivor-cap"
+            assert marker["absorbed"] == old
+        # Survivor now holds merged real entries (the forwarding markers are NOT
+        # merged onto the survivor as proof).
         assert "survivor-cap" in result
         task_ids = {e["task_id"] for e in result["survivor-cap"]}
         assert task_ids == {"task-s1", "task-a1", "task-a2", "task-b1"}
@@ -865,7 +948,9 @@ class TestCarryProofRecordsForConsolidation:
 
         result = carry_proof_records_for_consolidation(consolidated, proof_records)
 
-        assert "old-cap" not in result
+        # The absorbed key is replaced with a forwarding marker (not popped).
+        assert result["old-cap"][0]["proof_kind"] == "absorbed_into"
+        assert result["old-cap"][0]["survivor"] == "new-survivor"
         assert result["new-survivor"][0]["task_id"] == "task-x"
 
     def test_input_dict_not_mutated(self):
@@ -1620,7 +1705,15 @@ class TestCommissionProofEarnLoop:
     async def test_already_proven_cap_excluded(self):
         """A demanded capability that is already proven is excluded from earning."""
         project = MagicMock()
-        project.capability_proof_records = {}
+        project.capability_proof_records = {
+            "proven-cap": [
+                {
+                    "task_id": "platform:test:proven-cap",
+                    "proof_kind": "named_test",
+                    "proof_ref": "t1",
+                }
+            ]
+        }
         project.problem_model = {"capabilities": [
             {"name": "proven-cap", "status": "working",
              "evidence_refs": [{"proven": True, "ref": "t1", "source_id": "s1"}]},
@@ -1993,7 +2086,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "source": _exemption_source()},
         ]
     }
-    project.capability_proof_records = {}
+    project.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     async def _verify(p: str) -> bool:
         return True
@@ -2023,6 +2116,36 @@ def test_exempt_capability_skipped_in_earn_loop():
         "return dict must include empty path_proven_stuck"
     )
 
+    # Exercise the defensive filter itself.  The authoritative demand builder
+    # normally excludes operator-exempt capabilities before this point, but the
+    # earn loop deliberately re-checks the ledger so stale/precomputed demand
+    # cannot accidentally earn proof for an exempt capability.  That early
+    # return must preserve the function's documented summary shape.
+    forced_demand = [{"kind": "capability", "ref": "exempt-no-proof"}]
+    with patch(
+        "app.capability_demand.compute_unproven_demanded_capabilities",
+        return_value=forced_demand,
+    ), patch("app.capability_proof.flag_modified"):
+        defensive_result = asyncio.get_event_loop().run_until_complete(
+            commission_proof_earn_loop(
+                project,
+                demand_result={"total": 1, "demands": forced_demand},
+                problem_model=project.problem_model,
+                verify_path=_verify,
+            )
+        )
+
+    assert defensive_result == {
+        "total_demanded_unproven": 0,
+        "earned": 0,
+        "no_backing_paths": [],
+        "still_unproven": [],
+        "path_proven_stuck": [],
+        "named_test_earned": [],
+        "named_test_executed": [],
+        "execution_proven": [],
+    }
+
     # Now test with a mix: one exempt unproven cap, one real unproven cap.
     # The exempt cap is never demanded (proven), the real one is.
     project2 = MagicMock()
@@ -2034,7 +2157,7 @@ def test_exempt_capability_skipped_in_earn_loop():
              "backing_paths": ["backend/app/main.py"]},
         ]
     }
-    project2.capability_proof_records = {}
+    project2.capability_proof_records = _platform_exemption_ledger("exempt-no-proof")
 
     with patch("app.capability_proof.flag_modified"):
         result2 = asyncio.get_event_loop().run_until_complete(
@@ -2233,6 +2356,160 @@ class TestBackingPathTieringInEnforceGate:
         assert proof["paths-field-cap"] == "partial"
 
 
+# ── Spawn-gate: raw agent-writable absorbs alias bypass is closed ─────────────
+
+
+class TestSpawnGateAbsorbsAliasBypassClosed:
+    """ACCEPTANCE EVIDENCE. Pin the closure of the spawn-time enforce-gate bypass
+    where a raw agent-writable ``absorbs`` alias with no platform forwarding marker
+    cleared the enforce gate because ``capability_need_proof_status`` returned
+    ``None`` (no-match) for the alias — and ``capability_need_blocked_by_proof_gate``
+    treats ``None`` as "not a registry capability, skip the gate" (a free pass).
+
+    The fix: ``working_capability_proof_status`` now registers every agent-declared
+    absorbs alias that has no platform forwarding marker as ``"unproven"`` so the
+    alias appears in the proof map with a non-None status.  The gate then correctly
+    blocks it in enforce mode (``unproven != "proven"``).
+    """
+
+    def _absorbs_model(self, survivor_name="Unified harness", alias_name="Old harness name"):
+        """A problem model with one working capability that declares an absorbs alias."""
+        from app.problem_model import Capability, ProblemModel
+
+        return ProblemModel(
+            capabilities=[
+                Capability(
+                    name=survivor_name,
+                    status="working",
+                    absorbs=[alias_name],
+                    # No evidence_refs → the survivor itself is unproven.
+                )
+            ]
+        )
+
+    def _forwarding_marker(self, *, absorbed="old-harness-name", survivor="unified-harness"):
+        """Minimal platform ledger that records a genuine consolidation marker."""
+        return {
+            absorbed: [
+                {
+                    "task_id": f"absorbed_into:{absorbed}",
+                    "proof_kind": "absorbed_into",
+                    "survivor": survivor,
+                    "absorbed": absorbed,
+                }
+            ]
+        }
+
+    def test_absorbs_alias_without_marker_is_unproven_in_proof_map(self):
+        """SECURITY: an agent-declared ``absorbs`` without a platform forwarding marker
+        must appear in the proof map as ``"unproven"`` — NOT as absent (None).
+
+        Absent → None → capability_need_blocked_by_proof_gate returns False → free
+        pass in enforce mode. ``"unproven"`` → gate evaluates and correctly blocks."""
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+
+        assert "old-harness-name" in proof, (
+            "absorbs alias must appear in the proof map so the enforce gate can "
+            "evaluate it — an absent entry reads as None (free pass)"
+        )
+        assert proof["old-harness-name"] == "unproven", (
+            "absorbs alias with no platform marker must be 'unproven', not any "
+            "stronger tier"
+        )
+
+    def test_absorbs_alias_without_marker_blocks_in_enforce_mode(self):
+        """ACCEPTANCE EVIDENCE. A need naming an agent-declared absorbs alias with no
+        platform forwarding marker must be BLOCKED in enforce mode, not cleared.
+
+        Before the fix, spawn_capability_gate_disposition returned ("ok", None)
+        because the alias was absent from the proof map; the enforce gate was bypassed
+        with zero verification."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="enforce"
+        )
+        assert disposition == "block", (
+            "an absorbs-declared alias with no platform marker must be BLOCKED in "
+            f"enforce mode — got disposition={disposition!r}, proof_status={proof_status!r}"
+        )
+        assert proof_status == "unproven"
+
+    def test_absorbs_alias_without_marker_surfaces_in_observe_mode(self):
+        """Observe mode surfaces the unproven alias but does NOT block."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="observe"
+        )
+        assert disposition == "surface", (
+            "observe mode must surface an unproven alias, not block — "
+            f"got disposition={disposition!r}"
+        )
+        assert proof_status == "unproven"
+
+    def test_genuine_consolidation_with_platform_marker_clears_enforce_gate(self):
+        """A GENUINE consolidation (platform forwarding marker present + survivor
+        proven in ledger) still clears the enforce gate. Positive regression guard:
+        the fix must not break legitimate platform-recorded alias resolution."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        # Survivor has a machine-verified proof entry (recent timestamp — within TTL).
+        proof_records = {
+            "unified-harness": [
+                {
+                    "task_id": str(uuid.uuid4()),
+                    "proof_kind": "named_test",
+                    "proof_ref": "testing/test_foo.py::test_ok",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                }
+            ],
+            **self._forwarding_marker(),
+        }
+        model = self._absorbs_model()
+
+        # The alias should carry the survivor's proof status via the platform marker.
+        # (The ledger upgrade wires the forwarded name to the survivor's proof.)
+        from app.capability_registry import consumer_gate_proof_status
+
+        gate_proof = consumer_gate_proof_status(model, proof_records)
+        need = {"kind": "capability", "ref": "old-harness-name"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, gate_proof, mode="enforce"
+        )
+        assert disposition == "ok", (
+            "a genuinely consolidated alias with a platform marker + survivor proof "
+            f"must CLEAR the enforce gate — got disposition={disposition!r}, "
+            f"proof_status={proof_status!r}"
+        )
+
+    def test_unrelated_non_registry_capability_still_returns_ok_none(self):
+        """A need that names a capability absent from the working registry entirely
+        (not an absorbs alias, not a real capability) still returns ("ok", None).
+        The fix must not fabricate a block for unrecognized capability names."""
+        from app.research_completion import spawn_capability_gate_disposition
+
+        model = self._absorbs_model()
+        proof = working_capability_proof_status(model)
+        need = {"kind": "capability", "ref": "completely-unknown-cap"}
+
+        disposition, proof_status = spawn_capability_gate_disposition(
+            need, proof, mode="enforce"
+        )
+        assert disposition == "ok"
+        assert proof_status is None
+
+
 # ── Earn loop is not flag-only: proof is written, not just computed ───────────
 
 
@@ -2382,7 +2659,15 @@ async def test_earn_loop_demand_driven_intersection_and_proof():
     - the return summary reports earned, no_backing_paths, still_unproven correctly
     """
     project = MagicMock()
-    project.capability_proof_records = {}
+    project.capability_proof_records = {
+        "demanded-proven": [
+            {
+                "task_id": "platform:test:demanded-proven",
+                "proof_kind": "named_test",
+                "proof_ref": "test_demanded_proven",
+            }
+        ]
+    }
     problem_model = {
         "capabilities": [
             # demanded + unproven working + has backing_paths → WILL be earned
@@ -2566,6 +2851,111 @@ class TestProofEarnLoopDedup:
         assert set(second["path_proven_stuck"]) == {fresh_cap, stuck_cap}, (
             f"both caps should be in path_proven_stuck, got {second['path_proven_stuck']}"
         )
+
+
+# ── Acceptance: full earn-loop with all-unproven capabilities ──────────────────
+
+
+@pytest.mark.asyncio
+async def test_earn_loop_all_unproven_proves_caps_with_backing_paths():
+    """ACCEPTANCE EVIDENCE (salvage: capability-proof-earning-loop):
+    When ALL working capabilities are unproven, the earn loop correctly earns
+    proof for those with verifiable backing_paths and reports no_backing_paths
+    for those without.
+
+    This verifies the full earn-loop machinery against an all-unproven project,
+    mirroring the situation where the sweep fires without demand (the
+    "synthetic demand" path in sweep_proof_earn_loop / Step 22b).  Previously
+    the earn loop only fired on DEMANDED capabilities; an all-unproven project
+    with no blocked dependents was never processed, leaving the gate stuck.
+    """
+    project = MagicMock()
+    project.capability_proof_records = {}
+    problem_model = {
+        "capabilities": [
+            # Has backing_paths → will earn backing_path proof (path_proven)
+            {
+                "name": "ci-pipeline",
+                "status": "working",
+                "backing_paths": ["backend/app/capability_proof.py"],
+            },
+            # No backing_paths → reported as gap
+            {
+                "name": "repo-map",
+                "status": "working",
+                "backing_paths": [],
+            },
+            # Already proven (evidence_refs with a proven ref) → excluded
+            {
+                "name": "already-proven",
+                "status": "working",
+                "evidence_refs": [{"kind": "named_test", "ref": "test_foo.py", "proven": True}],
+            },
+            # planned → not working, excluded
+            {
+                "name": "planned-cap",
+                "status": "planned",
+            },
+        ]
+    }
+    project.problem_model = problem_model
+
+    async def _all_present(p: str) -> bool:
+        return True
+
+    # Build a synthetic demand covering ALL unproven working capabilities
+    # (mirroring the synthetic demand built by sweep_proof_earn_loop).
+    from app.capability_registry import working_capability_proof_status
+
+    proof_by_name = working_capability_proof_status(problem_model)
+    unproven_names = [
+        name for name, status in proof_by_name.items() if status != "proven"
+    ]
+    synthetic_demand = {
+        "total": len(unproven_names),
+        "demands": [
+            {"kind": "capability", "ref": name, "dependent_count": 1}
+            for name in unproven_names
+        ],
+    }
+    assert "ci-pipeline" in unproven_names
+    assert "repo-map" in unproven_names
+    assert "already-proven" not in unproven_names  # already proven
+
+    with patch("app.capability_proof.flag_modified"):
+        result = await commission_proof_earn_loop(
+            project,
+            demand_result=synthetic_demand,
+            problem_model=problem_model,
+            verify_path=_all_present,
+        )
+
+    # ci-pipeline should have earned backing_path proof.
+    assert result["earned"] >= 1, (
+        "ci-pipeline with backing_paths should earn proof"
+    )
+    assert result["total_demanded_unproven"] == 2, (
+        "two unproven working capabilities should be reported"
+    )
+    # ci-pipeline recorded in capability_proof_records.
+    assert "ci-pipeline" in (project.capability_proof_records or {}), (
+        "ci-pipeline must have a proof record"
+    )
+    # repo-map has no backing_paths → reported as no_backing_paths.
+    assert "repo-map" in result["no_backing_paths"], (
+        "repo-map without backing_paths must be in no_backing_paths"
+    )
+    # already-proven was excluded from the intersection.
+    assert "already-proven" not in result.get("still_unproven", []), (
+        "already-proven cap must be excluded from earn loop"
+    )
+    # still_unproven should be empty (ci-pipeline earned proof).
+    assert result["still_unproven"] == [], (
+        "no caps should remain unproven after earn loop"
+    )
+    assert result["path_proven_stuck"] == [], (
+        "first-earn path should not report stuck caps"
+    )
 
 
 # ── named_test_present-tier automated proof earning (c-e9ef1da6 / d-2b95bef1) ──
@@ -3152,6 +3542,584 @@ class TestEarnLoopNamedTestTier:
         assert result["named_test_earned"] == []
 
 
+class TestEarnLoopExecutionTrialEnrollment:
+    """Slice 3 (design 84021e2d): under ``capability_proof_execution_trials_enabled``,
+    the earn loop ENROLLS a bounded execution trial for a discovered-covered
+    capability (earning the real ``proven`` tier via an actual test run) instead of
+    recording the static ``named_test_present`` (``path_proven``) proof. Flag-off,
+    no-session, and degraded-enroll cases preserve the exact prior static path.
+    Enrollment is cadence-guarded on the executed proof's freshness + HEAD sha."""
+
+    _CAP = "capability-proof-gate"
+
+    @classmethod
+    def _project_and_demand(cls, backing_paths, records=None):
+        project = MagicMock()
+        project.capability_proof_records = records if records is not None else {}
+        project.problem_model = {
+            "capabilities": [
+                {"name": cls._CAP, "status": "working", "backing_paths": backing_paths}
+            ]
+        }
+        demand = {
+            "total": 1,
+            "demands": [{"kind": "capability", "ref": cls._CAP, "dependent_count": 2}],
+        }
+        return project, demand
+
+    @staticmethod
+    async def _verify(p):
+        # Both the backing path and its convention-named test exist at HEAD.
+        return p in {
+            "backend/app/capability_proof.py",
+            "backend/testing/test_capability_proof.py",
+        }
+
+    @staticmethod
+    async def _read(p):
+        if p == "backend/testing/test_capability_proof.py":
+            return "from app.capability_proof import record_capability_named_test_proof\n"
+        return None
+
+    @staticmethod
+    def _exec_record(recorded_at, commit_sha):
+        return {
+            "capability-proof-gate": [
+                {
+                    "task_id": "named_test_exec:capability-proof-gate",
+                    "recorded_at": recorded_at,
+                    "proof_kind": "named_test",
+                    "commit_sha": commit_sha,
+                    "executed": True,
+                }
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_enrolls_trial_when_flag_on(self):
+        """ACCEPTANCE (design 84021e2d Slice 3): flag ON + covering tests
+        discovered ⇒ the earn loop enrolls a ``capability_proof_trial`` and reports
+        the cap under ``named_test_executed`` — it does NOT record the static
+        ``named_test_present`` proof."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll), \
+                patch("app.capability_proof.record_capability_named_test_proof") as rec:
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head,
+            )
+
+        # A trial was enrolled with the discovered covering tests + current HEAD.
+        enroll.assert_awaited_once()
+        _args, _kwargs = enroll.call_args
+        assert _args[2] == self._CAP  # raw_name/canonical
+        assert "backend/testing/test_capability_proof.py" in _args[3]  # test_refs
+        assert _kwargs.get("head_sha") == "deadbeef"
+        # The STATIC named_test_present recorder was NOT invoked.
+        rec.assert_not_called()
+        # The summary reports the executed-trial cap, not the static earn.
+        assert result["named_test_executed"] == [self._CAP]
+        assert result["named_test_earned"] == []
+        assert result["earned"] == 0
+        # And nothing was written to the static path_proven ledger.
+        assert project.capability_proof_records == {}
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_flag_off_records_named_test_present(self):
+        """Regression guard: flag OFF (default) ⇒ exact prior behaviour — the
+        static ``named_test_present`` proof is recorded, NO trial is enrolled, and
+        ``named_test_executed`` is empty."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=MagicMock())
+        rc = {"capability_proof_execution_trials_enabled": False}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(),
+            )
+
+        enroll.assert_not_awaited()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        assert result["earned"] == 1
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_flag_on_no_session_falls_back_to_static(self):
+        """Flag ON but no ``session`` supplied ⇒ the loop cannot enroll a trial, so
+        it falls back to the UNCHANGED static ``named_test_present`` recording."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=MagicMock())
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=None,
+            )
+
+        enroll.assert_not_awaited()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_enroll_noop_falls_back_to_static(self):
+        """Flag ON, session present, but enrollment degrades to a no-op (``None``)
+        — e.g. the flag flipped off mid-flight — ⇒ the loop falls back to the
+        static ``named_test_present`` recording rather than dropping the cap."""
+        project, demand = self._project_and_demand(["backend/app/capability_proof.py"])
+        enroll = AsyncMock(return_value=None)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head,
+            )
+
+        enroll.assert_awaited_once()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == [self._CAP]
+        entry = project.capability_proof_records[self._CAP][0]
+        assert entry["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+
+    @pytest.mark.asyncio
+    async def test_fresh_matching_executed_proof_suppresses_reenroll(self):
+        """Cadence guard: a fresh green executed proof whose ``commit_sha`` matches
+        HEAD suppresses re-enrollment — no trial, no static downgrade."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        records = self._exec_record(now.isoformat(), "deadbeef")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        enroll = AsyncMock(return_value=MagicMock())
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll), \
+                patch("app.capability_proof.record_capability_named_test_proof") as rec:
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_not_awaited()
+        rec.assert_not_called()
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == []
+        assert result["earned"] == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_executed_proof_reenrolls(self):
+        """Cadence guard: an executed proof aged past ``PROOF_FRESHNESS_TTL``
+        re-enrolls a fresh trial (the genuine re-verification loop)."""
+        from datetime import datetime, timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._exec_record(stale, "deadbeef")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="deadbeef")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_awaited_once()
+        assert result["named_test_executed"] == [self._CAP]
+
+    @pytest.mark.asyncio
+    async def test_head_moved_reenrolls(self):
+        """Cadence guard: a still-fresh executed proof whose ``commit_sha`` differs
+        from the current HEAD re-enrolls a trial to re-verify the new tree."""
+        from datetime import datetime
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        records = self._exec_record(now.isoformat(), "oldsha0000")
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"], records=records
+        )
+        fake_task = MagicMock()
+        fake_task.id = uuid.uuid4()
+        enroll = AsyncMock(return_value=fake_task)
+        head = AsyncMock(return_value="newsha1111")
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.enroll_capability_proof_trial", enroll):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(), read_head_sha=head, now=now,
+            )
+
+        enroll.assert_awaited_once()
+        _args, _kwargs = enroll.call_args
+        assert _kwargs.get("head_sha") == "newsha1111"
+        assert result["named_test_executed"] == [self._CAP]
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_at_head_suppresses_reenroll(self):
+        """Cadence guard: a merge-gate named_test proof whose commit_sha matches
+        HEAD suppresses trial enrollment — we don't re-verify what the merge gate
+        already proved at this exact revision."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    # Merge-gate proof: real task_id (not named_test_exec:), no
+                    # recorded_at, but has proof_kind=named_test and commit_sha.
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                }
+            ]
+        }
+        assert _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "deadbeef", now=now
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_gate_proof_different_sha_still_reenrolls(self):
+        """A merge-gate proof for a DIFFERENT sha does not suppress enrollment
+        — HEAD moved so we need to re-verify at the new sha."""
+        from datetime import datetime
+
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 7, 14, 0, 0, 0)
+        project = MagicMock()
+        project.capability_proof_records = {
+            "capability-proof-gate": [
+                {
+                    "task_id": "abc123-real-task-id",
+                    "proved_at": now.isoformat(),
+                    "proof_kind": "named_test",
+                    "commit_sha": "oldsha111",
+                }
+            ]
+        }
+        # HEAD moved to a new sha — merge-gate proof at old sha does not cover it.
+        assert not _fresh_executed_proof_covers_head(
+            project, "capability-proof-gate", "newsha222", now=now
+        )
+
+    @pytest.mark.asyncio
+    async def test_earn_loop_executed_proof_path(self):
+        """ACCEPTANCE: when _maybe_enroll_proof_trial returns "fresh" (cadence guard:
+        a green executed proof already covers HEAD), the earn loop routes the cap into
+        ``execution_proven``, NOT into ``earned``, ``named_test_executed``,
+        ``named_test_earned``, ``path_proven_stuck``, or ``still_unproven``.
+
+        This exercises the full earn-loop executed-proof path end-to-end: the "fresh"
+        outcome from the cadence guard is the signal that the cap already holds a
+        ``proven``-tier (enforce-gate-clearing) proof this sweep — previously this
+        information was silently dropped (the loop continued without recording it
+        anywhere). The fix routes it into ``execution_proven`` so callers can see
+        which caps currently clear the enforce gate via an executed proof.
+
+        To force the cap into the main loop despite its proven status (otherwise
+        the revision-stale supplement would exclude it), we patch
+        ``_maybe_enroll_proof_trial`` to return "fresh" directly, which is exactly
+        the code path this production fix adds to.
+        """
+        project, demand = self._project_and_demand(
+            ["backend/app/capability_proof.py"],
+        )
+        # Patch compute_unproven_demanded_capabilities to inject the cap directly
+        # into the main loop (bypassing the proven-status filter), and patch
+        # _maybe_enroll_proof_trial to return "fresh" so we exercise that branch.
+        forced_demand = [{"kind": "capability", "ref": self._CAP}]
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        fresh_trial = AsyncMock(return_value="fresh")
+        rec = MagicMock(return_value=False)
+
+        with patch("app.capability_proof.flag_modified"), \
+                patch("app.shared_state.runtime_config", new=rc), \
+                patch(
+                    "app.capability_demand.compute_unproven_demanded_capabilities",
+                    return_value=forced_demand,
+                ), \
+                patch("app.capability_proof._maybe_enroll_proof_trial", fresh_trial), \
+                patch("app.capability_proof.record_capability_named_test_proof", rec):
+            result = await commission_proof_earn_loop(
+                project, demand, project.problem_model,
+                verify_path=self._verify, read_head=self._read,
+                session=object(),
+            )
+
+        # _maybe_enroll_proof_trial was called and returned "fresh".
+        fresh_trial.assert_awaited_once()
+        # No static proof downgrade — "fresh" suppresses the static recorder.
+        rec.assert_not_called()
+        # The cap surfaces in execution_proven (enforce-gate-clearing proof present).
+        assert result["execution_proven"] == [self._CAP]
+        # The cap is absent from all other buckets.
+        assert result["earned"] == 0
+        assert result["named_test_executed"] == []
+        assert result["named_test_earned"] == []
+        assert result["path_proven_stuck"] == []
+        assert result["still_unproven"] == []
+
+
+class TestRevokeStaleExecutionProof:
+    """revoke_stale_execution_proof removes the ledger entry and evidence_ref
+    for a capability after a definitive RED trial proves it broken at HEAD."""
+
+    def _project_with_exec_proof(self, cap_name: str):
+        """Return a project mock with a named_test_exec ledger entry."""
+        project = MagicMock()
+        norm = cap_name.lower().replace(" ", "-")
+        dedup_id = f"named_test_exec:{norm}"
+        project.capability_proof_records = {
+            norm: [
+                {
+                    "task_id": dedup_id,
+                    "proved_at": "2026-07-14T00:00:00",
+                    "recorded_at": "2026-07-14T00:00:00",
+                    "proof_kind": "named_test",
+                    "commit_sha": "deadbeef",
+                    "executed": True,
+                }
+            ]
+        }
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": cap_name,
+                    "status": "working",
+                    "evidence_refs": [
+                        {
+                            "kind": "named_test",
+                            "proven": True,
+                            "source_id": dedup_id,
+                            "recorded_at": "2026-07-14T00:00:00",
+                        }
+                    ],
+                }
+            ]
+        }
+        return project
+
+    def test_revoke_removes_ledger_entry(self):
+        """A RED result removes the named_test_exec ledger entry."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, cap)
+
+        assert result is True
+        entries = project.capability_proof_records.get("repo-map") or []
+        assert not any(e.get("task_id") == "named_test_exec:repo-map" for e in entries)
+
+    def test_revoke_removes_evidence_ref(self):
+        """Revocation also removes the matching evidence_ref from problem_model."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        caps = project.problem_model.get("capabilities", [])
+        refs = caps[0].get("evidence_refs", []) if caps else []
+        assert not any(r.get("source_id") == "named_test_exec:repo-map" for r in refs)
+
+    def test_revoke_returns_false_when_no_entry(self):
+        """Returns False when no executed-proof entry exists (nothing to revoke)."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        project = MagicMock()
+        project.capability_proof_records = {"other-cap": []}
+        project.problem_model = {"capabilities": []}
+        with patch("app.capability_proof.flag_modified"):
+            result = revoke_stale_execution_proof(project, "repo-map")
+
+        assert result is False
+
+    def test_revoke_leaves_non_named_test_entries(self):
+        """Revocation removes ALL named_test-kind entries; non-named_test proof
+        entries (e.g. backing_path, downstream_artifact) are preserved."""
+        from app.capability_proof import revoke_stale_execution_proof
+
+        cap = "repo-map"
+        project = self._project_with_exec_proof(cap)
+        # Add a merge-gate named_test proof (now also removed by RED).
+        project.capability_proof_records["repo-map"].append(
+            {
+                "task_id": "merge-gate-task-id",
+                "proved_at": "2026-07-13T00:00:00",
+                "proof_kind": "named_test",
+                "commit_sha": "abc123",
+            }
+        )
+        # Add a backing_path proof (structural, not affected by RED revocation).
+        project.capability_proof_records["repo-map"].append(
+            {
+                "task_id": "backing:repo-map",
+                "proved_at": "2026-07-12T00:00:00",
+                "proof_kind": "backing_path",
+                "commit_sha": "",
+            }
+        )
+        with patch("app.capability_proof.flag_modified"):
+            revoke_stale_execution_proof(project, cap)
+
+        entries = project.capability_proof_records.get("repo-map") or []
+        # Only the backing_path entry survives — both named_test entries are gone.
+        assert len(entries) == 1
+        assert entries[0]["proof_kind"] == "backing_path"
+        assert not any(e.get("proof_kind") == "named_test" for e in entries)
+
+
+def test_current_red_invalidates_older_revision_proofs():
+    """A definitive RED trial supersedes an older merge-gate named_test proof.
+
+    Scenario: a capability was proven by a prior green PR (merge-gate named_test
+    proof, task_id = some UUID). A later execution trial runs the same tests at the
+    current HEAD and FAILS. revoke_stale_execution_proof must remove the older
+    merge-gate proof so the capability is no longer seen as proven — not wait for
+    the 30-day TTL to expire.
+
+    Without this fix the gate is cleared by superseded evidence: the merge-gate
+    proof survives revocation and the enforce gate reads 'proven' even though the
+    capability is demonstrably broken at HEAD.
+    """
+    from app.capability_proof import revoke_stale_execution_proof
+    from app.capability_registry import normalize_capability_name
+
+    cap = "capability-proof-gate"
+    norm = normalize_capability_name(cap)
+
+    # Merge-gate proof written when a prior PR passed named_test acceptance evidence.
+    # This is the OLD proof that should be superseded by a current RED trial.
+    merge_gate_task_id = "task-prior-green-merge-abc123"
+    merge_gate_proof = {
+        "task_id": merge_gate_task_id,
+        "proved_at": "2026-01-01T00:00:00Z",
+        "proof_kind": _PROOF_KIND_NAMED_TEST,
+        "proof_ref": "backend/testing/test_capability_proof.py::test_cap",
+        "commit_sha": "old-sha-before-regression",
+    }
+
+    project = MagicMock()
+    project.capability_proof_records = {norm: [merge_gate_proof]}
+    project.problem_model = {
+        "capabilities": [
+            {
+                "name": cap,
+                "status": "working",
+                "evidence_refs": [
+                    {
+                        "kind": _PROOF_KIND_NAMED_TEST,
+                        "ref": "backend/testing/test_capability_proof.py::test_cap",
+                        "proven": True,
+                        "source_id": merge_gate_task_id,
+                        "recorded_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+            }
+        ]
+    }
+
+    # Pre-condition: the merge-gate proof makes the capability 'proven'.
+    vocab = [{"name": cap, "status": "working"}]
+    before = annotate_capability_proof_status(vocab, project.capability_proof_records)
+    assert before[0]["proof_status"] == "proven", (
+        "precondition: merge-gate named_test proof must make capability 'proven' before RED"
+    )
+
+    # Definitive RED trial fires — tests ran and failed at current HEAD.
+    with patch("app.capability_proof.flag_modified"):
+        revoked = revoke_stale_execution_proof(project, cap)
+
+    # The revocation must succeed even though there is no named_test_exec entry
+    # — only an older merge-gate proof is present.
+    assert revoked is True, (
+        "revoke_stale_execution_proof must return True when an older merge-gate "
+        "named_test proof is present; a definitive RED supersedes it immediately"
+    )
+
+    # All named_test proof records must be gone from capability_proof_records.
+    remaining = project.capability_proof_records.get(norm) or []
+    named_test_remaining = [
+        e for e in remaining
+        if isinstance(e, dict) and e.get("proof_kind") == _PROOF_KIND_NAMED_TEST
+    ]
+    assert not named_test_remaining, (
+        "all named_test proof records must be removed by a definitive RED; "
+        f"still present: {named_test_remaining}"
+    )
+
+    # After revocation: the capability must no longer be seen as 'proven'.
+    after = annotate_capability_proof_status(vocab, project.capability_proof_records)
+    assert after[0]["proof_status"] != "proven", (
+        "capability must not be 'proven' after a definitive RED removes the "
+        f"merge-gate proof; got proof_status={after[0]['proof_status']!r}"
+    )
+
+    # evidence_refs must also be cleared of named_test refs.
+    cap_data = project.problem_model["capabilities"][0]
+    named_test_refs = [
+        r for r in cap_data.get("evidence_refs", [])
+        if isinstance(r, dict) and r.get("kind") == _PROOF_KIND_NAMED_TEST
+    ]
+    assert not named_test_refs, (
+        "named_test evidence_refs must be removed from problem_model on definitive RED"
+    )
+
+
 class TestCapabilityProofFreshnessExpiry:
     """Capability proofs expire and force re-verification once stale.
 
@@ -3352,6 +4320,173 @@ class TestCapabilityProofFreshnessExpiry:
         assert folded_fresh["cap-a"] == "proven"
 
 
+class TestLedgerProofFreshness:
+    """``_ledger_proof_status`` evaluates ledger proof freshness when ``now`` is
+    supplied, so an expired historical proof does NOT corroborate a self-declared
+    ``proven`` claim at the enforce gate.
+
+    Without freshness (``now=None`` — legacy behaviour), a stale proof still grades
+    ``proven`` because the synthetic refs carry no timestamp the classifier expires.
+    The opt-in path carries each entry's ``proved_at`` as ``recorded_at`` and passes
+    ``now`` to ``classify_evidence_tiered``, which drops stale refs before tiering.
+    """
+
+    def _now(self):
+        from datetime import datetime
+
+        return datetime(2026, 7, 15, 12, 0, 0)
+
+    def _records(self, cap_name: str, proved_at: str) -> dict:
+        return {
+            cap_name: [{"proof_kind": "named_test", "proved_at": proved_at}]
+        }
+
+    def test_fresh_ledger_proof_grades_proven(self):
+        """A freshly-dated ledger entry corroborates a self-declared claim."""
+        from datetime import timedelta
+
+
+        now = self._now()
+        fresh = (now - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", fresh)
+        # Fresh — with now supplied: grades proven.
+        assert _ledger_proof_status(records, "real-cap", now=now) == "proven"
+
+        # Same, via ledger_corroborated_proof_status with now supplied.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_stale_ledger_proof_does_not_grade_proven(self):
+        """A ledger proof older than PROOF_FRESHNESS_TTL demotes below 'proven'."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", stale)
+        # With now supplied: stale → not proven.
+        assert _ledger_proof_status(records, "real-cap", now=now) != "proven"
+
+        # The stale ledger entry does NOT corroborate a self-declared proven claim.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] != "proven"
+        assert corroborated["real-cap"] == "unverified"
+
+    def test_legacy_now_none_preserves_stale_proof(self):
+        """Without ``now``, a stale proof still grades 'proven' — legacy behaviour."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = self._records("real-cap", stale)
+        # No now → legacy: age is never checked.
+        assert _ledger_proof_status(records, "real-cap") == "proven"
+
+        # ledger_corroborated_proof_status without now: also preserves legacy.
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_missing_proved_at_is_indeterminate(self):
+        """A ledger entry with no ``proved_at`` is never expired — indeterminate."""
+        records = {
+            "real-cap": [{"proof_kind": "named_test"}]
+        }
+        now = self._now()
+        assert _ledger_proof_status(records, "real-cap", now=now) == "proven"
+        corroborated = ledger_corroborated_proof_status(
+            {"real-cap": "proven"}, records, now=now
+        )
+        assert corroborated["real-cap"] == "proven"
+
+    def test_backing_path_stale_is_not_proven(self):
+        """A stale backing_path-only ledger entry does not corroborate."""
+        from datetime import timedelta
+
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        records = {
+            "structural-cap": [{"proof_kind": "backing_path", "proved_at": stale}]
+        }
+        assert _ledger_proof_status(records, "structural-cap", now=now) != "proven"
+        # A stale backing_path must not corroborate a self-declared proven claim.
+        corroborated = ledger_corroborated_proof_status(
+            {"structural-cap": "proven"}, records, now=now
+        )
+        assert corroborated["structural-cap"] != "proven"
+
+    def test_release_gate_rejects_stale_ledger_proof(self):
+        """``capability_proof_gate_release_status`` with ``now`` blocks on stale proof."""
+        from app.capability_registry import capability_proof_gate_release_status
+
+        from datetime import timedelta
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        now = self._now()
+        stale = (now - PROOF_FRESHNESS_TTL - timedelta(days=1)).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", records, now=now
+        )
+        assert blocked is True
+        assert "real-cap" in detail["uncorroborated"]
+        assert detail["corroborated"] == []
+
+    def test_release_gate_rejects_stale_ledger_proof_without_explicit_now(self):
+        """``capability_proof_gate_release_status`` with no explicit ``now`` still
+        enforces freshness — a stale ledger proof does not clear the enforce gate.
+
+        Before the fix, the gate only checked freshness when ``now`` was explicitly
+        supplied; callers omitting it got unchecked legacy behaviour."""
+        from app.capability_registry import capability_proof_gate_release_status
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: freshness must still be evaluated.
+        blocked, detail = capability_proof_gate_release_status(
+            model, "enforce", records
+        )
+        assert blocked is True, "stale ledger proof must block promotion"
+        assert "real-cap" in detail["uncorroborated"]
+        assert detail["corroborated"] == []
+
+
 class TestReleaseGateLedgerCorroboration:
     """Finding #1: the release-qualifier enforce gate must clear a capability only
     from PLATFORM-verified proof (the durable capability_proof_records ledger),
@@ -3515,6 +4650,469 @@ class TestReleaseGateLedgerCorroboration:
         assert detail["uncorroborated"] == ["legacy-cap"]
         assert detail["corroborated"] == []
 
+
+class TestLedgerCorroborationAliases:
+    """The ledger-corroboration pass resolves absorbed alias names through the
+    survivor's platform proof record, so a dependent blocked on an old name is
+    unblocked when the survivor has a ledger proof — while a forged claim on a
+    non-absorbed name is never accidentally corroborated.
+
+    The alias edge is PLATFORM-recorded: :func:`platform_recorded_alias_map` reads
+    the ``absorbed_into`` forwarding markers left in the ledger by a genuine
+    consolidation. It is NOT derived from the agent-writable ``problem_model.absorbs``
+    field — declaring ``absorbs`` alone never establishes an alias edge here.
+    ``ledger_corroborated_proof_status`` retries the survivor's ledger key when a
+    direct lookup fails and the name appears in the alias map.
+    """
+
+    def test_absorbed_alias_corroborated_through_survivor(self):
+        """A blocked dependent that names an absorbed alias ``old-y`` clears when
+        the survivor ``survivor-x`` has a platform ledger proof AND a forwarding
+        marker records the genuine consolidation — the alias is retried against the
+        survivor's ledger key."""
+        # The platform ledger stores proof under the SURVIVOR's name and a
+        # forwarding marker under the absorbed name (genuine consolidation).
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
+        }
+        alias_map = platform_recorded_alias_map(records)
+        assert alias_map == {"old-y": "survivor-x"}
+
+        # Without alias_map: ``old-y`` is demoted to unverified (its own ledger key
+        # holds only a forwarding marker, which is not machine proof).
+        no_alias = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records
+        )
+        assert no_alias["old-y"] == "unverified", (
+            "without alias_map the absorbed alias must fail direct ledger lookup"
+        )
+
+        # WITH alias_map: ``old-y`` is retried against the survivor's ledger key.
+        with_alias = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records, alias_map=alias_map
+        )
+        assert with_alias["old-y"] == "proven", (
+            "the absorbed alias must be corroborated through the survivor's ledger key"
+        )
+
+    def test_survivor_corroborated_through_absorbed_alias_ledger_key(self):
+        """When a capability was renamed (survivor-x absorbs old-y) and the proof
+        was recorded under the OLD name (old-y) before the rename, the SURVIVOR
+        name must still be corroborated via the absorbed alias's ledger key.
+
+        This is the reverse direction: the alias_map is ``{old-y: survivor-x}``
+        and the name being looked up is ``survivor-x`` (not a key in the map).
+        Without the reverse lookup, the survivor is demoted to ``unverified`` even
+        though its platform proof exists under the absorbed key."""
+        alias_map = {"old-y": "survivor-x"}
+        # Proof recorded under the absorbed (old) name before the rename.
+        records = {
+            "old-y": [{"proof_kind": "named_test"}]
+        }
+        # Without the reverse lookup, direct lookup of "survivor-x" finds nothing.
+        no_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records
+        )
+        assert no_reverse["survivor-x"] == "unverified", (
+            "without alias_map the survivor with proof under an old key must fail direct lookup"
+        )
+
+        # WITH alias_map: "survivor-x" is a VALUE in alias_map, so we check
+        # its absorbed keys and find the pre-rename proof under "old-y".
+        with_reverse = ledger_corroborated_proof_status(
+            {"survivor-x": "proven"}, records, alias_map=alias_map
+        )
+        assert with_reverse["survivor-x"] == "proven", (
+            "the survivor must be corroborated through its absorbed alias's ledger key"
+        )
+
+    def test_declared_absorbs_without_marker_is_no_alias(self):
+        """An agent declaring ``absorbs`` with NO platform forwarding marker
+        establishes NO alias edge: the absorbed name is not corroborated through
+        the survivor's ledger. This is the insecure raw-``absorbs`` inheritance the
+        fix removes."""
+        # survivor-x has a real ledger proof, but there is NO forwarding marker for
+        # old-y — the agent merely declared ``absorbs: [old-y]`` in problem_model.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ]
+        }
+        alias_map = platform_recorded_alias_map(records)
+        assert alias_map == {}, "a declared-only absorb leaves no platform alias edge"
+        corroborated = ledger_corroborated_proof_status(
+            {"old-y": "proven"}, records, alias_map=alias_map
+        )
+        assert corroborated["old-y"] == "unverified", (
+            "a declared-but-not-consolidated absorb must not inherit the survivor's proof"
+        )
+
+    def test_self_declared_non_absorbed_not_corroborated(self):
+        """A self-declared ``proven`` claim on a name NOT in the alias map is never
+        accidentally corroborated — even alongside a genuine consolidation of a
+        different name."""
+        # A genuine consolidation of ``real-y`` into ``survivor-x`` exists, but
+        # ``forged-x`` is a wholly separate self-declared capability outside it.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "real-y": [_fwd_marker("survivor-x", "real-y")],
+        }
+        alias_map = platform_recorded_alias_map(records)
+        corroborated = ledger_corroborated_proof_status(
+            {"forged-x": "proven"}, records, alias_map=alias_map
+        )
+        assert corroborated["forged-x"] != "proven", (
+            "a forged name outside the alias map must not be corroborated by "
+            "the survivor's ledger entry"
+        )
+        assert corroborated["forged-x"] == "unverified"
+
+    def test_alias_map_is_built_from_forwarding_markers(self):
+        """``platform_recorded_alias_map`` maps absorbed names to survivors from the
+        platform ledger's forwarding markers, resolving chains to the terminal
+        survivor."""
+        records = {
+            "alpha": [_make_proof_entry("A1")],
+            "old-alpha": [_fwd_marker("alpha", "old-alpha")],
+            "beta": [_make_proof_entry("B1")],
+            "old-beta-1": [_fwd_marker("beta", "old-beta-1")],
+            "old-beta-2": [_fwd_marker("beta", "old-beta-2")],
+            # Chained: gamma-old -> gamma-mid -> gamma (terminal survivor).
+            "gamma": [_make_proof_entry("G1")],
+            "gamma-mid": [_fwd_marker("gamma", "gamma-mid")],
+            "gamma-old": [_fwd_marker("gamma-mid", "gamma-old")],
+        }
+        alias_map = platform_recorded_alias_map(records)
+        assert alias_map["old-alpha"] == "alpha"
+        assert alias_map["old-beta-1"] == "beta"
+        assert alias_map["old-beta-2"] == "beta"
+        assert alias_map["gamma-mid"] == "gamma"
+        assert alias_map["gamma-old"] == "gamma", "chained forwards resolve to terminal"
+        assert "alpha" not in alias_map, "a survivor is not its own alias"
+
+    def test_alias_map_empty_for_no_markers(self):
+        """A ledger with only real proof entries (no forwarding markers) returns ``{}``."""
+        records = {
+            "cap-a": [_make_proof_entry("t1")],
+            "cap-b": [_make_proof_entry("t2")],
+        }
+        assert platform_recorded_alias_map(records) == {}
+
+    def test_alias_map_empty_for_missing_records(self):
+        """A missing / empty / malformed ledger gracefully returns ``{}``."""
+        assert platform_recorded_alias_map({}) == {}
+        assert platform_recorded_alias_map(None) == {}
+        assert platform_recorded_alias_map({"cap-a": "junk"}) == {}
+
+    def test_consumer_gate_wires_platform_alias_map(self):
+        """``consumer_gate_proof_status`` resolves an absorbed alias through the
+        platform forwarding marker so a consumer seam does not strand it."""
+        from app.capability_registry import consumer_gate_proof_status
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                }
+            ]
+        }
+        # Ledger has proof under the survivor's name AND a forwarding marker for the
+        # genuine consolidation of old-y.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
+        }
+        gate = consumer_gate_proof_status(model, records)
+        # The absorbed alias "old-y" must grade proven (survivor's ledger).
+        assert gate["old-y"] == "proven"
+        assert gate["survivor-x"] == "proven"
+
+    def test_consumer_gate_declared_absorbs_without_marker_stays_blocked(self):
+        """SECURITY: a survivor that merely DECLARES ``absorbs: [proven-cap]`` with
+        NO genuine consolidation inherits nothing — it stays blocked while the real
+        proven capability remains proven on its own."""
+        from app.capability_registry import consumer_gate_proof_status
+
+        model = {
+            "capabilities": [
+                # The genuinely proven capability, standing on its own.
+                {
+                    "name": "proven-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::p", "proven": True}
+                    ],
+                },
+                # The attacker: declares absorbs of the proven cap, no real proof.
+                {
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        records = {
+            "proven-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::p"}
+            ]
+            # No forwarding marker: no genuine consolidation happened.
+        }
+        gate = consumer_gate_proof_status(model, records)
+        assert gate["proven-cap"] == "proven", "the real capability stays proven"
+        assert gate["attacker-cap"] != "proven", (
+            "a declared-only absorb must NOT inherit the absorbed cap's proof"
+        )
+
+
+class TestAgentDeclaredAbsorbsDoesNotTransferPlatformAuthority:
+    """SECURITY (capability alias proof laundering): the agent-writable
+    ``problem_model.capabilities[].absorbs`` field must NOT transfer platform proof
+    or an operator exemption from an absorbed capability to the declaring survivor.
+
+    The trust boundary is the PLATFORM ledger: only a genuine, destructive
+    consolidation (a survivor absorbing a JUST-DELETED capability) leaves an
+    ``absorbed_into`` forwarding marker via ``carry_proof_records_for_consolidation``,
+    and only that marker binds an absorbed name to a survivor for the authority
+    seams. Declaring ``absorbs: [proven-or-exempt-name]`` without a real
+    consolidation binds nothing.
+    """
+
+    @staticmethod
+    def _release(problem_model, proof_records):
+        from app.capability_registry import capability_proof_gate_release_status
+
+        return capability_proof_gate_release_status(
+            problem_model, "enforce", proof_records
+        )
+
+    @staticmethod
+    def _consumer(problem_model, proof_records):
+        from app.capability_registry import consumer_gate_proof_status
+
+        return consumer_gate_proof_status(problem_model, proof_records)
+
+    def test_agent_declared_absorbs_does_not_transfer_platform_authority(self):
+        """The named acceptance proof for this fix.
+
+        (i)   An agent-declared ``absorbs`` of a PROVEN capability does NOT clear the
+              enforce gate for the declaring capability when no platform
+              consolidation/forwarding record exists.
+        (ii)  An agent-declared ``absorbs`` of an operator-EXEMPT capability does NOT
+              transfer the exemption.
+        (iii) A GENUINE consolidation (via ``carry_proof_records_for_consolidation``
+              producing a ``capabilities_consolidated`` forwarding record) STILL
+              clears the survivor AND STILL resolves a dependent that names the old
+              absorbed name.
+        """
+        # ── (i) declared absorbs of a PROVEN capability transfers NO proof ────────
+        proven_ledger = {
+            "proven-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::p"}
+            ]
+        }
+        attack_proof_model = {
+            "capabilities": [
+                {
+                    "name": "proven-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::p", "proven": True}
+                    ],
+                },
+                {
+                    # Attacker: no real proof, just declares it absorbs the proven cap.
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        blocked, detail = self._release(attack_proof_model, proven_ledger)
+        assert blocked is True, "the fake absorber must block promotion"
+        assert "attacker-cap" in detail["unproven"], (
+            f"attacker-cap must stay unproven; detail={detail}"
+        )
+        # The consumer gate agrees: attacker-cap does not grade proven.
+        gate = self._consumer(attack_proof_model, proven_ledger)
+        assert gate["attacker-cap"] != "proven"
+        assert gate["proven-cap"] == "proven", "the real capability is unaffected"
+
+        # ── (ii) declared absorbs of an EXEMPT capability transfers NO exemption ──
+        exempt_ledger = _platform_exemption_ledger("exempt-cap")
+        attack_exempt_model = {
+            "capabilities": [
+                {"name": "exempt-cap", "status": "working", "evidence_refs": []},
+                {
+                    "name": "greedy-cap",
+                    "status": "working",
+                    "absorbs": ["exempt-cap"],
+                    "evidence_refs": [],
+                },
+            ]
+        }
+        from app.capability_registry import exempt_capability_names
+
+        exempt_set = exempt_capability_names(attack_exempt_model, exempt_ledger)
+        assert "exempt-cap" in exempt_set, "the genuinely-exempt cap stays exempt"
+        assert "greedy-cap" not in exempt_set, (
+            "a declared-only absorb must NOT inherit the operator exemption"
+        )
+        blocked, detail = self._release(attack_exempt_model, exempt_ledger)
+        assert blocked is True, "the fake absorber of an exempt cap must block"
+        assert "greedy-cap" in detail["unproven"]
+        assert detail["exempt_cleared"] == ["exempt-cap"]
+
+        # ── (iii) a GENUINE consolidation still clears + forwards to the old name ──
+        # Start with a proof recorded under the old (to-be-absorbed) capability, then
+        # run the real consolidation carry: it moves the proof onto the survivor and
+        # leaves a forwarding marker under the old name.
+        pre_consolidation_ledger = {
+            "old-real-cap": [
+                {"task_id": "T9", "proof_kind": "named_test", "proof_ref": "t.py::r"}
+            ]
+        }
+        consolidated_ledger = carry_proof_records_for_consolidation(
+            [{"survivor": "surviving-cap", "absorbed": ["old-real-cap"]}],
+            pre_consolidation_ledger,
+        )
+        # The survivor now owns the real proof; the old key holds a forwarding marker.
+        assert any(
+            e["task_id"] == "T9" for e in consolidated_ledger["surviving-cap"]
+        )
+        assert consolidated_ledger["old-real-cap"][0]["proof_kind"] == "absorbed_into"
+
+        consolidated_model = {
+            "capabilities": [
+                {
+                    "name": "surviving-cap",
+                    "status": "working",
+                    "absorbs": ["old-real-cap"],
+                    # tier-1 append may be lost; the ledger is authoritative.
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::r", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # The survivor clears the release gate.
+        blocked, detail = self._release(consolidated_model, consolidated_ledger)
+        assert blocked is False, f"the genuine survivor must clear; detail={detail}"
+        assert detail["unproven"] == []
+        # And a dependent that still names the OLD absorbed capability resolves
+        # through the survivor's platform proof (consumer gate).
+        gate = self._consumer(consolidated_model, consolidated_ledger)
+        assert gate["old-real-cap"] == "proven", (
+            "a dependent naming the genuinely-absorbed old name must resolve through "
+            "the survivor's forwarded platform proof"
+        )
+        assert gate["surviving-cap"] == "proven"
+
+
+class TestReleaseQualifierAliases:
+    """The release-qualifier enforce gate correctly handles absorbed aliases
+    through the alias-aware ledger corroboration — an absorbed old name is
+    unblocked by the survivor's proof, while a forged name on a non-absorbed
+    capability is never accidentally corroborated.
+    """
+
+    @staticmethod
+    def _status(problem_model, proof_records, **kw):
+        from app.capability_registry import capability_proof_gate_release_status
+
+        return capability_proof_gate_release_status(
+            problem_model, "enforce", proof_records, **kw
+        )
+
+    def test_absorbed_alias_not_uncorroborated(self):
+        """An absorbed old name must NOT appear in ``uncorroborated`` when the
+        survivor has a ledger proof — the alias is resolved through the survivor."""
+        model = {
+            "capabilities": [
+                {
+                    "name": "survivor-x",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        # Genuine consolidation: proof under the survivor + a forwarding marker for
+        # the absorbed old-y. The platform-recorded alias resolves old-y here.
+        records = {
+            "survivor-x": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "old-y": [_fwd_marker("survivor-x", "old-y")],
+        }
+        blocked, detail = self._status(model, records)
+        assert blocked is False
+        assert detail["uncorroborated"] == [], (
+            "the absorbed alias must NOT be reported as uncorroborated: "
+            f"{detail['uncorroborated']}"
+        )
+        assert detail["corroborated"] == ["old-y", "survivor-x"]
+        assert detail["unproven"] == []
+
+    def test_forged_name_not_absorbed_still_blocks(self):
+        """A self-declared ``proven`` capability with a name that is NOT absorbed
+        still BLOCKS — even when a different survivor has a ledger entry.
+
+        The alias retry ONLY helps names that are actually absorbed (keys in the
+        alias map). A forged name sitting outside the absorbed set is never
+        accidentally corroborated."""
+        # ``real-cap`` absorbed ``old-y``. The forged name ``forged-cap`` is
+        # unrelated and sits outside the alias map entirely.
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "absorbs": ["old-y"],
+                    "evidence_refs": [],
+                },
+                {
+                    "name": "forged-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "forged.py", "proven": True}
+                    ],
+                },
+            ]
+        }
+        # real-cap genuinely consolidated old-y (forwarding marker present), but the
+        # release seam does NOT fold ledger upgrades, so real-cap/old-y stay unproven.
+        records = {
+            "real-cap": [
+                {"task_id": "T1", "proof_kind": "named_test", "proof_ref": "t.py::x"}
+            ],
+            "old-y": [_fwd_marker("real-cap", "old-y")],
+        }
+        blocked, detail = self._status(model, records)
+        assert blocked is True
+        # forged-cap is proven in the base map but the ledger has no entry for it.
+        assert "forged-cap" in detail["uncorroborated"], (
+            "a forged name outside the alias map must not be corroborated"
+        )
+        # The release seam now folds platform-ledger upgrades just like the
+        # consumer seams. The genuine consolidation therefore proves real-cap and
+        # its forwarded alias, while the unrelated forged name remains blocked.
+        assert "real-cap" in detail["corroborated"]
+        assert "old-y" in detail["corroborated"]
+        assert "real-cap" not in detail["unproven"]
+        assert "old-y" not in detail["unproven"]
 
 class TestAuthorizedExemptionLedgerCarveOut:
     """Findings #2 + #9: WHO may authorize the one bypass of the machine-proof
@@ -3770,6 +5368,115 @@ class TestAuthorizedExemptionLedgerCarveOut:
         assert detail["uncorroborated"] == []
 
 
+class TestTaskBackedCapabilityProofGate:
+    """The task-provider route has registry-equivalent proof and alias guarantees."""
+
+    @staticmethod
+    def _blocked(need, records, model=None, mode="enforce"):
+        from app.capability_registry import task_backed_capability_need_blocked_by_proof_gate
+
+        return task_backed_capability_need_blocked_by_proof_gate(
+            need, records, model or {"capabilities": []}, mode=mode
+        )
+
+    def test_non_capability_need_never_enters_task_backed_proof_gate(self):
+        assert not self._blocked(
+            {"kind": "task", "ref": "foundation-id"}, {}, mode="enforce"
+        )
+
+    def test_stale_task_backed_ledger_proof_does_not_clear_enforce(self):
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": stale}]
+        }
+        assert self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_fresh_task_backed_ledger_proof_clears_enforce(self):
+        from datetime import datetime, timedelta, timezone
+
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        records = {
+            "provider-cap": [{"proof_kind": "named_test", "proved_at": fresh}]
+        }
+        assert not self._blocked({"kind": "capability", "ref": "provider-cap"}, records)
+
+    def test_absorbed_alias_uses_canonical_proof_and_exemption(self):
+        """A dependent naming a GENUINELY-absorbed old name resolves through the
+        survivor's platform proof / exemption — via the forwarding marker, NOT the
+        agent-writable ``absorbs`` list."""
+        from datetime import datetime, timedelta, timezone
+        from app.capability_registry import build_operator_exemption_record
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "surviving-cap",
+                    "status": "working",
+                    "absorbs": ["old-cap"],
+                }
+            ]
+        }
+        need = {"kind": "capability", "ref": "old-cap"}
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        # Genuine consolidation: proof under the survivor + forwarding marker for old-cap.
+        assert not self._blocked(
+            need,
+            {
+                "surviving-cap": [{"proof_kind": "named_test", "proved_at": fresh}],
+                "old-cap": [_fwd_marker("surviving-cap", "old-cap")],
+            },
+            model,
+        )
+        # And the survivor's operator exemption forwards to the old name too.
+        assert not self._blocked(
+            need,
+            {
+                "surviving-cap": [
+                    build_operator_exemption_record("surviving-cap", "operator")
+                ],
+                "old-cap": [_fwd_marker("surviving-cap", "old-cap")],
+            },
+            model,
+        )
+
+    def test_declared_absorbs_without_marker_does_not_transfer_to_task_gate(self):
+        """SECURITY: a need naming a capability that merely DECLARES ``absorbs:
+        [proven-cap]`` (no genuine consolidation / forwarding marker) stays blocked —
+        it inherits neither the absorbed cap's ledger proof nor its exemption."""
+        from datetime import datetime, timedelta, timezone
+        from app.capability_registry import build_operator_exemption_record
+
+        model = {
+            "capabilities": [
+                {
+                    "name": "attacker-cap",
+                    "status": "working",
+                    "absorbs": ["proven-cap"],
+                }
+            ]
+        }
+        need = {"kind": "capability", "ref": "attacker-cap"}
+        fresh = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        # proven-cap has a real ledger proof, but there is NO forwarding marker
+        # binding attacker-cap to it — only the agent's declared ``absorbs``.
+        assert self._blocked(
+            need,
+            {"proven-cap": [{"proof_kind": "named_test", "proved_at": fresh}]},
+            model,
+        )
+        # Likewise an operator exemption for proven-cap does not transfer.
+        assert self._blocked(
+            need,
+            {"proven-cap": [build_operator_exemption_record("proven-cap", "operator")]},
+            model,
+        )
+
+
 class TestConsumerGateSharesTheReleaseRule:
     """Finding #4: the TWO CONSUMER seams — the spawn-time prerequisite resolver
     (``research_completion``) and the blocked-resume sweep
@@ -3910,6 +5617,40 @@ class TestConsumerGateSharesTheReleaseRule:
         model = {"capabilities": [{"name": "ledger-only", "status": "working"}]}
         assert self._gate(model, self._ledger("ledger-only"))["ledger-only"] == "proven"
 
+    def test_stale_ledger_proof_does_not_corroborate_without_explicit_now(self):
+        """``consumer_gate_proof_status`` with no explicit ``now`` still enforces
+        freshness — a ledger proof older than PROOF_FRESHNESS_TTL is demoted to
+        ``unverified`` rather than corroborating the self-declared ``proven`` claim.
+
+        Before the fix, passing ``now=None`` left the timestamp unresolved and the
+        freshness check was skipped inside ``ledger_corroborated_proof_status``,
+        so an expired historical proof could corroborate a fresh agent-authored claim."""
+        from datetime import datetime, timedelta, timezone
+        from app.evidence_primitive import PROOF_FRESHNESS_TTL
+
+        stale = (
+            datetime.now(timezone.utc) - PROOF_FRESHNESS_TTL - timedelta(days=1)
+        ).isoformat()
+        model = {
+            "capabilities": [
+                {
+                    "name": "real-cap",
+                    "status": "working",
+                    "evidence_refs": [
+                        {"kind": "named_test", "ref": "t.py::x", "proven": True}
+                    ],
+                }
+            ]
+        }
+        records = {"real-cap": [{"proof_kind": "named_test", "proved_at": stale}]}
+        # No explicit now: the gate must still evaluate freshness and reject the stale proof.
+        gate = self._gate(model, records)
+        assert gate["real-cap"] != "proven", (
+            "a stale ledger proof must not corroborate a self-declared claim even "
+            "when consumer_gate_proof_status is called without an explicit now"
+        )
+        assert gate["real-cap"] == "unverified"
+
     def test_consumer_gate_matches_release_gate_verdict(self):
         """The consumer seams and the release seam must reach the SAME verdict on the
         same inputs — divergence between them IS the vulnerability. Every capability
@@ -3971,3 +5712,865 @@ class TestConsumerGateSharesTheReleaseRule:
         )
         assert set(detail["corroborated"]) == {"real-cap"}
         assert set(detail["exempt_cleared"]) == {"human-process-cap"}
+
+
+# ── record_capability_named_test_execution_proof ─────────────────────────────
+
+
+class TestRecordCapabilityNamedTestExecutionProof:
+    """The executed-named_test recorder mints the GENUINE ``proven`` tier.
+
+    Unlike :func:`record_capability_named_test_proof` (static discovery →
+    ``named_test_present`` → ``path_proven``), this recorder stamps the executed
+    ``named_test`` kind, which grades ``proven`` everywhere and corroborates at
+    the enforce gate. It also re-verifies freshness: a second call REPLACES the
+    prior entry rather than deduping it away.
+    """
+
+    def test_named_test_execution_proof_grades_proven(self):
+        """Acceptance: a fresh execution proof grades ``proven`` (not path_proven).
+
+        This is the proof-of-capability seam for design 84021e2d Slice 1 — it
+        exercises the new recorder end-to-end through the shared tiering readers
+        (``classify_evidence_tiered`` on the appended EvidenceRef, and
+        ``working_capability_proof_status`` on the problem_model).
+        """
+        cap_name = "language-aware-repo-map"
+        project = _make_project_with_problem_model(cap_name)
+
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project,
+                cap_name,
+                ["backend/testing/test_prompt.py::test_map"],
+                head_sha="deadbeef",
+            )
+
+        assert result is True
+        entries = project.capability_proof_records[cap_name]
+        assert len(entries) == 1
+        e = entries[0]
+        # The genuine executed tier — NOT the structural named_test_present tier.
+        assert e["proof_kind"] == _PROOF_KIND_NAMED_TEST
+        assert e["proof_kind"] != _PROOF_KIND_NAMED_TEST_PRESENT
+        assert e["executed"] is True
+        assert e["commit_sha"] == "deadbeef"
+        assert e["task_id"] == "named_test_exec:language-aware-repo-map"
+        assert e["test_refs"] == ["backend/testing/test_prompt.py::test_map"]
+
+        # The appended EvidenceRef classifies ``proven`` (named_test is a machine
+        # kind, not in BACKING_ONLY_KINDS).
+        cap = project.problem_model["capabilities"][0]
+        refs = cap["evidence_refs"]
+        assert len(refs) == 1
+        assert refs[0]["kind"] == _PROOF_KIND_NAMED_TEST
+        assert refs[0]["commit_sha"] == "deadbeef"
+        assert classify_evidence_tiered(refs) == "proven"
+
+        # And the working-capability reader grades the whole capability ``proven``.
+        status_map = working_capability_proof_status(project.problem_model)
+        assert status_map.get(cap_name) == "proven"
+
+    def test_named_test_present_still_path_proven(self):
+        """The STATIC recorder is unchanged — it still grades path_proven, so the
+        two recorders are genuinely distinct tiers."""
+        cap_name = "repo-map"
+        static_project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_proof(
+                static_project, cap_name, ["backend/testing/test_repo_map.py"]
+            )
+        static_refs = static_project.problem_model["capabilities"][0]["evidence_refs"]
+        assert classify_evidence_tiered(static_refs) == "path_proven"
+
+    def test_ledger_corroborated_keeps_proven(self):
+        """``ledger_corroborated_proof_status`` does NOT demote an executed proof.
+
+        The platform ledger written by the recorder grades ``proven`` via
+        ``_ledger_proof_status``, so a ``proven`` tier-1 claim is corroborated
+        (kept), not demoted to ``unverified``.
+        """
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["backend/testing/test_repo_map.py"], head_sha="abc"
+            )
+
+        records = project.capability_proof_records
+        assert _ledger_proof_status(records, cap_name) == "proven"
+        corroborated = ledger_corroborated_proof_status(
+            {cap_name: "proven"}, records
+        )
+        assert corroborated[cap_name] == "proven"
+
+    def test_second_call_replaces_rather_than_appends(self):
+        """A second call with a newer commit_sha REPLACES the prior entry.
+
+        Freshness re-verification: the ledger holds exactly one
+        ``named_test_exec:{norm}`` entry, carrying the newer sha and a refreshed
+        timestamp — not two entries.
+        """
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            first = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="sha-old"
+            )
+            second = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="sha-new"
+            )
+
+        assert first is True
+        # Replace-in-place returns True (a fresh proof WAS recorded), not False.
+        assert second is True
+
+        entries = project.capability_proof_records[cap_name]
+        assert len(entries) == 1
+        assert entries[0]["commit_sha"] == "sha-new"
+
+        # The appended EvidenceRef is replaced in place too — one fresh ref.
+        refs = project.problem_model["capabilities"][0]["evidence_refs"]
+        assert len(refs) == 1
+        assert refs[0]["commit_sha"] == "sha-new"
+
+    def test_empty_test_refs_records_nothing(self):
+        """An empty (or whitespace-only) ``test_refs`` records nothing."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["", "   "], head_sha="abc"
+            )
+        assert result is False
+        assert cap_name not in project.capability_proof_records
+        mock_fm.assert_not_called()
+
+    def test_vacuous_green_records_nothing(self):
+        """A non-verifying (skipped/empty) executed suite records nothing."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_a.py"], head_sha="abc",
+                suite_verifying=False,
+            )
+        assert result is False
+        assert cap_name not in project.capability_proof_records
+        mock_fm.assert_not_called()
+
+    def test_unnormalizable_name_records_nothing(self):
+        """A capability name that cannot be normalized returns False."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified") as mock_fm:
+            result = record_capability_named_test_execution_proof(
+                project, "", ["test_a.py"], head_sha="abc"
+            )
+        assert result is False
+        mock_fm.assert_not_called()
+
+    def test_bounded_at_max_entries(self):
+        """The proof entry list stays bounded at _MAX_PROOF_ENTRIES_PER_CAPABILITY."""
+        cap_key = "repo-map"
+        existing = [
+            {
+                "task_id": f"task-{i}",
+                "proved_at": "2026-01-01T00:00:00",
+                "proof_kind": "named_test",
+                "proof_ref": cap_key,
+                "commit_sha": "",
+            }
+            for i in range(_MAX_PROOF_ENTRIES_PER_CAPABILITY)
+        ]
+        project = _make_project_with_problem_model(cap_key)
+        project.capability_proof_records = {cap_key: existing[:]}
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, cap_key, ["test_a.py"], head_sha="abc"
+            )
+        assert result is True
+        entries = project.capability_proof_records[cap_key]
+        assert len(entries) == _MAX_PROOF_ENTRIES_PER_CAPABILITY
+        assert entries[-1]["task_id"] == "named_test_exec:repo-map"
+
+    def test_normalizes_cap_name_with_underscores(self):
+        """Underscored names normalize to hyphens (same key convention)."""
+        project = _make_project()
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, "related_tests", ["test_a.py"], head_sha="abc"
+            )
+        assert result is True
+        assert "related-tests" in project.capability_proof_records
+        assert "related_tests" not in project.capability_proof_records
+
+    def test_env_fingerprint_stored_when_supplied(self):
+        """env_fingerprint is persisted in the proof_entry when non-empty."""
+        cap_name = "gpu-compute"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            result = record_capability_named_test_execution_proof(
+                project, cap_name, ["test_gpu.py"], head_sha="sha1",
+                env_fingerprint="runner-image-v42",
+            )
+        assert result is True
+        e = project.capability_proof_records[cap_name][0]
+        assert e["env_fingerprint"] == "runner-image-v42"
+        # Also present on the appended EvidenceRef
+        ref = project.problem_model["capabilities"][0]["evidence_refs"][0]
+        assert ref["env_fingerprint"] == "runner-image-v42"
+
+    def test_env_fingerprint_absent_when_omitted(self):
+        """Omitting env_fingerprint leaves the entry without that field."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1"
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+    def test_env_fingerprint_absent_when_empty_string(self):
+        """An empty string env_fingerprint is treated as absent (not stored)."""
+        cap_name = "repo-map"
+        project = _make_project_with_problem_model(cap_name)
+        with patch("app.capability_proof.flag_modified"):
+            record_capability_named_test_execution_proof(
+                project, cap_name, ["test_rm.py"], head_sha="sha1",
+                env_fingerprint="",
+            )
+        e = project.capability_proof_records[cap_name][0]
+        assert "env_fingerprint" not in e
+
+
+class TestFreshExecutedProofEnvFingerprint:
+    """_fresh_executed_proof_covers_head env-fingerprint binding behaviour."""
+
+    def _base_entry(self, sha: str = "sha1", env_fp: str | None = None) -> dict:
+        from datetime import datetime
+        entry: dict = {
+            "task_id": "named_test_exec:gpu-compute",
+            "proved_at": datetime(2026, 1, 1).isoformat(),
+            "recorded_at": datetime(2026, 1, 1).isoformat(),
+            "proof_kind": "named_test",
+            "commit_sha": sha,
+            "executed": True,
+        }
+        if env_fp:
+            entry["env_fingerprint"] = env_fp
+        return entry
+
+    def _project_with_entry(self, entry: dict):
+        project = MagicMock()
+        project.capability_proof_records = {"gpu-compute": [entry]}
+        return project
+
+    def test_matching_env_fingerprint_returns_true(self):
+        """Proof is fresh when commit_sha AND env_fingerprint both match."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v1"
+        )
+
+    def test_mismatched_env_fingerprint_returns_false(self):
+        """Proof is stale when commit_sha matches but env_fingerprint differs."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert not _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_stored_ignores_env_binding(self):
+        """Proof with no stored env_fingerprint is fresh on commit_sha+TTL alone."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        project = self._project_with_entry(self._base_entry("sha1"))
+        # Caller supplies a fingerprint but stored proof has none → not env-bound
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now, env_fingerprint="image-v2"
+        )
+
+    def test_no_fingerprint_supplied_ignores_env_binding(self):
+        """Caller omitting env_fingerprint doesn't trigger env-binding check."""
+        from datetime import datetime
+        from app.capability_proof import _fresh_executed_proof_covers_head
+
+        now = datetime(2026, 1, 15)
+        # Stored proof has a fingerprint but caller doesn't supply one
+        project = self._project_with_entry(self._base_entry("sha1", "image-v1"))
+        assert _fresh_executed_proof_covers_head(
+            project, "gpu-compute", "sha1", now=now
+        )
+
+
+class TestResolveHeadAccess:
+    """_resolve_head_access: route HEAD validation through the GitHub reader.
+
+    Production runs the backend under ``/app`` with no ``/tmp/workspace``
+    checkout, so the local-git helpers resolve indeterminate. These tests prove
+    the resolver binds to the project's GitHub integration branch when
+    credentials resolve, and preserves the local-checkout helpers otherwise.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_session_returns_local_helpers(self):
+        from app.capability_proof import (
+            _read_file_at_head,
+            _resolve_head_access,
+        )
+        from app.source_ref_validation import _path_exists_at_head
+
+        verify, read_head = await _resolve_head_access(None, MagicMock())
+        assert verify is _path_exists_at_head
+        assert read_head is _read_file_at_head
+
+    @pytest.mark.asyncio
+    async def test_unresolved_credentials_returns_local_helpers(self):
+        from app.capability_proof import (
+            _read_file_at_head,
+            _resolve_head_access,
+        )
+        from app.source_ref_validation import _path_exists_at_head
+
+        # branch-only context (no token/owner/repo) → no authorized repo.
+        ctx = {"branch": "main", "project_id": "p1"}
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ):
+            verify, read_head = await _resolve_head_access(object(), MagicMock())
+        assert verify is _path_exists_at_head
+        assert read_head is _read_file_at_head
+
+    @pytest.mark.asyncio
+    async def test_github_context_binds_reader_without_checkout(self):
+        """With resolved credentials, verify/read route through the branch
+        snapshot — and succeed even though no /tmp/workspace checkout exists."""
+        from app.capability_proof import _resolve_head_access
+
+        ctx = {
+            "branch": "main",
+            "project_id": "p1",
+            "token": "t",
+            "owner": "o",
+            "repo": "r",
+        }
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ), patch(
+            "app.github_repo_snapshot.path_exists_on_branch",
+            new=AsyncMock(return_value=True),
+        ), patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(True, "import foo\n")),
+        ), patch(
+            # No local checkout exists in prod — the local-git branch must never
+            # be the thing that answers here.
+            "os.path.isdir",
+            return_value=False,
+        ):
+            verify, read_head = await _resolve_head_access(object(), MagicMock())
+            exists = await verify("backend/app/capability_proof.py")
+            text = await read_head("backend/app/capability_proof.py")
+
+        assert exists is True
+        assert text == "import foo\n"
+
+
+class TestEarnLoopWithoutCheckout:
+    """commission_proof_earn_loop earns proof with no /tmp/workspace checkout.
+
+    Regression for g-capability-proof-gating: the backend image runs under
+    ``/app`` and has no local git checkout, so HEAD validation must route
+    through the project-scoped GitHub reader. With neither ``verify_path`` nor
+    ``read_head`` injected, the earn loop resolves the project's integration
+    branch and validates a real source reference against the branch snapshot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_earns_backing_path_proof_via_github_reader(self):
+        project = MagicMock()
+        project.capability_proof_records = {}
+        problem_model = {
+            "capabilities": [
+                {
+                    "name": "prod-cap",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                }
+            ]
+        }
+        project.problem_model = problem_model
+        demand_result = {
+            "total": 1,
+            "demands": [
+                {"kind": "capability", "ref": "prod-cap", "dependent_count": 3},
+            ],
+        }
+
+        ctx = {
+            "branch": "main",
+            "project_id": "p1",
+            "token": "t",
+            "owner": "o",
+            "repo": "r",
+        }
+
+        # Backing path present on the branch; no convention-named test discovered
+        # (glob/dir lookups return None) so the loop records the structural
+        # backing_path proof — all resolved via the GitHub snapshot, never a
+        # local checkout (os.path.isdir is False, mimicking the /app image).
+        async def _exists(path, **kwargs):
+            return path == "backend/app/capability_proof.py"
+
+        with patch(
+            "app.source_ref_validation.resolve_branch_verification_context",
+            new=AsyncMock(return_value=ctx),
+        ), patch(
+            "app.github_repo_snapshot.path_exists_on_branch",
+            new=AsyncMock(side_effect=_exists),
+        ), patch(
+            "app.github_repo_snapshot.glob_exists_on_branch",
+            new=AsyncMock(return_value=None),
+        ), patch(
+            "app.github_repo_snapshot.file_text_on_branch",
+            new=AsyncMock(return_value=(False, None)),
+        ), patch(
+            "os.path.isdir", return_value=False
+        ), patch(
+            "app.capability_proof.flag_modified"
+        ):
+            result = await commission_proof_earn_loop(
+                project,
+                demand_result=demand_result,
+                problem_model=problem_model,
+                session=object(),
+            )
+
+        assert result["earned"] == 1, (
+            "earn loop must validate the source ref via the GitHub reader with "
+            "no local checkout present"
+        )
+        assert "prod-cap" in project.capability_proof_records
+
+
+# ── resolve_no_backing_paths_gap ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_without_discovery():
+    """A cap with no discoverable backing_paths returns unresolved."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _no_candidates(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_no_candidates,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "no-backing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["trial_enrolled"] is False
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_discovery_backing_path():
+    """A cap with discoverable candidates but no covering test records a
+    backing_path proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _no_test(*_a, **_kw):
+        return []
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_no_test,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_backing_path_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_BACKING_PATH
+    assert result["named_test_earned"] is False
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_with_named_test_present():
+    """A cap with discoverable candidates that are test-covered records a
+    named_test_present proof."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value=None,
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ), patch(
+        "app.capability_proof.record_capability_named_test_proof",
+        return_value=True,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["proof_kind"] == _PROOF_KIND_NAMED_TEST_PRESENT
+    assert result["named_test_earned"] is True
+    assert result["discovery_suggestions"] == ["backend/app/discovered_cap.py"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_enrolled():
+    """A cap whose covering tests trigger trial enrollment returns
+    trial_enrolled=True."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="enrolled",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_enrolled"] is True
+    assert result["proof_kind"] is None
+    assert result["named_test_earned"] is False
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_trial_fresh():
+    """A cap with a fresh executed proof already at HEAD returns trial_fresh."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _discover(*_a, **_kw):
+        return ["backend/app/discovered_cap.py"]
+
+    async def _has_test(*_a, **_kw):
+        return ["backend/testing/test_discovered_cap.py"]
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_discover,
+    ), patch(
+        "app.capability_proof._named_tests_covering_paths",
+        new=_has_test,
+    ), patch(
+        "app.capability_proof._maybe_enroll_proof_trial",
+        return_value="fresh",
+    ), patch(
+        "app.capability_proof.flag_modified",
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "discovered-cap", project=project,
+        )
+
+    assert result["resolved"] is True
+    assert result["trial_fresh"] is True
+    assert result["trial_enrolled"] is False
+
+
+# ── capability_earn_obligation_dedupe_key ─────────────────────────────────────
+
+
+class TestCapabilityEarnObligationDedupeKey:
+    """capability_earn_obligation_dedupe_key produces stable, unique keys."""
+
+    def test_key_is_stable_across_calls(self):
+        """Same project_id + cap_name always produces the same key."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        assert capability_earn_obligation_dedupe_key(pid, "repo-map") == (
+            capability_earn_obligation_dedupe_key(pid, "repo-map")
+        )
+
+    def test_key_includes_project_and_cap(self):
+        """The key encodes both project_id and cap_name for global uniqueness."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        key = capability_earn_obligation_dedupe_key(pid, "repo-map")
+        assert "repo-map" in key
+        assert str(pid) in key
+
+    def test_different_caps_produce_different_keys(self):
+        """Two distinct cap_names under the same project yield distinct keys."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+        assert capability_earn_obligation_dedupe_key(pid, "repo-map") != (
+            capability_earn_obligation_dedupe_key(pid, "ci-integration")
+        )
+
+    def test_different_projects_produce_different_keys(self):
+        """Same cap_name under different projects yields distinct keys."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid_a = uuid.UUID("cccccccc-cccc-cccc-cccc-cccccccccccc")
+        pid_b = uuid.UUID("dddddddd-dddd-dddd-dddd-dddddddddddd")
+        assert capability_earn_obligation_dedupe_key(pid_a, "repo-map") != (
+            capability_earn_obligation_dedupe_key(pid_b, "repo-map")
+        )
+
+    def test_key_has_expected_prefix(self):
+        """The key starts with the 'capability_earn_obligation:' prefix."""
+        from app.completion_debt import capability_earn_obligation_dedupe_key
+
+        pid = uuid.UUID("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee")
+        key = capability_earn_obligation_dedupe_key(pid, "test-cap")
+        assert key.startswith("capability_earn_obligation:")
+
+    def test_kind_constant_is_correct(self):
+        """KIND_CAPABILITY_EARN_OBLIGATION is the expected string literal."""
+        from app.completion_debt import KIND_CAPABILITY_EARN_OBLIGATION
+
+        assert KIND_CAPABILITY_EARN_OBLIGATION == "capability_earn_obligation"
+
+
+@pytest.mark.asyncio
+async def test_resolve_gap_discovery_degrades_gracefully():
+    """A discovery failure degrades to unresolved (never raises)."""
+    from unittest.mock import MagicMock, patch
+
+    project = MagicMock()
+    project.capability_proof_records = {}
+
+    async def _raise_error(*_a, **_kw):
+        raise RuntimeError("transient discovery failure")
+
+    with patch(
+        "app.capability_proof._discover_candidate_backing_paths",
+        new=_raise_error,
+    ):
+        result = await resolve_no_backing_paths_gap(
+            "failing-cap", project=project,
+        )
+
+    assert result["resolved"] is False
+    assert result["proof_kind"] is None
+    assert result["discovery_suggestions"] == []
+
+
+# ── enroll_capability_proof_trial unit tests ──────────────────────────────────
+
+
+class TestEnrollCapabilityProofTrialGuards:
+    """Unit tests for enroll_capability_proof_trial guards and dedup logic.
+
+    Tests run against the real function with a mocked SQLAlchemy session so
+    the DB-dependent paths are exercised without a live DB.
+    """
+
+    @staticmethod
+    def _make_session(scalar_result=None):
+        """Return an async-capable mock session.
+
+        scalar_result: value returned by scalar_one_or_none() (None = no match).
+        """
+        execute_result = MagicMock()
+        execute_result.scalar_one_or_none.return_value = scalar_result
+        session = AsyncMock()
+        session.execute = AsyncMock(return_value=execute_result)
+        session.add = MagicMock()
+        session.commit = AsyncMock()
+        session.refresh = AsyncMock()
+        return session
+
+    @staticmethod
+    def _make_project(project_id=None):
+        p = MagicMock()
+        p.id = project_id or uuid.uuid4()
+        return p
+
+    @pytest.mark.asyncio
+    async def test_empty_refs_after_cap_returns_none(self):
+        """Belt-and-suspenders: refs empty after [:MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES]
+        returns None instead of enrolling an empty-refs trial."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc), \
+                patch("app.capability_proof.MAX_CAPABILITY_PROOF_TRIAL_TEST_FILES", 0):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        # Nothing should have been committed.
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_in_flight_trial_blocks_enrollment(self):
+        """Dedup guard: an existing in-flight (non-terminal) trial returns None
+        without creating a second task."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        existing_id = uuid.uuid4()
+        session = self._make_session(scalar_result=existing_id)
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        session.add.assert_not_called()
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_completed_trial_does_not_block_reenrollment(self):
+        """Dedup guard only blocks on in-flight statuses — a COMPLETED trial must
+        allow re-enrollment so a fresh commit can trigger a new run."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        # session.execute returns no in-flight match (COMPLETED not in the set)
+        session = self._make_session(scalar_result=None)
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        task_mock = MagicMock()
+        task_mock.id = uuid.uuid4()
+        session.refresh = AsyncMock(side_effect=lambda t: setattr(t, "id", task_mock.id))
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+                head_sha="abc123",
+            )
+
+        # A new task must have been added and committed.
+        session.add.assert_called_once()
+        session.commit.assert_awaited_once()
+        added_task = session.add.call_args[0][0]
+        assert added_task.payloads[0]["cap"] == "test-capability"
+        assert added_task.payloads[0]["head_sha"] == "abc123"
+        assert added_task.payloads[0]["test_refs"] == ["backend/testing/test_foo.py"]
+
+    @pytest.mark.asyncio
+    async def test_flag_off_returns_none(self):
+        """When capability_proof_execution_trials_enabled is False, enrollment
+        is a no-op regardless of inputs."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": False}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=["backend/testing/test_foo.py"],
+            )
+
+        assert result is None
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_empty_test_refs_input_returns_none(self):
+        """No usable refs at all (empty list) returns None without DB access."""
+        from app.capability_proof import enroll_capability_proof_trial
+
+        session = self._make_session()
+        project = self._make_project()
+        rc = {"capability_proof_execution_trials_enabled": True}
+
+        with patch("app.shared_state.runtime_config", new=rc):
+            result = await enroll_capability_proof_trial(
+                session,
+                project,
+                cap_name="test-capability",
+                test_refs=[],
+            )
+
+        assert result is None
+        session.commit.assert_not_awaited()

@@ -38,28 +38,28 @@ def test_custom_domain_alerts_require_project_enablement():
 
     decision = should_emit_project_alert(
         project,
-        "warm_pool.payoff",
+        "release.calcifying",
         severity=AlertSeverity.WARNING,
     )
 
     assert decision.emit is False
-    assert decision.reason == "domain_disabled:warm_pool"
+    assert decision.reason == "domain_disabled:release_lifecycle"
 
 
 def test_build_config_can_enable_reusable_alert_domain():
     project = make_project(
         is_self_repo=False,
-        build_config={"alert_domains": {DOMAIN_WARM_POOL: {"enabled": True}}},
+        build_config={"alert_domains": {DOMAIN_RELEASE_LIFECYCLE: {"enabled": True}}},
     )
 
     decision = should_emit_project_alert(
         project,
-        "warm_pool.payoff",
+        "release.calcifying",
         severity=AlertSeverity.WARNING,
     )
 
     assert decision.emit is True
-    assert decision.domain == DOMAIN_WARM_POOL
+    assert decision.domain == DOMAIN_RELEASE_LIFECYCLE
 
 
 def test_self_repo_keeps_existing_domain_alert_defaults():
@@ -137,19 +137,21 @@ def test_info_severity_is_suppressed_for_durable_alerts():
 
     assert decision.emit is False
     assert decision.reason == "info_severity"
+    assert decision.domain == DOMAIN_RELEASE_LIFECYCLE
 
 
-def test_proven_info_alert_surfaces_when_allow_info_set():
+def test_audience_gate_suppresses_strategist_internal_events():
+    """Strategist-internal events are suppressed regardless of domain enablement."""
     project = make_project(is_self_repo=True)
 
     decision = should_emit_project_alert(
         project,
         "warm_pool.payoff",
-        severity=AlertSeverity.INFO,
+        severity=AlertSeverity.WARNING,
     )
 
-    assert decision.emit is True
-    assert decision.domain == DOMAIN_WARM_POOL
+    assert decision.emit is False
+    assert decision.reason == "audience:strategist-internal"
 
 
 def test_apply_project_alert_domain_updates_round_trips_build_config():
@@ -194,18 +196,18 @@ async def test_create_project_alert_if_allowed_suppresses_disabled_domain(
     alert, created, decision = await create_project_alert_if_allowed(
         db_session,
         project_id=project.id,
-        event_type="warm_pool.payoff",
+        event_type="release.calcifying",
         severity=AlertSeverity.WARNING,
-        title="Warm-pool payoff: COST_REGRESSION",
-        message="Disable or reduce the pool.",
+        title="Release calcifying",
+        message="Version release is calcifying.",
         source="test",
-        dedupe_key=f"warm_pool.payoff:{project.id}",
+        dedupe_key=f"release.calcifying:{project.id}",
         broadcast=True,
     )
 
     assert alert is None
     assert created is False
-    assert decision.reason == "domain_disabled:warm_pool"
+    assert decision.reason == "domain_disabled:release_lifecycle"
     broadcast.assert_not_called()
     rows = (await db_session.execute(select(Alert))).scalars().all()
     assert rows == []
@@ -216,40 +218,37 @@ async def test_create_project_alert_if_allowed_dedups_and_counts(db_session, moc
     broadcast = mocker.patch(
         "app.alert_policy.broadcast_to_project", new_callable=AsyncMock
     )
-    project = make_project(
-        is_self_repo=False,
-        build_config={"alert_domains": {DOMAIN_WARM_POOL: {"enabled": True}}},
-    )
+    project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
     kwargs = dict(
         project_id=project.id,
-        event_type="warm_pool.payoff",
+        event_type="runner.deactivated",
         severity=AlertSeverity.WARNING,
-        title="Warm-pool payoff: COST_REGRESSION",
-        message="Disable or reduce the pool.",
+        title="Runner deactivated",
+        message="Runner is offline.",
         source="test",
-        dedupe_key=f"warm_pool.payoff:{project.id}",
+        dedupe_key=f"runner.deactivated:{project.id}",
         broadcast=True,
     )
     first, created, decision = await create_project_alert_if_allowed(
         db_session, **kwargs
     )
     second, created_again, _ = await create_project_alert_if_allowed(
-        db_session, **{**kwargs, "message": "Still regressing."}
+        db_session, **{**kwargs, "message": "Still offline."}
     )
 
     assert decision.emit is True
     assert created is True
     assert created_again is False
     assert first.id == second.id
-    assert second.domain == DOMAIN_WARM_POOL
-    assert second.event_type == "warm_pool.payoff"
+    assert second.domain == "core"
+    assert second.event_type == "runner.deactivated"
     assert second.occurrence_count == 2
     assert second.last_seen_at is not None
-    assert second.message == "Still regressing."
+    assert second.message == "Still offline."
     broadcast.assert_awaited_once()
 
 

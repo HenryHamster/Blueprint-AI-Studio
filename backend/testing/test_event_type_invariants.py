@@ -45,10 +45,16 @@ def test_extract_event_types_from_source():
         snapshot = json.load(f)
     snapshot_events = {et["name"] for et in snapshot["event_types"]}
 
-    # Extract event_type="..." from all source files using regex
-    # Find all event_type="..." patterns (both function args and dict keys)
-    # Matches: event_type="value" and "event_type": "value"
-    pattern = r'(?:event_type|"event_type")\s*[:=]\s*["\']([^"\']+)["\']'
+    # Extract event_type="..." from all source files using regex.
+    # Match keyword arguments, dict entries, and typed default parameters:
+    #   event_type="value"
+    #   "event_type": "value"
+    #   event_type: str = "value"
+    pattern = (
+        r'(?:event_type|"event_type")\s*'
+        r'(?:[:=]|:\s*[A-Za-z_][\w.\[\] |]*\s*=)\s*'
+        r'["\']([^"\']+)["\']'
+    )
     source_events: set[str] = set()
     for source_path in source_paths:
         with open(source_path) as f:
@@ -84,8 +90,9 @@ def test_snapshot_has_required_fields():
     with open(snapshot_path) as f:
         snapshot = json.load(f)
 
-    required_fields = {"name", "classification", "source_fn"}
+    required_fields = {"name", "classification", "source_fn", "audience"}
     valid_classifications = {"escalation", "high_signal", "routine"}
+    valid_audiences = {"operator-action-needed", "operator-fyi", "strategist-internal", "pipeline-log"}
 
     for entry in snapshot["event_types"]:
         missing = required_fields - set(entry.keys())
@@ -98,6 +105,69 @@ def test_snapshot_has_required_fields():
             f"Event type '{entry['name']}' has invalid classification '{classification}'. "
             f"Must be one of: {valid_classifications}"
         )
+
+        audience = entry.get("audience")
+        assert audience in valid_audiences, (
+            f"Event type '{entry['name']}' has invalid audience '{audience}'. "
+            f"Must be one of: {valid_audiences}"
+        )
+
+
+def test_all_snapshot_entries_have_audience():
+    """Every event type in the snapshot must carry an ``audience`` field.
+
+    This is the fail-closed guard for the ledger side: any event type without
+    ``audience`` would default to ``strategist-internal`` (suppressed for the
+    operator).  A new ``post_*_message`` function whose event type is missing
+    from the snapshot (or lacks ``audience``) fails CI — the same mechanism
+    that keeps ``HIGH_SIGNAL_NOTE_EVENT_TYPES`` honest today.
+    """
+    snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
+    with open(snapshot_path) as f:
+        snapshot = json.load(f)
+
+    valid_audiences = {"operator-action-needed", "operator-fyi", "strategist-internal", "pipeline-log"}
+    for entry in snapshot["event_types"]:
+        audience = entry.get("audience")
+        assert audience in valid_audiences, (
+            f"Event type '{entry['name']}' has missing or invalid audience='{audience}'. "
+            f"Every event type must declare an audience in {valid_audiences}."
+        )
+
+
+def test_snapshot_audience_matches_runtime_registry():
+    """Every snapshot entry's ``audience`` must match the live ``route_event`` registry.
+
+    The snapshot is the ledger-side declaration; ``message_audience._EVENT_AUDIENCE_REGISTRY``
+    is the runtime resolver. If they drift — e.g. someone edits the registry without updating
+    the snapshot or vice-versa — an event type would resolve to a different audience at
+    runtime than the one declared in the snapshot, silently leaking internal notices to
+    the operator or suppressing operator-visible items.
+    """
+    import importlib
+
+    snapshot_path = Path(__file__).parent / "event_type_snapshot.json"
+    with open(snapshot_path) as f:
+        snapshot = json.load(f)
+
+    ma = importlib.import_module("app.message_audience")
+
+    mismatches: list[str] = []
+    for entry in snapshot["event_types"]:
+        name = entry["name"]
+        expected_audience = entry["audience"]
+        actual_audience = ma.route_event(name)
+        if actual_audience != expected_audience:
+            mismatches.append(
+                f"  {name!r}: snapshot={expected_audience!r}, registry={actual_audience!r}"
+            )
+
+    assert not mismatches, (
+        "Snapshot audience does not match runtime registry for:\n"
+        + "\n".join(mismatches)
+        + "\n\n→ Update either event_type_snapshot.json or message_audience._EVENT_AUDIENCE_REGISTRY"
+        " so they agree."
+    )
 
 
 def test_high_signal_note_set_matches_snapshot():

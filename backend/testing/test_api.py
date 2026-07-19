@@ -161,6 +161,47 @@ async def test_get_project_tasks_filter_by_direction_and_type(
 
 
 @pytest.mark.asyncio
+async def test_get_project_tasks_hides_backend_managed_but_keeps_payloadless(
+    client: AsyncClient, db_session
+):
+    project = Project(name="Task cleanliness", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    normal = Task(project_id=project.id, title="normal parent", payloads=[])
+    shadow = Task(
+        project_id=project.id,
+        title="Resident operator turn (shadow)",
+        payloads=[{"type": "strategic_resident_turn"}],
+        archived=True,
+    )
+    db_session.add(normal)
+    db_session.add(shadow)
+    await db_session.commit()
+
+    response = await client.get(f"/api/projects/{project.id}/tasks")
+    assert response.status_code == 200
+    # BACKEND_MANAGED_TASK_TYPES is now empty (M4 flipped strategic_resident_turn
+    # to execution_owner=agent), so the default listing no longer hides the
+    # archived resident-turn shadow row — it matches the include_backend_managed
+    # view below. Compare as a set (PG created_at ties make ordering nondeterministic).
+    assert {row["title"] for row in response.json()["tasks"]} == {
+        "normal parent",
+        "Resident operator turn (shadow)",
+    }
+
+    debug = await client.get(
+        f"/api/projects/{project.id}/tasks?include_backend_managed=true"
+    )
+    assert {row["title"] for row in debug.json()["tasks"]} == {
+        "normal parent",
+        "Resident operator turn (shadow)",
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_project_tasks_includes_cost_fields(client: AsyncClient, db_session):
     """
     Completed tasks with VM timing data expose duration_seconds and

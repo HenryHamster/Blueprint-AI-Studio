@@ -100,6 +100,19 @@ export interface ResetOptions {
   baseBranch?: string;
 }
 
+/**
+ * Raised before a warm handoff attempts to run git in a workspace that no
+ * longer exists.  Keeping this distinct from an exec failure makes a failed
+ * clone/removal immediately diagnosable instead of surfacing as `spawn git
+ * ENOENT` (which incorrectly suggests the git binary is missing).
+ */
+export class WorkspaceMissingError extends Error {
+  constructor(workspace: string) {
+    super(`workspace missing at ${workspace} — cannot hand off to next role`);
+    this.name = 'WorkspaceMissingError';
+  }
+}
+
 // Home-relative provider credential / CLI-state paths the boot manifest
 // materializes (build_agent_secret_manifest → materialize_manifest.py): provider
 // API/OAuth cred dirs plus the Claude Code onboarding-bypass file ~/.claude.json
@@ -276,6 +289,13 @@ export async function resetForNextRole(opts: ResetOptions): Promise<void> {
   // Step 4 — reset the workspace to a clean HEAD while preserving
   // dependency caches. This is the only step we re-throw on; if the
   // workspace itself is gone we cannot hand off to the next role.
+  try {
+    await fs.promises.stat(workspace);
+  } catch {
+    const workspaceError = new WorkspaceMissingError(workspace);
+    console.error(`[reset] step 4 (workspace check) failed: ${workspaceError.message}`);
+    throw workspaceError;
+  }
   try {
     await execFileAsync('git', ['reset', '--hard', 'HEAD'], { cwd: workspace });
   } catch (err) {

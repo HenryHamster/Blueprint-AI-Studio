@@ -3,8 +3,8 @@
 Covers:
 - ``_is_chronic_offender`` threshold logic (window and growth triggers)
 - ``_parse_git_diff_output`` diff parsing
-- ``_emit_size_violation_alerts`` escalation: chronic → ERROR, first-time → WARNING
-- Dedup behaviour for chronic alerts
+- ``_emit_size_violation_alerts`` operator-alert suppression
+- Repeated chronic and first-time violations remain strategist-internal
 - Acceptance criterion: ``test_chronic_offender_escalates_not_silently_bumped``
 """
 
@@ -17,7 +17,7 @@ import pytest
 from sqlmodel import select
 
 from app import hotfix_backmerge as hb
-from app.models import Alert, AlertSeverity, Project
+from app.models import Alert, Project
 from app.size_limit_policy import (
     CHRONIC_WINDOW_DAYS,
     BumpRecord,
@@ -199,12 +199,7 @@ def test_parse_git_diff_empty_output():
 
 @pytest.mark.asyncio
 async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker):
-    """Acceptance criterion: a module past the chronic-bump threshold produces
-    an ERROR alert with a decomposition signal; a first-time breach is WARNING.
-
-    This is the primary acceptance test named by the task's proof selector:
-    test_size_offender_governance.py::test_chronic_offender_escalates_not_silently_bumped
-    """
+    """Size governance remains strategist-internal with no operator Alert rows."""
     project = await _make_project(db_session)
 
     # --- chronic offender: 3 recent bumps (within CHRONIC_WINDOW_DAYS) ---
@@ -213,7 +208,9 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
         _record(4050, 4500, CHRONIC_WINDOW_DAYS - 60),
         _record(4500, 4700, 30),
     ]
-    with patch("app.hotfix_backmerge.parse_bump_history", return_value=chronic_history):
+    with patch(
+        "app.hotfix_backmerge.parse_bump_history", return_value=chronic_history
+    ) as parse_history:
         await hb._emit_size_violation_alerts(
             db_session,
             project.id,
@@ -229,22 +226,8 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
             trigger_desc="",
         )
     await db_session.flush()
-
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 1
-    chronic_alert = alerts[0]
-
-    # Must escalate to ERROR — not WARNING
-    assert chronic_alert.severity == AlertSeverity.ERROR, (
-        f"Expected ERROR for chronic offender but got {chronic_alert.severity}"
-    )
-    # Title must name the module and indicate decomposition required
-    assert "reaper_sweeps.py" in chronic_alert.title
-    assert "decomposition required" in chronic_alert.title.lower()
-    # Message must mention decomposition (not just 'consider decomposing')
-    assert "decomposition" in chronic_alert.message.lower()
-    # Message should NOT offer 'bump the cap' as an option
-    assert "bumping the cap" not in chronic_alert.message.lower()
+    parse_history.assert_not_called()
+    assert await _alerts_for(db_session, project.id) == []
 
     # --- first-time breach: empty history → WARNING ---
     with patch("app.hotfix_backmerge.parse_bump_history", return_value=[]):
@@ -264,17 +247,12 @@ async def test_chronic_offender_escalates_not_silently_bumped(db_session, mocker
         )
     await db_session.flush()
 
-    all_alerts = await _alerts_for(db_session, project.id)
-    assert len(all_alerts) == 2
-    first_alert = next(a for a in all_alerts if "orchestrator.py" in a.title)
-    assert first_alert.severity == AlertSeverity.WARNING, (
-        f"Expected WARNING for first-time breach but got {first_alert.severity}"
-    )
+    assert await _alerts_for(db_session, project.id) == []
 
 
 @pytest.mark.asyncio
 async def test_chronic_alert_deduplicates(db_session, mocker):
-    """A second call for the same chronic module does not create a duplicate alert."""
+    """Repeated chronic violations remain absent from operator Alert rows."""
     project = await _make_project(db_session)
     chronic_history = [
         _record(1000, 1200, CHRONIC_WINDOW_DAYS - 10),
@@ -291,19 +269,19 @@ async def test_chronic_alert_deduplicates(db_session, mocker):
             db_session, project.id, violations=violation, pr_number=10, trigger_desc=""
         )
         await db_session.flush()
-        assert len(await _alerts_for(db_session, project.id)) == 1
+        assert await _alerts_for(db_session, project.id) == []
 
         # Second call — should not create a duplicate.
         await hb._emit_size_violation_alerts(
             db_session, project.id, violations=violation, pr_number=11, trigger_desc=""
         )
         await db_session.flush()
-        assert len(await _alerts_for(db_session, project.id)) == 1
+        assert await _alerts_for(db_session, project.id) == []
 
 
 @pytest.mark.asyncio
 async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker):
-    """If parse_bump_history raises, _emit_size_violation_alerts still emits a WARNING."""
+    """If parse_bump_history raises, the audience gate already suppressed the alert."""
     project = await _make_project(db_session)
 
     with patch(
@@ -326,9 +304,7 @@ async def test_parse_bump_history_error_does_not_block_alert(db_session, mocker)
         )
     await db_session.flush()
 
-    alerts = await _alerts_for(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
+    assert await _alerts_for(db_session, project.id) == []
 
 
 # ---------------------------------------------------------------------------

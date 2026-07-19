@@ -35,6 +35,7 @@ vi.mock('child_process', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   WORKSPACE: '',
   getAgentToken: vi.fn().mockReturnValue(null),
   log: vi.fn(),
@@ -74,6 +75,7 @@ vi.mock('../prompt.js', () => ({
   writeMessagesHelper: vi.fn(),
   writeSkillHelpers: vi.fn(),
   formatSkills: vi.fn(() => ''),
+  formatProjectTools: vi.fn(() => ''),
   SHARED_LIFECYCLE_REMAINDER: '',
 }));
 
@@ -84,6 +86,7 @@ import {
   getLastProviderRunErrorReport,
   _setLastProviderRunErrorReportForTesting,
   __setCommandExistsOverrideForSmoke,
+  refreshRuntimeState,
 } from './runners.js';
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
@@ -628,5 +631,45 @@ describe('drainJsonChunks — tool-result byte accounting (user events)', () => 
     await runProviderAgent('prompt', null, { value: '' });
     expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledOnce();
     expectCalledWith(recordToolResultBytes, expectedBytes);
+  });
+});
+
+describe('text-mode stdout handler (Gemini) — recordToolUse on progress', () => {
+  // Save/restore PROVIDER env so gemini tests don't leak into siblings.
+  const savedProvider = process.env.PROVIDER;
+
+  beforeEach(() => {
+    mockRecordToolUse.mockClear();
+    vi.mocked(spawn).mockReset();
+    process.env.PROVIDER = 'gemini';
+    process.env.GEMINI_API_KEY = 'test-key';
+    refreshRuntimeState();
+  });
+
+  afterEach(() => {
+    process.env.PROVIDER = savedProvider;
+    delete process.env.GEMINI_API_KEY;
+    refreshRuntimeState();
+  });
+
+  it('calls recordToolUse("model_output", ...) when text-mode stdout emits non-empty text', async () => {
+    // emitStream sends raw lines; text-mode (gemini) passes them through as-is.
+    emitStream(['Writing tests for the new feature']);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(mockRecordToolUse).toHaveBeenCalledWith('model_output', 'Writing tests for the new feature');
+  });
+
+  it('calls recordToolUse once per non-empty chunk', async () => {
+    emitStream(['first chunk', 'second chunk']);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(mockRecordToolUse).toHaveBeenCalledTimes(2);
+    expect(mockRecordToolUse).toHaveBeenCalledWith('model_output', 'first chunk');
+    expect(mockRecordToolUse).toHaveBeenCalledWith('model_output', 'second chunk');
+  });
+
+  it('does NOT call recordToolUse for whitespace-only chunks', async () => {
+    emitStream(['   ']);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(mockRecordToolUse).not.toHaveBeenCalled();
   });
 });

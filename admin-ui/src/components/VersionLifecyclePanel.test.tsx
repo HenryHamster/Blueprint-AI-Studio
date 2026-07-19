@@ -8,6 +8,7 @@ vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  getIdTokenAfterAuthRestore: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
   signOut: vi.fn(),
 }));
@@ -88,6 +89,36 @@ describe('VersionLifecyclePanel', () => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
+  });
+
+  it('separates lifetime qualifications from the current error retry episode', () => {
+    render(
+      <VersionLifecyclePanel
+        data={makeVersionLifecycleResponse({
+          current_version: makeCurrentVersion({
+            phase: 'stabilize',
+            qualification_attempts: 11,
+            qualification_trigger_state: {
+              auto_trigger: 'armed',
+              last_attempt: null,
+              next_expected_trigger: 'sweep_retry',
+              blocking: [],
+              lifetime_qualification_attempts: 11,
+              error_retry_episode: { count: 0, cap: 5 },
+              knob: 'on',
+              evaluated_at: '2026-01-01T00:00:00Z',
+            },
+          }),
+        })}
+        loading={false}
+        projectId="proj-1"
+        onRefresh={mockRefresh}
+      />
+    );
+
+    expect(screen.getByText('11 lifetime qualifications')).toBeInTheDocument();
+    expect(screen.getByText('lifetime qualifications: 11')).toBeInTheDocument();
+    expect(screen.getByText('error retry episode: 0/5')).toBeInTheDocument();
   });
 
   it('renders the promotion policy source and fallback reason', () => {
@@ -4325,6 +4356,185 @@ describe('VersionLifecyclePanel', () => {
         expect(screen.getByTestId('verdict-history')).toBeInTheDocument();
       });
       expect(screen.queryByText(/d:\d+open/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe('hotfix remediation panel', () => {
+    function makeInfraFailureVersion(isPermanent: boolean) {
+      return makeCurrentVersion({
+        phase: 'stabilize',
+        active_candidate_sha: 'abc1234567890',
+        last_qualification: makeQualification({
+          status: 'infra_failure',
+          error: 'migration_apply_check_unavailable',
+          consecutive_infra_errors: 3,
+          is_permanent_gate_incapacity: isPermanent,
+        }),
+      });
+    }
+
+    it('shows hotfix remediation panel when is_permanent_gate_incapacity is true', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.getByTestId('hotfix-remediation-panel')).toBeInTheDocument();
+      expect(screen.getByText(/Permanent gate incapacity/)).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-open-btn')).toBeInTheDocument();
+    });
+
+    it('does not show hotfix remediation panel when is_permanent_gate_incapacity is false', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(false) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('hotfix-remediation-panel')).not.toBeInTheDocument();
+    });
+
+    it('does not show hotfix panel without a projectId', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId={null}
+          onRefresh={mockRefresh}
+        />
+      );
+      expect(screen.queryByTestId('hotfix-remediation-panel')).not.toBeInTheDocument();
+    });
+
+    it('loads scope preview on clicking Inspect hotfix eligibility', async () => {
+      vi.mocked(api.getHotfixPreview).mockResolvedValue({
+        status: 'eligible',
+        eligible: true,
+        changed_files: ['backend/app/release_scoring.py'],
+        offending_files: [],
+        reason: 'All changed files are hotfix-eligible.',
+        candidate_sha: 'abc1234567890',
+        prior_deployed_sha: 'def9876543210',
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('hotfix-open-btn'));
+      await waitFor(() => {
+        expect(screen.getByText(/Eligible for hotfix-deploy/)).toBeInTheDocument();
+      });
+      expect(screen.getByText(/All changed files are hotfix-eligible/)).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-reason-input')).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-ack-checkbox')).toBeInTheDocument();
+      expect(screen.getByTestId('hotfix-promote-btn')).toBeDisabled();
+    });
+
+    it('requires reason and ack before enabling hotfix promote', async () => {
+      vi.mocked(api.getHotfixPreview).mockResolvedValue({
+        status: 'eligible',
+        eligible: true,
+        changed_files: ['backend/app/release_scoring.py'],
+        offending_files: [],
+        reason: 'All changed files are hotfix-eligible.',
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('hotfix-open-btn'));
+      await waitFor(() => expect(screen.getByTestId('hotfix-promote-btn')).toBeInTheDocument());
+
+      // Neither filled → disabled
+      expect(screen.getByTestId('hotfix-promote-btn')).toBeDisabled();
+
+      // Fill reason but not ack → still disabled
+      fireEvent.change(screen.getByTestId('hotfix-reason-input'), { target: { value: 'fix the scorer' } });
+      expect(screen.getByTestId('hotfix-promote-btn')).toBeDisabled();
+
+      // Check ack → now enabled
+      fireEvent.click(screen.getByTestId('hotfix-ack-checkbox'));
+      expect(screen.getByTestId('hotfix-promote-btn')).not.toBeDisabled();
+    });
+
+    it('calls triggerHotfixPromote and refreshes on success', async () => {
+      vi.mocked(api.getHotfixPreview).mockResolvedValue({
+        status: 'eligible',
+        eligible: true,
+        changed_files: ['backend/app/release_scoring.py'],
+        offending_files: [],
+        reason: 'All changed files are hotfix-eligible.',
+        candidate_sha: 'abc1234567890',
+      });
+      vi.mocked(api.triggerHotfixPromote).mockResolvedValue({ status: 'ok' });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('hotfix-open-btn'));
+      await waitFor(() => expect(screen.getByTestId('hotfix-promote-btn')).toBeInTheDocument());
+
+      fireEvent.change(screen.getByTestId('hotfix-reason-input'), { target: { value: 'fix scorer' } });
+      fireEvent.click(screen.getByTestId('hotfix-ack-checkbox'));
+      fireEvent.click(screen.getByTestId('hotfix-promote-btn'));
+
+      await waitFor(() => {
+        expect(api.triggerHotfixPromote).toHaveBeenCalledWith(
+          'proj-1',
+          'fix scorer',
+          ['backend/app/release_scoring.py'],
+          true,
+          'abc1234567890',
+        );
+        expect(mockRefresh).toHaveBeenCalled();
+      });
+    });
+
+    it('shows ineligible state when scope preview reports ineligibility', async () => {
+      vi.mocked(api.getHotfixPreview).mockResolvedValue({
+        status: 'ineligible',
+        eligible: false,
+        changed_files: ['backend/app/release_scoring.py', 'backend/app/compute_jobs.py'],
+        offending_files: ['backend/app/compute_jobs.py'],
+        reason: '1 file is outside the hotfix-eligible allowlist.',
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeInfraFailureVersion(true) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      fireEvent.click(screen.getByTestId('hotfix-open-btn'));
+      await waitFor(() => expect(screen.getByText(/Not eligible for hotfix-deploy/)).toBeInTheDocument());
+      expect(screen.getByText(/1 file is outside the hotfix-eligible allowlist/)).toBeInTheDocument();
+      expect(screen.queryByTestId('hotfix-promote-btn')).not.toBeInTheDocument();
     });
   });
 });

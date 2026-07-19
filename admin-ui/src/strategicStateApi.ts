@@ -1,5 +1,6 @@
 import { apiFetch, type StrategicRefreshMarker } from './api';
 import type { ProjectMessagePreview } from './types/messages';
+import type { MessageAttachment } from './types/messages';
 import type { WorkbenchEventEnvelopeV1 } from './types/workbenchEvents';
 
 export interface StrategicStateCycle {
@@ -38,9 +39,16 @@ export interface StrategicStateTask {
 export type StrategicStateMessagePreview = ProjectMessagePreview;
 export type StrategicStateMessage = StrategicStateMessagePreview;
 
+export interface StrategicStateAttentionItemAction {
+  kind: string;
+  label: string;
+  method?: string | null;
+  path?: string | null;
+}
+
 export interface StrategicStateAttentionItem {
   id: string;
-  kind: 'message' | 'task' | 'direction' | string;
+  kind: 'message' | 'task' | 'direction' | 'confirmation' | string;
   severity: 'needs_operator' | 'watch' | string;
   reason: string;
   label: string;
@@ -50,6 +58,10 @@ export interface StrategicStateAttentionItem {
   status?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
+  /** Present on ``kind: 'confirmation'`` items — the pending_user_confirmation type. */
+  confirmation_type?: string | null;
+  /** Inline affordances (accept/dismiss) the operator can act on from the daily surface. */
+  actions?: StrategicStateAttentionItemAction[] | null;
   ref: {
     kind: string;
     id: string;
@@ -129,6 +141,8 @@ export interface StrategicContextDescriptorDetail {
 export interface StrategicContextDescriptorChartPoint {
   label: string;
   value: number;
+  /** ISO timestamp for time-series (line chart) rendering; absent for bar charts. */
+  t?: string;
 }
 
 export interface StrategicContextRenderableDescriptor {
@@ -142,6 +156,7 @@ export interface StrategicContextRenderableDescriptor {
     | 'text'
     | 'image'
     | 'video'
+    | 'pdf'
     | 'chart'
     | 'plot'
     | 'task_detail'
@@ -157,6 +172,20 @@ export interface StrategicContextRenderableDescriptor {
   empty?: boolean;
   stale?: boolean;
   unsupported_reason?: string | null;
+  /** Earned-vs-claimed evidence tier for compute_experiment artifacts
+   *  (machine-verified / attested / backfilled / partial / self-reported).
+   *  Rendered via the shared EvidenceTierBadge; absent for non-compute
+   *  artifacts. */
+  evidence_tier?: string | null;
+  /** Number of viewable output files omitted when building the preview set
+   *  (exceeds the cap of 25 files / 8 MiB each). Rendered as an amber
+   *  "N file(s) omitted" note; absent/null for descriptors with no drops. */
+  viewable_files_dropped?: number | null;
+  /** When viewable artifacts for this descriptor are expected to expire from
+   *  GCS (the artifacts bucket has a ~7-day lifecycle DELETE). After this
+   *  timestamp, signed preview URLs will 404 — the artifact is permanently
+   *  gone and retries are futile. ISO-8601 string. */
+  artifact_expires_at?: string | null;
   metrics?: StrategicContextDescriptorMetric[];
   columns?: StrategicContextDescriptorTableColumn[];
   rows?: StrategicContextDescriptorTableRow[];
@@ -169,24 +198,51 @@ export interface StrategicContextRenderableDescriptor {
     width?: number | null;
     height?: number | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   } | null;
   video?: {
     url?: string | null;
     alt?: string | null;
     storage_uri?: string | null;
     mime_type?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   } | null;
   images?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   }> | null;
   videos?: Array<{
     url?: string | null;
     alt?: string | null;
     filename?: string | null;
     storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
+  }> | null;
+  // PDFs are never rendered inline on the app origin — the descriptor carries a
+  // storage_uri (and/or a baked signed url) that the frontend resolves fresh and
+  // opens in a new browser tab (the PDF renders in the browser's sandboxed viewer
+  // on the storage origin). Mirrors the image/video singular+list shape.
+  pdf?: {
+    url?: string | null;
+    alt?: string | null;
+    storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
+  } | null;
+  pdfs?: Array<{
+    url?: string | null;
+    alt?: string | null;
+    filename?: string | null;
+    storage_uri?: string | null;
+    revision?: string | null;
+    live?: boolean | null;
   }> | null;
   chart?: {
     kind?: 'bar' | 'line' | string;
@@ -242,6 +298,8 @@ export interface StrategicContextArtifactViewablePreview {
   filename?: string | null;
   /** Stable gs:// ref for lazy re-resolution when the baked signed URL expires. */
   storage_uri?: string | null;
+  revision?: string | null;
+  live?: boolean | null;
 }
 
 export interface StrategicContextArtifactEvidence {
@@ -258,6 +316,12 @@ export interface StrategicContextArtifactEvidence {
   has_logs?: boolean | null;
   storage_uri?: string | null;
   viewable_previews?: StrategicContextArtifactViewablePreview[] | null;
+  // Run provenance + evidence tier for compute_experiment artifacts, stamped
+  // from the backing compute knowledge document (canonical source).
+  executing_backend?: string | null;
+  runner_target_id?: string | null;
+  runner_hostname?: string | null;
+  evidence_tier?: string | null;
 }
 
 export interface StrategicContextEvidenceCollection<T> {
@@ -291,7 +355,7 @@ export interface StrategicContextPackageDescriptor {
       pending_count?: number;
       oldest_pending_age_hours?: number | null;
     };
-    artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
+    artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence> & { live_count?: number };
   } | null;
   descriptors?: StrategicContextRenderableDescriptor[];
   drilldowns?: StrategicContextPackageDrilldown[];
@@ -660,6 +724,7 @@ export interface StrategicWorkSession {
 export interface StrategicSessionConversation {
   limit: number;
   has_more?: boolean;
+  next_before_sequence?: number | null;
   order?: 'oldest_first' | 'newest_first' | string;
   items: StrategicStateMessage[];
 }
@@ -708,6 +773,11 @@ export interface StrategicSessionMessageCreate {
   context?: Record<string, unknown>;
   workbench_context?: Record<string, unknown>;
   idempotency_key?: string;
+  reply_to_message_id?: string | null;
+  source_refs?: Array<Record<string, unknown>>;
+  artifact_refs?: Array<Record<string, unknown>>;
+  operator_intent?: Record<string, unknown>;
+  attachments?: MessageAttachment[];
 }
 
 export interface StrategicSessionCheckInCreate {
@@ -749,6 +819,86 @@ export interface StrategicSessionMessageResponse {
   recent_outputs?: StrategicSessionOutput[];
   arming?: string | null;
   message?: StrategicStateMessage;
+  wakeup_state?: StrategicMessageWakeupState;
+}
+
+export type StrategicMessageWakeupState =
+  | 'queued'
+  | 'coalesced'
+  | 'paused'
+  | 'waiting_for_capacity';
+
+export interface StrategicConversationQuery {
+  afterSequence?: number | null;
+  beforeSequence?: number | null;
+  limit?: number;
+  includeMessageId?: string | null;
+  idempotencyKey?: string | null;
+  search?: string | null;
+}
+
+export interface ResidentEngineTurnHealth {
+  task_id: string;
+  status: string;
+  updated_at: string | null;
+}
+
+export interface ResidentEngineHealth {
+  project_id: string;
+  observed_at: string;
+  resident_initialized: boolean;
+  engine_owner?: 'legacy' | 'strategic_resident' | string;
+  engine_version?: string | null;
+  background_policy?: 'active' | 'paused' | string;
+  authority_generation?: number;
+  health_status?: string | null;
+  last_healthy_at?: string | null;
+  last_error_at?: string | null;
+  checkpoint?: { checkpoint_id: string; version: number; content_hash: string } | null;
+  turns?: {
+    active: ResidentEngineTurnHealth | null;
+    interactive_successor: ResidentEngineTurnHealth | null;
+    background_successor: ResidentEngineTurnHealth | null;
+  };
+  conversation?: {
+    handled_sequence: number;
+    shadow_handled_sequence: number;
+    latest_unhandled_user_sequence: number | null;
+  };
+  operations?: { unsettled_receipt_count: number };
+  shadow?: {
+    state: string | null;
+    last_completed_at: string | null;
+    last_projection_latency_ms: number | null;
+    last_comparison: Record<string, unknown> | null;
+  };
+  soak?: {
+    cutover_completed_at: string | null;
+    observed_seconds: number;
+    required_seconds: number;
+    rollback_rehearsed_at: string | null;
+  };
+  cutover_ready: boolean;
+  rollback_ready: boolean;
+  legacy_retirement_ready: boolean;
+  blockers: string[];
+  retirement_blockers?: string[];
+}
+
+/**
+ * Per-kind turn-latency statistics for one turn type (operator or autonomous).
+ * Mirrors the shape computed by `getResidentTurnLatencyTelemetry` in the agent.
+ */
+export interface TurnLatencyKindSummary {
+  count: number;
+  mean_turn_ms: number | null;
+  max_turn_ms: number;
+  mean_ttft_ms: number | null;
+  interrupted_count: number;
+  total_tool_calls: number;
+  total_tool_call_duration_ms: number;
+  mean_inter_token_ms: number | null;
+  mean_pickup_lag_ms: number | null;
 }
 
 /**
@@ -767,6 +917,33 @@ export interface StrategicResidentSessionSnapshot {
   ended_at?: string | null;
   last_progress_at?: string | null;
   last_operator_interaction_at?: string | null;
+  compaction_count?: number | null;
+  last_compaction_at?: string | null;
+  /**
+   * Operator-decision capture telemetry for this session (mirrors
+   * `_operator_decision_summary` on the backend session blob, projected by
+   * `resident_session_snapshot`). `capture_rate` is an integer percent (0–100)
+   * of operator turns that ended with a valid OPERATOR-DECISION marker; `null`
+   * when no operator turns have been processed yet. The whole field is optional
+   * and `null` on legacy sessions / before any operator turn.
+   */
+  operator_decision_summary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
+  /**
+   * Per-kind turn-latency summary for this session (mirrors
+   * `_turn_latency_summary` on the backend session blob, projected by
+   * `resident_session_snapshot`). Contains rolling mean/max turn ms for
+   * operator and autonomous turns. `null` when no turns have been recorded yet
+   * or on legacy sessions.
+   */
+  turn_latency_summary?: {
+    operator: TurnLatencyKindSummary;
+    autonomous: TurnLatencyKindSummary;
+  } | null;
 }
 
 /**
@@ -981,6 +1158,7 @@ export interface StrategicStateResponse {
       stale_provisioning_tasks?: number;
       stale_queued_tasks?: number;
       manual_directions: number;
+      pending_confirmations?: number;
       alerts?: number;
       error_alerts?: number;
       warning_alerts?: number;
@@ -1055,6 +1233,39 @@ export interface StrategicStateResponse {
    *  resident Strategic session. Each entry is a {note, set_at} pair.
    *  Written by the set_memory strategic op. */
   strategic_memory_notes?: StrategicMemoryNote[];
+}
+
+/**
+ * Lightweight mode + resident-session liveness probe (mirrors the backend
+ * `GET /projects/{id}/strategic-liveness` endpoint). Carries ONLY the cheap
+ * fields the chat/workday shell needs to render the mode indicator and the
+ * resident-session liveness chip immediately on reload, computed without any of
+ * the heavy `strategic-state` Phase-1/Phase-2 assembly. The full read model
+ * ({@link fetchStrategicState}) still hydrates the complete state afterward and
+ * takes over once it lands.
+ */
+export interface StrategicLivenessResponse {
+  project_id: string;
+  interaction_mode: StrategicWorkbenchState['interaction_mode'];
+  resident_session?: StrategicResidentSessionSnapshot | null;
+  resident_session_available?: boolean;
+  resident_session_availability?: StrategicResidentSessionAvailability | null;
+  resident_session_runners?: StrategicResidentRunnerOption[] | null;
+}
+
+export async function fetchStrategicLiveness(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<StrategicLivenessResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-liveness`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch strategic liveness: ${res.status}`);
+  return res.json() as Promise<StrategicLivenessResponse>;
 }
 
 export async function fetchStrategicState(
@@ -1186,21 +1397,92 @@ export async function fetchStrategicSession(
 
 export async function fetchStrategicConversation(
   projectId: string,
-  includeMessageId?: string | null,
+  queryOptions: StrategicConversationQuery = {},
   signal?: AbortSignal,
-): Promise<{ conversation: StrategicSessionConversation }> {
+  etag?: string | null,
+): Promise<{ conversation: StrategicSessionConversation; matched_message?: StrategicStateMessage | null; wakeup_state?: StrategicMessageWakeupState | null; etag?: string } | StrategicConversationNotModified> {
   const params = new URLSearchParams();
-  if (includeMessageId) params.set('include_message_id', includeMessageId);
+  if (queryOptions.afterSequence != null) params.set('after_sequence', String(queryOptions.afterSequence));
+  if (queryOptions.beforeSequence != null) params.set('before_sequence', String(queryOptions.beforeSequence));
+  if (queryOptions.limit != null) params.set('limit', String(queryOptions.limit));
+  if (queryOptions.includeMessageId) params.set('include_message_id', queryOptions.includeMessageId);
+  if (queryOptions.idempotencyKey) params.set('idempotency_key', queryOptions.idempotencyKey);
+  if (queryOptions.search) params.set('search', queryOptions.search);
   const query = params.toString();
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
-    undefined,
+    etag ? { headers: { 'If-None-Match': etag } } : undefined,
     2,
     30000,
     signal,
   );
+  if (res.status === 304) return STRATEGIC_CONVERSATION_NOT_MODIFIED;
   if (!res.ok) throw new Error(`Failed to fetch Strategic conversation: ${res.status}`);
-  return res.json() as Promise<{ conversation: StrategicSessionConversation }>;
+  const body = await res.json() as (StrategicSessionConversation & {
+    matched_message?: StrategicStateMessage | null;
+    wakeup_state?: StrategicMessageWakeupState | null;
+  }) | {
+    conversation: StrategicSessionConversation;
+    matched_message?: StrategicStateMessage | null;
+    wakeup_state?: StrategicMessageWakeupState | null;
+  };
+  const conversation = 'conversation' in body ? body.conversation : body;
+  const matchedMessage = body.matched_message;
+  const wakeupState = body.wakeup_state;
+  const responseEtag = res.headers.get('ETag');
+  return {
+    conversation,
+    ...(matchedMessage !== undefined ? { matched_message: matchedMessage } : {}),
+    ...(wakeupState !== undefined ? { wakeup_state: wakeupState } : {}),
+    ...(responseEtag ? { etag: responseEtag } : {}),
+  };
+}
+
+export async function fetchResidentEngineHealth(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ResidentEngineHealth | null> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/resident-engine/health`,
+    undefined,
+    1,
+    15000,
+    signal,
+  );
+  // The rollout surface is owner-only and may not exist during a staged deploy.
+  // Both cases intentionally degrade to the legacy activity projection.
+  if (res.status === 403 || res.status === 404) return null;
+  if (!res.ok) throw new Error(`Failed to fetch Resident engine health: ${res.status}`);
+  return res.json() as Promise<ResidentEngineHealth>;
+}
+
+export interface StrategicMessageIdentityReceipt {
+  message: StrategicStateMessage;
+  wakeup_state: StrategicMessageWakeupState | null;
+}
+
+export async function findStrategicMessageByClientIdentity(
+  projectId: string,
+  idempotencyKey: string,
+  signal?: AbortSignal,
+): Promise<StrategicMessageIdentityReceipt | null> {
+  const result = await fetchStrategicConversation(projectId, { idempotencyKey, limit: 1 }, signal);
+  if (isStrategicConversationNotModified(result)) return null;
+  const message = result.matched_message ?? result.conversation.items.find(message => (
+    message.client_idempotency_key === idempotencyKey
+    || message.idempotency_key === idempotencyKey
+  )) ?? null;
+  return message ? { message, wakeup_state: result.wakeup_state ?? null } : null;
+}
+
+/** Empty transcript-poll response: callers retain their existing conversation. */
+export const STRATEGIC_CONVERSATION_NOT_MODIFIED = { notModified: true } as const;
+export type StrategicConversationNotModified = typeof STRATEGIC_CONVERSATION_NOT_MODIFIED;
+
+export function isStrategicConversationNotModified(
+  result: { conversation: StrategicSessionConversation; etag?: string } | StrategicConversationNotModified,
+): result is StrategicConversationNotModified {
+  return result === STRATEGIC_CONVERSATION_NOT_MODIFIED;
 }
 
 export async function createStrategicSessionMessage(
@@ -1212,8 +1494,25 @@ export async function createStrategicSessionMessage(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new Error(`Failed to create Strategic session message: ${res.status}`);
+  if (!res.ok) {
+    let detail = `Failed to create Strategic session message: ${res.status}`;
+    try {
+      const body = await res.json() as { detail?: unknown };
+      if (typeof body.detail === 'string' && body.detail.trim()) detail = body.detail.trim();
+    } catch { /* retain status fallback */ }
+    throw new StrategicSessionMessageCreateError(res.status, detail);
+  }
   return res.json() as Promise<StrategicSessionMessageResponse>;
+}
+
+export class StrategicSessionMessageCreateError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = 'StrategicSessionMessageCreateError';
+    this.status = status;
+  }
 }
 
 export async function checkInStrategicSession(
@@ -1316,19 +1615,22 @@ export interface MessageAttachmentUploadUrlResponse {
   download_url: string;
   storage_uri: string;
   attachment_id: string;
+  size_bytes: number;
+  expires_in_seconds?: number;
 }
 
 export async function getMessageAttachmentUploadUrl(
   projectId: string,
   filename: string,
-  contentType?: string,
+  contentType: string | undefined,
+  sizeBytes: number,
 ): Promise<MessageAttachmentUploadUrlResponse> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-upload-url`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ filename, content_type: contentType }),
+      body: JSON.stringify({ filename, content_type: contentType, size_bytes: sizeBytes }),
     },
   );
   if (!res.ok) {
@@ -1336,4 +1638,83 @@ export async function getMessageAttachmentUploadUrl(
     throw new Error((detail as { detail?: string }).detail || `Failed to get upload URL: ${res.status}`);
   }
   return res.json() as Promise<MessageAttachmentUploadUrlResponse>;
+}
+
+export async function deleteMessageAttachmentUpload(
+  projectId: string,
+  attachmentId: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/messages/attachment-uploads/${encodeURIComponent(attachmentId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`Failed to delete pending attachment upload: ${res.status}`);
+  }
+}
+
+interface AttachmentDownloadUrlCacheEntry {
+  expiresAt: number;
+  promise: Promise<MessageAttachmentDownloadUrl>;
+}
+
+export interface MessageAttachmentDownloadUrl {
+  downloadUrl: string;
+  expiresAt: number;
+}
+
+const MAX_ATTACHMENT_DOWNLOAD_URLS = 128;
+const attachmentDownloadUrlCache = new Map<string, AttachmentDownloadUrlCacheEntry>();
+
+function trimAttachmentDownloadUrlCache(): void {
+  while (attachmentDownloadUrlCache.size > MAX_ATTACHMENT_DOWNLOAD_URLS) {
+    const oldestKey = attachmentDownloadUrlCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    attachmentDownloadUrlCache.delete(oldestKey);
+  }
+}
+
+export function invalidateMessageAttachmentDownloadUrl(
+  projectId: string,
+  messageId: string,
+  attachmentId: string,
+): void {
+  attachmentDownloadUrlCache.delete(`${projectId}:${messageId}:${attachmentId}`);
+}
+
+export function getMessageAttachmentDownloadUrl(
+  projectId: string,
+  messageId: string,
+  attachmentId: string,
+): Promise<MessageAttachmentDownloadUrl> {
+  const key = `${projectId}:${messageId}:${attachmentId}`;
+  const cached = attachmentDownloadUrlCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) {
+    attachmentDownloadUrlCache.delete(key);
+    attachmentDownloadUrlCache.set(key, cached);
+    return cached.promise;
+  }
+  if (cached) attachmentDownloadUrlCache.delete(key);
+  const entry: AttachmentDownloadUrlCacheEntry = {
+    expiresAt: Number.POSITIVE_INFINITY,
+    promise: Promise.resolve({ downloadUrl: '', expiresAt: 0 }),
+  };
+  const request = apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation/${encodeURIComponent(messageId)}/attachments/${encodeURIComponent(attachmentId)}/download-url`,
+  ).then(async res => {
+    if (!res.ok) throw new Error(`Failed to get attachment download URL: ${res.status}`);
+    const body = await res.json() as { download_url: string; expires_in_seconds?: number };
+    const lifetimeSeconds = Math.max(1, (body.expires_in_seconds ?? 900) - 30);
+    entry.expiresAt = Date.now() + lifetimeSeconds * 1_000;
+    return { downloadUrl: body.download_url, expiresAt: entry.expiresAt };
+  }).catch(error => {
+    if (attachmentDownloadUrlCache.get(key) === entry) {
+      attachmentDownloadUrlCache.delete(key);
+    }
+    throw error;
+  });
+  entry.promise = request;
+  attachmentDownloadUrlCache.set(key, entry);
+  trimAttachmentDownloadUrlCache();
+  return request;
 }

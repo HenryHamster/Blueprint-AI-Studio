@@ -1175,15 +1175,16 @@ async def test_in_progress_stale_tool_use_but_fresh_attempt_not_reaped(
 
 
 @pytest.mark.asyncio
-async def test_in_progress_no_tool_use_codex_provider_not_reaped(
+async def test_in_progress_no_tool_use_non_anthropic_provider_reaped(
     reaper_db, stop_after_one_cycle, reaper_side_effects
 ):
-    """Codex (openai) tasks with last_tool_use_at NULL must NOT be reaped.
+    """Zero-progress non-Anthropic tasks must be reaped on the progress-stale clock.
 
-    The wrapper's outputMode='text' for Codex never invokes recordToolUse,
-    so last_tool_use_at IS NULL for every Codex task by design — even when
-    Codex is calling apply_patch happily. Pre-fix this watchdog reaped all
-    healthy Codex work after the progress-stale cutoff. Pin the gate.
+    The agent wrapper now calls recordToolUse('model_output', ...) on every
+    non-empty stdout chunk in text-mode (Gemini/Codex), so last_tool_use_at IS
+    populated for any genuinely-progressing task.  A task that has last_tool_use_at
+    NULL after the progress-stale cutoff has truly produced zero output and must be
+    reaped just like a stalled Anthropic task.
     """
     project = await _make_project(reaper_db)
     t = Task(
@@ -1203,7 +1204,10 @@ async def test_in_progress_no_tool_use_codex_provider_not_reaped(
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
-    assert t.status == TaskStatus.IN_PROGRESS
+    # A reaped zero-progress task with attempt_count=0 is requeued for retry,
+    # not moved to a terminal status (TaskStatus has no TIMED_OUT member).
+    assert t.status == TaskStatus.QUEUED
+    assert t.attempt_count == 1
 
 
 @pytest.mark.asyncio
@@ -3413,6 +3417,59 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_step6_agent_managed_resident_turn_triggers_queued_age_alert(reaper_db):
+    """An agent-managed (non-backend) resident turn queued beyond the alert
+    threshold fires a queued-age alert.  ``strategic_resident_turn`` has
+    ``execution_owner="agent"``, so it is NOT excluded by the
+    ``BACKEND_MANAGED_TASK_TYPES`` filter — the alert fires as expected."""
+    project = await _make_project(reaper_db)
+    reaper_db.add(
+        Task(
+            project_id=project.id,
+            title="Resident shadow",
+            payloads=[{"type": "strategic_resident_turn"}],
+            status=TaskStatus.QUEUED,
+            created_at=_utcnow() - timedelta(hours=24),
+            archived=True,
+        )
+    )
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db,
+        _utcnow(),
+        runtime_config={"queued_age_alert_hours": 2},
+    )
+    assert alerted == 1
+
+
+@pytest.mark.asyncio
+async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    import app.reaper as _reaper_mod
+
+    shadow = mocker.patch(
+        "app.reaper.sweep_shadow_resident_turns",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("shadow projection failed"),
+    )
+    later = mocker.patch(
+        "app.reaper.sweep_regression_scan",
+        new_callable=AsyncMock,
+    )
+
+    await _run_reaper_once()
+
+    shadow.assert_awaited_once()
+    assert (
+        shadow.await_args.kwargs["session_factory"]
+        is _reaper_mod.AsyncSessionLocal
+    )
+    later.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_step6_alert_does_not_broadcast_on_commit_failure(reaper_db, mocker):
     """If the batch commit fails, queued-age alerts must not be broadcast."""
     project = await _make_project(reaper_db)
@@ -5396,6 +5453,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5510,6 +5568,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(audit_task.id),
             "smoketest_task_id": str(smoke_task.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(version)
         await reaper_db.commit()
@@ -5562,6 +5621,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
             "started_at": _now_for_seed().isoformat(),
             "audit_task_id": str(control_audit.id),
             "smoketest_task_id": str(control_smoke.id),
+            "rubric_snapshot": [],
         }
         reaper_db.add(control_version)
         await reaper_db.commit()
@@ -7032,6 +7092,51 @@ async def test_sweep_routine_message_retention_skips_commit_when_nothing_purged(
 
 
 @pytest.mark.asyncio
+async def test_sweep_expired_message_attachment_uploads_is_global_and_bounded(
+    db_session,
+    mocker,
+):
+    from app.models import ProjectMessageAttachmentUpload
+
+    project = Project(name="Global attachment sweep", user_id="sweep-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    expired = [
+        ProjectMessageAttachmentUpload(
+            attachment_id=_uuid_mod.uuid4(),
+            project_id=project.id,
+            actor_user_id=f"actor-{index}",
+            storage_uri=f"gs://bucket/message-attachments/{project.id}/{index}/file.bin",
+            filename="file.bin",
+            expected_size_bytes=10,
+            created_at=_utcnow() - timedelta(minutes=30),
+            expires_at=_utcnow() - timedelta(minutes=15),
+        )
+        for index in range(3)
+    ]
+    db_session.add_all(expired)
+    await db_session.commit()
+    delete_object = mocker.patch(
+        "app.reaper_sweeps.delete_storage_uri_best_effort",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+
+    removed = await _rs.sweep_expired_message_attachment_uploads(
+        db_session,
+        batch_size=2,
+    )
+
+    assert removed == 2
+    assert delete_object.await_count == 2
+    remaining = (
+        await db_session.execute(select(ProjectMessageAttachmentUpload))
+    ).scalars().all()
+    assert len(remaining) == 1
+
+
+@pytest.mark.asyncio
 async def test_sweep_regression_scan_cadence_gate_suppresses_second_call(mocker):
     """sweep_regression_scan returns 0 immediately when called within the 15-min window."""
     _rs._last_regression_scan = None  # reset to force first call through
@@ -7356,21 +7461,22 @@ def test_classify_orphan_open_pr_uses_90s_cutoff():
     assert _classify_orphan(t, now, has_open_pr=True) is True
 
 
-def test_classify_orphan_stalled_but_heartbeating_anthropic_no_tool_use():
+def test_classify_orphan_stalled_but_heartbeating_no_tool_use_all_providers():
     now = _utcnow()
     # Fresh heartbeat, zero tool calls ever, started 10min ago (past 8min small
-    # progress cutoff), anthropic provider → agent_stalled orphan.
-    t = _FakeClassifyTask(
-        status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=now - timedelta(seconds=30),
-        last_tool_use_at=None,
-        started_at=now - timedelta(minutes=10),
-        context={"llm_provider": "anthropic"},
-    )
-    assert _classify_orphan(t, now, has_open_pr=False) is True
-    # Same task on a non-anthropic provider is NOT reaped (Codex text-mode gate).
-    t.context = {"llm_provider": "codex"}
-    assert _classify_orphan(t, now, has_open_pr=False) is False
+    # progress cutoff). All providers now emit recordToolUse on progress, so
+    # last_tool_use_at=None means genuinely zero-progress for all → reap.
+    for provider in ("anthropic", "openai", "gemini", "zai", "deepseek", None):
+        t = _FakeClassifyTask(
+            status=TaskStatus.IN_PROGRESS,
+            last_heartbeat=now - timedelta(seconds=30),
+            last_tool_use_at=None,
+            started_at=now - timedelta(minutes=10),
+            context={"llm_provider": provider} if provider else {},
+        )
+        assert _classify_orphan(t, now, has_open_pr=False) is True, (
+            f"Expected zero-progress reap for provider={provider!r}"
+        )
 
 
 def test_classify_orphan_cross_attempt_stale_tool_guard():
@@ -8176,17 +8282,17 @@ def test_classify_orphan_stale_offrow_tool_use_still_reaps_genuine_stall():
 
 
 def test_classify_orphan_fresh_offrow_tool_use_suppresses_zero_toolcall_stall():
-    """Fix 3b also covers the zero-tool-calls-ever branch (anthropic gate): on-row
-    last_tool_use_at is None and started_at is past the progress cutoff, but a
-    fresh OFF-ROW tool use means the agent DID record a tool call the lock-starved
-    heartbeat failed to land on the task row — it is progressing, don't reap."""
+    """Fix 3b: on-row last_tool_use_at is None and started_at is past the
+    progress cutoff, but a fresh OFF-ROW tool use means the agent DID record a
+    tool call the lock-starved heartbeat failed to land on the task row — it is
+    progressing, don't reap. Applies to all providers."""
     now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),
         last_tool_use_at=None,  # on-row: zero tool calls ever
         started_at=now - timedelta(minutes=10),  # past 8min small progress cutoff
-        context={"llm_provider": "anthropic"},
+        context={"llm_provider": "gemini"},
         vm_instance_id="vm-zero-tool",
     )
     # Without the off-row signal → reap (existing zero-tool anthropic stall).
@@ -8478,10 +8584,10 @@ def test_task_scoped_row_present_with_null_tool_stamp_does_not_fall_back():
     )
 
 
-def test_zero_tool_anthropic_stall_branch_is_also_task_scoped():
-    """The second stall branch (fresh heartbeat, NO tool use ever, anthropic) must
+def test_zero_tool_stall_branch_is_also_task_scoped():
+    """The zero-tool-use stall branch (fresh heartbeat, NO tool use ever) must
     consult the task-scoped row too — otherwise a sibling's tool calls still mask a
-    never-progressed hung anthropic agent."""
+    never-progressed hung agent on a shared runner."""
     now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
@@ -9877,6 +9983,161 @@ async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
     assert t.status == TaskStatus.BLOCKED
     assert t.recheck_after is not None and t.recheck_after > now
     assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_first_retry_needs_no_prior_evidence(reaper_db, mocker):
+    """The first optimistic retry (optimistic_used == 0) requires no prior evidence
+    and stamps _blocked_last_retry_at on the requeued task."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: ./pr open returned HTTP 500",
+        depends_on=[],
+        blocked_at=now - timedelta(minutes=5),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: ./pr open returned HTTP 500",
+            }
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    # Evidence timestamp is stamped so subsequent retries can gate on it.
+    assert t.context.get("_blocked_last_retry_at") is not None
+    assert "optimistic" in (t.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retry_gate_holds_when_no_evidence(reaper_db, mocker):
+    """Retry 2+ is withheld when blocked_at has not advanced past the last retry
+    timestamp — no VM run happened since the previous retry was dispatched."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    last_retry_at = now - timedelta(seconds=30)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        # blocked_at is BEFORE last_retry_at: no new VM run has happened since retry 1.
+        blocked_at=now - timedelta(seconds=60),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": 1,
+            "_blocked_last_retry_at": last_retry_at.isoformat(),
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # Retry budget unchanged — the slot was NOT consumed.
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    # Backoff was re-armed instead.
+    assert t.recheck_after is not None and t.recheck_after > now
+    assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("last_retry_at", [None, "not-a-timestamp"])
+async def test_unblock_sweep_retry_gate_holds_for_missing_or_malformed_evidence(
+    reaper_db, mocker, last_retry_at
+):
+    """Retry 2+ fails closed when its prior-run timestamp is absent or invalid."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    context = {
+        "blocker": {
+            "source": "agent",
+            "waiting_on": "precondition",
+            "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+        },
+        "_blocked_optimistic_retries": 1,
+    }
+    if last_retry_at is not None:
+        context["_blocked_last_retry_at"] = last_retry_at
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        blocked_at=now - timedelta(seconds=30),
+        context=context,
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_optimistic_retries") == 1
+    assert t.context.get("_blocked_recheck_attempts") == 1
+    assert t.recheck_after is not None and t.recheck_after > now
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_retry_gate_allows_when_task_reblocked(reaper_db, mocker):
+    """Retry 2 is allowed when blocked_at is more recent than the last retry
+    timestamp, proving the previous retry ran a VM that then re-blocked."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    last_retry_at = now - timedelta(seconds=60)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        # blocked_at is AFTER last_retry_at: the previous retry actually ran a VM.
+        blocked_at=now - timedelta(seconds=30),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": 1,
+            "_blocked_last_retry_at": last_retry_at.isoformat(),
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 1
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.QUEUED
+    assert t.context.get("_blocked_optimistic_retries") == 2
+    # Evidence timestamp updated to this retry's timestamp.
+    assert t.context.get("_blocked_last_retry_at") is not None
+    assert t.context.get("_blocked_last_retry_at") != last_retry_at.isoformat()
+    assert "optimistic" in (t.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio
@@ -13404,13 +13665,12 @@ def _assert_message_update_event_payload(
     assert payload["type"] == message_type
     assert payload["from"] == msg.from_type
     assert payload["status"] == status
-    assert payload["message"] == {
-        "id": str(msg.id),
-        "type": message_type,
-        "from": msg.from_type,
-        "status": status,
-        "excerpt": msg.content,
-    }
+    msg_payload = payload["message"]
+    assert msg_payload["id"] == str(msg.id)
+    assert msg_payload["type"] == message_type
+    assert msg_payload["from"] == msg.from_type
+    assert msg_payload["status"] == status
+    assert msg_payload["excerpt"] == msg.content
     assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
 
 
@@ -13768,6 +14028,490 @@ async def test_linked_message_resurfaces_when_task_completed_but_never_landed(
     ctx = msg.context or {}
     assert ctx.get("_convergence_link_stale") is not None
     assert "did not land" in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+# ── Step 18b/18c: generalized linked-resolve + stale-open decay sweeps ─────────
+
+from app.reaper_sweeps import (  # noqa: E402
+    sweep_resolve_linked_messages,
+    sweep_decay_stale_open_messages,
+    STALE_OPEN_DECAY_DAYS,
+    STALE_QUESTION_DECAY_DAYS,
+)
+
+
+async def _make_conversational_message(
+    db, project, *, msg_type=MessageType.NOTE, status="open", context=None,
+    created_at=None,
+):
+    kwargs = dict(
+        project_id=project.id,
+        message_type=msg_type,
+        from_type="strategic",
+        content="conversational item",
+        status=status,
+        context=context or {},
+    )
+    if created_at is not None:
+        kwargs["created_at"] = created_at
+    msg = ProjectMessage(**kwargs)
+    db.add(msg)
+    await db.commit()
+    await db.refresh(msg)
+    return msg
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_resolves_non_bug_on_landing(reaper_db):
+    """A non-bug 'linked' NOTE auto-resolves once its owning task lands."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    msg = await _make_conversational_message(reaper_db, project)
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert "landed" in (msg.resolution or "")
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_skips_bug_class(reaper_db):
+    """Bug-class 'linked' messages stay owned by the Step-15 sweep (disjoint)."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    bug = await _make_bug_message(reaper_db, project)
+    link_message_to_outcome(bug, "task", str(task.id))
+    reaper_db.add(bug)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(bug)
+    assert bug.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_resolve_linked_messages_left_linked_when_not_landed(reaper_db):
+    """A non-bug 'linked' message is untouched when its owner has not landed."""
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION
+    )
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+
+    acted = await sweep_resolve_linked_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "linked"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_resolves_aged_note(reaper_db):
+    """An OPEN NOTE with no activity past the decay window is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_leaves_recent_and_live_types(reaper_db):
+    """Recent NOTEs, BLOCKER, and QUESTIONs under 30d are never decayed."""
+    project = await _make_project(reaper_db)
+    # 19 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 5)
+    recent_note = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE
+    )  # created now
+    live_blocker = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.BLOCKER, created_at=old
+    )
+    # QUESTION at 19 days: below STALE_QUESTION_DECAY_DAYS (30d), must survive
+    young_question = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    for m in (recent_note, live_blocker, young_question):
+        await reaper_db.refresh(m)
+        assert m.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_messages_resolves_aged_question(reaper_db):
+    """An OPEN QUESTION past the 30-day question window is auto-decayed as 'stale_unanswered'."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_QUESTION_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_survives_short_window(reaper_db):
+    """An OPEN QUESTION older than NOTE decay window (14d) but younger than the
+    question window (30d) must NOT be decayed — questions get more patience."""
+    project = await _make_project(reaper_db)
+    # 15 days: past NOTE threshold (14d) but before QUESTION threshold (30d)
+    mildly_old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=mildly_old
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_question_respects_runtime_config(reaper_db, monkeypatch):
+    """'stale_question_decay_days' runtime config overrides the default 30-day window."""
+    import app.shared_state as _ss
+
+    project = await _make_project(reaper_db)
+    # 5 days old — within default window (30d) but past the custom window (3d)
+    slightly_old = _utcnow() - timedelta(days=5)
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.QUESTION, created_at=slightly_old
+    )
+
+    original = dict(_ss.runtime_config)
+    monkeypatch.setattr(_ss, "runtime_config", {**original, "stale_question_decay_days": 3})
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+    monkeypatch.setattr(_ss, "runtime_config", original)
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "stale_unanswered"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_skips_operator_action_needed_note(reaper_db):
+    """An operator-action-needed NOTE older than 14 days but under 60 days survives."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    # Older than the normal decay window (14 days) but younger than the OAN
+    # threshold (60 days) — must survive.
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_resolves_ordinary_note_with_operator_fyi(reaper_db):
+    """An ordinary NOTE with operator-fyi audience still decays — only
+    operator-action-needed blocks auto-resolution."""
+    from app.message_audience import OPERATOR_FYI
+
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_DECAY_DAYS + 1)
+    ctx = {"audience": OPERATOR_FYI}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+# ── Step 18d: stale-open bug-class decay ─────────────────────────────────────
+
+from app.reaper_bug_message_sweeps import (  # noqa: E402
+    STALE_OPEN_BUG_CLASS_DECAY_DAYS,
+    sweep_decay_stale_open_bug_messages,
+)
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_bug_report(reaper_db):
+    """An OPEN unowned BUG_REPORT older than the threshold is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="old unowned bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_decays_unowned_blocker(reaper_db):
+    """An OPEN unowned BLOCKER older than the threshold is auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="agent",
+        content="old unowned blocker",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_recent(reaper_db):
+    """A BUG_REPORT younger than the threshold is left open."""
+    project = await _make_project(reaper_db)
+    recent = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS - 1)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="recent bug report",
+        status="open",
+        context={},
+        created_at=recent,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_user_authored(reaper_db):
+    """Operator-authored (user) BUG_REPORTs are never auto-decayed."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 10)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="operator-authored bug report",
+        status="open",
+        context={},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_linked(reaper_db):
+    """A BUG_REPORT with a live convergence link is skipped (Step-15 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 5)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="linked bug report",
+        status="open",
+        context={"_convergence_link": {"kind": "direction", "id": "some-direction"}},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_direction_owned(reaper_db):
+    """An old BUG_REPORT with direction_id ownership is skipped (Step 17 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 10)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="system",
+        content="old direction-owned bug report",
+        status="open",
+        context={"direction_id": "d-still-active"},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_sweep_decay_stale_open_bug_messages_skips_task_owned(reaper_db):
+    """An old BLOCKER with pr_number+source_task_id ownership is skipped (Step 17 owns it)."""
+    project = await _make_project(reaper_db)
+    old = _utcnow() - timedelta(days=STALE_OPEN_BUG_CLASS_DECAY_DAYS + 20)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="agent",
+        content="old task-owned blocker",
+        status="open",
+        context={"pr_number": 1234, "source_task_id": "00000000-0000-0000-0000-000000000001"},
+        created_at=old,
+    )
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    await reaper_db.refresh(msg)
+
+    acted = await sweep_decay_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_operator_action_needed_eventually_decays(reaper_db):
+    """An operator-action-needed NOTE older than 60 days is eventually auto-decayed."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    # Older than the long threshold (60 days)
+    very_old = _utcnow() - timedelta(days=61)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=very_old, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "auto-decayed (stale)"
+
+
+@pytest.mark.asyncio
+async def test_decay_stale_open_operator_action_needed_preserved_within_threshold(reaper_db):
+    """An operator-action-needed NOTE younger than 60 days is preserved."""
+    from app.message_audience import OPERATOR_ACTION_NEEDED
+
+    project = await _make_project(reaper_db)
+    # Older than the normal 14-day window but younger than the 60-day OAN threshold
+    mid_age = _utcnow() - timedelta(days=30)
+    ctx = {"audience": OPERATOR_ACTION_NEEDED}
+    msg = await _make_conversational_message(
+        reaper_db, project, msg_type=MessageType.NOTE, created_at=mid_age, context=ctx,
+    )
+
+    acted = await sweep_decay_stale_open_messages(reaper_db, _utcnow())
+
+    assert acted == 0
+    await reaper_db.refresh(msg)
+    assert msg.status == "open"
+    assert msg.resolution is None
 
 
 # ── Step 16: converge duplicate foundations ───────────────────────────────
@@ -16625,6 +17369,78 @@ async def test_sweep_unblock_per_row_commit_releases_lock_between_tasks(
     )
 
 
+# ── Message supersession mode defaults to enforce ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_message_supersession_defaults_to_enforce_mode(reaper_db):
+    """The message supersession mode defaults to 'enforce', so stale messages
+    from a prior version are auto-resolved even when no runtime config override
+    is set. This is the acceptance test for the observe->enforce graduation."""
+    from app.message_supersession import supersede_stale_messages_on_version_close
+    from app.models import MessageType, ProjectMessage
+    from app.shared_state import runtime_config as _rc
+
+    NOW = _utcnow()
+    V1_OPENED = NOW - timedelta(days=180)
+    V2_OPENED = NOW - timedelta(days=150)
+    # Message in v1's window (created before V2_OPENED) and older than 14d.
+    MSG_TIME = NOW - timedelta(days=165)
+
+    saved = _rc.pop("message_supersession_mode", None)
+    try:
+        project = await _make_project(reaper_db)
+
+        reaper_db.add(ReleaseVersion(
+            project_id=project.id, version_number=1,
+            status="open", opened_at=V1_OPENED,
+        ))
+        reaper_db.add(ReleaseVersion(
+            project_id=project.id, version_number=2,
+            status="open", opened_at=V2_OPENED,
+        ))
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="stale status update",
+            status="open",
+            created_at=MSG_TIME,
+        )
+        reaper_db.add(msg)
+        await reaper_db.commit()
+        await reaper_db.refresh(msg)
+
+        summary = await supersede_stale_messages_on_version_close(
+            reaper_db,
+            project_id=project.id,
+            closed_version_number=2,
+            closed_version_opened_at=V2_OPENED,
+            terminal_status="promoted",
+            now=NOW,
+        )
+        await reaper_db.commit()
+
+        assert summary["mode"] == "enforce", (
+            "supersession mode should default to 'enforce'"
+        )
+        assert summary["acted"] is True, (
+            "supersession should act (resolve messages) by default"
+        )
+        assert summary["superseded"] == 1, (
+            "the stale v1 message should be superseded"
+        )
+        await reaper_db.refresh(msg)
+        assert msg.status == "resolved", (
+            "message should be resolved when mode defaults to enforce"
+        )
+    finally:
+        if saved is None:
+            _rc.pop("message_supersession_mode", None)
+        else:
+            _rc["message_supersession_mode"] = saved
+
+
 # ── Acceptance: extracted sweeps re-exported from reaper_sweeps ──────────────
 
 
@@ -17773,6 +18589,261 @@ async def test_proof_earn_loop_runs_after_backing_proof_same_cycle(reaper_db, mo
         _rs._last_proof_earn_loop_sweep = _prev_earn
 
 
+# ── Step 22e: auto-clear moot pending confirmations ──────────────────────────
+
+
+async def _make_ready_llm_account(db, user_id: str):
+    """Create an enabled, runtime-ready Anthropic OAuth account for a user."""
+    from app.models import MaxPlanAccount
+
+    acct = MaxPlanAccount(
+        user_id=user_id,
+        name="acct-1",
+        enabled=True,
+        oauth_token="projects/x/secrets/tok",
+    )
+    db.add(acct)
+    await db.commit()
+    return acct
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_clears_credentials_when_owner_ready(reaper_db):
+    """A credentials_needed item auto-clears once the owner has a runtime-ready
+    LLM account, and the removal persists to the durable problem_model column."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        project = await _make_project(reaper_db)  # user_id == "user1"
+        await _make_ready_llm_account(reaper_db, "user1")
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add an Anthropic Claude OAuth token for the pool.",
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 1
+
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"] == []
+        # revision-log entry was appended by the pure helper
+        log = project.problem_model.get("revision_log") or []
+        assert any(
+            e.get("changes", {}).get("auto_cleared_pending_confirmations") == ["p-cred"]
+            for e in log
+        )
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_leaves_item_when_not_ready(reaper_db):
+    """No runtime-ready credential -> the credentials_needed item is left in place;
+    intent_change is never auto-removed regardless."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        project = await _make_project(reaper_db)  # no LLM account for user1
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add a Claude OAuth token.",
+                },
+                {
+                    "id": "p-intent",
+                    "type": "intent_change",
+                    "proposal": "Pivot the project.",
+                },
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 0
+
+        await reaper_db.refresh(project)
+        ids = {p["id"] for p in project.problem_model["pending_user_confirmation"]}
+        assert ids == {"p-cred", "p-intent"}
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_cadence_gated(reaper_db):
+    """A just-stamped cadence timer gates the sweep out (returns 0 without work)."""
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = _utcnow()  # just ran -> not due
+    try:
+        project = await _make_project(reaper_db)
+        await _make_ready_llm_account(reaper_db, "user1")
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Add an Anthropic Claude OAuth token.",
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 0
+        await reaper_db.refresh(project)
+        # Untouched because the sweep was gated out.
+        assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-cred"
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_moot_confirmation_sweep_covers_all_projects_beyond_old_limit(reaper_db):
+    """Sweep must cover ALL projects, not just the first 25.
+
+    Creates 30 projects each with a clearable credentials_needed item and a
+    ready owner LLM account, then asserts all 30 items are cleared in a single
+    sweep invocation — verifying exhaustive pagination beyond the old LIMIT 25.
+    """
+    _prev = _rs._last_moot_confirm_sweep
+    _rs._last_moot_confirm_sweep = None
+    try:
+        await _make_ready_llm_account(reaper_db, "user1")
+        projects = []
+        for i in range(30):
+            p = Project(name=f"proj-pagination-{i}", user_id="user1")
+            p.problem_model = {
+                "pending_user_confirmation": [
+                    {
+                        "id": f"p-cred-{i}",
+                        "type": "credentials_needed",
+                        "proposal": "Add an Anthropic Claude OAuth token for the pool.",
+                    }
+                ]
+            }
+            reaper_db.add(p)
+            projects.append(p)
+        await reaper_db.commit()
+
+        cleared = await _rs.sweep_auto_clear_moot_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert cleared == 30, f"expected 30 cleared, got {cleared}"
+
+        for p in projects:
+            await reaper_db.refresh(p)
+            assert p.problem_model["pending_user_confirmation"] == [], (
+                f"project {p.id} still has pending confirmations"
+            )
+    finally:
+        _rs._last_moot_confirm_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_proof_earn_loop_fires_without_demand_when_unproven_caps_exist(reaper_db, mocker):
+    """Step 22b fires even with NO demand when unproven working capabilities exist.
+
+    The no-demand fallthrough breaks the circularity: demand requires blocked
+    dependents, blocked dependents require enforce mode, and enforce mode
+    requires proven capabilities.  Without this fallthrough the earn loop would
+    never fire on a project with all capabilities unproven and no blocked
+    dependents, leaving the gate permanently stuck in 'off'.
+
+    This test asserts that when collect_missing_capability_demand returns empty
+    demand, the sweep still calls commission_proof_earn_loop with a synthetic
+    demand covering all unproven working capabilities.
+    """
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    _rs._last_backing_proof_sweep = None
+    _rs._last_proof_earn_loop_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": "ci-pipeline",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                },
+                {
+                    "name": "repo-map",
+                    "status": "working",
+                    "backing_paths": [],
+                },
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        now = _utcnow()
+
+        # Return NO demand from the collector.
+        demand_spy = mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(return_value={"total": 0, "demands": []}),
+        )
+        # Spy on the earn loop to verify it receives a synthetic demand.
+        commission_spy = mocker.patch(
+            "app.capability_proof.commission_proof_earn_loop",
+            new=AsyncMock(
+                return_value={
+                    "total_demanded_unproven": 1,
+                    "earned": 0,
+                    "no_backing_paths": ["repo-map"],
+                    "still_unproven": [],
+                    "path_proven_stuck": [],
+                }
+            ),
+        )
+
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        # The demand collector was called.
+        demand_spy.assert_awaited()
+        # The earn loop was called (not skipped by the demand guard).
+        commission_spy.assert_awaited_once()
+        # Extract the synthetic demand passed to commission_proof_earn_loop.
+        _call_args = commission_spy.await_args
+        assert _call_args is not None
+        _synthetic_demand = _call_args[0][1] if _call_args.args else {}
+        assert _synthetic_demand.get("total", 0) >= 1, (
+            "synthetic demand must cover at least one unproven capability"
+        )
+        synthetic_refs = {
+            d["ref"] for d in _synthetic_demand.get("demands", [])
+            if d.get("kind") == "capability"
+        }
+        # Both capabilities should be in the synthetic demand.
+        assert "ci-pipeline" in synthetic_refs, (
+            "ci-pipeline must be in synthetic demand"
+        )
+        assert "repo-map" in synthetic_refs, (
+            "repo-map must be in synthetic demand"
+        )
+        # The sweep ran (result is not {} — it's the combined summary).
+        assert result != {}, "sweep must not return empty dict when it ran"
+        assert _rs._last_proof_earn_loop_sweep == now
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn
+
 @pytest.mark.asyncio
 async def test_proof_earn_loop_honors_its_own_cadence_gate(reaper_db, mocker):
     """Step 22b's cadence gate is independent of the backing-proof timer.
@@ -17804,6 +18875,71 @@ async def test_proof_earn_loop_honors_its_own_cadence_gate(reaper_db, mocker):
         # Its own timer is unchanged by a gated call; the backing timer stays None.
         assert _rs._last_proof_earn_loop_sweep == now
         assert _rs._last_backing_proof_sweep is None
+    finally:
+        _rs._last_backing_proof_sweep = _prev_backing
+        _rs._last_proof_earn_loop_sweep = _prev_earn
+
+
+@pytest.mark.asyncio
+async def test_proof_earn_loop_threads_named_test_executed_and_session(reaper_db, mocker):
+    """Step 22b threads the execution-trial signal (Slice 3, design 84021e2d).
+
+    The sweep must (a) pass the DB ``session`` into ``commission_proof_earn_loop``
+    so it can enroll a bounded ``capability_proof_trial``, and (b) accumulate the
+    per-project ``named_test_executed`` list into the combined summary so operators
+    can see which capabilities are earning the real ``proven`` tier this sweep.
+    """
+    _prev_backing = _rs._last_backing_proof_sweep
+    _prev_earn = _rs._last_proof_earn_loop_sweep
+    _rs._last_backing_proof_sweep = None
+    _rs._last_proof_earn_loop_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "capabilities": [
+                {
+                    "name": "ci-pipeline",
+                    "status": "working",
+                    "backing_paths": ["backend/app/capability_proof.py"],
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        now = _utcnow()
+
+        mocker.patch(
+            "app.capability_demand.collect_missing_capability_demand",
+            new=AsyncMock(
+                return_value={
+                    "total": 1,
+                    "demands": [{"kind": "capability", "ref": "ci-pipeline"}],
+                }
+            ),
+        )
+        commission_spy = mocker.patch(
+            "app.capability_proof.commission_proof_earn_loop",
+            new=AsyncMock(
+                return_value={
+                    "total_demanded_unproven": 1,
+                    "earned": 0,
+                    "no_backing_paths": [],
+                    "still_unproven": [],
+                    "path_proven_stuck": [],
+                    "named_test_executed": ["ci-pipeline"],
+                }
+            ),
+        )
+
+        result = await _rs.sweep_proof_earn_loop(reaper_db, now)
+
+        # (a) The sweep passed the DB session through (keyword arg) so the earn
+        # loop can enroll a trial.
+        commission_spy.assert_awaited_once()
+        assert commission_spy.await_args.kwargs.get("session") is reaper_db
+        # (b) named_test_executed is accumulated into the combined summary.
+        assert result["named_test_executed"] == ["ci-pipeline"]
     finally:
         _rs._last_backing_proof_sweep = _prev_backing
         _rs._last_proof_earn_loop_sweep = _prev_earn

@@ -46,6 +46,12 @@ interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
   selectedProjectRepoLabel: string | null;
   hasVersionLifecycle?: boolean;
+  /** Current autonomous-mode state of the selected project (drives the
+   *  "Toggle autonomous mode" command label/detail). */
+  autonomousEnabled?: boolean;
+  /** Flips the selected project's autonomous mode (PATCH .../autonomous).
+   *  Absent when no toggle is wired; the command is then disabled. */
+  toggleAutonomousMode?: () => void;
   directionsCount: number;
   filteredTaskCount: number;
   visibleActiveCount: number;
@@ -483,6 +489,8 @@ export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
   hasVersionLifecycle = false,
+  autonomousEnabled = false,
+  toggleAutonomousMode,
   directionsCount,
   filteredTaskCount,
   visibleActiveCount,
@@ -1303,6 +1311,17 @@ export function useWorkbenchCommands({
         run: () => openProjectSection('directions'),
       },
       {
+        id: 'project.autonomy.toggle',
+        label: 'Toggle autonomous mode',
+        section: 'Project',
+        detail: autonomousEnabled ? 'On — turn off' : 'Off — turn on',
+        keywords: ['autonomous', 'autonomy', 'auto', 'pause', 'resume', 'enable', 'disable', 'toggle', 'mode'],
+        disabled: projectDisabled || !toggleAutonomousMode,
+        run: toggleAutonomousMode
+          ? () => runAndClose(toggleAutonomousMode)
+          : closePalette,
+      },
+      {
         id: 'project.model',
         label: 'Problem model',
         section: 'Project',
@@ -1579,6 +1598,8 @@ export function useWorkbenchCommands({
     ];
   }, [
     apiHealthy,
+    autonomousEnabled,
+    toggleAutonomousMode,
     designRevision,
     directionsCount,
     filteredTaskCount,

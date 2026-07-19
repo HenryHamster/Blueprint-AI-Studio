@@ -34,6 +34,7 @@ from app.failure_classification import (
     REASSIGNED,
     BLOCKED_PRECONDITION,
     BRANCH_GONE,
+    REPO_UNINITIALIZED,
     SCOPE_EMPTY,
     SCOPE_OVERFLOW,
     _external_api_subtype_from_message,
@@ -2800,6 +2801,138 @@ class TestBranchGoneClassification:
     def test_branch_gone_does_not_trigger_code_defect_investigation(self):
         # No debug/remediation task should spawn for a branch-gone race.
         t = _task(self._PROD_MSG, ctx={"failure_category": "CODE_ERROR"})
+        assert should_trigger_code_defect_investigation(t) is False
+
+
+class TestCloneDeliveryDisagreement:
+    """``is_clone_delivery_disagreement`` distinguishes the STALE-durable-signal
+    wedge (durable repo_is_empty=False vs. an empty cloned tree) from an ordinary
+    transient clone_failed, so the report path can self-heal the durable signal
+    instead of looping clone_failed forever."""
+
+    # The exact message ``verifyCloneDelivered`` (discovery.ts branch 2) throws.
+    _DISAGREEMENT_MSG = (
+        "clone_failed: the onboarding scan counted 12 source file(s), but the "
+        "cloned tree has only 0 source file(s) under the same exclusion rules — "
+        "the clone did not deliver the expected content"
+    )
+
+    def test_matches_the_disagreement_message(self):
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        assert is_clone_delivery_disagreement(self._DISAGREEMENT_MSG) is True
+
+    def test_matches_case_insensitively(self):
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        assert is_clone_delivery_disagreement(self._DISAGREEMENT_MSG.upper()) is True
+
+    def test_rejects_generic_clone_failure(self):
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        # A HEAD-missing / wrong-checkout clone failure is NOT the disagreement.
+        assert (
+            is_clone_delivery_disagreement(
+                "clone_failed: working tree has no resolvable HEAD after clone — "
+                "the clone did not deliver a checkout"
+            )
+            is False
+        )
+        assert (
+            is_clone_delivery_disagreement(
+                "fatal: Remote branch main not found in upstream origin"
+            )
+            is False
+        )
+
+    def test_safe_on_empty_and_none(self):
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        assert is_clone_delivery_disagreement("") is False
+        assert is_clone_delivery_disagreement(None) is False
+
+    def test_pattern_matches_agent_source_of_truth(self):
+        """Cross-language contract: the substring must appear verbatim in the
+        agent's verifyCloneDelivered so the two never silently drift apart."""
+        from app.failure_classification import (
+            _CLONE_DELIVERY_DISAGREEMENT_PATTERNS,
+        )
+
+        agent_file = _REPO_ROOT / "agent" / "src" / "prompts" / "discovery.ts"
+        if not agent_file.exists():
+            pytest.skip(
+                f"{agent_file} not available in this environment — the backend "
+                "test image ships no agent/ tree (build context is ./backend). "
+                "This cross-language drift guard runs wherever the full repo "
+                "tree is checked out (local dev, agent VM workspace)."
+            )
+        src = agent_file.read_text(encoding="utf-8").lower()
+        for pat in _CLONE_DELIVERY_DISAGREEMENT_PATTERNS:
+            assert pat in src, (
+                f"clone-delivery disagreement pattern {pat!r} not found in "
+                "discovery.ts — the cross-language contract has drifted"
+            )
+
+
+class TestRepoUninitializedClassification:
+    """A repository with zero commits has no default branch, so nothing can be
+    cloned from it. Git reports that with the SAME text as a deleted branch, so
+    without a distinct class the failure is reported to operators as "Branch
+    deleted (PR merged before clone)" — a transient-sounding lie about a
+    permanent setup gap, which is exactly how an empty repo onboarded to the
+    fleet loops forever without anyone noticing."""
+
+    # What the agent emits once it has probed the remote and found zero refs.
+    # Note it necessarily still quotes git's original text, so it contains BOTH
+    # the empty-repo marker AND the branch-gone marker.
+    _AGENT_MSG = (
+        "Clone failed: the repository has no commits, so its default branch does "
+        "not exist yet. Blueprint seeds an initial commit when a project is "
+        "onboarded — this repo was never seeded. Push any commit to the default "
+        "branch (or re-onboard the project) to fix. Original git error: "
+        "Cloning into '/tmp/workspace'...\nfatal: Remote branch main not found "
+        "in upstream origin"
+    )
+
+    def test_uninitialized_repo_beats_branch_gone(self):
+        # THE regression guard. The agent's message matches the branch-gone
+        # patterns too, so if the empty-repo check is ever moved after
+        # _is_branch_gone this silently reverts to the wrong class.
+        assert classify_failure(_task(self._AGENT_MSG)) == REPO_UNINITIALIZED
+
+    def test_overrides_agent_posted_code_error(self):
+        t = _task(self._AGENT_MSG, ctx={"failure_category": "CODE_ERROR"})
+        assert classify_failure(t) == REPO_UNINITIALIZED
+
+    def test_github_api_empty_repo_phrasing_classifies(self):
+        # GET /contents/ on a commitless repo: 404 "This repository is empty."
+        assert (
+            classify_failure(_task('GitHub 404: {"message": "This repository is empty."}'))
+            == REPO_UNINITIALIZED
+        )
+
+    def test_git_data_api_empty_repo_phrasing_classifies(self):
+        # POST /git/refs on a commitless repo: 409 "Git Repository is empty"
+        assert (
+            classify_failure(_task("GitHub 409: Git Repository is empty"))
+            == REPO_UNINITIALIZED
+        )
+
+    def test_deleted_branch_still_classifies_branch_gone(self):
+        # The pre-existing meaning must not be cannibalised: a clone failure with
+        # no empty-repo evidence is still a deleted branch.
+        msg = "fatal: Remote branch plan/763859dc not found in upstream origin"
+        assert classify_failure(_task(msg)) == BRANCH_GONE
+
+    def test_repo_uninitialized_is_budget_exempt_infra_class(self):
+        from app.failure_classification import INFRA_CLASSES
+
+        assert REPO_UNINITIALIZED in INFRA_CLASSES
+        assert REPO_UNINITIALIZED in ALL_FAILURE_CLASSES
+
+    def test_does_not_trigger_code_defect_investigation(self):
+        # An unseeded repo is an operator fix, not a code defect to debug.
+        t = _task(self._AGENT_MSG, ctx={"failure_category": "CODE_ERROR"})
         assert should_trigger_code_defect_investigation(t) is False
 
 

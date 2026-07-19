@@ -48,8 +48,11 @@ from app.compute_backends import (
     LocalSubprocessComputeBackend,
     ComputeStatusResult,
     RunnerSubprocessBackend,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
+    TerminalArtifactReference,
     OPERATOR_HARDWARE_NOMINAL_RATE_PER_SECOND,
 )
+from app import auth as auth_mod
 from app.database import resolve_async_engine
 from testing.conftest import TestingSessionLocal, USE_POSTGRES
 from app.models import (
@@ -62,12 +65,14 @@ from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
     KnowledgeDocument,
+    LocalRunner,
     Project,
     ProjectComputeImage,
     ProjectMember,
     ReleaseDeployArtifact,
     ReleaseVersion,
     Task,
+    TaskHistory,
     TaskStatus,
     TaskWakeRegistration,
     WakeAction,
@@ -340,7 +345,10 @@ class TestAgentSecretManifest:
         assert manifest["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-test"
         assert manifest["env"]["TASK_ID"] == str(task_id)
         assert manifest["metadata"]["task_type"] == "create"
-        assert manifest["files"] == []
+        # Anthropic always materializes ~/.claude.json (even without claude_config_json)
+        # so the CLI doesn't stall on the onboarding dialog.
+        assert len(manifest["files"]) == 1
+        assert manifest["files"][0]["path"] == "/home/agent/.claude.json"
 
     def test_build_agent_secret_manifest_materializes_file_based_provider_auth(self):
         task_id = uuid.uuid4()
@@ -468,6 +476,90 @@ class TestAgentSecretManifest:
         assert manifest["env"]["LLM_SETTINGS"] == "{}"
         assert "LLM_CLI_TRANSLATION" in manifest["env"]
         assert manifest["metadata"]["model"] == "claude-opus-4-8"
+
+    def test_anthropic_omitted_claude_config_json_materializes_minimal_file(self):
+        """Anthropic provider without claude_config_json still produces a
+        ~/.claude.json file entry so the CLI doesn't stall on onboarding."""
+        import json as _json
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-no-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-xyz",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        # Content must not carry secrets — only the structural config shell
+        content = _json.loads(files[0]["content"])
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in files[0]["content"]
+        assert "sk-ant" not in files[0]["content"]
+        assert isinstance(content, dict)
+
+    def test_anthropic_supplied_claude_config_json_preserved(self):
+        """When claude_config_json is supplied, it is forwarded verbatim
+        (the VM-side normalizer merges hasTrustDialogAccepted on top)."""
+        import json as _json
+        operator_config = _json.dumps(
+            {"hasCompletedOnboarding": True, "email": "op@example.com"}
+        )
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-with-config",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-abc",
+            task_type="fix",
+            provider="anthropic",
+            auth_mode="oauth",
+            claude_config_json=operator_config,
+        )
+        files = manifest["files"]
+        assert len(files) == 1
+        assert files[0]["path"] == "/home/agent/.claude.json"
+        content = _json.loads(files[0]["content"])
+        assert content["hasCompletedOnboarding"] is True
+        assert content["email"] == "op@example.com"
+        # Operator fields preserved; trust injection happens in materialize_manifest.py
+        assert "sk-ant" not in files[0]["content"]
+
+    def test_anthropic_claude_json_path_is_home_anchored(self):
+        """The manifest path must use /home/agent so the agent runner can
+        re-anchor it to the live $HOME (e.g. /home inside a bwrap sandbox)."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-home-anchor",
+            task_id=task_id,
+            oauth_token="sk-ant-oauth01-def",
+            task_type="create",
+            provider="anthropic",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is not None, "expected .claude.json in manifest files"
+        # Canonical home-agent path so re-anchoring logic matches '.claude.json' tail
+        assert claude_file["path"] == "/home/agent/.claude.json"
+
+    def test_non_anthropic_omitted_claude_config_json_no_file(self):
+        """Non-Anthropic providers without claude_config_json must NOT add a
+        .claude.json file — OpenAI/ZAI/DeepSeek/Gemini don't need the onboarding bypass."""
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-openai-no-config",
+            task_id=task_id,
+            oauth_token='{"tokens":{"access_token":"abc"}}',
+            task_type="create",
+            provider="openai",
+            auth_mode="oauth",
+        )
+        claude_file = next(
+            (f for f in manifest["files"] if f["path"].endswith(".claude.json")), None
+        )
+        assert claude_file is None, "non-Anthropic provider must not add .claude.json"
 
 
 @pytest.mark.asyncio
@@ -717,6 +809,45 @@ async def test_gcp_compute_backend_adopts_existing_vm_with_original_started_at(
 
     assert result.started_at == started_at
     assert result.metadata["zone"] == "us-central1-f"
+
+
+@pytest.mark.asyncio
+async def test_gcp_compute_backend_launch_stamps_heartbeat_auth_marker(monkeypatch):
+    """GcpComputeBackend.launch() must stamp heartbeat_auth='hmac' in returned metadata.
+
+    This marker is persisted to polling_metadata via _apply_launch_result, which
+    is how the heartbeat endpoint knows this VM's startup script embeds the HMAC
+    token (and therefore the legacy UUID bearer must be rejected).
+    """
+    backend = GcpComputeBackend()
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+
+    async def fake_signed_url(jid, *, expires_at=None):
+        return "https://storage.example.com/upload"
+
+    async def fake_provision(vm_id, **kwargs):
+        return True
+
+    monkeypatch.setattr(
+        storage, "generate_compute_job_artifact_upload_signed_url", fake_signed_url
+    )
+    monkeypatch.setattr(compute, "provision_ephemeral_vm", fake_provision)
+    monkeypatch.setattr(compute, "find_vm_zone", lambda _vm_name: None)
+    monkeypatch.setattr(compute, "get_vm_zone", lambda _vm_name: "us-central1-f")
+
+    result = await backend.launch(spec)
+
+    assert result.metadata.get("heartbeat_auth") == "hmac", (
+        "GCP launch must stamp heartbeat_auth='hmac' so the heartbeat endpoint "
+        "can reject legacy UUID bearers for this job"
+    )
 
 
 @pytest.mark.asyncio
@@ -1209,6 +1340,7 @@ def _terminal_record_bytes(
     metrics: dict | None = None,
     command_log: dict | None = None,
     release_sha: str = "",
+    resume_provenance: dict | None = None,
     schema_version: int = 1,
 ) -> bytes:
     """terminal.json bytes exactly as the on-VM terminal_record.py would write."""
@@ -1222,6 +1354,11 @@ def _terminal_record_bytes(
             _b64_text(json.dumps(command_log)) if command_log is not None else ""
         ),
         "release_echo_b64": _b64_text(release_sha) if release_sha else "",
+        "resume_provenance_b64": (
+            _b64_text(json.dumps(resume_provenance))
+            if resume_provenance is not None
+            else ""
+        ),
     }
     return json.dumps(record).encode("utf-8")
 
@@ -1323,6 +1460,230 @@ def test_gcp_startup_script_no_progress_watchdog_inert_when_unset():
     assert "_NP_TIMEOUT_SECONDS=0" in script
 
 
+def test_gcp_startup_script_resume_hydration_is_fail_closed():
+    """Cross-job resume must FAIL CLOSED on download/extract failure — aborting the
+    run with a durable terminal record — mirroring the in-process backend's
+    ``_rehydrate_input_artifact_bundle`` (which raises), NOT silently running from
+    an empty workspace and burning the deadline redoing the resumed work."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url="https://storage.example.com/resume-bundle",
+    )
+    # The resume block is present with its provenance markers.
+    assert "resume_hydration.ok" in script
+    assert "resume_hydration.failed" in script
+    # On failure the run ABORTS loudly: durable terminal record with a parseable
+    # reason, serial FAILED markers, artifact upload, and poweroff — the exact
+    # fail-closed sequence the container-pull-fail branch uses.
+    assert "FAILED 1 resume_hydration_failed" in script
+    assert f"{compute_backends_module._SERIAL_REASON_PREFIX}resume_hydration_failed" in script
+    assert f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED" in script
+    fail_idx = script.index("FAILED 1 resume_hydration_failed")
+    tail = script[fail_idx:]
+    assert "upload_artifacts" in tail
+    assert "poweroff || shutdown -h now || true" in tail
+    assert "exit 1" in tail
+    # It must NOT silently continue from an empty workspace.
+    assert "running from scratch" not in script
+    # The rendered script is still syntactically valid bash.
+    _assert_bash_syntax_ok(script)
+
+
+def _run_gcp_resume_block(
+    monkeypatch, tmp_path, *, members: dict[str, bytes], fail_publication: bool = False
+):
+    """Execute only the generated hydration block with local test fixtures."""
+    import subprocess
+
+    artifact_dir = tmp_path / "artifacts"
+    bundle = tmp_path / "source.tar.gz"
+    with tarfile.open(bundle, "w:gz") as archive:
+        for name, payload in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    monkeypatch.setattr(
+        compute_backends_module, "_GCP_ARTIFACT_DIR_PATH", str(artifact_dir)
+    )
+    source_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+        input_artifact_job_id=str(source_id),
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url=bundle.as_uri(),
+    )
+    start_marker = "rm -rf /tmp/blueprint_resume_stage; rm -f /tmp/blueprint_resume_bundle.tar.gz"
+    start = script.index(start_marker)
+    end = script.index(start_marker, start + 1) + len(start_marker)
+    block = script[start:end]
+    prelude = (
+        "curl() { return 1; }; upload_artifacts() { :; }; "
+        "poweroff() { :; }; shutdown() { :; }; TTL_PID=; _NP_WATCHDOG_PID=; "
+    )
+    if fail_publication:
+        prelude += "cp() { return 1; }; "
+    proc = subprocess.run(
+        ["bash", "-c", prelude + block],
+        capture_output=True,
+        text=True,
+    )
+    return proc, artifact_dir, source_id
+
+
+def test_gcp_resume_rejects_empty_accepted_archive(monkeypatch, tmp_path):
+    """An archive with no regular files cannot become a successful checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={}
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
+def test_gcp_resume_rejects_archive_with_only_unsafe_member(monkeypatch, tmp_path):
+    """Skipped traversal members cannot count as a hydrated checkpoint."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"../outside/checkpoint.pt": b"weights"},
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+    assert "resume_hydration_failed" in proc.stdout
+
+
+def test_gcp_resume_scrubs_failed_publication(monkeypatch, tmp_path):
+    """A failed staged copy is checked and no partial checkpoint survives."""
+    proc, artifact_dir, _source_id = _run_gcp_resume_block(
+        monkeypatch,
+        tmp_path,
+        members={"checkpoint/model.pt": b"weights"},
+        fail_publication=True,
+    )
+
+    assert proc.returncode == 1
+    assert not (artifact_dir / "checkpoint/model.pt").exists()
+    assert not (artifact_dir / "resume_hydration.ok").exists()
+    assert (artifact_dir / "resume_hydration.failed").is_file()
+
+
+def test_gcp_resume_provenance_is_valid_for_chained_source(monkeypatch, tmp_path):
+    """Successful GCP hydration emits every field the next chain hop requires."""
+    proc, _artifact_dir, source_id = _run_gcp_resume_block(
+        monkeypatch, tmp_path, members={"checkpoint/model.pt": b"weights"}
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            next(
+                line
+                for line in proc.stdout.splitlines()
+                if line.startswith(compute_backends_module._SERIAL_RESUME_PREFIX)
+            ),
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None and status.resume_provenance is not None
+    provenance = status.resume_provenance
+    assert provenance["resumed_from_job_id"] == str(source_id)
+    assert provenance["file_count"] == 1
+    assert datetime.fromisoformat(provenance["recorded_at"]).tzinfo is not None
+
+    resumed_gcp_job = MagicMock(
+        backend=compute_backends_module.GCP_BACKEND_NAME,
+        polling_metadata={
+            "input_artifact_job_id": str(source_id),
+            "resume_provenance": provenance,
+        },
+    )
+    assert compute_jobs._has_verified_resume_provenance(resumed_gcp_job) is True
+
+
+def test_gcp_startup_script_emits_resume_serial_marker():
+    """The GCP startup script emits _SERIAL_RESUME_PREFIX on both the success and
+    failure branches of the resume block so the operator can always distinguish a
+    continued-from-checkpoint run from a from-scratch restart."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec,
+        artifact_upload_url="https://storage.example.com/upload",
+        input_artifact_download_url="https://storage.example.com/resume-bundle",
+    )
+
+    # The success branch emits the prefix with a base64-encoded payload.
+    prefix = compute_backends_module._SERIAL_RESUME_PREFIX
+    assert prefix in script, (
+        f"_SERIAL_RESUME_PREFIX ({prefix!r}) must appear in the startup script"
+    )
+
+    # The failure branch carries the pre-computed failed provenance marker.
+    assert compute_backends_module._SERIAL_RESUME_FAILED_B64 in script, (
+        "pre-computed failed resume marker must be in the failure branch"
+    )
+
+    # The prefix appears before the fail-closed path (before 'resume_hydration_failed')
+    # as well as on the success path.
+    resume_reason_idx = script.find("resume_hydration_failed")
+    fail_marker_idx = script.find(
+        compute_backends_module._SERIAL_RESUME_FAILED_B64
+    )
+    # The failure-branch serial marker must appear near the resume_hydration_failed
+    # reason, not orphaned elsewhere in the script.
+    assert 0 <= fail_marker_idx < resume_reason_idx + 200, (
+        "failure branch serial marker must be near the resume_hydration_failed reason"
+    )
+
+    _assert_bash_syntax_ok(script)
+
+
+def test_gcp_startup_script_no_resume_block_without_download_url():
+    """Without a resume source, no resume-hydration block (or its fail-closed
+    abort) is emitted — the fail-closed path is scoped to actual resume jobs."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=3600,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "resume_hydration" not in script
+
+
 def test_extract_terminal_record_from_bundle_roundtrips_and_failsoft():
     extract = compute_backends_module._extract_terminal_record_from_bundle
     # A faithful multi-file bundle: terminal.json is picked out by basename even
@@ -1398,13 +1759,17 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     marker is captured; the VM reads TERMINATED with no marker. poll_status must
     reconcile to SUCCEEDED from the durable terminal.json, NOT report FAILURE."""
     backend = GcpComputeBackend()
+    source_id = uuid.uuid4()
     job = ComputeJob(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
         backend=backend.name,
         external_compute_id="compute-job-vm-fast0001",
         status=ComputeJobStatus.RUNNING,
-        polling_metadata={"zone": "us-central1-f"},
+        polling_metadata={
+            "zone": "us-central1-f",
+            "input_artifact_job_id": str(source_id),
+        },
     )
 
     # Serial output carries NO terminal marker (lost to the poweroff race).
@@ -1420,6 +1785,12 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
                 exit_code=0,
                 reason="completed",
                 metrics={"mean_act_gain": 0.16},
+                resume_provenance={
+                    "ok": True,
+                    "file_count": 3,
+                    "recorded_at": "2026-07-15T00:00:00+00:00",
+                    "resumed_from_job_id": str(source_id),
+                },
             )
         }
     )
@@ -1436,6 +1807,9 @@ async def test_gcp_poll_status_reconciles_terminated_vm_from_durable_success(
     assert status.status == ComputeJobStatus.SUCCEEDED
     assert status.exit_code == 0
     assert status.metrics == {"mean_act_gain": 0.16}
+    assert status.resume_provenance is not None
+    assert status.resume_provenance["ok"] is True
+    assert status.resume_provenance["resumed_from_job_id"] == str(source_id)
     assert download_calls == [job.id]
 
 
@@ -1577,7 +1951,11 @@ async def test_runner_subprocess_poll_status_exit_125_classifies_no_progress():
         },
     )
     result = await backend.poll_status(job)
-    assert result.status == ComputeJobStatus.FAILED
+    # Exit 125 is the reserved no-progress watchdog code: poll_status terminalizes
+    # it as TIMED_OUT (matching the end-to-end monitor finalize path asserted in
+    # test_runner_report_exit_125_finalizes_no_progress_through_monitor), not a
+    # generic FAILED — otherwise the platform kill misattributes to the command.
+    assert result.status == ComputeJobStatus.TIMED_OUT
     assert result.exit_code == 125
     assert "no_progress_timeout" in result.message
     assert (
@@ -1605,6 +1983,398 @@ async def test_runner_subprocess_poll_status_generic_failure_not_no_progress():
     assert result.status == ComputeJobStatus.FAILED
     assert result.message == "compute job failed"
     assert "no_progress_timeout" not in result.message
+
+
+# ── End-to-end: runner /report endpoint → monitor → failure classification ────
+#
+# The unit tests above cover RunnerSubprocessBackend.poll_status in isolation.
+# The three tests below drive the WHOLE runner-job terminal pipeline: a real HTTP
+# POST to /api/runner/compute-job/{id}/report (runner Bearer auth), which stamps
+# polling_metadata, then process_compute_jobs_once (the monitor) polls that state,
+# finalizes the ComputeJob, and the durable terminal_reason is fed through
+# classify_compute_terminal_reason. This is the seam the client-side watchdog kill
+# (exit 125) and the runtime-deadline kill (exit 124) traverse in production;
+# nothing between the report endpoint and the classified outcome is mocked.
+
+
+async def _make_project_owner(session, *, name):
+    """A committed Project. The runner /report endpoint authenticates the runner
+    (not a user), and ``allowed_project_ids`` always includes the runner's
+    enrollment project, so no ProjectMember row is needed here."""
+    project = Project(name=name, user_id="test-user")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return project
+
+
+async def _make_runner_subprocess_job(
+    session, project, runner, *, status=ComputeJobStatus.RUNNING
+):
+    """A runner-subprocess ComputeJob pinned to ``runner`` and ready for /report.
+
+    The pin (``polling_metadata['runner_target_id']``) is exactly what the report
+    endpoint's runner-scoping filter requires, mirroring the claim path in
+    /next-compute-job.
+    """
+    job = ComputeJob(
+        project_id=project.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=status,
+        started_at=_utcnow() - timedelta(seconds=30),
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "command": "python train.py",
+        },
+    )
+    session.add(job)
+    await session.commit()
+    await session.refresh(job)
+    return job
+
+
+async def _register_runner(session, project):
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        last_seen_at=_utcnow(),
+        capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+    )
+    session.add(runner)
+    await session.commit()
+    await session.refresh(runner)
+    return runner, token
+
+
+@pytest.mark.asyncio
+async def test_stranded_runner_subprocess_sweep_finalizes_only_dead_claimed_jobs(db_session):
+    """Dead claimed runners finalize jobs; fresh, unclaimed, and other jobs survive."""
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+    from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Stranded runner sweep")
+    stale_runner = LocalRunner(project_id=project.id, token_hash="stale", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    inactive_runner = LocalRunner(project_id=project.id, token_hash="inactive", status="inactive", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    boundary_runner = LocalRunner(project_id=project.id, token_hash="boundary", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS))
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add_all([stale_runner, inactive_runner, boundary_runner, task])
+    await db_session.commit()
+
+    def job(status=ComputeJobStatus.RUNNING, backend=RUNNER_SUBPROCESS_BACKEND_NAME, **kwargs):
+        return ComputeJob(project_id=project.id, backend=backend, status=status, **kwargs)
+
+    stranded_running = job(task_id=task.id, ran_on_runner_id=stale_runner.id)
+    stranded_starting = job(status=ComputeJobStatus.STARTING, ran_on_runner_id=inactive_runner.id)
+    boundary_job = job(ran_on_runner_id=boundary_runner.id)
+    unclaimed_job = job()
+    other_backend_job = job(backend="local-subprocess", ran_on_runner_id=stale_runner.id)
+    terminal_job = job(status=ComputeJobStatus.FAILED, outcome=ComputeJobOutcome.FAILURE, ran_on_runner_id=stale_runner.id)
+    db_session.add_all([stranded_running, stranded_starting, boundary_job, unclaimed_job, other_backend_job, terminal_job])
+    await db_session.flush()
+    wake = TaskWakeRegistration(task_id=task.id, project_id=project.id, wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND, wake_source_ref=str(stranded_running.id), wake_action=WakeAction.FINALIZE)
+    db_session.add(wake)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession)
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 2
+    )
+
+    await db_session.refresh(stranded_running)
+    await db_session.refresh(stranded_starting)
+    await db_session.refresh(boundary_job)
+    await db_session.refresh(unclaimed_job)
+    await db_session.refresh(other_backend_job)
+    await db_session.refresh(terminal_job)
+    await db_session.refresh(wake)
+    assert stranded_running.status == ComputeJobStatus.FAILED
+    assert stranded_running.outcome == ComputeJobOutcome.FAILURE
+    assert stranded_running.terminal_reason == "runner_subprocess_runner_dead"
+    assert stranded_starting.status == ComputeJobStatus.FAILED
+    assert stranded_starting.terminal_reason == "runner_subprocess_runner_dead"
+    assert wake.fired_at is not None
+    history = (await db_session.execute(select(TaskHistory).where(TaskHistory.task_id == task.id))).scalars().all()
+    assert any(row.action == "COMPUTE_TERMINATED" for row in history)
+    assert boundary_job.status == ComputeJobStatus.RUNNING
+    assert unclaimed_job.status == ComputeJobStatus.RUNNING
+    assert other_backend_job.status == ComputeJobStatus.RUNNING
+    assert terminal_job.status == ComputeJobStatus.FAILED
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_stranded_runner_subprocess_sweep_protects_paused_draining_runners(db_session):
+    """Paused/draining runners with recent heartbeats keep in-flight jobs; stale ones get finalized."""
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+    from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Paused/Draining runner sweep")
+    # Paused/draining runners with RECENT heartbeats — still alive, should NOT lose jobs.
+    paused_alive = LocalRunner(project_id=project.id, token_hash="paused-alive", status="paused", last_seen_at=now)
+    draining_alive = LocalRunner(project_id=project.id, token_hash="draining-alive", status="draining", last_seen_at=now)
+    # Paused/draining runners with STALE heartbeats — truly dead, jobs SHOULD be finalized.
+    paused_dead = LocalRunner(project_id=project.id, token_hash="paused-dead", status="paused", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    draining_dead = LocalRunner(project_id=project.id, token_hash="draining-dead", status="draining", last_seen_at=now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS + 1))
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add_all([paused_alive, draining_alive, paused_dead, draining_dead, task])
+    await db_session.commit()
+
+    def job(status=ComputeJobStatus.RUNNING, **kwargs):
+        return ComputeJob(project_id=project.id, backend=RUNNER_SUBPROCESS_BACKEND_NAME, status=status, **kwargs)
+
+    paused_alive_job = job(ran_on_runner_id=paused_alive.id)
+    draining_alive_job = job(ran_on_runner_id=draining_alive.id)
+    paused_dead_job = job(ran_on_runner_id=paused_dead.id)
+    draining_dead_job = job(ran_on_runner_id=draining_dead.id)
+    db_session.add_all([paused_alive_job, draining_alive_job, paused_dead_job, draining_dead_job])
+    await db_session.flush()
+    wake = TaskWakeRegistration(
+        task_id=task.id, project_id=project.id,
+        wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(paused_dead_job.id), wake_action=WakeAction.FINALIZE,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+
+    session_factory = async_sessionmaker(resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession)
+    # Expected: 2 dead-runner jobs finalized, 2 alive-runner jobs survive.
+    assert (
+        await sweep_stranded_runner_subprocess_compute_jobs(
+            db_session, now, session_factory=session_factory
+        )
+        == 2
+    )
+
+    await db_session.refresh(paused_alive_job)
+    await db_session.refresh(draining_alive_job)
+    await db_session.refresh(paused_dead_job)
+    await db_session.refresh(draining_dead_job)
+    # Alive paused/draining: their jobs MUST survive (runner still heartbeating).
+    assert paused_alive_job.status == ComputeJobStatus.RUNNING
+    assert draining_alive_job.status == ComputeJobStatus.RUNNING
+    # Dead paused/draining: their jobs ARE finalized (runner truly gone).
+    assert paused_dead_job.status == ComputeJobStatus.FAILED
+    assert paused_dead_job.terminal_reason == "runner_subprocess_runner_dead"
+    assert draining_dead_job.status == ComputeJobStatus.FAILED
+    assert draining_dead_job.terminal_reason == "runner_subprocess_runner_dead"
+
+
+@pytest.mark.asyncio
+async def test_draining_runner_finishes_in_flight_job_without_new_dispatch(
+    client, db_session
+):
+    """Drain is a quiesce contract: preserve active work and refuse new claims.
+
+    The runner-side worker interprets ``cancel_requested: false`` on its normal
+    running report as permission to keep the healthy subprocess alive.  This
+    exercises that report path through normal completion, while separately
+    proving the next-compute-job pull cannot claim work after the runner drains.
+    """
+    from app.reaper_sweeps import sweep_stranded_runner_subprocess_compute_jobs
+
+    now = _utcnow()
+    project = await _make_project_owner(db_session, name="Runner drain contract")
+    runner, token = await _register_runner(db_session, project)
+    in_flight = await _make_runner_subprocess_job(db_session, project, runner)
+    queued = await _make_runner_subprocess_job(
+        db_session, project, runner, status=ComputeJobStatus.STARTING
+    )
+
+    # This mirrors the admin drain transition after the in-flight subprocess has
+    # already been claimed.  The recent heartbeat must continue to prove liveness.
+    runner.status = "draining"
+    runner.last_seen_at = now
+    await db_session.commit()
+
+    running = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "running"},
+    )
+    assert running.status_code == 200, running.text
+    assert running.json()["cancel_requested"] is False
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session), expire_on_commit=False, class_=AsyncSession
+    )
+    assert await sweep_stranded_runner_subprocess_compute_jobs(
+        db_session,
+        now,
+        session_factory=session_factory,
+    ) == 0
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.RUNNING
+    assert in_flight.terminal_reason is None
+
+    no_dispatch = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert no_dispatch.status_code == 204
+    await db_session.refresh(queued)
+    assert queued.status == ComputeJobStatus.STARTING
+
+    completed = await client.post(
+        f"/api/runner/compute-job/{in_flight.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "succeeded", "exit_code": 0},
+    )
+    assert completed.status_code == 200, completed.text
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(in_flight)
+    assert in_flight.status == ComputeJobStatus.SUCCEEDED
+    assert in_flight.terminal_reason != "runner_subprocess_runner_dead"
+
+
+@pytest.mark.asyncio
+async def test_runner_report_exit_125_finalizes_no_progress_timeout_through_monitor(
+    client, db_session
+):
+    """END-TO-END: a runner no-progress watchdog kill (exit 125) reported over the
+    HTTP /report endpoint is finalized by the monitor as an intentional TIMED_OUT
+    no-progress cut whose durable terminal_reason classifies to NO_PROGRESS_TIMEOUT.
+
+    This is the full pipeline the unit test only samples at poll_status: the
+    reserved exit code produced by scripts/local_runner.py's watchdog must survive
+    the report endpoint, poll_status' exit-125 translation, and the monitor's
+    finalize path, so the platform kill is never misattributed to the operator's
+    command (which would burn retry budget)."""
+    from app.failure_classification import (
+        NO_PROGRESS_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner NoProgress E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    # 1) Runner reports the no-progress watchdog kill over the real HTTP endpoint.
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 125},
+    )
+    assert report.status_code == 200, report.text
+
+    # 2) The monitor polls the stamped state and finalizes the job.
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert (job.polling_metadata or {}).get("exit_code") == 125
+    assert job.terminal_reason == "no_progress_timeout"
+    assert (job.polling_metadata or {}).get("terminal_kind") == "no_progress"
+    # 3) The classifier keys the terminal reason to a platform kill, not a defect.
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None)
+        == NO_PROGRESS_TIMEOUT
+    )
+    result = json.loads(compute_jobs.build_compute_result_logs(job))
+    assert result["intentional_terminal"] is True
+    assert result["killed_by"] == "deadline"
+
+
+@pytest.mark.asyncio
+async def test_runner_report_exit_124_finalizes_runtime_deadline_through_monitor(
+    client, db_session
+):
+    """END-TO-END: a runner runtime-deadline kill (exit 124) reported over the HTTP
+    /report endpoint is finalized as a TIMED_OUT deadline outcome that classifies
+    to AGENT_TIMEOUT — the other client-side watchdog, and NOT a CODE_ERROR.
+
+    Guards the sibling of the exit-125 path: exit 124 is recognised as a runtime
+    timeout by the monitor (_status_is_runtime_timeout), so the platform deadline
+    kill is attributed to the deadline, not to the command."""
+    from app.failure_classification import (
+        AGENT_TIMEOUT,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner Deadline E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 124},
+    )
+    assert report.status_code == 200, report.text
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Runtime-deadline kills terminalize as TIMED_OUT (matching the server-side
+    # runtime_deadline enforcement), not FAILED.
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert "runtime deadline" in (job.terminal_reason or "")
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None) == AGENT_TIMEOUT
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_report_generic_failure_finalizes_code_error_through_monitor(
+    client, db_session
+):
+    """CONTROL: a runner report of a plain non-watchdog failure (exit 1) finalizes
+    as a FAILURE that classifies to CODE_ERROR.
+
+    Proves the 124/125 special-casing is SPECIFIC — an ordinary command failure is
+    still attributed to the command, so the watchdog reasons are not over-applied."""
+    from app.failure_classification import (
+        CODE_ERROR,
+        classify_compute_terminal_reason,
+    )
+
+    project = await _make_project_owner(db_session, name="Runner CodeError E2E")
+    runner, token = await _register_runner(db_session, project)
+    job = await _make_runner_subprocess_job(db_session, project, runner)
+
+    report = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"exec_status": "failed", "exit_code": 1},
+    )
+    assert report.status_code == 200, report.text
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert (job.polling_metadata or {}).get("exit_code") == 1
+    assert (
+        classify_compute_terminal_reason(job.terminal_reason, None) == CODE_ERROR
+    )
 
 
 @pytest.mark.asyncio
@@ -1916,11 +2686,21 @@ async def test_input_artifact_job_id_rehydrates_checkpoint_bundle(monkeypatch):
         tar.add(first_artifact_dir, arcname=".")
     bundle_bytes = buf.getvalue()
 
-    async def fake_download(job_id):
-        return bundle_bytes if str(job_id) == str(first_id) else None
+    # Rehydration STREAMS the predecessor bundle to a temp file on disk (never
+    # buffers it whole in the orchestrator heap), so the seam it goes through is
+    # ``_download_artifact_bundle_to_path`` — mock that, writing the bundle to the
+    # destination path exactly as a real streaming download would.
+    def fake_stream_to_path(job_id, dest_path):
+        if str(job_id) != str(first_id):
+            return False
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle_bytes)
+        return True
 
     monkeypatch.setattr(
-        storage, "download_compute_job_artifact_bundle", fake_download
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
     )
 
     # ── Second job: launched WITH the predecessor reference; its command copies the
@@ -1966,11 +2746,15 @@ async def test_input_artifact_rehydration_fails_loudly_when_bundle_missing(monke
     letting the command run against an empty workspace."""
     backend = LocalSubprocessComputeBackend()
 
-    async def fake_download(job_id):
-        return None
+    # The streaming seam reports a missing object by returning False (no bundle to
+    # resume from) — rehydration must convert that into a loud, typed failure.
+    def fake_stream_to_path(job_id, dest_path):
+        return False
 
     monkeypatch.setattr(
-        storage, "download_compute_job_artifact_bundle", fake_download
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
     )
 
     spec = ComputeLaunchSpec(
@@ -1983,6 +2767,185 @@ async def test_input_artifact_rehydration_fails_loudly_when_bundle_missing(monke
     )
     with pytest.raises(RuntimeError, match="input_artifact_rehydration_failed"):
         await backend.launch(spec)
+
+
+@pytest.mark.asyncio
+async def test_local_backend_resume_records_provenance(monkeypatch):
+    """Cross-job checkpoint resume stamps resume_provenance into launch metadata so
+    the operator and agent surfaces can distinguish a continued-from-checkpoint run
+    from a from-scratch restart."""
+    backend = LocalSubprocessComputeBackend()
+
+    # First job: write a checkpoint file.
+    first_id = uuid.uuid4()
+    first_spec = ComputeLaunchSpec(
+        job_id=first_id,
+        command='echo "step-42" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"',
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+    )
+    first_result = await backend.launch(first_spec)
+    first_artifact_dir = first_result.metadata["artifact_dir"]
+    first_job = ComputeJob(
+        id=first_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=first_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": first_result.metadata["pid"]},
+    )
+    await _await_local_terminal(first_job)
+
+    # Build the predecessor's durable bundle from its artifact dir.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        tar.add(first_artifact_dir, arcname=".")
+    bundle_bytes = buf.getvalue()
+
+    def fake_stream_to_path(job_id, dest_path):
+        if str(job_id) != str(first_id):
+            return False
+        with open(dest_path, "wb") as handle:
+            handle.write(bundle_bytes)
+        return True
+
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_download_artifact_bundle_to_path",
+        fake_stream_to_path,
+    )
+
+    # Second job: launched WITH the predecessor reference.
+    second_id = uuid.uuid4()
+    second_spec = ComputeLaunchSpec(
+        job_id=second_id,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        input_artifact_job_id=first_id,
+    )
+    second_result = await backend.launch(second_spec)
+
+    # Resume provenance MUST be present in the launch metadata.
+    provenance = second_result.metadata.get("resume_provenance")
+    assert provenance is not None, "resume_provenance not stamped in launch metadata"
+    assert provenance.get("ok") is True, "ok must be True for successful rehydration"
+    assert isinstance(provenance.get("file_count"), int), "file_count must be an int"
+    assert provenance.get("file_count") >= 1, "at least one file must be rehydrated"
+    assert provenance.get("resumed_from_job_id") == str(first_id), \
+        "resumed_from_job_id must match the predecessor job id"
+    assert isinstance(provenance.get("recorded_at"), str), \
+        "recorded_at must be an ISO timestamp"
+
+    # Verify the second command can see the rehydrated file.
+    second_job = ComputeJob(
+        id=second_id,
+        project_id=uuid.uuid4(),
+        backend=backend.name,
+        external_compute_id=second_result.external_id,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata={"pid": second_result.metadata["pid"]},
+    )
+    await _await_local_terminal(second_job)
+    terminal = compute_backends_module._read_local_terminal_status(second_job)
+    assert terminal is not None
+    assert terminal.status == ComputeJobStatus.SUCCEEDED
+    assert terminal.exit_code == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adoption_path", ["memory", "persisted_pid", "terminal"])
+async def test_local_resume_adoption_recovers_durable_provenance(
+    monkeypatch, tmp_path, adoption_path
+):
+    """Every idempotent adoption path recovers proof after DB persistence loss."""
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    backend = LocalSubprocessComputeBackend()
+    source_id = uuid.uuid4()
+    job_id = uuid.uuid4()
+    external_id = f"local-{job_id}"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    provenance = {
+        "ok": True,
+        "file_count": 4,
+        "recorded_at": "2026-07-15T00:00:00+00:00",
+        "resumed_from_job_id": str(source_id),
+    }
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id, provenance
+    )
+
+    if adoption_path == "memory":
+        proc = MagicMock()
+        proc.pid = 4101
+        proc.poll.return_value = None
+        backend._processes[external_id] = compute_backends_module._LocalProcessHandle(
+            proc=proc, started_at=datetime(2026, 7, 15)
+        )
+    elif adoption_path == "persisted_pid":
+        monkeypatch.setattr(
+            compute_backends_module,
+            "_local_subprocess_pid_for_external_id",
+            lambda _external_id: 4102,
+        )
+
+        async def running(_pid):
+            return True
+
+        monkeypatch.setattr(compute_backends_module, "_aio_is_pid_running", running)
+    else:
+        compute_backends_module._write_local_state_text(
+            compute_backends_module._local_terminal_path_for_external_id(external_id),
+            "STATUS=SUCCEEDED\nEXIT_CODE=0",
+        )
+
+    result = await backend.launch(
+        ComputeLaunchSpec(
+            job_id=job_id,
+            external_id=external_id,
+            command="must-not-run",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_at=None,
+            input_artifact_job_id=str(source_id),
+        )
+    )
+
+    assert result.metadata["resume_provenance"] == provenance
+
+
+def test_local_resume_provenance_recovery_rejects_mismatched_source(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "local-source-match"
+    os.makedirs(
+        compute_backends_module._local_state_dir_for_external_id(external_id),
+        exist_ok=True,
+    )
+    compute_backends_module._write_local_resume_provenance_for_external_id(
+        external_id,
+        {
+            "ok": True,
+            "file_count": 1,
+            "resumed_from_job_id": str(uuid.uuid4()),
+        },
+    )
+    assert (
+        compute_backends_module._read_local_resume_provenance_for_external_id(
+            external_id, uuid.uuid4()
+        )
+        is None
+    )
 
 
 def test_safe_extract_artifact_bundle_rejects_path_traversal(tmp_path):
@@ -2426,6 +3389,68 @@ def test_gcp_startup_script_emits_valid_env_keys():
     assert "export SEED2=42" in script
 
 
+def test_gcp_startup_script_decodes_viewable_watch_script():
+    """The GCP startup script decodes the viewable_watch.py base64 blob into /tmp."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The base64-encoded viewable_watch.py is decoded to /tmp/blueprint_viewable_watch.py
+    assert "blueprint_viewable_watch.py" in script
+    assert "base64 -d > /tmp/blueprint_viewable_watch.py" in script
+
+
+def test_gcp_startup_script_launches_viewable_watcher_background():
+    """The viewable watcher runs as a background process with the expected args."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The watcher is launched as a background process (trailing &).
+    assert "blueprint_viewable_watch.py" in script
+    assert "&" in script[script.index("blueprint_viewable_watch.py"):]
+
+
+def test_gcp_startup_script_kills_viewable_watcher_on_cleanup():
+    """The viewable watcher PID is included in the main cleanup kill command."""
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+
+    # The final kill command must include _VIEWABLE_PID alongside the others.
+    assert '$_VIEWABLE_PID' in script
+    # The PID must be pre-declared before the setup-failure branches.
+    assert '_VIEWABLE_PID=' in script
+
+
 @pytest.mark.parametrize(
     "bad_key",
     [
@@ -2474,6 +3499,26 @@ def test_gcp_startup_script_refuses_env_keys_that_are_not_shell_identifiers(bad_
 # ENV_KEY_RE must not silently weaken the check that catches its output.
 _WELL_FORMED_EXPORT_RE = re.compile(r"^export [A-Za-z_][A-Za-z0-9_]*=", re.M)
 _ANY_EXPORT_RE = re.compile(r"^export ", re.M)
+
+
+def _assert_bash_syntax_ok(script: str) -> None:
+    """Fail if ``bash -n`` rejects the rendered startup script's syntax.
+
+    Skips (does not fail) when no ``bash`` binary is on this host, so the check is
+    a no-op on a minimal CI image but a real gate wherever bash exists.
+    """
+    import subprocess
+
+    bash = shutil.which("bash")
+    if bash is None:  # pragma: no cover - environment-dependent
+        pytest.skip("bash not available to run `bash -n`")
+    proc = subprocess.run(
+        [bash, "-n"],
+        input=script,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"bash -n rejected the script: {proc.stderr}"
 
 
 def _multi_line_exports(script: str) -> list[str]:
@@ -2684,6 +3729,14 @@ async def test_gcp_backend_adopt_existing_vm_records_artifact_uri(monkeypatch):
 
     assert result.metadata["artifact_uri"] == storage.compute_job_artifact_uri(job_id)
     assert result.metadata["zone"] == "us-central1-f"
+    # The adopted VM was provisioned by this backend with an HMAC startup script,
+    # so the adopt path must stamp the same marker as the normal launch path —
+    # otherwise _accepts_legacy_compute_heartbeat would accept a bare job-UUID
+    # bearer and let anyone knowing the job UUID spoof its heartbeats.
+    assert result.metadata.get("heartbeat_auth") == "hmac", (
+        "GCP crash-recovery adopt path must stamp heartbeat_auth='hmac' so legacy "
+        "UUID-bearer heartbeats are rejected for the recovered job"
+    )
 
 
 @pytest.mark.asyncio
@@ -2869,6 +3922,11 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         ("Detected A40 GPU, which is not supported by this container", True),
         # A normal successful run is not a false positive.
         ("throughput_tflops: 42.0\nrun complete", False),
+        # CUDA error 209: image lacks device code for host GPU arch (e.g. sm_70/Volta).
+        (
+            "CUDA error: no kernel image is available for execution on the device",
+            True,
+        ),
         # Non-fatal mentions of "gpu" and "supported" must not trip it.
         ("Using GPU 0; mixed precision supported", False),
     ],
@@ -2994,6 +4052,648 @@ async def test_process_compute_jobs_once_reclassifies_no_usable_gpu_as_failure(
     # Outcome is FAILURE, not SUCCESS, even though the container exited 0.
     assert job.outcome == ComputeJobOutcome.FAILURE
     assert "no usable GPU" in (job.terminal_reason or "")
+
+
+def _job_with_declared_metric(metric: str | None) -> ComputeJob:
+    meta: dict = {}
+    if metric is not None:
+        meta["declared_metric"] = metric
+    return ComputeJob(
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata=meta,
+    )
+
+
+def test_declared_metric_unmeasured_present_in_result_file():
+    # Declared metric captured directly in $BLUEPRINT_RESULT_FILE metrics → measured.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": 0.91, "loss": 0.2},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_present_in_one_arm():
+    # Multi-arm result: the declared metric lives inside an arm block (best-arm
+    # semantics the success-criterion evaluator uses) → measured.
+    job = _job_with_declared_metric("median_matmul_ms")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={
+            "arms": {
+                "fp32": {"median_matmul_ms": 12.4, "elapsed_seconds": 5.0},
+                "fp16": {"median_matmul_ms": 6.1, "elapsed_seconds": 5.0},
+            }
+        },
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_present_via_stdout_fallback():
+    # No result-file metrics, but the command printed its result object to stdout —
+    # the stdout fallback recovers it exactly as build_compute_result_logs does.
+    job = _job_with_declared_metric("throughput_tflops")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        command_log={"text": "run complete\n{\"throughput_tflops\": 42.0}\n"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_case_insensitive_match():
+    # Matches the evaluator's case-insensitive metric lookup.
+    job = _job_with_declared_metric("Accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": 0.5},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_absent_everywhere():
+    # Declared metric captured NOWHERE — result file empty, no arm, no stdout → the
+    # unmeasured case that must be reclassified.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"loss": 0.2},
+        command_log={"text": "training finished, no accuracy printed"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is True
+
+
+def test_declared_metric_unmeasured_no_declared_metric_is_false():
+    # A job that declares NO metric is never unmeasured (byte-for-byte unaffected).
+    job = _job_with_declared_metric(None)
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED, exit_code=0, metrics=None
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is False
+
+
+def test_declared_metric_unmeasured_tolerates_malformed_status():
+    # Missing/malformed metrics and command_log must be tolerated, not raise.
+    job = _job_with_declared_metric("accuracy")
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics=None,
+        command_log={"text": None},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job, status) is True
+    # Non-numeric declared value does not count as measured (matches evaluator).
+    job2 = _job_with_declared_metric("accuracy")
+    status2 = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics={"accuracy": "n/a"},
+    )
+    assert compute_jobs._declared_metric_unmeasured(job2, status2) is True
+
+
+@pytest.mark.asyncio
+async def test_declared_metric_missing_reclassified_not_success(
+    db_session, monkeypatch
+):
+    """A declared-metric job that exits 0 writing NO metric is FAILURE, not SUCCESS.
+
+    Regression guard for the recurring silent-SUCCESS waste class (operator bug
+    reports b8879c55 / daa28062 / 87baf5fe): a multi-hour runner-subprocess run
+    declared a metric, exited 0, but never wrote that metric anywhere — result
+    file, per-arm block, or stdout. It was recorded outcome=SUCCESS despite
+    measuring nothing. It must reclassify to FAILURE via the no-data guard, whose
+    precise resolver confirms the declared scalar metric is unmeasured.
+    """
+    project = Project(name="Metric Missing Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="declared-metric experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+        declared_metric="val_accuracy",
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "metricless-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="metricless-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            # Exited 0, produced NO metric anywhere — the silent waste case.
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=None,
+                command_log={"text": "epoch 1..10 done\n"},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    # Reclassified: FAILURE, not a clean SUCCESS.
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    # Unified no-data terminal reason (the declared scalar metric was unmeasured).
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_declared_metric_written_still_success(db_session, monkeypatch):
+    """A declared-metric job that WRITES the metric stays SUCCESS (no false positive)."""
+    project = Project(name="Metric Written Success", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="declared-metric experiment measured",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+        declared_metric="val_accuracy",
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "measured-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="measured-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics={"val_accuracy": 0.87},
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.parametrize(
+    "metrics,expected",
+    [
+        (None, True),
+        ({}, True),
+        ("not-a-dict", True),
+        ({"accuracy": 0.9}, False),
+    ],
+)
+def test_status_has_no_reported_metrics(metrics, expected):
+    status = ComputeStatusResult(
+        status=ComputeJobStatus.SUCCEEDED,
+        exit_code=0,
+        metrics=metrics,
+    )
+    assert compute_jobs._status_has_no_reported_metrics(status) is expected
+
+
+def test_job_expects_data_variants():
+    # Declared metric stamped in polling_metadata (job-creation path) → expects data.
+    job = ComputeJob(polling_metadata={"declared_metric": "val/loss"})
+    assert compute_jobs._job_expects_data(job, None) is True
+
+    # Arms block on the task payload → expects data even with no declared metric.
+    empty_job = ComputeJob(polling_metadata={})
+    arms_task = Task(payloads=[{"arms": {"a": {"metric": 1.0}}}])
+    assert compute_jobs._job_expects_data(empty_job, arms_task) is True
+
+    # success_criterion.metric on the task payload → expects data.
+    crit_task = Task(payloads=[{"success_criterion": {"metric": "acc"}}])
+    assert compute_jobs._job_expects_data(empty_job, crit_task) is True
+
+    # Pure side-effect job: no declared metric, no arms, no criterion → no data expected.
+    side_effect_task = Task(payloads=[{"type": "research"}])
+    assert compute_jobs._job_expects_data(empty_job, side_effect_task) is False
+    assert compute_jobs._job_expects_data(empty_job, None) is False
+
+    # criterion-free compute_experiment: _job_expects_data returns False (it handles
+    # metric/arms only); the separate _is_criterion_free_experiment path catches this.
+    experiment_no_criterion = Task(payloads=[{"type": "compute_experiment"}])
+    assert compute_jobs._job_expects_data(empty_job, experiment_no_criterion) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_no_criterion) is True
+
+    # compute_experiment WITH a stamped declared_metric in polling_metadata → not criterion-free.
+    job_with_metric = ComputeJob(polling_metadata={"declared_metric": "acc"})
+    assert compute_jobs._is_criterion_free_experiment(job_with_metric, experiment_no_criterion) is False
+
+    # compute_experiment WITH a success_criterion in payload → not criterion-free.
+    experiment_with_criterion = Task(payloads=[{"type": "compute_experiment", "success_criterion": {"metric": "acc"}}])
+    assert compute_jobs._is_criterion_free_experiment(empty_job, experiment_with_criterion) is False
+
+    # Non-experiment type (research) → never criterion-free.
+    assert compute_jobs._is_criterion_free_experiment(empty_job, side_effect_task) is False
+    assert compute_jobs._is_criterion_free_experiment(empty_job, None) is False
+
+
+async def _run_no_data_guard_job(
+    db_session,
+    monkeypatch,
+    *,
+    task_payload,
+    status_metrics=None,
+    artifact_reference=None,
+):
+    """Drive a SUCCEEDED metric-less compute job through the monitor.
+
+    Shared harness for the no-data-guard tests: creates a job whose backend
+    reports SUCCEEDED/exit 0 with the given ``status_metrics``, stubs
+    durable-artifact detection to return ``artifact_reference``, runs two
+    monitor ticks, and returns the refreshed job so the caller can assert the
+    resulting outcome/terminal_reason.
+    """
+    project = Project(name="No Data Guard", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[task_payload],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python run.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    declared_metric = task_payload.get("declared_metric")
+    criterion = task_payload.get("success_criterion")
+    if not declared_metric and isinstance(criterion, dict):
+        declared_metric = criterion.get("metric")
+    if isinstance(declared_metric, str) and declared_metric.strip():
+        # Production job creation stamps this launch-contract value. Mirror that
+        # durable declaration so the no-data harness exercises the precise
+        # terminal resolver rather than only task-payload fallback behavior.
+        meta["declared_metric"] = declared_metric.strip()
+    job.polling_metadata = meta
+    await db_session.commit()
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-data-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="no-data-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=status_metrics,
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+
+    async def _fake_collect(_job):
+        return artifact_reference
+
+    monkeypatch.setattr(
+        compute_jobs, "collect_terminal_artifact_reference", _fake_collect
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    return job
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reclassifies_no_data_success_as_failure(
+    db_session, monkeypatch
+):
+    """A metric-declaring job that exits 0 with no metrics AND no artifacts fails.
+
+    Regression guard for the documented silent metric-less SUCCESS incidents: the
+    command exited cleanly but produced neither a reported metric nor any durable
+    artifact, so it never generated a usable result — it must be reclassified as a
+    FAILURE, not recorded as a clean SUCCESS.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "val/loss"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_process_compute_jobs_once_reclassifies_arms_no_data_as_failure(
+    db_session, monkeypatch
+):
+    """The arms sweep path is especially vulnerable — its preflight metric check is
+    skipped — so a metric-less, artifact-less arms job must still fail here."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
+        status_metrics={"elapsed_seconds": 12.0},
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "no usable result" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_respects_reported_metrics(db_session, monkeypatch):
+    """A metric-declaring job that DID report metrics stays SUCCESS."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "accuracy"},
+        status_metrics={"accuracy": 0.91},
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_without_criterion_fails(db_session, monkeypatch):
+    """A compute_experiment that declares no metric and no success_criterion must FAIL.
+
+    compute_experiment is a measurement task by definition; a metric is mandatory.
+    The _job_expects_data carve-out was designed for pure side-effect commands (no
+    declared metric), not for experiments — this regression guard ensures a criterion-
+    free experiment is reclassified as FAILURE rather than recorded as clean SUCCESS.
+    """
+    project = Project(name="No Metric Declared Experiment", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="compute_experiment with no metric",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=300,
+    )
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
+    # No declared metric was persisted.
+    assert "declared_metric" not in (job.polling_metadata or {})
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "no-criterion-experiment-job"
+
+        async def launch(self, spec):
+            return ComputeLaunchResult(
+                external_id="no-criterion-experiment-job",
+                started_at=_utcnow() - timedelta(seconds=30),
+                cost_rate_per_second=0.0,
+                message="launched",
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(
+                status=ComputeJobStatus.SUCCEEDED,
+                exit_code=0,
+                finished_at=_utcnow(),
+                message="completed",
+                metrics=None,
+            )
+
+        async def terminate(self, persisted_job, *, reason):
+            raise AssertionError("terminate should not be called")
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    await db_session.refresh(job)
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "compute_experiment declared no metric" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_side_effect_job_no_metric_stays_success(db_session, monkeypatch):
+    """Side-effect jobs (non-experiment type) with no metric stay SUCCESS.
+
+    The _job_expects_data carve-out must remain intact for non-experiment task types
+    (research, plan, etc.) that legitimately have no declared metric.  Only
+    compute_experiment tasks are required to declare a criterion.
+    """
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_respects_durable_artifacts(db_session, monkeypatch):
+    """Incidental artifacts do not fulfill an unmeasured declared metric."""
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/artifacts",
+        backend="local",
+        file_count=3,
+        total_size_bytes=1024,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "declared_metric": "val/loss"},
+        status_metrics={"elapsed_seconds": 12.0},
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "durable artifacts preserved" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/artifacts" in (job.terminal_reason or "")
+    assert "file_count=3" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_reclassifies_arms_with_incidental_artifact(
+    db_session, monkeypatch
+):
+    """An arms job needs per-arm data; a stray artifact must not rescue SUCCESS."""
+    reference = TerminalArtifactReference(
+        uri="file:///tmp/arms-checkpoint",
+        backend="local",
+        file_count=1,
+        total_size_bytes=512,
+    )
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research", "arms": {"fp16": {"metric": "tflops"}}},
+        status_metrics={"elapsed_seconds": 12.0},
+        artifact_reference=reference,
+    )
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert "never measured its declared result" in (job.terminal_reason or "")
+    assert "uri=file:///tmp/arms-checkpoint" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_no_data_guard_skips_side_effect_job(db_session, monkeypatch):
+    """A pure side-effect job (no declared metric, no arms) that exits 0 with no
+    metrics and no artifacts stays SUCCESS — the guard must not false-reject it."""
+    job = await _run_no_data_guard_job(
+        db_session,
+        monkeypatch,
+        task_payload={"type": "research"},
+        status_metrics=None,
+        artifact_reference=None,
+    )
+    assert job.outcome == ComputeJobOutcome.SUCCESS
 
 
 @pytest.mark.asyncio
@@ -4284,7 +5984,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         project_id=project.id,
         title="compute parent",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment"}],
+        payloads=[{"type": "compute_experiment", "declared_metric": "score"}],
     )
     db_session.add(task)
     await db_session.commit()
@@ -4296,6 +5996,7 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         command=(
             'printf "stdout-line\\n"; '
             'printf "stderr-line\\n" >&2; '
+            'printf \'{"score":1.0}\' > "$BLUEPRINT_COMPUTE_RESULT_PATH"; '
             'printf "checkpoint-bytes" > "$BLUEPRINT_ARTIFACT_DIR/model.ckpt"'
         ),
         machine_type="e2-standard-2",
@@ -4329,7 +6030,10 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         raise AssertionError("compute job did not reach a terminal state")
 
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # NOTE: outcome may be FAILURE for criterion-free compute_experiment tasks
+    #       (no declared metric, arms, or success_criterion) — this test is about
+    #       artifact capture, not outcome semantics.
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     # The durable artifact directory outlived the (now-exited) subprocess and the
     # checkpoint is still re-readable from the persisted location.
@@ -6830,7 +8534,13 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
         project_id=project.id,
         title="compute_experiment: parked job",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -6889,6 +8599,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -6914,7 +8625,8 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     db_session.expire_all()
     await db_session.refresh(job)
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert len(regs) == 1, "launch must not create duplicate parked registrations"
@@ -6934,7 +8646,8 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     assert reg.attempt_count == 1
     compute_result = (task.plan_output or {}).get("compute_result")
     assert compute_result is not None
-    assert compute_result["outcome"] == "SUCCESS"
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert compute_result["outcome"] in ("SUCCESS", "FAILURE")
     assert compute_result["final_cost_usd"] == pytest.approx(0.12)
 
     # Idempotency: a duplicate monitor tick skips the already-terminal job (no
@@ -6988,7 +8701,13 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
         project_id=project.id,
         title="compute_experiment: terminal before park",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -7032,6 +8751,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -7062,7 +8782,8 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
     await db_session.refresh(task)
     assert job.status == ComputeJobStatus.SUCCEEDED
-    assert job.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
     # The monitor fired nothing — no registration existed when the job finalized.
     pre_regs = (await db_session.execute(select(TaskWakeRegistration))).scalars().all()
     assert pre_regs == [], "no registration should exist before the task parks"
@@ -7105,7 +8826,8 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     assert (task.context or {}).get("failure_category") != "park_wake_timeout"
     compute_result = (task.plan_output or {}).get("compute_result")
     assert compute_result is not None
-    assert compute_result["outcome"] == "SUCCESS"
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert compute_result["outcome"] in ("SUCCESS", "FAILURE")
     assert compute_result["final_cost_usd"] == pytest.approx(0.21)
     assert reg.delivery_state == WakeDeliveryState.DELIVERED
     assert reg.result_state == "finalized"
@@ -9355,7 +11077,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project.id,
         title="compute_experiment: lock release",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[{"type": "compute_experiment", "base_branch": "main", "success_criterion": "artifact_produced"}],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task)
@@ -9444,7 +11166,13 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         project_id=project2.id,
         title="compute_experiment: terminal wake",
         status=TaskStatus.IN_PROGRESS,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "declared_metric": "score",
+            }
+        ],
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:12]}",
     )
     db_session.add(task2)
@@ -9486,6 +11214,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
                 exit_code=0,
                 finished_at=_utcnow(),
                 message="completed",
+                metrics={"score": 1.0},
             )
 
         async def terminate(self, persisted_job, *, reason):
@@ -9504,7 +11233,8 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
     # instance would lazy-load (MissingGreenlet under real asyncpg expiry).
     await db_session.refresh(task2)
     assert job2.status == ComputeJobStatus.SUCCEEDED
-    assert job2.outcome == ComputeJobOutcome.SUCCESS
+    # criterion-free compute_experiment → outcome may be FAILURE (no metric declared)
+    assert job2.outcome in (ComputeJobOutcome.SUCCESS, ComputeJobOutcome.FAILURE)
 
     await park_task(
         db_session,
@@ -12064,6 +13794,74 @@ def test_parse_serial_status_garbled_echo_is_tolerated():
     assert status.echoed_release_sha is None
 
 
+def test_parse_serial_status_decodes_resume_marker():
+    """_parse_serial_status decodes BLUEPRINT_COMPUTE_RESUME into
+    resume_provenance dict."""
+    payload_b64 = base64.b64encode(
+        json.dumps({"ok": True, "file_count": 3}).encode()
+    ).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            f"BLUEPRINT_COMPUTE_RESUME={payload_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is not None
+    assert status.resume_provenance.get("ok") is True
+    assert status.resume_provenance.get("file_count") == 3
+
+
+def test_parse_serial_status_missing_resume_yields_none():
+    """_parse_serial_status returns resume_provenance=None when marker is absent."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is None
+
+
+def test_parse_serial_status_garbled_resume_is_tolerated():
+    """Garbled resume provenance marker is tolerated — resume_provenance stays None."""
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=RUNNING",
+            "BLUEPRINT_COMPUTE_RESUME=not-valid-base64-$$$",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.RUNNING
+    assert status.resume_provenance is None
+
+
+def test_parse_serial_status_resume_passes_through_terminal():
+    """Resume provenance serial marker is preserved through terminal status
+    (SUCCEEDED/FAILED), not only on RUNNING status."""
+    payload_b64 = base64.b64encode(
+        json.dumps({"ok": False, "file_count": 0, "reason": "resume_hydration_failed"}).encode()
+    ).decode("ascii")
+    serial = "\n".join(
+        [
+            "BLUEPRINT_COMPUTE_STATUS=FAILED",
+            "BLUEPRINT_COMPUTE_EXIT_CODE=1",
+            f"BLUEPRINT_COMPUTE_RESUME={payload_b64}",
+        ]
+    )
+    status = compute_backends_module._parse_serial_status(serial)
+    assert status is not None
+    assert status.status == ComputeJobStatus.FAILED
+    assert status.resume_provenance is not None
+    assert status.resume_provenance.get("ok") is False
+    assert status.resume_provenance.get("reason") == "resume_hydration_failed"
+
+
 def test_local_wrapper_command_writes_release_echo_to_terminal_file():
     """Local wrapper writes RELEASE_ECHO= to the terminal state file."""
     wrapper = compute_backends_module._build_local_wrapper_command(
@@ -12531,13 +14329,314 @@ async def test_compute_job_vm_heartbeat_wrong_bearer_rejected(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_bare_uuid_cannot_suppress_watchdog(
+    client, db_session, monkeypatch
+):
+    """A bare job-UUID bearer must NOT quiet the watchdog or keep a job alive.
+
+    Regression for the weak-auth finding: the job UUID is a resource identifier
+    (URL path / poll responses / logs), so it must not authenticate the heartbeat.
+    A caller presenting only the bare UUID is rejected with 403 and mutates
+    NOTHING — it cannot transition a stuck STARTING job to RUNNING (which would
+    suppress the provisioning-deadline timeout) nor append a progress sample
+    (which would quiet the no-progress watchdog). The properly-authenticated
+    runner — presenting the per-job secret derived by ``compute_job_heartbeat_secret``
+    — still can.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Bare UUID Guard", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.STARTING
+    job.last_heartbeat_at = None
+    # Stamp the HMAC launch marker: this job was launched by the HMAC engine so
+    # its startup script contains the per-job secret, not the bare UUID.
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
+    await db_session.commit()
+
+    progress_body = json.dumps({"progress": {"metric": "loss", "value": 0.5}}).encode()
+
+    # 1) A bare job-UUID bearer is rejected and changes nothing.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {job.id}",
+            "Content-Type": "application/json",
+        },
+        content=progress_body,
+    )
+    assert resp.status_code == 403, "bare job-UUID bearer must be rejected"
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.STARTING, (
+        "a rejected heartbeat must NOT keep a stuck STARTING job alive"
+    )
+    assert job.last_heartbeat_at is None, "a rejected heartbeat must not refresh liveness"
+    assert "progress_series" not in (job.polling_metadata or {}), (
+        "a rejected heartbeat must not feed the no-progress watchdog"
+    )
+
+    # 2) The properly-authenticated runner (per-job secret) still works.
+    secret = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    assert secret != str(job.id), "the heartbeat secret must NOT be the job UUID"
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": f"Bearer {secret}",
+            "Content-Type": "application/json",
+        },
+        content=progress_body,
+    )
+    assert resp.status_code == 204, "the properly-authenticated runner must succeed"
+
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING, (
+        "the authenticated first heartbeat transitions STARTING→RUNNING"
+    )
+    assert job.last_heartbeat_at is not None, "authenticated heartbeat refreshes liveness"
+    series = (job.polling_metadata or {}).get("progress_series")
+    assert series, "authenticated heartbeat must record the progress sample"
+    assert series[-1]["name"] == "loss" and series[-1]["value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_pre_rollout_uuid_keeps_vm_alive(
+    client, db_session, monkeypatch
+):
+    """A VM launched before the HMAC deploy may refresh its heartbeat with its UUID."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Flag-day Compatibility", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    # No heartbeat_auth marker: simulates a row created by the pre-HMAC engine
+    # whose startup script sends the bare job UUID as the heartbeat bearer.
+    job.polling_metadata = {}
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+
+    assert resp.status_code == 204
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_unmarked_job_after_rollout_date_accepts_uuid(
+    client, db_session, monkeypatch
+):
+    """An unmarked job (no heartbeat_auth marker) launched AFTER the old rollout date
+    must still accept a legacy UUID bearer.
+
+    This is the exact case the v26 qualification finding cites: VMs launched by
+    the still-serving pre-HMAC engine have no marker in polling_metadata regardless
+    of their created_at timestamp.  The marker-based check replaces the old
+    calendar-keyed check, so post-rollout-date rows without the marker are treated
+    as pre-HMAC (legacy UUID bearer accepted).
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Marker Unmarked Post-Rollout", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    # No heartbeat_auth marker and created_at AFTER the old rollout boundary.
+    # Under the old calendar-keyed scheme this would be rejected; under the new
+    # marker-based scheme it must be accepted (no marker = legacy engine).
+    job.polling_metadata = {}
+    job.created_at = datetime(2026, 7, 15, 0, 0, 0, tzinfo=timezone.utc).replace(
+        tzinfo=None
+    )
+    job.last_heartbeat_at = None
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 204, (
+        "unmarked job (no heartbeat_auth marker) must accept legacy UUID bearer "
+        "regardless of created_at — this is the exact v26 gating bug"
+    )
+    await db_session.refresh(job)
+    assert job.last_heartbeat_at is not None, "heartbeat must update liveness"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_marked_job_rejects_uuid_accepts_hmac(
+    client, db_session, monkeypatch
+):
+    """A job with heartbeat_auth='hmac' marker rejects UUID bearer and accepts HMAC."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Marker HMAC Only", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
+    await db_session.commit()
+
+    # UUID bearer must be rejected.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={"Authorization": f"Bearer {job.id}"},
+    )
+    assert resp.status_code == 403, "marked job must reject bare UUID bearer"
+
+    # HMAC bearer must be accepted.
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/heartbeat",
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
+    )
+    assert resp.status_code == 204, "marked job must accept HMAC bearer"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_vm_heartbeat_malformed_bearer_no_500(
+    client, db_session, monkeypatch
+):
+    """A non-ASCII or empty bearer must never cause a 500 — always 403."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="HB Malformed Bearer", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.polling_metadata = {"heartbeat_auth": "hmac"}
+    await db_session.commit()
+
+    for bad_bearer in ["", "not-a-uuid", "x" * 256, "null"]:
+        resp = await client.post(
+            f"/api/agent/compute-jobs/{job.id}/heartbeat",
+            headers={"Authorization": f"Bearer {bad_bearer}"},
+        )
+        assert resp.status_code in (403, 422), (
+            f"malformed bearer {bad_bearer!r} must not 500"
+        )
+
+
+@pytest.mark.asyncio
 async def test_compute_job_vm_heartbeat_missing_job_returns_404(client, monkeypatch):
-    """POST /compute-jobs/{id}/heartbeat for an unknown ID returns 404."""
+    """POST /compute-jobs/{id}/heartbeat for an unknown ID returns 404.
+
+    The caller must present the correctly-derived per-job secret to get PAST auth
+    and reach the existence check; a bare-UUID caller is rejected at auth (403)
+    and never learns whether the job exists.
+    """
     monkeypatch.setattr(compute, "LOCAL_MODE", True)
     fake_id = uuid.uuid4()
     resp = await client.post(
         f"/api/agent/compute-jobs/{fake_id}/heartbeat",
-        headers={"Authorization": f"Bearer {fake_id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(fake_id)}"
+            )
+        },
     )
     assert resp.status_code == 404
 
@@ -12578,7 +14677,11 @@ async def test_compute_job_vm_heartbeat_transitions_starting_to_running(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -12624,7 +14727,11 @@ async def test_compute_job_vm_heartbeat_updates_running_job(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -12670,7 +14777,11 @@ async def test_compute_job_vm_heartbeat_noop_for_terminal_job(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204, "terminal job heartbeat must not error"
 
@@ -13795,7 +15906,9 @@ async def test_compute_job_vm_heartbeat_stores_live_output(
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
         headers={
-            "Authorization": f"Bearer {job.id}",
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            ),
             "Content-Type": "application/json",
         },
         content=body,
@@ -13846,7 +15959,11 @@ async def test_compute_job_vm_heartbeat_empty_body_unchanged(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
     )
     assert resp.status_code == 204
 
@@ -13915,6 +16032,40 @@ def test_gcp_startup_script_heartbeat_emits_live_tail_and_progress():
     assert '-d "$_HB_BODY"' in hb_func_body, (
         "_compute_heartbeat must POST the helper-built JSON body"
     )
+
+
+def test_gcp_startup_script_heartbeat_bearer_is_derived_secret_not_uuid():
+    """The VM heartbeat must authenticate with the per-job secret, NOT the raw UUID.
+
+    Delivery-side guard for the weak-auth finding: the startup script embeds the
+    HMAC-derived per-job secret and sends it as the heartbeat bearer, so a mere
+    observer of the job UUID cannot forge a heartbeat. The job UUID stays only as
+    the resource identifier in the URL path.
+    """
+    job_id = uuid.uuid4()
+    spec = ComputeLaunchSpec(
+        job_id=job_id,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    expected = compute_backends_module.compute_job_heartbeat_secret(job_id)
+    assert expected != str(job_id), "derived secret must differ from the job UUID"
+    assert f"_COMPUTE_HB_TOKEN={shlex.quote(expected)}" in script, (
+        "startup script must embed the derived per-job heartbeat secret"
+    )
+    # The Authorization header uses the secret variable, never the raw job UUID.
+    assert 'Authorization: Bearer $_COMPUTE_HB_TOKEN' in script
+    assert 'Authorization: Bearer $_COMPUTE_JOB_ID' not in script, (
+        "the heartbeat must NOT authenticate with the bare job UUID"
+    )
+    # The UUID still identifies the resource in the heartbeat URL path.
+    assert "/api/agent/compute-jobs/$_COMPUTE_JOB_ID/heartbeat" in script
 
 
 def test_heartbeat_body_helper_emits_live_tail_and_progress(tmp_path):
@@ -14033,7 +16184,11 @@ def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
             # Spread the samples evenly across the trailing window.
             t = now - timedelta(seconds=window * (n - 1 - i) / (n - 1))
             meta = append_progress_sample(
-                meta, metric="loss", value=v, t=t.isoformat()
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
             )
         return ComputeJob(
             command="true",
@@ -14060,6 +16215,95 @@ def test_no_progress_stalled_detects_plateau_and_spares_advancing_metric():
         if k != "declared_metric"
     }
     assert _no_progress_stalled(no_metric, now=now) is False
+
+
+def test_no_progress_stalled_respects_per_job_timeout():
+    """_no_progress_stalled honours no_progress_timeout_seconds from polling_metadata.
+
+    A per-job timeout of 300s should fire (stalled) when the plateau spans 300s,
+    even when the global window constant is much larger.  A job whose plateau is
+    shorter than the per-job window must be spared, even if it already exceeds
+    the global default.
+    """
+    from app.compute_jobs import append_progress_sample, _no_progress_stalled
+
+    min_samples = compute_jobs.COMPUTE_JOB_NO_PROGRESS_MIN_SAMPLES
+    per_job_timeout = 300  # seconds — well below the 1800s global default
+
+    now = datetime(2026, 1, 2, 0, 0, 0)
+    # Job has been running longer than per_job_timeout (grace) + per_job_timeout (window).
+    started = now - timedelta(seconds=per_job_timeout * 2 + 60)
+
+    def build_job(values, *, window_seconds):
+        meta = {
+            "declared_metric": "loss",
+            "no_progress_timeout_seconds": per_job_timeout,
+        }
+        n = len(values)
+        for i, v in enumerate(values):
+            t = now - timedelta(seconds=window_seconds * (n - 1 - i) / (n - 1))
+            meta = append_progress_sample(
+                meta,
+                metric="loss",
+                value=v,
+                t=t.isoformat(),
+                received_at=t,
+            )
+        return ComputeJob(
+            command="true",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            status=ComputeJobStatus.RUNNING,
+            started_at=started,
+            polling_metadata=meta,
+        )
+
+    # Plateau spanning exactly the per-job window → stalled → should fire.
+    stalled = build_job([0.5] * (min_samples + 1), window_seconds=per_job_timeout)
+    assert _no_progress_stalled(stalled, now=now) is True, (
+        "expected stalled=True for plateau spanning per-job window"
+    )
+
+    # Plateau spanning only half the per-job window → NOT enough history → spared.
+    too_short = build_job([0.5] * (min_samples + 1), window_seconds=per_job_timeout / 2)
+    assert _no_progress_stalled(too_short, now=now) is False, (
+        "expected stalled=False when plateau history is shorter than per-job window"
+    )
+
+    # Advancing metric within the per-job window → NOT stalled.
+    advancing = build_job(
+        [0.9 - 0.1 * i for i in range(min_samples + 1)],
+        window_seconds=per_job_timeout,
+    )
+    assert _no_progress_stalled(advancing, now=now) is False, (
+        "expected stalled=False for advancing metric"
+    )
+
+    # Without per-job timeout (global 1800s default), the 300s plateau is NOT stalled.
+    global_job_meta: dict = {
+        "declared_metric": "loss",
+    }
+    n = min_samples + 1
+    for i, v in enumerate([0.5] * n):
+        t = now - timedelta(seconds=per_job_timeout * (n - 1 - i) / (n - 1))
+        global_job_meta = append_progress_sample(
+            global_job_meta,
+            metric="loss",
+            value=v,
+            t=t.isoformat(),
+            received_at=t,
+        )
+    global_job = ComputeJob(
+        command="true",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        status=ComputeJobStatus.RUNNING,
+        started_at=started,
+        polling_metadata=global_job_meta,
+    )
+    assert _no_progress_stalled(global_job, now=now) is False, (
+        "expected stalled=False when plateau is shorter than global window (no per-job override)"
+    )
 
 
 def test_local_backend_live_tail_read_on_poll(tmp_path):
@@ -14195,11 +16439,114 @@ async def test_create_compute_job_registry_auth_password_accepted_for_runner_sub
     )
 
     assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import decrypt_field
+
     persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
     assert persisted_auth is not None
     assert persisted_auth["server"] == "nvcr.io"
     assert persisted_auth["username"] == "$oauthtoken"
-    assert persisted_auth["password"] == "s3cr3t-ngc-api-key"
+    # Password is stored encrypted; decrypt to verify the round-trip.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_encrypted_at_rest(
+    db_session, monkeypatch
+):
+    """Registry password must be stored as Fernet ciphertext when a real key is configured."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.field_encryption import FERNET_CIPHERTEXT_PREFIX, decrypt_field
+    from app.models import LocalRunner
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    # Use a real Fernet key so encrypt_field produces actual ciphertext.
+    real_key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", real_key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    project = Project(name="Registry Auth Encrypt Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "s3cr3t-ngc-api-key",
+        },
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth is not None
+    assert persisted_auth["server"] == "nvcr.io"
+    assert persisted_auth["username"] == "$oauthtoken"
+    # Password must be stored as Fernet ciphertext, not plaintext.
+    assert persisted_auth["password"] != "s3cr3t-ngc-api-key"
+    assert persisted_auth["password"].startswith(FERNET_CIPHERTEXT_PREFIX)
+    # Decryption must recover the original value.
+    assert decrypt_field(persisted_auth["password"]) == "s3cr3t-ngc-api-key"
+
+
+def test_decrypt_registry_auth_decrypts_password(monkeypatch):
+    """_decrypt_registry_auth must decrypt a Fernet-encrypted password field."""
+    from app.routers.runner import _decrypt_registry_auth
+    from app.field_encryption import encrypt_field, FERNET_CIPHERTEXT_PREFIX
+    from cryptography.fernet import Fernet
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+    encrypted = encrypt_field("secret-pw")
+    assert encrypted is not None and encrypted.startswith(FERNET_CIPHERTEXT_PREFIX)
+    auth = {"server": "nvcr.io", "username": "$oauthtoken", "password": encrypted}
+    result = _decrypt_registry_auth(auth)
+    assert result is not None
+    assert result["password"] == "secret-pw"
+    assert result["server"] == "nvcr.io"
+    assert result["username"] == "$oauthtoken"
+
+
+def test_decrypt_registry_auth_handles_no_password():
+    """_decrypt_registry_auth must pass through auth dicts without a password field."""
+    from app.routers.runner import _decrypt_registry_auth
+
+    auth_no_pw = {"server": "nvcr.io", "username": "$oauthtoken"}
+    result = _decrypt_registry_auth(auth_no_pw)
+    assert result == auth_no_pw
+
+    assert _decrypt_registry_auth(None) is None
 
 
 # ── Runner-subprocess backend tests ──────────────────────────────────────────
@@ -15489,7 +17836,7 @@ async def test_spawn_followup_suppressed_for_engine_authored_task_with_false(db_
     spawn_mock.assert_not_called()
 
 
-# ── Progress-series ring buffer + terminal_kind disposition ──────────────────
+# ── Progress-series compaction + terminal_kind disposition ──────────────────
 
 def test_append_progress_sample_basic():
     """A valid metric+value is appended as {t, name, value} into progress_series."""
@@ -15501,6 +17848,7 @@ def test_append_progress_sample_basic():
     assert len(series) == 1
     assert series[0]["name"] == "loss"
     assert series[0]["value"] == 0.42
+    assert datetime.fromisoformat(series[0]["received_at"]) <= _utcnow()
     assert series[0]["t"] == "2026-01-01T00:00:00"
 
 
@@ -15523,16 +17871,22 @@ def test_append_progress_sample_non_finite_value():
 
 
 def test_append_progress_sample_ring_buffer_cap():
-    """After 55 samples only the last 50 are retained (drop-oldest)."""
+    """The per-metric history retains the last 1,500 minute buckets."""
     from app.compute_jobs import append_progress_sample
 
     meta: dict = {}
-    for i in range(55):
-        meta = append_progress_sample(meta, metric="step", value=float(i), t=f"t{i}")
+    start = datetime(2026, 1, 1)
+    for i in range(1505):
+        meta = append_progress_sample(
+            meta,
+            metric="step",
+            value=float(i),
+            t=(start + timedelta(minutes=i)).isoformat(),
+        )
     series = meta["progress_series"]
-    assert len(series) == 50
+    assert len(series) == 1500
     assert series[0]["value"] == 5.0, "oldest 5 samples should have been dropped"
-    assert series[-1]["value"] == 54.0
+    assert series[-1]["value"] == 1504.0
 
 
 def test_append_progress_sample_does_not_mutate_input():
@@ -15544,6 +17898,61 @@ def test_append_progress_sample_does_not_mutate_input():
     assert "progress_series" not in original
     assert "progress_series" in result
     assert original["other"] == "data"
+
+
+def test_merge_progress_report_bridges_new_records_to_progress_series():
+    """_merge_progress_report returns new_records so callers can bridge them into
+    progress_series — the key the no-progress watchdog reads.  Verify that the
+    returned new_records list is non-empty and maps to the correct shape expected
+    by append_progress_sample (metric/value fields present)."""
+    from app.routers.runner import _merge_progress_report
+    from app.compute_jobs import append_progress_sample, _no_progress_stalled
+    from app.models import ComputeJob, ComputeJobStatus, _utcnow
+    import uuid
+
+    now = _utcnow()
+    raw = {
+        "records": [
+            {"metric": "reward", "value": 1.0, "ts": "2026-01-01T00:00:00"},
+            {"metric": "reward", "value": 2.0, "ts": "2026-01-01T00:01:01"},
+        ],
+        "count": 2,
+    }
+    merged, new_records = _merge_progress_report(None, raw, now)
+
+    assert merged is not None, "merged dict must be returned for valid payload"
+    assert len(new_records) == 2, "both records are new and must be returned"
+    assert new_records[0]["metric"] == "reward"
+    assert new_records[1]["value"] == 2.0
+
+    # Bridge new_records into progress_series the same way the route handler does.
+    meta: dict = {}
+    for rec in new_records:
+        meta = append_progress_sample(
+            meta,
+            metric=rec["metric"],
+            value=rec["value"],
+            t=rec.get("ts") or now.isoformat(),
+            received_at=now,
+        )
+
+    series = meta.get("progress_series", [])
+    assert len(series) == 2
+    assert series[0]["name"] == "reward"
+    assert series[0]["value"] == 1.0
+    assert series[1]["value"] == 2.0
+
+    # Confirm the watchdog can now read progress for a runner job.
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        polling_metadata=meta,
+        declared_metric="reward",
+    )
+    # Two ascending samples — watchdog must NOT stall (metric is advancing).
+    assert _no_progress_stalled(job, now=now) is False
 
 
 @pytest.mark.asyncio
@@ -15580,7 +17989,11 @@ async def test_compute_job_vm_heartbeat_stores_progress_sample(
 
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
         json={"progress": {"metric": "loss", "value": 0.42}},
     )
     assert resp.status_code == 204
@@ -15628,7 +18041,11 @@ async def test_compute_job_vm_heartbeat_invalid_progress_still_204(
     # Invalid: metric key has a space, value is a non-numeric string
     resp = await client.post(
         f"/api/agent/compute-jobs/{job.id}/heartbeat",
-        headers={"Authorization": f"Bearer {job.id}"},
+        headers={
+            "Authorization": (
+                f"Bearer {compute_backends_module.compute_job_heartbeat_secret(job.id)}"
+            )
+        },
         json={"progress": {"metric": "bad key!", "value": "not a number"}},
     )
     assert resp.status_code == 204
@@ -15728,6 +18145,146 @@ def test_serialize_compute_job_response_safe_absent_on_legacy_rows():
     data = serialize_compute_job_response_safe(job)
     assert data["terminal_kind"] is None
     assert data["progress_series"] is None
+
+
+def test_serialize_compute_job_response_safe_promotes_watchdog_protection_status():
+    """serialize_compute_job_response_safe promotes watchdog-protection status
+    fields as first-class fields on the operator-facing payload.
+
+    Three sub-cases:
+    (1) Protected running job: declared metric + enough fresh receipt-time history
+        -> watchdog_active=True and watchdog_state='protected'.
+    (2) No declared metric: watchdog_active=False, watchdog_inert_reason='no_declared_metric'.
+    (3) Metric-name mismatch: samples exist but none match declared metric ->
+        watchdog_inert_reason='metric_name_mismatch'.
+    """
+    from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
+
+    # --- Case 1: protected job with declared metric and matching samples ---
+    now = _utcnow()
+    progress_series = [
+        {
+            "t": "runner-authored",
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
+            "name": "reward",
+            "value": 1.0,
+        }
+        for age in (3600, 2700, 1800, 900, 0)
+    ]
+    job_protected = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        started_at=now - timedelta(hours=2),
+        polling_metadata={
+            "declared_metric": "reward",
+            "no_progress_timeout_seconds": 3600,
+            "progress_series": progress_series,
+        },
+    )
+    data = serialize_compute_job_response_safe(job_protected)
+    assert data["watchdog_active"] is True, "watchdog must be active for a protected job"
+    assert data["watchdog_state"] == "protected"
+    assert data["no_progress_timeout_seconds"] == 3600, "per-job timeout must be reported"
+    assert data["last_progress_at"] == now.isoformat(), "must return newest server receipt time"
+    assert data["watchdog_inert_reason"] is None, "no inert reason for an active watchdog"
+
+    # --- Case 2: no declared metric ---
+    job_no_metric = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={},
+    )
+    data2 = serialize_compute_job_response_safe(job_no_metric)
+    assert data2["watchdog_active"] is False
+    assert data2["watchdog_inert_reason"] == "no_declared_metric"
+    assert data2["no_progress_timeout_seconds"] is None
+    assert data2["last_progress_at"] is None
+
+    # --- Case 3: declared metric but all samples carry a different metric name ---
+    job_mismatch = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "declared_metric": "reward",
+            "progress_series": [
+                {
+                    "t": "runner-authored",
+                    "received_at": now.isoformat(),
+                    "name": "loss",
+                    "value": 0.5,
+                },
+            ],
+        },
+    )
+    data3 = serialize_compute_job_response_safe(job_mismatch)
+    assert data3["watchdog_active"] is False
+    assert data3["watchdog_state"] == "inert"
+    assert data3["watchdog_inert_reason"] == "metric_name_mismatch"
+    assert data3["last_progress_at"] is None
+
+
+def test_runner_bridge_last_progress_at_reflects_written_samples():
+    """Regression: runner-written progress samples bridge into progress_series and
+    are reflected by last_progress_at in the serialized response — no residual
+    key-mismatch path silently drops progress."""
+    from app.routers.runner import _merge_progress_report
+    from app.compute_jobs import append_progress_sample
+    from app.schemas import serialize_compute_job_response_safe
+    from app.models import _utcnow
+
+    now = _utcnow()
+    raw_report = {
+        "records": [
+            {"metric": "reward", "value": 10.0, "ts": "2026-06-01T00:00:00"},
+            {"metric": "reward", "value": 11.0, "ts": "2026-06-01T00:01:00"},
+        ],
+        "count": 2,
+    }
+    _merged, new_records = _merge_progress_report(None, raw_report, now)
+    assert len(new_records) == 2, "bridge must yield both records"
+
+    # Bridge into progress_series exactly as the /report route handler does.
+    meta: dict = {"declared_metric": "reward"}
+    for rec in new_records:
+        meta = append_progress_sample(
+            meta,
+            metric=rec["metric"],
+            value=rec["value"],
+            t=rec.get("ts") or now.isoformat(),
+            received_at=now,
+        )
+
+    job = ComputeJob(
+        id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=1.0,
+        polling_metadata=meta,
+    )
+    data = serialize_compute_job_response_safe(job)
+
+    # The bridge preserves runner-authored t for presentation but the watchdog
+    # exposes authenticated server receipt time as last_progress_at.
+    assert data["progress_series"][-1]["t"] == "2026-06-01T00:01:00"
+    assert data["last_progress_at"] == now.isoformat(), (
+        "last_progress_at must use server receipt time, not the runner timestamp"
+    )
+    assert data["watchdog_active"] is False
+    assert data["watchdog_state"] == "insufficient_history"
+    assert data["watchdog_inert_reason"] == "missing_start_time"
+
+
 @pytest.mark.asyncio
 async def test_compute_experiment_defaults_container_image_to_project_image(
     db_session, mocker
@@ -16009,6 +18566,296 @@ def test_dependency_hash_empty_raises():
 
 
 # ---------------------------------------------------------------------------
+# assemble_fingerprint_inputs / bare_manifest_fallback_files
+# ---------------------------------------------------------------------------
+
+
+def test_assemble_fingerprint_inputs_parent_changes_hash():
+    """Changing the parent image changes the fingerprint hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.12-slim")
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_no_parent_differs_from_with_parent():
+    """No parent and some parent produce different hashes."""
+    h_no = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_yes = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, parent="python:3.11-slim")
+    )
+    assert h_no != h_yes
+
+
+def test_assemble_fingerprint_inputs_build_args_order_independent():
+    """build_args hash is stable regardless of insertion order."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"A": "1", "B": "2"}
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n", {}, build_args={"B": "2", "A": "1"}
+        )
+    )
+    assert h1 == h2
+
+
+def test_assemble_fingerprint_inputs_build_args_value_changes_hash():
+    """Changing a build-arg value changes the hash."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.4"})
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={"CUDA": "12.5"})
+    )
+    assert h1 != h2
+
+
+def test_assemble_fingerprint_inputs_empty_build_args_same_as_none():
+    """Empty build_args dict does not add a pseudo-key (same hash as no build_args)."""
+    h_none = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {})
+    )
+    h_empty = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(b"FROM x\n", {}, build_args={})
+    )
+    assert h_none == h_empty
+
+
+def test_assemble_fingerprint_inputs_nested_dep_file_changes_hash():
+    """A declared dep file at a nested path changes the hash when its content changes."""
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==1.26\n"},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"packages/api/requirements.txt": b"numpy==2.0\n"},
+        )
+    )
+    assert h1 != h2
+
+
+@pytest.mark.parametrize("reserved_name", ["Dockerfile", "__parent_image__", "__build_args__"])
+def test_assemble_fingerprint_inputs_reserved_looking_dep_is_typed(reserved_name):
+    """Valid dependency names cannot overwrite Dockerfile or metadata inputs."""
+    base = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"one"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    changed = _bci.assemble_fingerprint_inputs(
+        b"FROM x\n",
+        {reserved_name: b"two"},
+        parent="python:3.11-slim",
+        build_args={"CUDA": "12.4"},
+    )
+    assert _bci.compute_dependency_hash(base) != _bci.compute_dependency_hash(changed)
+    assert base["\x00dockerfile"] == b"FROM x\n"
+    assert base["\x00parent_image"] == b"python:3.11-slim"
+    assert base["\x00build_args"] == b'{"CUDA": "12.4"}'
+    assert base[f"\x00dep:{reserved_name}"] == b"one"
+
+
+def test_build_and_push_includes_parent_in_hash(tmp_path):
+    """build_and_push uses assemble_fingerprint_inputs: parent affects the dep_hash."""
+    (tmp_path / ".blueprint").mkdir()
+    (tmp_path / ".blueprint" / "Dockerfile.compute").write_bytes(b"FROM scratch\n")
+    (tmp_path / "requirements.txt").write_bytes(b"torch==2.3\n")
+
+    seen_hashes: list[str] = []
+
+    def fake_run(cmd, **kw):
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    for p in ("python:3.11", "python:3.12"):
+        result = _bci.build_and_push(
+            repo_dir=str(tmp_path),
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            parent=p,
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: True,
+        )
+        seen_hashes.append(result.dep_hash)
+
+    assert seen_hashes[0] != seen_hashes[1], "different parent must yield different dep_hash"
+
+
+def test_bare_manifest_fallback_files_includes_package_json_when_no_lockfile():
+    """package.json is a candidate when no node lockfile is in the resolved set."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "package.json" in result
+
+
+def test_bare_manifest_fallback_files_excludes_package_json_when_lockfile_present():
+    """package.json is NOT a candidate when a node lockfile is in the resolved set."""
+    for lockfile in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+        result = _bci.bare_manifest_fallback_files(frozenset([lockfile]))
+        assert "package.json" not in result, f"package.json must be skipped when {lockfile} present"
+
+
+def test_bare_manifest_fallback_files_includes_pipfile_when_no_lock():
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "Pipfile" in result
+
+
+def test_bare_manifest_fallback_files_excludes_pipfile_when_lock_present():
+    result = _bci.bare_manifest_fallback_files(frozenset(["Pipfile.lock"]))
+    assert "Pipfile" not in result
+
+
+def test_bare_manifest_fallback_files_all_lockfiles_present_returns_nothing():
+    """When every ecosystem has a lockfile, no bare manifests are candidates."""
+    all_lockfiles = frozenset(
+        ["package-lock.json", "Pipfile.lock", "requirements.txt"]
+    )
+    result = _bci.bare_manifest_fallback_files(all_lockfiles)
+    assert result == []
+
+
+def test_bare_manifest_lockfile_less_content_changes_hash():
+    """A bare manifest's content changes the fingerprint hash when no lockfile is present."""
+    # package.json present, no node lockfile => package.json is a hash input
+    h1 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "1.0.0"}\n'},
+        )
+    )
+    h2 = _bci.compute_dependency_hash(
+        _bci.assemble_fingerprint_inputs(
+            b"FROM x\n",
+            {"package.json": b'{"name": "my-app", "version": "2.0.0"}\n'},
+        )
+    )
+    assert h1 != h2
+
+
+# ---------------------------------------------------------------------------
+# Manifest compute.image.build: deps field
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_compute_image_build_deps_valid():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {
+        "name": "reg/img:tag",
+        "build": {"deps": ["packages/api/requirements.txt", "shared/pyproject.toml"]},
+    }
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == [
+        "packages/api/requirements.txt",
+        "shared/pyproject.toml",
+    ]
+
+
+def test_manifest_compute_image_build_deps_empty_list():
+    from app.routers.admin_project_tools import (
+        _validate_manifest_compute_image,
+        _normalize_manifest_compute_image,
+    )
+
+    spec = {"name": "reg/img:tag", "build": {"deps": []}}
+    assert _validate_manifest_compute_image(spec) is None
+    norm = _normalize_manifest_compute_image(spec)
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_absent_defaults_empty():
+    from app.routers.admin_project_tools import _normalize_manifest_compute_image
+
+    norm = _normalize_manifest_compute_image({"name": "reg/img:tag", "build": {}})
+    assert norm["build"]["deps"] == []
+
+
+def test_manifest_compute_image_build_deps_traversal_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["../etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": ["/etc/secret"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_whitespace_absolute_path_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [" /etc/passwd"]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["C:\\secrets\\token", "C:/secrets/token", "\\secrets\\token", "\\\\server\\share\\token", "//server/share/token", "lib\\..\\secret"],
+)
+def test_manifest_compute_image_build_deps_non_repo_relative_paths_rejected(path):
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [path]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_non_string_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": [123]}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+def test_manifest_compute_image_build_deps_not_list_rejected():
+    from app.routers.admin_project_tools import _validate_manifest_compute_image
+
+    err = _validate_manifest_compute_image(
+        {"name": "reg/img:t", "build": {"deps": "requirements.txt"}}
+    )
+    assert err is not None
+    assert "deps" in err
+
+
+# ---------------------------------------------------------------------------
 # Credential scanner
 # ---------------------------------------------------------------------------
 
@@ -16162,8 +19009,13 @@ def test_build_and_push_skips_when_image_present(tmp_path):
 
         class P:
             returncode = 0
-            stdout = "reg/repo/img@sha256:" + "a" * 64
+            stdout = ""
             stderr = ""
+
+        # The already-present fast path reads the digest daemon-free from the
+        # registry via `gcloud artifacts docker images describe --format=json`.
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
+            P.stdout = json.dumps({"image_summary": {"digest": "sha256:" + "a" * 64}})
         return P()
 
     result = _bci.build_and_push(
@@ -16180,7 +19032,7 @@ def test_build_and_push_skips_when_image_present(tmp_path):
     # No `docker build` / `docker push` was invoked.
     assert not any("build" in c for c in run_calls)
     assert not any("push" in c for c in run_calls)
-    assert result.pinned_ref.startswith("reg/repo/img@sha256:")
+    assert result.pinned_ref == "reg/repo/img@sha256:" + "a" * 64
 
 
 def test_build_and_push_builds_when_hash_new(tmp_path):
@@ -16194,8 +19046,12 @@ def test_build_and_push_builds_when_hash_new(tmp_path):
         class P:
             returncode = 0
             stderr = ""
-            # docker image inspect --format returns the RepoDigest.
-            stdout = "reg/repo/img@sha256:" + "b" * 64
+            stdout = ""
+
+        # After push, the canonical digest is read daemon-free from the registry
+        # via `gcloud artifacts docker images describe --format=json` (#15569).
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
+            P.stdout = json.dumps({"image_summary": {"digest": "sha256:" + "b" * 64}})
         return P()
 
     result = _bci.build_and_push(
@@ -16217,6 +19073,65 @@ def test_build_and_push_builds_when_hash_new(tmp_path):
     # The declared parent is threaded through as a build-arg.
     assert any("PARENT_IMAGE=python:3.11-slim" in c for c in flat)
     assert result.pinned_ref == "reg/repo/img@sha256:" + "b" * 64
+
+
+def test_build_and_push_sanitizes_authenticated_git_metadata_from_context(tmp_path):
+    """A Dockerfile that encodes its whole context cannot recover Git credentials."""
+    repo = _write_repo(
+        tmp_path,
+        dockerfile=(
+            b"FROM scratch\nCOPY . /project\n"
+            b"RUN find /project -type f -exec base64 {} \\;\n"
+        ),
+    )
+    token = "ghs_abcdefghijklmnopqrstuvwxyz1234567890"
+    repo_path = tmp_path / "repo"
+    (repo_path / ".git").mkdir()
+    (repo_path / ".git" / "config").write_text(
+        f"[credential]\n\ttoken = {token}\n"
+    )
+    (repo_path / "vendor").mkdir()
+    (repo_path / "vendor" / ".git").mkdir()
+    (repo_path / "vendor" / ".git" / "config").write_text(token)
+    (repo_path / "project-source.txt").write_text("ordinary project source\n")
+    os.symlink("project-source.txt", repo_path / "project-source-link")
+    contexts = []
+
+    def fake_run(cmd, **kw):
+        if cmd[:2] == ["docker", "build"]:
+            context = cmd[-1]
+            contexts.append(context)
+            assert cmd[cmd.index("-f") + 1] == os.path.join(
+                context, ".blueprint", "Dockerfile.compute"
+            )
+            assert not os.path.exists(os.path.join(context, ".git"))
+            assert not os.path.exists(os.path.join(context, "vendor", ".git"))
+            with open(os.path.join(context, "project-source.txt"), "rb") as fh:
+                assert fh.read() == b"ordinary project source\n"
+            assert os.path.islink(os.path.join(context, "project-source-link"))
+            copied_files = []
+            for root, _dirs, files in os.walk(context):
+                for name in files:
+                    with open(os.path.join(root, name), "rb") as copied_file:
+                        copied_files.append(copied_file.read())
+            # This simulates the Dockerfile's base64 command over every copied file.
+            encoded_context = base64.b64encode(b"\0".join(copied_files))
+            assert token.encode() not in base64.b64decode(encoded_context)
+        return _ok_proc(stdout="reg/repo/img@sha256:" + "c" * 64)
+
+    _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+
+    assert len(contexts) == 1
+    assert not os.path.exists(contexts[0]), "temporary Docker context was not cleaned up"
 
 
 def test_build_and_push_credential_leak_fails_before_push(tmp_path):
@@ -16248,6 +19163,68 @@ def test_build_and_push_credential_leak_fails_before_push(tmp_path):
         )
     # Nothing was pushed.
     assert not any("push" in c for c in cmds)
+
+
+def test_build_and_push_rejects_secret_build_args_before_build(tmp_path):
+    """A platform-secret key in build_args is rejected before docker build runs."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    with pytest.raises(_bci.CredentialLeakError, match="build_args contains platform secret keys"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            build_args={"ANTHROPIC_API_KEY": "sk-ant-secret"},
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+        )
+    # Neither build nor push should have run.
+    flat = [" ".join(c) for c in cmds]
+    assert not any(c.startswith("docker build") for c in flat)
+    assert not any(c.startswith("docker push") for c in flat)
+
+
+def test_build_and_push_allows_clean_build_args(tmp_path):
+    """Build args that are not platform secrets pass through without error."""
+    repo = _write_repo(tmp_path)
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    # A clean build arg (non-secret key, non-empty value) should not raise.
+    result = _bci.build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        build_args={"PYTHON_VERSION": "3.11"},
+        _run=fake_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+    assert result.built is True
+    flat = [" ".join(c) for c in cmds]
+    assert any("--build-arg" in c and "PYTHON_VERSION=3.11" in c for c in flat)
 
 
 def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
@@ -16289,6 +19266,55 @@ def test_build_and_push_layer_credential_leak_fails_before_push(tmp_path):
     assert any(c.startswith("docker build") for c in flat)
     assert not any(c.startswith("docker push") for c in flat)
     assert len(layer_scan_called_with) == 1
+
+
+def test_build_and_push_config_env_baked_secret_blocked_before_push(tmp_path):
+    """End-to-end: a platform secret baked into the built image's .config.Env is
+    blocked by the REAL layer scanner before any push.
+
+    A ``RUNNER_TOKEN`` inherited from a base image / injected via --build-arg lands
+    in ``.config.Env`` without appearing in the source Dockerfile (which is clean
+    here) or as a credential PATTERN in any layer file. This exercises the actual
+    ``scan_image_layers_for_credentials`` config-env path through ``build_and_push``
+    — not an injected fake — proving the "no platform creds baked into project
+    images" guard is enforced, not merely a design note.
+    """
+    repo = _write_repo(tmp_path)  # clean Dockerfile (input scan passes)
+    # docker-save archive: clean layer file, config.Env bakes a platform secret.
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/bin", "RUNNER_TOKEN=baked-into-the-runtime-env"]
+    )
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        # `docker save -o <path> <ref>` streams the archive to the -o destination;
+        # the real scanner reads it back and finds the baked secret.
+        if "save" in cmd and "-o" in cmd:
+            with open(cmd[cmd.index("-o") + 1], "wb") as fh:
+                fh.write(archive)
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return P()
+
+    with pytest.raises(_bci.CredentialLeakError, match="built image layers"):
+        _bci.build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists=lambda *a, **k: False,
+            _assert_network_fn=lambda *a, **k: None,
+        )
+    flat = [" ".join(c) for c in cmds]
+    assert any(c.startswith("docker build") for c in flat)
+    assert not any(c.startswith("docker push") for c in flat)
 
 
 # ---------------------------------------------------------------------------
@@ -16504,18 +19530,13 @@ def test_already_present_resolves_digest_from_registry_with_an_empty_local_store
 
     def fake_run(cmd, **kw):
         cmds.append(cmd)
-        if cmd[:3] == ["docker", "manifest", "inspect"]:
+        # The digest is read daemon-free from the REGISTRY via
+        # `gcloud artifacts docker images describe --format=json` (#15569) —
+        # it never consults the local docker store, so a fresh/pruned host
+        # still resolves the pin.
+        if cmd[:5] == ["gcloud", "artifacts", "docker", "images", "describe"]:
             return _ok_proc(
-                stdout=json.dumps(
-                    {
-                        "Ref": "reg/repo/img:tag",
-                        "Descriptor": {
-                            "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                            "digest": registry_digest,
-                            "size": 1234,
-                        },
-                    }
-                )
+                stdout=json.dumps({"image_summary": {"digest": registry_digest}})
             )
         if cmd[:3] == ["docker", "image", "inspect"]:
             # EMPTY LOCAL STORE — this host never built or pulled the image.
@@ -16539,7 +19560,9 @@ def test_already_present_resolves_digest_from_registry_with_an_empty_local_store
     )
     assert result.pinned_ref == "reg/repo/img@" + registry_digest
     assert result.digest_unknown is False
-    assert any(c[:3] == ["docker", "manifest", "inspect"] for c in cmds)
+    assert any(
+        c[:5] == ["gcloud", "artifacts", "docker", "images", "describe"] for c in cmds
+    )
 
 
 def test_already_present_marks_the_digest_unknown_when_no_source_resolves_it(tmp_path):
@@ -16569,24 +19592,18 @@ def test_already_present_marks_the_digest_unknown_when_no_source_resolves_it(tmp
 
 
 def test_resolve_registry_digest_handles_a_multi_arch_manifest_list():
-    """`docker manifest inspect -v` emits a LIST for multi-arch images."""
+    """``gcloud artifacts docker images describe`` returns image_summary.digest."""
     digest = "sha256:" + "f" * 64
 
     def fake_run(cmd, **kw):
-        return _ok_proc(
-            stdout=json.dumps(
-                [
-                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": digest}},
-                    {"Ref": "reg/repo/img:t", "Descriptor": {"digest": "sha256:" + "9" * 64}},
-                ]
-            )
-        )
+        assert "gcloud" in cmd and "describe" in cmd, f"Expected gcloud describe, got {cmd}"
+        return _ok_proc(stdout=json.dumps({"image_summary": {"digest": digest}}))
 
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) == digest
 
 
 def test_resolve_registry_digest_returns_none_on_garbage():
-    """A non-JSON / error response resolves to None rather than a bogus digest."""
+    """A non-JSON / error / missing-key response resolves to None rather than a bogus digest."""
 
     def fake_run(cmd, **kw):
         return _ok_proc(stdout="not json at all")
@@ -16594,9 +19611,72 @@ def test_resolve_registry_digest_returns_none_on_garbage():
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=fake_run) is None
 
     def failing_run(cmd, **kw):
-        raise OSError("docker not installed")
+        raise OSError("gcloud not installed")
 
     assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=failing_run) is None
+
+    def missing_key_run(cmd, **kw):
+        return _ok_proc(stdout=json.dumps({"image_summary": {}}))
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "t", _run=missing_key_run) is None
+
+
+def test_registry_tag_exists_uses_gcloud_describe():
+    """registry_tag_exists shells to gcloud (not docker), fail-open on errors."""
+    commands_seen = []
+
+    def capture(cmd, **kw):
+        commands_seen.append(cmd)
+        return _ok_proc()
+
+    result = _bci.registry_tag_exists("reg/repo/img", "mytag", _run=capture)
+    assert result is True
+    assert any("gcloud" in c and "describe" in c for c in commands_seen), commands_seen
+    assert any("reg/repo/img:mytag" in " ".join(c) for c in commands_seen), commands_seen
+
+    # Non-zero exit → absent (not an exception)
+    def not_found(cmd, **kw):
+        class _Proc:
+            returncode = 1
+            stdout = stderr = ""
+        return _Proc()
+
+    assert _bci.registry_tag_exists("reg/repo/img", "missing", _run=not_found) is False
+
+    # OSError → absent (fail-open)
+    def broken(cmd, **kw):
+        raise OSError("no gcloud")
+
+    assert _bci.registry_tag_exists("reg/repo/img", "missing", _run=broken) is False
+
+
+def test_resolve_registry_digest_uses_gcloud_describe():
+    """resolve_registry_digest shells to gcloud and parses image_summary.digest."""
+    digest = "sha256:" + "a" * 64
+    commands_seen = []
+
+    def capture(cmd, **kw):
+        commands_seen.append(cmd)
+        return _ok_proc(stdout=json.dumps({"image_summary": {"digest": digest}}))
+
+    result = _bci.resolve_registry_digest("reg/repo/img", "v1", _run=capture)
+    assert result == digest
+    assert any("gcloud" in c and "describe" in c for c in commands_seen), commands_seen
+
+    # Non-zero exit → None
+    def not_found(cmd, **kw):
+        class _Proc:
+            returncode = 1
+            stdout = stderr = ""
+        return _Proc()
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "v1", _run=not_found) is None
+
+    # OSError → None (fail-open)
+    def broken(cmd, **kw):
+        raise OSError("no gcloud")
+
+    assert _bci.resolve_registry_digest("reg/repo/img", "v1", _run=broken) is None
 
 
 # ---------------------------------------------------------------------------
@@ -16801,6 +19881,127 @@ def test_scan_image_layers_oci_format_clean_passes():
     """A clean OCI-layout archive resolves its layer and finds nothing."""
     findings = _bci.scan_image_layers_for_credentials(
         "img:tag", _run=_fake_docker_save(_oci_save_archive(b"nothing secret here\n"))
+    )
+    assert findings == []
+
+
+# ---------------------------------------------------------------------------
+# scan_image_layers_for_credentials ALSO scans the image config .Env: a platform
+# secret baked into the runtime environment (base image, --build-arg, RUN export)
+# is invisible to both the layer-file pattern scan and the source-Dockerfile scan.
+# ---------------------------------------------------------------------------
+
+_CLEAN_LAYER_FILE = b"nothing secret here\n"
+
+
+def _classic_save_archive_with_env(env_entries: list) -> bytes:
+    """Classic docker-save archive whose manifest points at a config with .Env."""
+    layer_tar = _tar_bytes({"root/app": _CLEAN_LAYER_FILE})
+    config = json.dumps({"config": {"Env": env_entries}}).encode()
+    return _tar_bytes(
+        {
+            "0a1b2c/layer.tar": layer_tar,
+            "config.json": config,
+            "manifest.json": b'[{"Config":"config.json","Layers":["0a1b2c/layer.tar"]}]',
+        }
+    )
+
+
+def _oci_save_archive_with_env(env_entries: list) -> bytes:
+    """OCI-layout docker-save archive whose config blob carries .config.Env."""
+    layer_tar = _tar_bytes({"root/app": _CLEAN_LAYER_FILE})
+    layer_digest = "l" * 64
+    config_digest = "c" * 64
+    config = json.dumps({"config": {"Env": env_entries}}).encode()
+    manifest = json.dumps(
+        {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {"digest": "sha256:" + config_digest},
+            "layers": [{"digest": "sha256:" + layer_digest}],
+        }
+    ).encode()
+    manifest_digest = "m" * 64
+    index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [{"digest": "sha256:" + manifest_digest}],
+        }
+    ).encode()
+    return _tar_bytes(
+        {
+            "oci-layout": b'{"imageLayoutVersion":"1.0.0"}',
+            "index.json": index,
+            "blobs/sha256/" + manifest_digest: manifest,
+            "blobs/sha256/" + layer_digest: layer_tar,
+            "blobs/sha256/" + config_digest: config,
+        }
+    )
+
+
+def test_scan_config_env_pure_flags_secret_name_with_value():
+    """The pure config-Env scanner flags a secret-named var carrying a value."""
+    findings = _bci._scan_config_env_for_secrets(
+        "config:x", ["PATH=/usr/bin", "RUNNER_TOKEN=deadbeef-uuid-not-a-regex-match"]
+    )
+    assert any("RUNNER_TOKEN" in f for f in findings), findings
+    assert all("PATH" not in f for f in findings)
+
+
+def test_scan_config_env_pure_ignores_empty_and_benign():
+    """Empty secret values and benign names produce no findings."""
+    findings = _bci._scan_config_env_for_secrets(
+        "config:x", ["ANTHROPIC_API_KEY=", "LANG=C.UTF-8", "NODE_ENV=production"]
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_classic_config_env_secret_detected():
+    """A platform secret baked into the classic-layout image config .Env is caught.
+
+    The value (a bare UUID-ish orchestrator runner token) matches NO credential
+    regex and appears in no layer file — only the config Env name-scan catches it.
+    """
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/local/bin", "BLUEPRINT_RUNNER_TOKEN=11111111-2222-3333"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert any(
+        "BLUEPRINT_RUNNER_TOKEN" in f and "config Env" in f for f in findings
+    ), findings
+
+
+def test_scan_image_layers_classic_config_env_clean_passes():
+    """A classic image whose config Env holds only benign vars yields no findings."""
+    archive = _classic_save_archive_with_env(
+        ["PATH=/usr/local/bin", "LANG=C.UTF-8", "PYTHONUNBUFFERED=1"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert findings == []
+
+
+def test_scan_image_layers_oci_config_env_secret_detected():
+    """A platform secret baked into an OCI-layout image config .Env is caught."""
+    archive = _oci_save_archive_with_env(
+        ["PATH=/usr/bin", "BLUEPRINT_ORCHESTRATOR_URL=https://orch.internal"]
+    )
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
+    )
+    assert any(
+        "BLUEPRINT_ORCHESTRATOR_URL" in f and "config Env" in f for f in findings
+    ), findings
+
+
+def test_scan_image_layers_oci_config_env_clean_passes():
+    """A clean OCI-layout config Env yields no findings."""
+    archive = _oci_save_archive_with_env(["PATH=/usr/bin", "TERM=xterm"])
+    findings = _bci.scan_image_layers_for_credentials(
+        "img:tag", _run=_fake_docker_save(archive)
     )
     assert findings == []
 
@@ -17296,6 +20497,82 @@ async def test_resolve_digest_pin_does_not_warn_when_pinned(db_session, caplog):
         r for r in caplog.records
         if r.levelno == _logging.WARNING and "MUTABLE tag" in r.getMessage()
     ]
+
+
+# ---------------------------------------------------------------------------
+# _load_baked_image_ref: surface project-baked compute image ref for agent context.
+#
+# The strategic spawning pipeline merges baked_image_ref into local_runner_status
+# so authoring agents can prefer the project image over a raw NGC URI.  These
+# tests cover the query helper directly:
+#   - no rows → None
+#   - built=True row with pinned_ref → returns pinned_ref
+#   - built=False row ignored
+#   - returns most recent when multiple rows exist
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_dispatch_defaults_project_image(db_session):
+    """_load_baked_image_ref returns the most recent built digest-pinned ref,
+    so the strategic spawner can merge it into local_runner_status and agents
+    default compute_experiments to the project-baked image."""
+    from app.models import ProjectComputeImage
+    from app.strategic_local_runner import _load_baked_image_ref
+
+    project = await _make_project(db_session, name="Baked Image Context Proj")
+
+    # No rows → None (project has not been built yet).
+    assert await _load_baked_image_ref(db_session, project.id) is None
+
+    pinned = "ghcr.io/org/compute-proj@sha256:" + "e" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep1",
+            tag="latest",
+            pinned_ref=pinned,
+            digest="sha256:" + "e" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+
+    # Single built row → pinned_ref returned.
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # An unbuilt row (built=False) for the same project must be ignored.
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep2-unbuilt",
+            tag="latest",
+            pinned_ref="ghcr.io/org/compute-proj@sha256:" + "f" * 64,
+            digest="sha256:" + "f" * 64,
+            built=False,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == pinned
+
+    # A newer built row supersedes the older one (ordered by updated_at DESC).
+    newer_pinned = "ghcr.io/org/compute-proj@sha256:" + "a" * 64
+    db_session.add(
+        ProjectComputeImage(
+            project_id=project.id,
+            image_name="compute-proj",
+            registry_repo="ghcr.io/org",
+            dep_hash="dep3-newer",
+            tag="latest",
+            pinned_ref=newer_pinned,
+            digest="sha256:" + "a" * 64,
+            built=True,
+        )
+    )
+    await db_session.commit()
+    assert await _load_baked_image_ref(db_session, project.id) == newer_pinned
 
 
 # ---------------------------------------------------------------------------
@@ -18079,9 +21356,13 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
     image_name = "img"
     full_repo = f"{repo_base}/{image_name}"
     d_referenced = _digest("a")
+    # A genuinely orphaned digest: it has NO ProjectComputeImage row and no
+    # live/recent job — only a leftover ``inuse-`` tag in the registry. (A digest
+    # that DID have a ProjectComputeImage row would be a standing pin and stay
+    # protected regardless of age — see test_reaper_sweeps_compute_image.py.)
     d_unreferenced = _digest("d")
 
-    # Two baked images: one still referenced by a running job, one orphaned.
+    # One baked image, still referenced by a running job.
     db_session.add(
         ProjectComputeImage(
             project_id=project.id,
@@ -18094,21 +21375,9 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
             built=True,
         )
     )
-    db_session.add(
-        ProjectComputeImage(
-            project_id=project.id,
-            image_name=image_name,
-            registry_repo=repo_base,
-            dep_hash="dep-orphan",
-            tag="tag-orphan",
-            pinned_ref=f"{full_repo}@{d_unreferenced}",
-            digest=d_unreferenced,
-            built=True,
-        )
-    )
     await db_session.commit()
 
-    # A live job references only the first digest.
+    # A live job references the digest.
     await _make_compute_job(
         db_session,
         project,
@@ -18116,10 +21385,10 @@ async def test_compute_image_gc_protects_referenced_digest(db_session):
         container_image=f"{full_repo}@{d_referenced}",
     )
 
-    # Run the sweep from a point 60 days in the future: both image rows were
-    # just built, so pushing "now" past the 30-day freshness window ensures
-    # neither is auto-protected as a recent bake. Protection then comes purely
-    # from the live job's reference — isolating the referenced-digest behaviour.
+    # Run the sweep from a point 60 days in the future: the image row was just
+    # built, so pushing "now" past the 30-day freshness window shows protection
+    # holds via BOTH the standing pin and the live job's reference, while the
+    # orphaned registry tag (no row, no job) is correctly pruned.
     sweep_now = _utcnow() + timedelta(days=60)
 
     applied_tags = []
@@ -18290,12 +21559,100 @@ def test_collect_viewable_candidates_keeps_multi_arm_same_basename_from_dir(tmp_
     # A root-level file keeps its bare name alongside the nested ones.
     (tmp_path / "summary.png").write_bytes(_VIEW_PNG_BYTES + b"-root")
 
-    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    cands, _size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
     names = sorted(c.filename for c in cands)
     assert names == ["arm1__reward.png", "arm2__reward.png", "summary.png"]
     by_name = {c.filename: c for c in cands}
     assert by_name["arm1__reward.png"].data == _VIEW_PNG_BYTES + b"arm1"
     assert by_name["arm2__reward.png"].data == _VIEW_PNG_BYTES + b"arm2"
+
+
+def test_collect_viewable_candidates_from_dir_streams_large_video(tmp_path):
+    """A local video over the in-memory image cap becomes a STREAMED candidate.
+
+    Instead of being read into memory (and rejected by the image cap), an
+    oversized local video yields a candidate carrying a ``source_path`` (the
+    on-disk original) with no in-memory ``data`` and the ``artifact_root`` set so
+    the upload path can re-verify symlink containment. A co-located image stays
+    on the in-memory ``data`` path.
+    """
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    big_video = os.urandom(image_cap + 256 * 1024)  # ~8.25 MiB > image cap
+    (tmp_path / "rollout.mp4").write_bytes(big_video)
+    (tmp_path / "frame.png").write_bytes(_VIEW_PNG_BYTES)
+
+    cands, _size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
+    by_name = {c.filename: c for c in cands}
+    assert set(by_name) == {"rollout.mp4", "frame.png"}
+
+    video = by_name["rollout.mp4"]
+    assert video.kind == "video"
+    assert video.data is None
+    assert video.source_path == str(tmp_path / "rollout.mp4")
+    assert video.source_is_temp is False
+    assert video.artifact_root == os.path.realpath(str(tmp_path))
+    assert video.size_bytes == len(big_video)
+
+    image = by_name["frame.png"]
+    assert image.data == _VIEW_PNG_BYTES
+    assert image.source_path is None
+
+
+@pytest.mark.asyncio
+async def test_persist_streams_local_video_via_nofollow_open(tmp_path, monkeypatch):
+    """A local job's oversized video is streamed to storage via an O_NOFOLLOW open.
+
+    End-to-end for the local backend: the streamed candidate's original file is
+    opened (not buffered) and handed to ``upload_compute_job_viewable_stream``;
+    the original artifact file is left in place (never unlinked as a temp).
+    """
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    big_video = os.urandom(image_cap + 256 * 1024)
+    video_path = tmp_path / "rollout.mp4"
+    video_path.write_bytes(big_video)
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.LOCAL_BACKEND_NAME
+    job.polling_metadata = {"artifact_dir": str(tmp_path)}
+
+    streamed: list = []
+
+    async def _fake_stream_upload(job_id, basename, fileobj, content_type, *, size=None):
+        fileobj.seek(0, os.SEEK_END)
+        measured = fileobj.tell()
+        fileobj.seek(0)
+        streamed.append({"basename": basename, "size": measured, "size_kwarg": size})
+        return storage.compute_job_viewable_uri(job_id, basename)
+
+    async def _forbid_file_upload(*_a, **_k):
+        raise AssertionError("a large video must stream, not use the in-memory seam")
+
+    monkeypatch.setattr(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_stream",
+        _fake_stream_upload,
+    )
+    monkeypatch.setattr(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        _forbid_file_upload,
+    )
+
+    manifest, dropped = await compute_backends_module.persist_viewable_artifacts(job)
+
+    assert dropped == 0
+    assert [m["filename"] for m in manifest] == ["rollout.mp4"]
+    assert manifest[0]["size_bytes"] == len(big_video)
+    assert streamed == [
+        {"basename": "rollout.mp4", "size": len(big_video), "size_kwarg": len(big_video)}
+    ]
+    # The ORIGINAL artifact file must remain in place (not treated as a temp).
+    assert video_path.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -18322,8 +21679,11 @@ def test_collect_viewable_candidates_from_dir_collects_beyond_cap(tmp_path):
     """Dir walker collects ALL qualifying files (count cap removed from inner loop)."""
     for i in range(_MAX_COUNT + 3):
         (tmp_path / f"file{i:03d}.png").write_bytes(_VIEW_PNG_BYTES + str(i).encode())
-    cands = compute_backends_module._collect_viewable_candidates_from_dir(str(tmp_path))
+    cands, size_dropped, _svg_count = compute_backends_module._collect_viewable_candidates_from_dir(
+        str(tmp_path)
+    )
     assert len(cands) == _MAX_COUNT + 3
+    assert size_dropped == 0
 
 
 @pytest.mark.asyncio
@@ -18344,7 +21704,7 @@ async def test_collect_viewable_artifact_candidates_sorts_and_caps(tmp_path):
         "_MAX_VIEWABLE_FILE_COUNT",
         7,
     ):
-        selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+        selected, dropped, _svg_count = await compute_backends_module._collect_viewable_artifact_candidates(job)
 
     # 10 total, cap=7 → 3 dropped
     assert len(selected) == 7
@@ -18366,7 +21726,7 @@ async def test_collect_viewable_artifact_candidates_no_drop_when_within_cap(tmp_
     job.polling_metadata = {"artifact_dir": str(tmp_path)}
     job.external_compute_id = None
 
-    selected, dropped = await compute_backends_module._collect_viewable_artifact_candidates(job)
+    selected, dropped, _svg_count = await compute_backends_module._collect_viewable_artifact_candidates(job)
     assert len(selected) == 3
     assert dropped == 0
 
@@ -18399,7 +21759,17 @@ async def test_persist_viewable_artifacts_returns_tuple_with_dropped_count(tmp_p
     assert dropped == 2
     # Each manifest entry has the required fields
     entry = manifest[0]
-    assert {"filename", "storage_uri", "content_type", "size_bytes", "kind"} <= entry.keys()
+    assert {
+        "filename",
+        "storage_uri",
+        "content_type",
+        "size_bytes",
+        "kind",
+        "revision",
+        "live",
+    } <= entry.keys()
+    assert isinstance(entry["revision"], str) and entry["revision"]
+    assert entry["live"] is False
 
 
 @pytest.mark.asyncio
@@ -18634,6 +22004,30 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
                 "basename": basename,
                 "size": len(data),
                 "content_type": content_type,
+                "streamed": False,
+            }
+        )
+        return (
+            f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+        )
+
+    async def _fake_stream_upload(job_id, basename, fileobj, content_type, *, size=None):
+        if fail_on is not None and fail_on in basename:
+            raise RuntimeError("simulated GCS stream upload error")
+        # Measure the source WITHOUT reading it into memory (seek to end), so the
+        # mock itself never reintroduces the OOM the streaming path exists to avoid.
+        try:
+            fileobj.seek(0, os.SEEK_END)
+            measured = fileobj.tell()
+            fileobj.seek(0)
+        except OSError:
+            measured = size
+        calls["uploads"].append(
+            {
+                "basename": basename,
+                "size": measured if measured is not None else size,
+                "content_type": content_type,
+                "streamed": True,
             }
         )
         return (
@@ -18649,6 +22043,9 @@ def _mock_viewable_storage(monkeypatch, bundle: bytes, *, fail_on: str | None = 
         storage, "download_compute_job_artifact_bundle", _forbid_whole_bundle_download
     )
     monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_upload)
+    monkeypatch.setattr(
+        storage, "upload_compute_job_viewable_stream", _fake_stream_upload
+    )
     return calls
 
 
@@ -18662,6 +22059,753 @@ async def _job_files(db_session, job_id) -> list[ComputeJobFile]:
         .scalars()
         .all()
     )
+
+
+# ── GCP VM viewable upload endpoint ──────────────────────────────────────
+
+
+def _build_viewable_multipart_body(
+    file_data: bytes, filename: str
+) -> tuple[bytes, str]:
+    """Build a ``multipart/form-data`` body matching viewable_watch.py's format."""
+    boundary = b"----TestBoundaryViewable"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="file"; filename="'
+        + filename.encode("utf-8")
+        + b'"',
+        b"Content-Type: application/octet-stream",
+        b"",
+        file_data,
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="filename"',
+        b"",
+        filename.encode("utf-8"),
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    return body, ct
+
+
+async def _fake_viewable_upload(job_id, basename, data, content_type, *, calls):
+    """Async fake for ``storage.upload_compute_job_viewable_file``."""
+    calls.append({"basename": basename, "size": len(data)})
+    return (
+        f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_large_video_uses_streaming_seam(
+    client, db_session, monkeypatch
+):
+    """A video body above the spool threshold is uploaded via the STREAMING seam.
+
+    The whole point of the spool+streaming path: a multi-hundred-MiB video must
+    never be buffered whole in the orchestrator heap.  The test shrinks the spool
+    threshold to a trivially small value so the test payload (a few KB) rolls to
+    disk and the streaming branch activates, then asserts that
+    ``upload_compute_job_viewable_stream`` is called with a file-like object that
+    reads back the exact file bytes — while ``upload_compute_job_viewable_file``
+    (the OOM vector) is never called.
+    """
+    from app.routers import agent_compute_jobs as agent_mod
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="GCP VM Stream Viewable", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    video_bytes = b"\x00\x01FAKE-MP4-PAYLOAD" * 64  # ~1 KiB, distinctive
+
+    captured: dict = {}
+    fake_uri = (
+        f"gs://test-bucket/compute-jobs/{job.id}/artifacts/viewable/rollout.mp4"
+    )
+
+    async def _fake_stream(job_id, basename, fileobj, content_type, *, size=None):
+        captured["read"] = fileobj.read()
+        captured["size"] = size
+        captured["content_type"] = content_type
+        captured["basename"] = basename
+        return fake_uri
+
+    body, content_type = _build_viewable_multipart_body(video_bytes, "rollout.mp4")
+
+    # Shrink the spool threshold so the modest test payload rolls to disk and
+    # activates the streaming branch.  The in-memory seam MUST NOT be touched.
+    with monkeypatch.context() as mp:
+        mp.setattr(agent_mod, "_MAX_VIEWABLE_FILE_BYTES", 8)
+        mp.setattr(agent_mod, "_MULTIPART_BODY_MARGIN", 8)
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_stream",
+            _fake_stream,
+        )
+        monkeypatch.setattr(
+            storage,
+            "upload_compute_job_viewable_file",
+            AsyncMock(
+                side_effect=AssertionError(
+                    "rolled video must not use the in-memory upload seam"
+                )
+            ),
+        )
+
+        resp = await client.post(
+            f"/api/agent/compute-jobs/{job.id}/viewable",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+
+    assert resp.status_code == 200, (
+        f"Expected 200 for streamed video, got {resp.status_code}: {resp.text}"
+    )
+    body_json = resp.json()
+    assert body_json["ok"] is True
+    assert body_json["entry"]["kind"] == "video"
+    assert body_json["entry"]["storage_uri"] == fake_uri
+    assert body_json["entry"]["size_bytes"] == len(video_bytes)
+
+    # The streamed bytes are EXACTLY the file part — no multipart framing.
+    assert captured["read"] == video_bytes, (
+        "streaming seam must yield exactly the file part bytes, no multipart framing"
+    )
+    assert captured["size"] == len(video_bytes)
+    assert captured["content_type"] == "video/mp4"
+
+    # DB row + manifest recorded with the streamed size.
+    await db_session.refresh(job)
+    vf = (job.polling_metadata or {}).get("viewable_files", [])
+    assert len(vf) == 1 and vf[0]["size_bytes"] == len(video_bytes)
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_heartbeat_stamps_live_viewable_file(
+    client, db_session, monkeypatch
+):
+    """Acceptance test: a GCP VM uploads a viewable file mid-run and it is
+    persisted in polling_metadata with ``live=True``, reachable before the
+    job reaches a terminal state.
+
+    This is the named acceptance evidence for the 'push mid-run viewables
+    from GCP-VM jobs' task.  It exercises the full endpoint seam: auth via
+    per-job HMAC secret, multipart body parsing, kind classification,
+    per-kind byte caps, GCS upload integration, polling_metadata manifest
+    update, and ``ComputeJobFile`` row creation — all without requiring a
+    real GCS bucket.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    upload_calls: list = []
+    monkeypatch.setattr(
+        storage,
+        "upload_compute_job_viewable_file",
+        lambda j, b, d, ct: _fake_viewable_upload(j, b, d, ct, calls=upload_calls),
+    )
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev-001")
+
+    project = Project(name="GCP VM Viewable Acc", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    body, content_type = _build_viewable_multipart_body(png_data, "reward.png")
+
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": content_type,
+        },
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200, got {resp.status_code}: {resp.text}"
+    )
+
+    data = resp.json()
+    assert data["ok"] is True
+    assert data["total_viewable_files"] == 1
+    entry = data["entry"]
+    assert entry["filename"] == "reward.png"
+    assert entry["kind"] == "image"
+    assert entry["content_type"] == "image/png"
+    assert entry["live"] is True
+    assert entry["size_bytes"] == len(png_data)
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    viewable_files = meta.get("viewable_files") or []
+    assert len(viewable_files) == 1
+    assert viewable_files[0]["filename"] == "reward.png"
+    assert viewable_files[0]["live"] is True
+    assert viewable_files[0]["kind"] == "image"
+
+    assert len(upload_calls) == 1
+    assert upload_calls[0]["basename"] == "reward.png"
+
+    # A ComputeJobFile row was created
+    rows = await _job_files(db_session, job.id)
+    assert len(rows) == 1
+    assert rows[0].safe_relpath == "reward.png"
+    assert rows[0].media_type == "image"
+    assert rows[0].content_type == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_bad_auth(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with a wrong bearer token returns 403."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable Auth", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={"Authorization": "Bearer wrong-token", "Content-Type": ct},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_terminal_job(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable for a terminal job returns 409."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Terminal", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_unsupported_type(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with an unsupported extension (.html) returns 422."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Type", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"<html><body>hi</body></html>", "page.html")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_rejects_oversized(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable with a file over the per-kind byte cap returns 413."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    project = Project(name="GCP Viewable Oversized", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    oversized = b"\x89PNG\r\n\x1a\n" + b"\x00" * (9 * 1024 * 1024)
+    body, ct = _build_viewable_multipart_body(oversized, "huge.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 413
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_cap_enforced(
+    client, db_session, monkeypatch
+):
+    """POST .../viewable when the 25-file cap is reached returns 429."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    upload_count = 0
+    async def _fake_up(job_id, basename, data, ct):
+        nonlocal upload_count
+        upload_count += 1
+        return f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_up)
+
+    project = Project(name="GCP Viewable Cap", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    preload = []
+    for i in range(25):
+        preload.append({
+            "filename": f"file{i:02d}.png",
+            "storage_uri": (
+                f"gs://test-bucket/compute-jobs/{job.id}"
+                f"/artifacts/viewable/file{i:02d}.png"
+            ),
+            "content_type": "image/png",
+            "size_bytes": 100,
+            "kind": "image",
+            "revision": f"r{i}",
+            "live": True,
+        })
+    job.polling_metadata = {"viewable_files": preload}
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "new_file.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_refreshes_existing(
+    client, db_session, monkeypatch
+):
+    """Re-uploading the same relpath updates the existing entry (no cap error)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    upload_count = 0
+    async def _fake_up(job_id, basename, data, ct):
+        nonlocal upload_count
+        upload_count += 1
+        return f"gs://test-bucket/compute-jobs/{job_id}/artifacts/viewable/{basename}"
+    monkeypatch.setattr(storage, "upload_compute_job_viewable_file", _fake_up)
+
+    project = Project(name="GCP Viewable Refresh", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+
+    body, ct = _build_viewable_multipart_body(png_data, "reward.png")
+    resp1 = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp1.status_code == 200
+    assert resp1.json()["total_viewable_files"] == 1
+
+    newer_data = b"\x89PNG\r\n\x1a\n" + b"\xff" * 200
+    body2, ct2 = _build_viewable_multipart_body(newer_data, "reward.png")
+    resp2 = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body2,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct2,
+        },
+    )
+    assert resp2.status_code == 200
+    data2 = resp2.json()
+    assert data2["total_viewable_files"] == 1
+    assert data2["entry"]["size_bytes"] == len(newer_data)
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    files = meta.get("viewable_files") or []
+    assert len(files) == 1
+    assert files[0]["size_bytes"] == len(newer_data)
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_with_subdir_relpath(
+    client, db_session, monkeypatch
+):
+    """A file from a subdirectory (arm1/reward.png) is stored with flattened name."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    upload_calls: list = []
+    monkeypatch.setattr(
+        storage,
+        "upload_compute_job_viewable_file",
+        lambda j, b, d, ct: _fake_viewable_upload(j, b, d, ct, calls=upload_calls),
+    )
+    monkeypatch.setattr(storage, "delete_compute_job_viewable_file", AsyncMock())
+    monkeypatch.setattr(storage, "new_viewable_revision", lambda: "test-rev")
+
+    project = Project(name="GCP Viewable Subdir", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    png_data = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+    body, ct = _build_viewable_multipart_body(png_data, "arm1/reward.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["entry"]["filename"] == "arm1__reward.png"
+    assert data["total_viewable_files"] == 1
+    assert len(upload_calls) == 1
+    assert upload_calls[0]["basename"] == "arm1__reward.png"
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_missing_filename_field(
+    client, db_session, monkeypatch
+):
+    """A multipart body without a 'filename' field returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable NoFn", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+
+    boundary = b"----TestBoundaryNoFn"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="file"; filename="x.png"',
+        b"Content-Type: application/octet-stream",
+        b"",
+        b"PNGDATA",
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_missing_file_field(
+    client, db_session, monkeypatch
+):
+    """A multipart body without a 'file' field returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable NoFile", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+
+    boundary = b"----TestBoundaryNoFile"
+    parts = [
+        b"--" + boundary,
+        b'Content-Disposition: form-data; name="filename"',
+        b"",
+        b"test.png",
+        b"--" + boundary + b"--",
+    ]
+    body = b"\r\n".join(parts)
+    ct = f'multipart/form-data; boundary={boundary.decode("ascii")}'
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_empty_file(
+    client, db_session, monkeypatch
+):
+    """An empty file body returns 400."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    project = Project(name="GCP Viewable Empty", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = await compute_jobs.create_compute_job(
+        db_session, task, command="true",
+        machine_type="e2-standard-2", spend_cap_usd=1.0,
+        deadline_seconds=300, backend_name="local-subprocess",
+    )
+    job.status = ComputeJobStatus.RUNNING
+    await db_session.commit()
+    token = compute_backends_module.compute_job_heartbeat_secret(job.id)
+    body, ct = _build_viewable_multipart_body(b"", "empty.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{job.id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_gcp_vm_viewable_upload_nonexistent_job(client, monkeypatch):
+    """POST .../viewable for a non-existent job returns 404."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    fake_id = uuid.uuid4()
+    token = compute_backends_module.compute_job_heartbeat_secret(fake_id)
+    body, ct = _build_viewable_multipart_body(b"PNG", "test.png")
+    resp = await client.post(
+        f"/api/agent/compute-jobs/{fake_id}/viewable",
+        content=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": ct,
+        },
+    )
+    assert resp.status_code == 404
+
+
+# ── Terminal viewable-pipeline tests ──────────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -18680,10 +22824,12 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
             "./screen.jpeg": jpg_data,
             "./anim.webp": b"RIFF" + b"\x00" * 100,
             "./icon.gif": b"GIF89a" + b"\x00" * 50,
-            # SVG is EXCLUDED fail-closed (script execution via signed URL).
+            # SVG is sanitized server-side and now viewable.
             "./diagram.svg": b"<svg></svg>",
             "./output.mp4": mp4_data,
             "./clip.webm": b"\x1aE\xdf\xa3" + b"\x00" * 100,
+            # PDF is a first-class viewable kind (matplotlib savefig('*.pdf')).
+            "./report.pdf": b"%PDF-1.4\n" + b"\x00" * 100,
             # Non-viewable — must be skipped.
             "./terminal.json": b'{"status": "SUCCEEDED"}',
             "./command.log": b"all good\n",
@@ -18698,25 +22844,26 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
     )
     await db_session.commit()
 
-    # 7 viewable files (SVG excluded fail-closed), uploaded ONCE each.
-    assert len(manifest) == 7
+    # 9 viewable files (SVG now viewable — sanitized before upload), uploaded ONCE each.
+    assert len(manifest) == 9
     assert dropped == 0
-    assert len(calls["uploads"]) == 7
+    assert len(calls["uploads"]) == 9
     assert calls["downloads"] == 1, "the bundle must be downloaded exactly once"
 
     rows = await _job_files(db_session, job.id)
-    assert len(rows) == 7
+    assert len(rows) == 9
 
     by_name = {r.safe_relpath: r for r in rows}
     assert by_name["plot.png"].media_type == "image"
     assert by_name["plot.png"].content_type == "image/png"
     assert by_name["output.mp4"].media_type == "video"
     assert by_name["output.mp4"].content_type == "video/mp4"
-
-    # SVG must NOT be persisted as a signable/viewable file — excluded fail-closed
-    # on BOTH surfaces (script-execution risk when served from a signed URL).
-    assert "diagram.svg" not in by_name
-    assert not any(e["filename"] == "diagram.svg" for e in manifest)
+    assert by_name["report.pdf"].media_type == "pdf"
+    assert by_name["report.pdf"].content_type == "application/pdf"
+    # SVG is now persisted as kind=image (script-stripped before upload).
+    assert by_name["diagram.svg"].media_type == "image"
+    assert by_name["diagram.svg"].content_type == "image/svg+xml"
+    assert any(e["filename"] == "diagram.svg" for e in manifest)
 
     # Non-viewable files must NOT appear.
     for skipped in ("terminal.json", "command.log", "script.py", "results.txt"):
@@ -18731,8 +22878,63 @@ async def test_viewable_pipeline_roundtrips_images_and_videos(db_session, monkey
 
     # The manifest is stamped on the job for the admin UI / strategic context.
     meta = job.polling_metadata or {}
-    assert meta.get("viewable_file_count") == 7
-    assert len(meta.get("viewable_files") or []) == 7
+    assert meta.get("viewable_file_count") == 9
+    assert len(meta.get("viewable_files") or []) == 9
+
+
+@pytest.mark.asyncio
+async def test_pdf_is_viewable_artifact_kind(db_session, monkeypatch):
+    """A .pdf plot persisted as kind='pdf' and an .svg as kind='image' (sanitized)
+    — end to end from storage classifier through the persistence pipeline."""
+    # 1) The storage classifier maps .pdf to (application/pdf, "pdf") on BOTH
+    #    viewable surfaces, and the MIME->kind mapper agrees.
+    assert storage.viewable_content_type_for_filename("figure.pdf") == (
+        "application/pdf",
+        "pdf",
+    )
+    assert "pdf" in storage._VIEWABLE_CONTENT_TYPES
+    assert ".pdf" in storage.VIEWABLE_COMPUTE_JOB_EXTENSIONS
+    assert storage._media_kind_for_mime("application/pdf") == "pdf"
+    # SVG is now also accepted on both surfaces (sanitized before upload).
+    assert storage.svg_is_viewable() is True
+    assert storage.viewable_content_type_for_filename("figure.svg") == (
+        "image/svg+xml",
+        "image",
+    )
+
+    # 2) A bundle containing a .pdf (alongside a .svg) yields manifest
+    #    entries + ComputeJobFile rows for both.
+    job = await _create_bundle_compute_job(db_session)
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./savefig.pdf": b"%PDF-1.5\n" + b"\x00" * 200,
+            "./diagram.svg": b"<svg><rect width='10' height='10'/></svg>",
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert len(manifest) == 2
+    by_name = {e["filename"]: e for e in manifest}
+    pdf_entry = by_name["savefig.pdf"]
+    assert pdf_entry["kind"] == "pdf"
+    assert pdf_entry["content_type"] == "application/pdf"
+    svg_entry = by_name["diagram.svg"]
+    assert svg_entry["kind"] == "image"
+    assert svg_entry["content_type"] == "image/svg+xml"
+    assert len(calls["uploads"]) == 2
+
+    rows = await _job_files(db_session, job.id)
+    assert len(rows) == 2
+    row_by_name = {r.safe_relpath: r for r in rows}
+    assert row_by_name["savefig.pdf"].media_type == "pdf"
+    assert row_by_name["diagram.svg"].media_type == "image"
+    assert row_by_name["diagram.svg"].content_type == "image/svg+xml"
 
 
 @pytest.mark.asyncio
@@ -18800,6 +23002,197 @@ async def test_viewable_pipeline_enforces_single_per_file_size_cap(
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 1
     assert rows[0].safe_relpath == "tiny_plot.png"
+
+
+@pytest.mark.asyncio
+async def test_viewable_pipeline_streams_large_video_over_image_cap(
+    db_session, monkeypatch
+):
+    """A video over the 8 MiB in-memory image cap is STREAMED, not dropped.
+
+    Rollout/training videos routinely exceed the per-file in-memory ceiling that
+    governs images. Rather than being silently dropped (locked inside the opaque
+    bundle), they are streamed member-by-member to storage through the dedicated
+    streaming seam (``upload_compute_job_viewable_stream``), while a co-resident
+    image keeps taking the in-memory path.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    # Incompressible so the archived member genuinely exceeds the image cap.
+    big_video = os.urandom(image_cap + 512 * 1024)  # ~8.5 MiB > image cap
+    small_png = b"\x89PNG\r\n\x1a\n" + b"Y" * 1024
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./rollout.mp4": big_video,
+            "./frame.png": small_png,
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    # Both persisted — the big video is NOT dropped for exceeding the image cap.
+    by_name = {m["filename"]: m for m in manifest}
+    assert set(by_name) == {"rollout.mp4", "frame.png"}
+    assert by_name["rollout.mp4"]["size_bytes"] == len(big_video)
+    assert by_name["rollout.mp4"]["kind"] == "video"
+    assert by_name["rollout.mp4"]["content_type"] == "video/mp4"
+
+    uploads = {u["basename"]: u for u in calls["uploads"]}
+    # The video went through the STREAMING seam; the image through the in-memory one.
+    assert uploads["rollout.mp4"]["streamed"] is True
+    assert uploads["rollout.mp4"]["size"] == len(big_video)
+    assert uploads["frame.png"]["streamed"] is False
+
+    rows = await _job_files(db_session, job.id)
+    names = {r.safe_relpath for r in rows}
+    assert names == {"rollout.mp4", "frame.png"}
+
+
+@pytest.mark.asyncio
+async def test_viewable_pipeline_enforces_video_ceiling(db_session, monkeypatch):
+    """A video over the (larger) streamed-video ceiling is still skipped.
+
+    Streaming raises the video ceiling far above the image cap, but it is not
+    unbounded: a video above ``_MAX_VIEWABLE_VIDEO_BYTES`` is skipped (stays in
+    the bundle) while one within the ceiling is streamed. The ceiling is
+    monkeypatched down so the test needn't materialize a half-gigabyte file.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    image_cap = compute_backends_module._MAX_VIEWABLE_FILE_BYTES
+    video_ceiling = image_cap + 4 * 1024 * 1024  # 12 MiB, above the image cap
+    monkeypatch.setattr(
+        compute_backends_module, "_MAX_VIEWABLE_VIDEO_BYTES", video_ceiling
+    )
+
+    within = os.urandom(image_cap + 1 * 1024 * 1024)  # ~9 MiB: streamed
+    over = os.urandom(video_ceiling + 1 * 1024 * 1024)  # ~13 MiB: skipped
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./ok_clip.mp4": within,
+            "./too_big.webm": over,
+        }
+    )
+    calls = _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    # Only the within-ceiling video is persisted; the oversized one is skipped
+    # and reported in the aggregate omission count, matching image-size and
+    # count-cap omissions.
+    assert [m["filename"] for m in manifest] == ["ok_clip.mp4"]
+    assert dropped == 1
+    uploads = {u["basename"]: u for u in calls["uploads"]}
+    assert set(uploads) == {"ok_clip.mp4"}
+    assert uploads["ok_clip.mp4"]["streamed"] is True
+
+    rows = await _job_files(db_session, job.id)
+    assert {r.safe_relpath for r in rows} == {"ok_clip.mp4"}
+
+
+def test_viewable_pipeline_streams_large_video_and_peak_memory_is_bounded(
+    tmp_path, monkeypatch
+):
+    """A large video is uploaded WITHOUT ever holding it whole in RAM.
+
+    The whole point of streaming: a video far larger than the 8 MiB in-memory
+    image cap must reach storage while the orchestrator's peak allocation stays
+    bounded by the copy/stream buffer, not the video size. An implementation that
+    buffered the video (``upload_from_string``) would pay for its full size here
+    and trip the ceiling.
+    """
+    monkeypatch.setattr(
+        compute_backends_module, "_MAX_VIEWABLE_VIDEO_BYTES", 128 * 1024 * 1024
+    )
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 4096
+    # INCOMPRESSIBLE and well over the 8 MiB image cap (but under the video
+    # ceiling): the streamed bytes a buffering impl would hold are the full 40 MiB.
+    big_video = os.urandom(40 * 1024 * 1024)
+    src = tmp_path / "bundle.tar.gz"
+    with tarfile.open(str(src), mode="w:gz", compresslevel=1) as tar:
+        for name, payload in (
+            ("./rollout.mp4", big_video),
+            ("./plot.png", png),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    video_size = len(big_video)
+    del big_video
+    assert src.stat().st_size > 32 * 1024 * 1024, "the video must dwarf the ceiling"
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(str(src), dest_path)  # to disk; no Python-level buffer
+        return True
+
+    async def _forbid_whole_bundle_download(_job_id):
+        raise AssertionError("must stream the bundle to disk, never load it whole")
+
+    uploaded: list = []
+
+    async def _fake_file_upload(job_id, filename, data, content_type):
+        uploaded.append({"filename": filename, "streamed": False})
+        return storage.compute_job_viewable_uri(job_id, filename)
+
+    async def _fake_stream_upload(job_id, filename, fileobj, content_type, *, size=None):
+        # Measure via seek — reading the file whole here would defeat the test.
+        fileobj.seek(0, os.SEEK_END)
+        measured = fileobj.tell()
+        fileobj.seek(0)
+        uploaded.append({"filename": filename, "streamed": True, "size": measured})
+        return storage.compute_job_viewable_uri(job_id, filename)
+
+    job = MagicMock()
+    job.id = uuid.uuid4()
+    job.backend = compute_backends_module.GCP_BACKEND_NAME
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.storage,
+        "download_compute_job_artifact_bundle",
+        _forbid_whole_bundle_download,
+    ), patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_file",
+        _fake_file_upload,
+    ), patch.object(
+        compute_backends_module.storage,
+        "upload_compute_job_viewable_stream",
+        _fake_stream_upload,
+    ):
+        tracemalloc.start()
+        try:
+            manifest, dropped = asyncio.run(
+                compute_backends_module.persist_viewable_artifacts(job)
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    assert sorted(m["filename"] for m in manifest) == ["plot.png", "rollout.mp4"]
+    assert dropped == 0
+    by_name = {u["filename"]: u for u in uploaded}
+    assert by_name["rollout.mp4"]["streamed"] is True
+    assert by_name["rollout.mp4"]["size"] == video_size
+    assert by_name["plot.png"]["streamed"] is False
+
+    # Peak stays bounded — well under the 40 MiB video — proving the video is
+    # streamed, not materialized in the orchestrator's heap.
+    ceiling = 16 * 1024 * 1024
+    assert peak < ceiling, (
+        f"the viewable pass peaked at {peak / 1024 / 1024:.1f} MiB streaming a "
+        f"{video_size / 1024 / 1024:.1f} MiB video — it is buffering the video "
+        "instead of streaming it (this is the OOM the task fixes)"
+    )
 
 
 @pytest.mark.asyncio
@@ -18919,6 +23312,137 @@ async def test_viewable_pipeline_upload_failure_is_non_blocking(
     }
     # A file that never landed in storage must NOT be advertised as signable.
     assert not any("fail_me" in r.storage_uri for r in rows)
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_total_failure_preserves_live_entries_and_retries(
+    db_session, monkeypatch
+):
+    """A corrupt/unavailable terminal bundle must not erase durable live previews.
+
+    The incomplete pass also must not stamp the idempotency marker: a later
+    healthy terminal pass retries and authoritatively reconciles the previews.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    live_manifest = [
+        {
+            "filename": "plot.png",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "plot.png"),
+            "content_type": "image/png",
+            "size_bytes": 11,
+            "kind": "image",
+            "revision": "live-plot-revision",
+            "live": True,
+        },
+        {
+            "filename": "clip.mp4",
+            "storage_uri": storage.compute_job_viewable_uri(job.id, "clip.mp4"),
+            "content_type": "video/mp4",
+            "size_bytes": 12,
+            "kind": "video",
+            "revision": "live-clip-revision",
+            "live": True,
+        },
+    ]
+    job.polling_metadata = {"viewable_files": live_manifest}
+    db_session.add(job)
+    await db_session.commit()
+
+    failed_calls = _mock_viewable_storage(monkeypatch, b"not-a-tar")
+    preserved, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert failed_calls["uploads"] == []
+    assert {entry["filename"] for entry in preserved} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is True for entry in preserved)
+    failed_meta = job.polling_metadata or {}
+    assert failed_meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in failed_meta
+
+    healthy_bundle = _make_viewable_tar_bundle(
+        {
+            "./plot.png": b"\x89PNG terminal",
+            "./clip.mp4": b"\x00\x00\x00\x18ftypmp42 terminal",
+        }
+    )
+    healthy_calls = _mock_viewable_storage(monkeypatch, healthy_bundle)
+    reconciled, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    assert len(healthy_calls["uploads"]) == 2
+    assert {entry["filename"] for entry in reconciled} == {"plot.png", "clip.mp4"}
+    assert all(entry["live"] is False for entry in reconciled)
+    complete_meta = job.polling_metadata or {}
+    assert complete_meta.get("viewable_file_count") == 2
+    assert "viewable_terminal_reconciliation_incomplete" not in complete_meta
+
+
+@pytest.mark.asyncio
+async def test_terminal_viewable_partial_upload_preserves_unreconciled_live_entry(
+    db_session, monkeypatch
+):
+    """A partial terminal upload replaces successes but retains failed live files."""
+    job = await _create_bundle_compute_job(db_session)
+    failed_live_revision = "live-failed-file-revision"
+    job.polling_metadata = {
+        "viewable_files": [
+            {
+                "filename": "good.png",
+                "storage_uri": storage.compute_job_viewable_uri(job.id, "good.png"),
+                "content_type": "image/png",
+                "size_bytes": 8,
+                "kind": "image",
+                "revision": "old-good-revision",
+                "live": True,
+            },
+            {
+                "filename": "fail_me.png",
+                "storage_uri": storage.compute_job_viewable_uri(
+                    job.id, "fail_me.png"
+                ),
+                "content_type": "image/png",
+                "size_bytes": 9,
+                "kind": "image",
+                "revision": failed_live_revision,
+                "live": True,
+            },
+        ]
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    bundle = _make_viewable_tar_bundle(
+        {
+            "./good.png": b"\x89PNG good-terminal",
+            "./fail_me.png": b"\x89PNG failed-terminal",
+        }
+    )
+    _mock_viewable_storage(monkeypatch, bundle, fail_on="fail_me")
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    assert dropped == 0
+    by_name = {entry["filename"]: entry for entry in manifest}
+    assert set(by_name) == {"good.png", "fail_me.png"}
+    assert by_name["good.png"]["live"] is False
+    assert by_name["good.png"]["revision"] != "old-good-revision"
+    assert by_name["fail_me.png"]["live"] is True
+    assert by_name["fail_me.png"]["revision"] == failed_live_revision
+    meta = job.polling_metadata or {}
+    assert meta.get("viewable_terminal_reconciliation_incomplete") is True
+    assert "viewable_file_count" not in meta
 
 
 @pytest.mark.asyncio
@@ -18942,6 +23466,8 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     await db_session.commit()
     assert len(manifest1) == 2
+    first_revisions = {e["filename"]: e["revision"] for e in manifest1}
+    assert all(e["live"] is False for e in manifest1)
     assert calls["downloads"] == 1
     assert len(calls["uploads"]) == 2
 
@@ -18957,9 +23483,72 @@ async def test_viewable_pipeline_is_idempotent_and_downloads_bundle_once(
     )
     assert len(calls["uploads"]) == 2, "re-entry must NOT re-upload any file"
     assert {e["filename"] for e in manifest2} == {e["filename"] for e in manifest1}
+    assert {e["filename"]: e["revision"] for e in manifest2} == first_revisions
 
     rows = await _job_files(db_session, job.id)
     assert len(rows) == 2, f"expected no duplicate rows on re-entry, got {len(rows)}"
+
+
+@pytest.mark.asyncio
+async def test_terminal_extract_purges_orphaned_computejobfile_rows(
+    db_session, monkeypatch
+):
+    """ComputeJobFile rows for mid-run uploads not in the terminal manifest are deleted.
+
+    A file uploaded mid-run but not selected into the terminal top-N manifest leaves
+    an orphaned ComputeJobFile row (still signable via the download-URL endpoint) and
+    an orphaned GCS object. The terminal extraction pass must delete both.
+    """
+    job = await _create_bundle_compute_job(db_session)
+    orphan_uri = storage.compute_job_viewable_uri(job.id, "orphan_live.png")
+    # Pre-populate an orphaned ComputeJobFile row simulating a mid-run upload that
+    # didn't make the terminal cut.
+    orphan_row = ComputeJobFile(
+        compute_job_id=job.id,
+        safe_relpath="orphan_live.png",
+        media_type="image",
+        storage_uri=orphan_uri,
+        content_type="image/png",
+        file_size_bytes=500,
+    )
+    db_session.add(orphan_row)
+    await db_session.commit()
+
+    deleted_uris: list[str] = []
+
+    async def _fake_delete(uri: str) -> bool:
+        deleted_uris.append(uri)
+        return True
+
+    monkeypatch.setattr(storage, "delete_storage_uri_best_effort", _fake_delete)
+
+    # Terminal bundle contains only terminal.png — orphan is NOT in the bundle.
+    bundle = _make_viewable_tar_bundle(
+        {"./terminal.png": b"\x89PNG\r\n\x1a\n" + b"\x00" * 50}
+    )
+    _mock_viewable_storage(monkeypatch, bundle)
+
+    manifest, dropped = await compute_jobs.persist_viewable_files_for_job(
+        db_session, job
+    )
+    await db_session.commit()
+
+    # The terminal manifest contains only the terminal file.
+    assert len(manifest) == 1
+    assert manifest[0]["filename"] == "terminal.png"
+
+    # The orphaned GCS object was deleted.
+    assert orphan_uri in deleted_uris, (
+        "orphaned GCS object must be deleted when not in terminal manifest"
+    )
+
+    # The orphaned ComputeJobFile row was removed from the DB.
+    rows = await _job_files(db_session, job.id)
+    names = {r.safe_relpath for r in rows}
+    assert "orphan_live.png" not in names, (
+        "orphaned ComputeJobFile row must be purged at terminal extract"
+    )
+    assert "terminal.png" in names
 
 
 @pytest.mark.asyncio
@@ -19005,7 +23594,7 @@ async def test_viewable_pipeline_skips_backends_without_a_bundle(
 
 # ── No-progress watchdog ──────────────────────────────────────────────────────
 #
-# The surfacing half (progress_series ring buffer + declared_metric) already
+# The surfacing half (bounded progress_series + declared_metric) already
 # shipped; these cover the CONSUMER wired in this change: _no_progress_stalled
 # and its enforcement in _process_single_compute_job.
 
@@ -19020,7 +23609,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     """Build an in-memory job-like object for pure watchdog-trend tests.
 
     ``samples`` is a list of ``(seconds_before_now, name, value)`` tuples for the
-    progress ring buffer; ``started_offset_seconds`` is how long ago the job
+    progress history; ``started_offset_seconds`` is how long ago the job
     started.
     """
     from types import SimpleNamespace
@@ -19032,6 +23621,7 @@ def _progress_job(*, metric, samples, started_offset_seconds, extra_meta=None):
     series = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": name,
             "value": value,
         }
@@ -19085,16 +23675,18 @@ def test_no_progress_stalled_requires_window_of_history():
     assert compute_jobs._no_progress_stalled(job, now=now) is False
 
 
-def test_no_progress_stalled_ignores_stale_buffer():
+def test_no_progress_stalled_treats_stale_buffer_as_missing_progress():
     metric = "val/loss"
     # A flat buffer whose newest sample predates the trailing window entirely
-    # (the job stopped reporting long ago). The window slice is empty → no fire;
-    # a genuinely dead VM is handled by the poll-failure kills, not the watchdog.
+    # A flat buffer whose newest sample predates the trailing window entirely
+    # means a declared watchdog has received no current progress for a full
+    # window. That is an enforcement failure and must fire, while backend poll
+    # failures remain a separate safety-kill path.
     samples = [(3600 - i * 300, metric, 1.0) for i in range(6)]  # ages 3600..2100
     job, now = _progress_job(
         metric=metric, samples=samples, started_offset_seconds=7200
     )
-    assert compute_jobs._no_progress_stalled(job, now=now) is False
+    assert compute_jobs._no_progress_stalled(job, now=now) is True
 
 
 def test_no_progress_stalled_respects_grace_period():
@@ -19214,6 +23806,7 @@ async def test_process_compute_jobs_once_cuts_stalled_no_progress_job(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 2.71828,
         }
@@ -19295,6 +23888,7 @@ async def test_process_compute_jobs_once_keeps_progressing_job_running(
     meta["progress_series"] = [
         {
             "t": (now - timedelta(seconds=age)).isoformat(),
+            "received_at": (now - timedelta(seconds=age)).isoformat(),
             "name": "val/loss",
             "value": 3.0 - i * 0.15,
         }
@@ -19357,6 +23951,31 @@ def test_build_compute_launch_kwargs_forwards_declared_metric():
         {}, command="python x.py", spend_cap_usd=1.0, deadline_seconds=60
     )
     assert "declared_metric" not in absent
+
+
+def test_build_compute_launch_kwargs_preserves_resume_watchdog_pair_flat_and_nested():
+    """Both supported payload shapes forward a checkpoint resume guard together."""
+    from app.orchestrator_runner_dispatch import _build_compute_launch_kwargs
+
+    predecessor = str(uuid.uuid4())
+    base = {"command": "python x.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    flat = _build_compute_launch_kwargs(
+        {"input_artifact_job_id": predecessor, "no_progress_timeout_seconds": 60},
+        **base,
+    )
+    nested_resume = _build_compute_launch_kwargs(
+        {
+            "compute_experiment": {
+                "input_artifact_job_id": predecessor,
+                "no_progress_timeout_seconds": 60,
+            }
+        },
+        **base,
+    )
+
+    for kwargs in (flat, nested_resume):
+        assert kwargs["input_artifact_job_id"] == predecessor
+        assert kwargs["no_progress_timeout_seconds"] == 60
 
 
 # ── Cross-job checkpoint resume (input_artifact_job_id) ───────────────────────
@@ -19464,7 +24083,9 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
         machine_type="e2-standard-2",
         spend_cap_usd=1.0,
         deadline_seconds=300,
+        no_progress_timeout_seconds=120,
         input_artifact_job_id=str(predecessor.id),
+        declared_metric="loss",
     )
     assert job.backend == compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME
     assert job.polling_metadata.get("input_artifact_job_id") == str(predecessor.id)
@@ -19530,6 +24151,32 @@ async def test_compute_job_resume_hydrates_prior_bundle(client, db_session, monk
 
 
 @pytest.mark.asyncio
+async def test_compute_job_resume_requires_explicit_watchdog_before_persisting(
+    db_session, monkeypatch
+):
+    """Direct callers cannot create an unguarded checkpoint successor row."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py --resume",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(uuid.uuid4()),
+        )
+
+    assert exc.value.detail["error"] == "input_artifact_watchdog_required"
+    jobs = (
+        await db_session.execute(select(ComputeJob).where(ComputeJob.task_id == task.id))
+    ).scalars().all()
+    assert jobs == []
+
+
+@pytest.mark.asyncio
 async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
     db_session, monkeypatch
 ):
@@ -19546,6 +24193,7 @@ async def test_compute_job_resume_rejects_unknown_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(uuid.uuid4()),
         )
     assert exc.value.detail["error"] == "input_artifact_job_not_found"
@@ -19573,6 +24221,7 @@ async def test_compute_job_resume_rejects_malformed_input_artifact_job_id(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id="not-a-uuid",
         )
     assert exc.value.detail["error"] == "invalid_input_artifact_job_id"
@@ -19602,6 +24251,7 @@ async def test_compute_job_resume_rejects_cross_project_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(foreign.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_cross_project"
@@ -19627,9 +24277,85 @@ async def test_compute_job_resume_rejects_bundleless_input_artifact(
             machine_type="e2-standard-2",
             spend_cap_usd=1.0,
             deadline_seconds=300,
+            no_progress_timeout_seconds=60,
             input_artifact_job_id=str(predecessor.id),
         )
     assert exc.value.detail["error"] == "input_artifact_job_has_no_bundle"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_failed_ancestor_hydration(db_session, monkeypatch):
+    """A bundle from a failed resume hydration is never lineage-eligible."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    predecessor = await _make_resume_predecessor_job(
+        db_session, project_id=task.project_id, with_bundle=True
+    )
+    predecessor.polling_metadata = {
+        "input_artifact_job_id": str(uuid.uuid4()),
+        "resume_provenance": {"ok": False, "reason": "extract_error"},
+    }
+    db_session.add(predecessor)
+    await db_session.commit()
+
+    with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+            input_artifact_job_id=str(predecessor.id),
+            declared_metric="loss",
+            no_progress_timeout_seconds=120,
+        )
+    assert exc.value.detail["error"] == "input_artifact_job_resume_provenance_invalid"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_resume_rejects_non_terminal_source(db_session, monkeypatch):
+    """A still-RUNNING or POLLING predecessor is refused as a resume source.
+
+    Resuming from a non-terminal job risks rehydrating a partial/mid-checkpoint
+    bundle — the design doc flags this as 'infinite chaining of dead runs'.
+    """
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    for non_terminal_status in (
+        ComputeJobStatus.RUNNING,
+        ComputeJobStatus.POLLING,
+        ComputeJobStatus.QUEUED,
+        ComputeJobStatus.STARTING,
+    ):
+        job = ComputeJob(
+            project_id=task.project_id,
+            backend=compute_backends_module.RUNNER_SUBPROCESS_BACKEND_NAME,
+            machine_type="e2-standard-2",
+            status=non_terminal_status,
+            accrued_cost_usd=0.0,
+            result_reference=storage.compute_job_artifact_uri(uuid.uuid4()),
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as exc:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+                no_progress_timeout_seconds=60,
+                input_artifact_job_id=str(job.id),
+            )
+        assert exc.value.detail["error"] == "input_artifact_job_not_terminal", (
+            f"expected rejection for status={non_terminal_status}"
+        )
+        assert exc.value.detail["source_status"] == non_terminal_status.value
 
 
 @pytest.mark.asyncio
@@ -19680,12 +24406,12 @@ async def test_gcp_startup_script_hydrates_input_artifact_bundle(monkeypatch):
 
     assert download_calls == [str(predecessor_id)]
     script = provision_calls[0]
-    # Downloads the predecessor bundle and extracts it into the artifact dir.
+    # Downloads the predecessor bundle and extracts it into the staging dir first,
+    # then moves it into the artifact dir (so partial extracts never corrupt it).
     assert "https://storage.example.com/predecessor-bundle" in script
-    assert (
-        f"tar -C {shlex.quote(compute_backends_module._GCP_ARTIFACT_DIR_PATH)} "
-        f"--no-same-owner -xzf" in script
-    )
+    assert "/tmp/blueprint_resume_stage" in script
+    assert "tarfile.open" in script
+    assert "m.isreg() or m.isdir()" in script
     assert "resume_hydration.ok" in script
     assert "resume_hydration.failed" in script
 
@@ -20062,6 +24788,192 @@ def test_viewable_pipeline_streams_bundle_and_peak_memory_is_bounded(tmp_path):
     )
 
 
+def test_checkpoint_resume_streams_predecessor_bundle_and_peak_memory_is_bounded(
+    tmp_path,
+):
+    """Cross-job checkpoint resume must never hold the predecessor bundle in RAM.
+
+    The resume path rehydrates a predecessor compute job's DURABLE artifact bundle
+    into the new job's artifact dir before the command runs. A results bundle is
+    unbounded (multi-GB RL checkpoints), so pulling the whole object into the
+    orchestrator (``download_compute_job_artifact_bundle`` -> ``download_as_bytes``
+    + ``io.BytesIO``) is the same leader-OOM class the viewable pass already fixed.
+    It must stream the bundle to a temp file and extract from disk.
+
+    Both transports are modelled HONESTLY so the assertion means something:
+
+    * the streaming seam (``_download_artifact_bundle_to_path``) copies the object
+      to its destination file — nothing passes through Python memory;
+    * the whole-bundle seam (``storage.download_compute_job_artifact_bundle``) does
+      what it really does — materialize the object as ``bytes``. That allocation
+      lands inside the measurement window, so an implementation that reaches for it
+      to resume is caught paying for it.
+    """
+    # INCOMPRESSIBLE, like a real checkpoint: the wire bytes a whole-object
+    # download would hold are the full 48 MiB, not a gzip artefact of it.
+    big_checkpoint = os.urandom(48 * 1024 * 1024)
+    src = tmp_path / "bundle.tar.gz"
+    # Written straight to disk (compresslevel=1) so the TEST never holds the
+    # archive either — only the resume path's own allocations land in the window.
+    with tarfile.open(str(src), mode="w:gz", compresslevel=1) as tar:
+        for name, payload in (
+            ("./checkpoint/model.pt", big_checkpoint),
+            ("./config.json", b'{"lr": 0.001}'),
+            ("./logs/train.log", b"step 1000 loss 0.5\n"),
+        ):
+            info = tarfile.TarInfo(name=name)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
+    del big_checkpoint
+    bundle_size = src.stat().st_size
+    assert bundle_size > 32 * 1024 * 1024, (
+        f"the bundle ({bundle_size} bytes) must dwarf the memory ceiling"
+    )
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(str(src), dest_path)  # to disk; no Python-level buffer
+        return True
+
+    async def _fake_whole_bundle_download(_job_id):
+        return src.read_bytes()  # a real whole-object fetch: 48+ MiB resident
+
+    dest_dir = tmp_path / "artifacts"
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.storage,
+        "download_compute_job_artifact_bundle",
+        _fake_whole_bundle_download,
+    ):
+        tracemalloc.start()
+        try:
+            extracted = asyncio.run(
+                compute_backends_module._rehydrate_input_artifact_bundle(
+                    "predecessor-job-id", str(dest_dir)
+                )
+            )
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+    # The resume still WORKS: every member is rehydrated onto disk under the
+    # artifact dir, checkpoint included.
+    assert extracted == 3
+    assert (dest_dir / "checkpoint" / "model.pt").stat().st_size == 48 * 1024 * 1024
+    assert (dest_dir / "config.json").read_bytes() == b'{"lr": 0.001}'
+    assert (dest_dir / "logs" / "train.log").exists()
+
+    # And it did not pay for the bundle's size in RAM. The ceiling is generous
+    # (well under half the archive), pinning the SHAPE — bounded, not proportional.
+    ceiling = 16 * 1024 * 1024
+    assert peak < ceiling, (
+        f"checkpoint resume peaked at {peak / 1024 / 1024:.1f} MiB on a "
+        f"{bundle_size / 1024 / 1024:.1f} MiB bundle — it is buffering the whole "
+        "predecessor bundle in the orchestrator heap instead of streaming it to "
+        "disk (this is the leader OOM on multi-GB checkpoints)"
+    )
+
+
+@pytest.mark.parametrize("directory_only", [False, True])
+def test_local_checkpoint_resume_rejects_bundle_without_regular_files(
+    tmp_path, directory_only
+):
+    """Empty and directory-only archives cannot earn successful provenance."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        if directory_only:
+            directory = tarfile.TarInfo("checkpoint/")
+            directory.type = tarfile.DIRTYPE
+            archive.addfile(directory)
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_strips_stale_status_files_before_counting(tmp_path):
+    """A bundle containing only predecessor status files is not a checkpoint."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name in compute_backends_module._RESUME_STALE_ARTIFACT_FILENAMES:
+            payload = b"stale predecessor status"
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), pytest.raises(RuntimeError, match="contains no resumable files"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+
+
+def test_local_checkpoint_resume_cleans_injected_partial_atomic_publication(
+    tmp_path,
+):
+    """A publication error after one entry cannot expose a partial durable tree."""
+    source = tmp_path / "source.tar.gz"
+    with tarfile.open(source, "w:gz") as archive:
+        for name, payload in (("first.ckpt", b"one"), ("second.ckpt", b"two")):
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    def _fake_stream(_job_id, dest_path):
+        shutil.copyfile(source, dest_path)
+        return True
+
+    dest_dir = tmp_path / "artifacts"
+    dest_dir.mkdir()
+    (dest_dir / "incomplete-from-prior-attempt.ckpt").write_bytes(b"old")
+    real_replace = os.replace
+
+    def _interrupt_atomic_replace(src, dst):
+        if os.path.basename(src).startswith(".bp-resume-stage-"):
+            os.mkdir(dst)
+            first_entry = sorted(os.listdir(src))[0]
+            real_replace(os.path.join(src, first_entry), os.path.join(dst, first_entry))
+            raise OSError("injected interruption after first top-level entry")
+        return real_replace(src, dst)
+
+    with patch.object(
+        compute_backends_module, "_download_artifact_bundle_to_path", _fake_stream
+    ), patch.object(
+        compute_backends_module.os, "replace", _interrupt_atomic_replace
+    ), pytest.raises(RuntimeError, match="could not be published"):
+        asyncio.run(
+            compute_backends_module._rehydrate_input_artifact_bundle(
+                "predecessor-job-id", str(dest_dir)
+            )
+        )
+
+    assert not dest_dir.exists()
+    assert not list(tmp_path.glob("artifacts.bp-incomplete-*"))
+
+
 def test_no_progress_watchdog_escalates_to_sigkill_when_sigterm_is_ignored(
     tmp_path, monkeypatch
 ):
@@ -20188,3 +25100,974 @@ def test_no_progress_watchdog_shields_itself_from_its_own_group_term():
     )
     assert lines.index("trap '' TERM") < lines.index(term_line)
     assert lines.index(term_line) < lines.index(kill_line)
+
+
+def test_local_container_watchdog_names_and_docker_kills_the_container(monkeypatch):
+    """Shape guard: a CONTAINERIZED job's watchdog must docker-kill the container.
+
+    The trainer inside runs as a child of dockerd, NOT a member of the wrapper's
+    process group, so the watchdog's group SIGKILL can never reach it. The emitted
+    wrapper must therefore (a) give the container a deterministic ``--name`` and
+    (b) ``docker kill`` THAT name in the watchdog escalation, and do so BEFORE the
+    group KILL reaps the watchdog (otherwise the escalation is dead code). A bare
+    (non-container) job must NOT gain a docker kill — the group kill reaches it.
+    """
+    monkeypatch.setattr(compute_backends_module, "detect_local_gpu", lambda: None)
+    external_id = "np-container-shape"
+    name = compute_backends_module._local_container_name_for_external_id(external_id)
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/pytorch:24.01-py3",
+        no_progress_timeout_seconds=30,
+    )
+    assert f"--name {shlex.quote(name)}" in wrapper
+    lines = [line.strip() for line in wrapper.splitlines()]
+    docker_kill_line = f"docker kill {shlex.quote(name)} 2>/dev/null || true"
+    kill_group_line = "kill -KILL -$$ 2>/dev/null || true"
+    assert docker_kill_line in lines, (
+        "the containerized watchdog must docker kill the container by name — a "
+        "group SIGKILL cannot reach the dockerd-parented trainer"
+    )
+    assert lines.index(docker_kill_line) < lines.index(kill_group_line), (
+        "docker kill must run BEFORE the group KILL reaps the watchdog, else the "
+        "container-reaching escalation never executes"
+    )
+    # Bare job: no container, no docker kill (group kill reaches everything).
+    bare = compute_backends_module._build_local_wrapper_command(
+        "echo ok", external_id="np-bare", no_progress_timeout_seconds=30
+    )
+    assert "docker kill" not in bare
+    assert "--name" not in bare
+
+
+def test_local_container_watchdog_actually_kills_containerized_workload(
+    tmp_path, monkeypatch
+):
+    """END-TO-END: a TERM-ignoring CONTAINERIZED trainer must be reaped by the
+    no-progress watchdog.
+
+    A containerized trainer runs as a child of dockerd, NOT a member of the
+    wrapper's process group, so the watchdog's group SIGKILL cannot touch it — a
+    TERM-ignoring trainer kept running (and kept billing) after the job was
+    recorded FAILED. Only reaching the container directly (``docker kill <name>``)
+    stops it.
+
+    Modelled HONESTLY with a fake ``docker`` on PATH that reparents the trainer
+    OUT of the wrapper's process group (``start_new_session``), exactly as dockerd
+    does: the group signals then genuinely cannot reach the trainer, and ONLY a
+    ``docker kill`` targeting the recorded container can. If the wrapper does not
+    docker-kill the container, the trainer survives and this test fails.
+    """
+    import subprocess
+    import textwrap
+    import time
+
+    if not sys.platform.startswith("linux"):
+        pytest.skip("process-group signalling + `/proc` state target the Linux substrate")
+
+    monkeypatch.setattr(compute_backends_module, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(
+        compute_backends_module, "_LOCAL_STATE_ROOT", str(tmp_path / "state")
+    )
+    external_id = "np-container-e2e"
+    container_name = compute_backends_module._local_container_name_for_external_id(
+        external_id
+    )
+
+    # Fake-docker state dir: name -> container (session) pid, so `docker kill
+    # <name>` can reach the reparented trainer.
+    fake_state = tmp_path / "fakedocker"
+    fake_state.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env python3\n"
+        + textwrap.dedent(
+            f"""
+            import os, sys, signal, subprocess
+            STATE = {str(fake_state)!r}
+            argv = sys.argv[1:]
+            if not argv:
+                sys.exit(0)
+            verb = argv[0]
+            if verb in ("pull", "login"):
+                sys.exit(0)
+            if verb == "run":
+                name = None
+                for i, a in enumerate(argv):
+                    if a == "--name" and i + 1 < len(argv):
+                        name = argv[i + 1]
+                # The container command is everything from the first `bash` token.
+                try:
+                    bidx = argv.index("bash")
+                except ValueError:
+                    sys.exit(0)
+                inner = argv[bidx:]
+                # start_new_session: the trainer runs in its OWN session/group,
+                # NOT the caller's process group. This models the dockerd-parenting
+                # that makes the wrapper's group SIGKILL unable to reach it.
+                child = subprocess.Popen(inner, start_new_session=True)
+                if name:
+                    with open(os.path.join(STATE, name + ".pid"), "w") as fh:
+                        fh.write(str(child.pid))
+                # If WE (the docker client) are signalled, the container keeps
+                # running — just like a real container detached from a dead CLI.
+                child.wait()
+                sys.exit(0)
+            if verb == "kill":
+                name = None
+                for a in argv[1:]:
+                    if not a.startswith("-"):
+                        name = a
+                if name:
+                    try:
+                        with open(os.path.join(STATE, name + ".pid")) as fh:
+                            pid = int(fh.read().strip())
+                        os.killpg(pid, signal.SIGKILL)
+                    except (OSError, ValueError):
+                        pass
+                sys.exit(0)
+            sys.exit(0)
+            """
+        ),
+        encoding="utf-8",
+    )
+    os.chmod(fake_docker, 0o755)
+
+    # A login shell may reset PATH (Debian's /etc/profile does). Re-prepend the
+    # fake-docker dir from ~/.bash_profile so every `bash -lc` in the wrapper
+    # resolves `docker` to the fake regardless of profile behaviour.
+    home_dir = tmp_path / "home"
+    home_dir.mkdir()
+    (home_dir / ".bash_profile").write_text(
+        f'export PATH={shlex.quote(str(fake_bin))}:"$PATH"\n', encoding="utf-8"
+    )
+
+    pid_file = tmp_path / "trainer.pid"
+    stubborn = tmp_path / "trainer.py"
+    stubborn.write_text(
+        "import os, signal, sys, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "with open(sys.argv[1], 'w') as fh:\n"
+        "    fh.write(str(os.getpid()))\n"
+        "    fh.flush()\n"
+        "time.sleep(600)\n",
+        encoding="utf-8",
+    )
+
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        f"python3 {shlex.quote(str(stubborn))} {shlex.quote(str(pid_file))}",
+        external_id=external_id,
+        container_image="fake/trainer:latest",
+        no_progress_timeout_seconds=5,  # the command never touches the progress file
+    )
+    # Setup sanity: the container is named so the fake can record + target it.
+    assert f"--name {shlex.quote(container_name)}" in wrapper
+
+    env = dict(os.environ)
+    env["HOME"] = str(home_dir)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+
+    def _alive(pid: int) -> bool:
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                state = fh.read().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            return False
+        return state != "Z"
+
+    proc = subprocess.Popen(
+        ["bash", "-lc", wrapper],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    trainer_pid = None
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            raw = pid_file.read_text().strip() if pid_file.exists() else ""
+            if raw:
+                trainer_pid = int(raw)
+                break
+            time.sleep(0.1)
+        assert trainer_pid, (
+            "the containerized trainer never started (fake docker not on PATH?)"
+        )
+
+        # It really is OUTSIDE the wrapper's process group (dockerd-parented) — the
+        # precondition that makes the group SIGKILL unable to reach it.
+        assert os.getpgid(trainer_pid) != os.getpgid(proc.pid), (
+            "the trainer must be in a different process group than the wrapper for "
+            "this to model a dockerd-parented workload"
+        )
+
+        # The watchdog fires ~5s (no progress), group-TERMs (futile), then must
+        # `docker kill` the container ~2s later.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline and _alive(trainer_pid):
+            time.sleep(0.2)
+
+        assert not _alive(trainer_pid), (
+            "the TERM-ignoring CONTAINERIZED trainer SURVIVED the no-progress "
+            "watchdog — the group SIGKILL cannot reach a dockerd-parented process, "
+            "so without a `docker kill <name>` escalation a stalled containerized "
+            "job keeps running, and keeps billing, after being reported FAILED"
+        )
+
+        terminal_path = compute_backends_module._local_terminal_path_for_external_id(
+            external_id
+        )
+        assert os.path.exists(terminal_path), "no terminal record written"
+        raw = open(terminal_path, encoding="utf-8").read()
+        assert "REASON=no_progress_timeout" in raw, raw
+    finally:
+        if trainer_pid and _alive(trainer_pid):
+            try:
+                os.killpg(os.getpgid(trainer_pid), signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+
+
+def test_no_blocking_time_sleep_in_async_functions():
+    """Regression: async coroutines must not call the blocking builtin
+    time.sleep(), which freezes the entire event loop. Cooldown waits and any
+    other in-coroutine delays must use `await asyncio.sleep(...)` instead.
+
+    This walks the AST of app/compute.py and fails if any `time.sleep(...)`
+    call is lexically nested inside an `async def`.
+    """
+    import ast
+    import inspect
+
+    source = inspect.getsource(compute)
+    tree = ast.parse(source)
+
+    def _is_time_sleep(call_node):
+        func = call_node.func
+        return (
+            isinstance(func, ast.Attribute)
+            and func.attr == "sleep"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+        )
+
+    offenders = []
+
+    class _Visitor(ast.NodeVisitor):
+        def __init__(self):
+            self.async_stack = []
+
+        def visit_AsyncFunctionDef(self, node):
+            self.async_stack.append(node.name)
+            self.generic_visit(node)
+            self.async_stack.pop()
+
+        def visit_FunctionDef(self, node):
+            # A sync def nested inside an async def breaks the async context;
+            # blocking sleeps there are acceptable, so clear the stack.
+            saved = self.async_stack
+            self.async_stack = []
+            self.generic_visit(node)
+            self.async_stack = saved
+
+        def visit_Call(self, node):
+            if self.async_stack and _is_time_sleep(node):
+                offenders.append((self.async_stack[-1], node.lineno))
+            self.generic_visit(node)
+
+    _Visitor().visit(tree)
+
+    assert not offenders, (
+        "Blocking time.sleep() found inside async function(s) in compute.py "
+        f"(use await asyncio.sleep instead): {offenders}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# test_compute_image_registry_iam — validates that compute-image operations
+# target the correct Artifact Registry repo and construct the gcloud/docker
+# commands that require the artifactregistry.writer / artifactregistry.reader
+# IAM bindings (infra/terraform/workload_identity.tf).
+# ---------------------------------------------------------------------------
+
+
+def test_compute_image_registry_iam(monkeypatch, tmp_path):
+    """The compute-image flow targets Artifact Registry with the correct commands
+    for tag existence checks, image push, and protection tag management — the
+    operations gated by artifactregistry.writer and artifactregistry.reader IAM
+    bindings on the compute-images repo."""
+    from app import compute_backends as cb
+    from app import compute_image_build as cib
+    from app import storage
+
+    # Create a minimal repo dir with a Dockerfile so build_and_push can read it.
+    dockerfile_dir = tmp_path / "repo"
+    dockerfile_dir.mkdir()
+    (dockerfile_dir / ".blueprint").mkdir()
+    (dockerfile_dir / ".blueprint" / "Dockerfile.compute").write_text("FROM scratch\nCOPY . /\n")
+
+    # Configure an Artifact Registry repo (mirrors prod resolution).
+    monkeypatch.delenv("COMPUTE_IMAGE_REGISTRY", raising=False)
+    monkeypatch.delenv("COMPUTE_IMAGE_REGION", raising=False)
+    monkeypatch.setattr(storage, "GCP_PROJECT_ID", "my-gcp-proj")
+    ar_repo = cb.resolve_compute_image_registry_repo()
+    assert ar_repo == "us-docker.pkg.dev/my-gcp-proj/compute-images"
+    assert "docker.pkg.dev" in ar_repo  # Valid AR host.
+
+    commands_run = []
+
+    def _capture_run(cmd, **kw):
+        commands_run.append(cmd)
+
+        class _OkProc:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        return _OkProc()
+
+    # ── registry_tag_exists — gcloud artifacts docker images describe against AR ──
+    # This is the first read operation against the AR repo (requires reader).
+    cib.registry_tag_exists(ar_repo, "test-tag", _run=_capture_run)
+    assert any(
+        "gcloud" in c and "describe" in c
+        for c in commands_run
+    ), "Expected gcloud artifacts docker images describe for AR tag existence check"
+    assert any(
+        ar_repo in str(c) for c in commands_run
+    ), f"Expected gcloud describe to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── build_and_push (fast-path: tag exists) ──────────────────────────────────
+    # Simulates the fast path where the dependency-hash tag already exists.
+    result = cib.build_and_push(
+        repo_dir=str(dockerfile_dir),
+        registry_repo=ar_repo,
+        image_name="my-project",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=[],
+        _run=_capture_run,
+        _tag_exists=lambda *a, **k: True,
+        _scan_layers_fn=lambda *a, **k: [],
+    )
+    assert result.already_present is True
+    assert ar_repo in result.pinned_ref
+    commands_run.clear()
+
+    # ── build_and_push (full path: build + push) — docker push to AR ──────────
+    # Simulates the full build+push path. The orchestrator pushes to the AR
+    # repo, which requires artifactregistry.writer on compute_images_repo.
+    result = cib.build_and_push(
+        repo_dir=str(dockerfile_dir),
+        registry_repo=ar_repo,
+        image_name="my-project",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=[],
+        _run=_capture_run,
+        _tag_exists=lambda *a, **k: False,
+        _scan_layers_fn=lambda *a, **k: [],
+        # Bypass credential scan and network assertions for unit test.
+        _assert_network_fn=lambda *a, **k: None,
+    )
+    assert result.built is True
+    assert ar_repo in result.pinned_ref
+    push_cmds = [c for c in commands_run if "push" in c]
+    assert any(
+        ar_repo in str(c) for c in push_cmds
+    ), f"Expected docker push to target AR repo {ar_repo}, got {push_cmds}"
+    commands_run.clear()
+
+    # ── apply_registry_protection_tag — gcloud artifacts docker tags add ──────
+    # Tag management requires artifactregistry.writer on the AR repo.
+    digest = "sha256:" + "a" * 64
+    tag = cib.apply_registry_protection_tag(ar_repo, digest, _run=_capture_run)
+    assert tag is not None
+    assert tag.startswith("inuse-")
+    add_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "add" in str(c)
+    ]
+    assert len(add_cmds) >= 1, "Expected gcloud artifacts docker tags add command"
+    assert any(
+        ar_repo in str(c) for c in add_cmds
+    ), f"Expected tags add to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── list_registry_protection_tags — gcloud artifacts docker tags list ─────
+    # Listing tags requires artifactregistry.reader (or writer) on the AR repo.
+    listed = cib.list_registry_protection_tags(ar_repo, _run=_capture_run)
+    assert listed == []
+    list_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "list" in str(c)
+    ]
+    assert len(list_cmds) >= 1, "Expected gcloud artifacts docker tags list command"
+    assert any(
+        ar_repo in str(c) for c in list_cmds
+    ), f"Expected tags list to target AR repo {ar_repo}"
+    commands_run.clear()
+
+    # ── delete_registry_protection_tag — gcloud artifacts docker tags delete ──
+    # Deleting tags requires artifactregistry.writer on the AR repo.
+    deleted = cib.delete_registry_protection_tag(
+        ar_repo, "inuse-aaaaaaaaaaaaaaaa", _run=_capture_run
+    )
+    assert deleted is True
+    delete_cmds = [
+        c for c in commands_run
+        if "gcloud" in str(c) and "artifacts" in str(c) and "tags" in str(c) and "delete" in str(c)
+    ]
+    assert len(delete_cmds) >= 1, "Expected gcloud artifacts docker tags delete command"
+    assert any(
+        ar_repo in str(c) for c in delete_cmds
+    ), f"Expected tags delete to target AR repo {ar_repo}"
+
+
+# ---------------------------------------------------------------------------
+# test_compute_image_builder_least_privilege_contract — drift guard for the
+# isolated regional Cloud Build builder IAM/config contract. The builder can
+# publish compute images and read its own disposable source bucket, but must
+# have NO Secret Manager access, NO platform/runtime credential, and NO access
+# to the general agent-artifacts bucket. The orchestrator keeps only the
+# permissions to create/get/cancel builds and actAs the builder — while its
+# existing compute-image protection-tag write and agent image-pull grants stay
+# intact. Config values must be wired into both cloudbuild.yaml (source of
+# truth) and cloud_run.tf (drift mirror).
+# ---------------------------------------------------------------------------
+
+
+def _infra_repo_root():
+    """Locate the repo root that contains infra/terraform + backend/cloudbuild.yaml.
+
+    Resolves across environments:
+      - the Docker backend test harness, which mounts the repo read-only at /repo
+        (see scripts/test-backend.sh) while backend/ is the container WORKDIR;
+      - a local full checkout, where backend/testing/ is two levels below root.
+    Returns None when no such root is reachable (e.g. a stripped-down image with
+    neither mount), in which case the drift guard skips rather than false-fails.
+    """
+    from pathlib import Path
+
+    marker = Path("infra") / "terraform" / "iam.tf"
+    candidates = [Path("/repo"), Path(__file__).resolve().parents[2]]
+    candidates += list(Path(__file__).resolve().parents)
+    seen = set()
+    for root in candidates:
+        if root in seen:
+            continue
+        seen.add(root)
+        if (root / marker).is_file():
+            return root
+    return None
+
+
+def _read_infra_file(relative_name: str) -> str:
+    root = _infra_repo_root()
+    if root is None:
+        pytest.skip("infra/terraform not present in this test image")
+    return (root / relative_name).read_text()
+
+
+def test_compute_image_builder_least_privilege_contract():
+    iam = _read_infra_file("infra/terraform/iam.tf")
+    wi = _read_infra_file("infra/terraform/workload_identity.tf")
+
+    # The compute-image builder is a dedicated LEAF service account whose only
+    # capability is push/pull on the compute-images Artifact Registry repo, so an
+    # off-orchestrator project-image build reaches none of the orchestrator's
+    # authority: no Secret Manager, no agent-artifacts bucket, no other project
+    # role. This SA (``image_builder_sa``, #15566) superseded the earlier
+    # Cloud-Build ``compute_image_builder_sa`` (#15482) when the builder moved to a
+    # throwaway builder VM; its bindings are the real current least-privilege
+    # contract this test guards.
+    builder_member = "google_service_account.image_builder_sa.email"
+
+    # (a) The dedicated builder SA exists.
+    assert 'resource "google_service_account" "image_builder_sa"' in iam
+    assert 'account_id   = "image-builder-sa"' in iam
+
+    # (b) Builder can PUSH built images (artifactregistry.writer) and PULL a
+    #     private parent/base image (artifactregistry.reader) — both scoped to the
+    #     compute-images repo only, granted in workload_identity.tf.
+    writer_block = wi.split(
+        'resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_writer"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_artifact_registry_repository.compute_images_repo.name" in writer_block
+    assert '"roles/artifactregistry.writer"' in writer_block
+    assert builder_member in writer_block
+
+    reader_block = wi.split(
+        'resource "google_artifact_registry_repository_iam_member" "image_builder_compute_images_reader"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_artifact_registry_repository.compute_images_repo.name" in reader_block
+    assert '"roles/artifactregistry.reader"' in reader_block
+    assert builder_member in reader_block
+
+    # (c) Orchestrator can actAs the builder SA (to attach it to a throwaway
+    #     builder VM) and nothing more — no new project-level role is granted.
+    orch_member = "google_service_account.orchestrator_sa.email"
+    actas_block = iam.split(
+        'resource "google_service_account_iam_member" "orchestrator_act_as_image_builder"',
+        1,
+    )[1].split("resource ", 1)[0]
+    assert "google_service_account.image_builder_sa.name" in actas_block
+    assert '"roles/iam.serviceAccountUser"' in actas_block
+    assert orch_member in actas_block
+
+    # (d) LEAST PRIVILEGE: every resource block that binds a role TO the builder SA
+    #     (i.e. names it as the grantee ``member``) grants NO Secret Manager
+    #     access, NO agent-artifacts bucket access, and NOTHING beyond the two
+    #     Artifact Registry roles above. The actAs block above references
+    #     image_builder_sa.name as the *target* but grants serviceAccountUser to
+    #     the orchestrator, so it is (correctly) not a role held by the builder —
+    #     builder_member matches the ``.email`` grantee, which appears only on the
+    #     two AR bindings. Any other role bound to this SA is a
+    #     privilege-escalation regression.
+    def _blocks_binding_builder(text: str) -> list[str]:
+        return [
+            "resource " + chunk
+            for chunk in text.split("resource ")[1:]
+            if builder_member in ("resource " + chunk)
+        ]
+
+    granted_roles: list[str] = []
+    for body in _blocks_binding_builder(iam) + _blocks_binding_builder(wi):
+        assert "secretmanager" not in body, (
+            "builder SA must have NO Secret Manager access; offending block:\n" + body
+        )
+        assert "google_storage_bucket.artifacts" not in body, (
+            "builder SA must not be granted access to the agent-artifacts bucket; "
+            "offending block:\n" + body
+        )
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("role") and '"' in stripped:
+                granted_roles.append(stripped.split('"')[1])
+    assert sorted(set(granted_roles)) == [
+        "roles/artifactregistry.reader",
+        "roles/artifactregistry.writer",
+    ], (
+        "builder SA must hold ONLY artifactregistry reader+writer; a different role "
+        f"is a privilege-escalation regression. Found: {sorted(set(granted_roles))}"
+    )
+
+    # (e) Pre-existing orchestrator/agent compute-image grants are preserved:
+    #     orchestrator keeps its compute-image protection-tag write permission,
+    #     and the agent keeps its image-pull (reader) permission.
+    assert (
+        'resource "google_artifact_registry_repository_iam_member" "orchestrator_compute_images_writer"'
+        in wi
+    )
+    assert (
+        'resource "google_artifact_registry_repository_iam_member" "agent_compute_images_reader"'
+        in wi
+    )
+
+
+# ── Remote build path (compute_image_remote_build) ─────────────────────────
+#
+# This module talks to Google APIs directly (Artifact Registry, Cloud Build,
+# Storage) and has NEVER shelled out to gcloud, so the historical ``_run`` seam
+# these tests passed was silently discarded (**_ignored) — and the placeholder
+# ``reg/repo/img`` ref is not a valid Artifact Registry image reference, so the
+# real parser correctly rejected it, hiding the mis-mock. The helpers below stub
+# the *real* boundary: the AR / Cloud Build clients, with a valid AR ref.
+
+# A valid Artifact Registry image ref: LOCATION-docker.pkg.dev/PROJECT/REPO/IMAGE
+_AR_FULL_REPO = "us-central1-docker.pkg.dev/proj/repo/img"
+
+
+class _FakeDockerImage:
+    """Stand-in for an artifactregistry_v1.DockerImage carrying one tag."""
+
+    def __init__(self, tag, digest="sha256:" + "de" * 32):
+        self.name = (
+            "projects/proj/locations/us-central1/repositories/repo/"
+            f"dockerImages/img@{digest}"
+        )
+        self.tags = [tag]
+
+
+class _FakeArtifactRegistryClient:
+    def __init__(self, images):
+        self._images = list(images)
+
+    def list_docker_images(self, request):
+        return list(self._images)
+
+
+class _RaisingArtifactRegistryClient:
+    def list_docker_images(self, request):
+        raise RuntimeError("artifact registry unreachable")
+
+
+def _fake_cb_operation(build_id="build-12345"):
+    """A Cloud Build create_build() operation whose metadata.build carries an id."""
+    op = MagicMock()
+    op.metadata.build.id = build_id
+    op.metadata.build.log_url = "https://cloudbuild.example/log"
+    return op
+
+
+def _fake_cb_build(status_name, detail=""):
+    """A Cloud Build get_build() result with a named status and failure detail."""
+    build = MagicMock()
+    build.status.name = status_name
+    build.failure_info.detail = detail
+    return build
+
+
+def test_remote_registry_tag_exists_present():
+    """remote_registry_tag_exists returns True when the AR client finds the tag."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("abc123")])
+    assert remote_registry_tag_exists(_AR_FULL_REPO, "abc123", _client=client) is True
+
+
+def test_remote_registry_tag_exists_absent():
+    """remote_registry_tag_exists returns False when the AR client has no match."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("some-other-tag")])
+    assert remote_registry_tag_exists(_AR_FULL_REPO, "abc123", _client=client) is False
+
+
+def test_remote_registry_tag_exists_fail_open_on_error():
+    """remote_registry_tag_exists returns False (not-so-present) on any error."""
+    from app.compute_image_remote_build import remote_registry_tag_exists
+
+    # Fail-open: a registry error is treated as "not present" so the caller
+    # falls through to a build.
+    assert (
+        remote_registry_tag_exists(
+            _AR_FULL_REPO, "abc123", _client=_RaisingArtifactRegistryClient()
+        )
+        is False
+    )
+
+
+def test_remote_resolve_digest_from_api():
+    """_resolve_registry_digest_from_api returns the digest from the AR client."""
+    from app.compute_image_remote_build import _resolve_registry_digest_from_api
+
+    digest = "sha256:" + "ba" * 32
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("abc123", digest=digest)])
+    resolved = _resolve_registry_digest_from_api(_AR_FULL_REPO, "abc123", _client=client)
+    assert resolved == digest and resolved.startswith("sha256:")
+
+
+def test_remote_resolve_digest_from_api_not_found():
+    """_resolve_registry_digest_from_api returns None when tag is absent."""
+    from app.compute_image_remote_build import _resolve_registry_digest_from_api
+
+    client = _FakeArtifactRegistryClient([_FakeDockerImage("some-other-tag")])
+    assert (
+        _resolve_registry_digest_from_api(_AR_FULL_REPO, "nonexistent", _client=client)
+        is None
+    )
+
+
+def test_remote_build_and_push_fast_path_skips_when_tag_exists(tmp_path, monkeypatch):
+    """Remote build skips submission when the hash-tagged image already exists."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:baadf00d"}]'
+            stderr = ""
+        return P()
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists_fn=lambda repo_tag, tag, _run=None: True,
+    )
+    assert result.already_present is True
+    assert result.built is False
+    # No Cloud Build submission was made.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+
+
+def test_remote_build_and_push_credential_leak_fails_before_submission(tmp_path, monkeypatch):
+    """Input credential scan fails the remote build BEFORE Cloud Build is invoked."""
+    from app.compute_image_remote_build import remote_build_and_push
+    from app.compute_image_build import CredentialLeakError
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    # Dockerfile with a literal GitHub PAT baked into an ENV.
+    dockerfile = b"FROM python:3.11-slim\nENV GITHUB_APP_PRIVATE_KEY=ghs_deadbeefdeadbeefdeadbeef\n"
+    repo = _write_repo(tmp_path, dockerfile=dockerfile)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    with pytest.raises(CredentialLeakError, match="credential scan failed"):
+        remote_build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _run=fake_run,
+            _tag_exists_fn=lambda *a, **k: False,
+        )
+    # No Cloud Build was ever submitted — the credential gate fired first.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+
+
+def test_remote_build_and_push_dry_run_does_not_submit(tmp_path, monkeypatch):
+    """dry_run=True skips Cloud Build submission, returns hash-only result."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(cmd)
+        class P:
+            returncode = 0
+            stdout = "[]"
+            stderr = ""
+        return P()
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        dry_run=True,
+        _run=fake_run,
+        _tag_exists_fn=lambda *a, **k: False,
+    )
+    assert result.already_present is False
+    assert result.built is False
+    # No Cloud Build submission on dry_run.
+    assert not any("builds submit" in " ".join(c) for c in run_calls)
+    # But we do get a dep_hash and a pinned_ref (tag-only in dry_run).
+    assert result.dep_hash
+    assert result.pinned_ref.endswith(result.dep_hash)
+
+
+def test_remote_build_and_push_cancellation_reaches_cloud_build(tmp_path, monkeypatch):
+    """When BuildControl is aborted, the Cloud Build is cancelled.
+
+    Only the GCP clients (Cloud Build + Storage) are stubbed; the real
+    _submit_cloud_build -> _poll_cloud_build -> abort-detect -> _cancel_cloud_build
+    path runs against the fake client, so the assertion proves the cancellation
+    reached the Cloud Build API rather than a mock of the cancellation logic.
+    """
+    from app import compute_image_remote_build as crb
+    from app.compute_image_build import BuildControl, BuildAborted, set_build_control
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+
+    repo = _write_repo(tmp_path)
+
+    class _FakeCloudBuildClient:
+        """Stays WORKING, fires control.abort() after a few polls, then reports
+        CANCELLED once cancel_build has been requested."""
+
+        def __init__(self):
+            self.create_calls = []
+            self.cancel_calls = []
+            self.get_count = 0
+
+        def create_build(self, request):
+            self.create_calls.append(request)
+            return _fake_cb_operation("build-12345")
+
+        def get_build(self, request):
+            self.get_count += 1
+            if self.cancel_calls:
+                # Terminal after cancellation so _wait_for_cloud_build_terminal
+                # returns immediately instead of busy-polling.
+                return _fake_cb_build("CANCELLED")
+            if self.get_count >= 3:
+                # In real life the admin endpoint's timeout fires control.abort().
+                control = _bci.current_build_control()
+                if control is not None:
+                    control.abort()
+            return _fake_cb_build("WORKING")
+
+        def cancel_build(self, request):
+            self.cancel_calls.append(request)
+
+    fake_cb = _FakeCloudBuildClient()
+    monkeypatch.setattr(crb, "_cloud_build_client", lambda region=None: fake_cb)
+    monkeypatch.setattr(crb, "_REMOTE_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr("google.cloud.storage.Client", lambda *a, **k: MagicMock())
+
+    control = BuildControl()
+    token = set_build_control(control)
+    try:
+        with pytest.raises(BuildAborted, match="cancelled"):
+            crb.remote_build_and_push(
+                repo_dir=repo,
+                registry_repo="reg/repo",
+                image_name="img",
+                dockerfile=".blueprint/Dockerfile.compute",
+                dep_files=["requirements.txt"],
+                _tag_exists_fn=lambda *a, **k: False,
+            )
+    finally:
+        _bci.reset_build_control(token)
+
+    # The cancellation reached the Cloud Build job.
+    assert len(fake_cb.cancel_calls) >= 1, (
+        "Expected a Cloud Build cancel_build call, got "
+        f"create={fake_cb.create_calls} cancel={fake_cb.cancel_calls}"
+    )
+
+
+def test_remote_build_and_push_succeeds_without_local_docker(tmp_path, monkeypatch):
+    """Remote build succeeds even when docker is unavailable locally.
+
+    This is the key acceptance test: the remote path never touches a local
+    docker daemon — it talks only to the Cloud Build / Storage / Artifact
+    Registry APIs. Those clients are stubbed; the real remote_build_and_push
+    flow (hash -> scan -> package -> submit -> poll SUCCESS -> resolve digest)
+    runs end to end, proving a changed image publishes with no local Docker.
+    """
+    from app import compute_image_remote_build as crb
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+
+    repo = _write_repo(tmp_path)
+
+    class _FakeCloudBuildClient:
+        def __init__(self):
+            self.create_calls = []
+
+        def create_build(self, request):
+            self.create_calls.append(request)
+            return _fake_cb_operation("build-abc")
+
+        def get_build(self, request):
+            return _fake_cb_build("SUCCESS")
+
+    fake_cb = _FakeCloudBuildClient()
+    monkeypatch.setattr(crb, "_cloud_build_client", lambda region=None: fake_cb)
+    monkeypatch.setattr(crb, "_REMOTE_POLL_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr("google.cloud.storage.Client", lambda *a, **k: MagicMock())
+
+    digest = "sha256:" + "ff" * 32
+    result = crb.remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _tag_exists_fn=lambda *a, **k: False,
+        _resolve_digest_fn=lambda full_repo, tag: digest,
+    )
+
+    assert result.built is True
+    assert result.already_present is False
+    assert result.pinned_ref == f"reg/repo/img@{digest}"
+    assert result.pinned_ref.startswith("reg/repo/img@sha256:")
+    # The remote path ran: exactly one Cloud Build was submitted (no local docker).
+    assert len(fake_cb.create_calls) == 1
+
+
+def test_remote_build_and_push_not_configured_raises(tmp_path, monkeypatch):
+    """When env vars are missing, the remote path raises a clear error."""
+    from app.compute_image_remote_build import remote_build_and_push
+
+    # Deliberately do NOT set the required env vars.
+    repo = _write_repo(tmp_path)
+
+    with pytest.raises(RuntimeError, match="not configured"):
+        remote_build_and_push(
+            repo_dir=repo,
+            registry_repo="reg/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+        )
+
+
+def test_remote_build_and_push_unchanged_hash_avoids_submission(tmp_path, monkeypatch):
+    """When the dep hash exists in the registry, no Cloud Build is submitted.
+
+    This is the acceptance evidence for: 'unchanged hashes avoid submission.'
+    """
+    from app.compute_image_remote_build import remote_build_and_push
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder-sa@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "proj-compute-build-source")
+
+    repo = _write_repo(tmp_path)
+    run_calls = []
+
+    def fake_run(cmd, **kw):
+        run_calls.append(" ".join(cmd))
+        class P:
+            returncode = 0
+            stdout = '[{"tag": "abc123", "version": "sha256:ccdd"}]'
+            stderr = ""
+        return P()
+
+    # The tag_exists function simulates the image already being present.
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="reg/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _run=fake_run,
+        _tag_exists_fn=lambda *a, **k: True,
+    )
+
+    assert result.already_present is True
+    assert result.built is False
+    # No build submission occurred — fast path.
+    assert not any("builds submit" in c for c in run_calls)

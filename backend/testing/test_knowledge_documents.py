@@ -2434,8 +2434,11 @@ async def test_knowledge_index_entry_shape(db_session):
         "unavailable_cause",
         "criterion_met",
         "criterion",
+        "criterion_unmeasured_reason",
+        "evidence_tier",
         "per_arm_verdicts",
         "origin_provenance",
+        "run_provenance",
         "sweep_id",
         "arm_label",
         "lifecycle_status",
@@ -5904,3 +5907,435 @@ async def test_strategic_context_evidence_orders_by_oldest_pending_first(db_sess
     assert returned_titles == titles[:4], (
         f"expected oldest 4 docs {titles[:4]}, got {returned_titles}"
     )
+
+
+# ── knowledge commission dedup guards ────────────────────────────────────────
+# Tests for knowledge_doc_recently_produced and knowledge_task_in_flight in
+# app/knowledge_query.py.  These guards prevent redundant web_research/design
+# commissions from _handle_research_completion when the same direction+topic
+# knowledge has recently been produced or is already in flight.
+
+
+async def _make_project_and_task(
+    db_session,
+    *,
+    project_name="KGUARD",
+    task_type="web_research",
+    topic=None,
+    direction_id=None,
+    status=TaskStatus.COMPLETED,
+):
+    """Minimal project + task for guard tests."""
+    project = make_project(name=project_name)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    payload = {"type": task_type, "base_branch": "main"}
+    if topic is not None:
+        payload["topic"] = topic
+    if direction_id is not None:
+        payload["direction_id"] = direction_id
+
+    task = make_task(
+        project_id=project.id,
+        title=f"{task_type}: {topic or 'X'}",
+        status=status,
+        payloads=[payload],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+async def _make_knowledge_doc_for_guard(
+    db_session,
+    project_id,
+    source_task_id,
+    *,
+    topic="some-topic",
+    direction_id=None,
+    source_kind="web_research",
+    age_hours=0,
+):
+    """Insert a KnowledgeDocument for guard tests with controllable age/direction."""
+    from datetime import timedelta
+
+    created_at = _utcnow_func() - timedelta(hours=age_hours)
+    doc = KnowledgeDocument(
+        project_id=project_id,
+        source_task_id=source_task_id,
+        title=f"Doc on {topic}",
+        summary="Summary.",
+        body="Body.",
+        topic=topic,
+        direction_id=direction_id,
+        source_kind=source_kind,
+        tags=[],
+        source_citations=[],
+        forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    db_session.add(doc)
+    await db_session.commit()
+    await db_session.refresh(doc)
+    return doc
+
+
+# ── knowledge_doc_recently_produced ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_recent_same_direction_topic_returns_true(db_session):
+    """knowledge_doc_recently_produced → True when doc for same direction+topic exists within cooldown."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocHit", topic="auth-flow", direction_id="d-001"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="auth-flow", direction_id="d-001", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-001", "auth-flow"
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_different_direction_returns_false(db_session):
+    """knowledge_doc_recently_produced → False when direction differs (no cross-direction false positive)."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocDirMiss", topic="auth-flow", direction_id="d-001"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="auth-flow", direction_id="d-001", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-DIFFERENT", "auth-flow"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_different_topic_returns_false(db_session):
+    """knowledge_doc_recently_produced → False when topic differs (no same-direction false positive)."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocTopicMiss", topic="auth-flow", direction_id="d-001"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="auth-flow", direction_id="d-001", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-001", "totally-different-topic"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_outside_cooldown_returns_false(db_session):
+    """knowledge_doc_recently_produced → False when doc is older than the cooldown window."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocOld", topic="caching", direction_id="d-002"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="caching", direction_id="d-002",
+        age_hours=50  # older than 48h default cooldown
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-002", "caching"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_absent_direction_id_returns_false(db_session):
+    """knowledge_doc_recently_produced → False when direction_id is None (no reliable dedup basis)."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocNoDirID", topic="caching", direction_id="d-003"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="caching", direction_id="d-003", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, None, "caching"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_absent_topic_returns_false(db_session):
+    """knowledge_doc_recently_produced → False when topic is None (no reliable dedup basis)."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocNoTopic", topic="caching", direction_id="d-003"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="caching", direction_id="d-003", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-003", None
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_zero_cooldown_disables_guard(db_session):
+    """knowledge_doc_recently_produced → False when cooldown_hours=0 (guard disabled by operator)."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocZeroCooldown", topic="routing", direction_id="d-004"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="routing", direction_id="d-004", age_hours=1
+    )
+
+    result = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-004", "routing", cooldown_hours=0
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_doc_custom_cooldown_hours(db_session):
+    """knowledge_doc_recently_produced respects a custom cooldown_hours parameter."""
+    from app.knowledge_query import knowledge_doc_recently_produced
+
+    project, task = await _make_project_and_task(
+        db_session, project_name="KGdocCustomCooldown", topic="routing", direction_id="d-005"
+    )
+    await _make_knowledge_doc_for_guard(
+        db_session, project.id, task.id, topic="routing", direction_id="d-005",
+        age_hours=6  # 6 hours old
+    )
+
+    # With 4h cooldown: doc is outside window → False
+    result_outside = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-005", "routing", cooldown_hours=4
+    )
+    assert result_outside is False
+
+    # With 24h cooldown: doc is inside window → True
+    result_inside = await knowledge_doc_recently_produced(
+        db_session, project.id, "d-005", "routing", cooldown_hours=24
+    )
+    assert result_inside is True
+
+
+# ── knowledge_task_in_flight ──────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_active_task_same_direction_topic_returns_true(db_session):
+    """knowledge_task_in_flight → True when an IN_PROGRESS task for same direction+topic exists."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflight",
+        task_type="web_research",
+        topic="perf-baseline",
+        direction_id="d-inf-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-inf-001", "perf-baseline"
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_queued_task_returns_true(db_session):
+    """knowledge_task_in_flight → True when a QUEUED task for same direction+topic exists."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightQ",
+        task_type="web_research",
+        topic="perf-baseline",
+        direction_id="d-inf-002",
+        status=TaskStatus.QUEUED,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-inf-002", "perf-baseline"
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_different_direction_returns_false(db_session):
+    """knowledge_task_in_flight → False when direction differs (no cross-direction false positive)."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightDirMiss",
+        task_type="web_research",
+        topic="perf-baseline",
+        direction_id="d-inf-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-DIFFERENT", "perf-baseline"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_different_topic_returns_false(db_session):
+    """knowledge_task_in_flight → False when topic differs (distinct topics are not deduplicated)."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightTopicMiss",
+        task_type="web_research",
+        topic="perf-baseline",
+        direction_id="d-inf-001",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-inf-001", "completely-different-topic"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_completed_task_not_in_flight(db_session):
+    """knowledge_task_in_flight → False for COMPLETED tasks (only active tasks count)."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightDone",
+        task_type="web_research",
+        topic="completed-research",
+        direction_id="d-inf-003",
+        status=TaskStatus.COMPLETED,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-inf-003", "completed-research"
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_absent_direction_id_returns_false(db_session):
+    """knowledge_task_in_flight → False when direction_id is None."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightNoDirID",
+        task_type="web_research",
+        topic="auth",
+        direction_id="d-inf-004",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(db_session, project.id, None, "auth")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_absent_topic_returns_false(db_session):
+    """knowledge_task_in_flight → False when topic is None."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightNoTopic",
+        task_type="web_research",
+        topic="auth",
+        direction_id="d-inf-004",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(db_session, project.id, "d-inf-004", None)
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_kguard_inflight_design_task_detected(db_session):
+    """knowledge_task_in_flight → True for an active design task (not just web_research)."""
+    from app.knowledge_query import knowledge_task_in_flight
+
+    project, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGinflightDesign",
+        task_type="design",
+        topic="api-design",
+        direction_id="d-inf-005",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    result = await knowledge_task_in_flight(
+        db_session, project.id, "d-inf-005", "api-design"
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_kguard_distinct_topics_same_direction_not_deduplicated(db_session):
+    """Two distinct topics under the same direction are NOT deduplicated against each other."""
+    from app.knowledge_query import knowledge_task_in_flight, knowledge_doc_recently_produced
+
+    # Create in-flight task for topic-A in direction d-006
+    project_a, _ = await _make_project_and_task(
+        db_session,
+        project_name="KGdistinctTopics",
+        task_type="web_research",
+        topic="topic-alpha",
+        direction_id="d-006",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    # topic-beta under same direction should NOT be blocked
+    result = await knowledge_task_in_flight(
+        db_session, project_a.id, "d-006", "topic-beta"
+    )
+    assert result is False, "Distinct topics must not be deduplicated against each other"
+
+    # Also verify the doc guard doesn't cross topics
+    task2 = make_task(
+        project_id=project_a.id,
+        title="WR: topic-alpha completed",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "web_research", "topic": "topic-alpha", "base_branch": "main"}],
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+    await _make_knowledge_doc_for_guard(
+        db_session, project_a.id, task2.id,
+        topic="topic-alpha", direction_id="d-006", age_hours=1
+    )
+
+    doc_result = await knowledge_doc_recently_produced(
+        db_session, project_a.id, "d-006", "topic-beta"
+    )
+    assert doc_result is False, "Recent doc for topic-alpha must not block commission for topic-beta"

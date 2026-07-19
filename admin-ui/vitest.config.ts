@@ -11,6 +11,18 @@ export default defineConfig({
     // the separate browser-mode viewport suite), so the no-layout DOM is
     // equivalent for these tests.
     environment: 'happy-dom',
+    environmentOptions: {
+      happyDOM: {
+        settings: {
+          // Unit tests assert iframe URLs but do not run an HTTP server. Happy
+          // DOM otherwise navigates every appended iframe and can leave the
+          // suite waiting on Vitest's localhost:3000 environment URL. Real
+          // iframe loading remains covered by the separate browser viewport
+          // configurations.
+          disableIframePageLoading: true,
+        },
+      },
+    },
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
     include: ['src/**/*.test.{ts,tsx}', 'eslint-rules/**/*.test.{js,ts}'],

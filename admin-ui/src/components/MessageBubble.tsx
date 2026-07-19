@@ -1,4 +1,4 @@
-import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy, FileText } from 'lucide-react';
+import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy } from 'lucide-react';
 import { useState, useCallback, memo } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
@@ -7,6 +7,8 @@ import type { CitationState, MessageAttachment, ProjectMessage, ProjectMessageCo
 import { buildMessageStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
 import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 import { AttachmentPreviewModal } from './AttachmentPreviewModal';
+import { MessageAttachments } from './MessageAttachments';
+import { invalidateMessageAttachmentDownloadUrl } from '../strategicStateApi';
 
 export type { ProjectMessage, ProjectMessageContext } from '../types/messages';
 
@@ -122,49 +124,6 @@ const CITATION_BADGE_CONFIG: Record<CitationState, { label: string; container: s
   },
 };
 
-function AttachmentThumbnails({ attachments, onPreview }: { attachments: MessageAttachment[]; onPreview: (att: MessageAttachment) => void }) {
-  if (!attachments.length) return null;
-  return (
-    <div className="mt-2 flex flex-wrap gap-2">
-      {attachments.map((att, i) => {
-        if (att.mime_type?.startsWith('image/') && att.data) {
-          return (
-            <button
-              key={i}
-              type="button"
-              onClick={() => onPreview(att)}
-              className="cursor-pointer border-0 bg-transparent p-0 leading-none"
-              aria-label={`Preview ${att.name || 'image'}`}
-              data-viewport-allow-small-target
-            >
-              <img
-                src={`data:${att.mime_type};base64,${att.data}`}
-                alt={att.name || 'Image attachment'}
-                className="max-h-48 max-w-full rounded border border-neutral-700/60 object-contain"
-              />
-            </button>
-          );
-        }
-        return (
-          <button
-            key={i}
-            type="button"
-            onClick={() => onPreview(att)}
-            className="inline-flex cursor-pointer items-center gap-1.5 rounded border border-neutral-700/60 bg-neutral-800/40 px-2.5 py-1.5 text-xs text-neutral-300 hover:border-neutral-500/60 transition-colors"
-            aria-label={`Preview ${att.name || att.mime_type || 'File'}`}
-          >
-            <FileText className="h-3.5 w-3.5 shrink-0 text-neutral-500" />
-            <span className="max-w-[200px] truncate">{att.name || att.mime_type || 'File'}</span>
-            {att.size_bytes != null && (
-              <span className="text-neutral-500 shrink-0">({att.size_bytes < 1024 ? '<1' : (att.size_bytes / 1024).toFixed(0)} KB)</span>
-            )}
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
 function StaleCitationBadge({ msg }: { msg: ProjectMessage }) {
   if (msg.message_type !== 'BUG_REPORT' && msg.message_type !== 'BLOCKER') return null;
   const warnings = getProvenanceWarnings(msg.context);
@@ -238,7 +197,7 @@ export interface MessageBubbleProps {
   msg: ProjectMessage;
   faded?: boolean;
   readOnly?: boolean;
-  allMessages?: ProjectMessage[];
+  replyTarget?: ProjectMessage | null;
   presentation?: 'triage' | 'chat';
   highlighted?: boolean;
   actionMode?: 'full' | 'reply-only' | 'none';
@@ -263,13 +222,14 @@ export interface MessageBubbleProps {
   onCancelInvestigate: () => void;
   onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
   onOpenStrategicContext?: () => void;
+  currentActorUserId?: string | null;
 }
 
 export const MessageBubble = memo(function MessageBubble({
   msg,
   faded = false,
   readOnly = false,
-  allMessages = [],
+  replyTarget = null,
   presentation = 'triage',
   highlighted = false,
   actionMode = 'full',
@@ -294,8 +254,10 @@ export const MessageBubble = memo(function MessageBubble({
   onCancelInvestigate,
   onReply,
   onOpenStrategicContext,
+  currentActorUserId,
 }: MessageBubbleProps) {
   const [previewAttachment, setPreviewAttachment] = useState<MessageAttachment | null>(null);
+  const [attachmentResolutionVersion, setAttachmentResolutionVersion] = useState(0);
   const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
   const Icon = config.icon;
   const userMsg = isUserMessage(msg);
@@ -305,23 +267,29 @@ export const MessageBubble = memo(function MessageBubble({
   const replyableChatAuthor = fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist';
   const canChatReply = chatMode && replyableChatAuthor && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
   const isResolving = resolvingId === msg.id;
+  // Only genuinely-actionable rows (the derived needs-action set: QUESTION / BLOCKER)
+  // keep a manual resolve affordance. Conversational NOTE/FEEDBACK/BUG_REPORT/reply
+  // rows are transcript and carry no open/resolved obligation, so the manual resolve
+  // control is noise there — the reaper sweeps auto-resolve linked/stale items server-side.
+  const isActionable = msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER';
   const taskId = msg.from_task_id;
   const strategicContextReceipt = chatMode && userMsg
     ? buildMessageStrategicContextDescriptor(msg.context)
     : null;
-
-  let replyContextMsg: ProjectMessage | null = null;
-  let replyContextType: 'feedback' | 'question' | null = null;
-  if (msg.message_type === 'NOTE' &&
-      typeof msg.context.reply_to === 'string') {
-    if (msg.context.event_type === 'feedback_acknowledgment') {
-      replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
-      replyContextType = replyContextMsg ? 'feedback' : null;
-    } else if (msg.context.event_type === 'question_answer') {
-      replyContextMsg = allMessages.find(m => m.id === msg.context.reply_to) || null;
-      replyContextType = replyContextMsg ? 'question' : null;
-    }
-  }
+  const actorLabel = userMsg && msg.actor_user_id
+    ? (msg.actor_user_id === currentActorUserId ? 'You' : `Operator ${msg.actor_user_id.slice(0, 8)}`)
+    : null;
+  const structuredReplyPreview = msg.context.reply_preview && typeof msg.context.reply_preview === 'object'
+    ? msg.context.reply_preview
+    : null;
+  const replyPreviewText = typeof msg.context.reply_preview === 'string'
+    ? msg.context.reply_preview
+    : structuredReplyPreview?.content ?? replyTarget?.content ?? null;
+  const legacyReplyLabel = msg.context.event_type === 'question_answer'
+    ? 'Answering your question:'
+    : msg.context.event_type === 'feedback_acknowledgment'
+      ? 'In reply to your feedback:'
+      : null;
 
   return (
     <>
@@ -337,6 +305,13 @@ export const MessageBubble = memo(function MessageBubble({
             : 'w-full max-w-[92%] md:max-w-[76%]'
           : 'max-w-[85%] md:max-w-[70%]'
       } ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
+        {chatMode && actorLabel && (
+          <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
+            <span className="font-medium text-neutral-400">{actorLabel}</span>
+            <span aria-hidden="true">·</span>
+            <span>{formatAge(msg.created_at)}</span>
+          </div>
+        )}
         {chatMode && !userMsg && (
           <div className="relative mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
             <span className="font-medium text-neutral-400">{formatChatFromType(msg)}</span>
@@ -396,19 +371,11 @@ export const MessageBubble = memo(function MessageBubble({
             {actionMode === 'full' && <CopyableMessageRef msgId={msg.id} />}
           </div>
           )}
-          {/* Reply context for feedback acknowledgment and question answer */}
-          {replyContextMsg && (
+          {/* One canonical reply quote for durable and legacy reply projections. */}
+          {replyPreviewText && (
             <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
-              <p className="text-ui-md text-neutral-500 mb-0.5">
-                {replyContextType === 'question' ? 'Answering your question:' : 'In reply to your feedback:'}
-              </p>
-              <p className="text-ui-md text-neutral-400 truncate">{replyContextMsg.content}</p>
-            </div>
-          )}
-          {/* Reply quote (if this message is a reply) */}
-          {typeof msg.context.reply_preview === 'string' && (
-            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
-              <p className="text-ui-md text-neutral-500 truncate">{msg.context.reply_preview}</p>
+              {legacyReplyLabel && <p className="text-ui-md text-neutral-500 mb-0.5">{legacyReplyLabel}</p>}
+              <p className="text-ui-md text-neutral-500 truncate">{replyPreviewText}</p>
             </div>
           )}
           {/* Content */}
@@ -422,7 +389,13 @@ export const MessageBubble = memo(function MessageBubble({
             </div>
           )}
           {msg.context.attachments && Array.isArray(msg.context.attachments) && msg.context.attachments.length > 0 && (
-            <AttachmentThumbnails attachments={msg.context.attachments} onPreview={setPreviewAttachment} />
+            <MessageAttachments
+              attachments={msg.context.attachments}
+              onPreview={setPreviewAttachment}
+              projectId={msg.project_id}
+              messageId={msg.id}
+              resolutionVersion={attachmentResolutionVersion}
+            />
           )}
           {showOpsChrome && <StaleCitationBadge msg={msg} />}
           {/* Context badges */}
@@ -478,7 +451,7 @@ export const MessageBubble = memo(function MessageBubble({
             {selectMode && actionMode === 'full' && msg.message_type === 'FEEDBACK' && (
               <button
                 onClick={() => onToggleSelect(msg.id)}
-                className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${
+                className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center ${
                   selectedIds.has(msg.id) ? 'text-purple-400 bg-purple-500/20' : 'text-neutral-600 hover:text-neutral-400'
                 }`}
               >
@@ -488,7 +461,7 @@ export const MessageBubble = memo(function MessageBubble({
             <button
               onClick={() => onReply({ id: msg.id, content: msg.content, from: formatFromType(msg), message_type: msg.message_type, status: msg.status })}
               title="Reply"
-              className="text-neutral-600 hover:text-blue-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+              className="text-neutral-600 hover:text-blue-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
             >
               <Reply className="w-3.5 h-3.5" />
             </button>
@@ -497,7 +470,7 @@ export const MessageBubble = memo(function MessageBubble({
                 onClick={() => onCreateDirection(msg)}
                 disabled={creatingDirectionIds.has(msg.id)}
                 title="Create Direction"
-                className="text-purple-500/70 hover:text-purple-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                className="text-purple-500/70 hover:text-purple-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
               >
                 <PlusCircle className="w-3.5 h-3.5" />
               </button>
@@ -507,7 +480,7 @@ export const MessageBubble = memo(function MessageBubble({
                 onClick={() => onStartInvestigate(msg.id)}
                 disabled={investigatingIds.has(msg.id)}
                 title="Investigate"
-                className="text-amber-500/70 hover:text-amber-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                className="text-amber-500/70 hover:text-amber-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
               >
                 <AlertTriangle className="w-3.5 h-3.5" />
               </button>
@@ -518,25 +491,25 @@ export const MessageBubble = memo(function MessageBubble({
                 <button
                   onClick={() => onCreateInvestigation(msg)}
                   disabled={investigatingIds.has(msg.id)}
-                  className="text-amber-400 hover:text-amber-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  className="text-amber-400 hover:text-amber-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
                   title="Confirm investigation"
                 >
                   <Check className="w-3 h-3" />
                 </button>
                 <button
                   onClick={onCancelInvestigate}
-                  className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
                   title="Cancel"
                 >
                   <X className="w-3 h-3" />
                 </button>
               </div>
             )}
-            {actionMode === 'full' && (!isResolving ? (
+            {actionMode === 'full' && isActionable && (!isResolving ? (
               <button
                 onClick={() => onStartResolve(msg.id)}
                 title="Resolve"
-                className="text-emerald-500/70 hover:text-emerald-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                className="text-emerald-500/70 hover:text-emerald-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
               >
                 <Check className="w-3.5 h-3.5" />
               </button>
@@ -554,14 +527,14 @@ export const MessageBubble = memo(function MessageBubble({
                 <button
                   onClick={() => onResolve(msg.id, resolveInput)}
                   disabled={msg.message_type === 'QUESTION' && !resolveInput.trim()}
-                  className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  className="text-emerald-400 hover:text-emerald-300 p-1 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
                   title="Confirm resolve"
                 >
                   <Check className="w-3 h-3" />
                 </button>
                 <button
                   onClick={onCancelResolve}
-                  className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                  className="text-neutral-500 hover:text-neutral-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center"
                   title="Cancel"
                 >
                   <X className="w-3 h-3" />
@@ -573,7 +546,7 @@ export const MessageBubble = memo(function MessageBubble({
               onClick={() => onDelete(msg.id)}
               disabled={deletingIds.has(msg.id)}
               title="Delete"
-              className="text-neutral-600 hover:text-red-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+              className="text-neutral-600 hover:text-red-400 p-2.5 md:p-1.5 rounded transition-colors disabled:opacity-30 min-h-[44px] min-w-[44px] flex items-center justify-center"
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
@@ -587,6 +560,13 @@ export const MessageBubble = memo(function MessageBubble({
         attachment={previewAttachment}
         open={true}
         onClose={() => setPreviewAttachment(null)}
+        onPreviewError={() => {
+          if (previewAttachment.attachment_id && !msg.id.startsWith('optimistic:')) {
+            invalidateMessageAttachmentDownloadUrl(msg.project_id, msg.id, previewAttachment.attachment_id);
+          }
+          setAttachmentResolutionVersion(version => version + 1);
+          setPreviewAttachment(null);
+        }}
       />
     )}
     </>

@@ -93,6 +93,7 @@ from app.artifact_prerequisites import (
     stamp_artifact_logical_key,
 )
 from app.landed_signal import merge_verification_status as _merge_verification_status
+from app.acceptance_gate import check_required_diff_paths
 from app.acceptance_gate import record_artifact_consumptions_for_task
 from app.acceptance_gate import stamp_changed_files_signal
 from app.time_utils import _utcnow, exponential_backoff, set_retry_after
@@ -1591,6 +1592,33 @@ async def update_agent_status(
         # cannot flip RATE_LIMIT→CODE_ERROR once the cooldown lifts.
         ctx["failure_class"] = normalized_failure_category
         task.context = ctx
+
+        # Self-heal the stale-``repo_is_empty=False`` wedge. When the agent's
+        # clone-delivery guard reports ``clone_failed`` because the DURABLE
+        # signal says the repo is NOT empty but the cloned tree is empty, a
+        # genuinely empty/near-empty repo can never self-correct — every task
+        # dies clone_failed forever. On that specific disagreement signature
+        # (NOT ordinary transient clone failures), re-verify the durable signal
+        # against GitHub and flip it only when fresh detection authoritatively
+        # confirms the repo is empty. Best-effort: never raises, and preserves
+        # fail-loud for a real clone shortfall (a repo with content leaves the
+        # stored signal untouched, so the next task still fails loud).
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        _raw_fc = payload.failure_category.strip().lower()
+        _disagreement_text = "\n".join(
+            t for t in (payload.logs, task.latest_status_message) if t
+        )
+        if _raw_fc == "clone_failed" and is_clone_delivery_disagreement(
+            _disagreement_text
+        ):
+            from app.build_config_detection import (
+                maybe_correct_stale_repo_empty_signal,
+            )
+
+            _heal_project = await session.get(Project, task.project_id)
+            if _heal_project is not None:
+                await maybe_correct_stale_repo_empty_signal(_heal_project, session)
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
         ctx["scope_gate_triggered"] = payload.scope_gate_triggered
@@ -1688,6 +1716,24 @@ async def update_agent_status(
             task, session, payload.consumed_artifact_ids, modern_agent=True
         )
     session.add(task)
+
+    # Enforce required_diff_paths contract — fail-closed when declared, for ALL
+    # COMPLETED submissions regardless of artifact_type (PR, commit, or none).
+    if payload.status == TaskStatus.COMPLETED:
+        _missing_paths = check_required_diff_paths(
+            task, payload.changed_files or []
+        )
+        if _missing_paths:
+            _missing_list = ", ".join(repr(p) for p in _missing_paths)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"PR diff is missing required path(s): {_missing_list}. "
+                    "The task payload declared required_diff_paths that must "
+                    "all appear in the PR diff. Ensure the PR touches every "
+                    "declared path before marking the task complete."
+                ),
+            )
 
     # 3. Create Artifact if provided (with duplicate prevention for PR artifacts).
     # Audit 2026-04-25 A14: pre-check is non-locking — two concurrent status POSTs

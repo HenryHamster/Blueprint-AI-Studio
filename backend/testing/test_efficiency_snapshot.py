@@ -4318,8 +4318,10 @@ async def _payoff_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_cost_regression_fires_warning(db_session, mocker):
-    """A transition to COST_REGRESSION fires one WARNING carrying the numbers."""
+async def test_payoff_cost_regression_is_suppressed_from_operator_alerts(
+    db_session, mocker
+):
+    """COST_REGRESSION stays strategist-internal and creates no operator alert."""
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
@@ -4339,24 +4341,13 @@ async def test_payoff_transition_cost_regression_fires_warning(db_session, mocke
     await db_session.refresh(project)
 
     fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
-    assert fired == POOL_PAYOFF_COST_REGRESSION
+    assert fired is None
+    assert await _payoff_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
 
-    alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
-    assert "COST_REGRESSION" in alerts[0].title
-    # Supporting numbers must be embedded so the operator can act from the alert.
-    assert "20.00%" in alerts[0].message  # idle-inclusive cost drift
-    assert "0.4" in alerts[0].message  # pool hit rate
-    assert "8 warm starts" in alerts[0].message
-    bcast.assert_awaited()
-
-    # The marker advanced so a repeat tick is deduped (see next test's path).
+    # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert (
-        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_PAYOFF_KEY]
-        == POOL_PAYOFF_COST_REGRESSION
-    )
+    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
@@ -4393,8 +4384,10 @@ async def test_payoff_transition_does_not_advance_marker_without_alert(
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
-    """A second tick at the same verdict does not fire a second alert."""
+async def test_payoff_internal_verdict_remains_suppressed_across_ticks(
+    db_session, mocker
+):
+    """Repeated strategist-internal verdicts remain suppressed and unmarked."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
         build_config=_warm_pool_alert_build_config(),
@@ -4419,10 +4412,11 @@ async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
 
     first = await maybe_alert_pool_payoff_transition(db_session, project_id)
     second = await maybe_alert_pool_payoff_transition(db_session, project_id)
-    assert first == POOL_PAYOFF_COST_REGRESSION
-    assert second is None  # deduped on the persisted marker
-    alerts = await _payoff_alerts(db_session, project_id)
-    assert len(alerts) == 1
+    assert first is None
+    assert second is None
+    assert await _payoff_alerts(db_session, project_id) == []
+    await db_session.refresh(project)
+    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
@@ -4614,8 +4608,8 @@ async def _routing_alerts(db_session, project_id):
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_adopt_fires_warning(db_session, mocker):
-    """A transition to ADOPT fires one WARNING carrying the supporting numbers."""
+async def test_routing_adopt_is_suppressed_from_operator_alerts(db_session, mocker):
+    """ADOPT stays strategist-internal and creates no operator alert."""
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
@@ -4627,28 +4621,21 @@ async def test_routing_verdict_adopt_fires_warning(db_session, mocker):
     await db_session.refresh(project)
 
     fired = await maybe_alert_provider_routing_transition(db_session, project.id)
-    assert fired == PROVIDER_ROUTING_ADOPT
+    assert fired is None
+    assert await _routing_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
 
-    alerts = await _routing_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.WARNING
-    assert "ADOPT" in alerts[0].title
-    assert "0.50" in alerts[0].message  # cost ratio
-    assert "Adopt DeepSeek" in alerts[0].message
-    bcast.assert_awaited()
-
-    # The marker advanced so a repeat tick is deduped.
+    # Suppression must not advance the durable operator-alert marker.
     await db_session.refresh(project)
-    assert (
-        project.design_doc[DESIGN_DOC_KEY][LAST_ALERTED_ROUTING_KEY]
-        == PROVIDER_ROUTING_ADOPT
-    )
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_reject_fires_warning(db_session, mocker):
-    """A transition to REJECT fires one WARNING."""
-    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+async def test_routing_reject_is_suppressed_from_operator_alerts(db_session, mocker):
+    """REJECT stays strategist-internal and creates no operator alert."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
     project = make_project(
         design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_REJECT),
     )
@@ -4657,16 +4644,18 @@ async def test_routing_verdict_reject_fires_warning(db_session, mocker):
     await db_session.refresh(project)
 
     fired = await maybe_alert_provider_routing_transition(db_session, project.id)
-    assert fired == PROVIDER_ROUTING_REJECT
-
-    alerts = await _routing_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert "REJECT" in alerts[0].title
+    assert fired is None
+    assert await _routing_alerts(db_session, project.id) == []
+    bcast.assert_not_awaited()
+    await db_session.refresh(project)
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
-async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
-    """A second tick at the same verdict does not fire a second alert."""
+async def test_routing_internal_verdict_remains_suppressed_across_ticks(
+    db_session, mocker
+):
+    """Repeated strategist-internal verdicts remain suppressed and unmarked."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
         design_doc=_routing_design_doc(verdict_state=PROVIDER_ROUTING_ADOPT),
@@ -4681,10 +4670,11 @@ async def test_routing_verdict_dedups_same_verdict(db_session, mocker):
 
     first = await maybe_alert_provider_routing_transition(db_session, project_id)
     second = await maybe_alert_provider_routing_transition(db_session, project_id)
-    assert first == PROVIDER_ROUTING_ADOPT
-    assert second is None  # deduped on the persisted marker
-    alerts = await _routing_alerts(db_session, project_id)
-    assert len(alerts) == 1
+    assert first is None
+    assert second is None
+    assert await _routing_alerts(db_session, project_id) == []
+    await db_session.refresh(project)
+    assert LAST_ALERTED_ROUTING_KEY not in project.design_doc[DESIGN_DOC_KEY]
 
 
 @pytest.mark.asyncio
@@ -12330,3 +12320,152 @@ def test_acceptance_proof_rate_axes_registered():
     assert AXIS_ACCEPTANCE_SATISFIED_RATE in ALL_AXES
     assert AXIS_ACCEPTANCE_SATISFIED_RATE == "acceptance_satisfied_rate"
     assert AXIS_ACCEPTANCE_SATISFIED_RATE in AXIS_CONSUMERS
+
+
+# ---------------------------------------------------------------------------
+# Tests for fix(metrics): remove silent VM-cost sampling
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_exposes_cohort_coverage(db_session):
+    """compute_current_axes must include cohort_task_count (int) and cohort_capped (bool)."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(_make_efficient_task(project.id))
+    db_session.add(_make_efficient_task(project.id, vm_warm_start=True))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert "cohort_task_count" in axes, "compute_current_axes must include cohort_task_count"
+    assert "cohort_capped" in axes, "compute_current_axes must include cohort_capped"
+    assert isinstance(axes["cohort_task_count"], int), (
+        f"cohort_task_count must be int, got {type(axes['cohort_task_count'])}"
+    )
+    assert isinstance(axes["cohort_capped"], bool), (
+        f"cohort_capped must be bool, got {type(axes['cohort_capped'])}"
+    )
+    # With only 2 tasks in the window, the cap is not reached.
+    assert axes["cohort_task_count"] == 2
+    assert axes["cohort_capped"] is False
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_exposes_blocked_vm_spend(db_session):
+    """compute_current_axes must include blocked_provisioned_vm_spend_usd as a non-negative float."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # A BLOCKED task that had a VM provisioned and stopped.
+    blocked_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.BLOCKED,
+        vm_provisioned_at=now - timedelta(minutes=3),
+        vm_stopped_at=now,
+        vm_spot=False,
+        vm_runtime_cost_banked_db=99.0,
+        attempt_history_db=[
+            {
+                "vm_provisioned_at": (now - timedelta(days=10)).isoformat(),
+                "vm_stopped_at": (now - timedelta(days=10, minutes=-5)).isoformat(),
+                "vm_runtime_cost_usd": 99.0,
+            }
+        ],
+    )
+    db_session.add(blocked_task)
+    # A terminal task (should be in cohort, not BLOCKED spend).
+    db_session.add(_make_efficient_task(project.id))
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    assert "blocked_provisioned_vm_spend_usd" in axes, (
+        "compute_current_axes must include blocked_provisioned_vm_spend_usd"
+    )
+    spend = axes["blocked_provisioned_vm_spend_usd"]
+    assert isinstance(spend, float), (
+        f"blocked_provisioned_vm_spend_usd must be float, got {type(spend)}"
+    )
+    assert spend >= 0.0, "blocked_provisioned_vm_spend_usd must be non-negative"
+    # 3 minutes = 180 seconds at the default on-demand rate. The $99 banked
+    # attempt is outside the seven-day window and must not be attributed here.
+    expected = round(180 * ON_DEMAND_RATE, 6)
+    assert spend == pytest.approx(expected, abs=1e-6), (
+        f"BLOCKED VM spend {spend} does not match expected {expected}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_compute_current_axes_counts_blocked_vm_spend_without_attempt_history(
+    db_session,
+):
+    """A first blocked VM attempt does not require legacy context to be loaded."""
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            status=TaskStatus.BLOCKED,
+            vm_provisioned_at=now - timedelta(minutes=3),
+            vm_stopped_at=now,
+            vm_spot=False,
+        )
+    )
+    await db_session.commit()
+
+    axes = await compute_current_axes(db_session, project.id)
+
+    expected = round(180 * ON_DEMAND_RATE, 6)
+    assert axes["blocked_provisioned_vm_spend_usd"] == pytest.approx(
+        expected, abs=1e-6
+    )
+
+
+@pytest.mark.asyncio
+async def test_load_recent_tasks_is_terminal_time_ordered(db_session):
+    """_load_recent_tasks must return tasks ordered by updated_at descending."""
+    from app.efficiency_snapshot import _load_recent_tasks  # noqa: PLC0415
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    # Three tasks with distinct updated_at timestamps.
+    t_old = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(days=4),
+    )
+    t_mid = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(days=2),
+    )
+    t_new = make_task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        updated_at=now - timedelta(hours=1),
+    )
+    db_session.add_all([t_old, t_mid, t_new])
+    await db_session.commit()
+
+    tasks = await _load_recent_tasks(db_session, project.id)
+    assert len(tasks) == 3
+    # Must be in descending updated_at order (newest first).
+    dates = [t.updated_at for t in tasks]
+    assert dates == sorted(dates, reverse=True), (
+        "Tasks must be ordered by updated_at descending"
+    )

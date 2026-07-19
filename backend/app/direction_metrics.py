@@ -905,6 +905,41 @@ def _compute_direction_quality_score(d: dict) -> float:
         recent_weighted = sum(proof_weighted_merged(e) for e in acc_recent)
         components.append(max(0.0, min(1.0, recent_weighted / recent_verified)))
 
+    # (e) grade quality signal — recency-weighted fraction of HIGH-grade findings.
+    # Consumes the grade_distribution stored per research_history entry by
+    # research_direction_state.  A direction that consistently produces HIGH-grade
+    # findings scores better than one producing mostly LOW-grade noise.  Added ONLY
+    # when at least one cycle in the window has grade_distribution data; cycles
+    # without the key are neutral so legacy entries do not drag down new ones.
+    grade_data_w = 0.0
+    grade_high_w = 0.0
+    for entry, w in zip(recent, weights, strict=True):
+        gd = entry.get("grade_distribution") or {}
+        high = gd.get("HIGH", 0) or 0
+        medium = gd.get("MEDIUM", 0) or 0
+        low = gd.get("LOW", 0) or 0
+        total = high + medium + low
+        if total > 0:
+            grade_high_w += w * high / total
+            grade_data_w += w
+    if grade_data_w > 0:
+        components.append(grade_high_w / grade_data_w)
+
+    # (f) quality grader pass rate — recency-weighted fraction of cycles that
+    # passed forward-quality grading.  Added ONLY when at least one cycle in
+    # the window carries a quality_grader_verdict; cycles without the key are
+    # neutral so legacy entries do not drag down new ones.
+    qg_data_w = 0.0
+    qg_pass_w = 0.0
+    for entry, w in zip(recent, weights, strict=True):
+        qgv = entry.get("quality_grader_verdict")
+        if isinstance(qgv, dict) and "passed" in qgv:
+            qg_data_w += w
+            if qgv.get("passed"):
+                qg_pass_w += w
+    if qg_data_w > 0:
+        components.append(qg_pass_w / qg_data_w)
+
     score = sum(components) / len(components)
     return max(0.0, min(1.0, score))
 

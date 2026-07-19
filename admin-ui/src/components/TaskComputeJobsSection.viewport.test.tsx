@@ -11,6 +11,7 @@ vi.mock('../firebase', () => ({
   signInWithGoogle: vi.fn(),
   signOut: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
+  getIdTokenAfterAuthRestore: vi.fn(async () => 'test-token'),
   onAuthChange: vi.fn(() => () => {}),
 }));
 
@@ -45,6 +46,10 @@ const mockJob: ComputeJob = {
     hostname: 'iconlab-gpu-01',
     status: 'active',
   },
+  viewable_artifacts: [
+    { storage_uri: 'gs://bucket/loss.png', filename: 'loss.png', content_type: 'image/png', size_bytes: 4096, kind: 'image' },
+    { storage_uri: 'gs://bucket/rollout.mp4', filename: 'rollout.mp4', content_type: 'video/mp4', size_bytes: 7_000_000, kind: 'video' },
+  ],
 };
 
 // TaskDetailDrawerSections' module graph statically imports many named exports
@@ -124,6 +129,37 @@ describe('TaskComputeJobsSection — viewport regression at 640px', () => {
       await act(async () => { r.render(<TaskComputeJobsSection task={computeTask} />); });
       // Wait for fetchComputeJobs effect to resolve
       await act(async () => { await Promise.resolve(); });
+      // Must render the evidence-tier badge (local-subprocess + no result → 'partial' → 'Partial')
+      if (!(host.textContent ?? '').includes('Partial')) {
+        throw new Error('Evidence-tier badge not rendered in TaskComputeJobsSection');
+      }
+    });
+  });
+});
+
+describe('TaskComputeJobsSection — viewport at 1280px (acceptance capture)', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) { act(() => { r.unmount(); }); root = null; }
+    if (host) { host.remove(); host = null; }
+  });
+
+  test('renders the compute-artifact gallery toggle at 1280px without horizontal overflow', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<TaskComputeJobsSection task={computeTask} />); });
+      // Wait for fetchComputeJobs effect to resolve
+      await act(async () => { await Promise.resolve(); });
+      // The job carries viewable_artifacts, so the drawer gallery toggle mounts.
+      if (!host.querySelector('[data-testid="drawer-artifact-gallery-toggle"]')) {
+        throw new Error('expected compute-artifact gallery toggle to render');
+      }
     });
   });
 });

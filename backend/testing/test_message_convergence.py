@@ -1,6 +1,7 @@
 """Tests for message convergence resolver and reference handling."""
 
 import logging
+import uuid
 
 import pytest
 from fastapi import HTTPException
@@ -10,9 +11,24 @@ from app.message_convergence import (
     link_message_to_outcome,
     get_message_link,
     is_bug_class,
+    derive_needs_action,
+    mark_message_resolved,
+    linked_outcome_landed_resolution,
     LINKED_STATUS,
+    RESOLVED_STATUS,
+    NEEDS_ACTION_MESSAGE_TYPES,
+    CONVERSATIONAL_DECAY_MESSAGE_TYPES,
 )
-from app.models import Project, ProjectMember, ProjectMessage, MessageType
+from app.models import (
+    Direction,
+    Project,
+    ProjectMember,
+    ProjectMessage,
+    MessageType,
+    Task,
+    TaskStatus,
+)
+from app.time_utils import _utcnow
 
 
 TEST_USER_ID = "test-user-123"
@@ -216,3 +232,178 @@ async def test_resolve_message_ref_invalid_hex(db_session):
 
     assert exc_info.value.status_code == 400
     assert "hex" in exc_info.value.detail.lower()
+
+
+# ── Stage-2 generalized lifecycle: needs-action derivation ────────────────────
+
+
+def _msg(msg_type, status="open"):
+    return ProjectMessage(
+        project_id=uuid.uuid4(),
+        message_type=msg_type,
+        content="x",
+        status=status,
+    )
+
+
+def test_needs_action_message_types_are_question_and_blocker():
+    assert NEEDS_ACTION_MESSAGE_TYPES == frozenset(
+        {MessageType.QUESTION.value, MessageType.BLOCKER.value}
+    )
+    assert CONVERSATIONAL_DECAY_MESSAGE_TYPES == frozenset(
+        {MessageType.NOTE.value, MessageType.FEEDBACK.value, MessageType.QUESTION.value}
+    )
+
+
+def test_derive_needs_action_true_for_open_question_and_blocker():
+    assert derive_needs_action(_msg(MessageType.QUESTION, "open")) is True
+    assert derive_needs_action(_msg(MessageType.BLOCKER, "linked")) is True
+
+
+def test_derive_needs_action_false_when_resolved():
+    # A resolved QUESTION/BLOCKER no longer needs action — the derivation is how
+    # auto-resolve clears needs-action without a schema column.
+    assert derive_needs_action(_msg(MessageType.QUESTION, RESOLVED_STATUS)) is False
+    assert derive_needs_action(_msg(MessageType.BLOCKER, RESOLVED_STATUS)) is False
+
+
+def test_derive_needs_action_false_for_conversational_types():
+    assert derive_needs_action(_msg(MessageType.NOTE, "open")) is False
+    assert derive_needs_action(_msg(MessageType.FEEDBACK, "open")) is False
+
+
+def test_mark_message_resolved_stamps_audit_trail():
+    msg = _msg(MessageType.QUESTION, "linked")
+    now = _utcnow()
+    mark_message_resolved(msg, now, "auto-decayed (stale)")
+    assert msg.status == RESOLVED_STATUS
+    assert msg.resolution == "auto-decayed (stale)"
+    assert msg.resolved_at == now
+    assert msg.context.get("_convergence_converged_at") == now.isoformat()
+    # Resolving clears the derived needs-action flag.
+    assert derive_needs_action(msg) is False
+
+
+# ── Stage-2 generalized lifecycle: linked-outcome landing detector ────────────
+
+
+@pytest.mark.asyncio
+async def test_linked_outcome_landed_resolution_task_merged(db_session):
+    """A non-bug NOTE linked to a merged-completion task yields a landed audit."""
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="tracked via task",
+    )
+    link_message_to_outcome(msg, "task", str(task.id))
+    db_session.add(msg)
+    await db_session.commit()
+
+    audit = await linked_outcome_landed_resolution(db_session, msg, now=_utcnow())
+    assert audit is not None
+    assert "landed" in audit or "merged" in audit
+
+
+@pytest.mark.asyncio
+async def test_linked_outcome_landed_resolution_task_not_landed(db_session):
+    """A task COMPLETED without the landed signal is NOT treated as landed."""
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.FEEDBACK,
+        content="tracked",
+    )
+    link_message_to_outcome(msg, "task", str(task.id))
+    db_session.add(msg)
+    await db_session.commit()
+
+    assert await linked_outcome_landed_resolution(db_session, msg, now=_utcnow()) is None
+
+
+@pytest.mark.asyncio
+async def test_linked_outcome_landed_resolution_direction_completed(db_session):
+    """A message linked to a completed direction yields a landed audit."""
+    project = await _make_project(db_session)
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-done1",
+        status="completed",
+        data={"id": "d-done1", "status": "completed"},
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        content="answered by direction",
+    )
+    link_message_to_outcome(msg, "direction", "d-done1")
+    db_session.add(msg)
+    await db_session.commit()
+
+    audit = await linked_outcome_landed_resolution(db_session, msg, now=_utcnow())
+    assert audit is not None
+    assert "completed" in audit
+
+
+@pytest.mark.asyncio
+async def test_linked_outcome_landed_resolution_direction_active_is_none(db_session):
+    """An active (not completed) direction leaves the message unresolved."""
+    project = await _make_project(db_session)
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-active1",
+        status="active",
+        data={"id": "d-active1", "status": "active"},
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        content="tracked",
+    )
+    link_message_to_outcome(msg, "direction", "d-active1")
+    db_session.add(msg)
+    await db_session.commit()
+
+    assert await linked_outcome_landed_resolution(db_session, msg, now=_utcnow()) is None
+
+
+@pytest.mark.asyncio
+async def test_linked_outcome_landed_resolution_no_link_is_none(db_session):
+    """A message with no _convergence_link is a fail-safe None."""
+    project = await _make_project(db_session)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        content="unlinked",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+
+    assert await linked_outcome_landed_resolution(db_session, msg, now=_utcnow()) is None

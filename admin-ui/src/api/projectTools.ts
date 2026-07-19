@@ -8,6 +8,7 @@ export interface ProjectTool {
   enabled: boolean;
   placement: string;
   content_revision: number;
+  config?: Record<string, unknown>;
 }
 
 export interface ToolKindConfig {
@@ -28,7 +29,11 @@ export interface UpdateProjectToolPayload {
   title?: string;
   config?: Record<string, unknown>;
   enabled?: boolean;
+  placement?: string;
 }
+
+/** Placements the backend accepts (mirrors _VALID_PLACEMENTS server-side). */
+export const TOOL_PLACEMENTS = ['project_section', 'toolbar', 'sidebar'] as const;
 
 export interface FetchProjectToolsResult {
   tools: ProjectTool[];
@@ -123,6 +128,149 @@ export interface ToolContent<T = Record<string, unknown>> {
 
 export interface ToolContentSaveResult {
   content_revision: number;
+}
+
+export interface ResidentToolArtifactRef {
+  id: string;
+  artifact_ref_id: string;
+  tool_id: string;
+  project_id: string;
+  kind: 'notes' | 'whiteboard';
+  revision: number;
+  checksum: string;
+  author: string;
+  timestamp: string;
+  retrieval: {
+    capability: 'inline_bounded_text' | 'project_tool_rendered_image';
+    href: string;
+  };
+}
+
+export interface ResidentRenderedImageReceipt {
+  attachment_id: string;
+  storage_uri: string;
+  checksum: string;
+  mime_type?: string;
+  width?: number;
+  height?: number;
+}
+
+export interface ResidentToolArtifactReadyResponse {
+  state: 'ready';
+  artifact_ref: ResidentToolArtifactRef;
+}
+
+export interface ResidentToolArtifactPendingResponse {
+  state: 'pending';
+  promotion_intent_id: string;
+  receipt_id: string;
+  retry_after_ms: number;
+}
+
+export type ResidentToolArtifactCreateResponse =
+  | ResidentToolArtifactReadyResponse
+  | ResidentToolArtifactPendingResponse;
+
+export class ToolArtifactRequestError extends Error {
+  readonly status: number | null;
+  readonly retryable: boolean;
+
+  constructor(message: string, status: number | null, retryable: boolean) {
+    super(message);
+    this.name = 'ToolArtifactRequestError';
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+export class ToolArtifactConflictError extends Error {
+  readonly currentRevision: number | null;
+  readonly action: string;
+
+  constructor(currentRevision: number | null, action = 'reload_or_rebase') {
+    super('Tool changed before it could be shared. Reload or rebase your edits.');
+    this.name = 'ToolArtifactConflictError';
+    this.currentRevision = currentRevision;
+    this.action = action;
+  }
+}
+
+export async function createResidentToolArtifactRef(
+  projectId: string,
+  toolId: string,
+  expectedRevision: number,
+  renderedImage?: ResidentRenderedImageReceipt,
+): Promise<ResidentToolArtifactCreateResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/tools/${encodeURIComponent(toolId)}/artifact-refs`,
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_revision: expectedRevision,
+        ...(renderedImage ? { rendered_image: renderedImage } : {}),
+      }),
+    },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({})) as {
+      detail?: string | { current_revision?: number; action?: string };
+      error?: { message?: string | { current_revision?: number; action?: string } };
+      current_revision?: number;
+      action?: string;
+    };
+    if (res.status === 409) {
+      const wrapped = body.error?.message;
+      const detail = typeof body.detail === 'object' && body.detail
+        ? body.detail
+        : typeof wrapped === 'object' && wrapped
+          ? wrapped
+          : body;
+      throw new ToolArtifactConflictError(
+        typeof detail.current_revision === 'number' ? detail.current_revision : null,
+        typeof detail.action === 'string' ? detail.action : undefined,
+      );
+    }
+    const detail = typeof body.detail === 'string'
+      ? body.detail
+      : typeof body.error?.message === 'string'
+        ? body.error.message
+        : `Failed to share tool revision: ${res.status}`;
+    throw new ToolArtifactRequestError(
+      detail,
+      res.status,
+      res.status === 401
+        || res.status === 408
+        || res.status === 425
+        || res.status === 429
+        || res.status >= 500,
+    );
+  }
+  const body = await res.json() as Partial<ResidentToolArtifactCreateResponse>;
+  if (body.state === 'ready' && body.artifact_ref) {
+    return { state: 'ready', artifact_ref: body.artifact_ref };
+  }
+  if (
+    body.state === 'pending'
+    && typeof body.promotion_intent_id === 'string'
+    && body.promotion_intent_id.length > 0
+    && typeof body.receipt_id === 'string'
+    && body.receipt_id.length > 0
+    && typeof body.retry_after_ms === 'number'
+    && Number.isFinite(body.retry_after_ms)
+    && body.retry_after_ms >= 0
+  ) {
+    return {
+      state: 'pending',
+      promotion_intent_id: body.promotion_intent_id,
+      receipt_id: body.receipt_id,
+      retry_after_ms: body.retry_after_ms,
+    };
+  }
+  throw new ToolArtifactRequestError(
+    'Artifact reference response was not recognized.',
+    res.status,
+    false,
+  );
 }
 
 export async function fetchToolContent<T = Record<string, unknown>>(
@@ -225,12 +373,16 @@ export async function fetchAssetToken(
 
 /**
  * Build the absolute URL for loading a project-declared tool's asset entry
- * point with the capability token as a query parameter.
+ * point with the capability token embedded in the URL path.
  *
- * The entry path is a relative path like "index.html" or "dist/index.html"
- * within the tool's `.blueprint/tools/{toolSlug}/` directory. Path separators
- * are preserved so multi-segment paths work with the FastAPI `{path:path}`
- * route parameter.
+ * The token is placed in the path rather than as a query parameter so that
+ * relative subresources (e.g. `<script src="./app.js">`) resolve inside the
+ * token-prefix tree and authenticate automatically.  A query-string token
+ * would be dropped on relative resolution, causing 401 for every subresource
+ * in multi-file tools inside a `sandbox="allow-scripts"` (no
+ * `allow-same-origin`) iframe where cookies and custom headers are unavailable.
+ *
+ * Route shape: `/api/admin/projects/{id}/tools/{slug}/t/{token}/assets/{path}`
  */
 export function buildToolAssetUrl(
   projectId: string,
@@ -242,5 +394,58 @@ export function buildToolAssetUrl(
   const proj = encodeURIComponent(projectId);
   const slug = encodeURIComponent(toolSlug);
   const encodedPath = entryPath.split('/').map(seg => encodeURIComponent(seg)).join('/');
-  return `${base}/api/admin/projects/${proj}/tools/${slug}/assets/${encodedPath}?token=${encodeURIComponent(token)}`;
+  return `${base}/api/admin/projects/${proj}/tools/${slug}/t/${encodeURIComponent(token)}/assets/${encodedPath}`;
+}
+
+// ── Compute image status (owner-only baked-image read surface) ──────────────
+
+export interface ComputeImageDrift {
+  drifted: boolean | null;
+  current_dep_hash?: string;
+  stored_dep_hash?: string;
+  reason?: string;
+}
+
+export interface ComputeImageBuiltStatus {
+  status: 'built';
+  pinned_ref: string;
+  digest: string | null;
+  dep_hash: string;
+  tag: string;
+  built: boolean;
+  created_at: string | null;
+  updated_at: string | null;
+  is_digest_pinned: boolean;
+  drift?: ComputeImageDrift;
+}
+
+export interface ComputeImageNoDeclareStatus {
+  status: 'no_compute_image_declared';
+}
+
+export interface ComputeImageNeverBuiltStatus {
+  status: 'never_built';
+}
+
+export type ComputeImageStatusResponse =
+  | ComputeImageBuiltStatus
+  | ComputeImageNoDeclareStatus
+  | ComputeImageNeverBuiltStatus;
+
+/**
+ * Fetch the baked compute-image build record for a project.
+ *
+ * When ``checkDrift`` is true the backend clones the repo and computes the
+ * current dependency hash (expensive) to report whether it has drifted from
+ * the stored build record.  Omit ``checkDrift`` (or pass false) for the cheap
+ * status-only read.
+ */
+export async function fetchComputeImageStatus(
+  projectId: string,
+  checkDrift?: boolean,
+): Promise<ComputeImageStatusResponse> {
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/compute-image/status${checkDrift ? '?check_drift=true' : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) throw new Error(`Failed to fetch compute image status: ${res.status}`);
+  return res.json();
 }

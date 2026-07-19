@@ -1,6 +1,7 @@
 """Project CRUD, deploy, WebSocket, and status endpoints."""
 
 import asyncio
+import hmac
 import json
 import logging
 import time
@@ -17,6 +18,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -39,12 +41,14 @@ from app.models import (
 )
 from app.max_plan_pool import filter_user_task_context
 from app.payload_schemas import validate_task_payload
+from app.task_capabilities import BACKEND_MANAGED_TASK_TYPES
 from app.research_completion import resolve_research_findings_for_surface
 from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
 from app.strategic_events import emit_strategic_session_delta
+from app.strategic_resident_agent_binding import RESIDENT_CLAIM_NONCE_CONTEXT_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,27 @@ _AGENT_WS_TERMINAL_STATUSES = (
     # websocket should close — there is no live agent to relay to.
     TaskStatus.PARKED,
 )
+
+
+def _agent_ws_binding_invalid(task: Task | None, payload: dict) -> bool:
+    """Return true when a live WebSocket no longer matches its task claim."""
+
+    if task is None or task.status in _AGENT_WS_TERMINAL_STATUSES:
+        return True
+    token_vm = payload.get("vm_instance_id")
+    if token_vm and task.vm_instance_id and task.vm_instance_id != token_vm:
+        return True
+    if payload.get("task_type") != "strategic_resident_turn":
+        return False
+    persisted_nonce = str(
+        (task.context or {}).get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""
+    )
+    presented_nonce = str(payload.get("claim_nonce") or "")
+    return (
+        not persisted_nonce
+        or not presented_nonce
+        or not hmac.compare_digest(presented_nonce, persisted_nonce)
+    )
 
 
 def _truncate_vm_instance_id(vm_instance_id: object) -> str:
@@ -194,6 +219,11 @@ async def deploy_blueprint(
         session.add(task)
         created_tasks.append(task)
 
+    from app.strategic_resident_checkpointing import initialize_strategic_resident
+
+    await initialize_strategic_resident(
+        session, project.id, locked_project=project
+    )
     await session.commit()
 
     # Populate branch columns from GitHub immediately so that the first task
@@ -314,6 +344,7 @@ async def get_project_tasks(
     status: Optional[TaskStatus] = None,
     direction_id: Optional[str] = None,
     task_type: Optional[str] = None,
+    include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -367,6 +398,14 @@ async def get_project_tasks(
 
     # Fetch tasks
     tasks_stmt = select(Task).where(Task.project_id == project_id)
+    if not include_backend_managed:
+        task_type_expr = Task.payloads[0]["type"].as_string()
+        tasks_stmt = tasks_stmt.where(
+            or_(
+                task_type_expr.is_(None),
+                task_type_expr.not_in(sorted(BACKEND_MANAGED_TASK_TYPES)),
+            )
+        )
     if status:
         tasks_stmt = tasks_stmt.where(Task.status == status)
     if direction_id:
@@ -723,6 +762,28 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             )
             await _safe_ws_close(websocket, code=1008, reason="VM instance mismatch")
             return
+        if payload.get("task_type") == "strategic_resident_turn":
+            task_context = task.context if isinstance(task.context, dict) else {}
+            persisted_nonce = str(
+                task_context.get(RESIDENT_CLAIM_NONCE_CONTEXT_KEY) or ""
+            )
+            presented_nonce = str(payload.get("claim_nonce") or "")
+            if (
+                not persisted_nonce
+                or not presented_nonce
+                or not hmac.compare_digest(presented_nonce, persisted_nonce)
+            ):
+                _log_agent_auth_reject(
+                    "ws_resident_claim_nonce_stale",
+                    path=path,
+                    task_id=task_id,
+                    token_vm_instance_id=token_vm,
+                    token_project_id=token_project,
+                )
+                await _safe_ws_close(
+                    websocket, code=1008, reason="Resident claim superseded"
+                )
+                return
 
         project_id = str(task.project_id)
 
@@ -783,16 +844,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 if now - last_recheck >= _DB_RECHECK_INTERVAL:
                     async with AsyncSessionLocal() as rs:
                         fresh = await rs.get(Task, task_id)
-                    if (
-                        fresh is None
-                        or fresh.status in _AGENT_WS_TERMINAL_STATUSES
-                        or (
-                            payload.get("vm_instance_id")
-                            and fresh is not None
-                            and fresh.vm_instance_id
-                            and fresh.vm_instance_id != payload.get("vm_instance_id")
-                        )
-                    ):
+                    if _agent_ws_binding_invalid(fresh, payload):
                         _log_agent_auth_reject(
                             "ws_periodic_recheck_terminal",
                             path=path,
@@ -828,6 +880,16 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 except json.JSONDecodeError:
                     receive_task = asyncio.create_task(websocket.receive_text())
                     continue
+                if (
+                    payload.get("task_type") == "strategic_resident_turn"
+                    and data.get("type") != "log"
+                ):
+                    await _safe_ws_close(
+                        websocket,
+                        code=1008,
+                        reason="Resident frame type is not authorized",
+                    )
+                    return
 
                 if data.get("type") == "log":
                     sanitized = _sanitize_log(data.get("content", ""))
@@ -886,16 +948,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 if now - last_recheck >= _DB_RECHECK_INTERVAL:
                     async with AsyncSessionLocal() as rs:
                         fresh = await rs.get(Task, task_id)
-                    if (
-                        fresh is None
-                        or fresh.status in _AGENT_WS_TERMINAL_STATUSES
-                        or (
-                            payload.get("vm_instance_id")
-                            and fresh is not None
-                            and fresh.vm_instance_id
-                            and fresh.vm_instance_id != payload.get("vm_instance_id")
-                        )
-                    ):
+                    if _agent_ws_binding_invalid(fresh, payload):
                         _log_agent_auth_reject(
                             "ws_periodic_recheck_terminal",
                             path=path,

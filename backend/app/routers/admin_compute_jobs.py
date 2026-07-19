@@ -49,6 +49,7 @@ from app.task_evaluators import (
     _declared_success_criterion,
     evaluate_compute_success_criterion,
 )
+from app.storage import artifact_expires_at
 
 logger = logging.getLogger(__name__)
 
@@ -128,11 +129,12 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
 
     Reads the ``viewable_files`` manifest stamped onto ``polling_metadata`` by
     ``_link_terminal_artifact`` and returns a sanitized, backward-compatible list
-    of ``{filename, storage_uri, content_type, size_bytes, kind}``. A signed
-    preview URL is resolved lazily via ``/api/admin/artifacts/download-url`` from
-    ``storage_uri`` (which lives inside the allowlisted compute-job prefix), so no
-    URL is minted here. Returns ``[]`` when a job produced no viewable files or
-    the manifest is malformed (absent/empty is the common, expected case).
+    of ``{filename, storage_uri, content_type, size_bytes, kind, revision, live}``.
+    A signed preview URL is resolved lazily via
+    ``/api/admin/artifacts/download-url`` from ``storage_uri`` (which lives inside
+    the allowlisted compute-job prefix), so no URL is minted here. Returns ``[]``
+    when a job produced no viewable files or the manifest is malformed
+    (absent/empty is the common, expected case).
     """
     if not isinstance(raw, list):
         return []
@@ -147,6 +149,8 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
         content_type = entry.get("content_type")
         size_bytes = entry.get("size_bytes")
         kind = entry.get("kind")
+        revision = entry.get("revision")
+        live = entry.get("live")
         out.append(
             {
                 "filename": str(filename) if filename is not None else None,
@@ -157,7 +161,11 @@ def _viewable_artifacts_descriptor(raw: Any) -> list[Dict[str, Any]]:
                 "size_bytes": int(size_bytes)
                 if isinstance(size_bytes, int) and not isinstance(size_bytes, bool)
                 else None,
-                "kind": kind if kind in ("image", "video") else None,
+                "kind": kind if kind in ("image", "video", "pdf") else None,
+                "revision": revision
+                if isinstance(revision, str) and revision
+                else None,
+                "live": live if isinstance(live, bool) else None,
             }
         )
     return out
@@ -257,6 +265,11 @@ async def _build_compute_job_payload(
         )
         runner_map = {r.id: r for r in runner_rows}
 
+    # Canonical evidence-tier derivation lives server-side in knowledge_completion;
+    # import it once here so the compute-job payload can serve the tier as a
+    # first-class field instead of the UI forking a second copy of the logic.
+    from app.knowledge_completion import _compute_evidence_tier
+
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
@@ -331,6 +344,9 @@ async def _build_compute_job_payload(
                 "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
                 "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,
                 "require_durable_artifact": bool(fp.get("require_durable_artifact")) if fp.get("require_durable_artifact") is not None else None,
+                "setup_step": fp.get("setup_step") or None,
+                "no_progress_timeout_seconds": int(fp["no_progress_timeout_seconds"]) if fp.get("no_progress_timeout_seconds") is not None else None,
+                "input_artifact_job_id": fp.get("input_artifact_job_id") or None,
             }
         data["task_title"] = title
         data["task_type"] = task_type
@@ -338,6 +354,17 @@ async def _build_compute_job_payload(
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id
         data["per_arm_verdicts"] = per_arm_verdicts
+        # Serve the canonical evidence tier (machine-verified / attested /
+        # self-reported) as a first-class field so the UI stops re-deriving it.
+        # A run "produced a result" when it yielded either a criterion verdict or
+        # any per-arm verdict — the same signals the client derivation used.
+        _produced_result = (
+            (per_arm_verdicts is not None and len(per_arm_verdicts) > 0)
+            or criterion_verdict is not None
+        )
+        data["evidence_tier"] = _compute_evidence_tier(
+            job, {"_produced": True} if _produced_result else None
+        )
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis
@@ -353,6 +380,40 @@ async def _build_compute_job_payload(
         # image/video references alongside the opaque bundle `artifact`.
         data["viewable_artifacts"] = _viewable_artifacts_descriptor(
             pm.get("viewable_files")
+        )
+        # Additive, backward-compatible job-level aggregate: how many viewable
+        # files were omitted from the manifest for exceeding the count cap (25)
+        # or the per-file size cap (8 MiB). Stamped only when > 0; defaults to 0
+        # for legacy/absent rows so existing clients keep working.
+        data["viewable_artifacts_dropped_count"] = int(
+            pm.get("viewable_files_dropped") or 0
+        )
+        svg_excl = pm.get("viewable_files_svg_excluded")
+        if isinstance(svg_excl, int) and svg_excl > 0:
+            data["viewable_artifacts_svg_omitted_count"] = svg_excl
+        # Live omissions reported by the runner while the job is still RUNNING.
+        # Contains the count of unique relpaths skipped due to per-kind size cap
+        # ("size_cap") or 25-file count cap ("count_cap"). Absent or null for
+        # terminal jobs (use viewable_artifacts_dropped_count instead).
+        raw_live_om = pm.get("viewable_live_omissions")
+        live_om: dict | None = None
+        if isinstance(raw_live_om, dict) and job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+            validated_om: dict = {}
+            for _key in ("size_cap", "count_cap"):
+                _val = raw_live_om.get(_key)
+                if isinstance(_val, int) and not isinstance(_val, bool) and _val >= 0:
+                    validated_om[_key] = _val
+            live_om = validated_om or None
+        data["viewable_artifacts_live_omissions"] = live_om
+        # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+        # lifecycle DELETE.  Once the retention window passes, the underlying
+        # storage object is permanently gone and re-minting a signed URL will
+        # still 404.  Stamp the expected expiry so the frontend can distinguish
+        # a transient preview failure from permanent expiry.  Uses completed_at
+        # (object creation time for viewable files) with a fallback to
+        # created_at for in-flight jobs.
+        data["artifact_expires_at"] = artifact_expires_at(
+            job.completed_at or job.created_at
         )
         raw_runner_id = pm.get("runner_target_id")
         runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
@@ -627,21 +688,29 @@ async def get_project_awaiting_local_runner_holds(
     return [_awaiting_local_runner_entry(task, runner_map) for task in rows]
 
 
+_SUMMARY_WINDOW_DAYS = 90
+
+
 @router.get("/projects/{project_id}/compute-jobs/summary")
 async def get_project_compute_jobs_aggregate_summary(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Return aggregate summary over ALL compute jobs for a project (viewer+).
+    """Return aggregate summary over recent compute jobs for a project (viewer+).
 
-    Unlike the list endpoint, this endpoint is not capped by include_finished_minutes
-    and covers the project's full history — suitable for cumulative experiment totals.
+    Stats are bounded to the last 90 days to avoid full-history table scans on
+    large projects.  The response also includes ``total_jobs_all_time`` — a
+    lightweight COUNT(*) over the project's full history — so callers retain
+    access to the cumulative figure without paying for a full aggregate scan.
     """
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    return await aggregate_all_compute_jobs_summary(session, project_id=project_id)
+    since = datetime.now(tz=timezone.utc) - timedelta(days=_SUMMARY_WINDOW_DAYS)
+    return await aggregate_all_compute_jobs_summary(
+        session, project_id=project_id, since=since
+    )
 
 
 # ── GPU contamination audit ───────────────────────────────────────────────────

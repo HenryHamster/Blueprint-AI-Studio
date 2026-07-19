@@ -2,11 +2,14 @@ import { describe, it, expect } from 'vitest';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
+  computeResidentActivityState,
+  RESIDENT_HEARTBEAT_STALE_MS,
   countStrategicReplies,
   isStrategicReplyDelta,
 } from './strategicSessionLive';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import type { ProjectMessage } from '../types/messages';
+import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
 
 function delta(p: Partial<StrategicSessionDelta> & { id: number }): StrategicSessionDelta {
   return { session_id: 'ss-1', text: '', ...p };
@@ -35,15 +38,58 @@ describe('computeStrategicStreamingTurn', () => {
   it('builds the bubble from reply-kind deltas only (activity noise excluded)', () => {
     const transcript = [
       delta({ id: 1, seq: 1, kind: 'command', text: '$ ls' }),
-      delta({ id: 2, seq: 2, kind: 'message', text: 'The plan' }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'The plan ' }),
       delta({ id: 3, seq: 3, kind: 'tool_result', text: '✓ done' }),
       delta({ id: 4, seq: 4, kind: 'message', text: 'is cheaper.' }),
     ];
     const turn = computeStrategicStreamingTurn(transcript, []);
-    // Reply-kind deltas are joined (one per WS frame); activity frames excluded.
-    expect(turn?.text).toBe('The plan\nis cheaper.');
+    // Contiguous reply fragments concatenate WITHOUT an injected separator — the
+    // agent-side ~100ms flush split vanishes; activity frames stay excluded.
+    expect(turn?.text).toBe('The plan is cheaper.');
     expect(turn?.text).not.toContain('$ ls');
     expect(turn?.text).not.toContain('done');
+    expect(turn?.segments).toEqual([{ kind: 'reply', text: 'The plan is cheaper.' }]);
+  });
+
+  it('concatenates multi-fragment reply text but preserves each fragment\'s own newlines', () => {
+    // One continuous reply run split across flush boundaries: the fragments carry
+    // real paragraph breaks, a bullet list, and a fenced code block. The split
+    // boundaries must NOT inject newlines, but every real newline must survive.
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'message', text: 'First paragraph that ' }),
+      delta({ id: 2, seq: 2, kind: 'message', text: 'keeps going.\n\n- bullet one\n- bullet' }),
+      delta({ id: 3, seq: 3, kind: 'message', text: ' two\n\n```\ncode();\n```' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    expect(turn?.text).toBe(
+      'First paragraph that keeps going.\n\n- bullet one\n- bullet two\n\n```\ncode();\n```',
+    );
+  });
+
+  it('separates reasoning deltas from reply deltas into ordered segments', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'reasoning', text: 'Let me think ' }),
+      delta({ id: 2, seq: 2, kind: 'reasoning', text: 'about this.' }),
+      delta({ id: 3, seq: 3, kind: 'message', text: 'Here is ' }),
+      delta({ id: 4, seq: 4, kind: 'message', text: 'the answer.' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    // Contiguous same-kind fragments merge without separators; the two kinds split.
+    expect(turn?.segments).toEqual([
+      { kind: 'reasoning', text: 'Let me think about this.' },
+      { kind: 'reply', text: 'Here is the answer.' },
+    ]);
+    // `text` is reply-only — reasoning never leaks into the primary reply content.
+    expect(turn?.text).toBe('Here is the answer.');
+  });
+
+  it('shows a reasoning-only turn (thinking before any reply) as a reasoning segment', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'reasoning', text: 'Considering options…' }),
+    ];
+    const turn = computeStrategicStreamingTurn(transcript, []);
+    expect(turn?.segments).toEqual([{ kind: 'reasoning', text: 'Considering options…' }]);
+    expect(turn?.text).toBe('');
   });
 
   it('returns null when only activity (no reply) has streamed', () => {
@@ -154,6 +200,97 @@ describe('computeStrategicSessionActivity', () => {
     const activity = computeStrategicSessionActivity(transcript, []);
     expect(activity.items).toHaveLength(8);
     expect(activity.items[activity.items.length - 1].text).toBe('$ cmd-11');
+  });
+});
+
+describe('computeResidentActivityState', () => {
+  const NOW = new Date('2026-06-01T12:00:00Z').getTime();
+  function session(p: Partial<StrategicResidentSessionSnapshot> = {}): StrategicResidentSessionSnapshot {
+    // Fresh heartbeat by default so a session is presumed alive unless overridden.
+    return { status: 'active', updated_at: '2026-06-01T11:59:55Z', ...p };
+  }
+
+  it('returns null when there is no resident session (nothing to render)', () => {
+    expect(computeResidentActivityState([], [], null, NOW)).toBeNull();
+    expect(computeResidentActivityState([], [], undefined, NOW)).toBeNull();
+  });
+
+  it('EXECUTING: an in-flight command surfaces its text + a live start time', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: 'bash scripts/test-backend.sh', ts: '2026-06-01T11:59:58Z' }),
+    ];
+    const state = computeResidentActivityState(transcript, [], session(), NOW);
+    expect(state?.phase).toBe('executing');
+    expect(state?.commandText).toBe('bash scripts/test-backend.sh');
+    // A live start time drives the ticking counter; no frozen endMs in this phase.
+    expect(state?.startMs).toBe(new Date('2026-06-01T11:59:58Z').getTime());
+    expect(state?.endMs).toBeUndefined();
+  });
+
+  it('IDLE: a trailing tool_result means the command finished — no ticking timer', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ ls' }),
+      delta({ id: 3, seq: 3, kind: 'tool_result', text: '✓ done' }),
+    ];
+    const state = computeResidentActivityState(transcript, [], session(), NOW);
+    expect(state?.phase).toBe('idle');
+    // No live start time in idle: nothing should tick.
+    expect(state?.startMs).toBeUndefined();
+  });
+
+  it('IDLE: an active session whose turn is done shows idle, not executing', () => {
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ ran' }),
+      delta({ id: 3, seq: 3, kind: 'status', text: 'done', status: 'done' }),
+    ];
+    const state = computeResidentActivityState(transcript, [], session(), NOW);
+    expect(state?.phase).toBe('idle');
+  });
+
+  it('DEAD: status ended freezes the counter at ended_at and never ticks', () => {
+    const endedAt = '2026-06-01T11:58:00Z';
+    const transcript = [
+      // A command is still "in flight" per the feed, but the session snapshot says ended.
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ hung', ts: '2026-06-01T11:57:00Z' }),
+    ];
+    const state = computeResidentActivityState(
+      transcript, [], session({ status: 'ended', ended_at: endedAt }), NOW,
+    );
+    expect(state?.phase).toBe('dead');
+    expect(state?.startMs).toBeUndefined();
+    // Frozen at the end time — the counter must not tick against the wall clock.
+    expect(state?.endMs).toBe(new Date(endedAt).getTime());
+  });
+
+  it('DEAD: stop_requested marks the session gone even without ended_at', () => {
+    const state = computeResidentActivityState([], [], session({ stop_requested: true }), NOW);
+    expect(state?.phase).toBe('dead');
+  });
+
+  it('DEAD: a heartbeat stale beyond the threshold is presumed dead (no done frame ever arrives)', () => {
+    const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000).toISOString();
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ hung forever', ts: staleAt }),
+    ];
+    const state = computeResidentActivityState(transcript, [], session({ updated_at: staleAt }), NOW);
+    expect(state?.phase).toBe('dead');
+    // Frozen at the last heartbeat — no forever-ticking counter for a dead session.
+    expect(state?.endMs).toBe(new Date(staleAt).getTime());
+  });
+
+  it('stays EXECUTING while the heartbeat is fresh and a command is in flight', () => {
+    const freshAt = new Date(NOW - 3000).toISOString();
+    const transcript = [
+      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
+      delta({ id: 2, seq: 2, kind: 'command', text: '$ running', ts: freshAt }),
+    ];
+    const state = computeResidentActivityState(transcript, [], session({ updated_at: freshAt }), NOW);
+    expect(state?.phase).toBe('executing');
   });
 });
 

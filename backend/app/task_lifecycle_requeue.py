@@ -844,28 +844,36 @@ async def _requeue_parent_task(
         # Filter criterion_ids to active-only so a retracted/superseded criterion
         # stops propagating to new clones and accruing fresh evidence.
         _raw_criterion_ids = list(child.criterion_ids or [])
-        _active_criterion_ids = _raw_criterion_ids
-        if _raw_criterion_ids:
+        from app.acceptance_criteria import (
+            resolve_task_criterion_release_version_id as _resolve_criterion_version,
+            task_criterion_release_version_id as _task_criterion_version,
+        )
+
+        _criterion_release_version_id = _task_criterion_version(child)
+        if _criterion_release_version_id is None:
+            _criterion_release_version_id = await _resolve_criterion_version(
+                session, child, child.project_id
+            )
+            if _criterion_release_version_id is not None:
+                clone_ctx["criterion_release_version_id"] = str(
+                    _criterion_release_version_id
+                )
+        _active_criterion_ids: list[str] = []
+        if _raw_criterion_ids and _criterion_release_version_id is not None:
             try:
                 from app.acceptance_criteria import (
                     filter_active_criterion_keys as _filter_active_crit_requeue,
-                )
-                from app.release_version import (
-                    current_open_version as _cur_open_ver_requeue,
-                )
-
-                _open_ver_requeue = await _cur_open_ver_requeue(
-                    session, child.project_id
                 )
                 _active_criterion_ids = await _filter_active_crit_requeue(
                     session,
                     child.project_id,
                     _raw_criterion_ids,
-                    release_version_id=_open_ver_requeue.id if _open_ver_requeue else None,
+                    release_version_id=_criterion_release_version_id,
                 )
             except Exception:
                 logger.exception(
-                    "[REQUEUE] Failed to filter criterion_ids for task %s — using raw list",
+                    "[REQUEUE] Failed to filter criterion_ids for task %s — "
+                    "dropping criterion links",
                     child.id,
                 )
 

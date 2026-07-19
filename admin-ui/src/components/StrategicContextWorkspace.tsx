@@ -24,7 +24,7 @@ import {
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
-import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
+import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import {
   StrategicSessionControl,
@@ -51,6 +51,36 @@ interface StrategicContextWorkspaceProps {
   sessionBusy?: boolean;
   sessionRunners?: StrategicResidentRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
+  operatorDecisionSummary?: {
+    total: number;
+    captured: number;
+    missed: number;
+    capture_rate: number | null;
+  } | null;
+  turnLatencySummary?: {
+    operator: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+    autonomous: {
+      count: number;
+      mean_turn_ms: number | null;
+      max_turn_ms: number;
+      mean_ttft_ms: number | null;
+      interrupted_count: number;
+      total_tool_calls: number;
+      total_tool_call_duration_ms: number;
+      mean_inter_token_ms: number | null;
+      mean_pickup_lag_ms: number | null;
+    };
+  } | null;
   projectId?: string | null;
   onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
@@ -595,6 +625,8 @@ export function StrategicContextWorkspace({
   sessionBusy = false,
   sessionRunners = null,
   sessionSelectedRunnerId = null,
+  operatorDecisionSummary = null,
+  turnLatencySummary = null,
   projectId,
   onSelectRunner,
   onStartSession,
@@ -658,6 +690,16 @@ export function StrategicContextWorkspace({
   const artifactDescriptors = useMemo(
     () => (contextPackage?.descriptors ?? []).filter(d => d.kind !== 'context_map'),
     [contextPackage?.descriptors],
+  );
+  // Artifact IDs already shown as descriptors (strip "artifact:" prefix to get UUID).
+  // Used below to skip rendering duplicate media in the Evidence section.
+  const promotedArtifactIds = useMemo(
+    () => new Set(
+      artifactDescriptors
+        .map(d => (typeof d.id === 'string' && d.id.startsWith('artifact:') ? d.id.slice('artifact:'.length) : null))
+        .filter((id): id is string => id !== null),
+    ),
+    [artifactDescriptors],
   );
   const canvasResources = useMemo(
     () => resources.filter(r => r.kind === 'canvas'),
@@ -728,6 +770,11 @@ export function StrategicContextWorkspace({
   const tone = contextStatusTone(contextPackage?.status);
   const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
   const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
+  const artifactLiveCount: number = contextPackage?.evidence?.artifacts?.live_count ?? 0;
+  const knowledgeDurableTotal: number = contextPackage?.evidence?.knowledge?.total ?? knowledgeEvidence.length;
+  const artifactDurableTotal: number = contextPackage?.evidence?.artifacts?.total ?? artifactEvidence.length;
+  const evidenceDisplayedCount = knowledgeEvidence.length + artifactEvidence.length;
+  const evidenceDurableTotal = knowledgeDurableTotal + artifactDurableTotal;
   const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
@@ -846,6 +893,8 @@ export function StrategicContextWorkspace({
                   sessionBusy={sessionBusy}
                   sessionRunners={sessionRunners}
                   sessionSelectedRunnerId={sessionSelectedRunnerId}
+                  operatorDecisionSummary={operatorDecisionSummary}
+                  turnLatencySummary={turnLatencySummary}
                   onSelectRunner={onSelectRunner}
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}
@@ -1170,7 +1219,12 @@ export function StrategicContextWorkspace({
 
             <Section
               title="Evidence"
-              meta={`${knowledgeEvidence.length + artifactEvidence.length}`}
+              meta={[
+                evidenceDurableTotal > evidenceDisplayedCount
+                  ? `showing ${evidenceDisplayedCount} of ${evidenceDurableTotal}`
+                  : `${evidenceDisplayedCount}`,
+                artifactLiveCount > 0 ? `${artifactLiveCount} live` : null,
+              ].filter(Boolean).join(' · ')}
               testId="strategic-context-workspace-evidence"
             >
               {knowledgeEvidence.length === 0 && artifactEvidence.length === 0 ? (
@@ -1196,14 +1250,27 @@ export function StrategicContextWorkspace({
                     <div className={CONTEXT_LIST_CLASS}>
                       {artifactEvidence.map(item => {
                         const ref = selectedRefFromArtifactEvidence(item);
-                        return renderKeepableRow({
-                          key: `artifact:${item.id}`,
-                          label: ref.label ?? 'Artifact',
-                          kind: item.artifact_type ?? item.kind,
-                          detail: item.task_title ?? item.task_status ?? null,
-                          target: item.target,
-                          ref,
-                        });
+                        const label = ref.label ?? 'Artifact';
+                        const isPromoted = promotedArtifactIds.has(String(item.id));
+                        return (
+                          <div key={`artifact:${item.id}`} className="min-w-0">
+                            {renderKeepableRow({
+                              key: `artifact-row:${item.id}`,
+                              label,
+                              kind: item.artifact_type ?? item.kind,
+                              detail: item.task_title ?? item.task_status ?? null,
+                              target: item.target,
+                              ref,
+                            })}
+                            {!isPromoted && (
+                              <ArtifactViewablePreviews
+                                previews={item.viewable_previews}
+                                projectId={projectId}
+                                label={label}
+                              />
+                            )}
+                          </div>
+                        );
                       })}
                     </div>
                   )}

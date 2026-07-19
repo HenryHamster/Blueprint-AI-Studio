@@ -110,6 +110,8 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     fetchMetricsIntegrityObservability: vi.fn(),
     patchMetricsIntegritySettings: vi.fn(),
     patchCapabilityProofGateSettings: vi.fn(),
+    grantCapabilityProofExemption: vi.fn(),
+    revokeCapabilityProofExemption: vi.fn(),
     fetchCompletionDebts: vi.fn(),
     dismissCompletionDebt: vi.fn(),
     resolveCompletionDebt: vi.fn(),
@@ -122,12 +124,18 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     revokeFleetRunner: vi.fn(),
     updateRunnerCapabilities: vi.fn(),
     patchRunnerStatus: vi.fn(),
+    listRunnerProjects: vi.fn(),
+    addRunnerProject: vi.fn(),
+    removeRunnerProject: vi.fn(),
+    listOwnedProjects: vi.fn(),
     fetchRunnerTelemetry: vi.fn(),
     fetchRunnerStats: vi.fn(),
     resetTaskIterationCap: vi.fn(),
     triggerTaskRollup: vi.fn(),
     fetchDeadLetters: vi.fn(),
     redriveDeadLetters: vi.fn(),
+    getHotfixPreview: vi.fn(),
+    triggerHotfixPromote: vi.fn(),
   };
   return { ...base, ...overrides };
 }

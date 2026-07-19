@@ -196,8 +196,14 @@ export function ProjectManagementModal({
               }`}
             >
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-medium text-neutral-200 truncate">{label}</p>
-                <p className="text-xs text-neutral-500 truncate">{project.status}</p>
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <p className="text-xs font-medium text-neutral-200 truncate">{label}</p>
+                  {tab === 'active' && project.paused && (
+                    <span className="shrink-0 px-1.5 py-0.5 rounded text-ui-sm font-medium bg-amber-500/15 text-amber-400 border border-amber-500/20">
+                      Paused
+                    </span>
+                  )}
+                </div>
               </div>
               {isBusy ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-neutral-500 shrink-0" data-testid="busy-spinner" />

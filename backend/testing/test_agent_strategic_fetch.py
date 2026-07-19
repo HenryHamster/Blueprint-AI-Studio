@@ -8,7 +8,7 @@ into its own router seam; behavior and contracts are unchanged.
 """
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient
@@ -22,6 +22,7 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectMessage,
+    QualificationDimensionResult,
     QualificationVerdict,
     ReleaseDeployArtifact,
     ReleaseVersion,
@@ -3787,10 +3788,10 @@ async def test_strategic_resolve_question_posts_answer_note(
 
 
 @pytest.mark.asyncio
-async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcast_reply(
+async def test_strategic_resolve_question_commit_failure_is_atomic(
     client: AsyncClient, db_session, mocker
 ):
-    """A failed optional reply write must not emit a phantom reply-created event."""
+    """A failed commit persists neither the resolution nor its canonical reply."""
     from unittest.mock import AsyncMock
 
     project, task = await _make_project_task(db_session)
@@ -3811,15 +3812,8 @@ async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcas
     )
     from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
 
-    real_commit = _AsyncSession.commit
-    commit_count = 0
-
     async def _commit_reply_failure(session, *args, **kwargs):
-        nonlocal commit_count
-        commit_count += 1
-        if commit_count == 2:
-            raise RuntimeError("reply commit failed")
-        return await real_commit(session, *args, **kwargs)
+        raise RuntimeError("atomic resolve commit failed")
 
     mocker.patch.object(
         _AsyncSession,
@@ -3828,45 +3822,89 @@ async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcas
         side_effect=_commit_reply_failure,
     )
 
-    res = await client.post(
-        "/api/agent/strategic",
-        headers={"x-agent-token": token},
-        json={
-            "task_id": str(task.id),
-            "op": "resolve_message",
-            "data": {
-                "message_id": str(msg.id),
-                "resolution": "Resolved, but reply persistence failed.",
+    with pytest.raises(RuntimeError, match="atomic resolve commit failed"):
+        await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "resolve_message",
+                "data": {
+                    "message_id": str(msg.id),
+                    "resolution": "Resolved, but reply persistence failed.",
+                },
             },
-        },
-    )
+        )
 
-    assert res.status_code == 200, res.text
-    assert res.json()["status"] == "ok"
+    # Snapshot project.id before the rollback: on Postgres the rollback expires
+    # ORM attributes (the conftest _expire no-op is SQLite-only), so reading
+    # project.id afterward triggers a sync lazy-load -> MissingGreenlet.
+    project_id = project.id
+    await db_session.rollback()
     await db_session.refresh(msg)
-    assert msg.status == "resolved"
-    assert broadcast.await_count == 1
-    project_id, event, payload = broadcast.await_args.args
-    assert project_id == str(project.id)
-    assert event == "message_updated"
-    assert payload["message_id"] == str(msg.id)
-    assert payload["message"]["status"] == "resolved"
-    _assert_project_message_event_payload(
-        payload,
-        project=project,
-        msg=msg,
-        action="resolved",
-        status="resolved",
-    )
+    assert msg.status == "open"
+    assert broadcast.await_count == 0
     notes = (
         await db_session.execute(
             select(ProjectMessage).where(
-                ProjectMessage.project_id == project.id,
+                ProjectMessage.project_id == project_id,
                 ProjectMessage.message_type == MessageType.NOTE,
             )
         )
     ).scalars().all()
     assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_retry_reconciles_missing_reply(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="Was this already answered?",
+        status="resolved",
+        resolution="The durable answer.",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    request = {
+        "task_id": str(task.id),
+        "op": "resolve_message",
+        "data": {
+            "message_id": str(msg.id),
+            "resolution": "The durable answer.",
+        },
+    }
+
+    first = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=request,
+    )
+    second = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=request,
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "already_resolved"
+    assert second.status_code == 200, second.text
+    replies = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.reply_to_message_id == msg.id,
+            )
+        )
+    ).scalars().all()
+    assert len(replies) == 1
+    assert replies[0].sequence is not None
 
 
 @pytest.mark.asyncio
@@ -3906,11 +3944,11 @@ async def test_strategic_resolve_feedback_posts_acknowledgment_note(
 
     notes = (
         await db_session.execute(
-            select(ProjectMessage).where(
-                ProjectMessage.project_id == project.id,
-                ProjectMessage.message_type == MessageType.NOTE,
-                ProjectMessage.from_type == "system",
-            )
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "strategic",
+                )
         )
     ).scalars().all()
     matching = [
@@ -4525,6 +4563,218 @@ async def test_open_version_qualification_state_agrees_across_surfaces(
         assert state is not None and state["state"] == "qualifying", (surface, state)
     for surface, dis in disagreements3.items():
         assert dis is None, f"{surface} raised a FALSE disagreement when sources agree: {dis}"
+
+
+@pytest.mark.asyncio
+async def test_pending_attempt_does_not_inherit_prior_finalization_across_surfaces(
+    client: AsyncClient, db_session
+):
+    """A same-candidate retry stays pending until its own verdict finalizes."""
+    from unittest.mock import AsyncMock, patch
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.qualification_state_resolver import resolve_open_version_qualification_read_model
+    from app.release_artifacts import version_serving_summary
+    from app.release_readiness import compute_qualification_trigger_state
+    from app.release_version import current_open_version, to_phase_block
+    from app.strategic_payload_compaction import _compact_version_phase
+    from app.system_state import compute_system_state
+
+    project, task, version = await _make_open_version_project(
+        db_session, vm="agent-vm-attempt-scoped"
+    )
+    candidate = "d" * 40
+    prior_attempt = uuid.uuid4()
+    active_attempt = uuid.uuid4()
+    audit_task_id = uuid.uuid4()
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            qualification_attempt_id=prior_attempt,
+            candidate_sha=candidate,
+            confidence=0.91,
+            sub_scores={"audit": 0.93},
+            terminal_status="promoted",
+            finalized_at=datetime(2026, 7, 15, 10, 0, 0, tzinfo=timezone.utc),
+            audit_findings=[{"severity": "LOW", "summary": "prior attempt"}],
+        )
+    )
+    db_session.add(
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=candidate,
+            dimension="audit",
+            status="passed",
+            sub_score=0.93,
+            producing_task_id=audit_task_id,
+            origin_attempt_id=prior_attempt,
+            reused_by_attempt_ids=[str(active_attempt)],
+        )
+    )
+    version.active_qualification_attempt_id = active_attempt
+    version.qualification_attempts = 2
+    version.qualification_retry_episode = 1
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": candidate,
+        "qualification_attempt_id": str(active_attempt),
+        "retry_episode": 1,
+        "retry_episode_cap": 5,
+        "audit_task_id": str(audit_task_id),
+        "promotion_pending": {
+            "pr_number": 123,
+            "pr_url": "https://example.test/pull/123",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    async def collect_surfaces():
+        from app.routers.admin_release_version import _version_lifecycle_cache
+
+        _version_lifecycle_cache.clear()
+        token = create_agent_token(str(task.id), task.vm_instance_id)
+        agent_phase_res = await client.get(f"/api/agent/projects/{project.id}/version-phase", headers={"x-agent-token": token})
+        assert agent_phase_res.status_code == 200, agent_phase_res.text
+        agent_phase = agent_phase_res.json()["data"]["current_version"]
+
+        agent_qualification_res = await client.get(f"/api/agent/projects/{project.id}/qualification", headers={"x-agent-token": token})
+        assert agent_qualification_res.status_code == 200, agent_qualification_res.text
+        agent_qualification = agent_qualification_res.json()
+
+        with patch("app.release_qualifier.compute_promotion_readiness", new=AsyncMock(return_value={"ready": False, "reason": "test"})):
+            admin_res = await client.get(f"/api/admin/projects/{project.id}/version-lifecycle")
+        assert admin_res.status_code == 200, admin_res.text
+        admin_phase = admin_res.json()["current_version"]
+
+        snapshot = await compute_system_state(db_session, project.id)
+        loaded = await current_open_version(db_session, project.id, include_artifacts=True)
+        aggregate, artifacts = version_serving_summary(loaded, project)
+        strategic_read = await resolve_open_version_qualification_read_model(db_session, loaded, project, serving=(aggregate, artifacts))
+        strategic_phase = to_phase_block(
+            loaded,
+            aggregate_serving_status=aggregate["serving_status"],
+            aggregate_deploy_failure_reason=aggregate["reason_code"],
+            artifact_evidence=artifacts,
+        )
+        strategic_phase.update(
+            {
+                "qualification_state": strategic_read.qualification_state,
+                "qualification_provenance": strategic_read.provenance,
+                "dimension_states": strategic_read.dimension_states,
+                "qualification_attempts": loaded.qualification_attempts,
+                "qualification_retry_episode": loaded.qualification_retry_episode,
+                "active_qualification_attempt_id": str(
+                    loaded.active_qualification_attempt_id
+                ),
+            }
+        )
+        strategic_phase["qualification_trigger_state"] = await compute_qualification_trigger_state(db_session, project.id)
+        compacted_strategic = _compact_version_phase(strategic_phase)
+        return {"agent_phase": agent_phase, "admin_phase": admin_phase, "system_state": snapshot.to_dict()["version"], "strategic": compacted_strategic}, agent_qualification
+
+    pending_surfaces, pending_agent_qualification = await collect_surfaces()
+    for surface, payload in pending_surfaces.items():
+        assert payload["qualification_state"]["state"] == "promotion_in_flight", surface
+        provenance = payload["qualification_provenance"]
+        assert provenance["active_projection"] == {
+            "attempt_id": str(active_attempt),
+            "candidate_sha": candidate,
+            "currency": "current",
+        }
+        assert provenance["selected_verdict"]["attempt_id"] is None
+        assert provenance["selected_verdict"]["currency"] == "none"
+        assert provenance["lifetime_attempts"] == 2
+        assert provenance["retry_episode"] == {"count": 1, "cap": 5}
+        audit_dimension = next(row for row in payload["dimension_states"] if row["key"] == "audit")
+        assert audit_dimension["provenance"] == {
+            "origin_attempt_id": str(prior_attempt),
+            "candidate_sha": candidate,
+            "producing_task_id": str(audit_task_id),
+            "currency": "reused",
+        }
+        assert provenance["child_tasks"]["audit"] == {
+            "task_id": str(audit_task_id),
+            "attempt_id": str(active_attempt),
+            "candidate_sha": candidate,
+            "currency": "current",
+        }
+
+    assert pending_agent_qualification["source"] == "last_qualification"
+    assert pending_agent_qualification["status"] == "pending"
+    assert pending_agent_qualification["qualification_provenance"]["selected_verdict"]["currency"] == "none"
+    assert pending_agent_qualification["qualification_trigger_state"]["qualification_provenance"]["active_projection"]["attempt_id"] == str(active_attempt)
+    assert pending_surfaces["strategic"]["qualification_trigger_state"]["qualification_provenance"]["active_projection"]["attempt_id"] == str(active_attempt)
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            qualification_attempt_id=active_attempt,
+            candidate_sha=candidate,
+            confidence=0.96,
+            sub_scores={"audit": 0.93},
+            terminal_status="promoted",
+            finalized_at=datetime(2026, 7, 15, 11, 0, 0, tzinfo=timezone.utc),
+            audit_findings=[{"severity": "LOW", "summary": "active attempt"}],
+        )
+    )
+    await db_session.commit()
+
+    finalized_surfaces, finalized_agent_qualification = await collect_surfaces()
+    for surface, payload in finalized_surfaces.items():
+        state = payload["qualification_state"]["state"]
+        assert state.startswith("promoted") or state == "promotion_confirmation_timed_out", (
+            surface,
+            state,
+        )
+        selected = payload["qualification_provenance"]["selected_verdict"]
+        assert selected["attempt_id"] == str(active_attempt)
+        assert selected["candidate_sha"] == candidate
+        assert selected["currency"] == "current"
+
+    assert finalized_agent_qualification["source"] == "qualification_verdict"
+    assert finalized_agent_qualification["status"] == "promoted"
+    assert finalized_agent_qualification["qualification_provenance"]["selected_verdict"]["attempt_id"] == str(active_attempt)
+
+    different_candidate_attempt = uuid.uuid4()
+    different_candidate = "f" * 40
+    version.active_qualification_attempt_id = different_candidate_attempt
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": different_candidate,
+        "qualification_attempt_id": str(different_candidate_attempt),
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    changed_surfaces, _ = await collect_surfaces()
+    for surface, payload in changed_surfaces.items():
+        assert payload["qualification_state"]["state"] == "qualifying", surface
+        assert payload["qualification_provenance"]["selected_verdict"]["currency"] == "none"
+        audit = next(row for row in payload["dimension_states"] if row["key"] == "audit")
+        assert audit["status"] == "pending" and "provenance" not in audit
+
+    version.active_qualification_attempt_id = None
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate,
+        "confidence": 0.7,
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+    legacy_surfaces, legacy_agent_qualification = await collect_surfaces()
+    for surface, payload in legacy_surfaces.items():
+        assert payload["qualification_state"]["state"] == "not_promoted", surface
+        assert payload["qualification_provenance"]["active_projection"]["currency"] == "legacy_unknown"
+        assert payload["qualification_provenance"]["selected_verdict"]["currency"] == "legacy_unknown"
+    assert legacy_agent_qualification["qualification_provenance"]["active_projection"]["currency"] == "legacy_unknown"
 
 
 # ---------------------------------------------------------------------------

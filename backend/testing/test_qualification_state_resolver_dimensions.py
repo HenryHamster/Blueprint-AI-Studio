@@ -9,7 +9,7 @@ _ALL_KEYS = {
     "migration_identity", "migration_apply", "merge_grade",
     "challenge", "acceptance_window",
     "criterion_coverage", "debt_pressure", "goal_alignment",
-    "capability_proof",
+    "capability_proof", "env_preflight",
 }
 
 
@@ -19,7 +19,7 @@ def _by_key(states):
 
 def test_none_last_qualification_returns_all_pending():
     result = resolve_dimension_states(None)
-    assert len(result) == 13
+    assert len(result) == 14
     d = _by_key(result)
     for key in _ALL_KEYS:
         assert d[key]["status"] == "pending", key
@@ -214,6 +214,104 @@ def test_smoketest_disabled_not_applicable():
     result = resolve_dimension_states(qual)
     d = _by_key(result)
     assert d["smoketest"]["status"] == "not_applicable"
+
+
+def test_env_preflight_dark_by_default_is_not_applicable():
+    # Slice 3 ships DARK: a finalized record with no env_preflight_enabled key
+    # (the default, and every legacy record) renders the dimension not_applicable.
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "not_applicable"
+
+
+def test_env_preflight_enabled_all_present_passed():
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 1.0,
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "passed"
+    assert d["env_preflight"]["score"] == pytest.approx(1.0)
+
+
+def test_env_preflight_boot_prereq_missing_blocker_is_failed():
+    # The boot_prereq_missing blocker maps to the env_preflight dimension.
+    qual = {
+        "status": "not_promoted",
+        "blocker": "boot_prereq_missing",
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 0.0,
+            "env_preflight_missing": ["GITHUB_PAT_ENCRYPTION_KEY"],
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "failed"
+    assert d["env_preflight"]["reason"] == "boot_prereq_missing"
+
+
+def test_env_preflight_boot_prereq_evidence_missing_blocker_is_failed():
+    # The boot_prereq_evidence_missing blocker maps to the env_preflight dimension.
+    qual = {
+        "status": "not_promoted",
+        "blocker": "boot_prereq_evidence_missing",
+        "sub_scores": {
+            "audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8,
+            "env_preflight": 0.0,
+        },
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "failed"
+    assert d["env_preflight"]["reason"] == "boot_prereq_evidence_missing"
+
+
+def test_env_preflight_enabled_no_manifest_is_unavailable():
+    # Enabled but no env_preflight sub_score (candidate declared no manifest) →
+    # unavailable, never a spurious block.
+    qual = {
+        "status": "promoted",
+        "blocker": None,
+        "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+        "ci_resolution": {"state": "green"},
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+        "smoketest_enabled": True,
+        "env_preflight_enabled": True,
+    }
+    result = resolve_dimension_states(qual)
+    d = _by_key(result)
+    assert d["env_preflight"]["status"] == "unavailable"
 
 
 def test_goal_alignment_unavailable_when_absent():
@@ -502,7 +600,7 @@ def test_debt_pressure_when_present():
 
 def test_returns_all_13_dimensions():
     result = resolve_dimension_states(None)
-    assert len(result) == 13
+    assert len(result) == 14
     keys = {s["key"] for s in result}
     assert keys == _ALL_KEYS
 
@@ -531,7 +629,8 @@ def test_merge_grade_not_applicable():
 @pytest.mark.asyncio
 async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     """When ledger rows exist for the version's candidate SHA, the operator-facing
-    dimension states are derived from the ledger for the 8 overlapping dimensions.
+    dimension states are derived from the ledger for the 10 overlapping dimensions
+    that have ledger rows populated.
     The 2 blob-only dimensions (criterion_coverage, goal_alignment) stay derived
     from last_qualification."""
     from app.models import Project, ReleaseVersion, QualificationDimensionResult
@@ -591,7 +690,7 @@ async def test_operator_dimension_state_reads_ledger_when_populated(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # 10 ledger-backed dimensions use ledger values (with status mapping).
@@ -656,7 +755,7 @@ async def test_ledger_empty_falls_back_to_blob(db_session):
     # Deliberately NO ledger rows.
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # All derived from blob — same as calling resolve_dimension_states directly.
@@ -714,7 +813,7 @@ async def test_ledger_different_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # CI is "passed" from blob (ci_resolution.state=green), NOT "failed" from ledger.
@@ -742,7 +841,7 @@ async def test_ledger_no_candidate_sha_falls_back(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
     assert d["ci"]["status"] == "pending"
 
@@ -875,7 +974,7 @@ async def test_proof_gate_ledger_backed_path_works(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
     assert d["capability_proof"]["status"] == "passed"
 
@@ -1077,7 +1176,7 @@ async def test_challenge_and_acceptance_window_surface_from_ledger(db_session):
     await db_session.flush()
 
     result = await resolve_dimension_states_from_ledger(db_session, version)
-    assert len(result) == 13
+    assert len(result) == 14
     d = {s["key"]: s for s in result}
 
     # Blob would have returned "unavailable" for both; ledger overrides to "passed".
@@ -1525,86 +1624,32 @@ async def test_strategic_recent_version_entry_no_ledger_matches_blob(db_session)
     assert qual_state is not None
     assert qual_state["sub_scores"]["audit"] == pytest.approx(0.9)
     assert qual_state["sub_scores"]["test_erosion"] == pytest.approx(0.85)
-@pytest.mark.asyncio
-async def test_qualifying_dimensions_are_scoped_to_started_at_generation(db_session):
-    """An in-flight attempt must not inherit stale same-candidate ledger rows."""
-    from datetime import UTC, datetime, timedelta
 
-    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+@pytest.mark.asyncio
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_ci(db_session):
+    """When a CI ledger row has currency='reused' (stale prior-attempt fact),
+    resolve_dimension_states_from_ledger falls back to the blob-derived state
+    for the ci dimension rather than surfacing the stale passed row.
+
+    Scenario: Attempt-1 passed CI; the re-drive (Attempt-2) re-measured CI as
+    blocking.  The ledger still holds the Attempt-1 row marked as
+    reused_by=[Attempt-2].  The blob records the fresh Attempt-2 result:
+    ci_resolution.state='red'.  The resolver must use the blob (blocked) for ci,
+    not the stale ledger (passed).
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
     from app.qualification_state_resolver import resolve_dimension_states_from_ledger
 
-    project = Project(name="Attempt generation project", user_id="test-user-123")
+    project = Project(name="Test Project", user_id="test-user-123")
     db_session.add(project)
     await db_session.flush()
 
-    started_at = datetime.now(UTC).replace(tzinfo=None)
-    version = ReleaseVersion(
-        project_id=project.id,
-        version_number=1,
-        phase="stabilize",
-        status="open",
-        last_qualification={
-            "status": "qualifying",
-            "started_at": started_at.isoformat(),
-            "candidate_sha": "sha-generation",
-        },
-    )
-    db_session.add(version)
-    await db_session.flush()
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
 
-    db_session.add_all([
-        QualificationDimensionResult(
-            project_id=project.id,
-            release_version_id=version.id,
-            candidate_sha="sha-generation",
-            dimension="audit",
-            status="failed",
-            sub_score=0.96,
-            blocker=None,
-            computed_at=started_at + timedelta(seconds=1),
-        ),
-        QualificationDimensionResult(
-            project_id=project.id,
-            release_version_id=version.id,
-            candidate_sha="sha-generation",
-            dimension="ci",
-            status="unavailable",
-            blocker=None,
-            computed_at=started_at + timedelta(seconds=1),
-        ),
-        QualificationDimensionResult(
-            project_id=project.id,
-            release_version_id=version.id,
-            candidate_sha="sha-generation",
-            dimension="merge_grade",
-            status="failed",
-            sub_score=0.2,
-            blocker="merge_grade_misses",
-            computed_at=started_at - timedelta(minutes=5),
-        ),
-    ])
-    await db_session.flush()
-
-    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
-    assert states["audit"]["status"] == "passed"
-    assert states["audit"]["score"] == pytest.approx(0.96)
-    assert states["ci"]["status"] == "pending"
-    assert states["merge_grade"]["status"] == "pending"
-
-
-@pytest.mark.asyncio
-async def test_finalized_dimensions_keep_terminal_same_candidate_failure(db_session):
-    """Generation filtering applies only while the attempt is in flight."""
-    from datetime import UTC, datetime, timedelta
-
-    from app.models import Project, QualificationDimensionResult, ReleaseVersion
-    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
-
-    project = Project(name="Finalized generation project", user_id="test-user-123")
-    db_session.add(project)
-    await db_session.flush()
-
-    started_at = datetime.now(UTC).replace(tzinfo=None)
     version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -1612,8 +1657,220 @@ async def test_finalized_dimensions_keep_terminal_same_candidate_failure(db_sess
         status="open",
         last_qualification={
             "status": "not_promoted",
-            "started_at": started_at.isoformat(),
-            "candidate_sha": "sha-finalized-generation",
+            "candidate_sha": "sha-reused-ci",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh re-drive result: CI is now red.
+            "ci_resolution": {"state": "red"},
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": "ci_not_green",
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt CI row: passed (from Attempt-1), now marked reused by Attempt-2.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-ci",
+        dimension="ci",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # The fresh blob state is ci_resolution.state='red' → ci is blocked/failed.
+    assert d["ci"]["status"] == "failed", (
+        "stale reused CI ledger row must not override fresh blob-derived failed state"
+    )
+    # Provenance is still recorded with currency=reused so callers know why.
+    assert d["ci"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_current_currency_uses_ledger_ci(db_session):
+    """When a CI ledger row has currency='current' (origin_attempt_id matches active),
+    the ledger value IS used — this is the normal case."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-current-ci",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Blob says red, but the CURRENT ledger row says passed —
+            # the ledger is authoritative when currency='current'.
+            "ci_resolution": {"state": "red"},
+            "sub_scores": {"audit": 0.9},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Current CI row: origin_attempt_id == active_attempt_id → currency=current.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-current-ci",
+        dimension="ci",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=active_attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Ledger (current) wins over stale blob.
+    assert d["ci"]["status"] == "passed", (
+        "current CI ledger row must override the blob-derived state"
+    )
+    assert d["ci"]["provenance"]["currency"] == "current"
+
+
+@pytest.mark.asyncio
+async def test_qualifying_attempt_only_surfaces_terminal_dimension_facts(
+    db_session,
+):
+    """Pending UI state is attempt-scoped, while same-attempt proof can advance.
+
+    This covers the production v26 shape: a new durable attempt is active while
+    the JSON projection can still carry an older attempt id, and the candidate's
+    ledger contains a mixture of current, unavailable, and explicitly reused
+    facts. Only terminal rows produced by the durable active attempt may replace
+    the all-pending projection.
+    """
+    import uuid
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Attempt scoped project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    stale_blob_attempt = uuid.uuid4()
+    active_attempt = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt,
+        last_qualification={
+            "status": "qualifying",
+            "candidate_sha": "sha-attempt-scoped",
+            "qualification_attempt_id": str(stale_blob_attempt),
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add_all([
+        # Audit deductions are valid scored evidence, not a hard failure. This
+        # exact 0.96 shape previously rendered as a red failed dimension.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="audit",
+            status="failed",
+            sub_score=0.96,
+            blocker=None,
+            origin_attempt_id=active_attempt,
+        ),
+        # Nonterminal same-attempt facts must remain pending while qualification
+        # is still running.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="ci",
+            status="unavailable",
+            blocker=None,
+            origin_attempt_id=active_attempt,
+        ),
+        # An explicit reuse is provenance, not current-attempt terminal proof.
+        QualificationDimensionResult(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="sha-attempt-scoped",
+            dimension="merge_grade",
+            status="failed",
+            sub_score=0.2,
+            blocker="merge_grade_misses",
+            origin_attempt_id=stale_blob_attempt,
+            reused_by_attempt_ids=[str(active_attempt)],
+        ),
+    ])
+    await db_session.flush()
+
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+
+    assert states["audit"]["status"] == "passed"
+    assert states["audit"]["score"] == pytest.approx(0.96)
+    assert states["audit"]["provenance"]["currency"] == "current"
+    # CI ledger row status='unavailable' is skipped by the in-flight guard; blob status='qualifying' → pending.
+    assert states["ci"]["status"] == "pending"
+    assert states["ci"]["provenance"]["currency"] == "current"
+    assert states["merge_grade"]["status"] == "pending"
+    assert states["merge_grade"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+
+async def test_finalized_attempt_does_not_hide_reused_terminal_failure(db_session):
+    """The in-flight guard must not erase real terminal failures after finalize."""
+    import uuid
+
+    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Finalized attempt project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt = uuid.uuid4()
+    active_attempt = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt,
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-finalized-reuse",
+            "qualification_attempt_id": str(active_attempt),
         },
     )
     db_session.add(version)
@@ -1621,41 +1878,88 @@ async def test_finalized_dimensions_keep_terminal_same_candidate_failure(db_sess
     db_session.add(QualificationDimensionResult(
         project_id=project.id,
         release_version_id=version.id,
-        candidate_sha="sha-finalized-generation",
+        candidate_sha="sha-finalized-reuse",
         dimension="merge_grade",
         status="failed",
         sub_score=0.2,
         blocker="merge_grade_misses",
-        computed_at=started_at - timedelta(minutes=5),
+        origin_attempt_id=prior_attempt,
+        reused_by_attempt_ids=[str(active_attempt)],
     ))
     await db_session.flush()
 
     states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
     assert states["merge_grade"]["status"] == "failed"
     assert states["merge_grade"]["reason"] == "merge_grade_misses"
+    assert states["merge_grade"]["provenance"]["currency"] == "reused"
 
 
 @pytest.mark.asyncio
 async def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
     """Missing generation identity must stay pending rather than claim stale proof."""
-    from app.models import Project, QualificationDimensionResult, ReleaseVersion
+    import uuid
+
+    from app.models import Project, ReleaseVersion
     from app.qualification_state_resolver import resolve_dimension_states_from_ledger
 
     project = Project(name="Missing generation project", user_id="test-user-123")
     db_session.add(project)
     await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        active_qualification_attempt_id=active_attempt_id,
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-id",
+            "qualification_attempt_id": str(active_attempt_id),
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+    states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
+    # No ledger rows; blob has status="not_promoted" with no merge_grade_status → unavailable.
+    assert states["merge_grade"]["status"] == "unavailable"
+
+async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_identity(db_session):
+    """Parallel of the CI test: a reused migration_identity ledger row falls back
+    to the blob-derived state (unavailable) rather than surfacing the stale passed."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
         phase="stabilize",
         status="open",
         last_qualification={
-            "status": "qualifying",
-            "candidate_sha": "sha-missing-generation",
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-id",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh result: migration_safety is not 'ok' → resolves to unavailable/failed.
+            "ci_resolution": {"state": "green"},
+            "migration_safety": None,
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9},
+            "blocker": None,
+            "smoketest_enabled": True,
         },
     )
     db_session.add(version)
     await db_session.flush()
+
     db_session.add(QualificationDimensionResult(
         project_id=project.id,
         release_version_id=version.id,
@@ -1666,4 +1970,285 @@ async def test_qualifying_dimensions_fail_closed_without_started_at(db_session):
     await db_session.flush()
 
     states = _by_key(await resolve_dimension_states_from_ledger(db_session, version))
-    assert states["ci"]["status"] == "pending"
+    # Row with different candidate_sha is excluded; falls back to blob (ci_resolution=green).
+    assert states["ci"]["status"] == "passed"
+
+    # Stale prior-attempt migration_identity row: passed.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-mig-id",
+        dimension="migration_identity",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Blob-derived: migration_safety=None → not_applicable or unavailable, NOT passed.
+    assert d["migration_identity"]["status"] != "passed", (
+        "stale reused migration_identity ledger row must not override blob-derived state"
+    )
+    assert d["migration_identity"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_migration_apply(db_session):
+    """Parallel of the CI test: a reused migration_apply ledger row falls back
+    to the blob-derived state rather than surfacing the stale passed."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-mig-apply",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh result: migration_apply_safety is 'unsafe' → fails.
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "unsafe",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9},
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt migration_apply row: passed.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-mig-apply",
+        dimension="migration_apply",
+        status="passed",
+        sub_score=None,
+        blocker=None,
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Blob-derived: migration_apply_safety='unsafe' → failed, NOT passed.
+    assert d["migration_apply"]["status"] != "passed", (
+        "stale reused migration_apply ledger row must not override blob-derived state"
+    )
+    assert d["migration_apply"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_ledger_attempt_in_flight_status_single_computation(db_session):
+    """resolve_dimension_states_from_ledger computes status/attempt_in_flight once.
+    Verifies the surviving computation (not the removed duplicate) correctly gates
+    in-flight attempt filtering: when status='qualifying', rows are included; when
+    status='promotion_pending', attempt_in_flight=False so rows are not skipped."""
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    attempt_id = uuid.uuid4()
+
+    # promotion_pending=True means attempt_in_flight=False — rows must still be read.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "qualifying",
+            "promotion_pending": True,
+            "candidate_sha": "sha-inflight-test",
+            "qualification_attempt_id": str(attempt_id),
+            "ci_resolution": {"state": "green"},
+            "migration_safety": "ok",
+            "migration_apply_safety": "ok",
+            "merge_grade_status": "pass",
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.85, "smoketest": 0.8},
+            "blocker": None,
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-inflight-test",
+        dimension="audit",
+        status="passed",
+        sub_score=0.99,
+        blocker=None,
+        origin_attempt_id=attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Ledger row must be surfaced: attempt_in_flight=False (promotion_pending) so
+    # no active-attempt filter applies, and the row's sub_score=0.99 is visible.
+    assert d["audit"]["status"] == "passed"
+    assert d["audit"]["score"] == pytest.approx(0.99)
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_reused_currency_falls_back_to_blob_env_preflight(db_session):
+    """env_preflight is environment-dependent (mutable): a reused ledger row must
+    NOT override the freshly-measured blob state.
+
+    Scenario (defect this task fixes): Attempt-1 BLOCKED env_preflight
+    (boot_prereq_missing).  An operator then repaired the deploy environment and
+    the same-candidate re-drive (Attempt-2) re-measured env_preflight as passed.
+    The ledger still holds the Attempt-1 blocked row marked reused_by=[Attempt-2].
+    The read model must surface the fresh passed blob, NOT the stale blocked row.
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    prior_attempt_id = uuid.uuid4()
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-reused-envpf",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Fresh re-drive result: env is repaired → env_preflight scores 1.0.
+            "env_preflight_enabled": True,
+            "sub_scores": {"env_preflight": 1.0, "audit": 0.9},
+            "migration_apply_safety": "ok",
+            "smoketest_enabled": True,
+            "blocker": None,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Stale prior-attempt env_preflight row: blocked (boot_prereq_missing).
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-reused-envpf",
+        dimension="env_preflight",
+        status="blocked",
+        sub_score=None,
+        blocker="boot_prereq_missing",
+        origin_attempt_id=prior_attempt_id,
+        reused_by_attempt_ids=[str(active_attempt_id)],
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # The fresh blob state (env_preflight sub_score 1.0) → passed; the stale
+    # reused blocked ledger row must NOT be overlaid.
+    assert d["env_preflight"]["status"] == "passed", (
+        "stale reused env_preflight ledger row must not override the fresh "
+        "blob-derived passed state after the environment was repaired"
+    )
+    assert d["env_preflight"]["provenance"]["currency"] == "reused"
+
+
+@pytest.mark.asyncio
+async def test_mutable_dim_current_currency_uses_ledger_env_preflight(db_session):
+    """A CURRENT env_preflight ledger row (re-measured this attempt) overrides a
+    stale failed blob — the current provenance must not preserve the old failure.
+
+    Scenario: the blob still carries the prior boot_prereq_missing block, but the
+    active attempt re-measured env_preflight and wrote a fresh 'passed' ledger row
+    (origin_attempt_id == active).  The read model must surface passed.
+    """
+    import uuid
+    from app.models import Project, ReleaseVersion, QualificationDimensionResult
+    from app.qualification_state_resolver import resolve_dimension_states_from_ledger
+
+    project = Project(name="Test Project", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.flush()
+
+    active_attempt_id = uuid.uuid4()
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="open",
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "sha-current-envpf",
+            "qualification_attempt_id": str(active_attempt_id),
+            # Stale blob: still shows the prior boot-prereq block.
+            "env_preflight_enabled": True,
+            "sub_scores": {"env_preflight": 0.0, "audit": 0.9},
+            "blocker": "boot_prereq_missing",
+            "migration_apply_safety": "ok",
+            "smoketest_enabled": True,
+        },
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    # Confirm the blob alone would show env_preflight failed (the stale failure
+    # the current ledger row must supersede).
+    from app.qualification_state_resolver import resolve_dimension_states
+    blob = {s["key"]: s for s in resolve_dimension_states(version.last_qualification)}
+    assert blob["env_preflight"]["status"] == "failed"
+
+    # Fresh CURRENT env_preflight row: origin_attempt_id == active → currency=current.
+    db_session.add(QualificationDimensionResult(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="sha-current-envpf",
+        dimension="env_preflight",
+        status="passed",
+        sub_score=1.0,
+        blocker=None,
+        origin_attempt_id=active_attempt_id,
+    ))
+    await db_session.flush()
+
+    result = await resolve_dimension_states_from_ledger(db_session, version)
+    d = {s["key"]: s for s in result}
+
+    # Current ledger row wins over the stale failed blob.
+    assert d["env_preflight"]["status"] == "passed", (
+        "current env_preflight ledger row must override the stale failed blob"
+    )
+    assert d["env_preflight"]["provenance"]["currency"] == "current"

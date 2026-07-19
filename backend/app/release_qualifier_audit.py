@@ -37,6 +37,7 @@ from app.runtime_config_state import resolve_project_promotion_enabled
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 from app.json_extract import async_json_loads
+from app.deployed_sha import get_serving_sha
 
 # Preserve the historical logger name so existing caplog filters and log
 # processing continue to see these events under release_qualifier.
@@ -192,6 +193,7 @@ def _infra_failure_signature(
 
     Child task failures are useful evidence, but are unrelated to a deterministic
     gate error (and can vary between attempts).  Including them made a stable
+
     migration gate look transient and prevented incapacity escalation.  The
     suffix after the first colon is diagnostic detail too (scratch database names,
     exception text, and other per-attempt values), so only the stable error code
@@ -285,6 +287,7 @@ async def _spawn_release_audit_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     audit_base_sha: str | None = None,
     version_goal: str | None = None,
 ) -> Task:
@@ -296,6 +299,7 @@ async def _spawn_release_audit_task(
         # Audit C4: pin the audit to the exact qualified commit.  The agent
         # reads this from the payload and checks out this SHA.
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # Explicitly pin to Opus — regression guard against silent downgrade.
         "quality_tier": "opus",
     }
@@ -335,6 +339,7 @@ async def _spawn_release_audit_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
             "scope": "medium",
         },
     )
@@ -350,6 +355,7 @@ async def _spawn_release_audit_task(
                 "diff_range": diff_range,
                 "audit_base_sha": audit_base_sha,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
             },
         )
     )
@@ -364,6 +370,7 @@ async def _spawn_release_audit_challenge_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     primary_audit_task_id: str | None = None,
     primary_findings: list[dict[str, str]] | None = None,
     version_goal: str | None = None,
@@ -380,6 +387,7 @@ async def _spawn_release_audit_challenge_task(
         "base_branch": base_branch,
         "diff_range": diff_range,
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # Explicitly pin to Opus — regression guard against silent downgrade.
         "quality_tier": "opus",
     }
@@ -422,6 +430,7 @@ async def _spawn_release_audit_challenge_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
             "scope": "medium",
         },
     )
@@ -438,6 +447,7 @@ async def _spawn_release_audit_challenge_task(
                 "task_type": "release_audit_challenge",
                 "diff_range": diff_range,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
                 **(
                     {"primary_audit_task_id": primary_audit_task_id}
                     if primary_audit_task_id is not None
@@ -455,6 +465,7 @@ async def _spawn_qualifier_smoketest_task(
     *,
     version_id: uuid.UUID,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
 ) -> Task:
     """Create + queue a qualify-time ``smoketest`` task on the candidate commit."""
     project = await session.get(Project, project_id)
@@ -465,6 +476,7 @@ async def _spawn_qualifier_smoketest_task(
         # Audit C4: pin the smoketest to the exact qualified commit.  The agent
         # clones the integration branch then checks out this SHA.
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
     }
     type_model = (_runtime_config.get("task_type_models", {}) or {}).get("smoketest")
     if type_model:
@@ -492,6 +504,7 @@ async def _spawn_qualifier_smoketest_task(
             "release_version_id": str(version_id),
             "qualifier_smoketest": True,
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
         },
     )
     session.add(task)
@@ -505,6 +518,7 @@ async def _spawn_qualifier_smoketest_task(
                 "task_type": "smoketest",
                 "qualifier_smoketest": True,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
             },
         )
     )
@@ -519,9 +533,11 @@ async def _spawn_release_merge_grade_task(
     base_branch: str,
     diff_range: str,
     candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
     version_goal: str,
     merged_pr_numbers: list[int],
     categories: list[dict[str, Any]] | None = None,
+    rubric_fingerprint: str | None = None,
 ) -> Task:
     """Create + queue a blind ``release_merge_grade`` task for the qualifier.
 
@@ -548,6 +564,7 @@ async def _spawn_release_merge_grade_task(
         "diff_range": diff_range,
         # Pin the grade to the exact qualified commit (mirrors release_audit).
         "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
         # The ONLY narrative the grader is allowed to see: the frozen goal.
         "version_goal": version_goal,
         # The merged-PR window for this version (same acceptance-window /
@@ -559,6 +576,7 @@ async def _spawn_release_merge_grade_task(
         # partial + cited diff evidence + gap).  Empty list ⇒ no rubric; the agent
         # then grades only the holistic goal coverage.
         "categories": list(categories or []),
+        "rubric_fingerprint": rubric_fingerprint,
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
         "quality_tier": "opus",
@@ -603,6 +621,8 @@ async def _spawn_release_merge_grade_task(
         context={
             "release_version_id": str(version_id),
             "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
+            "rubric_fingerprint": rubric_fingerprint,
             "scope": "medium",
         },
     )
@@ -617,7 +637,9 @@ async def _spawn_release_merge_grade_task(
                 "task_type": "release_merge_grade",
                 "diff_range": diff_range,
                 "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
                 "merged_pr_count": len(merged_pr_numbers),
+                "rubric_fingerprint": rubric_fingerprint,
             },
         )
     )
@@ -903,12 +925,14 @@ async def _handle_infra_failure(
         and qual.get("candidate_sha")
         and previous_candidate_sha != qual.get("candidate_sha")
     )
+    engine_sha = get_serving_sha()
     prior_history = _bounded_infra_history(qual.get("infra_attempt_history"))
     attempt_entry = {
         "finalized_at": finalized_at,
         "error": infra_error,
         "signature": signature,
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "failing_leg": _infer_infra_leg(infra_error),
         "child_failures": child_failures,
     }
@@ -932,6 +956,7 @@ async def _handle_infra_failure(
             same_signature_streak >= _MIN_INFRA_ERROR_STREAK
         )
 
+
     infra_evidence = {
         "error": infra_error,
         "signature": signature,
@@ -952,7 +977,11 @@ async def _handle_infra_failure(
     failing_dimension = _infer_dimension_from_infra_error(infra_error)
 
     record: dict[str, Any] = {
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "retry_episode": qual.get("retry_episode", 0),
+        "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
+        "engine_sha": engine_sha,
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),
         "status": "infra_failure",
@@ -997,15 +1026,15 @@ async def _handle_infra_failure(
     # Skip when failing_dimension is None (e.g. ledger-integrity codes) — there
     # is no single dimension to blame and writing 'audit' would overwrite a
     # legitimately-resolved audit fact.
-    _rq = _release_qualifier_module()
     dimension_infra_streak = (
-        await _rq._record_infra_dimension_unavailable(
+        await _release_qualifier_module()._record_infra_dimension_unavailable(
             session,
             version,
             qual.get("candidate_sha"),
             failing_dimension,
             infra_error=infra_error,
             signature=signature,
+            origin_attempt_id=qual.get("qualification_attempt_id"),
         )
         if failing_dimension is not None
         else None
@@ -1026,6 +1055,12 @@ async def _handle_infra_failure(
                 version.version_number,
                 exc_info=True,
             )
+        # Persist the hotfix eligibility preview into the qualification record so
+        # post-mortem analysis can see the eligible changes without re-computing.
+        if hotfix_preview and hotfix_preview.get("eligible"):
+            infra_evidence["hotfix_preview"] = hotfix_preview
+            record["hotfix_preview"] = hotfix_preview
+            flag_modified(version, "last_qualification")
 
     # Phase 1b read: compose already-resolved dimension facts from the per-dimension
     # ledger into the record and verdict sub_scores, so a passed audit/CI/etc. is
@@ -1036,10 +1071,10 @@ async def _handle_infra_failure(
     _ledger_candidate_sha = qual.get("candidate_sha")
     if _ledger_candidate_sha:
         try:
-            _prior = await _rq._load_prior_dimension_results(
+            _prior = await _release_qualifier_module()._load_prior_dimension_results(
                 session, version, _ledger_candidate_sha
             )
-            _resolved_statuses = _rq._LEDGER_RESOLVED_STATUSES
+            _resolved_statuses = _release_qualifier_module()._LEDGER_RESOLVED_STATUSES
             for _dim, _row in _prior.items():
                 if _row.status in _resolved_statuses:
                     resolved_dimensions[_dim] = {
@@ -1059,6 +1094,7 @@ async def _handle_infra_failure(
         and current_streak % _MIN_INFRA_ERROR_STREAK == 0
     ):
         if is_permanent_gate_incapacity:
+
             preview_text = (
                 f"Eligible narrow diff: {hotfix_preview.get('changed_files', [])}. "
                 if hotfix_preview and hotfix_preview.get("eligible")
@@ -1072,7 +1108,7 @@ async def _handle_infra_failure(
                 f"{preview_text}Sanctioned remediation: use the hotfix scope "
                 f"preview and approved hotfix endpoint (POST /projects/{{id}}/promote/hotfix), "
                 f"not whole-tree force-promotion. "
-                f"Signature: {signature}."
+                f"Signature: {signature}. Engine: {engine_sha or 'unknown'}."
             )
         else:
             alert_message = (
@@ -1105,6 +1141,7 @@ async def _handle_infra_failure(
             infra_error,
         )
 
+
     rq = _release_qualifier_module()
     if is_permanent_gate_incapacity:
         preview_text = (
@@ -1119,7 +1156,7 @@ async def _handle_infra_failure(
             f"will not self-resolve by retry. "
             f"Use the sanctioned hotfix scope preview and endpoint "
             f"(POST /projects/{{id}}/promote/hotfix), not whole-tree force-promotion."
-            f"{preview_text}"
+            f"{preview_text} Engine: {engine_sha or 'unknown'}."
         )
     else:
         notify_message = (
@@ -1129,6 +1166,7 @@ async def _handle_infra_failure(
             f"re-qualification. Consecutive infra errors: {current_streak}. "
             f"Signature: {signature}; same as previous: {same_error_as_prior}."
         )
+
     await rq._notify_operator(
         session,
         version,
@@ -1143,11 +1181,12 @@ async def _handle_infra_failure(
             "consecutive_infra_errors": current_streak,
             "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
             "same_signature_streak": same_signature_streak,
+
         },
     )
 
     _webhook_task = asyncio.ensure_future(
-        rq.dispatch_external_notification(
+        _release_qualifier_module().dispatch_external_notification(
             version.project_id,
             "RELEASE_INFRA_FAILURE",
             {
@@ -1161,6 +1200,7 @@ async def _handle_infra_failure(
                 "consecutive_infra_errors": current_streak,
                 "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
                 "same_signature_streak": same_signature_streak,
+
             },
         )
     )
@@ -1188,12 +1228,18 @@ async def _handle_infra_failure(
     return {
         "status": "infra_failure",
         "error": infra_error,
+        "engine_sha": engine_sha,
         "infra_failure_signature": signature,
         "same_error_as_prior": same_error_as_prior,
         "same_error_different_candidate": same_error_different_candidate,
         "consecutive_infra_errors": current_streak,
         "is_permanent_gate_incapacity": is_permanent_gate_incapacity,
         "same_signature_streak": same_signature_streak,
+
+        # Hotfix scope preview (present only when is_permanent_gate_incapacity
+        # and the preview computation succeeded with an eligible result).
+        "hotfix_preview": hotfix_preview,
+
         # Per-dimension isolation (Phase 1): which single dimension was marked
         # unavailable, and that dimension's own infra-error streak (distinct from
         # the attempt-level ``consecutive_infra_errors`` above).
@@ -1218,6 +1264,9 @@ async def _handle_independent_blocker(
     """
     finalized_at = _utcnow().isoformat()
     record: dict[str, Any] = {
+        "qualification_attempt_id": qual.get("qualification_attempt_id"),
+        "retry_episode": qual.get("retry_episode", 0),
+        "retry_episode_cap": qual.get("retry_episode_cap"),
         "candidate_sha": qual.get("candidate_sha"),
         "ci_green": qual.get("ci_green"),
         "smoketest_enabled": qual.get("smoketest_enabled", True),

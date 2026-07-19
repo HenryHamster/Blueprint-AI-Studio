@@ -11,6 +11,7 @@ const WORKBENCH_THEME_FILES = [
   'src/components/OperatorWorkspaces.tsx',
   'src/components/PipelineWorkspace.tsx',
   'src/components/RuntimeAccountsPanel.tsx',
+  'src/components/RuntimeWorkspace.tsx',
   'src/components/StrategicContextArtifactSlot.tsx',
   'src/components/StrategicContextWorkspace.tsx',
   'src/components/WorkbenchLayout.tsx',

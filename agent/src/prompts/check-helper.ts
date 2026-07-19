@@ -10,6 +10,8 @@ import {
   detectLinterKind,
   validateCfgShellSafety,
   isBlueprintSelfRepo,
+  projectVerificationDirectories,
+  projectVerificationTargets,
   shouldRunBackendMergeGate,
   sanitizeCiFailureSelectors,
   type CodeChangeHelperConfig,
@@ -29,6 +31,13 @@ export const BLUEPRINT_BACKEND_RUFF_FORMAT_CMD = 'python3 -m ruff format --check
 // embedded in a bash generation context (not a different language inside bash).
 // Lazy-loaded so test suites which mock fs do not crash on module import.
 const _CHECK_HELPER_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+const _BACKEND_VERIFICATION_PATH = path.join(_CHECK_HELPER_DIR, 'check_backend_verification.sh');
+function loadBackendVerificationScript(): string {
+  try { return fs.readFileSync(_BACKEND_VERIFICATION_PATH, 'utf8'); } catch {
+    return '    echo "[check] required backend verification fragment missing — failing closed"\n    FAILED+=("required backend verification fragment")\n';
+  }
+}
 
 const _CI_FAILURE_VERIFY_PATH = path.join(_CHECK_HELPER_DIR, 'check_ci_failure_verify.sh');
 function loadCiFailureVerifyScript(): string {
@@ -53,6 +62,16 @@ function loadViewportUploadScript(): string {
 const _VISUAL_CAPTURE_PATH = path.join(_CHECK_HELPER_DIR, 'check_visual_capture.sh');
 function loadVisualCaptureScript(): string {
   try { return fs.readFileSync(_VISUAL_CAPTURE_PATH, 'utf8'); } catch { return ''; }
+}
+
+const _SIZE_GUARDRAIL_PATH = path.join(_CHECK_HELPER_DIR, 'check_size_guardrail.sh');
+// Unlike the sibling loaders above (which gate OPTIONAL blocks), the size
+// guardrail is an ALWAYS-ON gate: a missing/unreadable fragment must fail
+// ./check closed, not silently emit a script with no size gate at all.
+function loadSizeGuardrailScript(): string {
+  try { return fs.readFileSync(_SIZE_GUARDRAIL_PATH, 'utf8'); } catch {
+    return '\necho "[check] size guardrail fragment missing from agent build — failing closed"\nFAILED+=("size guardrail")\n';
+  }
 }
 
 /** Emit the ci_failure closed-loop verify block for the generated ./check.
@@ -141,6 +160,31 @@ function buildMergeVerifyBlock(taskId: string): string {
  *  NOT replace the standalone smoke run; the two are complementary. */
 function buildImpactedTestBlock(taskId: string): string {
   return loadImpactedTestScript().replace(/@TASK_ID@/g, taskId);
+}
+
+function buildRequiredBackendVerificationBlock(cfg: CodeChangeHelperConfig): string {
+  const blocks: string[] = [];
+  for (const { directory: dir, harness } of projectVerificationTargets(cfg)) {
+    const dirRe = dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pythonPathRe = dir === '.' ? '.*\\.py$' : `^${dirRe}/.*\\.py$`;
+    const testPathRe = dir === '.'
+      ? '^(testing|tests)/test_.*\\.py$'
+      : `^${dirRe}/(testing|tests)/test_.*\\.py$`;
+    const selectorPrefixRe = dir === '.' ? '' : `${dirRe}/`;
+    const fragment = loadBackendVerificationScript()
+      .replace(/@TASK_ID@/g, cfg.taskId)
+      .replace(/@DIR_RE@/g, dirRe)
+      .replace(/@PYTHON_PATH_RE@/g, pythonPathRe)
+      .replace(/@TEST_PATH_RE@/g, testPathRe)
+      .replace(/@SELECTOR_PREFIX_RE@/g, selectorPrefixRe)
+      .replace(/@DIR@/g, dir)
+      .replace(/@HARNESS@/g, harness);
+    const condition = dir === '.'
+      ? `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in *.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`
+      : `[ -n "$(printf '%s\\n' "$CHANGED" | while IFS= read -r f; do case "$f" in ${dir}/*.py) [ -f "$f" ] && printf x && break ;; esac; done)" ]`;
+    blocks.push(`if ${condition}; then\n${fragment}fi`);
+  }
+  return blocks.length > 0 ? `\n${blocks.join('\n\n')}\n` : '';
 }
 
 /** Emit a bash sub-block that uploads the failed viewport screenshot(s) for a
@@ -280,6 +324,7 @@ done
 # config-driven pytest gate below only if this environment still cannot run
 # the suite faithfully. ./pr surfaces it after a passing \`./check test\`.
 rm -f /tmp/check_gate_env_${cfg.taskId}.txt
+${projectVerificationDirectories(cfg).length > 0 ? `rm -f /tmp/project_verification_receipt_${cfg.taskId}.json` : ''}
 
 # Determine changed paths: committed since base + uncommitted. Verify at
 # least one diff source actually worked — silently-empty CHANGED used to
@@ -660,22 +705,7 @@ ${buildImpactedTestBlock(cfg.taskId)}  fi
 fi
 ${buildCiFailureVerifyBlock(ciFailureSelectors, cfg.taskId)}
 ${cfg.mergeVerify ? buildMergeVerifyBlock(cfg.taskId) : ''}
-
-# Fast module size-guardrail check: no DB/Docker/network, sub-second. Mirrors
-# the line-count caps that backend/testing/test_invariants.py enforces, so a
-# size breach surfaces HERE (before ./pr open) instead of only after a PR is
-# open and a full CI/Docker round-trip is burned. Runs UNCONDITIONALLY (all
-# sections, not diff-scoped): a rebase/merge can grow a file in a stack the
-# diff never touched (e.g. landing a feature whose merge balloons models.py),
-# and a size breach is a common, trivial CI failure we never want to burn a
-# fix iteration on. The checker is sub-second and skips any section whose
-# source tree is absent here, so always-on costs nothing.
-# Invoked BY REFERENCE as a committed script (exactly like the migration-chain
-# guard above) — no embedded Python heredoc (see CLAUDE.md). A breach makes
-# the checker exit non-zero, which \`run\` records in FAILED so ./check fails.
-# Remediate with: python3 backend/testing/check_size_limits.py --fix
-run "size guardrail" bash -c "python3 backend/testing/check_size_limits.py 2>&1"
-`;
+${loadSizeGuardrailScript()}`;
   // Stack-block selection (ordered, most specific first):
   //  1. build_config with directories  → config-driven per-directory blocks.
   //  2. no build_config, Blueprint self-repo → the hardcoded admin-ui/agent/
@@ -728,7 +758,7 @@ else
   exit 1
 fi
 `;
-  const script = header + stackBlocks + visualCaptureBlock + footer;
+  const script = header + stackBlocks + buildRequiredBackendVerificationBlock(cfg) + visualCaptureBlock + footer;
   // For Blueprint self-repo, `check` is a committed static entrypoint that
   // delegates to `.check-task` when present. Write the per-task generated
   // script there (gitignored) so the tracked `check` file stays clean and

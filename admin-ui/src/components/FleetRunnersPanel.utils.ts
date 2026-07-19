@@ -118,3 +118,161 @@ export function runnerSetupSnippets(
     macosLinux: shParts.join(' '),
   };
 }
+
+/**
+ * Host prerequisites the launcher requires before `start`/`install` will do
+ * anything useful. Mirrors `check_prerequisites()` in
+ * scripts/blueprint_runner.py (Node >= 22, the `claude` CLI) plus the two
+ * implicit ones the launcher assumes (a repo checkout to run from, and running
+ * the preflight first). Surfaced in the enroll dialog so a first-time operator
+ * isn't dropped at a command-not-found with an eternal "waiting…" spinner.
+ */
+export const RUNNER_PREREQUISITES: ReadonlyArray<string> = [
+  'Clone the Blueprint repo and run every command below from its root — `blueprint-runner` is the wrapper script in that checkout, not a globally-installed binary.',
+  'Node.js >= 22 on PATH — the agent binary runs on Node.',
+  'The Claude Code CLI on PATH: npm install -g @anthropic-ai/claude-code (provides the `claude` command).',
+  'Self-verify before starting: `bash blueprint-runner check` (Windows: `py -3 scripts/blueprint_runner.py check`) runs the preflight and names any missing prerequisite instead of failing silently at first heartbeat.',
+];
+
+export interface RunnerInstallSnippet {
+  /** Per-login durable service (systemd --user); survives logout on Linux. */
+  userService: string;
+  /** System-wide durable service for shared boxes; needs root (sudo). */
+  systemService: string;
+}
+
+/**
+ * Build the durable `blueprint-runner install` commands (a systemd service that
+ * survives logout/reboot) — the RECOMMENDED way to run a runner. The bare
+ * `start` command from {@link runnerSetupSnippets} is the quick/ephemeral
+ * alternative that dies with the shell.
+ *
+ * systemd is Linux-only, so both commands are bash; on macOS/Windows the
+ * foreground `start` command is the supported path (the dialog says so). --url
+ * is appended only for a non-prod backend, matching the start snippets.
+ */
+export function runnerInstallSnippet(token: string, origin: string): RunnerInstallSnippet {
+  const url = normalizeOrigin(origin);
+  const needsUrl = url !== DEFAULT_ORCHESTRATOR_URL;
+
+  const userParts = ['bash blueprint-runner install', '--token', shellQuote(token)];
+  const systemParts = ['sudo bash blueprint-runner install --system', '--token', shellQuote(token)];
+  if (needsUrl) {
+    userParts.push('--url', shellQuote(url));
+    systemParts.push('--url', shellQuote(url));
+  }
+
+  return {
+    userService: userParts.join(' '),
+    systemService: systemParts.join(' '),
+  };
+}
+
+// ── Live-config helpers ──────────────────────────────────────────────────────
+// Shared between the read-only status badges in FleetRunnersPanel and the
+// editable form in FleetRunnerConfigPanel, so both read the runner's config the
+// same way. Every value-extractor prefers the server-authoritative desired
+// config and falls back to the runner-reported capabilities for runners
+// enrolled before the live-config contract.
+
+// Per-job GPU reservation bounds. Must match backend runner_config.GPUS_PER_JOB_MIN
+// / GPUS_PER_JOB_MAX so the UI clamp agrees with the server-side clamp.
+export const GPUS_PER_JOB_MIN = 1;
+export const GPUS_PER_JOB_MAX = 8;
+
+// Agent-task concurrency bounds, mirroring the backend _normalize_max_concurrent
+// clamp so the UI never offers a value the server would reject.
+export const MAX_CONCURRENT_MIN = 1;
+export const MAX_CONCURRENT_MAX = 64;
+
+/** True when this runner's concurrency/task-types are pinned by the strategic
+ *  workload invariant (backend clamps max_concurrent→1, task_types→strategic
+ *  set). Such fields are shown read-only in the config form. */
+export function runnerPinsStrategicConfig(runner: FleetRunner): boolean {
+  return (
+    runner.capabilities?.runner_preset === 'strategic_local' ||
+    runner.capabilities?.workload === 'strategic'
+  );
+}
+
+/** Current agent-task max-concurrency for a runner, from config or capabilities. */
+export function maxConcurrentValue(runner: FleetRunner): number {
+  const raw = runner.config?.desired?.max_concurrent ?? runner.capabilities?.max_concurrent;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return 2;
+  return Math.max(MAX_CONCURRENT_MIN, Math.min(MAX_CONCURRENT_MAX, Math.trunc(raw)));
+}
+
+/** Effective compute concurrency; legacy runners fall back to the agent limit. */
+export function maxConcurrentComputeValue(runner: FleetRunner): number {
+  const raw = runner.config?.desired?.max_concurrent_compute ?? runner.capabilities?.max_concurrent_compute;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return maxConcurrentValue(runner);
+  return Math.max(MAX_CONCURRENT_MIN, Math.min(MAX_CONCURRENT_MAX, Math.trunc(raw)));
+}
+
+/** Current GPU allowlist for a runner, from the server-authoritative desired
+ *  config. Absent / "all" means no restriction (all visible GPUs eligible). */
+export function gpuAllowlistValue(runner: FleetRunner): 'all' | number[] {
+  const allow = runner.config?.gpu_indices_allowed;
+  if (Array.isArray(allow)) return allow;
+  return 'all';
+}
+
+/** Parse an operator-typed index list ("0, 1 2") into a deduped, sorted,
+ *  non-negative integer array — the shape the PATCH endpoint normalizes to. */
+export function parseGpuIndexList(text: string): number[] {
+  const seen = new Set<number>();
+  const out: number[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    if (!token) continue;
+    if (!/^\d+$/.test(token)) continue;
+    const value = Number(token);
+    if (!Number.isInteger(value) || value < 0 || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/** Current per-job GPU count for a runner, from the server-authoritative config.
+ *  Absent means the default of 1 GPU per job (backward compatible). */
+export function gpusPerJobValue(runner: FleetRunner): number {
+  const raw = runner.config?.gpus_per_job ?? runner.config?.desired?.gpus_per_job;
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return GPUS_PER_JOB_MIN;
+  return Math.max(GPUS_PER_JOB_MIN, Math.min(GPUS_PER_JOB_MAX, Math.trunc(raw)));
+}
+
+/** Current task-type allowlist for a runner. Prefers the desired config; falls
+ *  back to runner-reported capabilities. Absent / "all" means every type. */
+export function taskTypesValue(runner: FleetRunner): 'all' | string[] {
+  const desired = runner.config?.desired?.task_types;
+  if (Array.isArray(desired)) return desired;
+  if (desired === 'all') return 'all';
+  const reported = runner.capabilities?.task_types;
+  if (Array.isArray(reported)) return reported;
+  return 'all';
+}
+
+/** Parse an operator-typed task-type list into a deduped, trimmed array. */
+export function parseTaskTypeList(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const token of text.split(/[\s,]+/)) {
+    const trimmed = token.trim();
+    if (!trimmed || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    out.push(trimmed);
+  }
+  return out;
+}
+
+export function gpuAllowlistLabel(runner: FleetRunner): string {
+  const allow = gpuAllowlistValue(runner);
+  if (allow === 'all') return 'GPUs: all';
+  return allow.length > 0 ? `GPUs: ${allow.join(',')}` : 'GPUs: none';
+}
+
+export function taskTypesLabel(runner: FleetRunner): string {
+  const value = taskTypesValue(runner);
+  if (value === 'all') return 'tasks: all';
+  return value.length > 0 ? `tasks: ${value.join(', ')}` : 'tasks: none';
+}

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 vi.mock('../index.js', async (importOriginal) => {
@@ -48,7 +49,6 @@ import {
   prepareTaskWorkBranch,
 } from '../task-checkpoint.js';
 import { writePrHelper } from '../prompts/pr-helper.js';
-import { expectCalledWith } from '../utils/typed-mock-call.js';
 import * as fs from 'fs';
 
 describe('augmentSelfReview', () => {
@@ -575,14 +575,14 @@ describe('durable unshipped-work checkpoint retry transition', () => {
     expect(commitCall?.[0]).toContain('--allow-empty');
     expect(commitCall?.[0].join('\n')).toContain(`blueprint-checkpoint: preserve unshipped task ${taskId}`);
     expect(commitCall?.[0].join('\n')).toContain(`Blueprint-Base-Commit: ${baseCommit}`);
-    expect(vi.mocked(gitAsync)).toHaveBeenCalledWith([
+    expectCalledWith(gitAsync, [
       'push', '--force-with-lease', 'origin',
       `HEAD:refs/heads/${workBranch}`,
     ]);
-    expect(vi.mocked(apiGet)).toHaveBeenCalledWith(
+    expectCalledWith(apiGet,
       `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
     );
-    expect(vi.mocked(writeGitTokenFile)).toHaveBeenCalledWith('fresh-checkpoint-token');
+    expectCalledWith(writeGitTokenFile, 'fresh-checkpoint-token');
 
     const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
       ([, payload]) => payload.status === 'FAILED',

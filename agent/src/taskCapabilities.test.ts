@@ -16,8 +16,8 @@ describe('agent task-type coverage tuple', () => {
     expect(new Set(AGENT_TASK_TYPE_IDS).size).toBe(AGENT_TASK_TYPE_IDS.length);
   });
 
-  it('covers the 29 dispatchable task types', () => {
-    expect(ALL_AGENT_TASK_TYPES.length).toBe(29);
+  it('covers the 31 dispatchable task types', () => {
+    expect(ALL_AGENT_TASK_TYPES.length).toBe(31);
   });
 });
 

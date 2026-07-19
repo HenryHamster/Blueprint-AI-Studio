@@ -129,6 +129,8 @@ def reset_pr_attempt_state(review_loop: dict | None) -> dict:
     return {key: loop[key] for key in _PR_CHAIN_STATE_KEYS if key in loop}
 
 
+
+
 async def reconcile_closed_pr_replacement(
     *,
     task: Task,
@@ -243,6 +245,7 @@ async def reconcile_closed_pr_replacement(
     )
     review_loop["polls_since_pr_fetch"] = 999
     review_loop.pop(_REPLACEMENT_WAIT_KEY, None)
+
 
     rebound_context = {**(task.context or {}), "review_loop": review_loop}
     # This legacy parent-level verdict is also PR-scoped. Leaving it behind

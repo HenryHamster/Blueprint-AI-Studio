@@ -22,3 +22,14 @@ threshold: 0.90        # composite confidence required to promote.
 # Raised back to the conservative 0.90 calibration bar.
 
 merge_grade_block_threshold: 0.0  # raise (>0, typically 1.0) to hard-block on blind merge-grade "misses"
+
+# Slice 3 of the boot/env-prerequisite promotion gate (design 245212a4).
+# When true, the DEPLOYED orchestrator judges each candidate's declared boot/env
+# prerequisites (presence-only) against its OWN os.environ — a faithful proxy of
+# the deploy-target env — and HARD-BLOCKS promotion (boot_prereq_missing) when an
+# in-scope required var is absent. A failed preflight yields a deterministic,
+# actionable blocker that names the exact missing prerequisite — it never degrades
+# into a vague infra-failure retry loop (the v22 migration-gate lesson). A
+# per-project build_config.env_preflight_enabled override and the
+# runtime_config.env_preflight_enabled fleet flag take precedence over this.
+env_preflight_enabled: true

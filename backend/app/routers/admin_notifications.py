@@ -23,6 +23,8 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectMessage,
+    MessageHandlingState,
+    MessageSurface,
     MessageType,
     MESSAGE_CONTENT_MAX,
     MessagesLastSeen,
@@ -39,15 +41,20 @@ from app.admin import (
     _user_project_ids,
 )
 from app.task_locking import lock_project_or_429
-from app.message_convergence import LINKED_STATUS
+from app.message_convergence import LINKED_STATUS, NEEDS_ACTION_MESSAGE_TYPES, RESOLVED_STATUS
+from app.message_audience import operator_visible_alert_filter, operator_visible_audience_filter
 from app.project_message_creation import (
     create_operator_project_message,
+    lock_project_and_next_message_sequence,
     parse_operator_message_type,
+    stored_wakeup_state,
+    wakeup_state_for_arming,
 )
 from app.project_message_projection import (
     admin_message_dict,
     admin_message_list_dict,
     message_event_payload,
+    message_updated_event_payload,
 )
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
@@ -60,9 +67,8 @@ from app.messages_last_seen import (
 )
 from app.workbench_state import (
     WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
-    build_message_strategic_session_snapshot, get_strategic_workbench_state,
+    get_strategic_workbench_state,
     persist_strategic_workbench_update,
-    workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
 from app.workbench_events import (
@@ -72,8 +78,8 @@ from app.workbench_events import (
     emit_workbench_refetch,
 )
 from app.strategic_trigger import (
-    ARMING_STEERING,
     maybe_arm_operator_refresh,
+    strategic_refresh_pending,
 )
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
@@ -264,8 +270,46 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset = frozenset(
         "criterion_retracted",
         "criterion_superseded",
         "question_answer",
+        "capability_proof_gate_graduated_observe",
+        "capability_proof_gate_graduated_enforce",
     }
 )
+
+
+def _operator_visible_audience():
+    """SQLAlchemy predicate excluding rows tagged with a non-operator audience.
+
+    Rows with no ``audience`` key in context (legacy rows written before the
+    registry existed, and all user-authored / BLOCKER / FEEDBACK messages)
+    resolve to NULL and are KEPT — the filter only drops rows that explicitly
+    carry a strategist-internal / pipeline-log audience tag.
+    """
+    return operator_visible_audience_filter(ProjectMessage.context)
+
+
+def _operator_signal_predicate():
+    """Rows the operator Messages panel must surface regardless of ``surface``.
+
+    Mirrors the categories the 0608 BEFORE-INSERT trigger promotes onto the
+    'conversation' surface for operator reasons — user-authored messages,
+    bug-class messages (FEEDBACK/BLOCKER/BUG_REPORT), and system NOTEs whose
+    event_type is high-signal — so they are re-admitted to the operator feed
+    after the trigger moves them off 'activity', without widening the feed to
+    generic conversation rows (e.g. strategic replies, which are NOT in this
+    set). The activity feed on SQLite (no trigger) keeps every such row on
+    'activity', so this predicate is a no-op there.
+    """
+    return or_(
+        ProjectMessage.from_type == "user",
+        ProjectMessage.message_type.in_(["FEEDBACK", "BLOCKER", "BUG_REPORT"]),
+        and_(
+            ProjectMessage.message_type == MessageType.NOTE,
+            ProjectMessage.from_type == "system",
+            ProjectMessage.context["event_type"]
+            .as_string()
+            .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
+        ),
+    )
 
 
 # Reserved keys within MessagesNoisePrefs.prefs for temp-mutes and mute-window.
@@ -398,6 +442,7 @@ async def get_alerts(
     query = (
         select(Alert)
         .where(Alert.project_id.in_(_user_project_ids(current_user["user_id"])))
+        .where(operator_visible_alert_filter(Alert.event_type))
         .order_by(Alert.created_at.desc())
     )
     if project_id:
@@ -682,19 +727,32 @@ async def list_messages(
 ):
     """List project messages, optionally filtered by project, status, and content search."""
     user_pids = _user_project_ids(current_user["user_id"])
-    filters = [ProjectMessage.project_id.in_(user_pids)]
+    filters = [
+        ProjectMessage.project_id.in_(user_pids),
+        or_(
+            ProjectMessage.surface == MessageSurface.ACTIVITY,
+            _operator_signal_predicate(),
+        ),
+        _operator_visible_audience(),
+    ]
     if project_id:
         try:
             filters.append(ProjectMessage.project_id == uuid.UUID(project_id))
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid project_id format")
     if status and status != "all":
-        if status not in ("open", LINKED_STATUS, "resolved"):
+        if status == "needs_action":
+            filters.append(
+                ProjectMessage.message_type.in_(list(NEEDS_ACTION_MESSAGE_TYPES))
+            )
+            filters.append(ProjectMessage.status != RESOLVED_STATUS)
+        elif status not in ("open", LINKED_STATUS, "resolved"):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid status filter. Must be 'open', 'linked', 'resolved', or 'all'",
+                detail="Invalid status filter. Must be 'open', 'linked', 'resolved', 'needs_action', or 'all'",
             )
-        filters.append(ProjectMessage.status == status)
+        else:
+            filters.append(ProjectMessage.status == status)
     q_stripped = (q or "").strip()
     if q_stripped:
         q_escaped = q_stripped.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
@@ -717,12 +775,20 @@ async def list_messages(
         ProjectMessage.message_type,
         ProjectMessage.from_type,
         ProjectMessage.from_task_id,
+        ProjectMessage.actor_user_id,
+        ProjectMessage.sequence,
+        ProjectMessage.surface,
+        ProjectMessage.handling_state,
+        ProjectMessage.handled_by_task_id,
+        ProjectMessage.reply_to_message_id,
+        ProjectMessage.idempotency_key,
         ProjectMessage.content,
         ProjectMessage.context,
         ProjectMessage.status,
         ProjectMessage.resolution,
         ProjectMessage.resolved_at,
         ProjectMessage.created_at,
+        ProjectMessage.updated_at,
         raiseload=True,
     )
 
@@ -736,22 +802,16 @@ async def list_messages(
         # high. Clients should treat the returned list as "up to 100 most recent" rather
         # than a guaranteed-complete set.
         _HS_LIMIT = 100
+        # High-signal / operator-signal rows must be guaranteed regardless of
+        # surface: the 0608 trigger promotes them to 'conversation' on Postgres,
+        # so a surface==ACTIVITY filter here would evict the very rows this
+        # safety net exists to protect. _operator_signal_predicate() re-admits
+        # exactly the operator categories the trigger promotes.
         hs_filters = [
             ProjectMessage.project_id.in_(user_pids),
             ProjectMessage.status == "open",
-            or_(
-                ProjectMessage.from_type == "user",
-                ProjectMessage.message_type.in_(
-                    ["FEEDBACK", "BLOCKER", "BUG_REPORT"]
-                ),
-                and_(
-                    ProjectMessage.message_type == MessageType.NOTE,
-                    ProjectMessage.from_type == "system",
-                    ProjectMessage.context["event_type"]
-                    .as_string()
-                    .in_(list(HIGH_SIGNAL_NOTE_EVENT_TYPES)),
-                ),
-            ),
+            _operator_signal_predicate(),
+            _operator_visible_audience(),
             *([ProjectMessage.project_id == pid_uuid] if pid_uuid else []),
         ]
         if q_stripped:
@@ -861,6 +921,7 @@ async def create_message(
         "id": result.message_id,
         "status": result.status,
         "arming": result.arming,
+        "wakeup_state": result.wakeup_state,
         "message": admin_message_dict(result.message),
     }
     if result.message_event is not None:
@@ -879,21 +940,18 @@ async def resolve_message(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Resolve a message with an optional response."""
+    """Resolve a message and its canonical reply in one idempotent transaction."""
     msg = await session.get(ProjectMessage, message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Message not found")
     # Verify user has write access to the project (member+; viewers are read-only)
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         msg.project_id, current_user["user_id"], session, "member"
     )
 
     message_project_uuid = msg.project_id
     message_type = msg.message_type
     message_id_str = str(msg.id)
-    base_message_response = admin_message_dict(msg)
-    was_resolved = base_message_response.get("status") == "resolved"
-    message_event = message_event_payload(msg, status="resolved")
     resolution = (payload.resolution or "").strip()
     if len(resolution) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
@@ -902,9 +960,8 @@ async def resolve_message(
         )
     if workbench_state_exceeds_max_bytes(payload.workbench_context):
         raise HTTPException(status_code=400, detail=f"workbench_context exceeds {WORKBENCH_STATE_MAX_BYTES} byte limit")
-    workbench_context_for_snapshot = payload.workbench_context
     if payload.workbench_context is not None:
-        workbench_write = await persist_strategic_workbench_update(
+        await persist_strategic_workbench_update(
             session,
             current_user["user_id"],
             message_project_uuid,
@@ -912,150 +969,181 @@ async def resolve_message(
             arm_interaction_mode=False,
             commit=False,
         )
-        workbench_context_for_snapshot = workbench_context_for_strategic_session_snapshot(
-            workbench_write.state,
-            payload.workbench_context,
-        )
-    if was_resolved:
-        await session.commit()
-        return {"id": message_id_str, "status": "already_resolved", "message": base_message_response}
-    resolved_at = _utcnow()
-    # Use update with status check for idempotency: only update if still open.
-    # If a concurrent request also resolves before this one commits, the update
-    # will find 0 rows and we return already_resolved for both paths.
-    result = await session.execute(
-        update(ProjectMessage).where(
-            ProjectMessage.id == message_id,
-            ProjectMessage.status.in_(["open", LINKED_STATUS])
-        ).values(
-            status="resolved",
-            resolution=resolution or None,
-            resolved_at=resolved_at,
-        )
+
+    wants_reply = bool(
+        (resolution or msg.resolution)
+        and message_type in (MessageType.QUESTION, MessageType.FEEDBACK)
     )
-    if result.rowcount > 0:
-        message_response = {
-            **base_message_response,
-            "status": "resolved",
-            "resolution": resolution or None,
-            "resolved_at": resolved_at.isoformat(),
-        }
-        # Persist the resolution FIRST (together with any staged workbench
-        # update) so a secondary failure while posting the answer/ack reply can
-        # never roll back the primary resolution — the message stays resolved
-        # even if the reply cannot be posted (restores main's resilient order).
-        await session.commit()
-        reply_msg: ProjectMessage | None = None
-        reply_message_event: dict[str, Any] | None = None
-        reply_message_id: str | None = None
-        reply_message_response: dict[str, Any] | None = None
-        arming: str | None = None
-        if resolution and message_type in (
-            MessageType.QUESTION,
-            MessageType.FEEDBACK,
-        ):
-            try:
-                from app.notification_dispatch import (
-                    post_feedback_acknowledgment as _post_feedback_ack,
-                    post_question_answer as _post_qa,
-                )
-
-                strategic_session = await build_message_strategic_session_snapshot(
-                    session,
-                    current_user["user_id"],
-                    message_project_uuid,
-                    workbench_context_for_snapshot,
-                )
-                if message_type == MessageType.QUESTION:
-                    reply_msg = await _post_qa(
-                        session,
-                        message_project_uuid,
-                        message_id,
-                        resolution,
-                        from_type="user",
-                    )
-                else:
-                    reply_msg = await _post_feedback_ack(
-                        session,
-                        message_project_uuid,
-                        message_id,
-                        resolution,
-                    )
-                if strategic_session:
-                    reply_msg.context = {
-                        **(reply_msg.context or {}),
-                        "strategic_session": strategic_session,
-                    }
-                await session.commit()
-                await session.refresh(reply_msg)
-                reply_message_id = str(reply_msg.id)
-                reply_message_event = message_event_payload(reply_msg)
-                reply_message_response = admin_message_dict(reply_msg)
-                event_type = (
-                    reply_msg.context.get("event_type")
-                    if isinstance(reply_msg.context, dict)
-                    else None
-                )
-                # Suppress cadence steering when a live resident Workday session
-                # owns the project — the standing agent replies live, so waking a
-                # competing cadence writer (and posting a steer receipt) is wrong.
-                from app.models import Project as _Project
-                from app.strategic_resident_session import (
-                    read_resident_session,
-                    resident_session_is_active,
-                )
-
-                _reply_project = await session.get(_Project, message_project_uuid)
-                _resident_active = _reply_project is not None and resident_session_is_active(
-                    read_resident_session(_reply_project.vision)
-                )
-                arming = await maybe_arm_operator_refresh(
-                    session,
-                    message_project_uuid,
-                    MessageType(reply_msg.message_type),
-                    event_type=str(event_type) if event_type else None,
-                    message_content=resolution,
-                    resident_session_active=_resident_active,
-                )
-                if arming == ARMING_STEERING:
-                    await session.commit()
-            except Exception:
-                # A reply-post/arming failure is non-fatal: the resolution is
-                # already committed above and must stand. Log, discard the
-                # failed secondary work, and return the resolved message alone.
-                logger.warning(
-                    "resolve_message reply post failed for message %s; "
-                    "resolution stands",
-                    message_id_str,
-                    exc_info=True,
-                )
-                await session.rollback()
-                reply_msg = None
-                reply_message_event = None
-                reply_message_id = None
-                reply_message_response = None
-                arming = None
-        await broadcast_to_project(str(message_project_uuid), "message_updated", message_event)
-        if reply_message_event is not None:
-            await broadcast_to_project(
-                str(message_project_uuid),
-                "message_created",
-                reply_message_event,
+    reply_sequence: int | None = None
+    if wants_reply:
+        # Canonical mutation order: Project -> sequence counter -> reply target.
+        # A sequence gap is safe when a concurrent resolver already created the
+        # reply. Take FOR UPDATE up front because reply arming updates Project
+        # vision later in this transaction; upgrading after taking the counter
+        # would recreate a lock inversion with generic KEY SHARE writers.
+        await session.execute(
+            select(Project.id)
+            .where(Project.id == message_project_uuid)
+            .with_for_update()
+        )
+        reply_sequence = await lock_project_and_next_message_sequence(
+            session,
+            message_project_uuid,
+            lock_timeout_ms=1_500,
+        )
+        locked_message = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(ProjectMessage.id == message_id)
+                .with_for_update()
             )
-        response = {"id": message_id_str, "status": "resolved", "message": message_response}
-        if reply_message_id is not None:
-            response["reply_message_id"] = reply_message_id
-        if reply_message_response is not None:
-            response["reply_message"] = reply_message_response
-        if arming is not None:
-            response["arming"] = arming
-        return response
-    else:
+        ).scalar_one()
+        msg = locked_message
+
+    async def _existing_reply() -> ProjectMessage | None:
+        return (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == message_project_uuid,
+                    ProjectMessage.reply_to_message_id == message_id,
+                )
+                .order_by(ProjectMessage.created_at.asc(), ProjectMessage.id.asc())
+                .limit(1)
+            )
+        ).scalars().first()
+
+    async def _ensure_reply(
+        answer: str,
+    ) -> tuple[ProjectMessage | None, str | None, str | None, bool]:
+        if not answer or message_type not in (MessageType.QUESTION, MessageType.FEEDBACK):
+            return None, None, None, False
+        existing = await _existing_reply()
+        if existing is not None:
+            return existing, None, stored_wakeup_state(existing), False
+        from app.notification_dispatch import (
+            post_feedback_acknowledgment as _post_feedback_ack,
+            post_question_answer as _post_qa,
+        )
+        from app.strategic_resident_session import (
+            read_resident_session,
+            resident_session_is_active,
+        )
+
+        if message_type == MessageType.QUESTION:
+            reply = await _post_qa(
+                session,
+                message_project_uuid,
+                message_id,
+                answer,
+                from_type="user",
+                actor_user_id=current_user["user_id"],
+                content_override=answer,
+                sequence=reply_sequence,
+            )
+        else:
+            reply = await _post_feedback_ack(
+                session,
+                message_project_uuid,
+                message_id,
+                answer,
+                from_type="user",
+                actor_user_id=current_user["user_id"],
+                event_type="feedback_reply",
+                content_override=answer,
+                sequence=reply_sequence,
+            )
+        event_type = (reply.context or {}).get("event_type")
+        resident_active = resident_session_is_active(read_resident_session(project.vision))
+        locked_vision = await session.scalar(
+            select(Project.vision).where(Project.id == message_project_uuid)
+        )
+        refresh_was_pending = strategic_refresh_pending(locked_vision)
+        arming = await maybe_arm_operator_refresh(
+            session,
+            message_project_uuid,
+            MessageType(reply.message_type),
+            event_type=str(event_type) if event_type else None,
+            message_content=answer,
+            resident_session_active=resident_active,
+        )
+        if not session.in_transaction():
+            # Arming rolled back a poisoned transaction. Nothing in this
+            # resolve/reply operation committed, so the caller can safely retry.
+            raise HTTPException(
+                status_code=503,
+                detail="Message resolution temporarily unavailable; retry",
+                headers={"Retry-After": "2"},
+            )
+        wakeup_state = wakeup_state_for_arming(
+            arming,
+            refresh_was_pending=refresh_was_pending,
+        )
+        reply.context = {
+            **(reply.context or {}),
+            "_resident_wakeup_state": wakeup_state,
+        }
+        session.add(reply)
+        return reply, arming, wakeup_state, True
+
+    was_resolved = msg.status == "resolved"
+    updated = False
+    if not was_resolved:
+        resolved_at = _utcnow()
+        update_result = await session.execute(
+            update(ProjectMessage)
+            .where(
+                ProjectMessage.id == message_id,
+                ProjectMessage.status.in_(["open", LINKED_STATUS]),
+            )
+            .values(
+                status="resolved",
+                resolution=resolution or None,
+                resolved_at=resolved_at,
+                handling_state=MessageHandlingState.RESPONDED,
+                updated_at=resolved_at,
+            )
+        )
+        updated = update_result.rowcount > 0
+
+    effective_resolution = resolution
+    if not updated:
         await session.refresh(msg)
-        current_message_response = admin_message_dict(msg)
-        await session.commit()
-        # Message was already resolved by a concurrent request
-        return {"id": message_id_str, "status": "already_resolved", "message": current_message_response}
+        effective_resolution = (msg.resolution or resolution or "").strip()
+    reply_msg, arming, wakeup_state, reply_created = await _ensure_reply(
+        effective_resolution
+    )
+    await session.commit()
+    await session.refresh(msg)
+    if reply_msg is not None:
+        await session.refresh(reply_msg)
+
+    if updated:
+        await broadcast_to_project(
+            str(message_project_uuid),
+            "message_updated",
+            message_updated_event_payload(msg),
+        )
+    if reply_created and reply_msg is not None:
+        await broadcast_to_project(
+            str(message_project_uuid),
+            "message_created",
+            message_event_payload(reply_msg),
+        )
+
+    response: dict[str, Any] = {
+        "id": message_id_str,
+        "status": "resolved" if updated else "already_resolved",
+        "message": admin_message_dict(msg),
+    }
+    if reply_msg is not None:
+        response["reply_message_id"] = str(reply_msg.id)
+        response["reply_message"] = admin_message_dict(reply_msg)
+    if arming is not None:
+        response["arming"] = arming
+    if wakeup_state is not None:
+        response["wakeup_state"] = wakeup_state
+    return response
 
 
 @router.delete("/messages/{message_id}")

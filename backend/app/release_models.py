@@ -154,6 +154,18 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
 
+    # Lifecycle identity for the qualification projected in last_qualification.
+    active_qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
+    # Bounded retry episode, distinct from the lifetime attempt count.
+    qualification_retry_episode: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
+
     # Free-form reasoning text from the strategic agent explaining the latest
     # phase decision.
     phase_reasoning: str | None = Field(
@@ -680,6 +692,12 @@ class QualificationVerdict(SQLModel, table=True):
         ),
     )
 
+    # Nullable attempt identity; migration 0607 backfills historical rows.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     # The automain HEAD SHA that was scored.  Nullable per migration linter rules.
     candidate_sha: str | None = Field(
         default=None,
@@ -862,6 +880,21 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
 
+    # Per-attempt goal-verification verdict snapshot: the per-category verdicts
+    # and residual gap that drove the criterion_coverage gate at finalize time.
+    # Persisted so a re-qualification overwrite of last_qualification does NOT
+    # lose which category/residual facts belonged to this attempt.  Nullable —
+    # rows written before this column existed or for attempts where no rubric /
+    # grade was issued carry None.
+    category_verdicts: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+    residual_uncaptured_gap: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
     # Promotion-attempt context (only set on the promotion_failed / promoted
     # paths): the merge PR URL, whether the merge hit a conflict, and the
     # error/detail string describing why the merge failed.
@@ -1042,7 +1075,8 @@ class QualificationDimensionResult(SQLModel, table=True):
 
     # Which qualification dimension this row records — one of: audit,
     # migration_identity, migration_apply, ci, smoketest, merge_grade,
-    # test_erosion, acceptance_window, debt_pressure, challenge.
+    # test_erosion, acceptance_window, debt_pressure, challenge,
+    # capability_proof.
     dimension: str = Field(
         sa_column=Column(String(32), nullable=False),
     )
@@ -1087,6 +1121,21 @@ class QualificationDimensionResult(SQLModel, table=True):
     producing_task_id: uuid.UUID | None = Field(
         default=None,
         sa_column=Column(GUID(), nullable=True),
+    )
+
+    # The attempt that actually measured/produced this candidate-scoped fact.
+    # Reuse never overwrites this provenance.
+    origin_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
+    # Attempt ids that explicitly reused this resolved fact.  JSONB is used
+    # because this is append-only provenance, not ownership; the fact remains
+    # uniquely keyed by release version, candidate SHA, and dimension.
+    reused_by_attempt_ids: Any | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
     )
 
     computed_at: datetime = Field(
@@ -1190,12 +1239,22 @@ class CategoryVerdict(SQLModel, table=True):
         sa_column=Column(String(64), nullable=True),
     )
 
+    # The qualification attempt this verdict belongs to, for attempt-scoped
+    # querying and to prevent cross-attempt overwrites on same-SHA re-grades.
+    # Nullable for backward compatibility with rows created before this field
+    # was added.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "version_id",
             "candidate_sha",
             "category_key",
-            name="uq_categoryverdict_version_sha_category",
+            "qualification_attempt_id",
+            name="uq_categoryverdict_version_sha_category_attempt",
         ),
     )
 
@@ -1210,7 +1269,9 @@ class ResidualVerdict(SQLModel, table=True):
     met even if every category is ``met``
     (:func:`app.category_verdict_ledger.is_candidate_fully_met`).
 
-    One row PER ``(version_id, candidate_sha)``; a re-grade UPSERTs it.
+    One row PER ``(version_id, candidate_sha, qualification_attempt_id)``;
+    a re-grade UPSERTs it within an attempt, and different attempts on the
+    same candidate each retain their own residual row.
     """
 
     __tablename__ = "residualverdict"
@@ -1245,11 +1306,21 @@ class ResidualVerdict(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
+    # The qualification attempt this residual belongs to, for attempt-scoped
+    # querying and to prevent cross-attempt overwrites on same-SHA re-grades.
+    # Nullable for backward compatibility with rows created before this field
+    # was added.
+    qualification_attempt_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(GUID(), nullable=True, index=True),
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "version_id",
             "candidate_sha",
-            name="uq_residualverdict_version_sha",
+            "qualification_attempt_id",
+            name="uq_residualverdict_version_sha_attempt",
         ),
     )
 
@@ -1266,4 +1337,3 @@ class DimensionState(BaseModel):
     status: str  # "passed" | "failed" | "unavailable" | "not_applicable" | "pending"
     score: float | None = None
     reason: str | None = None
-

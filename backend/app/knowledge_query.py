@@ -15,6 +15,7 @@ omits the (potentially large) markdown body; only get-by-id returns it.
 
 import logging
 import uuid
+from datetime import timedelta
 from typing import Any, NamedTuple
 
 from sqlalchemy import String, cast, func, or_, case
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.models import KnowledgeDocument, SourceKind, Task, TaskStatus
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -573,8 +575,21 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
             verdict.get("unavailable_cause") if is_compute else None
         ),
         "criterion_met": criterion_met,
+        "criterion_unmeasured_reason": (
+            verdict.get("criterion_unmeasured_reason") if is_compute else None
+        ),
         "criterion": verdict.get("criterion") if is_compute else None,
         "per_arm_verdicts": verdict.get("per_arm_verdicts") if is_compute else None,
+        "evidence_tier": verdict.get("evidence_tier") if is_compute else None,
+        "run_provenance": (
+            {
+                "executing_backend": diag.get("executing_backend"),
+                "runner_hostname": diag.get("runner_hostname"),
+                "runner_target_id": diag.get("runner_target_id"),
+            }
+            if is_compute and (diag := verdict.get("terminal_diagnostics")) is not None
+            else None
+        ),
         "origin_provenance": serialize_origin_provenance(doc),
         "lifecycle_status": doc.lifecycle_status,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
@@ -1126,3 +1141,114 @@ async def build_compute_sweep_groups(
         reverse=True,
     )
     return dict(ordered[:limit])
+
+
+# ---------------------------------------------------------------------------
+# Knowledge-commission dedup guards
+# ---------------------------------------------------------------------------
+
+# Default cooldown (hours) for the knowledge-doc dedup guard.  Configurable
+# via the ``knowledge_commission_cooldown_hours`` runtime config key.
+_KNOWLEDGE_COMMISSION_COOLDOWN_HOURS: float = 48.0
+
+
+async def knowledge_doc_recently_produced(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str | None,
+    topic: str | None,
+    *,
+    cooldown_hours: float | None = None,
+) -> bool:
+    """True when a ``web_research`` or ``design`` knowledge document for the
+    same ``direction_id`` AND ``topic`` was produced within the cooldown window.
+
+    Guards against re-commissioning a knowledge task when equivalent work was
+    recently completed for the same direction and topic.  Both ``direction_id``
+    AND ``topic`` must match — checking topic alone produces false positives
+    across distinct research questions that happen to share a topic label within
+    the same direction.
+
+    Returns ``False`` when either ``direction_id`` or ``topic`` is absent
+    (no reliable dedup basis exists in that case — callers must allow the
+    commission rather than block on an incomplete key).
+
+    ``cooldown_hours`` defaults to ``_KNOWLEDGE_COMMISSION_COOLDOWN_HOURS`` (48 h)
+    when omitted; callers can pass the result of reading
+    ``runtime_config["knowledge_commission_cooldown_hours"]`` to make it
+    operator-configurable without polluting this function's signature.
+    """
+    if not direction_id or not topic:
+        return False
+    effective_hours = (
+        float(cooldown_hours)
+        if cooldown_hours is not None
+        else _KNOWLEDGE_COMMISSION_COOLDOWN_HOURS
+    )
+    if effective_hours <= 0:
+        return False
+    cutoff = _utcnow() - timedelta(hours=effective_hours)
+    result = await session.execute(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.direction_id == direction_id,
+            KnowledgeDocument.source_kind.in_(
+                [SourceKind.WEB_RESEARCH.value, SourceKind.DESIGN.value]
+            ),
+            KnowledgeDocument.topic == topic,
+            KnowledgeDocument.created_at >= cutoff,
+        ).limit(1)
+    )
+    return result.scalar_one_or_none() is not None
+
+
+async def knowledge_task_in_flight(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str | None,
+    topic: str | None,
+) -> bool:
+    """True when a ``web_research`` or ``design`` task with the same
+    ``direction_id`` AND ``topic`` is currently active (QUEUED / PROVISIONING
+    / IN_PROGRESS).
+
+    Guards against commissioning duplicate knowledge tasks while an identical
+    one is already running.  Both fields must match via the task's payload
+    ``topic`` and ``direction_id`` fields — these are stamped by
+    ``_handle_research_completion`` on knowledge findings so that this guard
+    can detect same-direction same-topic commissions from any concurrent
+    research cycle.
+
+    Returns ``False`` when either ``direction_id`` or ``topic`` is absent
+    (no reliable dedup basis exists — callers must allow the commission).
+
+    The scan is bounded at 100 rows to stay cheap; knowledge tasks in a
+    healthy project are sparse relative to the total task count.
+    """
+    if not direction_id or not topic:
+        return False
+    rows = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.status.in_(
+                    [
+                        TaskStatus.QUEUED,
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                    ]
+                ),
+                Task.payloads[0]["type"].as_string().in_(["web_research", "design"]),
+            )
+            .limit(100)
+        )
+    ).scalars().all()
+    for t in rows:
+        payload = t.first_payload or {}
+        if (
+            payload.get("topic") == topic
+            and payload.get("direction_id") == direction_id
+        ):
+            return True
+    return False

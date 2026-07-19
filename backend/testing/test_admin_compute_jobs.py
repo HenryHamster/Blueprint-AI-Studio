@@ -134,6 +134,31 @@ async def test_list_compute_jobs_viewer_ok(client: AsyncClient, db_session):
     # the descriptor explicitly as null so operators can tell the two apart.
     assert jobs[0]["artifact"] is None
     assert "command" not in jobs[0]["polling_metadata"]
+    # No viewable_files_dropped stamped -> aggregate defaults cleanly to 0.
+    assert jobs[0]["viewable_artifacts_dropped_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_exposes_viewable_dropped_count(
+    client: AsyncClient, db_session
+):
+    """A job whose polling_metadata records omitted viewable files exposes the
+    additive job-level ``viewable_artifacts_dropped_count`` aggregate."""
+    project = await _make_project(db_session)
+    await _add_member(db_session, project.id, "viewer")
+    _task, job, _artifact = await _make_job(db_session, project)
+    job.polling_metadata = {
+        "zone": "us-central1-a",
+        "viewable_files_dropped": 4,
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+    assert jobs[0]["viewable_artifacts_dropped_count"] == 4
 
 
 @pytest.mark.asyncio
@@ -673,6 +698,71 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
     assert jobs[0]["criterion_verdict"] == verdict
     assert jobs[0]["criterion_verdict"]["met"] is True
     assert jobs[0]["criterion_verdict"]["value"] == 0.95
+    # The canonical evidence tier is served first-class so the UI stops
+    # re-deriving it: operator hardware + a measured verdict → "Machine verified".
+    assert jobs[0]["evidence_tier"] == "covered"
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_serves_canonical_evidence_tier(
+    client: AsyncClient, db_session
+):
+    """evidence_tier is served first-class per job, matching the canonical
+    server derivation (knowledge_completion._compute_evidence_tier):
+      - operator hardware with NO result → partial (execution, nothing verified)
+      - cloud execution → attested (trusted report, not operator-verified)."""
+    project = await _make_project(db_session, name="Evidence Tier Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    # (1) Local run with NO criterion/verdict → partial.
+    local_task = Task(
+        project_id=project.id,
+        title="local no-result task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+    )
+    # (2) Cloud run → attested regardless of result.
+    cloud_task = Task(
+        project_id=project.id,
+        title="cloud task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+    )
+    db_session.add(local_task)
+    db_session.add(cloud_task)
+    await db_session.commit()
+    await db_session.refresh(local_task)
+    await db_session.refresh(cloud_task)
+
+    local_job = ComputeJob(
+        task_id=local_task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        spend_cap_usd=2.0,
+        accrued_cost_usd=0.0,
+        completed_at=_utcnow(),
+    )
+    cloud_job = ComputeJob(
+        task_id=cloud_task.id,
+        project_id=project.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.0,
+        completed_at=_utcnow(),
+    )
+    db_session.add(local_job)
+    db_session.add(cloud_job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = {j["id"]: j for j in resp.json()["compute_jobs"]}
+    assert jobs[str(local_job.id)]["evidence_tier"] == "partial"
+    assert jobs[str(cloud_job.id)]["evidence_tier"] == "attested"
 
 
 @pytest.mark.asyncio
@@ -722,6 +812,8 @@ async def test_list_compute_jobs_per_arm_verdicts_exposed(
     assert jobs[0]["per_arm_verdicts"] == per_arm
     assert jobs[0]["per_arm_verdicts"]["arm_a"]["cost_usd"] == pytest.approx(0.30)
     assert jobs[0]["per_arm_verdicts"]["arm_b"]["met"] is False
+    # Operator hardware + per-arm results is a measured run → "Machine verified".
+    assert jobs[0]["evidence_tier"] == "covered"
 
 
 @pytest.mark.asyncio
@@ -1387,14 +1479,18 @@ async def test_list_compute_jobs_redacts_credentials_in_result_metrics(
 
 
 @pytest.mark.asyncio
-async def test_aggregate_summary_endpoint_returns_all_jobs(
+async def test_aggregate_summary_endpoint_excludes_old_jobs_but_reports_alltime(
     client: AsyncClient, db_session
 ):
-    """The /compute-jobs/summary endpoint returns totals over ALL jobs regardless of age."""
+    """The /compute-jobs/summary endpoint uses a 90-day window for aggregate stats.
+
+    Jobs older than 90 days are excluded from total_jobs/spend/outcome_breakdown
+    but the cheap all-time count is returned in total_jobs_all_time.
+    """
     project = await _make_project(db_session, name="Agg Summary Project")
     await _add_member(db_session, project.id, "viewer")
 
-    # Old terminal job (would be outside any include_finished_minutes window).
+    # Old terminal job outside the 90-day window.
     old_task = Task(
         project_id=project.id,
         title="old task",
@@ -1413,12 +1509,17 @@ async def test_aggregate_summary_endpoint_returns_all_jobs(
         machine_type="e2-standard-2",
         spend_cap_usd=5.0,
         final_cost_usd=2.0,
+        # The summary endpoint windows on created_at (see
+        # aggregate_all_compute_jobs_summary: ``ComputeJob.created_at >= since``),
+        # so the "old" job must be old by created_at — not only completed_at —
+        # to fall outside the 90-day window. created_at otherwise defaults to now.
+        created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         completed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
     )
     db_session.add(old_job)
     await db_session.commit()
 
-    # Recent running job.
+    # Recent running job (within the 90-day window).
     new_task = Task(
         project_id=project.id,
         title="new task",
@@ -1444,16 +1545,18 @@ async def test_aggregate_summary_endpoint_returns_all_jobs(
     assert resp.status_code == 200
     body = resp.json()
 
-    # Both jobs are included (old terminal + new running).
-    assert body["total_jobs"] == 2
+    # Only the recent running job is in the 90-day window.
+    assert body["total_jobs"] == 1, "only in-window jobs counted in total_jobs"
     assert body["active_jobs"] == 1
-    assert body["terminal_jobs"] == 1
-    assert body["total_spend_usd"] == pytest.approx(2.5)  # 2.0 final + 0.5 accrued
-    assert body["outcome_breakdown"][ComputeJobStatus.SUCCEEDED.value] == 1
-    assert body["outcome_breakdown"][ComputeJobStatus.RUNNING.value] == 1
-    # old_task has criterion data.
-    assert body["criterion_measured"] == 1
-    assert body["criterion_met"] == 1
+    assert body["terminal_jobs"] == 0
+    assert body["total_spend_usd"] == pytest.approx(0.5)  # only accrued from new_job
+    assert ComputeJobStatus.RUNNING.value in body["outcome_breakdown"]
+    assert ComputeJobStatus.SUCCEEDED.value not in body["outcome_breakdown"]
+    # criterion_measured: old_task is outside the window; new_task has no criterion.
+    assert body["criterion_measured"] == 0
+    assert body["criterion_met"] == 0
+    # All-time count includes both jobs.
+    assert body["total_jobs_all_time"] == 2, "all-time count must include the old job"
 
 
 @pytest.mark.asyncio
@@ -1659,6 +1762,97 @@ async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_sess
     # No ProjectMember row — request must be rejected.
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_entry_includes_evidence_tier_and_provenance(
+    client: AsyncClient, db_session
+):
+    """Sweep-groups entries expose evidence_tier and run_provenance from forward_quality_verdict."""
+    project = await _make_project(db_session, name="Sweep Groups Tier Provenance")
+    await _add_member(db_session, project.id, "viewer")
+
+    terminal_diagnostics = {
+        "executing_backend": "local-subprocess",
+        "runner_hostname": "host-abc",
+        "runner_target_id": "runner-123",
+    }
+
+    async def _seed_with_tier(arm_label: str, tier: str) -> None:
+        task = Task(
+            project_id=project.id,
+            title=f"sweep task {arm_label}",
+            status=TaskStatus.COMPLETED,
+            payloads=[
+                {
+                    "type": "compute_experiment",
+                    "base_branch": "main",
+                    "sweep_id": "sw-tier-test",
+                    "experiment": arm_label,
+                }
+            ],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=task.id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+            title=f"arm {arm_label}",
+            summary="Summary.",
+            body="# Body",
+            topic="exp",
+            sweep_id="sw-tier-test",
+            arm_label=arm_label,
+            forward_quality_verdict={
+                "analysis_mode": "deterministic",
+                "criterion_met": True,
+                "evidence_tier": tier,
+                "terminal_diagnostics": terminal_diagnostics,
+            },
+        )
+        db_session.add(doc)
+        await db_session.commit()
+
+    await _seed_with_tier("baseline", "covered")
+    await _seed_with_tier("treatment", "attested")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert "sw-tier-test" in groups
+    entries = {e["arm_label"]: e for e in groups["sw-tier-test"]}
+
+    baseline = entries["baseline"]
+    assert baseline["evidence_tier"] == "covered"
+    assert baseline["run_provenance"] is not None
+    assert baseline["run_provenance"]["executing_backend"] == "local-subprocess"
+    assert baseline["run_provenance"]["runner_hostname"] == "host-abc"
+    assert baseline["run_provenance"]["runner_target_id"] == "runner-123"
+
+    treatment = entries["treatment"]
+    assert treatment["evidence_tier"] == "attested"
+    assert treatment["run_provenance"]["executing_backend"] == "local-subprocess"
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_entry_null_tier_for_missing_verdict_fields(
+    client: AsyncClient, db_session
+):
+    """Sweep-groups entries have null evidence_tier and run_provenance when verdict lacks them."""
+    project = await _make_project(db_session, name="Sweep Groups No Tier")
+    await _add_member(db_session, project.id, "viewer")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-no-tier", arm_label="baseline")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-no-tier", arm_label="treatment")
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    groups = resp.json()["sweep_groups"]
+    assert "sw-no-tier" in groups
+    for entry in groups["sw-no-tier"]:
+        assert entry["evidence_tier"] is None
+        assert entry["run_provenance"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -2959,3 +3153,56 @@ async def test_list_compute_jobs_task_id_bypasses_time_window(
     assert scoped_ids == [str(old_job.id)], f"expected stale job, got {scoped_ids}"
     # Per-task summary counts the returned jobs (aggregate is not meaningful here).
     assert scoped_body["summary"]["total_jobs"] == 1
+
+
+def test_viewable_artifacts_descriptor_preserves_pdf_and_svg_kinds():
+    """The operator-facing manifest normalizer preserves pdf, image (incl. SVG),
+    and video kinds, and coerces truly-unknown kinds to None."""
+    from app.routers.admin_compute_jobs import _viewable_artifacts_descriptor
+
+    out = _viewable_artifacts_descriptor(
+        [
+            {
+                "filename": "report.pdf",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/report.pdf",
+                "content_type": "application/pdf",
+                "size_bytes": 2048,
+                "kind": "pdf",
+                "revision": "terminal-rev-7",
+                "live": False,
+            },
+            {
+                "filename": "plot.png",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/plot.png",
+                "content_type": "image/png",
+                "size_bytes": 512,
+                "kind": "image",
+            },
+            {
+                "filename": "diagram.svg",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/diagram.svg",
+                "content_type": "image/svg+xml",
+                "size_bytes": 64,
+                "kind": "image",  # SVG maps to kind="image" via _VIEWABLE_CONTENT_TYPES
+            },
+            {
+                "filename": "unknown.xyz",
+                "storage_uri": "gs://bucket/compute-jobs/j/artifacts/viewable/unknown.xyz",
+                "content_type": "application/octet-stream",
+                "size_bytes": 32,
+                "kind": "xyz",  # unrecognised kind is coerced to None fail-closed
+            },
+        ]
+    )
+    by_name = {e["filename"]: e for e in out}
+    assert by_name["report.pdf"]["kind"] == "pdf"
+    assert by_name["report.pdf"]["content_type"] == "application/pdf"
+    assert by_name["report.pdf"]["revision"] == "terminal-rev-7"
+    assert by_name["report.pdf"]["live"] is False
+    assert by_name["plot.png"]["kind"] == "image"
+    assert by_name["plot.png"]["revision"] is None
+    # SVG persisted as kind="image" passes through as "image".
+    assert by_name["diagram.svg"]["kind"] == "image"
+    assert by_name["diagram.svg"]["content_type"] == "image/svg+xml"
+    # A truly unrecognised kind is coerced to None fail-closed.
+    assert by_name["unknown.xyz"]["kind"] is None

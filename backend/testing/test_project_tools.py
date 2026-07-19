@@ -281,6 +281,146 @@ async def test_register_tool_duplicate_slug(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_register_second_tool_of_same_kind_gets_unique_slug(
+    client: AsyncClient, db_session
+):
+    """A 2nd (and Nth) tool of an existing kind with NO explicit slug succeeds
+    with an auto-generated, distinct, pattern-valid slug — instead of 409ing on
+    the (project_id, slug) uniqueness constraint (SEV2 Add-form brick)."""
+    import re as _re
+
+    slug_pat = _re.compile(r"^[a-z0-9][a-z0-9\-_]{0,63}$")
+    project = await _make_project_member(db_session)
+
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "First Board"},
+    )
+    assert first.status_code == 200, first.text
+    slug1 = first.json()["slug"]
+    # The first tool of a kind keeps the historical bare-kind default slug.
+    assert slug1 == "whiteboard"
+
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Second Board"},
+    )
+    assert second.status_code == 200, second.text
+    slug2 = second.json()["slug"]
+    assert slug2 != slug1
+    assert slug_pat.match(slug2), slug2
+    assert second.json()["kind"] == "whiteboard"
+
+    # A THIRD of the same kind (even with a duplicate title) still succeeds with
+    # yet another distinct slug — the numeric-suffix fallback must terminate.
+    third = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Second Board"},
+    )
+    assert third.status_code == 200, third.text
+    slug3 = third.json()["slug"]
+    assert slug3 not in {slug1, slug2}
+    assert slug_pat.match(slug3), slug3
+
+
+@pytest.mark.asyncio
+async def test_register_explicit_slug_still_409s_on_collision(
+    client: AsyncClient, db_session
+):
+    """Auto-uniquify must NOT weaken the explicit-slug contract: a caller that
+    passes an explicit, already-taken slug still gets a deterministic 409."""
+    project = await _make_project_member(db_session)
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "explicit-board"},
+    )
+    assert first.status_code == 200, first.text
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "slug": "explicit-board"},
+    )
+    assert second.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_register_second_tool_of_kind_auto_slugs(client: AsyncClient, db_session):
+    """Two registrations of the same kind with no explicit slug both succeed;
+    the second auto-uniquifies to '<kind>-2' instead of a 409 dead-end."""
+    project = await _make_project_member(db_session)
+    first = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "First notes"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["slug"] == "notes"
+
+    second = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Second notes"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["slug"] == "notes-2"
+
+    third = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Third notes"},
+    )
+    assert third.status_code == 200, third.text
+    assert third.json()["slug"] == "notes-3"
+
+
+@pytest.mark.asyncio
+async def test_seed_then_register_same_kind_succeeds(client: AsyncClient, db_session):
+    """After Seed defaults installs one-of-each-kind, the Add form can still
+    register another tool of a seeded kind (no permanent 409 on the Add form)."""
+    project = await _make_project_member(db_session)
+    seed = await client.post(f"{_BASE}/projects/{project.id}/tools/seed")
+    assert seed.status_code == 200, seed.text
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "title": "Another board"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["slug"] == "whiteboard-2"
+
+
+@pytest.mark.asyncio
+async def test_create_tool_rejects_invalid_placement(client: AsyncClient, db_session):
+    """POST /tools rejects a bogus placement string with 400."""
+    project = await _make_project_member(db_session)
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "bad-placement", "placement": "floating_panel"},
+    )
+    assert resp.status_code == 400
+    msg = resp.json()["error"]["message"]
+    assert "placement" in msg.lower()
+    assert "floating_panel" in msg
+
+
+@pytest.mark.asyncio
+async def test_update_tool_rejects_invalid_placement(client: AsyncClient, db_session):
+    """PATCH /tools/{id} rejects a bogus placement string with 400."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "upd-placement"},
+        )
+    ).json()
+    tool_id = created["id"]
+
+    resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "nowhere"},
+    )
+    assert resp.status_code == 400
+    msg = resp.json()["error"]["message"]
+    assert "placement" in msg.lower()
+
+
+@pytest.mark.asyncio
 async def test_register_tool_requires_owner(client: AsyncClient, db_session):
     """A member (below owner) cannot register a tool -> 403."""
     project = await _make_project_member(db_session, role="member")
@@ -642,6 +782,31 @@ async def test_update_tool_config(client: AsyncClient, db_session):
         json={"config": {"theme": "dark"}},
     )
     assert resp.status_code == 200, resp.text
+    # The Configure UI prefills from the summary's `config`, so it must be
+    # surfaced (and reflect the just-saved value).
+    assert resp.json()["config"] == {"theme": "dark"}
+
+
+@pytest.mark.asyncio
+async def test_update_tool_placement_round_trips(client: AsyncClient, db_session):
+    """PATCH placement is accepted and echoed — the Configure UI relies on this."""
+    project = await _make_project_member(db_session)
+    created = (
+        await client.post(
+            f"{_BASE}/projects/{project.id}/tools",
+            json={"kind": "whiteboard", "slug": "place-upd"},
+        )
+    ).json()
+    tool_id = created["id"]
+    # Fresh summaries expose `config` (empty by default) for prefill.
+    assert created["config"] == {}
+
+    resp = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool_id}",
+        json={"placement": "sidebar"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["placement"] == "sidebar"
 
 
 @pytest.mark.asyncio
@@ -2336,6 +2501,124 @@ async def test_claim_omits_skills_when_no_manifest(client, db_session):
             )
 
 
+@pytest.mark.asyncio
+async def test_project_tool_content_reaches_agent_context(client, db_session):
+    """A project's enabled built-in notes tool content reaches the claim response.
+
+    This is the end-to-end acceptance proof for the tool-content bridge: an
+    operator writes markdown in a project's notes tool, and an agent claiming a
+    task for that project sees that text under the additive ``project_tools``
+    key — mirroring how manifest skills already reach agents.
+    """
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    project = await _make_project_member(db_session)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    notes_markdown = "# Working hypothesis\n\nThe retry loop double-counts on 429s."
+    # Enabled notes tool with real markdown content.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="notes",
+            title="Research Notes",
+            enabled=True,
+            content={"text": notes_markdown},
+        )
+    )
+    # A disabled tool that must NOT leak into the agent context.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="secret",
+            title="Disabled",
+            enabled=False,
+            content={"text": "should never appear"},
+        )
+    )
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="test-vm-tool-content",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "Build feature X"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "test-vm-tool-content")
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "project_tools" in body, (
+        f"Claim response missing 'project_tools' key. "
+        f"Available keys: {sorted(body.keys())}"
+    )
+    tools = body["project_tools"]
+    assert len(tools) == 1, f"expected only the enabled tool, got {tools}"
+    tool = tools[0]
+    assert tool["slug"] == "notes"
+    assert tool["title"] == "Research Notes"
+    assert tool["kind"] == "notes"
+    assert tool["text"] == notes_markdown
+    # The disabled tool's content must not appear anywhere in the payload.
+    assert "should never appear" not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_claim_omits_project_tools_when_none_enabled(client, db_session):
+    """When no enabled tool has content, the claim omits the project_tools key."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    project = await _make_project_member(db_session)
+    # An enabled but EMPTY-content notes tool contributes nothing.
+    db_session.add(
+        ProjectTool(
+            project_id=project.id,
+            kind="notes",
+            slug="notes",
+            title="Empty",
+            enabled=True,
+            content={"text": "   "},
+        )
+    )
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="test-vm-no-tools",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "Build feature X"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "test-vm-no-tools")
+    resp = await client.post(
+        "/api/agent/claim",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    if "project_tools" in body:
+        assert body["project_tools"] == [], (
+            "project_tools should be empty/absent when no enabled tool has content"
+        )
+
+
 # ===========================================================================
 # Compute image: manifest compute.image section parsing
 # ===========================================================================
@@ -2539,6 +2822,158 @@ async def test_manifest_compute_no_connected_repo_has_compute_key(
     assert body["compute"]["image"] is None
 
 
+# ---------------------------------------------------------------------------
+# Local-source fallback tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_manifest_local_fallback_loads_tools(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is set and project has no GitHub connection,
+    manifest loads from the local filesystem."""
+    from app.routers.admin_project_tools import _manifest_cache
+
+    # Set up a minimal tools.json under the local root.
+    blueprint_dir = tmp_path / ".blueprint"
+    blueprint_dir.mkdir()
+    manifest = {"tools": [{"slug": "canvas", "title": "Canvas", "entry": "index.html"}]}
+    (blueprint_dir / "tools.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    # No github_owner/github_repo — local fallback must fire.
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+    assert resp.status_code == 200
+    body = resp.json()
+    tools = body.get("tools", [])
+    assert any(t["slug"] == "canvas" for t in tools), f"Expected 'canvas' in tools: {tools}"
+    assert body.get("error") is None
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_manifest_local_fallback_absent_returns_empty(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT points to a dir with no tools.json,
+    the response is empty lists with no error."""
+    from app.routers.admin_project_tools import _manifest_cache
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("tools") == []
+    assert body.get("error") is None
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_manifest_github_primary_takes_precedence(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When a project has a GitHub connection, GitHub is the primary source even
+    if BLUEPRINT_LOCAL_TOOLS_ROOT is also set."""
+    from unittest.mock import AsyncMock, patch
+    from app.routers.admin_project_tools import _manifest_cache
+
+    # Write a local manifest with a 'local-only-tool' slug.
+    blueprint_dir = tmp_path / ".blueprint"
+    blueprint_dir.mkdir()
+    local_manifest = {"tools": [{"slug": "local-only-tool", "title": "Local Only", "entry": "index.html"}]}
+    (blueprint_dir / "tools.json").write_text(json.dumps(local_manifest), encoding="utf-8")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+    _manifest_cache.clear()
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    github_manifest = json.dumps({"tools": [{"slug": "github-tool", "title": "GitHub Tool", "entry": "app.html"}]})
+
+    with (
+        patch("app.github_auth.get_repo_installation_read_token", AsyncMock(return_value="ghs_tok")),
+        patch("app.github_refs.get_repo_default_branch", AsyncMock(return_value="main")),
+        patch("app.github.get_file_text_at_ref", AsyncMock(return_value=github_manifest)),
+    ):
+        resp = await client.get(f"{_BASE}/projects/{project.id}/tools/manifest")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    slugs = [t["slug"] for t in body.get("tools", [])]
+    assert "github-tool" in slugs, f"Expected GitHub tool in response: {slugs}"
+    assert "local-only-tool" not in slugs, f"Local tool should not appear: {slugs}"
+
+    _manifest_cache.clear()
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_local_fallback_serves_file(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is set and project has no GitHub connection,
+    asset files are served from the local filesystem."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    # Write a JS asset under the tool slug.
+    asset_dir = tmp_path / ".blueprint" / "tools" / "canvas"
+    asset_dir.mkdir(parents=True)
+    (asset_dir / "app.js").write_bytes(b"console.log('local');")
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+
+    project = await _make_project_member(db_session)
+    # No GitHub connection.
+
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/app.js"
+    )
+    assert resp.status_code == 200
+    assert b"local" in resp.content
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_local_fallback_missing_file_returns_404(client: AsyncClient, db_session, tmp_path, monkeypatch):
+    """When no local asset exists and project has no GitHub connection, serve 404."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    monkeypatch.setenv("BLUEPRINT_LOCAL_TOOLS_ROOT", str(tmp_path))
+
+    project = await _make_project_member(db_session)
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/missing.js"
+    )
+    assert resp.status_code == 404
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+
+@pytest.mark.asyncio
+async def test_asset_no_local_root_no_github_returns_404(client: AsyncClient, db_session, monkeypatch):
+    """When BLUEPRINT_LOCAL_TOOLS_ROOT is not set and project has no GitHub connection,
+    serve 404."""
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    monkeypatch.delenv("BLUEPRINT_LOCAL_TOOLS_ROOT", raising=False)
+
+    project = await _make_project_member(db_session)
+    token = _create_tool_asset_token(str(project.id), "canvas")
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/canvas/t/{token}/assets/app.js"
+    )
+    assert resp.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_research_claim_includes_project_skills(client, db_session):
     """Research and plan task types receive project skills just like create/fix tasks."""
@@ -2600,3 +3035,418 @@ async def test_research_claim_includes_project_skills(client, db_session):
             assert len(skills) == 1
             assert skills[0]["slug"] == "benchmark"
             assert skills[0]["command"] == "bash bench.sh"
+
+
+# ---------------------------------------------------------------------------
+# Agent-token fetch endpoint: GET /api/agent/projects/{id}/tools
+# (operator-facing strategic resident reads project tool content via ./fetch tools)
+# ---------------------------------------------------------------------------
+
+
+async def _make_project_with_task(session, name: str):
+    """Create a project plus a task whose agent token authorizes fetch calls."""
+    from app.models import Task
+
+    project = Project(name=name, user_id=TEST_USER_ID)
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-tools")
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_returns_enabled_content(client: AsyncClient, db_session):
+    """The agent-token /tools fetch returns serialized enabled-tool content."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_project_with_task(db_session, "AgentFetch-Tools")
+    db_session.add_all(
+        [
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="notes",
+                title="Notes", enabled=True,
+                content={"text": "# Plan\n\nShip the retry path."},
+            ),
+            ProjectTool(
+                project_id=project.id, kind="whiteboard", slug="wb",
+                title="Sketch", enabled=True,
+                content={"strokes": [{"points": [1, 2]}, {"points": [3, 4]}]},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    tools = body["tools"]
+    by_slug = {t["slug"]: t for t in tools}
+    assert by_slug["notes"]["text"] == "# Plan\n\nShip the retry path."
+    assert by_slug["notes"]["kind"] == "notes"
+    # Whiteboard renders as a presence/summary line, never raw stroke JSON.
+    assert "2 strokes" in by_slug["wb"]["text"]
+    assert "points" not in by_slug["wb"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_empty_when_none_enabled(client: AsyncClient, db_session):
+    """Disabled/empty tools yield an empty list rather than an error."""
+    from app.auth import create_agent_token
+
+    project, task = await _make_project_with_task(db_session, "AgentFetch-ToolsEmpty")
+    db_session.add_all(
+        [
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="off",
+                title="Off", enabled=False, content={"text": "hidden"},
+            ),
+            ProjectTool(
+                project_id=project.id, kind="notes", slug="blank",
+                title="Blank", enabled=True, content={"text": "   "},
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"tools": []}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_tools_cross_project_404(client: AsyncClient, db_session):
+    """An agent token for project A must not read project B's tool content."""
+    from app.auth import create_agent_token
+
+    project_a, task_a = await _make_project_with_task(db_session, "AgentFetch-ToolsA")
+    project_b, _ = await _make_project_with_task(db_session, "AgentFetch-ToolsB")
+    db_session.add(
+        ProjectTool(
+            project_id=project_b.id, kind="notes", slug="secret",
+            title="Secret", enabled=True, content={"text": "B-only note"},
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task_a.id), "agent-vm-tools")
+    resp = await client.get(
+        f"/api/agent/projects/{project_b.id}/tools",
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 404
+
+
+# ===========================================================================
+# End-to-end walkthrough: register → auto-slug → explicit-collision → disable/enable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_walkthrough_disable_enable_chain(client: AsyncClient, db_session):
+    """E2E walkthrough: register a tool (default slug) → register a second of the same kind
+    and assert auto-uniquified slug (SEV2) → explicit-collision slug → 409 → disable the
+    first tool and verify it leaves the list enabled=False and the agent fetch → re-enable
+    and verify the list and agent fetch reflect the restored state."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    # Setup: project with owner membership + a task for agent-token minting
+    project = await _make_project_member(db_session)
+    task = Task(
+        project_id=project.id,
+        vm_instance_id="walkthrough-agent-vm",
+        status="QUEUED",
+        payloads=[{"type": "create", "prompt": "walkthrough"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Step 1: register first tool — no explicit slug → default slug = kind name
+    r1 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "First Notes"},
+    )
+    assert r1.status_code == 200, r1.text
+    tool1 = r1.json()
+    assert tool1["slug"] == "notes"
+    assert tool1["enabled"] is True
+    tool1_id = tool1["id"]
+
+    # Step 2: register second tool of same kind without explicit slug → auto-uniquified (SEV2)
+    r2 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "notes", "title": "Second Notes"},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["slug"] == "notes-2", (
+        f"second tool of same kind must auto-uniquify; got {r2.json()['slug']!r}"
+    )
+
+    # Step 3: explicit slug collision → 409 (auto-uniquify must not weaken this guard)
+    r3 = await client.post(
+        f"{_BASE}/projects/{project.id}/tools",
+        json={"kind": "whiteboard", "slug": "notes"},
+    )
+    assert r3.status_code == 409
+
+    # Step 4: write content to tool1 so it surfaces in the agent-facing fetch
+    put_content = await client.put(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}/content",
+        json={"content": {"text": "# Walkthrough\n\nTest hypothesis"}, "base_revision": 0},
+    )
+    assert put_content.status_code == 200
+
+    agent_token = create_agent_token(str(task.id), "walkthrough-agent-vm")
+
+    # Step 5: disable tool1 → list shows enabled=False, agent fetch excludes it
+    patch_off = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}",
+        json={"enabled": False},
+    )
+    assert patch_off.status_code == 200
+    assert patch_off.json()["enabled"] is False
+
+    list_after_disable = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    tool1_in_list = next(t for t in list_after_disable if t["id"] == tool1_id)
+    assert tool1_in_list["enabled"] is False
+
+    agent_resp_off = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_off.status_code == 200
+    agent_slugs_off = [t["slug"] for t in agent_resp_off.json()["tools"]]
+    assert "notes" not in agent_slugs_off, (
+        "disabled tool must not appear in agent-facing content fetch"
+    )
+
+    # Step 6: re-enable tool1 → list shows enabled=True, agent fetch includes it
+    patch_on = await client.patch(
+        f"{_BASE}/projects/{project.id}/tools/{tool1_id}",
+        json={"enabled": True},
+    )
+    assert patch_on.status_code == 200
+    assert patch_on.json()["enabled"] is True
+
+    list_after_enable = (await client.get(f"{_BASE}/projects/{project.id}/tools")).json()["tools"]
+    tool1_re_enabled = next(t for t in list_after_enable if t["id"] == tool1_id)
+    assert tool1_re_enabled["enabled"] is True
+
+    agent_resp_on = await client.get(
+        f"/api/agent/projects/{project.id}/tools",
+        headers={"x-agent-token": agent_token},
+    )
+    assert agent_resp_on.status_code == 200
+    agent_tools_on = {t["slug"]: t for t in agent_resp_on.json()["tools"]}
+    assert "notes" in agent_tools_on, (
+        "re-enabled tool with content must appear in agent-facing content fetch"
+    )
+    assert "Walkthrough" in agent_tools_on["notes"]["text"]
+
+
+# ===========================================================================
+# Path-embedded token: subresource authentication fix (finding 37bc0b9c)
+# ===========================================================================
+#
+# Acceptance criteria (playbook: project-tool-iframe-token-propagation):
+#   1. A relative subresource path under the path-token prefix serves 200
+#      with a valid path token.
+#   2. The same request returns 401 with an invalid/expired path token.
+#   3. A multi-asset entry-HTML test (not just direct tokened URLs): the HTML
+#      entry point is served, and a relative subresource (JS) under the same
+#      path-token prefix is also served 200 — proving that a browser resolving
+#      `<script src="./app.js">` relative to the entry URL would authenticate.
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_serves_asset_with_valid_token(
+    client: AsyncClient, db_session,
+):
+    """A relative subresource path under the token prefix serves 200 with a valid path token."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value="console.log('app');"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/app.js"
+        )
+        assert resp.status_code == 200
+        assert "console.log" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_rejects_invalid_token(
+    client: AsyncClient, db_session,
+):
+    """A relative subresource path under the token prefix returns 401 with an invalid token."""
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    resp = await client.get(
+        f"{_BASE}/projects/{project.id}/tools/my-tool/t/not-a-valid-jwt/assets/app.js"
+    )
+    assert resp.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_multi_asset_page(
+    client: AsyncClient, db_session,
+):
+    """Multi-asset acceptance: the HTML entry and a relative JS subresource both
+    serve 200 under the same path-token prefix, proving relative URL resolution
+    would authenticate `<script src='./app.js'>` inside a sandboxed iframe."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    html_body = '<!DOCTYPE html><html><head><script src="./app.js"></script></head><body>Tool</body></html>'
+    js_body = "console.log('tool');"
+
+    def _mock_get_file(path, **_kwargs):
+        if path.endswith("index.html"):
+            return html_body
+        if path.endswith("app.js"):
+            return js_body
+        return None
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(side_effect=_mock_get_file),
+        ),
+    ):
+        html_resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert html_resp.status_code == 200, html_resp.text
+        assert "Tool" in html_resp.text
+        assert html_resp.headers["content-type"].startswith("text/html")
+
+        js_resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/app.js"
+        )
+        assert js_resp.status_code == 200, js_resp.text
+        assert "console.log" in js_resp.text
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_html_has_referrer_policy(
+    client: AsyncClient, db_session,
+):
+    """HTML served via the path-token route carries Referrer-Policy: no-referrer
+    to prevent the path-embedded token from leaking in Referer headers."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "my-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+        patch(
+            "app.github.get_file_text_at_ref",
+            AsyncMock(return_value="<html><body>Hi</body></html>"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert resp.status_code == 200
+        assert resp.headers.get("referrer-policy") == "no-referrer"
+
+
+@pytest.mark.asyncio
+async def test_path_token_route_wrong_slug_rejected(
+    client: AsyncClient, db_session,
+):
+    """A token minted for slug A is rejected when used with slug B in the path route."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.routers.admin_project_tools import _create_tool_asset_token
+
+    project = await _make_project_member(db_session)
+    project.github_owner = "test-owner"
+    project.github_repo = "test-repo"
+    await db_session.commit()
+
+    token = _create_tool_asset_token(str(project.id), "other-tool")
+
+    with (
+        patch(
+            "app.github_auth.get_repo_installation_read_token",
+            AsyncMock(return_value="ghs_testtoken"),
+        ),
+        patch(
+            "app.github_refs.get_repo_default_branch",
+            AsyncMock(return_value="main"),
+        ),
+    ):
+        resp = await client.get(
+            f"{_BASE}/projects/{project.id}/tools/my-tool/t/{token}/assets/index.html"
+        )
+        assert resp.status_code == 401

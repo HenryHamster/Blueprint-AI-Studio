@@ -17,6 +17,7 @@ from app.direction_metrics import (
     _PROOF_WEIGHT_DECLARED_UNPROVEN,
     _PROOF_WEIGHT_UNDECLARED,
     _agg_proof_weighted_merged,
+    _compute_direction_quality_score,
     _fold_evicted_into_aggregate,
     _weight_merged,
     proof_weighted_merged,
@@ -187,3 +188,61 @@ class TestFoldDecompositionDenominator:
             dq["subtask_merge_rate_weighted_sum"] / dq["subtask_count_sum"]
         )
         assert weighted_avg == pytest.approx(4.0 / 6)
+
+
+class TestComputeDirectionQualityScoreQualityGrader:
+    """_compute_direction_quality_score: quality_grader_verdict signal (f)."""
+
+    def _direction(self, history):
+        return {"research_history": history}
+
+    def test_all_passed_verdicts_raise_score(self):
+        history = [
+            {"quality_grader_verdict": {"passed": True, "reason": "ok"}},
+            {"quality_grader_verdict": {"passed": True, "reason": "ok"}},
+        ]
+        d = self._direction(history)
+        score = _compute_direction_quality_score(d)
+        # All verdicts pass → quality grader signal is 1.0, which raises the average.
+        assert score > 0.5
+
+    def test_all_failed_verdicts_lower_score(self):
+        history = [
+            {"quality_grader_verdict": {"passed": False, "reason": "bad"}},
+            {"quality_grader_verdict": {"passed": False, "reason": "bad"}},
+        ]
+        d = self._direction(history)
+        score = _compute_direction_quality_score(d)
+        # All verdicts fail → quality grader signal is 0.0, which lowers the average.
+        assert score < 0.5
+
+    def test_legacy_entries_without_verdict_are_neutral(self):
+        history = [
+            {"tasks_created": 2, "prs_merged": 1},
+            {"tasks_created": 3, "prs_merged": 2},
+        ]
+        d = self._direction(history)
+        score_without = _compute_direction_quality_score(d)
+        # Adding quality_grader_verdict to all entries raises the score.
+        history_with = [
+            {**e, "quality_grader_verdict": {"passed": True, "reason": "ok"}}
+            for e in history
+        ]
+        score_with = _compute_direction_quality_score(self._direction(history_with))
+        # Without verdicts: signal (f) is absent → score is neutral on that component.
+        # With all-pass verdicts: signal (f) = 1.0 → score increases.
+        assert score_with >= score_without
+
+    def test_no_history_returns_neutral(self):
+        d = self._direction([])
+        assert _compute_direction_quality_score(d) == pytest.approx(0.5)
+
+    def test_malformed_verdict_entry_ignored(self):
+        history = [
+            {"quality_grader_verdict": "not-a-dict"},
+            {"quality_grader_verdict": {"passed": True, "reason": "ok"}},
+        ]
+        d = self._direction(history)
+        # Malformed entry is skipped; only the valid entry contributes.
+        score = _compute_direction_quality_score(d)
+        assert 0.0 <= score <= 1.0

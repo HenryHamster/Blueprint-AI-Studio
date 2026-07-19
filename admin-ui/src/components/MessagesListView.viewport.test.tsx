@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
-import { MessagesListView, type MessagesListViewProps, buildTriageItems, type BuildParams } from './MessagesListView';
+import { MessagesListView, type MessagesListViewProps, type ConversationListImperativeApi, buildTriageItems, type BuildParams } from './MessagesListView';
+import { preserveScrollAnchorAfterPrepend } from '../utils/conversationScrollAnchor';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectNoTextTruncationAt, expectMinTouchTargetAt, stressStrings } from '../test/viewport';
 
@@ -84,6 +85,19 @@ function baseProps(overrides: Partial<MessagesListViewProps> = {}): MessagesList
   };
 }
 
+test('preserves the visible scroll anchor when older conversation rows prepend', async () => {
+  const viewport = { scrollHeight: 1_000, scrollTop: 320 };
+  let scheduled: (() => void) | null = null;
+  await preserveScrollAnchorAfterPrepend(
+    viewport,
+    () => { viewport.scrollHeight = 1_450; },
+    callback => { scheduled = callback; },
+  );
+  expect(viewport.scrollTop).toBe(320);
+  (scheduled as (() => void) | null)?.();
+  expect(viewport.scrollTop).toBe(770);
+});
+
 describe('MessagesListView — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -155,6 +169,65 @@ describe('MessagesListView — viewport regression', () => {
     // Poll until the render settles rather than asserting mid-suspense.
     await vi.waitFor(() => {
       expect(host?.querySelector('button[aria-label="Scroll to latest message"]')).toBeTruthy();
+    });
+  });
+
+  test('conversation virtualizes a 1,000-message history to a bounded DOM', async () => {
+    const messages = Array.from({ length: 1_000 }, (_, index) => makeMsg({
+      id: `conversation-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: `Conversation message ${index + 1}`,
+      surface: 'conversation',
+    }));
+    await renderView(baseProps({
+      presentation: 'conversation',
+      messages,
+    }));
+    await vi.waitFor(() => {
+      expect(host?.querySelector('[data-testid="strategic-conversation-column"]')).toBeTruthy();
+      const renderedBubbles = host?.querySelectorAll('[data-testid="message-bubble"]').length ?? 0;
+      expect(renderedBubbles).toBeGreaterThan(0);
+      expect(renderedBubbles).toBeLessThan(40);
+    });
+  });
+
+  test('imperative conversation navigation renders an offscreen target before resolving', async () => {
+    const messages = Array.from({ length: 200 }, (_, index) => makeMsg({
+      id: `target-history-${index + 1}`,
+      sequence: index + 1,
+      from_type: index % 2 ? 'strategic' : 'user',
+      content: `Target history ${index + 1}`,
+      surface: 'conversation',
+    }));
+    const conversationListRef = createRef<ConversationListImperativeApi>();
+    await renderView(baseProps({ presentation: 'conversation', messages, conversationListRef }));
+    expect(host?.querySelector('[data-message-id="target-history-150"]')).toBeNull();
+    let rendered = false;
+    let navigation!: Promise<boolean>;
+    act(() => { navigation = conversationListRef.current!.scrollToMessage('target-history-150'); });
+    rendered = await navigation;
+    expect(rendered).toBe(true);
+    expect(host?.querySelector('[data-message-id="target-history-150"]')).not.toBeNull();
+  });
+
+  test.each(['triage', 'conversation'] as const)('%s virtual rows retain listitem ARIA position metadata', async presentation => {
+    const messages = Array.from({ length: 4 }, (_, index) => makeMsg({
+      id: `aria-${presentation}-${index + 1}`,
+      sequence: index + 1,
+      from_type: presentation === 'conversation' ? 'strategic' : 'system',
+      surface: presentation === 'conversation' ? 'conversation' : 'activity',
+    }));
+    await renderView(baseProps({
+      presentation,
+      messages,
+      otherHighSignal: presentation === 'triage' ? messages : [],
+    }));
+    await vi.waitFor(() => {
+      const item = host?.querySelector('[role="listitem"]');
+      expect(item).toBeTruthy();
+      expect(item?.getAttribute('aria-posinset')).toBe('1');
+      expect(Number(item?.getAttribute('aria-setsize'))).toBeGreaterThanOrEqual(4);
     });
   });
 

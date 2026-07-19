@@ -14,6 +14,14 @@ from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
+
+from app.routers.admin_hotfix_promote import (
+    _HotfixPromoteRequest as _HotfixPromoteRequest,
+    get_hotfix_scope_preview as get_hotfix_scope_preview,
+    router as _hotfix_promote_router,
+    trigger_hotfix_promote as trigger_hotfix_promote,
+)
+
 from typing import List, Literal
 import uuid
 import logging
@@ -45,6 +53,7 @@ from app import release_qualifier, release_version
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["admin"])
+router.include_router(_hotfix_promote_router)
 
 _MAX_QUEUED_WAVE_EDGE_REPAIR_SCAN = 500
 
@@ -370,14 +379,8 @@ async def trigger_force_promote(
     return result
 
 
-from app.routers.admin_hotfix_promote import (
-    _HotfixPromoteRequest as _HotfixPromoteRequest,
-    get_hotfix_scope_preview as get_hotfix_scope_preview,
-    router as _hotfix_promote_router,
-    trigger_hotfix_promote as trigger_hotfix_promote,
-)
 
-router.include_router(_hotfix_promote_router)
+
 
 # Blocker provenance sources that mark a depends_on edge as a real, structural
 # prerequisite rather than legacy queue-wave serialization.

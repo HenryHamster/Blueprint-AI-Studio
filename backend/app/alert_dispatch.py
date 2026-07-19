@@ -32,6 +32,7 @@ from app.models import (
     Task,  # used in the "Task" string annotation on _maybe_create_failure_alert
     Alert,
     AlertSeverity,
+    ComputeJob,  # used in the "ComputeJob" string annotation
 )
 from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
@@ -726,6 +727,8 @@ async def _maybe_create_circuit_breaker_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
     reason: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a WARNING alert when the circuit breaker opens for a project.
     Deduplicates: skips if an undismissed circuit-breaker alert already exists."""
@@ -747,6 +750,12 @@ async def _maybe_create_circuit_breaker_alert(
         message=reason,
     )
     session.add(alert)
+    if expected_legacy_generation is not None:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -819,6 +828,7 @@ async def _maybe_create_spend_ceiling_alert(
     window_spend_usd: float,
     ceiling_usd: float,
     spend_window_days: int,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a deduplicated WARNING alert when a project's spend ceiling is hit.
 
@@ -848,7 +858,14 @@ async def _maybe_create_spend_ceiling_alert(
         ),
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -869,6 +886,7 @@ async def _maybe_create_approaching_ceiling_alert(
     ceiling_usd: float,
     warning_fraction: float,
     spend_window_days: int,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a deduplicated WARNING alert when a project's spend approaches its ceiling.
 
@@ -901,7 +919,14 @@ async def _maybe_create_approaching_ceiling_alert(
         ),
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
@@ -1836,6 +1861,15 @@ from app.runner_health_alerts import (  # noqa: F401
     _resolve_runner_cross_project_access_alert,
     _runner_cross_project_access_dedupe_key,
     _runner_cross_project_mismatch_timestamps,
+    # GCE task-VM low-disk / low-memory alerts (warm-pool VM monitoring parity)
+    _VM_LOW_DISK_EVENT_TYPE,
+    _VM_LOW_MEMORY_EVENT_TYPE,
+    _maybe_create_vm_low_disk_alert,
+    _maybe_create_vm_low_memory_alert,
+    _resolve_vm_low_disk_alert,
+    _resolve_vm_low_memory_alert,
+    _vm_low_disk_dedupe_key,
+    _vm_low_memory_dedupe_key,
 )
 
 # Stable title prefix for the per-project cost-telemetry-reconciliation-failure alert.
@@ -1908,10 +1942,86 @@ async def _maybe_create_cost_telemetry_reconciliation_alert(
     )
 
 
+# Stable title for the per-project compute-image drift/rebuild alert. Kept
+# CONSTANT (the drifting dep_hash and pinned_ref live in the message) so a
+# project whose image is rebuilt across consecutive sweep ticks dedups to
+# exactly ONE open alert per project. Keep the title stable.
+_COMPUTE_IMAGE_DRIFT_ALERT_TITLE = (
+    "Compute image auto-rebuilt: dependency manifest changed"
+)
+
+
+async def _maybe_create_compute_image_drift_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    dep_hash: "str | None",
+    pinned_ref: "str | None",
+) -> bool:
+    """Create a deduplicated INFO alert when the hourly sweep auto-rebuilds a
+    project's baked compute image because its dependency manifest drifted.
+
+    The hourly refresh sweep logs the rebuild at INFO level only — there is no
+    operator-facing signal that a project's image changed. This surfaces the
+    event in the same Alerts banner as other pipeline health signals so the
+    operator can see which projects rebuilt and what digest they now pin.
+
+    Deduplicated on a STABLE title so a project that rebuilds on consecutive
+    sweep ticks raises exactly ONE open alert per project; the dep_hash and
+    pinned_ref live in the message so a moving metric never defeats dedup.
+    Commits its own ``Alert`` row and broadcasts ``alert_created``; caller
+    wraps best-effort so an alert failure can never abort the sweep.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.
+    """
+    title = _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    ref_label = pinned_ref or "(unknown)"
+    if len(ref_label) > 120:
+        ref_label = ref_label[:117] + "…"
+    hash_label = (dep_hash or "(unknown)")[:32]
+    message = (
+        f"The project's baked compute image was automatically rebuilt because "
+        f"its dependency manifest changed (dep_hash={hash_label}). "
+        f"New pinned ref: {ref_label}. "
+        f"Authoring agents and new compute jobs will use the updated image."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.INFO,
+        title=title,
+        message=message,
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.INFO.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
     message: str,
+    *,
+    expected_legacy_generation: int | None = None,
 ) -> None:
     """Create a WARNING alert for strategic cycle failures. Deduplicates by title."""
     title = "Strategic cycle issue"
@@ -1932,9 +2042,92 @@ async def _create_strategic_alert(
         message=message[:1000],
     )
     session.add(alert)
-    await session.commit()
+    if expected_legacy_generation is None:
+        await session.commit()
+    else:
+        from app.strategic_resident_transition_locks import commit_legacy_authorized
+
+        await commit_legacy_authorized(
+            session, project_id, expected_legacy_generation
+        )
     await broadcast_to_project(
         str(project_id),
         "alert_created",
         {"alert_id": str(alert.id), "severity": "WARNING", "title": title},
+    )
+
+
+# Stable title for per-compute-job no-progress watchdog alert. Kept CONSTANT so
+# a persistent stall across monitor cycles dedups to exactly ONE alert per job.
+_NO_PROGRESS_WATCHDOG_ALERT_TITLE = (
+    "Compute job stalled — no progress detected"
+)
+
+
+async def _maybe_create_no_progress_watchdog_alert(
+    session: AsyncSession,
+    job: "ComputeJob",
+    *,
+    now: datetime,
+    watched_metric: str | None = None,
+) -> None:
+    """Create a WARNING alert when the no-progress watchdog is about to cut a job.
+
+    Fires BEFORE the terminate call so the operator sees a progressive
+    notification in the Alerts banner rather than learning about the cut only
+    after the job reaches TIMED_OUT. Deduplicates on (project_id, task_id, title)
+    — an undismissed alert with the stable title for this project+task means
+    earlier cycle(s) already raised one, so we skip. The caller owns the commit;
+    this helper commits only its own ``Alert`` row and broadcasts. Stamps
+    ``no_progress_warned_at`` in the job's polling_metadata so the monitor cycle
+    can cheaply skip re-alerting without a DB query on subsequent ticks (e.g.
+    when terminate fails and the job stays RUNNING).
+    """
+    # Cheap in-memory dedup: if this job was already warned on a prior cycle
+    # (e.g. terminate failed and the job is still RUNNING), skip the DB query.
+    if (job.polling_metadata or {}).get("no_progress_warned_at"):
+        return
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == job.project_id,
+            Alert.task_id == job.task_id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+
+    metric_label = watched_metric or (job.polling_metadata or {}).get(
+        "declared_metric", "unknown"
+    )
+    message = (
+        f"Compute job {str(job.id)[:8]} has made no measurable progress on "
+        f"declared metric '{metric_label}' and will be terminated early. "
+        f"Check the job logs or adjust the no-progress timeout if this is expected."
+    )[:1000]
+
+    alert = Alert(
+        project_id=job.project_id,
+        task_id=job.task_id,
+        severity=AlertSeverity.WARNING,
+        title=_NO_PROGRESS_WATCHDOG_ALERT_TITLE,
+        message=message,
+    )
+    session.add(alert)
+    # Stamp in-memory dedup marker so the caller doesn't re-alert if the
+    # monitor cycle re-enters this path before the job is terminated.
+    if job.polling_metadata is None:
+        job.polling_metadata = {}
+    job.polling_metadata["no_progress_warned_at"] = now.isoformat()
+    await session.commit()
+    await broadcast_to_project(
+        str(job.project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+        },
     )

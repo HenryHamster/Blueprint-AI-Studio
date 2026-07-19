@@ -527,6 +527,73 @@ def test_named_test_frontend_stem_mismatch_fails_closed():
     assert verdict.proven is False
 
 
+def test_named_test_python_suffix_convention_grounded_proven():
+    """A Python ``<module>_test.py`` suffix-named test grounds against a changed
+    ``<module>.py`` seam exactly like the ``test_<module>.py`` prefix does.
+
+    ``*_test.py`` is a pytest-recognized test-file shape (see
+    ``payload_schemas._TEST_FILE_BASENAME_RE``). Before the stem-grounding fix,
+    detection recognized it but ``_test_module_stem`` did not, so a legitimately
+    declared ``local_runner_test.py`` co-changed with ``local_runner.py`` failed
+    closed to satisfied/unproven. It must now earn machine-checked proof.
+    """
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/local_runner_test.py",
+        },
+        changed_files=[
+            "scripts/local_runner.py",
+            "backend/testing/local_runner_test.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is True
+    assert verdict.proven is True
+    assert "semantically grounded" in verdict.reason
+    assert verdict.proof_ref == "backend/testing/local_runner_test.py"
+
+
+def test_named_test_suffix_convention_stem_mismatch_fails_closed():
+    """A ``<module>_test.py`` whose stem matches no changed seam still fails
+    closed — the new suffix grounding grants proof only on a real stem match,
+    not to any suffix-named test with an unrelated production change."""
+    task = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/local_runner_test.py",
+        },
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/local_runner_test.py",
+        ],
+        unverified_reason=None,
+    )
+    verdict = evaluate_code_acceptance(task)
+    assert verdict.declared is True
+    assert verdict.satisfied is False
+    assert verdict.proven is False
+    assert "does not semantically correspond" in verdict.reason
+
+
+def test_test_module_stem_covers_suffix_conventions():
+    """``_test_module_stem`` extracts the module from every detection-recognized
+    suffix shape, and still fails closed on a non-test basename."""
+    from app.acceptance_gate import _test_module_stem
+
+    assert _test_module_stem("local_runner_test.py") == "local_runner"
+    assert _test_module_stem("orchestrator_test.go") == "orchestrator"
+    assert _test_module_stem("pipeline_test.exs") == "pipeline"
+    assert _test_module_stem("widget_spec.rb") == "widget"
+    # Prefix and JS/TS shapes are unchanged.
+    assert _test_module_stem("test_acceptance_gate.py") == "acceptance_gate"
+    assert _test_module_stem("ComputeJobsPanel.test.tsx") == "ComputeJobsPanel"
+    # A bare, non-test basename still fails closed (no machine proof granted).
+    assert _test_module_stem("random.py") is None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # named_test — GitHub-verified file list closes the self-declaration trust gap
 # ─────────────────────────────────────────────────────────────────────────────
@@ -676,6 +743,34 @@ def test_named_test_beyond_50_file_prefix_credits_soft_via_real_stamp():
     )
     assert verdict.proven is False
     assert "truncated" in verdict.reason
+
+
+def test_stamp_changed_files_signal_cap_boundary():
+    """The stored ``_pr_changed_files`` list is capped at ``_CHANGED_FILES_STAMP_CAP``
+    entries and the truncation sentinel fires exactly on overflow.
+
+    A list one past the cap stores exactly ``_CHANGED_FILES_STAMP_CAP`` paths and
+    sets ``_pr_changed_files_truncated``; a list at the cap stores everything and
+    sets no truncation sentinel. This pins the single source of truth for the cap
+    (the module constant, used in both the slice and the overflow check) so the
+    two sites can never drift apart.
+    """
+    from app.acceptance_gate import (
+        _CHANGED_FILES_STAMP_CAP,
+        stamp_changed_files_signal,
+    )
+
+    over = [f"backend/app/module_{i:03d}.py" for i in range(_CHANGED_FILES_STAMP_CAP + 1)]
+    signal_over = stamp_changed_files_signal(over)
+    assert len(signal_over["_pr_changed_files"]) == _CHANGED_FILES_STAMP_CAP
+    assert signal_over["_pr_changed_files"] == over[:_CHANGED_FILES_STAMP_CAP]
+    assert signal_over["_pr_changed_files_truncated"] is True
+
+    at_cap = [f"backend/app/module_{i:03d}.py" for i in range(_CHANGED_FILES_STAMP_CAP)]
+    signal_at = stamp_changed_files_signal(at_cap)
+    assert len(signal_at["_pr_changed_files"]) == _CHANGED_FILES_STAMP_CAP
+    assert signal_at["_pr_changed_files"] == at_cap
+    assert "_pr_changed_files_truncated" not in signal_at
 
 
 # ─────────────────────────────────────────────────────────────────────────────

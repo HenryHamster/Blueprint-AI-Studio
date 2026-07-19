@@ -7,6 +7,7 @@ import path from 'path';
 const fsPromisesMocks = vi.hoisted(() => ({
   unlink: vi.fn(),
   rm: vi.fn(),
+  stat: vi.fn(),
 }));
 
 vi.mock('fs', () => ({
@@ -58,7 +59,7 @@ vi.mock('os', () => ({
 }));
 
 // ── Imports (after mocks) ────────────────────────────────────────────────────
-import { resetForNextRole, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
+import { resetForNextRole, WorkspaceMissingError, clearStaleProviderCredentials, TMP_OUTPUT_NAMES } from './reset.js';
 import {
   registerChildPid,
   killAllChildren,
@@ -165,10 +166,12 @@ describe('resetForNextRole', () => {
     consoleLogSpy = installConsoleSpy('log');
     fsPromisesMocks.unlink.mockReset();
     fsPromisesMocks.rm.mockReset();
+    fsPromisesMocks.stat.mockReset();
     execFileImpl.mockReset();
     // Default: success for fs ops + git invocations.
     fsPromisesMocks.unlink.mockResolvedValue(undefined);
     fsPromisesMocks.rm.mockResolvedValue(undefined);
+    fsPromisesMocks.stat.mockResolvedValue({});
     execFileImpl.mockResolvedValue('');
   });
 
@@ -222,6 +225,18 @@ describe('resetForNextRole', () => {
     expect(unlinkPaths).not.toContain('/tmp/debug_output_X.json');
     expect(unlinkPaths).not.toContain('/tmp/perf_output_X.json');
     expect(unlinkPaths).not.toContain('/tmp/design_doc_output_X.json');
+  });
+
+  it('throws a self-describing workspace error instead of spawn git ENOENT when the workspace is absent', async () => {
+    const missing = new Error('ENOENT') as NodeJS.ErrnoException;
+    missing.code = 'ENOENT';
+    fsPromisesMocks.stat.mockRejectedValue(missing);
+
+    await expect(resetForNextRole({ workspace: '/missing/workspace', priorTaskId: 'X' }))
+      .rejects.toThrow(WorkspaceMissingError);
+    await expect(resetForNextRole({ workspace: '/missing/workspace', priorTaskId: 'X' }))
+      .rejects.toThrow('workspace missing at /missing/workspace — cannot hand off to next role');
+    expect(execFileImpl).not.toHaveBeenCalledWith('git', ['reset', '--hard', 'HEAD'], expect.anything());
   });
 
   it('survives ENOENT on /tmp unlink and continues to subsequent steps', async () => {

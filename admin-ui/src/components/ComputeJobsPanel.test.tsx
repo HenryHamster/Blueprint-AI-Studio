@@ -1,7 +1,7 @@
 import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, waitFor, act, fireEvent } from '@testing-library/react';
+import { render, waitFor, act, fireEvent, within } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
-import { ComputeJobsPanel } from './ComputeJobsPanel';
+import { ComputeJobsPanel, CompactJobsTable } from './ComputeJobsPanel';
 import {
   isComputeJobActive,
   computeJobTerminalLabel,
@@ -149,6 +149,26 @@ describe('ComputeJobsPanel helpers', () => {
     expect(
       computeJobTerminalLabel(makeJob({ outcome: 'TIMED_OUT', terminal_kind: 'no_progress' })),
     ).toBe('Killed: no progress');
+  });
+
+  test('computeJobTerminalLabel recognizes legacy runner no-progress watchdog rows only', () => {
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'runner-subprocess',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        terminal_reason: 'no_progress_timeout',
+        exit_code: 125,
+      })),
+    ).toBe('Killed: no progress');
+    expect(
+      computeJobTerminalLabel(makeJob({
+        backend: 'gcp_compute_engine',
+        status: 'FAILED',
+        outcome: 'FAILURE',
+        exit_code: 125,
+      })),
+    ).toBe('Failed');
   });
 
   test('computeJobTerminalLabel returns Killed: deadline for TIMED_OUT with terminal_kind deadline', () => {
@@ -305,11 +325,13 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     fetchHeldComputeExperiments.mockResolvedValue([]);
     fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
     fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
-    const { getByText } = render(
+    const { getByTestId } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
+    // Scope to the jobs list: the panel's tier FILTER control also renders the
+    // text 'Machine verified', so an unscoped query would be ambiguous.
     await waitFor(() => {
-      expect(getByText('Machine verified')).toBeTruthy();
+      expect(within(getByTestId('compute-jobs-list')).getByText('Machine verified')).toBeTruthy();
     });
   });
 
@@ -324,12 +346,104 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
     fetchHeldComputeExperiments.mockResolvedValue([]);
     fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
     fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
-    const { queryByText } = render(
+    const { findByText, getByTestId } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
-    await waitFor(() => {
-      expect(queryByText('Machine verified')).toBeNull();
+    // Wait for the active job to render, then confirm no tier badge in the jobs
+    // list (scoped so the filter control's 'Machine verified' label is excluded).
+    await findByText('compute_experiment: sweep');
+    expect(within(getByTestId('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
+  });
+
+  test('compact jobs table renders evidence-tier badge and runner id for terminal jobs', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+      accrued_cost_usd: 0,
+      final_cost_usd: 0,
+      completed_at: new Date().toISOString(),
+      runner: { id: 'dd59526e-0001-0002-0003-000000000004', hostname: 'iconlab-gpu-01', status: 'active' },
     });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" />
+    );
+    // Wait for the job's tier badge to render in the jobs list (scoped past the
+    // filter control which also contains a 'Machine verified' label), then switch
+    // to compact table view.
+    const jobsList = await findByTestId('compute-jobs-list');
+    await waitFor(() => {
+      expect(within(jobsList).getByText('Machine verified')).toBeTruthy();
+    });
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // Table should show evidence badge and runner hostname
+    const table = await findByTestId('compact-jobs-table');
+    expect(table.textContent).toContain('Machine verified');
+    expect(table.textContent).toContain('iconlab-gpu-01');
+  });
+
+  test('renders omitted-file note when viewable artifacts were dropped', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      viewable_artifacts: [
+        {
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/jobs/job-1/plot.png',
+          content_type: 'image/png',
+          size_bytes: 1024,
+          kind: 'image',
+        },
+      ],
+      viewable_artifacts_dropped_count: 3,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const note = await findByTestId('compute-artifact-omitted-note');
+    expect(note.textContent).toContain('3 files omitted');
+  });
+
+  test('renders no omitted-file note when dropped count is zero', async () => {
+    const job = makeJob({
+      backend: 'local-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      completed_at: new Date().toISOString(),
+      viewable_artifacts: [
+        {
+          filename: 'plot.png',
+          storage_uri: 'gs://bucket/jobs/job-1/plot.png',
+          content_type: 'image/png',
+          size_bytes: 1024,
+          kind: 'image',
+        },
+      ],
+      viewable_artifacts_dropped_count: 0,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Gallery renders (artifact present) but no omitted note.
+    await findByTestId('compute-artifact-gallery');
+    expect(
+      document.querySelector('[data-testid="compute-artifact-omitted-note"]'),
+    ).toBeNull();
   });
 
   test('renders Mutable image badge for a job whose image lacks a digest', async () => {
@@ -388,13 +502,14 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       final_cost_usd: 1.0,
       completed_at: new Date().toISOString(),
     })]));
-    const { getByText: getGcp, queryByText: queryGcp, unmount: unmountGcp } = render(
+    const { getByText: getGcp, getByTestId: gtGcp, unmount: unmountGcp } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
       expect(getGcp('Attested')).toBeTruthy();
     });
-    expect(queryGcp('Machine verified')).toBeNull();
+    // Scope 'Machine verified' past the tier filter control, which carries that label.
+    expect(within(gtGcp('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
     unmountGcp();
 
     // Operator-hardware (runner-subprocess) job WITH a measurable result: must
@@ -412,11 +527,11 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       completed_at: new Date().toISOString(),
       per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
     })]));
-    const { getByText: getRunner, unmount: unmountRunner } = render(
+    const { getByTestId: gtRunner, unmount: unmountRunner } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
-      expect(getRunner('Machine verified')).toBeTruthy();
+      expect(within(gtRunner('compute-jobs-list')).getByText('Machine verified')).toBeTruthy();
     });
     unmountRunner();
 
@@ -431,13 +546,13 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       final_cost_usd: 0,
       completed_at: new Date().toISOString(),
     })]));
-    const { getByText: getNoBackend, queryByText: queryNoBackend, unmount: unmountNoBackend } = render(
+    const { getByText: getNoBackend, getByTestId: gtNoBackend, unmount: unmountNoBackend } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
     await waitFor(() => {
       expect(getNoBackend('Self-reported')).toBeTruthy();
     });
-    expect(queryNoBackend('Machine verified')).toBeNull();
+    expect(within(gtNoBackend('compute-jobs-list')).queryByText('Machine verified')).toBeNull();
     unmountNoBackend();
 
     // Active cloud job: no evidence-tier badge at all
@@ -449,14 +564,272 @@ describe('ComputeJobsPanel evidence-tier badge rendering', () => {
       status: 'RUNNING',
       outcome: null,
     })]));
-    const { queryByText: queryActive } = render(
+    const { findByText: findActive, getByTestId: gtActive } = render(
       <ComputeJobsPanel projectId="proj-1" />
     );
-    await waitFor(() => {
-      expect(queryActive('Machine verified')).toBeNull();
-      expect(queryActive('Attested')).toBeNull();
-      expect(queryActive('Self-reported')).toBeNull();
+    await findActive('compute_experiment: active');
+    // No evidence-tier badge anywhere in the jobs list for an active job (scoped
+    // so the filter control's tier labels are excluded).
+    const activeList = within(gtActive('compute-jobs-list'));
+    expect(activeList.queryByText('Machine verified')).toBeNull();
+    expect(activeList.queryByText('Attested')).toBeNull();
+    expect(activeList.queryByText('Self-reported')).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel watchdog protection status', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  function setupMocks() {
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+  }
+
+  test('active job with watchdog_active:true renders Protected badge with timeout', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: true,
+        no_progress_timeout_seconds: 1800,
+        last_progress_at: new Date(Date.now() - 120_000).toISOString(),
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-protected"]')).toBeTruthy();
+    expect(el.textContent).toContain('Protected');
+    expect(el.textContent).toContain('30m');
+    expect(el.textContent).toContain('last progress');
+  });
+
+  test('active job with watchdog_active:false and no inert reason renders Unprotected badge', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        no_progress_timeout_seconds: null,
+        watchdog_inert_reason: null,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')).toBeTruthy();
+    expect(el.textContent).toContain('Unprotected');
+    expect(el.querySelector('[data-testid="compute-watchdog-inert-warning"]')).toBeNull();
+  });
+
+  test('active job with watchdog_active:false and inert reason renders warning block', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        watchdog_inert_reason: 'no_declared_metric',
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    const warning = el.querySelector('[data-testid="compute-watchdog-inert-warning"]');
+    expect(warning).toBeTruthy();
+    expect(warning?.textContent).toContain('no_declared_metric');
+    expect(warning?.textContent).toContain('Watchdog will not currently cut this job');
+  });
+
+  test.each([
+    ['warming_up', 'Warming up', 'observation window is still warming up'],
+    ['insufficient_history', 'Insufficient history', 'not enough trustworthy receipt-time history'],
+    ['stale_telemetry', 'Stale telemetry', 'progress telemetry is stale'],
+    ['inert', 'Inert', 'metric_name_mismatch'],
+  ] as const)(
+    'watchdog_state:%s explains why the job will not currently be cut',
+    async (watchdogState, label, explanation) => {
+      setupMocks();
+      fetchComputeJobs.mockResolvedValue(wrapJobs([
+        makeJob({
+          status: 'RUNNING',
+          watchdog_active: false,
+          watchdog_state: watchdogState,
+          watchdog_inert_reason: watchdogState === 'inert' ? 'metric_name_mismatch' : watchdogState,
+          no_progress_timeout_seconds: 1800,
+        }),
+      ]));
+      const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+      const el = await findByTestId('compute-watchdog-status');
+      expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')?.textContent).toContain(label);
+      const warning = el.querySelector('[data-testid="compute-watchdog-inert-warning"]');
+      expect(warning?.textContent).toContain(explanation);
+      expect(warning?.textContent?.toLowerCase()).toContain('will not currently cut');
+    },
+  );
+
+  test('new protected state overrides a contradictory legacy boolean', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        watchdog_active: false,
+        watchdog_state: 'protected',
+        no_progress_timeout_seconds: 1800,
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-watchdog-status');
+    expect(el.querySelector('[data-testid="compute-watchdog-protected"]')?.textContent).toContain('Protected');
+    expect(el.querySelector('[data-testid="compute-watchdog-unprotected"]')).toBeNull();
+  });
+
+  test('active job without watchdog fields renders no watchdog indicator (backward compat)', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({ status: 'RUNNING' })]));
+    const { findByText, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(container.querySelector('[data-testid="compute-watchdog-status"]')).toBeNull();
+  });
+
+  test('terminal job does not render watchdog indicator even when fields are present', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        completed_at: new Date().toISOString(),
+        watchdog_active: true,
+        no_progress_timeout_seconds: 1800,
+      }),
+    ]));
+    const { findByText, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(container.querySelector('[data-testid="compute-watchdog-status"]')).toBeNull();
+  });
+});
+
+describe('ComputeJobsPanel resume provenance rendering', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  function setupMocks() {
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+  }
+
+  test('card view shows resumed provenance line for a job that resumed from predecessor', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      resume_provenance: {
+        ok: true,
+        resumed_from_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        file_count: 5,
+        recorded_at: new Date().toISOString(),
+      },
     });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('a1b2c3d4');
+    expect(el.textContent).toContain('5 files');
+    // Successful resume should render in green
+    expect(el.className).toContain('text-emerald-400');
+  });
+
+  test('card view shows resume-failed indicator when hydration failed', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'dead-beef-1234-5678-0000',
+      resume_provenance: {
+        ok: false,
+        resumed_from_job_id: 'dead-beef-1234-5678-0000',
+        file_count: 0,
+        reason: 'checkpoint bundle not found',
+        recorded_at: new Date().toISOString(),
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('dead-beef');
+    expect(el.textContent).toContain('checkpoint bundle not found');
+    // Failed resume should render in amber
+    expect(el.className).toContain('text-amber-400');
+  });
+
+  test('card view shows scheduled resume indicator when input_artifact_job_id set but pre-hydration', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'RUNNING',
+      outcome: null,
+      input_artifact_job_id: 'resume-id-for-test-abc-123',
+      resume_provenance: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const el = await findByTestId('compute-resume-provenance');
+    expect(el.textContent).toContain('resumed from');
+    expect(el.textContent).toContain('resume-i');
+    // Pre-hydration (no provenance yet) should render in sky blue
+    expect(el.className).toContain('text-sky-400');
+  });
+
+  test('card view does not render resume indicator when input_artifact_job_id is absent', async () => {
+    setupMocks();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+    })]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-resume-provenance')).toBeNull();
+  });
+
+  test('compact table shows resume indicator when input_artifact_job_id is present', async () => {
+    setupMocks();
+    const job = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+      final_cost_usd: 1.0,
+      completed_at: new Date().toISOString(),
+      input_artifact_job_id: 'table-resume-id-5678',
+      resume_provenance: { ok: true, file_count: 3, resumed_from_job_id: 'table-resume-id-5678', recorded_at: new Date().toISOString() },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Switch to table view
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    const table = await findByTestId('compact-jobs-table');
+    const resumeIcon = table.querySelector('[data-testid="compact-table-resume"]');
+    expect(resumeIcon).toBeTruthy();
+    expect(resumeIcon?.getAttribute('title')).toContain('table-resume-id-5678');
   });
 });
 
@@ -1118,6 +1491,34 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(form.successThreshold).toBe('0.9');
     expect(form.containerImage).toBe('nvcr.io/test:latest');
     expect(form.useArmsMode).toBe(false);
+  });
+
+  test('buildCloneForm preserves inputArtifactJobId, setupStep, and noProgressTimeoutSeconds from launch_params', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      launch_params: {
+        command: 'python train.py',
+        spend_cap_usd: 5.0,
+        deadline_seconds: 3600,
+        setup_step: 'pip install -r requirements.txt',
+        no_progress_timeout_seconds: 1800,
+        input_artifact_job_id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const onCloneExperiment = vi.fn();
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onCloneExperiment={onCloneExperiment} />
+    );
+    const cloneBtn = await findByTestId('clone-to-form');
+    await act(async () => { cloneBtn.click(); });
+    expect(onCloneExperiment).toHaveBeenCalledTimes(1);
+    const form = onCloneExperiment.mock.calls[0][0];
+    expect(form.setupStep).toBe('pip install -r requirements.txt');
+    expect(form.noProgressTimeoutSeconds).toBe('1800');
+    expect(form.inputArtifactJobId).toBe('a1b2c3d4-e5f6-7890-abcd-ef1234567890');
   });
 
   test('clone-to-form button not rendered when onCloneExperiment is not provided', async () => {
@@ -2859,6 +3260,91 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(table.textContent).toContain('run-b: 0.95 MET ($0.53)');
   });
 
+  test('compares_runs_grouped_by_sweep_id: renders evidence_tier badge and provenance in comparison table', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({
+      sweep_groups: {
+        'sweep-tier': [
+          {
+            id: 'doc-tier-1',
+            title: 'accuracy_v2 run A',
+            summary: 'Covered run',
+            compute_acceptance_grade: 'acceptance',
+            criterion_met: true,
+            criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+            arm_label: 'run-a',
+            created_at: '2026-06-21T10:00:00Z',
+            evidence_tier: 'covered',
+            run_provenance: { executing_backend: 'local-subprocess', runner_hostname: 'host-xyz', runner_target_id: null },
+          },
+          {
+            id: 'doc-tier-2',
+            title: 'accuracy_v2 run B',
+            summary: 'Attested run',
+            compute_acceptance_grade: 'measured_only',
+            criterion_met: false,
+            criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+            arm_label: 'run-b',
+            created_at: '2026-06-21T11:00:00Z',
+            evidence_tier: 'attested',
+            run_provenance: null,
+          },
+          {
+            id: 'doc-tier-3',
+            title: 'accuracy_v2 run C',
+            summary: 'No tier',
+            compute_acceptance_grade: null,
+            criterion_met: null,
+            arm_label: 'run-c',
+            created_at: '2026-06-21T12:00:00Z',
+          },
+        ],
+      },
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('sweep-knowledge-groups');
+    const compareBtn = await findByTestId('sweep-knowledge-compare-toggle');
+    await act(async () => { compareBtn.click(); });
+    const table = await findByTestId('sweep-knowledge-comparison-table');
+    expect(table.textContent).toContain('Machine verified');
+    expect(table.textContent).toContain('Attested');
+    const provenanceLabels = table.querySelectorAll('[data-testid="sweep-knowledge-provenance-label"]');
+    expect(provenanceLabels.length).toBeGreaterThanOrEqual(1);
+    expect(provenanceLabels[0].textContent).toContain('host-xyz');
+    expect(table.textContent).toContain('Tier / Provenance');
+  });
+
+  test('compares_runs_grouped_by_sweep_id: renders evidence_tier badge in per-arm list view', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchComputeSweepGroups.mockResolvedValue({
+      sweep_groups: {
+        'sweep-list': [
+          {
+            id: 'doc-list-1',
+            title: 'list view run A',
+            summary: 'Covered',
+            arm_label: 'run-a',
+            criterion_met: true,
+            evidence_tier: 'covered',
+            created_at: '2026-06-22T10:00:00Z',
+          },
+          {
+            id: 'doc-list-2',
+            title: 'list view run B',
+            summary: 'No tier',
+            arm_label: 'run-b',
+            criterion_met: false,
+            created_at: '2026-06-22T11:00:00Z',
+          },
+        ],
+      },
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('sweep-knowledge-groups');
+    const group = await findByTestId('sweep-knowledge-group');
+    expect(group.textContent).toContain('Machine verified');
+  });
+
   test('compares_runs_grouped_by_sweep_id: hides sweep knowledge groups section when no groups returned', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     fetchComputeSweepGroups.mockResolvedValue({ sweep_groups: {} });
@@ -3898,6 +4384,32 @@ describe('ComputeJobsPanel — viewable artifact gallery', () => {
     expect(gallery.textContent).toContain('rollout.mp4 · 2.3 MB');
   });
 
+  test('refreshes an open same-URI live preview when polling reaches its terminal revision', async () => {
+    vi.useFakeTimers();
+    try {
+      const live = { ...VIEWABLE[0], revision: 'v1', live: true };
+      const terminal = { ...live, revision: 'v2', live: false };
+      fetchComputeJobs
+        .mockResolvedValueOnce(wrapJobs([makeJob({ status: 'RUNNING', viewable_artifacts: [live] })]))
+        .mockResolvedValueOnce(wrapJobs([makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', viewable_artifacts: [terminal] })]));
+      resolveArtifactDownloadUrl
+        .mockResolvedValueOnce('https://signed.example/plot-v1.png')
+        .mockResolvedValueOnce('https://signed.example/plot-v2.png');
+      const { getByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      const toggle = getByTestId('compute-artifact-gallery-toggle');
+      await act(async () => { toggle.click(); await Promise.resolve(); await Promise.resolve(); });
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/plot-v1.png');
+
+      await act(async () => { vi.advanceTimersByTime(10_000); await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
+      expect(container.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/plot-v2.png');
+      expect(toggle.textContent).toContain('Hide previews');
+      expect(resolveArtifactDownloadUrl).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('resolution failure shows a quiet placeholder that can retry', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([makeGalleryJob()]));
     resolveArtifactDownloadUrl.mockRejectedValue(new Error('403'));
@@ -3917,6 +4429,45 @@ describe('ComputeJobsPanel — viewable artifact gallery', () => {
       const thumb = await findByTestId('compute-artifact-thumbnail');
       expect(thumb.querySelector('img')?.getAttribute('src')).toBe('https://signed.example/retried.png');
     });
+  });
+
+  test('renders a pdf artifact as a click-to-open tile (no inline img/video) that opens a new tab', async () => {
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(
+      { opener: null, location: { replace: vi.fn() }, close: vi.fn() } as never,
+    );
+    const pdfUri = 'gs://bucket/compute-jobs/job-1/artifacts/viewable/2-report.pdf';
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        viewable_artifacts: [
+          { filename: 'report.pdf', storage_uri: pdfUri, content_type: 'application/pdf', kind: 'pdf' as const, size_bytes: 88_000 },
+        ],
+      }),
+    ]));
+    resolveArtifactDownloadUrl.mockResolvedValue('https://signed.example/2-report.pdf');
+    const { findByTestId, queryByTestId, container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggle = await findByTestId('compute-artifact-gallery-toggle');
+    expect(toggle.textContent).toContain('Show previews (1)');
+    await act(async () => { toggle.click(); });
+
+    // A pdf tile renders — never an inline <img>/<video>, and not resolved eagerly.
+    const tile = await findByTestId('compute-artifact-pdf');
+    expect(tile.tagName).toBe('BUTTON');
+    expect(tile.textContent).toContain('Open PDF');
+    expect(container.querySelector('img')).toBeNull();
+    expect(queryByTestId('compute-artifact-video')).toBeNull();
+    expect(resolveArtifactDownloadUrl).not.toHaveBeenCalled();
+    // Caption carries the filename + size.
+    const gallery = await findByTestId('compute-artifact-gallery');
+    expect(gallery.textContent).toContain('report.pdf · 86 KB');
+
+    // Clicking resolves a fresh signed URL and opens it in a new tab.
+    await act(async () => { tile.click(); });
+    await waitFor(() => expect(resolveArtifactDownloadUrl).toHaveBeenCalledWith('proj-1', pdfUri));
+    expect(openSpy).toHaveBeenCalled();
+    openSpy.mockRestore();
   });
 
   test('no gallery section when viewable_artifacts is absent or malformed', async () => {
@@ -4034,5 +4585,195 @@ describe('ComputeJobsPanel — runner identity on finished jobs', () => {
     expect(runnerEl.textContent).toContain('my-gpu-host');
     expect(runnerEl.textContent).toContain('claimed');
     expect(runnerEl.textContent).toContain('ago');
+  });
+});
+
+describe('CompactJobsTable — evidence tier + runner identity', () => {
+  test('terminal job renders the server-provided tier badge and runner hostname', () => {
+    const job = makeJob({
+      id: 'job-local',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      evidence_tier: 'covered',
+      runner_target_id: 'dd59526e-0001-0002-0003-000000000004',
+      runner: { id: 'dd59526e-0001-0002-0003-000000000004', hostname: 'iconlab-gpu-01', status: 'active' },
+    });
+    const { getByTestId, container } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    // Runner identity surfaces via the dedicated chip.
+    expect(getByTestId('compact-table-runner').textContent).toContain('iconlab-gpu-01');
+    // The badge reflects the canonical server tier ('covered' → "Machine verified"),
+    // not a client re-derivation.
+    expect(container.textContent).toContain('Machine verified');
+  });
+
+  test('runner chip falls back to a truncated target id when hostname is absent', () => {
+    const job = makeJob({
+      id: 'job-local-2',
+      backend: 'runner-subprocess',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 0,
+      evidence_tier: 'partial',
+      runner_target_id: 'abcdef12-0000-0000-0000-000000000000',
+      runner: null,
+    });
+    const { getByTestId } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    const chip = getByTestId('compact-table-runner');
+    expect(chip.textContent).toContain('abcdef12');
+    expect(chip.textContent).not.toContain('abcdef12-0000-0000-0000-000000000000');
+  });
+
+  test('active job suppresses the tier badge but still shows its runner', () => {
+    const job = makeJob({
+      id: 'job-active',
+      backend: 'runner-subprocess',
+      status: 'RUNNING',
+      outcome: null,
+      completed_at: null,
+      evidence_tier: 'covered',
+      runner_target_id: 'aa000000-0000-0000-0000-000000000001',
+      runner: { id: 'aa000000-0000-0000-0000-000000000001', hostname: 'iconlab-gpu-02', status: 'active' },
+    });
+    const { getByTestId, container } = render(
+      <CompactJobsTable jobs={[job]} sortConfig={null} onSort={() => {}} />,
+    );
+    expect(getByTestId('compact-table-runner').textContent).toContain('iconlab-gpu-02');
+    // Badge is terminal-only, consistent with the full job card.
+    expect(container.textContent).not.toContain('Machine verified');
+  });
+});
+
+describe('ComputeJobsPanel evidence-tier filter + sort', () => {
+  afterEach(() => {
+    fetchComputeJobs.mockReset();
+    fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
+    fetchComputeSweepGroups.mockReset();
+  });
+
+  // A mix spanning the two coarse trust groups plus an active job (no tier).
+  //  - tierjob-alpha:   operator hardware + a result → 'covered' → machine-verified
+  //  - tierjob-bravo:  cloud + a result             → 'attested' → low-trust
+  //  - tierjob-charlie: no backend, no result        → 'uncovered' → low-trust
+  //  - tierjob-delta:    still running                 → no tier (excluded by any filter)
+  const coveredJob = makeJob({
+    id: 'tierjob-alpha',
+    task_id: 'task-covered',
+    task_title: 'tierjob-alpha',
+    backend: 'local-subprocess',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    per_arm_verdicts: { armA: { value: 0.91, met: true, cost_usd: null } },
+    accrued_cost_usd: 0,
+    final_cost_usd: 0,
+    completed_at: new Date().toISOString(),
+  });
+  const attestedJob = makeJob({
+    id: 'tierjob-bravo',
+    task_id: 'task-attested',
+    task_title: 'tierjob-bravo',
+    backend: 'gcp',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    criterion_verdict: { metric: 'acc', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+    accrued_cost_usd: 1,
+    final_cost_usd: 1,
+    completed_at: new Date().toISOString(),
+  });
+  const uncoveredJob = makeJob({
+    id: 'tierjob-charlie',
+    task_id: 'task-uncovered',
+    task_title: 'tierjob-charlie',
+    backend: '',
+    status: 'SUCCEEDED',
+    outcome: 'SUCCESS',
+    criterion_verdict: null,
+    per_arm_verdicts: null,
+    accrued_cost_usd: 0,
+    final_cost_usd: 0,
+    completed_at: new Date().toISOString(),
+  });
+  const activeJob = makeJob({
+    id: 'tierjob-delta',
+    task_id: 'task-active',
+    task_title: 'tierjob-delta',
+    backend: 'local-subprocess',
+    status: 'RUNNING',
+    outcome: null,
+    completed_at: null,
+  });
+
+  function mountWith(jobs: ComputeJob[]) {
+    fetchComputeJobs.mockResolvedValue(wrapJobs(jobs));
+    fetchComputeJobsAggregateSummary.mockResolvedValue(null);
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    fetchComputeSweepGroups.mockResolvedValue({ groups: [], has_more: false });
+    return render(<ComputeJobsPanel projectId="proj-1" />);
+  }
+
+  test('renders the tier filter control in the filter bar', async () => {
+    const { findByTestId } = mountWith([coveredJob]);
+    const control = await findByTestId('compute-tier-filter');
+    expect(control).toBeTruthy();
+    // Both coarse groupings the operator asked for are present, plus the default.
+    expect(control.querySelector('[data-testid="compute-tier-all"]')).toBeTruthy();
+    expect(control.querySelector('[data-testid="compute-tier-machine-verified"]')).toBeTruthy();
+    expect(control.querySelector('[data-testid="compute-tier-low-trust"]')).toBeTruthy();
+  });
+
+  test('low-trust filter hides machine-verified jobs and keeps attested/self-reported ones', async () => {
+    const { findByTestId, getByTestId } = mountWith([coveredJob, attestedJob, uncoveredJob, activeJob]);
+    const jobsList = await findByTestId('compute-jobs-list');
+    // Default: everything visible.
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-alpha'));
+    expect(jobsList.textContent).toContain('tierjob-bravo');
+
+    act(() => { fireEvent.click(getByTestId('compute-tier-low-trust')); });
+
+    await waitFor(() => expect(jobsList.textContent).not.toContain('tierjob-alpha'));
+    // low-trust keeps the non-machine-verified terminal jobs...
+    expect(jobsList.textContent).toContain('tierjob-bravo');
+    expect(jobsList.textContent).toContain('tierjob-charlie');
+    // ...and excludes active jobs (they carry no tier).
+    expect(jobsList.textContent).not.toContain('tierjob-delta');
+  });
+
+  test('machine-verified filter shows only covered jobs', async () => {
+    const { findByTestId, getByTestId } = mountWith([coveredJob, attestedJob, uncoveredJob, activeJob]);
+    const jobsList = await findByTestId('compute-jobs-list');
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-bravo'));
+
+    act(() => { fireEvent.click(getByTestId('compute-tier-machine-verified')); });
+
+    await waitFor(() => expect(jobsList.textContent).toContain('tierjob-alpha'));
+    expect(jobsList.textContent).not.toContain('tierjob-bravo');
+    expect(jobsList.textContent).not.toContain('tierjob-charlie');
+    expect(jobsList.textContent).not.toContain('tierjob-delta');
+  });
+
+  test('tier sort orders the compact table from highest to lowest trust', async () => {
+    const { findByTestId, findByText, getAllByTestId } = mountWith([uncoveredJob, coveredJob, attestedJob]);
+    // Switch to the compact table view.
+    await findByText('tierjob-alpha');
+    const toggleBtn = await findByTestId('compute-view-mode-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('compact-jobs-table');
+
+    // Click the new Tier sort header (first click → ascending = highest trust first).
+    const [tierHeader] = getAllByTestId('jobs-table-sort-tier');
+    act(() => { fireEvent.click(tierHeader); });
+
+    await waitFor(() => {
+      const order = getAllByTestId('compact-table-job-name').map((n) => n.textContent);
+      expect(order).toEqual(['tierjob-alpha', 'tierjob-bravo', 'tierjob-charlie']);
+    });
   });
 });

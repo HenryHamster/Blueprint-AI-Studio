@@ -73,6 +73,24 @@ describe('useDeploymentState', () => {
     expect(mockAuthGet).not.toHaveBeenCalled();
   });
 
+  it('defers health requests until runtime polling is enabled', async () => {
+    const { rerender } = renderHook(
+      ({ enabled }) => useDeploymentState(vi.fn(), makeUser(), { current: vi.fn() }, 'proj-123', enabled),
+      { initialProps: { enabled: false } },
+    );
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(mockAuthGet).not.toHaveBeenCalled();
+
+    rerender({ enabled: true });
+    await waitFor(() => {
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/admin/deploy-state'));
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/admin/zone-health'));
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/debug/orchestrator'));
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/health/detailed'));
+      expect(mockAuthGet).toHaveBeenCalledWith(expect.stringContaining('/api/admin/projects/proj-123/diagnostics'));
+    });
+  });
+
   // --- Health polling on mount ---
 
   it('fetches all four health endpoints on mount when user is provided', async () => {

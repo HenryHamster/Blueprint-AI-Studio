@@ -18,20 +18,138 @@ Re-exported from ``orchestrator_runner_dispatch`` so existing import paths and
 ``orch._runner_*`` references keep working.
 """
 
+import re
 import uuid
 from typing import NamedTuple
 
 from app.models import LocalRunner
+from app.task_capabilities import get_task_capability
+
+
+_RUFF_COMMAND_RE = re.compile(r"^(?:python3?\s+-m\s+)?ruff(?:\s|$)")
+_PYTEST_COMMAND_RE = re.compile(r"^(?:python3?\s+-m\s+)?pytest(?:\s|$)")
+_PROJECT_VERIFICATION_HARNESS_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+_PROJECT_VERIFICATION_VERSION = 1
 
 
 class RunnerDispatchSnapshot(NamedTuple):
-    """Session-independent view of a live local runner used during dispatch."""
+    """Session-independent view of a live local runner used during dispatch.
+
+    ``project_id`` is a per-(runner, project) VIEW, not the runner's single home
+    project: a multi-project runner appears once per project on its allow-list,
+    each copy sharing the SAME ``capabilities`` dict. Because the unified
+    per-runner load accounting (``_active_agent_task_count`` and
+    ``active_compute_job_ids``, injected once by ``_load_active_runners_cache``)
+    lives in that shared ``capabilities`` dict, every copy reports the SAME
+    load — so a runner serving projects A and B is sized against one unified
+    ``max_concurrent`` ledger and can never double-book across the two. The
+    eligibility predicates below read only ``capabilities`` (never ``project_id``),
+    so the pure-function contract is unchanged by the fan-out.
+    """
 
     id: uuid.UUID
     project_id: uuid.UUID
     capabilities: dict
     consecutive_job_failures: int = 0
     hostname: str | None = None
+
+
+def _effective_build_command(entry: dict, kind: str) -> str:
+    confirmed = entry.get(f"confirmed_{kind}_cmd")
+    if entry.get("commands_stale") is not True and isinstance(confirmed, str):
+        confirmed = confirmed.strip()
+        if confirmed:
+            return confirmed
+    detected = entry.get(f"{kind}_cmd")
+    return detected.strip() if isinstance(detected, str) else ""
+
+
+def _project_backend_verification_directories(build_config: object) -> tuple[str, ...]:
+    if not isinstance(build_config, dict):
+        return ()
+    directories = build_config.get("directories")
+    if not isinstance(directories, list):
+        return ()
+    verified: list[str] = []
+    for entry in directories:
+        if not isinstance(entry, dict) or entry.get("type") != "python":
+            continue
+        lint_cmd = _effective_build_command(entry, "lint")
+        test_cmd = _effective_build_command(entry, "test")
+        project_verification = entry.get("project_verification")
+        path = entry.get("path")
+        if (
+            isinstance(path, str)
+            and path.strip()
+            and _RUFF_COMMAND_RE.match(lint_cmd)
+            and _PYTEST_COMMAND_RE.match(test_cmd)
+            and isinstance(project_verification, dict)
+            and project_verification.get("protocol") == "blueprint-v1"
+            and isinstance(project_verification.get("harness"), str)
+            and bool(project_verification["harness"].strip())
+            and not project_verification["harness"].startswith("/")
+            and ".." not in project_verification["harness"]
+            and _PROJECT_VERIFICATION_HARNESS_RE.fullmatch(
+                project_verification["harness"]
+            )
+        ):
+            normalized = path.strip().rstrip("/") or "."
+            if normalized not in verified:
+                verified.append(normalized)
+    return tuple(verified)
+
+
+def _task_is_authoring(task_type: str) -> bool:
+    capability = get_task_capability(task_type)
+    return bool(
+        capability is not None
+        and capability.agent_mode == "write"
+        and capability.run_shape == "workflow"
+        and capability.output_kind == "pr"
+    )
+
+
+def _task_requires_project_verification(
+    task_type: str, build_config: object
+) -> bool:
+    return bool(
+        _task_is_authoring(task_type)
+        and _project_backend_verification_directories(build_config)
+    )
+
+
+def _successful_verification_probe(probes: dict, name: str) -> bool:
+    probe = probes.get(name)
+    return bool(
+        isinstance(probe, dict)
+        and probe.get("ok") is True
+        and type(probe.get("exit_code")) is int
+        and probe["exit_code"] == 0
+    )
+
+
+def _runner_has_project_verification(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Validate the complete v1 functional report, failing closed on every gap."""
+    report = (runner.capabilities or {}).get("project_verification")
+    if not isinstance(report, dict):
+        return False
+    boundary = report.get("boundary")
+    probes = report.get("probes")
+    if not isinstance(boundary, dict) or not isinstance(probes, dict):
+        return False
+    version = report.get("version")
+    if (
+        type(version) is not int
+        or version != _PROJECT_VERIFICATION_VERSION
+        or report.get("ready") is not True
+        or boundary.get("class") != "agent"
+        or boundary.get("backend") != "bwrap"
+    ):
+        return False
+    return all(
+        _successful_verification_probe(probes, name)
+        for name in ("ruff", "docker_postgres")
+    )
 
 
 def _runner_handles_task_type(
@@ -151,8 +269,23 @@ _CONTAINER_BACKEND_KEYS = {
     "docker_usable",
     "podman_usable",
     "apptainer_ok",
-    "enroot_ok",
 }
+
+
+def _selected_container_runtime_and_mode(
+    caps: dict,
+) -> tuple[str | None, str | None]:
+    """Return the runtime and GPU flag mode the runner will actually execute."""
+    backends = caps.get("isolation_backends")
+    if not isinstance(backends, dict):
+        return None, None
+    if backends.get("docker_usable"):
+        return "docker", "cdi" if backends.get("docker_cdi_gpu") else "hook"
+    if backends.get("podman_usable"):
+        return "podman", "hook"
+    if backends.get("apptainer_ok"):
+        return "apptainer", "nv"
+    return None, None
 
 
 def _runner_has_container_capability(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
@@ -191,6 +324,78 @@ def _runner_has_free_vram(
     return any(mib >= required_mib for mib in free_mib_list)
 
 
+def _runner_has_free_disk(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    required_bytes: int,
+) -> bool:
+    """Whether this runner has at least ``required_bytes`` of free disk.
+
+    A container-image compute job must PULL a multi-GB image onto the runner
+    before it can start. Sent to a nearly-full box the pull dies part-way
+    ("no space left on device") and the claim is wasted — the job should have
+    held for a runner (or cloud backend) that can fit it.
+
+    Reads the heartbeat-reported ``disk_free_bytes`` (the free bytes on the
+    runner's image/workspace filesystem, the same field the low-disk health
+    sweep consults). As with :func:`_runner_has_free_vram`, absence of
+    telemetry is NOT a disqualification: a runner that never reports
+    ``disk_free_bytes`` (older runner) is treated as eligible — we gate
+    dispatch only on real contradicting data, never on missing data, so a
+    legitimately-configured runner is never demoted (backward compatible). A
+    malformed value is likewise ignored. A non-positive floor is no floor.
+    """
+    if required_bytes <= 0:
+        return True
+    caps = runner.capabilities or {}
+    disk_free = caps.get("disk_free_bytes")
+    if disk_free is None:
+        return True
+    try:
+        return int(disk_free) >= required_bytes
+    except (TypeError, ValueError):
+        # Malformed telemetry — do not gate on data we cannot trust.
+        return True
+
+
+def _runner_meets_min_compute_capability(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+    min_cc: float,
+) -> bool:
+    """Whether any GPU on this runner meets an image's CUDA compute-capability floor.
+
+    A container image is built for a specific set of GPU architectures (its bundled
+    CUDA/torch wheels carry compiled SASS/PTX only for those). Sent to a box whose
+    GPU is OLDER than the image's floor — an ``sm_80``-built image on a V100
+    (``sm_70``) — the job launches and then dies inside the sandbox ("no kernel
+    image is available for execution"). Today that is only caught REACTIVELY by the
+    runner's in-sandbox probe, which fails the job terminally, and nothing stops the
+    same doomed ``(runner, image)`` pairing from being re-selected and thrashing.
+
+    Reads the heartbeat-reported ``gpu_compute_capabilities`` list (one CUDA compute
+    capability float per GPU, index-aligned with ``gpu_names``: ``7.0`` for a V100,
+    ``8.9`` for an L40S) and returns True when at least one GPU meets ``min_cc``.
+
+    As with :func:`_runner_has_free_vram`, absence of telemetry is NOT a
+    disqualification: a runner that never reports ``gpu_compute_capabilities``
+    (older runner, or one that does not expose nvidia-smi) is treated as eligible —
+    we gate dispatch only on real contradicting data, never on missing data, so a
+    legitimately-configured runner is never demoted (backward compatible). The
+    reactive in-sandbox probe remains the safety net for those. A non-positive floor
+    is no floor at all.
+    """
+    if min_cc <= 0:
+        return True
+    caps = runner.capabilities or {}
+    cc_list = caps.get("gpu_compute_capabilities")
+    if not isinstance(cc_list, list) or not cc_list:
+        return True
+    try:
+        return any(float(cc) >= min_cc for cc in cc_list)
+    except (TypeError, ValueError):
+        # Malformed telemetry entry — do not gate on data we cannot trust.
+        return True
+
+
 def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
     """Whether a runner is trustworthy GPU-capable for accelerator dispatch.
 
@@ -227,6 +432,88 @@ def _runner_gpu_capable(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
         return len(gpu_names) > 0
     # No GPU telemetry reported at all — trust the self-report (backward compatible).
     return True
+
+
+def _runner_gpu_in_container_capable(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> bool:
+    """Whether a runner's container backend can pass GPUs through to containers.
+
+    When a job declares BOTH ``container_image`` AND ``accelerator``/``vram_gb``,
+    the runner must be able to expose GPUs *inside* the container — not merely
+    have a container runtime and a GPU independently (today a runner with both
+    can receive such a job and fail at runtime with "no supported GPU detected").
+
+    Capability is earned only by the runner's bounded functional probe through
+    the exact selected runtime and GPU flag mode. Runtime presence, CDI config,
+    and a host GPU are inputs to a probe, never substitutes for its result. Old
+    runners omit the additive proof and therefore fail closed for image+GPU jobs
+    while remaining eligible for CPU image jobs and imageless GPU jobs.
+    """
+    return _container_gpu_passthrough_verified(runner.capabilities or {})
+
+
+def _container_gpu_passthrough_verified(caps: dict) -> bool:
+    """Whether capabilities prove passthrough for the selected runtime/mode."""
+    proof = caps.get("container_gpu_passthrough")
+    if not isinstance(proof, dict):
+        return False
+    selected, expected_mode = _selected_container_runtime_and_mode(caps)
+    report = proof.get(selected) if selected else None
+    return (
+        isinstance(report, dict)
+        and report.get("verified") is True
+        and report.get("mode") == expected_mode
+    )
+
+
+def _runner_gpu_passthrough_blocker(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> str:
+    """Bounded, operator-facing blocker from runner-produced probe evidence."""
+    caps = runner.capabilities or {}
+    proof = caps.get("container_gpu_passthrough")
+    if not isinstance(proof, dict) or not proof:
+        return "runner has not reported a verified GPU passthrough probe"
+    selected, expected_mode = _selected_container_runtime_and_mode(caps)
+    report = proof.get(selected) if selected else None
+    if not isinstance(report, dict):
+        return f"selected runtime {selected or 'unknown'} has no probe report"
+    mode = report.get("mode") or "unknown mode"
+    if mode != expected_mode:
+        return (
+            f"{selected} probe mode {mode!r} does not match "
+            f"selected mode {expected_mode!r}"
+        )
+    reason = report.get("reason") or "probe failed"
+    return f"{selected} {mode} probe: {reason}"
+
+
+def _job_requires_gpu_in_container(
+    accelerator: str | None,
+    container_image: str | None,
+    vram_gb: float | None,
+) -> bool:
+    """Whether a job's declaration requires the runner to expose a GPU INSIDE the
+    container — the trigger condition for the :func:`_runner_gpu_in_container_capable`
+    gate.
+
+    True only when a ``container_image`` is declared AND the job asks for a GPU. A
+    GPU is asked for by EITHER an explicit ``accelerator`` string OR a positive
+    ``vram_gb`` GPU-memory floor: VRAM exists only on a GPU, so an imaged job that
+    reserves VRAM but omits an ``accelerator`` string still needs GPU passthrough
+    into the container and would otherwise fail at runtime with "no supported GPU
+    detected". This mirrors :func:`_runner_gpu_in_container_capable`'s own contract
+    ("container_image AND ``accelerator``/``vram_gb``") — keeping the DISPATCH
+    trigger and the CAPABILITY predicate aligned so the two never drift.
+
+    A non-positive / absent ``vram_gb`` is no GPU request on its own (matching the
+    ``vram_gb is not None and vram_gb > 0`` VRAM-fit gate in
+    ``_select_eligible_runner``), so a plain CPU imaged job is unaffected.
+    """
+    if not container_image:
+        return False
+    return bool(accelerator) or (vram_gb is not None and vram_gb > 0)
 
 
 def _runner_max_concurrent_compute(

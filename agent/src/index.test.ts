@@ -82,7 +82,12 @@ import { buildFixtureCapabilityContract } from './testSetup.js';
 import {
   _setLastProviderRunErrorReportForTesting,
   __setCommandExistsOverrideForSmoke,
+  __resetClaudeCapabilityCacheForTesting,
   claudeHelpSupportsPartialMessages,
+  probeClaudeCapabilities,
+  stripUnsupportedClaudeOptionalArgs,
+  applyProviderProcessBoundary,
+  requireResidentClaudeCapabilities,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -128,6 +133,7 @@ beforeEach(() => {
   // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
   // are not installed in the test environment; spawn is mocked separately.
   __setCommandExistsOverrideForSmoke(() => true);
+  __resetClaudeCapabilityCacheForTesting();
   process.env.PROVIDER = 'anthropic';
   process.env.AUTH_MODE = 'oauth';
   delete process.env.LLM_MODEL;
@@ -1922,6 +1928,80 @@ describe('VmConfigMissingError', () => {
 });
 
 describe('provider runner prompt transport', () => {
+  it('applies the Resident boundary without ambient credentials or customization', () => {
+    const runner = getProviderRunner('anthropic', 'api_key');
+    const command = runner.buildRunCommand('prompt', undefined, undefined, ['*']);
+    command.env.ORCHESTRATOR_URL = 'secret-control-plane';
+    command.env.AGENT_API_TOKEN = 'secret-agent-token';
+    command.env.GITHUB_TOKEN = 'secret-github-token';
+    command.env.ANTHROPIC_API_KEY = 'provider-key';
+    applyProviderProcessBoundary(command, 'anthropic', ['*'], {
+      cwd: '/tmp/resident/work',
+      promptDirectory: '/tmp/resident/tmp',
+      allowedEnvKeys: ['PATH', 'ANTHROPIC_API_KEY'],
+      envOverrides: {
+        HOME: '/tmp/resident/home',
+        CLAUDE_CONFIG_DIR: '/tmp/resident/config',
+      },
+      skipAmbientHelpers: true,
+      enforceNoTools: true,
+    });
+
+    expect(command.env).toMatchObject({
+      ANTHROPIC_API_KEY: 'provider-key',
+      HOME: '/tmp/resident/home',
+      CLAUDE_CONFIG_DIR: '/tmp/resident/config',
+    });
+    expect(command.env).not.toHaveProperty('ORCHESTRATOR_URL');
+    expect(command.env).not.toHaveProperty('AGENT_API_TOKEN');
+    expect(command.env).not.toHaveProperty('GITHUB_TOKEN');
+    expect(command.args).toEqual(expect.arrayContaining([
+      '--disallowedTools', '*', '--safe-mode', '--tools', '',
+      '--disable-slash-commands', '--strict-mcp-config', '--no-session-persistence',
+    ]));
+    const denied = command.args.flatMap((arg, index) => (
+      arg === '--disallowedTools' ? [command.args[index + 1]] : []
+    ));
+    expect(denied).toEqual(['*']);
+  });
+
+  it('requires every Resident Claude safety capability when help is available', () => {
+    const allCapabilities = new Set([
+      '--disallowedTools', '--safe-mode', '--tools', '--disable-slash-commands',
+      '--strict-mcp-config', '--no-session-persistence',
+    ]);
+    expect(() => requireResidentClaudeCapabilities(allCapabilities)).not.toThrow();
+    allCapabilities.delete('--strict-mcp-config');
+    expect(() => requireResidentClaudeCapabilities(allCapabilities))
+      .toThrow('missing --strict-mcp-config');
+    expect(() => requireResidentClaudeCapabilities(null)).not.toThrow();
+  });
+
+  it('rejects a Resident boundary without the wildcard tool fence', () => {
+    const command = getProviderRunner('anthropic', 'api_key').buildRunCommand('prompt');
+    expect(() => applyProviderProcessBoundary(command, 'anthropic', [], {
+      cwd: '/tmp/resident/work',
+      promptDirectory: '/tmp/resident/tmp',
+      allowedEnvKeys: ['PATH'],
+      envOverrides: {},
+      skipAmbientHelpers: true,
+      enforceNoTools: true,
+    })).toThrow('cannot satisfy the Resident no-tool process boundary');
+  });
+
+  it('passes the documented all-tools deny rule to Claude-compatible CLIs', () => {
+    const runner = getProviderRunner('anthropic', 'api_key');
+    const deniedTools = ['*', 'Task', 'Agent', 'Workflow', 'Skill'];
+    const command = runner.buildRunCommand(
+      'Bounded Resident prompt', undefined, undefined, deniedTools,
+    );
+
+    const denied = command.args.flatMap((arg, index) => (
+      arg === '--disallowedTools' ? [command.args[index + 1]] : []
+    ));
+    expect(denied).toEqual(deniedTools);
+  });
+
   it('uses stdin for OpenAI run commands instead of argv prompts', () => {
     const runner = getProviderRunner('openai', 'api_key');
     const command = runner.buildRunCommand('Very long prompt body', 'gpt-5');
@@ -2017,6 +2097,36 @@ describe('provider runner prompt transport', () => {
         'Usage: claude [options]\n  --output-format <format>',
       ),
     ).toBe(false);
+  });
+
+  it('caches Claude capabilities by binary version and preserves model routing while stripping unsupported optional flag values', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('claude 1.2.3')
+      .mockReturnValueOnce('Usage: claude [options]\n  --model <model>\n  --effort <level>');
+    const first = probeClaudeCapabilities('claude', process.env);
+    const second = probeClaudeCapabilities('claude', process.env);
+
+    expect(first).toEqual(new Set(['--model', '--effort']));
+    expect(second).toBe(first);
+    expect(execFileSync).toHaveBeenCalledTimes(2);
+    expect(stripUnsupportedClaudeOptionalArgs(
+      ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], first,
+    )).toEqual(['--model', 'glm-5.2', '--effort', 'high']);
+    expect(stripUnsupportedClaudeOptionalArgs(
+      ['--model', 'glm-5.2', '--effort', 'high', '--include-partial-messages'], new Set(['--model']),
+    )).toEqual(['--model', 'glm-5.2']);
+  });
+
+  it('fails open when the Claude capability probe is ambiguous or fails', () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValueOnce('claude 1.2.4').mockReturnValueOnce('');
+    expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
+    expect(stripUnsupportedClaudeOptionalArgs(['--effort', 'high'], null)).toEqual(['--effort', 'high']);
+
+    __resetClaudeCapabilityCacheForTesting();
+    vi.mocked(execFileSync).mockImplementationOnce(() => { throw new Error('help unavailable'); });
+    expect(probeClaudeCapabilities('claude', process.env)).toBeNull();
   });
 
   it('uses Claude Code with the Anthropic-compatible endpoint for Z.AI', () => {
@@ -3912,6 +4022,27 @@ describe('park directives and warm continuation', () => {
     expect(process.env.TASK_ID).toBe('');
   });
 
+  it('declines warm polling after a clone-failed role leaves no git workspace', async () => {
+    const pollForNextRole = vi.fn();
+
+    const result = await continueWarmContinuation({
+      priorTaskId: 'clone-failed-task',
+      priorPrNumber: null,
+      baseBranch: 'main',
+    }, {
+      pollForNextRole,
+      resetForNextRole: vi.fn(),
+      activateClaimedRole: vi.fn(),
+      materializeClaimCredentialState: vi.fn(),
+      performWarmRetarget: vi.fn(),
+      resolveVmInstanceId: () => 'vm-clone-failed',
+      isWorkspaceValid: () => false,
+    });
+
+    expect(result).toEqual({ action: 'exit' });
+    expect(pollForNextRole).not.toHaveBeenCalled();
+  });
+
   it('falls back to the task JWT vm id and re-targets after reclaim', async () => {
     process.env.TASK_ID = 'task-park';
     delete process.env.VM_INSTANCE_ID;
@@ -4715,8 +4846,9 @@ describe('bootstrapPoolMode', () => {
           {
             path: '/home/agent/.claude.json',
             content: JSON.stringify({
-              hasCompletedOnboarding: true,
+              email: 'operator@example.com',
               projects: {
+                '/other/project': { hasTrustDialogAccepted: false },
                 [WORKSPACE]: {
                   hasTrustDialogAccepted: false,
                   allowedTools: { Bash: true },
@@ -4735,9 +4867,11 @@ describe('bootstrapPoolMode', () => {
       );
       // Written where the CLI actually reads it…
       expect(claudeWrite).toBeDefined();
-      expect(JSON.parse(claudeWrite?.[1] as string)).toEqual({
+      expect(JSON.parse(claudeWrite?.[1] as string)).toMatchObject({
+        email: 'operator@example.com',
         hasCompletedOnboarding: true,
         projects: {
+          '/other/project': { hasTrustDialogAccepted: false },
           [WORKSPACE]: {
             hasTrustDialogAccepted: true,
             allowedTools: [],
@@ -4751,6 +4885,39 @@ describe('bootstrapPoolMode', () => {
       if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
       vi.mocked(fs.existsSync).mockReturnValue(false);
+      _resetCredentialStateForTesting();
+    }
+  });
+
+  it('normalizes an omitted Claude config under sandbox HOME without adding credentials', () => {
+    const savedHome = process.env.HOME;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home';
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: { PROVIDER: 'anthropic', AUTH_MODE: 'oauth' },
+        files: [{ path: '/home/agent/.claude.json', content: '{}', mode: '0600' }],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: sandbox-minimal-claude-config');
+
+      const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(c => c[0] === '/home/.claude.json');
+      expect(claudeWrite).toBeDefined();
+      const config: unknown = JSON.parse(claudeWrite?.[1] as string);
+      expect(config).toEqual({
+        hasCompletedOnboarding: true,
+        projects: {
+          [WORKSPACE]: {
+            hasTrustDialogAccepted: true,
+            allowedTools: [],
+          },
+        },
+      });
+      expect(claudeWrite?.[1]).not.toContain('OAUTH_TOKEN');
+      expect(claudeWrite?.[1]).not.toContain('sk-ant');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
       _resetCredentialStateForTesting();
     }
   });
@@ -4782,10 +4949,8 @@ describe('bootstrapPoolMode', () => {
       const claudeWrite = vi.mocked(fs.writeFileSync).mock.calls.find(
         c => c[0] === '/home/agent/.claude.json',
       );
-      const writtenConfig = JSON.parse(claudeWrite?.[1] as string) as {
-        projects: Record<string, unknown>;
-      };
-      expect(writtenConfig.projects[WORKSPACE]).toEqual({
+      const parsed = JSON.parse(claudeWrite?.[1] as string) as Record<string, unknown>;
+      expect((parsed.projects as Record<string, unknown>)[WORKSPACE]).toEqual({
         hasTrustDialogAccepted: true,
         allowedTools: [],
       });
@@ -6804,6 +6969,34 @@ describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
     killSpy.mockRestore();
   }, 20_000);
 
+  it('disables only the partial-message no-progress watchdog when an old CLI does not advertise partial streaming', async () => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync)
+      .mockReturnValueOnce('claude 0.9.0')
+      .mockReturnValueOnce('Usage: claude [options]\n  --output-format <format>');
+    const { child, handlers, emitStdout } = makeChild(7809);
+    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
+    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+
+    const promise = runProviderAgent('hello', null, { value: '' });
+    await Promise.resolve();
+    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
+    let remaining = LLM_NO_PROGRESS_STALL_MS + 120_000;
+    while (remaining > STEP) {
+      await vi.advanceTimersByTimeAsync(STEP);
+      emitStdout(JSON.stringify({ type: 'system' }));
+      remaining -= STEP;
+    }
+    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+
+    expect(killSpy).not.toHaveBeenCalledWith(-7809, 'SIGTERM');
+    child.exitCode = 0;
+    handlers.close?.(0, null);
+    await vi.runAllTimersAsync();
+    expect((await promise).exitCode).toBe(0);
+    killSpy.mockRestore();
+  }, 20_000);
+
   it('a NESTED partial-message delta does NOT reset the top-level no-progress watchdog', async () => {
     const { child, handlers, emitStdout } = makeChild(7806);
     vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
@@ -8273,5 +8466,91 @@ describe('resolveCredentialsFromSecretVersion', () => {
       '/tmp',
       { recursive: true, mode: 0o700 },
     );
+  });
+});
+
+// ── cloneWithRetry: commitless repositories ──────────────────────────────────
+// A repo with zero commits has no default branch, so `git clone --branch <trunk>`
+// fails with EXACTLY the same text as a branch that was deleted after its PR
+// merged. Retrying cannot conjure a branch, and letting the ambiguous text stand
+// gets the failure classified BRANCH_GONE ("PR merged before clone") — a benign
+// transient story for a permanent setup gap. The remote is the only oracle: a
+// commitless repo advertises zero refs.
+describe('cloneWithRetry — commitless repo', () => {
+  const CLONE_ARGS = [
+    '-c', 'credential.https://github.com.helper=/home/agent/.blueprint/git-credential-helper',
+    'clone', '--depth', '50', '--branch', 'main',
+    'https://github.com/HenryHamster/playground.git', '/tmp/workspace',
+  ];
+  // The literal stderr from the production failure (task 235d7c59, playground).
+  const BRANCH_MISSING_STDERR =
+    "Cloning into '/tmp/workspace'...\nfatal: Remote branch main not found in upstream origin";
+
+  /** A fake `git` child process: emits its output, then closes with `code`. */
+  function fakeGitProc(code: number, { stdout = '', stderr = '' } = {}) {
+    const proc = {
+      stdout: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stdout) cb(Buffer.from(stdout)); } },
+      stderr: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stderr) cb(Buffer.from(stderr)); } },
+      on: (ev: string, cb: (c: number) => void) => { if (ev === 'close') setImmediate(() => { cb(code); }); return proc; },
+      kill: vi.fn(),
+    };
+    return proc;
+  }
+
+  /** Script `git`: the clone always fails branch-missing; `ls-remote` reports
+   *  whatever refs the remote is pretending to have. */
+  function scriptGit(refs: string) {
+    vi.mocked(spawn).mockImplementation(((_cmd: string, args: string[]) => {
+      if (args[0] === 'ls-remote') return fakeGitProc(0, { stdout: refs });
+      return fakeGitProc(128, { stderr: BRANCH_MISSING_STDERR });
+    }) as unknown as typeof spawn);
+  }
+
+  const cloneAttempts = () =>
+    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[]).includes('clone'));
+  const lsRemoteProbes = () =>
+    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[])[0] === 'ls-remote');
+
+  beforeEach(() => { vi.mocked(spawn).mockReset(); });
+
+  it('zero refs → fails fast with the real reason, burning no retries', async () => {
+    scriptGit(''); // a commitless repo advertises no refs at all
+
+    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
+
+    // The whole point: one attempt, not three. Retrying a repo that has no
+    // commits is pure latency — the branch cannot appear on its own.
+    expect(cloneAttempts()).toHaveLength(1);
+    expect(lsRemoteProbes()).toHaveLength(1);
+  });
+
+  it('probes the remote over the clone URL, not the credential-helper arg', async () => {
+    scriptGit('');
+    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
+
+    expect(lsRemoteProbes()[0][1]).toEqual([
+      'ls-remote', '--heads', 'https://github.com/HenryHamster/playground.git',
+    ]);
+  });
+
+  it('deleted branch on a real repo → NOT reported as commitless, retries as before', async () => {
+    // Same git error, but the remote still has refs: this is the branch-gone
+    // case and must keep its existing behaviour. If the probe were skipped (or
+    // its result ignored) a merged-PR race would be misreported as an unseeded
+    // repo — the mirror image of the bug this fixes.
+    scriptGit('a1b2c3\trefs/heads/main\nd4e5f6\trefs/heads/develop\n');
+
+    vi.useFakeTimers();
+    try {
+      const attempt = cloneWithRetry(CLONE_ARGS);
+      const assertion = expect(attempt).rejects.toThrow(/not found in upstream origin/i);
+      await vi.runAllTimersAsync();
+      await assertion;
+      await expect(attempt).rejects.not.toThrow(/repository has no commits/i);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(cloneAttempts()).toHaveLength(3); // full retry budget, unchanged
   });
 });

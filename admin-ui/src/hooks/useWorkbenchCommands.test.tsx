@@ -222,6 +222,33 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('toggle autonomous mode command reflects state and runs the toggle action', () => {
+    const toggleAutonomousMode = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    mount({ autonomousEnabled: true, toggleAutonomousMode, setCommandPaletteOpen });
+
+    const command = captured.find(entry => entry.id === 'project.autonomy.toggle');
+    expect(command).toBeTruthy();
+    expect(command?.label).toBe('Toggle autonomous mode');
+    expect(command?.detail).toBe('On — turn off');
+    expect(command?.disabled).toBe(false);
+
+    command?.run();
+    expect(toggleAutonomousMode).toHaveBeenCalledTimes(1);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('toggle autonomous mode command shows off-state detail and disables without project or action', () => {
+    mount({ autonomousEnabled: false, toggleAutonomousMode: vi.fn() });
+    expect(captured.find(entry => entry.id === 'project.autonomy.toggle')?.detail).toBe('Off — turn on');
+
+    mount({ selectedProjectId: null, toggleAutonomousMode: vi.fn() });
+    expect(captured.find(entry => entry.id === 'project.autonomy.toggle')?.disabled).toBe(true);
+
+    mount({ toggleAutonomousMode: undefined });
+    expect(captured.find(entry => entry.id === 'project.autonomy.toggle')?.disabled).toBe(true);
+  });
+
   test('routes Strategic mode commands through the shared workbench session setter', () => {
     const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
     const handleTabChange = vi.fn();

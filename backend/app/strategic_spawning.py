@@ -149,6 +149,7 @@ from app.workbench_state import (
 
 from app.strategic_local_runner import (  # noqa: F401 — re-exported for callers/tests
     _RUNNER_LIVENESS_SECONDS,
+    _load_baked_image_ref,
     _load_local_runner_status,
     _agent_visible_vision,
     _local_runner_handles_task_type,
@@ -196,6 +197,10 @@ from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for 
     _fetch_operator_context_refs,
     _open_message_citation_summary,
     _fetch_open_messages,
+    _fetch_recent_handled_conversation,
+    _RECENT_HANDLED_KEEP,
+    _RECENT_HANDLED_FETCH_LIMIT,
+    _RECENT_HANDLED_EXCERPT_MAX_CHARS,
     _summarize_recent_interventions,
     _summarize_capability_trial_verdicts,
     _OPERATOR_OVERRIDES_SUMMARIZE_KEEP,
@@ -283,14 +288,14 @@ async def _strategic_recent_version_entry(
     session, version, project=None
 ) -> dict[str, Any]:
     from app.qualification_state_resolver import (
-        resolve_open_version_qualification_state,
+        resolve_open_version_qualification_read_model,
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
     # Route through the shared seam so this surface's qualification_state carries
     # the ledger-backed per-dimension sub_score overlay instead of the mutable
     # last_qualification blob, matching the dimension_states shown elsewhere.
-    qualification_state, _ = await resolve_open_version_qualification_state(
+    qualification_read = await resolve_open_version_qualification_read_model(
         session, version, project, serving=(aggregate, artifacts)
     )
     return {
@@ -298,7 +303,9 @@ async def _strategic_recent_version_entry(
         "status": version.status,
         "phase": version.phase,
         "last_qualification": version.last_qualification,
-        "qualification_state": qualification_state,
+        "qualification_state": qualification_read.qualification_state,
+        "qualification_provenance": qualification_read.provenance,
+        "dimension_states": qualification_read.dimension_states,
         "serving_status": aggregate["serving_status"],
         "served_sha": (version.served_sha or "")[:12] or None,
         "deploy_failure_reason": aggregate["reason_code"],
@@ -1179,8 +1186,9 @@ def _build_cycle_start_reconciliation(
         framing across cycles.
       * ``qualification_surface_conflicts`` — disagreements between the payload's
         qualification narrative surfaces (``last_qualification``, derived
-        ``qualification_state``, ``criterion_coverage``, ``promotion_readiness``,
-        and candidate currency). Populated only when ``version_phase_block`` is
+        ``qualification_state``, ``promotion_readiness``, and candidate currency).
+        Criterion evidence coverage remains observational rather than release
+        truth. Populated only when ``version_phase_block`` is
         present (LTS split). Each conflict names the two surfaces, what each
         asserts, and a reason for the disagreement.
 
@@ -1568,7 +1576,6 @@ def _build_cycle_start_reconciliation(
     if isinstance(version_phase_block, dict):
         vpb_last_qual = version_phase_block.get("last_qualification")
         vpb_qual_state = version_phase_block.get("qualification_state")
-        vpb_criterion_cov = version_phase_block.get("criterion_coverage")
         vpb_promotion_ready = version_phase_block.get("promotion_readiness")
         vpb_candidate_currency = version_phase_block.get(
             "last_qualification_candidate_currency"
@@ -1638,36 +1645,7 @@ def _build_cycle_start_reconciliation(
                         }
                     )
 
-        # Disagreement 3: criterion_coverage unmapped vs confidence/threshold
-        if isinstance(vpb_criterion_cov, dict) and isinstance(vpb_last_qual, dict):
-            covered = int(vpb_criterion_cov.get("covered", 0) or 0)
-            total = int(vpb_criterion_cov.get("total", 0) or 0)
-            confidence = vpb_last_qual.get("confidence")
-            threshold = vpb_last_qual.get("threshold")
-            # When confidence meets threshold but NOT all criteria are covered,
-            # the two surfaces disagree on "ready to promote" assessment.
-            if (
-                total > 0
-                and covered < total
-                and confidence is not None
-                and threshold is not None
-                and isinstance(confidence, (int, float))
-                and isinstance(threshold, (int, float))
-                and confidence >= threshold
-            ):
-                qualification_surface_conflicts.append(
-                    {
-                        "conflict_type": "criterion_coverage_vs_confidence",
-                        "description": (
-                            f"Confidence {confidence:.2%} meets threshold "
-                            f"{threshold:.2%}, but only {covered}/{total} criteria "
-                            "are covered. The version is deemed ready by confidence "
-                            "but incomplete by criterion coverage."
-                        ),
-                    }
-                )
-
-        # Disagreement 4: promotion_readiness trend vs current qualification status
+        # Disagreement 3: promotion_readiness trend vs current qualification status
         if isinstance(vpb_promotion_ready, dict) and isinstance(vpb_last_qual, dict):
             ready_state = vpb_promotion_ready.get("ready")
             qual_status = vpb_last_qual.get("status")
@@ -2232,6 +2210,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "floor": _floor_open_messages,
         "fetch_verb": "message",
     },
+    # Recently-answered operator conversation tail (non-actionable). Already
+    # hard-bounded at build time (≤8 messages, per-message excerpt cap), so the
+    # packer drops it whole under byte pressure rather than trimming — a coherence
+    # aid, never load-bearing, so a low priority + exempt bound is correct.
+    "recent_handled_conversation": {"priority": "medium", "exempt": True},
     "running_update": {"priority": "high", "exempt": True},
     "running_update_acknowledged_at": {"priority": "high", "exempt": True},
     "user_last_active_at": {"priority": "high", "exempt": True},
@@ -4109,6 +4092,7 @@ async def _spawn_design_doc_update(
     session: AsyncSession,
     *,
     apply_spawn_budget_guard: bool = False,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
@@ -4117,6 +4101,22 @@ async def _spawn_design_doc_update(
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        commit_legacy_authorized,
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        if expected_legacy_generation is None:
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
+                session, project.id
+            )
+            await session.commit()
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
+
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -4281,6 +4281,15 @@ async def _spawn_design_doc_update(
         steering_excerpt = strategic_refresh_excerpt(project.vision)
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
+    try:
+        await lock_and_validate_legacy_authority(
+            session,
+            project.id,
+            expected_generation=expected_legacy_generation,
+        )
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
     new_task = Task(
         project_id=project.id,
         title=f"Architecture review: {project.name}",
@@ -4309,7 +4318,34 @@ async def _spawn_design_doc_update(
         baseline_problem_model=project.problem_model or {},
         baseline_running_update=project.running_update,
     )
-    await session.commit()
+    from app.strategic_resident_runtime import coalesce_resident_turn
+
+    # Snapshot IDs before the try block so they remain accessible after rollback.
+    _project_id = project.id
+    _new_task_id = new_task.id
+    try:
+        async with session.begin_nested():
+            await coalesce_resident_turn(
+                session,
+                project_id=_project_id,
+                lane="background",
+                trigger_kind="project_change",
+                project_change_cursor={
+                    "strategic_cycle_id": str(cycle_id),
+                    "phase1_task_id": str(_new_task_id),
+                },
+            )
+    except Exception:
+        logger.exception(
+            "[RESIDENT_SHADOW] Phase-1 background wake failed open for project %s "
+            "(cycle=%s task=%s)",
+            _project_id,
+            cycle_id,
+            _new_task_id,
+        )
+    await commit_legacy_authorized(
+        session, project.id, expected_legacy_generation
+    )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
     from app.strategic_events import emit_strategic_cycle_started
 
@@ -5272,6 +5308,7 @@ async def _finalize_strategic_review_spawn(
     steering_excerpt: str | None,
     runner_pin_id: str | None = None,
     integrity_conflict_counts: dict[str, int] | None = None,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
 
@@ -5299,6 +5336,21 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        commit_legacy_authorized,
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        await lock_and_validate_legacy_authority(
+            session,
+            project_id,
+            expected_generation=expected_legacy_generation,
+        )
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
 
     # ``project_id`` was captured at the caller's function entry (before any
     # payload build), so the rollback-expiry MissingGreenlet (BUG_REPORT
@@ -5416,7 +5468,34 @@ async def _finalize_strategic_review_spawn(
     if _cycle_row is not None and integrity_conflict_counts is not None:
         strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
         session.add(_cycle_row)
-    await session.commit()
+    # Shadow only meaningful accepted cadence work. Unchanged cadence checks
+    # never reach this finalize transaction and therefore make zero Resident
+    # Tasks/model calls.
+    try:
+        async with session.begin_nested():
+            from app.strategic_resident_runtime import coalesce_resident_turn
+
+            await coalesce_resident_turn(
+                session,
+                project_id=project_id,
+                lane="background",
+                trigger_kind="project_change",
+                project_change_cursor={
+                    "strategic_cycle_id": str(cycle_id),
+                    "phase2_task_id": str(new_task.id),
+                },
+            )
+    except Exception:
+        logger.exception(
+            "[RESIDENT_SHADOW] Background cycle wake failed open for project %s "
+            "(cycle=%s task=%s); legacy cycle remains authoritative",
+            project_id,
+            cycle_id,
+            new_task.id,
+        )
+    await commit_legacy_authorized(
+        session, project_id, expected_legacy_generation
+    )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
 
@@ -5447,6 +5526,7 @@ async def _spawn_strategic_review(
     runner_pin_id: str | None = None,
     *,
     apply_spawn_budget_guard: bool = False,
+    expected_legacy_generation: int | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5528,6 +5608,20 @@ async def _spawn_strategic_review(
     project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
+    from app.strategic_resident_transition_locks import (
+        LegacyEngineAuthorityExpired,
+        lock_and_validate_legacy_authority,
+    )
+
+    try:
+        if expected_legacy_generation is None:
+            expected_legacy_generation = await lock_and_validate_legacy_authority(
+                session, project.id
+            )
+            await session.commit()
+    except LegacyEngineAuthorityExpired:
+        await session.rollback()
+        return False
 
     # Guard: no design_doc_update or strategic_review already running
     if await _has_active_strategic_task(project.id, session):
@@ -5650,6 +5744,13 @@ async def _spawn_strategic_review(
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
+        # Recently-answered operator conversation tail — DB-only, bounded, and
+        # explicitly non-actionable. Surfaces a correction the operator just made
+        # (now marked handled/resolved, so gone from the open feed) so a restarted
+        # resident session does not re-propose what the operator already settled.
+        _res_recent_handled = await _fetch_recent_handled_conversation(
+            session, project.id
+        )
         # Ship the resident-session pacing knobs from _runtime_config onto the
         # payload so the agent's residentConfig() reads LIVE, operator-tunable
         # values instead of falling back to hardcoded defaults. All six knobs are
@@ -5709,6 +5810,11 @@ async def _spawn_strategic_review(
                     # first-poll cursor that would otherwise be missed entirely.
                     "open_message_count": len(_res_open_messages),
                     "open_messages": _res_open_messages,
+                    **(
+                        {"recent_handled_conversation": _res_recent_handled}
+                        if _res_recent_handled
+                        else {}
+                    ),
                     **({"model": review_model} if review_model else {}),
                     **({"effort": review_effort} if review_effort else {}),
                     # Live, operator-tunable resident-session pacing knobs.
@@ -5756,6 +5862,7 @@ async def _spawn_strategic_review(
             # spawn path passes this; cadence spawns leave it None → QUEUED as before)
             # so POST /api/runner/next-task claims it directly.
             runner_pin_id=runner_pin_id,
+            expected_legacy_generation=expected_legacy_generation,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``;
@@ -6061,18 +6168,17 @@ async def _spawn_strategic_review(
                 # stale-pending window. The helper keeps audit resolution
                 # best-effort internally so a failed resolve never blocks assembly.
                 from app.qualification_state_resolver import (
-                    resolve_open_version_qualification_state,
+                    resolve_open_version_qualification_read_model,
                 )
 
-                (
-                    _open_qual_state,
-                    _open_qual_disagreement,
-                ) = await resolve_open_version_qualification_state(
+                _qualification_read = await resolve_open_version_qualification_read_model(
                     session,
                     _open_version,
                     project,
                     serving=(_open_aggregate, _open_artifacts),
                 )
+                _open_qual_state = _qualification_read.qualification_state
+                _open_qual_disagreement = _qualification_read.disagreement
                 _phase_block = to_phase_block(
                     _open_version,
                     aggregate_serving_status=_open_aggregate["serving_status"],
@@ -6094,6 +6200,16 @@ async def _spawn_strategic_review(
                     **_phase_block,
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
+                    "qualification_retry_episode": (
+                        _open_version.qualification_retry_episode
+                    ),
+                    "active_qualification_attempt_id": (
+                        str(_open_version.active_qualification_attempt_id)
+                        if _open_version.active_qualification_attempt_id
+                        else None
+                    ),
+                    "qualification_provenance": _qualification_read.provenance,
+                    "dimension_states": _qualification_read.dimension_states,
                     # Signals the strategist to author the objective this cycle.
                     # Absent once the goal is set (null goal → action needed).
                     **(
@@ -7410,6 +7526,17 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    # Baked compute image ref: the most recent digest-pinned ref built for this
+    # project, so the strategist can prefer the project image over a raw NGC URI
+    # when authoring compute_experiments. Merged at the call site (not inside
+    # _load_local_runner_status) to keep that helper's return shape stable.
+    # Fail-open: any error is swallowed and the field is simply absent.
+    try:
+        _baked_ref = await _load_baked_image_ref(session, project.id)
+        if _baked_ref:
+            _local_runner_status["baked_image_ref"] = _baked_ref
+    except Exception:  # noqa: BLE001 — fail-open; baked ref is advisory
+        logger.debug("[STRATEGIC] baked image ref load failed; continuing")
     # Experiment-authoring context: the experiment LEDGER (a bounded query over
     # recent terminal compute_experiment tasks — what was already measured, at
     # what cost, with what verdict) plus one-line near-duplicate advisories for
@@ -7544,6 +7671,7 @@ async def _spawn_strategic_review(
                 if (
                     _local_runner_status.get("ever_registered")
                     or _local_runner_status.get("require_local_runner")
+                    or _local_runner_status.get("baked_image_ref")
                 )
                 else {}
             ),
@@ -7769,6 +7897,7 @@ async def _spawn_strategic_review(
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
         integrity_conflict_counts=_integrity_counts,
+        expected_legacy_generation=expected_legacy_generation,
     )
 
 

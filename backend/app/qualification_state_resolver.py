@@ -46,6 +46,8 @@ backfills any they did not so the guarantee holds regardless of caller.
 from __future__ import annotations
 
 import logging
+import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Tuple, TYPE_CHECKING
 
@@ -53,11 +55,133 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import QualificationVerdict
+from app.qualification_dimensions import (
+    BLOCKER_TO_DIMENSION,
+    LEDGER_DIMENSION_KEYS,
+    MUTABLE_DIMENSION_KEYS,
+    UI_DIMENSIONS,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.models import ReleaseVersion, Project
 
 logger = logging.getLogger("backend.app.qualification_state_resolver")
+
+
+@dataclass(frozen=True)
+class QualificationReadModel:
+    """Attempt-scoped qualification state shared by every operator surface."""
+
+    qualification_state: dict[str, Any] | None
+    disagreement: dict[str, Any] | None
+    provenance: dict[str, Any]
+    dimension_states: list[dict[str, Any]]
+    selected_verdict: QualificationVerdict | None
+
+
+def _attempt_uuid(value: Any) -> uuid.UUID | None:
+    if isinstance(value, uuid.UUID):
+        return value
+    if isinstance(value, str):
+        try:
+            return uuid.UUID(value)
+        except ValueError:
+            return None
+    return None
+
+
+def active_qualification_attempt_id(version: ReleaseVersion) -> uuid.UUID | None:
+    """Return the durable active attempt, accepting legacy blob-only rows.
+
+    ``ReleaseVersion.active_qualification_attempt_id`` is authoritative. The JSON
+    projection can briefly lag it while a new attempt is being installed, so
+    preferring the blob can compose a new attempt with prior-attempt facts.
+    Fall back to the blob only for pre-migration or partial-backfill rows.
+    """
+    qual = (
+        version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
+    )
+    return _attempt_uuid(getattr(version, "active_qualification_attempt_id", None)) or (
+        _attempt_uuid(qual.get("qualification_attempt_id"))
+    )
+
+
+def _attempt_text(value: Any) -> str | None:
+    parsed = _attempt_uuid(value)
+    return str(parsed) if parsed is not None else None
+
+
+def qualification_read_provenance(
+    version: ReleaseVersion,
+    selected_verdict: QualificationVerdict | None,
+) -> dict[str, Any]:
+    """Describe which attempt produced each bounded qualification projection field."""
+    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
+    active_attempt = active_qualification_attempt_id(version)
+    active_text = str(active_attempt) if active_attempt is not None else None
+    candidate_sha = qual.get("candidate_sha")
+    projection_currency = "current" if active_text else "legacy_unknown"
+    retry_raw = (
+        qual.get("retry_episode")
+        if qual.get("retry_episode") is not None
+        else getattr(version, "qualification_retry_episode", 0)
+    )
+    try:
+        if not isinstance(retry_raw, (int, str)) or isinstance(retry_raw, bool):
+            raise TypeError("retry episode is not an integer")
+        retry_count = max(0, int(retry_raw))
+    except (TypeError, ValueError):
+        retry_count = 0
+
+    verdict_attempt = _attempt_text(
+        getattr(selected_verdict, "qualification_attempt_id", None)
+    )
+    if selected_verdict is None:
+        verdict_currency = "none"
+    elif active_text is not None and verdict_attempt == active_text:
+        verdict_currency = "current"
+    elif active_text is None or verdict_attempt is None:
+        verdict_currency = "legacy_unknown"
+    else:
+        verdict_currency = "prior_attempt"
+
+    child_tasks: dict[str, dict[str, Any]] = {}
+    for child, field in (
+        ("audit", "audit_task_id"),
+        ("smoketest", "smoketest_task_id"),
+        ("challenge", "challenge_task_id"),
+        ("merge_grade", "merge_grade_task_id"),
+    ):
+        task_id = qual.get(field)
+        if task_id is None:
+            continue
+        child_tasks[child] = {
+            "task_id": str(task_id),
+            "attempt_id": active_text,
+            "candidate_sha": candidate_sha,
+            "currency": projection_currency,
+        }
+
+    return {
+        "active_projection": {
+            "attempt_id": active_text,
+            "candidate_sha": candidate_sha,
+            "currency": projection_currency,
+        },
+        "selected_verdict": {
+            "attempt_id": verdict_attempt,
+            "candidate_sha": getattr(selected_verdict, "candidate_sha", None),
+            "currency": verdict_currency,
+        },
+        "child_tasks": child_tasks,
+        "lifetime_attempts": int(getattr(version, "qualification_attempts", 0) or 0),
+        "retry_episode": {
+            "count": retry_count,
+            "cap": qual.get("retry_episode_cap"),
+        },
+    }
 
 
 def _parse_iso_naive(raw: Any) -> datetime | None:
@@ -89,6 +213,8 @@ FINALIZED_TERMINAL_STATUSES = frozenset(
 def apply_verdict_substitution(
     qual: dict[str, Any] | None,
     latest_verdict: QualificationVerdict | None,
+    *,
+    active_attempt_id: uuid.UUID | str | None = None,
 ) -> Tuple[dict[str, Any], dict[str, Any] | None]:
     """Substitute a finalized verdict's ``terminal_status`` for a stale pending record.
 
@@ -108,8 +234,21 @@ def apply_verdict_substitution(
     q = qual if isinstance(qual, dict) else {}
     candidate_sha = q.get("candidate_sha")
     promotion_pending = q.get("promotion_pending")
+    projected_attempt = _attempt_uuid(q.get("qualification_attempt_id")) or _attempt_uuid(
+        active_attempt_id
+    )
+    verdict_attempt = _attempt_uuid(
+        getattr(latest_verdict, "qualification_attempt_id", None)
+    )
+    # Durable identity requires an exact attempt match before substitution.
+    attempt_matches = (
+        projected_attempt is None and verdict_attempt is None
+    ) or (
+        projected_attempt is not None and verdict_attempt == projected_attempt
+    )
     if (
         latest_verdict is not None
+        and attempt_matches
         and q.get("status") == "pending"
         and isinstance(promotion_pending, dict)
         and isinstance(candidate_sha, str)
@@ -188,7 +327,11 @@ def resolve_effective_qualification_state(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    effective_qual, disagreement = apply_verdict_substitution(qual, latest_verdict)
+    effective_qual, disagreement = apply_verdict_substitution(
+        qual,
+        latest_verdict,
+        active_attempt_id=getattr(version, "active_qualification_attempt_id", None),
+    )
 
     state = summarize_qualification_state(
         effective_qual,
@@ -205,25 +348,30 @@ def resolve_effective_qualification_state(
 async def resolve_newest_qualification_verdict(
     session: AsyncSession,
     version: ReleaseVersion,
+    *,
+    require_audit_findings: bool = False,
 ) -> QualificationVerdict | None:
-    """Return the newest ``QualificationVerdict`` row for ``version``.
+    """Return the active attempt's verdict, or the newest legacy verdict.
 
-    This is the single canonical newest-verdict query used for finalized-verdict
-    substitution across every open-version read surface: scoped to the version
-    (``release_version_id == version.id``), ordered newest-first, limit 1, with
-    NO ``audit_findings`` filter (a finalized promotion verdict — e.g. an
-    ``infra_failure`` or ``promotion_failed`` outcome — may legitimately carry no
-    findings, and the substitution only cares about ``terminal_status``).
-    Reusing this one helper keeps the surfaces from re-inlining subtly-different
-    SELECTs.
+    This is the single canonical verdict query used across every read surface.
+    When the active projection has durable identity, only a row with that exact
+    ``qualification_attempt_id`` is eligible; a prior same-candidate verdict is
+    deliberately invisible until the active attempt finalizes. Legacy projections
+    without identity retain the newest-row fallback and are marked
+    ``legacy_unknown`` by :func:`qualification_read_provenance`.
     """
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.release_version_id == version.id
+    )
+    attempt_id = active_qualification_attempt_id(version)
+    if attempt_id is not None:
+        stmt = stmt.where(QualificationVerdict.qualification_attempt_id == attempt_id)
+    if require_audit_findings:
+        stmt = stmt.where(QualificationVerdict.audit_findings.is_not(None))
     return (
         (
             await session.execute(
-                select(QualificationVerdict)
-                .where(QualificationVerdict.release_version_id == version.id)
-                .order_by(QualificationVerdict.created_at.desc())
-                .limit(1)
+                stmt.order_by(QualificationVerdict.created_at.desc()).limit(1)
             )
         )
         .scalars()
@@ -260,7 +408,11 @@ async def resolve_promotion_blocking_result(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    effective_qual, _ = apply_verdict_substitution(qual, latest_verdict)
+    effective_qual, _ = apply_verdict_substitution(
+        qual,
+        latest_verdict,
+        active_attempt_id=getattr(version, "active_qualification_attempt_id", None),
+    )
     qual_state = summarize_qualification_state(effective_qual)
     if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
         result: dict[str, Any] = {
@@ -301,34 +453,10 @@ def resolve_dimension_states(
     """
     q: dict[str, Any] = last_qualification if isinstance(last_qualification, dict) else {}
 
-    _DIMENSIONS: list[tuple[str, str]] = [
-        ("audit", "Audit"),
-        ("test_erosion", "Test Erosion"),
-        ("smoketest", "Smoketest"),
-        ("ci", "CI"),
-        ("migration_identity", "Migration Identity"),
-        ("migration_apply", "Migration Apply"),
-        ("merge_grade", "Merge Grade"),
-        ("challenge", "Challenge"),
-        ("acceptance_window", "Acceptance Window"),
-        ("criterion_coverage", "Criterion Coverage"),
-        ("debt_pressure", "Debt Pressure"),
-        ("goal_alignment", "Goal Alignment"),
-        ("capability_proof", "Capability Proof"),
-    ]
-
-    _BLOCKER_TO_DIM: dict[str, str] = {
-        "ci_not_green": "ci",
-        "ci_unresolved": "ci",
-        "migration_identity_collision": "migration_identity",
-        "migration_apply_drift": "migration_apply",
-        "merge_grade_misses": "merge_grade",
-        "criterion_coverage_incomplete": "criterion_coverage",
-        "smoketest_startup_failed": "smoketest",
-        "audit_missing": "audit",
-        "test_file_deleted": "test_erosion",
-        "capability_proof_gate_blocked": "capability_proof",
-    }
+    # Ordered UI dimensions + labels and the blocker-code routing both come from
+    # the canonical dimension registry (see qualification_dimensions).
+    _DIMENSIONS: tuple[tuple[str, str], ...] = UI_DIMENSIONS
+    _BLOCKER_TO_DIM: dict[str, str] = BLOCKER_TO_DIMENSION
 
     def _all(status: str, reason: str | None = None) -> list[dict[str, Any]]:
         return [
@@ -352,6 +480,10 @@ def resolve_dimension_states(
     sub_scores: dict[str, Any] = q.get("sub_scores") or {}
     ci_resolution: dict[str, Any] = q.get("ci_resolution") or {}
     smoketest_enabled: bool = bool(q.get("smoketest_enabled", True))
+    # Slice 3 (design 245212a4): the deployed-side env-preflight judge ships DARK.
+    # Default False so legacy records (and every run before the flag is armed)
+    # render the env_preflight dimension not_applicable — never a spurious block.
+    env_preflight_enabled: bool = bool(q.get("env_preflight_enabled", False))
     migration_safety = q.get("migration_safety")
     migration_apply_safety = q.get("migration_apply_safety")
     merge_grade_status = q.get("merge_grade_status")
@@ -546,6 +678,24 @@ def resolve_dimension_states(
                 score = float(acc_fraction)
             else:
                 dim_status = "unavailable"
+        elif key == "env_preflight":
+            # Slice 3 (design 245212a4): DARK by default.  When the judge is
+            # disabled the dimension is not_applicable (no boot_prereq_missing
+            # block can fire).  When enabled: a real block surfaces as "failed"
+            # via blocker_dim above (boot_prereq_missing → env_preflight); a
+            # recorded env_preflight sub_score of 1.0 is "passed"; a None score
+            # (no candidate manifest seen) is "unavailable".
+            if not env_preflight_enabled:
+                dim_status = "not_applicable"
+            else:
+                raw = sub_scores.get("env_preflight")
+                if raw is not None and float(raw) > 0.0:
+                    dim_status = "passed"
+                    score = float(raw)
+                else:
+                    # 0.0 with no blocker attributed here, or absent — surface as
+                    # unavailable (a genuine 0.0 block is caught by blocker_dim).
+                    dim_status = "unavailable"
         elif key == "capability_proof":
             # Mirror the ledger's capability-proof semantics (release_qualifier
             # ~3593): OFF → unavailable (gate inactive), OBSERVE/ENFORCE → passed.
@@ -566,14 +716,18 @@ def resolve_dimension_states(
     return result
 
 
-# Dimensions the QualificationDimensionResult ledger writes (11 total, 11 of which
-# overlap with the 13 UI dimensions). The 2 UI-only dimensions NOT in the ledger
+# Dimensions the QualificationDimensionResult ledger writes (12 total, 12 of which
+# overlap with the 14 UI dimensions). The 2 UI-only dimensions NOT in the ledger
 # (criterion_coverage, goal_alignment) must still be derived from the blob.
-_LEDGER_DIMENSION_KEYS: frozenset[str] = frozenset({
-    "audit", "test_erosion", "smoketest", "ci",
-    "migration_identity", "migration_apply", "merge_grade", "debt_pressure",
-    "capability_proof", "challenge", "acceptance_window",
-})
+# Sourced from the canonical dimension registry (see qualification_dimensions).
+_LEDGER_DIMENSION_KEYS: frozenset[str] = LEDGER_DIMENSION_KEYS
+
+# Dimensions whose live result is re-measured on every re-drive.  A ledger row
+# whose currency is "reused" (i.e. it belongs to a prior attempt that the
+# active attempt merely reused) must NOT overwrite the blob-derived state for
+# these dimensions: the blob already reflects the fresh live measurement while
+# the ledger row carries the stale prior-attempt fact.
+_MUTABLE_DIMENSION_KEYS: frozenset[str] = MUTABLE_DIMENSION_KEYS
 
 
 def _ledger_status_to_ui(
@@ -583,11 +737,16 @@ def _ledger_status_to_ui(
     sub_score: float | None,
     blocker: str | None,
 ) -> str:
-    """Map the ledger status to honest operator-facing dimension state.
+    """Map the ledger's status vocabulary to the UI dimension-state vocabulary.
 
-    ``blocked`` maps to ``failed``. Audit rows use ``failed`` for any deduction
-    below 1.0, even when they carry a positive score and no hard blocker; those
-    are scored evidence rather than a red terminal failure.
+    The ledger writes ``passed``/``blocked``/``failed``/``unavailable``.
+    The UI expects ``passed``/``failed``/``unavailable``/``not_applicable``/``pending``.
+    ``blocked`` maps to ``failed`` for the UI. Audit ledger rows use ``failed``
+    for any finding-derived deduction below a perfect 1.0, even when the score is
+    valid and no hard blocker fired. The blob resolver has always displayed such
+    positive audit scores as passed/scored; preserve that operator-facing meaning
+    instead of painting a 0.96 audit red.
+
     """
     if status == "blocked":
         return "failed"
@@ -609,11 +768,11 @@ async def resolve_dimension_states_from_ledger(
     """Resolve per-dimension qualification state from the QualificationDimensionResult ledger.
 
     When ledger rows exist for the version's current ``candidate_sha``, derive
-    dimension states from the ledger for the 11 overlapping dimensions (audit,
+    dimension states from the ledger for the 12 overlapping dimensions (audit,
     test_erosion, smoketest, ci, migration_identity, migration_apply, merge_grade,
-    debt_pressure, capability_proof, challenge, acceptance_window) plus the
-    synchronous blob derivation for the 2 dimensions the ledger does not write
-    (criterion_coverage, goal_alignment). When no ledger rows exist for this
+    debt_pressure, capability_proof, challenge, acceptance_window, env_preflight)
+    plus the synchronous blob derivation for the 2 dimensions the ledger does not
+    write (criterion_coverage, goal_alignment). When no ledger rows exist for this
     candidate SHA, fall back entirely to the original
     :func:`resolve_dimension_states` (pure, from ``last_qualification``).
 
@@ -642,15 +801,30 @@ async def resolve_dimension_states_from_ledger(
 
     if not rows:
         return resolve_dimension_states(version.last_qualification)
+
+    active_attempt = active_qualification_attempt_id(version)
+    active_text = str(active_attempt) if active_attempt else None
     status = qual.get("status")
     attempt_in_flight = (
         status in ("pending", "qualifying") and not qual.get("promotion_pending")
     )
-    attempt_started_at = _parse_iso_naive(qual.get("started_at"))
+    if active_text is not None:
+        rows = [
+            row
+            for row in rows
+            if _attempt_text(row.origin_attempt_id) == active_text
+            or active_text
+            in {
+                value
+                for raw in (row.reused_by_attempt_ids or [])
+                if (value := _attempt_text(raw)) is not None
+            }
+        ]
+        if not rows:
+            return resolve_dimension_states(version.last_qualification)
 
-
-    # Start with the full blob-derived state (all 13 dimensions). Then overwrite
-    # the 11 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
+    # Start with the full blob-derived state (all 14 dimensions). Then overwrite
+    # the 12 ledger-backed dimensions with ledger data. The 2 blob-only dimensions
     # (criterion_coverage, goal_alignment) are preserved from the blob.
     result = resolve_dimension_states(version.last_qualification)
     ledger_map = {row.dimension: row for row in rows}
@@ -660,25 +834,49 @@ async def resolve_dimension_states_from_ledger(
         if key in _LEDGER_DIMENSION_KEYS:
             row = ledger_map.get(key)
             if row is not None:
-                row_computed_at = getattr(row, "computed_at", None)
-                if isinstance(row_computed_at, datetime):
-                    row_computed_at = row_computed_at.replace(tzinfo=None)
+                origin_attempt = _attempt_text(row.origin_attempt_id)
+                reused_by = {
+                    value
+                    for raw in (row.reused_by_attempt_ids or [])
+                    if (value := _attempt_text(raw)) is not None
+                }
+                if origin_attempt is None:
+                    currency = "legacy_unknown"
+                elif origin_attempt == active_text:
+                    currency = "current"
+                elif active_text in reused_by:
+                    currency = "reused"
+                else:
+                    currency = "prior_attempt"
 
-                # The serving main schema predates durable per-attempt ledger
-                # identity. During an in-flight attempt, use its persisted
-                # started_at as a strict generation boundary: prior-attempt rows
-                # for the same candidate remain pending, as do nonterminal rows.
-                # If the boundary is missing, fail closed to pending instead of
-                # presenting stale pass/fail state as current proof.
-                row_is_current_attempt = (
-                    attempt_started_at is not None
-                    and row_computed_at is not None
-                    and row_computed_at >= attempt_started_at
-                )
+                provenance = {
+                    "origin_attempt_id": origin_attempt,
+                    "candidate_sha": row.candidate_sha,
+                    "producing_task_id": (
+                        str(row.producing_task_id) if row.producing_task_id else None
+                    ),
+                    "currency": currency,
+                }
+
+                # A running attempt begins with every dimension pending. Only a
+                # terminal fact produced by THAT durable attempt may advance an
+                # individual row. Reused/prior facts remain useful provenance,
+                # but must not make an unfinished attempt look failed or passed;
+                # unavailable/pending rows are likewise not terminal proof.
                 if attempt_in_flight and (
-                    not row_is_current_attempt
+                    currency != "current"
                     or row.status not in {"passed", "failed", "blocked"}
                 ):
+                    entry["provenance"] = provenance
+                    continue
+
+                # Mutable dimensions are re-measured live on every re-drive.
+                # When the ledger row's currency is "reused", the blob already
+                # carries the fresh live result; skip the ledger overlay so the
+                # stale prior-attempt fact cannot contradict the active state.
+                if key in _MUTABLE_DIMENSION_KEYS and currency == "reused":
+                    entry["provenance"] = provenance
+
                     continue
 
                 entry["status"] = _ledger_status_to_ui(
@@ -689,6 +887,7 @@ async def resolve_dimension_states_from_ledger(
                 )
                 entry["score"] = row.sub_score
                 entry["reason"] = row.blocker
+                entry["provenance"] = provenance
 
     return result
 
@@ -745,7 +944,7 @@ def patch_qualification_state_from_dimension_states(
     return result
 
 
-async def resolve_open_version_qualification_state(
+async def resolve_open_version_qualification_read_model(
     session: AsyncSession,
     version: ReleaseVersion,
     project: Project | None = None,
@@ -754,7 +953,7 @@ async def resolve_open_version_qualification_state(
     audit_child: Any = _UNSET,
     latest_verdict: Any = _UNSET,
     dimension_states: Any = _UNSET,
-) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
+) -> QualificationReadModel:
     """Resolve an OPEN version's ``qualification_state`` with ALL enrichments.
 
     The single async seam every open-version read surface (strategic payload,
@@ -842,4 +1041,34 @@ async def resolve_open_version_qualification_state(
             qual_state, dim_states
         )
 
-    return qual_state, disagreement
+    dim_states = dim_states or []
+    return QualificationReadModel(
+        qualification_state=qual_state,
+        disagreement=disagreement,
+        provenance=qualification_read_provenance(version, latest_verdict),
+        dimension_states=dim_states,
+        selected_verdict=latest_verdict,
+    )
+
+
+async def resolve_open_version_qualification_state(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    project: Project | None = None,
+    *,
+    serving: Tuple[dict[str, Any], list[dict[str, Any]]] | None = None,
+    audit_child: Any = _UNSET,
+    latest_verdict: Any = _UNSET,
+    dimension_states: Any = _UNSET,
+) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Backward-compatible tuple view over the attempt-scoped read model."""
+    resolved = await resolve_open_version_qualification_read_model(
+        session,
+        version,
+        project,
+        serving=serving,
+        audit_child=audit_child,
+        latest_verdict=latest_verdict,
+        dimension_states=dimension_states,
+    )
+    return resolved.qualification_state, resolved.disagreement

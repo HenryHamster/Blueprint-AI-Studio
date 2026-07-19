@@ -22,6 +22,7 @@ from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
 )
 from app.models import LocalRunner, MessagesNoisePrefs, _utcnow
+from app.runner_project_binding import runner_allowed_for_project
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
     ARMING_PASSIVE_NOTE,
@@ -823,7 +824,7 @@ async def _valid_preferred_runner_ids(
         await session.execute(
             select(LocalRunner)
             .where(
-                LocalRunner.project_id == project_id,
+                runner_allowed_for_project(project_id),
                 LocalRunner.status != "deleted",
             )
             .with_for_update()

@@ -178,6 +178,9 @@ async def github_oauth_authorize(
         f"https://github.com/login/oauth/authorize"
         f"?client_id={GITHUB_CLIENT_ID}"
         f"&state={state}"
+        # The onboarding authorization check calls GET /repos/{owner}/{repo}
+        # with this user token and must see private repositories too.
+        f"&scope=repo"
         f"&allow_signup=false"
     )
     orch_base = (os.getenv("ORCHESTRATOR_URL") or "").rstrip("/")
@@ -275,15 +278,24 @@ async def github_oauth_callback(
         )
         integration = (await session.execute(stmt)).scalars().first()
 
+        # Retain a caller-scoped credential separately from the App
+        # installation ID. The latter identifies an installation but cannot
+        # establish that this user may write an individual repository.
+        oauth_secret_name = await store_user_secret(
+            firebase_user_id, "github-oauth", user_token
+        )
+
         if integration:
             integration.github_installation_id = installation_id
             integration.github_account_name = account_name
+            integration.github_oauth_token = encrypt_field(oauth_secret_name)
             integration.updated_at = _utcnow()
         else:
             integration = UserIntegration(
                 user_id=firebase_user_id,
                 github_installation_id=installation_id,
                 github_account_name=account_name,
+                github_oauth_token=encrypt_field(oauth_secret_name),
             )
 
         session.add(integration)

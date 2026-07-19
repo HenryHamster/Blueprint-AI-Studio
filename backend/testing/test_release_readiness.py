@@ -495,6 +495,72 @@ class TestPromotionCiGreenGate:
         assert result is False
         run_qual.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_unresolvable_head_sha_maps_to_unavailable(
+        self, db_session, mocker
+    ):
+        """When the integration HEAD sha cannot be resolved (get_branch_sha
+        returns falsy), the gate degrades to ``unavailable`` with a reason that
+        names the integration branch — and never dispatches a run."""
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(mocker, run=None, head_sha=None)
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "unavailable"
+        assert gate["head_sha"] is None
+        assert "automain" in gate["reason"]
+        # No HEAD sha → the workflow-run lookup / dispatch must be short-circuited.
+        disp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_missing_project_maps_to_unavailable(self, db_session, mocker):
+        """A project_id with no Project row degrades to ``unavailable`` with the
+        ``project not found`` reason before any GitHub round-trip."""
+        import uuid as _uuid
+
+        resolve = mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=("tok", "acme", "widget")),
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, _uuid.uuid4())
+        assert gate["gate_state"] == "unavailable"
+        assert gate["reason"] == "project not found"
+        # Short-circuits before credential resolution.
+        resolve.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_failed_dispatch_maps_to_unavailable(self, db_session, mocker):
+        """When no run exists for HEAD and the fresh dispatch fails
+        (``dispatch_workflow_run`` returns falsy), the gate returns
+        ``unavailable`` — NOT ``dispatched`` — while still reporting the HEAD."""
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(
+            mocker, run=None, head_sha="cafef00d", dispatch_ok=False
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "unavailable"
+        assert gate["head_sha"] == "cafef00d"
+        assert "failed to dispatch" in gate["reason"]
+        disp.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_github_error_maps_to_unavailable(self, db_session, mocker):
+        """Any exception during gate computation (here: get_branch_sha raises) is
+        swallowed and degrades to ``unavailable`` — the gate NEVER propagates."""
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(mocker, run=None)
+        mocker.patch(
+            "app.github.get_branch_sha",
+            new=AsyncMock(side_effect=RuntimeError("gh 503")),
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "unavailable"
+        assert gate["reason"] == "error computing promotion CI green gate"
+        assert gate["head_sha"] is None
+
 
 class TestChallengeRefutedRate:
     def test_challenge_refuted_rate_never_exceeds_one(self):

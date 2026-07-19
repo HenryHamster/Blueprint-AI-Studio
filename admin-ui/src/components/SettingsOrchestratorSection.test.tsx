@@ -6,6 +6,7 @@ import {
   fetchMetricsIntegrityObservability,
   patchMetricsIntegritySettings,
   patchCapabilityProofGateSettings,
+  apiFetch,
 } from '../api';
 
 vi.mock('../api', () => ({
@@ -47,6 +48,9 @@ vi.mock('../api', () => ({
     flags_total: 0,
     errors_total: 0,
     enrolled_total: 0,
+    auto_resolved_total: 0,
+    auto_resolved_backing_path_total: 0,
+    auto_resolved_named_test_present_total: 0,
     last_tick_at: null,
     last_tick: null,
     recent_ticks: [],
@@ -132,12 +136,41 @@ describe('SettingsOrchestratorSection', () => {
       flags_total: 2,
       errors_total: 1,
       enrolled_total: 3,
+      auto_resolved_total: 4,
+      auto_resolved_backing_path_total: 2,
+      auto_resolved_named_test_present_total: 2,
       last_tick_at: '2026-07-05T12:00:00Z',
       last_tick: null,
       recent_ticks: [],
       recent_flags: [
-        { check_id: 'check-a', metric: 'cpu', expected: '< 0.8', found: '0.92' },
-        { check_id: 'check-b', metric: 'memory', expected: '< 0.7', found: '0.81' },
+        {
+          check: 'capability_proof_gate_gap',
+          status: 'flagged',
+          self_reported: 10,
+          ground_truth: 7,
+          delta: -3,
+          severity: 'warn',
+          subject: 'proj-abc',
+          detail: '3 capabilities have no proof',
+          auto_resolved: 2,
+          auto_resolved_backing_path: 1,
+          auto_resolved_named_test_present: 1,
+          at: '2026-07-05T12:00:00Z',
+        },
+        {
+          check: 'metrics_drift',
+          status: 'flagged',
+          self_reported: 5,
+          ground_truth: 8,
+          delta: 3,
+          severity: 'error',
+          subject: 'global',
+          detail: 'task completion rate drifted',
+          auto_resolved: null,
+          auto_resolved_backing_path: null,
+          auto_resolved_named_test_present: null,
+          at: '2026-07-05T12:00:00Z',
+        },
       ],
     });
 
@@ -147,8 +180,8 @@ describe('SettingsOrchestratorSection', () => {
     expect(await within(panel).findByText('7 ticks · 2 flags')).toBeInTheDocument();
     expect(within(panel).getByText('Checks Run').parentElement).toHaveTextContent('19');
     expect(within(panel).getByText('Errors Total').parentElement).toHaveTextContent('1');
-    expect(within(panel).getByText('check-b')).toBeInTheDocument();
-    expect(within(panel).getByText('memory')).toBeInTheDocument();
+    expect(within(panel).getByText('metrics_drift')).toBeInTheDocument();
+    expect(within(panel).getByText('global')).toBeInTheDocument();
     expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
   });
 
@@ -159,6 +192,9 @@ describe('SettingsOrchestratorSection', () => {
       flags_total: 0,
       errors_total: 0,
       enrolled_total: 0,
+      auto_resolved_total: 0,
+      auto_resolved_backing_path_total: 0,
+      auto_resolved_named_test_present_total: 0,
       last_tick_at: null,
       last_tick: null,
       recent_ticks: [],
@@ -170,6 +206,59 @@ describe('SettingsOrchestratorSection', () => {
     const panel = screen.getByTestId('metrics-integrity-observability-panel');
     expect(await within(panel).findByText('No metrics integrity sweep ticks recorded yet.')).toBeInTheDocument();
     expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
+  });
+
+  it('renders the live fleet proof-coverage meter from the settings payload', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        structural_health_audit_mode: 'off',
+        metrics_integrity_sweep_mode: 'off',
+        capability_proof_gate_mode: 'off',
+        capability_proof_gate_auto_graduation_enabled: false,
+        capability_proof_gate_auto_graduation_observe_threshold: 0.5,
+        capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
+        capability_proof_gate_coverage: {
+          coverage_ratio: 0.5,
+          total_proven: 1,
+          total_non_exempt_working: 2,
+          projects_contributing: 1,
+          num_projects: 1,
+        },
+      }),
+    } as unknown as Response);
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const value = await screen.findByTestId('proof-gate-fleet-coverage-value');
+    expect(value).toHaveTextContent('1/2 (50%)');
+  });
+
+  it('renders n/a in the coverage meter when the ratio is undefined', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        structural_health_audit_mode: 'off',
+        metrics_integrity_sweep_mode: 'off',
+        capability_proof_gate_mode: 'off',
+        capability_proof_gate_auto_graduation_enabled: false,
+        capability_proof_gate_auto_graduation_observe_threshold: 0.5,
+        capability_proof_gate_auto_graduation_enforce_threshold: 0.95,
+        capability_proof_gate_coverage: {
+          coverage_ratio: null,
+          total_proven: 0,
+          total_non_exempt_working: 0,
+          projects_contributing: 0,
+          num_projects: 1,
+        },
+      }),
+    } as unknown as Response);
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const meter = await screen.findByTestId('proof-gate-fleet-coverage-meter');
+    expect(meter).toHaveTextContent('n/a');
+    expect(screen.queryByTestId('proof-gate-fleet-coverage-value')).not.toBeInTheDocument();
   });
 
   it('patches the metrics integrity sweep mode when a mode button is clicked', async () => {
@@ -357,7 +446,8 @@ describe('SettingsOrchestratorSection', () => {
     });
 
     // Auto-graduation toggle issues a partial PATCH of just the boolean key.
-    const toggle = within(section).getByRole('button', { name: '' });
+    const autoGradContainer = within(section).getByTestId('proof-gate-auto-graduation');
+    const toggle = within(autoGradContainer).getByRole('button', { name: '' });
     await user.click(toggle);
     await waitFor(() => {
       expect(patchCapabilityProofGateSettings).toHaveBeenCalledWith({ capability_proof_gate_auto_graduation_enabled: true });

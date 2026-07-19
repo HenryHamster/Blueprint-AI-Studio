@@ -1,16 +1,26 @@
 """Agent-facing compute-job launch and polling endpoints."""
 
+import asyncio
 import base64
 import binascii
+import hmac
 import json
 import logging
+import tempfile
 import uuid
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
+from app import storage
+from app.compute_backends import (
+    _MAX_VIEWABLE_FILE_BYTES,
+    _MAX_VIEWABLE_FILE_COUNT,
+    _MAX_VIEWABLE_VIDEO_BYTES,
+    compute_job_heartbeat_secret,
+)
 from app.compute_jobs import (
     ComputeLaunchPreconditionFailed,
     _COMPUTE_JOB_TERMINAL_STATUSES,
@@ -19,7 +29,7 @@ from app.compute_jobs import (
     get_compute_job_for_task,
 )
 from app.database import get_session
-from app.models import ComputeJob, ComputeJobStatus, Task
+from app.models import ComputeJob, ComputeJobFile, ComputeJobStatus, Task
 from app.routers.agent import verify_agent_token
 from app.schemas import redact_command_log_text, serialize_compute_job_response
 from app.shared_state import limiter
@@ -32,6 +42,22 @@ _LIVE_TAIL_MAX_TEXT_CHARS = 10240
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/agent", tags=["agent"])
+
+
+def _accepts_legacy_compute_heartbeat(job: ComputeJob, bearer: str) -> bool:
+    """Whether a pre-HMAC VM may use its legacy UUID bearer.
+
+    A job is treated as launched under the HMAC contract when its
+    polling_metadata carries ``heartbeat_auth == "hmac"`` — a marker stamped at
+    launch time by the backend that embedded the HMAC token in the startup
+    script.  Jobs without that marker were launched by a pre-HMAC engine and
+    may authenticate with the bare job UUID (constant-time compare).  Jobs with
+    the marker are HMAC-only (fail-closed).
+    """
+    meta = job.polling_metadata or {}
+    if meta.get("heartbeat_auth") == "hmac":
+        return False
+    return hmac.compare_digest(bearer.encode("utf-8"), str(job.id).encode("ascii"))
 
 
 class LaunchComputeJobRequest(BaseModel):
@@ -195,22 +221,42 @@ async def compute_job_vm_heartbeat(
 ):
     """Liveness push from a GCP compute-job VM.
 
-    The VM's startup script POSTs here (bearer = job UUID) every ~60 s so the
-    orchestrator can confirm the VM is alive without relying on serial-console
-    polls or the GCP insert long-running-operation.  The first heartbeat also
-    transitions the job from STARTING to RUNNING so provisioning success is
-    declared on boot rather than on LRO completion.
+    The VM's startup script POSTs here every ~60 s so the orchestrator can confirm
+    the VM is alive without relying on serial-console polls or the GCP insert
+    long-running-operation.  The first heartbeat also transitions the job from
+    STARTING to RUNNING so provisioning success is declared on boot rather than on
+    LRO completion, and the body may carry progress samples that feed the
+    no-progress watchdog.
 
-    Authentication: the bearer token is the job UUID (128 bits of entropy —
-    equivalent to a random secret).  The endpoint is rate-limited and only
-    accepts active (non-terminal) job IDs.
+    Authentication: the bearer token is NOT the job UUID.  The UUID is a resource
+    identifier — it is in the URL path, agent poll responses, and log/serial
+    output — so authenticating with it would let any observer suppress the
+    no-progress watchdog or keep a stuck STARTING job alive.  Instead the VM sends
+    a per-job secret derived by ``compute_job_heartbeat_secret`` (HMAC of the job
+    id keyed by ``AGENT_JWT_SECRET``), embedded only in the encrypted startup
+    script and never echoed by any API.  The endpoint recomputes it and does a
+    constant-time compare. During the flag-day rollout only, pre-rollout jobs
+    accept their legacy UUID bearer so already-running VMs cannot be reaped
+    mid-job; jobs created at or after the boundary remain HMAC-only. The endpoint
+    is also rate-limited and only mutates active (non-terminal) jobs.
     """
     auth = request.headers.get("Authorization", "")
     bearer = auth.removeprefix("Bearer ").strip()
-    if bearer != str(job_id):
-        raise HTTPException(status_code=403, detail="Invalid compute job token")
+    expected = compute_job_heartbeat_secret(job_id)
+    # Compare as bytes (constant-time): hmac.compare_digest raises on a str with
+    # non-ASCII chars, so a hostile Authorization header must not 500 the endpoint.
+    hmac_valid = hmac.compare_digest(bearer.encode("utf-8"), expected.encode("ascii"))
+    job = None
+    if not hmac_valid:
+        # Fetch only when the primary secret failed: old VMs must keep their
+        # heartbeat lease through the deploy, while unknown UUIDs still receive
+        # the same generic 403 as other invalid credentials.
+        job = await session.get(ComputeJob, job_id)
+        if job is None or not _accepts_legacy_compute_heartbeat(job, bearer):
+            raise HTTPException(status_code=403, detail="Invalid compute job token")
 
-    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        job = await session.get(ComputeJob, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Compute job not found")
 
@@ -244,11 +290,13 @@ async def compute_job_vm_heartbeat(
     progress_sample = _parse_progress_sample(body_bytes)
     if progress_sample is not None:
         metric, value = progress_sample
+        _now = _utcnow()
         job.polling_metadata = append_progress_sample(
             dict(job.polling_metadata or {}),
             metric=metric,
             value=value,
-            t=_utcnow().isoformat(),
+            t=_now.isoformat(),
+            received_at=_now,
         )
     await session.commit()
     return Response(status_code=204)
@@ -312,3 +360,554 @@ def _parse_progress_sample(body: bytes) -> tuple[str, float] | None:
     except (TypeError, ValueError):
         return None
     return metric, float_val
+
+
+# ── Viewable file upload from GCP compute-job VMs ──────────────────────
+#
+# The GCP VM runs a background watcher (viewable_watch.py) that polls the
+# job's BLUEPRINT_ARTIFACT_DIR for files matching viewable extensions
+# (png/jpg/jpeg/webp/gif/mp4/webm) and POSTs each to this endpoint using
+# the per-job HMAC secret for authentication.  The endpoint enforces the
+# same policies as the runner-subprocess viewable endpoint in runner.py:
+# extension-based kind classification, per-kind byte caps (8 MiB for images,
+# 512 MiB for videos), and the 25-file per-job count budget.  Terminal jobs
+# are refused — mid-run uploads may only add evidence to a job that is still
+# live.
+
+# Margin added to the max file byte cap when sizing the multipart body
+# ceiling, so multipart framing overhead (boundary markers, headers, trailing
+# CRLFs) does not push a valid payload over the cap.  Copied from runner.py.
+_MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+
+
+# ── Streaming multipart helpers for large (video) bodies ────────────────────
+# Mirror of runner.py's _FileRangeReader + _parse_multipart_form_stream: the
+# same streaming strategy is needed on the agent-facing viewable endpoint so
+# a multi-hundred-MiB video upload never materialises in the orchestrator heap.
+
+_MAX_MULTIPART_PARTS = 64
+_MAX_MULTIPART_FIELD_BYTES = 4 * 1024  # 4 KiB
+
+
+class _FileRangeReader:
+    """Bounded, forward-only reader over a byte range of a seekable file.
+
+    Presents ``[start, start + length)`` of ``fileobj`` as its own read stream
+    so the (potentially multi-hundred-MiB) file part of a spooled multipart
+    body can be streamed to GCS via ``blob.upload_from_file`` WITHOUT ever
+    buffering it in the orchestrator heap.
+    """
+
+    def __init__(self, fileobj, start: int, length: int):
+        self._f = fileobj
+        self._remaining = max(0, length)
+        self._f.seek(start)
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0:
+            return b""
+        want = (
+            self._remaining if size is None or size < 0 else min(size, self._remaining)
+        )
+        data = self._f.read(want)
+        self._remaining -= len(data)
+        return data
+
+
+def _parse_multipart_form_stream(
+    fileobj,
+    content_type: str,
+    *,
+    read_chunk: int = 1024 * 1024,
+    header_window: int = 64 * 1024,
+    max_parts: int = _MAX_MULTIPART_PARTS,
+    max_field_bytes: int = _MAX_MULTIPART_FIELD_BYTES,
+) -> tuple[dict, dict | None]:
+    """Memory-bounded multipart parse over a SEEKABLE binary file.
+
+    The streaming counterpart of :func:`_parse_multipart_form`: locates each
+    part by scanning the file for boundary delimiters in a bounded sliding
+    window so the large file part is never loaded into memory. Scalar fields
+    are read into memory as bytes; the single file part is returned as a
+    byte-range descriptor ``{"name", "filename", "start", "length"}`` the
+    caller streams via :class:`_FileRangeReader`.
+
+    Returns ``(fields, file_part)`` where ``file_part`` is ``None`` when no
+    file part is present.
+    """
+    fields: dict[str, bytes] = {}
+    file_part: dict | None = None
+
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return fields, None
+
+    delimiter = b"--" + boundary.encode("latin-1")
+    dlen = len(delimiter)
+
+    positions: list[int] = []
+    fileobj.seek(0)
+    overlap = dlen - 1
+    carry = b""
+    base = 0
+    while True:
+        chunk = fileobj.read(read_chunk)
+        if not chunk:
+            break
+        buf = carry + chunk
+        search_from = 0
+        while True:
+            idx = buf.find(delimiter, search_from)
+            if idx == -1:
+                break
+            positions.append(base + idx)
+            if len(positions) > max_parts:
+                raise ValueError(
+                    f"multipart body contains more than {max_parts} boundary markers"
+                )
+            search_from = idx + dlen
+        keep = min(len(buf), overlap)
+        base += len(buf) - keep
+        carry = buf[len(buf) - keep:] if keep else b""
+
+    for i in range(len(positions) - 1):
+        seg_start = positions[i] + dlen
+        seg_end = positions[i + 1]
+        if seg_start >= seg_end:
+            continue
+        fileobj.seek(seg_start)
+        window = fileobj.read(min(header_window, seg_end - seg_start))
+        if window.startswith(b"--"):
+            continue
+        header_off = 2 if window.startswith(b"\r\n") else 0
+        header_rel = window.find(b"\r\n\r\n", header_off)
+        if header_rel == -1:
+            continue
+        header_block = window[header_off:header_rel].decode("latin-1", "replace")
+        content_start = seg_start + header_rel + 4
+        content_end = seg_end
+        if content_end - content_start >= 2:
+            content_end -= 2
+
+        name = None
+        filename = None
+        for hline in header_block.split("\r\n"):
+            if hline.lower().startswith("content-disposition:"):
+                for param in hline.split(";")[1:]:
+                    param = param.strip()
+                    if param.startswith("name="):
+                        name = param[len("name="):].strip().strip('"')
+                    elif param.startswith("filename="):
+                        filename = param[len("filename="):].strip().strip('"')
+        if name is None:
+            continue
+        length = max(0, content_end - content_start)
+        if filename is not None:
+            if file_part is None:
+                file_part = {
+                    "name": name,
+                    "filename": filename,
+                    "start": content_start,
+                    "length": length,
+                }
+        else:
+            if length > max_field_bytes:
+                raise ValueError(
+                    f"non-file field {name!r} exceeds {max_field_bytes} byte limit"
+                )
+            fileobj.seek(content_start)
+            fields[name] = fileobj.read(length)
+
+    return fields, file_part
+
+
+def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
+    """Parse a ``multipart/form-data`` body without requiring ``python-multipart``.
+
+    Returns ``(fields, files)``: ``fields`` maps each non-file field name to its
+    raw bytes value; ``files`` maps each file field name to its raw bytes content.
+    This is a minimal boundary splitter sufficient for the fixed-shape body of a
+    viewable-file upload (one file part + one filename field).  Mirrors the
+    implementation in ``runner.py``.
+
+    NOTE: this parser loads the entire body into memory.  For the GCP VM
+    viewable watcher the body is typically small (images under 8 MiB), so
+    the in-memory approach is fine for the initial implementation.  A future
+    streaming path similar to runner's ``_parse_multipart_form_stream`` +
+    ``_FileRangeReader`` can be added when large mid-run video uploads from
+    GCP VMs are needed.
+    """
+    fields: dict[str, bytes] = {}
+    files: dict[str, bytes] = {}
+
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return fields, files
+
+    delimiter = b"--" + boundary.encode("latin-1")
+    for seg in body.split(delimiter):
+        if not seg or seg in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        if seg.startswith(b"--"):
+            continue
+        if seg.startswith(b"\r\n"):
+            seg = seg[2:]
+        header_end = seg.find(b"\r\n\r\n")
+        if header_end == -1:
+            continue
+        header_block = seg[:header_end].decode("latin-1", "replace")
+        content = seg[header_end + 4:]
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+
+        name = None
+        filename = None
+        for hline in header_block.split("\r\n"):
+            if hline.lower().startswith("content-disposition:"):
+                for param in hline.split(";")[1:]:
+                    param = param.strip()
+                    if param.startswith("name="):
+                        name = param[len("name="):].strip().strip('"')
+                    elif param.startswith("filename="):
+                        filename = param[len("filename="):].strip().strip('"')
+        if name is None:
+            continue
+        if filename is not None:
+            files[name] = content
+        else:
+            fields[name] = content
+    return fields, files
+
+
+@router.post("/compute-jobs/{job_id}/viewable")
+@limiter.limit("120/minute")
+async def upload_compute_job_viewable(
+    request: Request,
+    job_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+):
+    """Receive a single viewable file from a GCP compute-job VM mid-execution.
+
+    GCP VMs run a background watcher (``viewable_watch.py``) that polls
+    ``$BLUEPRINT_ARTIFACT_DIR`` for new viewable-extension files and uploads each
+    to this endpoint so they appear in the strategic canvas BEFORE the job reaches
+    a terminal state.
+
+    Authentication uses the same per-job HMAC secret as the heartbeat endpoint
+    (see ``compute_job_heartbeat_secret``), embedded only in the encrypted startup
+    script and never echoed by any API.
+
+    Body is ``multipart/form-data``: a ``file`` field carrying the viewable file
+    bytes, plus a ``filename`` form field with the relative path of the file
+    (``reward_curve.png`` or ``arm1/reward.png`` — matching the terminal
+    ``persist_viewable_artifacts`` pipeline).
+
+    The endpoint enforces the same policies as the runner's viewable endpoint:
+    extension-based classification, per-kind byte caps (8 MiB for images,
+    512 MiB for videos), and the 25-file per-job count budget.
+    """
+    # ── Auth: same per-job HMAC secret as the heartbeat endpoint ────────
+    auth = request.headers.get("Authorization", "")
+    bearer = auth.removeprefix("Bearer ").strip()
+    expected = compute_job_heartbeat_secret(job_id)
+    if not hmac.compare_digest(bearer.encode("utf-8"), expected.encode("ascii")):
+        raise HTTPException(status_code=403, detail="Invalid compute job token")
+
+    # ── Read the multipart body with a bounded spool ────────────────────
+    # Small bodies (images) stay in memory; a large video body rolls to a
+    # temp file so the orchestrator never buffers a multi-hundred-MiB payload
+    # on the heap.  The hard cap covers the largest viewable file plus
+    # multipart framing overhead.
+    max_body_bytes = _MAX_VIEWABLE_VIDEO_BYTES + _MULTIPART_BODY_MARGIN
+    spool_threshold = _MAX_VIEWABLE_FILE_BYTES + _MULTIPART_BODY_MARGIN
+    with tempfile.SpooledTemporaryFile(max_size=spool_threshold) as spool:
+        received = 0
+        chunk_count = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > max_body_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail="viewable file body exceeds upload cap",
+                )
+            spool.write(chunk)
+            chunk_count += 1
+            # Yield the event loop every 64 chunks so a large video upload
+            # cannot monopolize it during body ingestion.
+            if chunk_count % 64 == 0:
+                await asyncio.sleep(0)
+
+        req_content_type = request.headers.get("content-type") or ""
+
+        # At/below the spool threshold the whole body is still in memory:
+        # reuse the in-memory parser and upload seam (fast path for images).
+        # Above it the body rolled to disk: parse and upload by STREAMING the
+        # file part so its bytes never re-enter the heap.
+        stream_upload = received > spool_threshold
+        file_part: dict | None = None
+        try:
+            if stream_upload:
+                fields, file_part = await asyncio.to_thread(
+                    _parse_multipart_form_stream, spool, req_content_type
+                )
+                if file_part is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="missing 'file' field in multipart form",
+                    )
+                file_bytes = None
+                file_length = file_part["length"]
+            else:
+                spool.seek(0)
+                raw = spool.read()
+                fields, files = _parse_multipart_form(raw, req_content_type)
+                file_bytes = files.get("file")
+                if file_bytes is None:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="missing 'file' field in multipart form",
+                    )
+                file_length = len(file_bytes)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if file_length == 0:
+            raise HTTPException(
+                status_code=400, detail="empty viewable file body"
+            )
+
+        raw_filename = (
+            (fields.get("filename") or b"").decode("latin-1", "replace").strip()
+        )
+        if not raw_filename:
+            raise HTTPException(
+                status_code=400,
+                detail="missing or empty 'filename' field",
+            )
+
+        # ── Extension-based classification ──────────────────────────────
+        type_info = storage.viewable_content_type_for_filename(raw_filename)
+        if type_info is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"file type not viewable: {raw_filename!r} — "
+                f"supported: png/jpg/jpeg/webp/gif/pdf/mp4/webm",
+            )
+        content_type, kind = type_info
+
+        safe_name = storage.sanitize_viewable_relpath(raw_filename)
+        if safe_name is None:
+            raise HTTPException(
+                status_code=422,
+                detail=f"filename {raw_filename!r} sanitizes to an empty or unsafe name",
+            )
+
+        # ── Enforce per-kind byte cap ───────────────────────────────────
+        size_cap = (
+            _MAX_VIEWABLE_VIDEO_BYTES
+            if kind == "video"
+            else _MAX_VIEWABLE_FILE_BYTES
+        )
+        if file_length > size_cap:
+            raise HTTPException(
+                status_code=413,
+                detail=f"viewable file {safe_name!r} ({file_length} bytes) "
+                f"exceeds the {size_cap}-byte cap for kind {kind!r}",
+            )
+
+        # ── Load job, validate non-terminal ─────────────────────────────
+        job = await session.get(ComputeJob, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Compute job not found")
+
+        if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            raise HTTPException(
+                status_code=409,
+                detail="compute job is terminal — "
+                "mid-run viewable uploads are refused",
+            )
+
+        # ── Pre-check count cap (advisory — authoritative under lock) ────
+        expected_uri = storage.compute_job_viewable_uri(job_id, safe_name)
+        meta_snapshot = job.polling_metadata or {}
+        existing_snapshot = meta_snapshot.get("viewable_files") or []
+
+        def _is_registered(meta_dict: Any) -> bool:
+            entries = (meta_dict or {}).get("viewable_files") or []
+            if not isinstance(entries, list):
+                return False
+            return any(
+                isinstance(e, dict) and e.get("storage_uri") == expected_uri
+                for e in entries
+            )
+
+        if (
+            isinstance(existing_snapshot, list)
+            and len(existing_snapshot) >= _MAX_VIEWABLE_FILE_COUNT
+            and not _is_registered(meta_snapshot)
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) "
+                f"reached for this job",
+            )
+
+        # ── Upload to GCS ───────────────────────────────────────────────
+        # Large bodies (videos that rolled to disk) are STREAMED so their bytes
+        # never re-enter the orchestrator heap. In-memory bodies use the simpler
+        # bytes-based seam.
+        if stream_upload and file_part is not None:
+            uploaded_uri = await storage.upload_compute_job_viewable_stream(
+                job_id,
+                safe_name,
+                _FileRangeReader(spool, file_part["start"], file_length),
+                content_type,
+                size=file_length,
+            )
+        else:
+            uploaded_uri = await storage.upload_compute_job_viewable_file(
+                job_id, safe_name, file_bytes, content_type,
+            )
+        if uploaded_uri is None:
+            logger.warning(
+                "[AGENT_JOBS] GCS upload failed for viewable file %r on "
+                "job %s — storage unavailable",
+                safe_name,
+                job_id,
+            )
+            raise HTTPException(
+                status_code=502,
+                detail="viewable file upload to storage failed",
+            )
+
+    # ── Re-read with row lock — re-check terminal + count cap ──────────
+    result = await session.execute(
+        select(ComputeJob)
+        .where(ComputeJob.id == job_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job vanished mid-upload")
+
+    if job.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+        logger.warning(
+            "[AGENT_JOBS] Compute job %s went terminal while viewable "
+            "file %r upload was in flight — discarding unreferenced object",
+            job_id,
+            safe_name,
+        )
+        await storage.delete_compute_job_viewable_file(job_id, safe_name)
+        raise HTTPException(
+            status_code=409,
+            detail="compute job went terminal during upload — "
+            "live artifact was discarded",
+        )
+
+    # ── Update polling_metadata viewable_files list ────────────────────
+    meta = dict(job.polling_metadata or {})
+
+    raw_existing_list = meta.get("viewable_files") or []
+    if not isinstance(raw_existing_list, list):
+        raw_existing_list = []
+    old_list = raw_existing_list
+    # Detach nested JSON dicts from the ORM-owned polling_metadata value.
+    existing_list = [
+        dict(item) if isinstance(item, dict) else item
+        for item in old_list
+    ]
+
+    # Dedup by storage_uri
+    existing_entry = None
+    for manifest_entry in existing_list:
+        if (
+            isinstance(manifest_entry, dict)
+            and manifest_entry.get("storage_uri") == uploaded_uri
+        ):
+            existing_entry = manifest_entry
+            break
+
+    # Count cap (definitive check under lock)
+    if existing_entry is None and len(existing_list) >= _MAX_VIEWABLE_FILE_COUNT:
+        await storage.delete_compute_job_viewable_file(job_id, safe_name)
+        raise HTTPException(
+            status_code=429,
+            detail=f"viewable file cap ({_MAX_VIEWABLE_FILE_COUNT}) "
+            f"reached for this job",
+        )
+
+    revision = storage.new_viewable_revision()
+
+    entry: dict[str, Any] = {
+        "filename": safe_name,
+        "storage_uri": uploaded_uri,
+        "content_type": content_type,
+        "size_bytes": file_length,
+        "kind": kind,
+        "revision": revision,
+        "live": True,
+    }
+
+    if existing_entry is not None:
+        existing_entry.update(entry)
+    else:
+        existing_list.append(entry)
+    meta["viewable_files"] = existing_list
+
+    # ── Create/update ComputeJobFile signing row ────────────────────────
+    file_row = (
+        await session.execute(
+            select(ComputeJobFile).where(
+                ComputeJobFile.storage_uri == uploaded_uri,
+            )
+        )
+    ).scalars().first()
+
+    if file_row is not None:
+        file_row.safe_relpath = safe_name
+        file_row.media_type = kind
+        file_row.content_type = content_type
+        file_row.file_size_bytes = file_length
+        session.add(file_row)
+    else:
+        try:
+            async with session.begin_nested():
+                cjf = ComputeJobFile(
+                    compute_job_id=job.id,
+                    safe_relpath=safe_name,
+                    media_type=kind,
+                    storage_uri=uploaded_uri,
+                    content_type=content_type,
+                    file_size_bytes=file_length,
+                )
+                session.add(cjf)
+                await session.flush()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "[AGENT_JOBS] ComputeJobFile insert failed for viewable "
+                "file %r in job=%s — continuing without DB row",
+                safe_name,
+                job.id,
+                exc_info=True,
+            )
+
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+    return {
+        "ok": True,
+        "entry": entry,
+        "total_viewable_files": len(existing_list),
+    }

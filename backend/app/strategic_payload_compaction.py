@@ -63,6 +63,49 @@ def _compact_scalar_mapping(value: Any, *, text_cap: int) -> dict | None:
     return out or None
 
 
+def _compact_qualification_provenance(value: Any, *, text_cap: int) -> dict | None:
+    """Keep bounded scalar attempt provenance while dropping arbitrary bodies."""
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("active_projection", "selected_verdict", "retry_episode"):
+        compact = _compact_scalar_mapping(value.get(key), text_cap=text_cap)
+        if compact:
+            out[key] = compact
+    if isinstance(value.get("lifetime_attempts"), int):
+        out["lifetime_attempts"] = value["lifetime_attempts"]
+    children = value.get("child_tasks")
+    if isinstance(children, dict):
+        compact_children = {
+            str(name): compact
+            for name, child in children.items()
+            if (compact := _compact_scalar_mapping(child, text_cap=text_cap))
+        }
+        if compact_children:
+            out["child_tasks"] = compact_children
+    return out or None
+
+
+def _compact_dimension_states(value: Any, *, text_cap: int) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    out: list[dict] = []
+    for row in value[:14]:
+        if not isinstance(row, dict):
+            continue
+        compact = {
+            key: row.get(key)
+            for key in ("key", "label", "status", "score", "reason")
+            if key in row
+        }
+        provenance = _compact_scalar_mapping(row.get("provenance"), text_cap=text_cap)
+        if provenance:
+            compact["provenance"] = provenance
+        if compact:
+            out.append(compact)
+    return out
+
+
 def _compact_release_artifacts(rows: Any) -> list[dict]:
     if not isinstance(rows, list):
         return []
@@ -189,6 +232,9 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     out: dict[str, Any] = {}
     for key in (
         "status",
+        "qualification_attempt_id",
+        "retry_episode",
+        "retry_episode_cap",
         "candidate_sha",
         "ci_green",
         "smoketest_enabled",
@@ -395,6 +441,8 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         "phase_changed_at",
         "tasks_merged_this_version",
         "qualification_attempts",
+        "qualification_retry_episode",
+        "active_qualification_attempt_id",
         "serving_status",
         "served_sha",
         "served_at",
@@ -416,6 +464,16 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     qs = _compact_qualification_state(block.get("qualification_state"), floor=floor)
     if qs:
         out["qualification_state"] = qs
+    provenance = _compact_qualification_provenance(
+        block.get("qualification_provenance"), text_cap=text_cap
+    )
+    if provenance:
+        out["qualification_provenance"] = provenance
+    dimension_states = _compact_dimension_states(
+        block.get("dimension_states"), text_cap=text_cap
+    )
+    if dimension_states:
+        out["dimension_states"] = dimension_states
     # Small scalar dict {last_qualification_status, verdict_terminal_status}
     # emitted when a finalized verdict superseded a stale pending record. Kept so
     # the finalized-verdict disagreement survives packing and stays consistent
@@ -434,6 +492,20 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     drift = _compact_scalar_mapping(block.get("goal_coverage_drift"), text_cap=text_cap)
     if drift:
         out["goal_coverage_drift"] = drift
+    trigger = block.get("qualification_trigger_state")
+    if isinstance(trigger, dict):
+        compact_trigger = _compact_scalar_mapping(trigger, text_cap=text_cap) or {}
+        for key in ("error_retry_episode", "active_projection", "selected_verdict"):
+            nested = _compact_scalar_mapping(trigger.get(key), text_cap=text_cap)
+            if nested:
+                compact_trigger[key] = nested
+        trigger_provenance = _compact_qualification_provenance(
+            trigger.get("qualification_provenance"), text_cap=text_cap
+        )
+        if trigger_provenance:
+            compact_trigger["qualification_provenance"] = trigger_provenance
+        if compact_trigger:
+            out["qualification_trigger_state"] = compact_trigger
     coverage = block.get("criterion_coverage")
     if isinstance(coverage, dict):
         compact_coverage: dict[str, Any] = {}
@@ -468,7 +540,13 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
                     if not isinstance(c, dict):
                         continue
                     entry: dict[str, Any] = {}
-                    for fkey in ("criterion_key", "coverage", "stuck_reason"):
+                    # ``status`` is load-bearing: the strategic renderer
+                    # (formatCriteriaRubric) filters the rubric to
+                    # ``status == 'active'`` criteria, so a floored entry without it
+                    # renders as "None authored yet" — the exact floored-out/no-criteria
+                    # conflation this floor path exists to avoid. Keep it (plus the small
+                    # identity/text/stuck fields) so the rubric stays truthful under budget.
+                    for fkey in ("criterion_key", "coverage", "status", "stuck_reason"):
                         if fkey in c:
                             entry[fkey] = c[fkey]
                     text = _bounded_text(c.get("text"), _VERSION_PHASE_TEXT_FLOOR_CAP)

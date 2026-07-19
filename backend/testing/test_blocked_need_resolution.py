@@ -11,7 +11,7 @@ an in-memory SQLite DB to exercise the sweep's project-scanning logic.
 
 import asyncio
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -324,7 +324,7 @@ def test_registry_capability_names_canonicalize_problem_model_names():
 
 
 def test_working_capability_names_only_working_status():
-    from app.capability_registry import working_capability_names
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES, working_capability_names
 
     model = ProblemModel(
         capabilities=[
@@ -334,8 +334,35 @@ def test_working_capability_names_only_working_status():
         ]
     )
 
-    assert working_capability_names(model) == {"seeded-evaluation-harness"}
-    assert working_capability_names(None) == set()
+    # Platform capabilities are always included regardless of the project model.
+    assert working_capability_names(model) == {"seeded-evaluation-harness"} | PLATFORM_WORKING_CAPABILITIES
+    assert working_capability_names(None) == PLATFORM_WORKING_CAPABILITIES
+
+
+def test_working_capability_names_includes_platform_capabilities():
+    """Platform capabilities resolve at spawn/resume so they can never produce
+    a permanently-blocked-but-demand-suppressed prerequisite."""
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES, working_capability_names
+
+    # Even with no project model, every platform capability is returned.
+    result = working_capability_names(None)
+    assert PLATFORM_WORKING_CAPABILITIES.issubset(result), (
+        f"Platform capabilities missing from working set: "
+        f"{PLATFORM_WORKING_CAPABILITIES - result}"
+    )
+
+    # A model with no capabilities still returns the full platform set.
+    empty_model = ProblemModel(capabilities=[])
+    assert PLATFORM_WORKING_CAPABILITIES.issubset(working_capability_names(empty_model))
+
+    # A capability need naming a platform capability resolves as satisfied.
+    from app.capability_registry import registry_satisfies_capability_need
+
+    for cap in PLATFORM_WORKING_CAPABILITIES:
+        need = {"kind": "capability", "ref": cap}
+        assert registry_satisfies_capability_need(need, working_capability_names(None)), (
+            f"Platform capability '{cap}' not resolved by registry_satisfies_capability_need"
+        )
 
 
 def test_registry_satisfies_capability_need_matches_working_only():
@@ -466,9 +493,14 @@ def test_proof_aware_resolver_returns_unproven_for_unproven_capability():
     assert registry_satisfies_capability_need(
         need, working_capability_names(model)
     )
-    # The map keys are exactly the working-capability name set the boolean check
-    # consumes — the invariant the sweep relies on to fetch once and serve both.
-    assert set(proof) == working_capability_names(model)
+    # The proof map covers the project-model working set; working_capability_names
+    # additionally includes PLATFORM_WORKING_CAPABILITIES (always resolved, no
+    # per-project evidence needed), so platform caps are a subset of the name set
+    # but not necessarily in the proof map.
+    from app.capability_registry import PLATFORM_WORKING_CAPABILITIES
+
+    assert set(proof).issubset(working_capability_names(model))
+    assert working_capability_names(model) - set(proof) == PLATFORM_WORKING_CAPABILITIES
 
 
 def test_proof_aware_resolver_no_match_cases_return_none():
@@ -499,7 +531,9 @@ def test_proof_aware_resolver_no_match_cases_return_none():
 
 
 def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
-    """An absorbed old capability name resolves to the surviving cap's proof status."""
+    """A GENUINELY-absorbed old capability name resolves to the surviving cap's proof
+    status — via the platform-recorded consolidation forwarding marker, NOT the
+    agent-writable ``absorbs`` field."""
     from app.capability_registry import (
         capability_need_proof_status,
         working_capability_proof_status,
@@ -515,7 +549,19 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
             )
         ]
     )
-    proof = working_capability_proof_status(model)
+    # The platform ledger records the genuine consolidation of the old name with a
+    # forwarding marker; only this (never raw ``absorbs``) folds the old name in.
+    proof_records = {
+        "old-harness-name": [
+            {
+                "task_id": "absorbed_into:old-harness-name",
+                "proof_kind": "absorbed_into",
+                "survivor": "unified-harness",
+                "absorbed": "old-harness-name",
+            }
+        ]
+    }
+    proof = working_capability_proof_status(model, proof_records=proof_records)
 
     # Both the survivor name and the absorbed alias carry the survivor's status.
     assert (
@@ -529,6 +575,54 @@ def test_proof_aware_resolver_alias_absorbs_returns_survivor_status():
             {"kind": "capability", "ref": "old-harness-name"}, proof
         )
         == "proven"
+    )
+
+
+def test_proof_aware_resolver_declared_absorbs_without_marker_cannot_inherit_survivor_status():
+    """SECURITY: an agent-declared ``absorbs`` with NO platform forwarding marker
+    does NOT allow the old name to inherit the survivor's PROVEN status — the old
+    name appears as ``"unproven"`` (not ``"proven"``) so a need naming it is gated
+    by enforce mode.
+
+    Before the bypass fix, the alias was absent from the proof map (proof_status=None),
+    which capability_need_blocked_by_proof_gate treated as a free pass in enforce mode.
+    After the fix, the alias is ``"unproven"`` — still NOT proven — so enforce blocks it,
+    and the security property holds: a forged absorbs declaration cannot transfer the
+    survivor's proven status to an unverified alias."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        capability_need_blocked_by_proof_gate,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                evidence_refs=[_proven_ref()],
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)  # no ledger, no marker
+
+    # Survivor is proven, but the alias must NOT inherit that status.
+    assert proof.get("unified-harness") == "proven", "survivor must be proven"
+
+    # The alias appears in the map as 'unproven' (not 'proven' — cannot inherit survivor's proof).
+    alias_status = capability_need_proof_status(
+        {"kind": "capability", "ref": "old-harness-name"}, proof
+    )
+    assert alias_status == "unproven", (
+        f"agent-declared absorbs alias must be 'unproven', not 'proven' or None "
+        f"(got {alias_status!r}) — it must not inherit the survivor's proven status"
+    )
+
+    # And enforce mode correctly blocks it (since "unproven" != "proven").
+    need = {"kind": "capability", "ref": "old-harness-name"}
+    assert capability_need_blocked_by_proof_gate(need, proof, mode="enforce"), (
+        "agent-declared absorbs alias must be blocked in enforce mode"
     )
 
 
@@ -891,6 +985,77 @@ def test_blocked_resume_sweep_routes_unproven_by_mode():
         "seeded-evaluation-harness", proof, proof_gate_mode="off"
     )
     assert off["completed_needs"] and not off["residual"]
+
+
+def test_absorbs_alias_without_marker_stays_residual_in_enforce_mode():
+    """SECURITY: an agent-declared absorbs alias that has no platform forwarding
+    marker appears in the proof map as ``"unproven"`` (not absent/None after the
+    fix).  The blocked-resume sweep must leave it in ``residual`` under enforce,
+    not route it to ``completed_needs``.
+
+    Uses ``_classify_capability_need`` with a proof map that simulates what
+    ``working_capability_proof_status`` returns for an absorbs-declared alias with
+    no platform forwarding marker."""
+    # The fix registers absorbs aliases as "unproven" in the proof map;
+    # simulate that here to pin the sweep-side behavior.
+    proof = {"unified-harness": "proven", "old-harness-name": "unproven"}
+    disp = _classify_capability_need(
+        "old-harness-name", proof, proof_gate_mode="enforce"
+    )
+
+    # The unproven alias must NOT satisfy the need under enforce.
+    assert disp["residual"] == [{"kind": "capability", "ref": "old-harness-name"}], (
+        "absorbs alias with unproven status must stay residual in enforce mode"
+    )
+    assert disp["completed_needs"] == []
+
+
+def test_absorbs_alias_without_marker_satisfies_in_observe_mode():
+    """Observe mode treats the same unproven absorbs alias as satisfied — the need
+    routes to completed_needs and does not block the dependent."""
+    proof = {"unified-harness": "proven", "old-harness-name": "unproven"}
+    disp = _classify_capability_need(
+        "old-harness-name", proof, proof_gate_mode="observe"
+    )
+
+    assert disp["completed_needs"] == [{"kind": "capability", "ref": "old-harness-name"}]
+    assert disp["residual"] == []
+
+
+def test_working_capability_proof_status_includes_absorbs_aliases():
+    """Integration: working_capability_proof_status registers agent-declared absorbs
+    aliases as 'unproven' so capability_need_proof_status returns a non-None status
+    for them — the precondition the gate bypass fix depends on."""
+    from app.capability_registry import (
+        capability_need_proof_status,
+        working_capability_proof_status,
+    )
+
+    model = ProblemModel(
+        capabilities=[
+            Capability(
+                name="Unified harness",
+                status="working",
+                absorbs=["Old harness name"],
+                # No evidence_refs → the survivor and all aliases are unproven.
+            )
+        ]
+    )
+    proof = working_capability_proof_status(model)  # no ledger, no platform marker
+
+    # The alias is in the map (not absent).
+    assert "old-harness-name" in proof, (
+        "absorbs alias must appear in the proof map after the fix"
+    )
+    # The alias reads as unproven (not "proven" — no verification has occurred).
+    assert proof["old-harness-name"] == "unproven"
+
+    # capability_need_proof_status returns "unproven", not None.
+    alias_need = {"kind": "capability", "ref": "old-harness-name"}
+    assert capability_need_proof_status(alias_need, proof) == "unproven", (
+        "proof status for an absorbs alias must be 'unproven', not None — "
+        "None would bypass the enforce gate"
+    )
 
 
 class _StubProject:
@@ -2097,18 +2262,19 @@ def test_capability_proof_gate_full_cycle():
     # regression in that shared derivation surfaces in the connected cycle.
     from app.capability_registry import capability_proof_gate_release_status
 
-    # Enforce + unproven working capability → promotion blocked, audited.
+    # A proof that survived only in the platform ledger clears release exactly as
+    # it already clears spawn and blocked-resume.
     q_blocked, q_detail = capability_proof_gate_release_status(
         unproven_model, "enforce", named_test_records
     )
-    assert q_blocked is True, (
-        "the release qualifier must block promotion under enforce mode when a "
-        "working capability is unproven"
+    assert q_blocked is False, (
+        "a ledger-only machine proof must clear release qualification"
     )
     assert q_detail["mode"] == "enforce"
-    assert q_detail["unproven"] == ["container-runtime"]
-    assert q_detail["unproven_count"] == 1
+    assert q_detail["unproven"] == []
+    assert q_detail["unproven_count"] == 0
     assert q_detail["total_working"] == 1
+    assert q_detail["corroborated"] == ["container-runtime"]
 
     # Enforce + proven working capability, CORROBORATED by the platform ledger →
     # promotion NOT blocked. The ledger is what clears it: the same problem_model
@@ -2148,6 +2314,45 @@ def test_capability_proof_gate_full_cycle():
     )
     assert q_blocked_none is False
     assert q_detail_none["error"] == "no problem_model"
+
+    # ── Phase F: spawn-time enforcement point (the FIRST consumer seam) ────────
+    # The spawn-time resolver (research_completion) grades an explicit capability
+    # prerequisite through ``spawn_capability_gate_disposition`` — the single
+    # source of truth for its three-way branch. Assert the same tiered proof map
+    # yields the same block/surface/ok decision the blocked-resume sweep (Phase 5)
+    # and the release qualifier (Phase 4) derive, so the three seams cannot drift.
+    from app.research_completion import spawn_capability_gate_disposition
+
+    _cr_need = {"kind": "capability", "ref": "container-runtime"}
+    _unproven_map = {"container-runtime": "unproven"}
+    _proven_map = {"container-runtime": "proven"}
+
+    # ENFORCE + unproven → block (dependent parks BLOCKED, matching the sweep).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="enforce"
+    ) == ("block", "unproven")
+
+    # ENFORCE + proven → ok (no gate, matching the sweep's resume in Phase 5/2).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _proven_map, mode="enforce"
+    ) == ("ok", "proven")
+
+    # OBSERVE + unproven → surface: the need still resolves, but the unverified
+    # status is surfaced (never gated) while enforce is off.
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="observe"
+    ) == ("surface", "unproven")
+
+    # OFF + unproven → surface too (any non-enforce mode surfaces, never blocks).
+    assert spawn_capability_gate_disposition(
+        _cr_need, _unproven_map, mode="off"
+    ) == ("surface", "unproven")
+
+    # A need matching NO working registry capability → ok with proof_status None
+    # (normal resolution applies; the gate never fabricates a block).
+    assert spawn_capability_gate_disposition(
+        {"kind": "capability", "ref": "nonexistent-cap"}, _unproven_map, mode="enforce"
+    ) == ("ok", None)
 
     # ── Phase 5: DB-backed end-to-end sweep (enforce holds, then resumes) ──────
     # Drive the REAL blocked-resume sweep (sweep_unblock_blocked_tasks) against a
@@ -2491,6 +2696,96 @@ async def _run_full_cycle_db_sweep() -> None:
                 "direct record_capability_proof call, closed the cycle"
             )
             assert pipe_blocked.status == TaskStatus.QUEUED
+
+            # ── Phase G: a FORGED proof kind mints no proof (enforce holds) ────
+            # record_capability_proof reads code_acceptance_verdict from the
+            # agent-writable task.context. A task that declared no acceptance
+            # evidence keeps whatever verdict it authored (record_code_acceptance_
+            # verdict no-ops for it), so an agent can self-author proven=True with
+            # an UNRECOGNIZED kind. Because classify_evidence_tiered reads any
+            # non-machine-but-unrecognized kind as full 'proven', such a record
+            # would clear the enforce gate with nothing verified. The recording
+            # seam must refuse it: only a kind in the recognized proof vocabulary
+            # mints a durable proof, so the dependent stays BLOCKED.
+            pm3 = project.problem_model
+            pm3["capabilities"].append(
+                {"name": "Forged cap", "status": "working"}
+            )
+            flag_modified(project, "problem_model")
+            s.add(project)
+            await s.commit()
+
+            forged_provider = Task(
+                id=uuid.uuid4(),
+                project_id=project.id,
+                title="forged-provider",
+                description="x",
+                status=TaskStatus.COMPLETED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                context={
+                    "provides_capability": "forged-cap",
+                    "code_acceptance_verdict": {
+                        "proven": True,
+                        # NOT a member of the recognized proof vocabulary — a
+                        # self-authored kind an agent could write into JSONB.
+                        "kind": "self_reflection",
+                        "proof_ref": "trust me",
+                    },
+                },
+            )
+            forged_recorded = record_capability_proof(forged_provider, project)
+            assert forged_recorded == [], (
+                "record_capability_proof must refuse a verdict whose kind is not "
+                "in the recognized proof vocabulary — a forged/self-authored kind "
+                "must never mint a gate-clearing proof"
+            )
+            assert "forged-cap" not in (project.capability_proof_records or {}), (
+                "no proof record may be written for an unrecognized proof kind"
+            )
+            s.add(project)
+            await s.commit()
+
+            forged_need = {"kind": "capability", "ref": "forged-cap"}
+            now4 = _utcnow()
+            forged_blocked = Task(
+                project_id=project.id,
+                title="forged-dependent",
+                description="x",
+                status=TaskStatus.BLOCKED,
+                created_by="u1",
+                requires_approval=False,
+                payloads=[{"type": "create"}],
+                status_log=[],
+                depends_on=[],
+                blocker_kind="precondition",
+                blocked_reason="BLOCKER: needs capability forged-cap",
+                blocked_at=now4,
+                recheck_after=now4 - timedelta(minutes=1),  # due
+                context={
+                    "blocker": {
+                        "source": "agent",
+                        "waiting_on": "capability",
+                        "needs": [forged_need],
+                        "need": forged_need,
+                    }
+                },
+            )
+            s.add(forged_blocked)
+            await s.commit()
+            await s.refresh(forged_blocked)
+
+            requeued5 = await sweep_unblock_blocked_tasks(
+                s, _utcnow(), verify_pr_merged=_stub_verify
+            )
+            await s.refresh(forged_blocked)
+            assert requeued5 == 0, (
+                "a forged-kind verdict mints no proof, so the enforce gate must "
+                "keep the dependent BLOCKED — no unverified self-report resumes it"
+            )
+            assert forged_blocked.status == TaskStatus.BLOCKED
     finally:
         if saved_mode is None:
             _rc.pop("capability_proof_gate_mode", None)
@@ -2674,6 +2969,10 @@ async def _grad_db():
         expire_on_commit=False,
     )
     async with Session() as s:
+        from app.models import DeploymentState
+
+        s.add(DeploymentState())
+        await s.commit()
         yield s
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.drop_all)
@@ -2709,15 +3008,41 @@ def _clean_grad_config():
 
 
 async def _create_project_with_caps(
-    db: AsyncSession, caps: list[dict]
+    db: AsyncSession, caps: list[dict], proof_records: dict | None = None
 ) -> str:
-    """Insert a project with the given capability list in problem_model and return its id."""
+    """Insert a project with the given capability list in problem_model and return its id.
+
+    ``proof_records`` seeds the platform-only ``capability_proof_records`` ledger —
+    the operator-recorded carve-out set the graduation sweep must honor.
+    """
+    from app.capability_registry import normalize_capability_name
     from app.models import Project
+
+    records = dict(proof_records or {})
+    for cap in caps:
+        name = normalize_capability_name(cap.get("name"))
+        refs = cap.get("evidence_refs")
+        if (
+            name
+            and name not in records
+            and isinstance(refs, list)
+            and any(isinstance(ref, dict) and ref.get("proven") is True for ref in refs)
+        ):
+            records[name] = [
+                {
+                    "task_id": f"proof:{name}",
+                    "proof_kind": "named_test",
+                    "proof_ref": f"testing/test_{name}.py::test_{name}",
+                    "proved_at": "2026-07-16T00:00:00Z",
+                    "commit_sha": "a" * 40,
+                }
+            ]
 
     p = Project(
         name="grad-test",
         user_id="u1",
         problem_model={"capabilities": caps},
+        capability_proof_records=records,
     )
     db.add(p)
     await db.commit()
@@ -2731,12 +3056,135 @@ def _make_sweep_ctx(db: AsyncSession):
 
     return SweepContext(
         session=db,
-        now=datetime.utcnow(),
+        now=datetime.now(timezone.utc),
         mode="observe",
         max_projects=10,
         sample_limit=200,
         window_days=14,
     )
+
+
+# ── compute_fleet_proof_coverage helper (shared with settings surface) ──────
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_ratio_excludes_exempt(_grad_db):
+    """The extracted coverage helper returns the same numerator/denominator the
+    graduation sweep grades on: proven / non-exempt-working, with a mixed fleet
+    yielding a fractional ratio."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": []},
+        ],
+    )
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["total_proven"] == 1
+    assert cov["total_non_exempt_working"] == 2
+    assert cov["coverage_ratio"] == 0.5
+    assert cov["projects_contributing"] == 1
+    assert cov["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_null_ratio_when_no_denominator(_grad_db):
+    """A fleet with no non-exempt working capabilities has an undefined ratio —
+    the helper returns ``coverage_ratio=None`` rather than dividing by zero."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    await _create_project_with_caps(
+        _grad_db,
+        [{"name": "Planned only", "status": "planned", "evidence_refs": []}],
+    )
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["coverage_ratio"] is None
+    assert cov["total_non_exempt_working"] == 0
+    assert cov["projects_contributing"] == 0
+    assert cov["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_fleet_proof_coverage_empty_fleet(_grad_db):
+    """No projects at all → undefined ratio and zero counts (num_projects=0)."""
+    from app.metrics_integrity_sweep import compute_fleet_proof_coverage
+
+    cov = await compute_fleet_proof_coverage(_grad_db, 10)
+    assert cov["coverage_ratio"] is None
+    assert cov["num_projects"] == 0
+    assert cov["total_non_exempt_working"] == 0
+
+
+# ── compute_trial_eligibility_projection (settings surface) ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_counts_backed_unproven(_grad_db):
+    """Caps with backing_paths that are unproven working are counted as
+    trial-eligible; proven caps and caps with no backing_paths are not."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    # One unproven cap with backing_paths (trial-eligible), one without.
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap A",
+                "status": "working",
+                "backing_paths": ["backend/app/cap_a.py"],
+            },
+            {
+                "name": "Cap B",
+                "status": "working",
+                "backing_paths": [],
+            },
+        ],
+    )
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 1, "only Cap A has backing_paths → 1 eligible"
+    assert proj["unproven_working"] == 2, "both caps are unproven working"
+    assert proj["projects_contributing"] == 1
+    assert proj["num_projects"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_excludes_proven(_grad_db):
+    """A cap that already has a named_test proven ref is NOT trial-eligible —
+    it is counted as proven, not unproven, so it does not inflate the projection."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap Proven",
+                "status": "working",
+                "backing_paths": ["backend/app/proven.py"],
+                "evidence_refs": [_proven_ref()],
+            },
+        ],
+    )
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 0, "proven cap must not be trial-eligible"
+    assert proj["unproven_working"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_trial_eligibility_projection_empty_fleet(_grad_db):
+    """An empty fleet yields zero counts and num_projects=0."""
+    from app.metrics_integrity_sweep import compute_trial_eligibility_projection
+
+    proj = await compute_trial_eligibility_projection(_grad_db, 10)
+    assert proj["trial_eligible"] == 0
+    assert proj["unproven_working"] == 0
+    assert proj["projects_contributing"] == 0
+    assert proj["num_projects"] == 0
 
 
 # ── Core acceptance-evidence test ──────────────────────────────────────────
@@ -2796,6 +3244,148 @@ async def test_capability_proof_gate_graduation(_grad_db):
     assert "already at enforce" in results3[0].detail
     assert _rc["capability_proof_gate_mode"] == "enforce"
 
+
+# ── Operator notification on advance (ACCEPTANCE EVIDENCE) ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_emits_operator_message_on_advance(_grad_db):
+    """ACCEPTANCE EVIDENCE. Each auto-graduation advance routes an
+    operator-visible ProjectMessage through the unified message-audience system:
+
+    - off → observe emits ``capability_proof_gate_graduated_observe`` (operator-fyi)
+    - observe → enforce emits ``capability_proof_gate_graduated_enforce``
+      (operator-action-needed, since enforce begins blocking)
+    - a no-op run (already enforce) emits nothing new
+    """
+    from sqlalchemy import select as _select
+
+    from app.message_audience import (
+        OPERATOR_ACTION_NEEDED,
+        OPERATOR_FYI,
+    )
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.models import ProjectMessage
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            {"name": "Cap B", "status": "working", "evidence_refs": [_proven_ref()]},
+        ],
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+
+    async def _messages() -> list[ProjectMessage]:
+        rows = (await _grad_db.execute(_select(ProjectMessage))).scalars().all()
+        return list(rows)
+
+    # Step 1: off → observe posts an operator-fyi FYI message.
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results[0].status == CheckStatus.FLAGGED
+    msgs = await _messages()
+    observe_msgs = [
+        m
+        for m in msgs
+        if (m.context or {}).get("event_type")
+        == "capability_proof_gate_graduated_observe"
+    ]
+    assert len(observe_msgs) == 1
+    om = observe_msgs[0]
+    assert om.from_type == "system"
+    assert (om.context or {}).get("audience") == OPERATOR_FYI
+    assert (om.context or {}).get("from_mode") == "off"
+    assert (om.context or {}).get("to_mode") == "observe"
+    assert "off → observe" in om.content
+
+    # Step 2: observe → enforce posts an operator-action-needed message that
+    # names the new blocking behavior.
+    results2 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results2[0].status == CheckStatus.FLAGGED
+    enforce_msgs = [
+        m
+        for m in await _messages()
+        if (m.context or {}).get("event_type")
+        == "capability_proof_gate_graduated_enforce"
+    ]
+    assert len(enforce_msgs) == 1
+    em = enforce_msgs[0]
+    assert (em.context or {}).get("audience") == OPERATOR_ACTION_NEEDED
+    assert (em.context or {}).get("to_mode") == "enforce"
+    assert "BLOCKS" in em.content
+
+    # Step 3: already at enforce — no-op, no new graduation messages.
+    total_before = len(await _messages())
+    results3 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert results3[0].status == CheckStatus.OK
+    assert len(await _messages()) == total_before
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_notification_commit_failure_cleans_session(_grad_db):
+    """A notification flush failure must not poison later sweep checks."""
+    from unittest.mock import patch
+
+    from sqlmodel import select
+
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.models import DeploymentState, Project
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {
+                "name": "Cap A",
+                "status": "working",
+                "evidence_refs": [_proven_ref()],
+            }
+        ],
+    )
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+    ctx = _make_sweep_ctx(_grad_db)
+
+    async def _enqueue_invalid_notification(session, project_id, **kwargs):
+        # The duplicate singleton fails during the caller's notification commit,
+        # reproducing a real failed-flush session rather than a pre-commit mock.
+        existing = await session.get(DeploymentState, 1)
+        session.expunge(existing)
+        session.add(DeploymentState(id=1))
+
+    with patch(
+        "app.notification_dispatch.post_capability_proof_gate_graduated_message",
+        new=_enqueue_invalid_notification,
+    ):
+        results = await check_capability_proof_gate_auto_graduation(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.FLAGGED
+    assert _rc["capability_proof_gate_mode"] == "observe"
+    state = await _grad_db.get(DeploymentState, 1)
+    assert state is not None
+    assert state.runtime_config_json["capability_proof_gate_mode"] == "observe"
+    # Raises PendingRollbackError when notification cleanup is absent, which
+    # would make the next check in the shared-session sweep fail spuriously.
+    assert (
+        (await _grad_db.execute(select(Project))).scalars().first()
+        is not None
+    )
 
 # ── Disabled flag ──────────────────────────────────────────────────────────
 
@@ -2996,18 +3586,11 @@ async def test_auto_graduation_skips_when_no_working_caps(_grad_db):
 @pytest.mark.asyncio
 async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_db):
     """A DECLARED ``proof_exempt`` no longer excludes a capability from the coverage
-    aggregate (finding #9).
+    aggregate or advance the global mode (finding #9).
 
-    The graduation sweep reads the problem_model tier-1 map, where an attributed
-    ``proof_exempt`` declaration still grades ``proven`` (that is what keeps the earn
-    loop from chasing a capability the strategist says cannot be machine-proven). It
-    is NOT, however, an exemption: ``exempt_capability_names`` now requires an
-    operator record in the platform-only ledger, so the capability is no longer
-    excluded from the denominator — it is simply counted, and the fleet advances
-    toward ENFORCE, which is the safe direction. At the gate itself the very same
-    capability is refused (see
-    ``test_agent_fabricated_exemption_provenance_blocks_blocked_resume``), so a
-    self-declared exemption buys an agent nothing anywhere.
+    The graduation sweep consumes the same ledger-backed grade as enforce
+    consumers. With no platform exemption or proof record, the declaration is
+    ``unverified`` and coverage is zero.
     """
     from app.metrics_integrity_sweep import (
         CheckStatus,
@@ -3034,9 +3617,80 @@ async def test_auto_graduation_does_not_exclude_a_self_declared_exemption(_grad_
     ctx = _make_sweep_ctx(_grad_db)
     results = await check_capability_proof_gate_auto_graduation(ctx)
     assert len(results) == 1
+    assert results[0].status == CheckStatus.OK
+    assert "below threshold" in results[0].detail
+    assert _rc["capability_proof_gate_mode"] == "off"
+
+
+@pytest.mark.asyncio
+async def test_auto_graduation_honors_operator_platform_exemption(_grad_db):
+    """ACCEPTANCE EVIDENCE (bug fix). A PLATFORM-recorded operator exemption is
+    honored by the graduation sweep: an unprovable-but-exempted working capability
+    is excluded from the coverage denominator, so a fleet of {1 proven + 1 exempted}
+    reaches 100% non-exempt coverage and graduates all the way to ENFORCE.
+
+    Before the fix, ``check_capability_proof_gate_auto_graduation`` selected only
+    ``Project.problem_model`` and called ``exempt_capability_names(pm)`` with the
+    ledger defaulting to None (an EMPTY ledger), so the operator's exemption was
+    invisible: the unprovable cap graded ``unproven`` and counted against the
+    denominator, pinning coverage at 50% and stalling the gate at ``observe``
+    forever. The fix loads ``Project.capability_proof_records`` and threads it into
+    both ``working_capability_proof_status`` and ``exempt_capability_names``.
+
+    The exempted capability carries NO agent-writable ``proof_exempt`` flag and NO
+    evidence — the ONLY thing clearing it is the platform-ledger operator-exemption
+    record. This is what distinguishes the fix from the pre-existing self-declared
+    path (``test_auto_graduation_does_not_exclude_a_self_declared_exemption``).
+    """
+    from app.capability_registry import build_operator_exemption_record
+    from app.metrics_integrity_sweep import (
+        CheckStatus,
+        check_capability_proof_gate_auto_graduation,
+    )
+    from app.shared_state import runtime_config as _rc
+
+    await _create_project_with_caps(
+        _grad_db,
+        [
+            {"name": "Cap A", "status": "working", "evidence_refs": [_proven_ref()]},
+            # A genuinely unprovable working cap: no evidence, no proof_exempt flag.
+            # Only the platform ledger exempts it.
+            {"name": "Human Review Cap", "status": "working"},
+        ],
+        proof_records={
+            "human-review-cap": [
+                build_operator_exemption_record(
+                    "human-review-cap",
+                    authorized_by="operator@example.com",
+                    reason="cannot be machine-verified",
+                )
+            ]
+        },
+    )
+
+    _rc["capability_proof_gate_auto_graduation_enabled"] = True
+    _rc["capability_proof_gate_auto_graduation_observe_threshold"] = 0.5
+    _rc["capability_proof_gate_auto_graduation_enforce_threshold"] = 0.95
+    _rc["capability_proof_gate_mode"] = "off"
+
+    ctx = _make_sweep_ctx(_grad_db)
+
+    # Step 1: off → observe. Coverage = 1 proven / 1 non-exempt = 100% (the exempt
+    # cap is excluded). Without the fix coverage would be 1/2 = 50%.
+    results = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results) == 1
     assert results[0].status == CheckStatus.FLAGGED
     assert "off → observe" in results[0].detail
     assert _rc["capability_proof_gate_mode"] == "observe"
+
+    # Step 2: observe → enforce. Coverage still 100% >= 0.95. This step is the
+    # discriminator: without the ledger threaded in, coverage is 50% < 0.95 and the
+    # gate would stall at observe forever — the exact stall this fix removes.
+    results2 = await check_capability_proof_gate_auto_graduation(ctx)
+    assert len(results2) == 1
+    assert results2[0].status == CheckStatus.FLAGGED
+    assert "observe → enforce" in results2[0].detail
+    assert _rc["capability_proof_gate_mode"] == "enforce"
 
 
 # ---------------------------------------------------------------------------
@@ -3353,9 +4007,40 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
         {"kind": "capability", "ref": "container-runtime"}
     ], "Phase 1: blocked need must name the unproven capability"
 
-    # ── Phase 2: blocked-resume seam — proven cap routes need to completed_needs ──
-    # Simulate proof being recorded: the capability is now proven.
-    proven_proof_map = {"container-runtime": "proven"}
+    # ── Phase 2: provider acceptance records proof; resume releases consumer ──
+    # Exercise the real producer rather than substituting a prebuilt proof map:
+    # a completed provider advertises the capability and carries the platform's
+    # green named-test acceptance verdict.  The recorder writes both the durable
+    # ledger entry and the matching evidence ref on the registry capability.
+    from app.capability_proof import record_capability_proof
+    from app.capability_registry import consumer_gate_proof_status
+
+    provider = _T(
+        project_id=_project.id,
+        title="Provider: container runtime",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        payloads=[{"type": "create"}],
+        context={
+            "provides_capability": "container-runtime",
+            "code_acceptance_verdict": {
+                "proven": True,
+                "kind": "named_test",
+                "proof_ref": "backend/testing/test_container.py::test_runtime",
+            },
+        },
+    )
+    recorded = record_capability_proof(provider, _project)
+    assert recorded == ["container-runtime"]
+    assert _project.capability_proof_records["container-runtime"][0]["proof_kind"] == "named_test"
+
+    # This is the same ledger-aware map the blocked-resume sweep receives;
+    # it proves that acceptance recording, rather than a self-authored claim,
+    # releases the consumer under enforce mode.
+    proven_proof_map = consumer_gate_proof_status(
+        _project.problem_model, _project.capability_proof_records
+    )
+    assert proven_proof_map["container-runtime"] == "proven"
     disp = await _classify_capability_need_async(
         "container-runtime", proven_proof_map, proof_gate_mode="enforce"
     )
@@ -3365,3 +4050,368 @@ async def test_enforce_gate_full_cycle_blocked_then_resumed(_spawn_db, mocker):
     assert disp["residual"] == [], (
         "Phase 2: no residual needs — the task would be unblocked by the sweep"
     )
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_trial_green_wakes_blocked_dependents(_spawn_db, mocker):
+    """ACCEPTANCE EVIDENCE (event-driven wake seam). A GREEN capability_proof_trial
+    immediately wakes BLOCKED dependents instead of leaving them for the periodic
+    reaper.
+
+    Phase 1: a task is BLOCKED on an unproven capability (enforce mode).
+    Phase 2: ``_handle_capability_proof_trial_completion`` runs with a GREEN result,
+    commits the proof, and immediately calls
+    ``event_driven_unblock_on_capability_proof``.
+    Phase 3: the dependent's status transitions to QUEUED without any periodic sweep.
+
+    This pins the event-driven unblock trigger in ``task_completion.py`` against the
+    full pipeline: proof commit → ``event_driven_unblock_on_capability_proof`` →
+    QUEUED.
+    """
+    import json as _json
+    from datetime import timedelta
+
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+    from app.task_completion import _handle_capability_proof_trial_completion
+    from app.time_utils import _utcnow
+
+    cap = "container-runtime-trial"
+    test_refs = ["backend/testing/test_container.py::test_runtime_trial"]
+
+    _rc["capability_proof_gate_mode"] = "enforce"
+    _rc["capability_proof_execution_trials_enabled"] = True
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    try:
+        # ── Phase 1: create project + BLOCKED dependent ──────────────────────
+        project = Project(
+            name="trial-wake-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap, "status": "working"}]},
+            capability_proof_records={},
+        )
+        _spawn_db.add(project)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        now = _utcnow()
+        need = {"kind": "capability", "ref": cap}
+        blocked = _T(
+            project_id=project.id,
+            title="dependent-needs-trial-cap",
+            description="x",
+            status=TaskStatus.BLOCKED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            blocker_kind="precondition",
+            blocked_reason=f"BLOCKER: needs capability {cap}",
+            blocked_at=now,
+            recheck_after=now - timedelta(minutes=1),
+            context={
+                "blocker": {
+                    "source": "agent",
+                    "waiting_on": "capability",
+                    "needs": [need],
+                    "need": need,
+                }
+            },
+        )
+        _spawn_db.add(blocked)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(blocked)
+        assert blocked.status == TaskStatus.BLOCKED, "Phase 1: dependent must start BLOCKED"
+
+        # Create the proof-trial task (the agent that ran the tests).
+        trial_task = _T(
+            project_id=project.id,
+            title=f"Capability proof trial: {cap}",
+            payloads=[{
+                "type": "capability_proof_trial",
+                "cap": cap,
+                "test_refs": test_refs,
+                "head_sha": "abc123",
+            }],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            status_log=[],
+            depends_on=[],
+        )
+        _spawn_db.add(trial_task)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(trial_task)
+
+        # ── Phase 2: GREEN trial ingestion fires the event-driven unblock ────
+        green = {
+            "type": "capability_proof_trial",
+            "cap": cap,
+            "head_sha": "abc123",
+            "test_refs": test_refs,
+            "ran": True,
+            "passed": True,
+            "could_not_run": False,
+            "skipped_summary": {"total": 2, "skipped": 0},
+        }
+        await _handle_capability_proof_trial_completion(
+            trial_task, _json.dumps(green), _spawn_db
+        )
+
+        # ── Phase 3: dependent must now be QUEUED — no periodic sweep needed ─
+        await _spawn_db.refresh(blocked)
+        assert blocked.status == TaskStatus.QUEUED, (
+            "GREEN capability_proof_trial must immediately wake BLOCKED dependents "
+            f"via event_driven_unblock_on_capability_proof — got {blocked.status}"
+        )
+
+        # Confirm the proof was actually recorded (not just a status flip).
+        await _spawn_db.refresh(project)
+        assert cap in (project.capability_proof_records or {}), (
+            "GREEN trial must record proof in capability_proof_records"
+        )
+        proof_entry = project.capability_proof_records[cap][0]
+        assert proof_entry["proof_kind"] == "named_test"
+        assert proof_entry["executed"] is True
+
+    finally:
+        _rc.pop("capability_proof_gate_mode", None)
+        _rc.pop("capability_proof_execution_trials_enabled", None)
+# ---------------------------------------------------------------------------
+# Capability proof gate enforcement cycle — end-to-end integration test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capability_proof_gate_enforcement_full_lifecycle(_grad_db):
+    """ACCEPTANCE EVIDENCE. Full capability proof gate enforcement life cycle:
+
+    1. Create a project with an unproven 'my-cap' working capability.
+    2. Set capability_proof_gate_mode to 'enforce'.
+    3. Verify the proof map shows 'my-cap' as unproven — the gate holds (a
+       consumer blocked on this capability would stay BLOCKED).
+    4. Simulate a provider task completing with a green named_test verdict via
+       record_capability_proof (the real platform proof recorder).
+    5. Verify the proof map now shows 'my-cap' as 'proven' — the gate releases
+       (the consumer would be unblocked by the resume sweep).
+
+    This exercises the intersection of:
+      - working_capability_proof_status (reads problem_model capabilities)
+      - ledger_corroborated_proof_status (corroborates with capability_proof_records)
+      - capability_need_blocked_by_proof_gate (enforce predicate)
+      - record_capability_proof (the platform proof recorder from acceptance gate)
+    """
+    from app.capability_proof import record_capability_proof
+    from app.capability_registry import (
+        capability_need_blocked_by_proof_gate,
+        consumer_gate_proof_status,
+    )
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+
+    cap_name = "my-cap"
+    need = {"kind": "capability", "ref": cap_name}
+
+    _rc["capability_proof_gate_mode"] = "enforce"
+    try:
+        # Step 1: create project with unproven 'my-cap' working capability.
+        project = Project(
+            name="enforcement-lifecycle-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap_name, "status": "working"}]},
+            capability_proof_records={},
+        )
+        _grad_db.add(project)
+        await _grad_db.commit()
+        await _grad_db.refresh(project)
+
+        # Step 2: mode is 'enforce' (set above).
+
+        # Step 3: verify the gate holds — my-cap is unproven, so a consumer blocked
+        # on it should stay BLOCKED.
+        proof_map = consumer_gate_proof_status(
+            project.problem_model, project.capability_proof_records
+        )
+        assert proof_map.get(cap_name) != "proven", (
+            "my-cap must be unproven before any proof is recorded"
+        )
+        assert capability_need_blocked_by_proof_gate(need, proof_map, mode="enforce") is True, (
+            "enforce mode + unproven cap must block the consumer"
+        )
+
+        # Step 4: simulate the provider task completing with a green named_test verdict.
+        provider = _T(
+            project_id=project.id,
+            title="feat: implement my-cap",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            context={
+                "provides_capability": cap_name,
+                "code_acceptance_verdict": {
+                    "proven": True,
+                    "kind": "named_test",
+                    "proof_ref": "backend/testing/test_my_cap.py::test_my_cap",
+                },
+            },
+        )
+        _grad_db.add(provider)
+        await _grad_db.commit()
+        await _grad_db.refresh(provider)
+
+        recorded = record_capability_proof(provider, project)
+        assert recorded == [cap_name], (
+            "record_capability_proof must stamp proof on the capability"
+        )
+        await _grad_db.commit()
+        await _grad_db.refresh(project)
+
+        # Step 5: verify the gate releases — my-cap is now proven, so the consumer
+        # would be unblocked by the resume sweep.
+        updated_proof_map = consumer_gate_proof_status(
+            project.problem_model, project.capability_proof_records
+        )
+        assert updated_proof_map.get(cap_name) == "proven", (
+            "my-cap must be proven after record_capability_proof"
+        )
+        assert capability_need_blocked_by_proof_gate(need, updated_proof_map, mode="enforce") is False, (
+            "enforce mode + proven cap must NOT block the consumer — gate releases"
+        )
+
+    finally:
+        _rc.pop("capability_proof_gate_mode", None)
+
+
+# ---------------------------------------------------------------------------
+# Capability proof gate — merge-gate proof path unblocks dependents (DB level)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_gate_proof_unblocks_blocked_consumer(_spawn_db, mocker):
+    """ACCEPTANCE EVIDENCE (merge-gate proof path, DB-level integration).
+
+    Exercises the full capability proof gate enforcement life cycle using the
+    regular merge-gate proof path (``record_capability_proof`` → commit →
+    ``event_driven_unblock_on_capability_proof``) rather than the trial
+    completion path.  This is the DB-level counterpart to
+    ``test_capability_proof_gate_enforcement_full_lifecycle`` (which only
+    verifies the proof map) and the merge-gate analog to
+    ``test_capability_proof_trial_green_wakes_blocked_dependents`` (which
+    covers the trial path).
+
+    Phase 1: A consumer task is BLOCKED on an unproven capability 'my-cap'
+             (gate mode = enforce).
+    Phase 2: A provider task completes with a green named_test verdict;
+             ``record_capability_proof`` stamps the proof into
+             ``capability_proof_records`` and the session is committed.
+    Phase 3: ``event_driven_unblock_on_capability_proof`` is called directly
+             (the same seam the periodic sweep invokes after a merge-gate
+             proof lands).  The consumer must transition to QUEUED without
+             any additional periodic sweep.
+    """
+    from datetime import timedelta
+
+    from app.capability_proof import record_capability_proof
+    from app.blocked_task_unblock_sweeps import event_driven_unblock_on_capability_proof
+    from app.models import Project, Task as _T, TaskStatus
+    from app.shared_state import runtime_config as _rc
+    from app.time_utils import _utcnow
+
+    cap = "my-cap"
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    _rc["capability_proof_gate_mode"] = "enforce"
+    try:
+        # ── Phase 1: create project + BLOCKED consumer ───────────────────────
+        project = Project(
+            name="merge-gate-proof-unblock-test",
+            user_id="u1",
+            problem_model={"capabilities": [{"name": cap, "status": "working"}]},
+            capability_proof_records={},
+        )
+        _spawn_db.add(project)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        now = _utcnow()
+        need = {"kind": "capability", "ref": cap}
+        consumer = _T(
+            project_id=project.id,
+            title="consumer-needs-my-cap",
+            description="x",
+            status=TaskStatus.BLOCKED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            blocker_kind="precondition",
+            blocked_reason=f"BLOCKER: needs capability {cap}",
+            blocked_at=now,
+            recheck_after=now - timedelta(minutes=1),
+            context={
+                "blocker": {
+                    "source": "agent",
+                    "waiting_on": "capability",
+                    "needs": [need],
+                    "need": need,
+                }
+            },
+        )
+        _spawn_db.add(consumer)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.BLOCKED, "Phase 1: consumer must start BLOCKED"
+
+        # ── Phase 2: provider completes with green named_test verdict ─────────
+        provider = _T(
+            project_id=project.id,
+            title="feat: implement my-cap",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            requires_approval=False,
+            payloads=[{"type": "create"}],
+            status_log=[],
+            depends_on=[],
+            context={
+                "provides_capability": cap,
+                "code_acceptance_verdict": {
+                    "proven": True,
+                    "kind": "named_test",
+                    "proof_ref": "backend/testing/test_my_cap.py::test_my_cap",
+                },
+            },
+        )
+        _spawn_db.add(provider)
+        await _spawn_db.commit()
+        await _spawn_db.refresh(provider)
+
+        recorded = record_capability_proof(provider, project)
+        assert recorded == [cap], "record_capability_proof must stamp proof for my-cap"
+        await _spawn_db.commit()
+        await _spawn_db.refresh(project)
+
+        assert cap in (project.capability_proof_records or {}), (
+            "capability_proof_records must contain my-cap after record_capability_proof"
+        )
+
+        # ── Phase 3: event-driven unblock must wake the consumer ─────────────
+        requeued = await event_driven_unblock_on_capability_proof(project.id, _spawn_db)
+        assert requeued >= 1, (
+            "event_driven_unblock_on_capability_proof must report ≥1 requeued task"
+        )
+
+        await _spawn_db.refresh(consumer)
+        assert consumer.status == TaskStatus.QUEUED, (
+            "merge-gate proof must immediately wake BLOCKED consumer via "
+            f"event_driven_unblock_on_capability_proof — got {consumer.status}"
+        )
+
+    finally:
+        _rc.pop("capability_proof_gate_mode", None)

@@ -220,6 +220,19 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # after the residual lane was extracted to its own module (circular-dependency /
 # load-order — same intentional pattern as main.py / services.py).
 "app/autonomous_research.py" = ["E402"]
+# release_qualifier.py declares _FORCE_PROMOTE_NOOP_STATUSES before the
+# release_hotfix_promotion import to break the mutual import cycle
+# (release_hotfix_promotion imports that constant at module load time).
+# The imports after the constant definition are the same intentional deferred
+# load-order pattern as main.py / orchestrator.py.
+"app/release_qualifier.py" = ["E402"]
+# _compute_scripts are baked into the GCP compute-job VM startup script as
+# base64 blobs.  They are self-contained stdin/stdout/stderr scripts that must
+# NEVER raise — a crash in the watcher or heartbeat helper would silence the
+# liveness signal and get a live job reaped, or crash the artifact upload on
+# poweroff.  The broad-except / try-except-pass patterns are intentional:
+# "log and continue — never crash the background loop."
+"app/_compute_scripts/*" = ["BLE001", "S110", "SIM105", "PERF203"]
 
 [tool.mypy]
 python_version = "3.11"

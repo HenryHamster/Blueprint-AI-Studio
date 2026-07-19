@@ -7,6 +7,7 @@ omits heavy fields such as knowledge bodies and artifact logs.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
@@ -21,14 +22,18 @@ from sqlmodel import select
 
 from app.models import (
     Artifact,
+    ComputeJob,
+    ComputeJobStatus,
     Direction,
     KnowledgeDocument,
     Project,
     ProjectMessage,
+    SourceKind,
     StrategicCycle,
     Task,
 )
 from app.storage import (
+    artifact_expires_at,
     generate_download_signed_url,
     verify_artifact_project_ownership,
     viewable_content_type_for_filename,
@@ -641,6 +646,122 @@ def selected_ref_descriptor(
 
 _PREVIEW_SIGNED_URL_MINUTES = 5
 
+# Bound how many non-terminal compute jobs we surface live previews for, so a
+# project with many concurrent runs never inflates the context package. These
+# running-job items are prepended to the artifact items (see
+# load_strategic_context_evidence) so live previews win the descriptor cut.
+_RUNNING_JOB_PREVIEW_LIMIT = 4
+
+# How many non-terminal compute-job rows to FETCH from the DB before filtering
+# for viewable-bearing ones, so an older job with a manifest of mid-run plots
+# is not hidden behind newer media-less rows.
+_RUNNING_JOB_PREVIEW_FETCH = 20
+
+# How many terminal-artifact rows to fetch from the DB before sorting for
+# viewable-bearing ones and capping. Same goal: prevent newer non-viewable
+# artifacts from burying an older artifact that carries actual image/video data.
+_ARTIFACT_EVIDENCE_FETCH = 20
+
+# How many terminal-artifact evidence items to surface in the context package
+# (the final output cap — unchanged from the original implicit 4).
+_ARTIFACT_EVIDENCE_LIMIT = 4
+
+
+async def _validate_viewable_files(
+    session: AsyncSession,
+    project_id: Any,
+    viewable_files: Any,
+) -> List[tuple]:
+    """Sequential ownership checks; returns (vf, classified) pairs that pass."""
+    valid: List[tuple] = []
+    if not isinstance(viewable_files, list):
+        return valid
+    for vf in viewable_files:
+        if not isinstance(vf, dict):
+            continue
+        vf_storage_uri = vf.get("storage_uri")
+        vf_kind = vf.get("kind", "image")
+        vf_filename = vf.get("filename", "")
+        if not vf_storage_uri or not isinstance(vf_storage_uri, str):
+            continue
+        # Defense in depth: only allowlisted-extension files whose stamped
+        # kind matches the filename's classification are ever signed — a
+        # manifest entry naming an svg (or misdeclaring its kind) is
+        # skipped even if one was somehow persisted.
+        classified = viewable_content_type_for_filename(vf_filename)
+        if classified is None or classified[1] != vf_kind:
+            continue
+        try:
+            await verify_artifact_project_ownership(
+                vf_storage_uri, project_id, session
+            )
+        except Exception:  # noqa: BLE001 — ownership violation
+            continue
+        valid.append((vf, classified))
+    return valid
+
+
+def _build_preview_from_vf(vf: dict, signed_url: str) -> Dict[str, Any]:
+    """Build a preview dict from a viewable_file entry and its signed URL."""
+    preview: Dict[str, Any] = {
+        "url": signed_url,
+        "storage_uri": vf.get("storage_uri"),
+        "kind": vf.get("kind", "image"),
+        "filename": vf.get("filename", ""),
+    }
+    if isinstance(vf.get("revision"), str) and vf["revision"]:
+        preview["revision"] = vf["revision"]
+    if isinstance(vf.get("live"), bool):
+        preview["live"] = vf["live"]
+    return preview
+
+
+async def _sign_viewable_manifest(
+    session: AsyncSession,
+    project_id: Any,
+    viewable_files: Any,
+) -> List[Dict[str, Any]]:
+    """Mint short-lived signed preview URLs for a ``viewable_files`` manifest.
+
+    Shared by the terminal-artifact path (``_resolve_viewable_previews``, reading
+    an Artifact's ``logs.viewable_files``) and the running-compute-job path
+    (``load_strategic_context_evidence``, reading a job's
+    ``polling_metadata['viewable_files']``). Each entry is
+    ``{filename, storage_uri, kind, ...}``; every one is independently verified
+    for project ownership and re-validated against the viewable-extension
+    allowlist (no svg — script execution via a signed URL), with a stamped
+    ``kind`` that must match the filename's classification.
+
+    Fail-soft: an ownership violation or signing failure skips that one file so
+    the rest of the manifest still resolves. Returns the signed preview list
+    (``[]`` when nothing resolves).
+
+    Two-phase: DB ownership checks run sequentially (AsyncSession is not
+    concurrency-safe), then all GCS signing coroutines are gathered in parallel.
+    """
+    # Phase 1: sequential ownership checks (session-dependent)
+    valid_entries = await _validate_viewable_files(session, project_id, viewable_files)
+    if not valid_entries:
+        return []
+
+    # Phase 2: parallel signing — all GCS round-trips in one gather
+    sign_results = await asyncio.gather(
+        *[
+            generate_download_signed_url(
+                vf.get("storage_uri"),
+                expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
+            )
+            for vf, _ in valid_entries
+        ],
+        return_exceptions=True,
+    )
+
+    return [
+        _build_preview_from_vf(vf, result)
+        for (vf, _), result in zip(valid_entries, sign_results, strict=False)
+        if not isinstance(result, Exception)
+    ]
+
 
 async def _resolve_viewable_previews(
     session: AsyncSession,
@@ -718,44 +839,166 @@ async def _resolve_viewable_previews(
             if isinstance(logs_data, dict)
             else []
         )
-        for vf in viewable_files:
-            if not isinstance(vf, dict):
-                continue
-            vf_storage_uri = vf.get("storage_uri")
-            vf_kind = vf.get("kind", "image")
-            vf_filename = vf.get("filename", "")
-            if not vf_storage_uri or not isinstance(vf_storage_uri, str):
-                continue
-            # Defense in depth: only allowlisted-extension files whose stamped
-            # kind matches the filename's classification are ever signed — a
-            # manifest entry naming an svg (or misdeclaring its kind) is
-            # skipped even if one was somehow persisted.
-            classified = viewable_content_type_for_filename(vf_filename)
-            if classified is None or classified[1] != vf_kind:
-                continue
-            try:
-                await verify_artifact_project_ownership(
-                    vf_storage_uri, project_id, session
-                )
-                signed_url = await generate_download_signed_url(
-                    vf_storage_uri,
-                    expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
-                )
-                previews.append(
-                    {
-                        "url": signed_url,
-                        "storage_uri": vf_storage_uri,
-                        "kind": vf_kind,
-                        "filename": vf_filename,
-                    }
-                )
-            except Exception:  # noqa: BLE001 — ownership violation or signing
-                # failure — skip this file so it degrades gracefully rather
-                # than breaking the whole evidence package.
-                continue
     except (json.JSONDecodeError, TypeError, ValueError):
-        pass
+        return previews
+    previews.extend(
+        await _sign_viewable_manifest(session, project_id, viewable_files)
+    )
     return previews
+
+
+_NON_TERMINAL_COMPUTE_JOB_STATUSES = (
+    ComputeJobStatus.QUEUED,
+    ComputeJobStatus.STARTING,
+    ComputeJobStatus.RUNNING,
+    ComputeJobStatus.POLLING,
+)
+
+_TERMINAL_COMPUTE_JOB_STATUSES = {
+    ComputeJobStatus.SUCCEEDED,
+    ComputeJobStatus.FAILED,
+    ComputeJobStatus.CANCELLED,
+    ComputeJobStatus.TIMED_OUT,
+}
+
+
+async def _running_job_preview_items(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> List[Dict[str, Any]]:
+    """Surface live viewable previews for RUNNING (non-terminal) compute jobs.
+
+    The backend accumulates a job's mid-run viewable files into
+    ``polling_metadata['viewable_files']`` (same manifest shape stamped at
+    terminal linkage) WHILE the job runs. A running job has not linked a durable
+    Artifact yet, so it would otherwise never appear as a renderable evidence
+    artifact — the operator watching a multi-week RL run would see no live plots
+    or rollout frames in the strategic canvas.
+
+    We build synthetic artifact-shaped items carrying signed ``viewable_previews``
+    (reusing the exact ownership + allowlist + signing pipeline as terminal
+    artifacts via ``_sign_viewable_manifest``) so ``_artifact_descriptor``
+    promotes the descriptor kind to image/video with a populated URL and no
+    ``unsupported_reason`` stub. ``artifact_id IS NULL`` scopes this to jobs not
+    yet linked to a durable artifact, so a terminal job is never double-surfaced.
+    """
+    rows = (
+        await session.execute(
+            select(ComputeJob, Task.title)
+            .options(
+                load_only(
+                    ComputeJob.id,
+                    ComputeJob.task_id,
+                    ComputeJob.status,
+                    ComputeJob.created_at,
+                    ComputeJob.polling_metadata,
+                    raiseload=True,
+                )
+            )
+            .join(Task, ComputeJob.task_id == Task.id, isouter=True)
+            .where(
+                ComputeJob.project_id == project_id,
+                ComputeJob.artifact_id.is_(None),
+                ComputeJob.status.in_(_NON_TERMINAL_COMPUTE_JOB_STATUSES),
+            )
+            .order_by(ComputeJob.updated_at.desc())
+            .limit(_RUNNING_JOB_PREVIEW_FETCH)
+        )
+    ).all()
+
+    # Phase 1: sequential ownership checks across all jobs and files.
+    # AsyncSession is not concurrency-safe, so DB calls remain sequential.
+    job_meta: List[tuple] = []  # (job, task_title, pm, valid_entries)
+    for job, task_title in rows:
+        pm = job.polling_metadata if isinstance(job.polling_metadata, dict) else {}
+        viewable_files = pm.get("viewable_files")
+        if not isinstance(viewable_files, list) or not viewable_files:
+            continue
+        valid = await _validate_viewable_files(session, project_id, viewable_files)
+        if valid:
+            job_meta.append((job, task_title, pm, valid))
+
+    if not job_meta:
+        return []
+
+    # Phase 2: gather ALL signing coroutines from ALL jobs in one batch.
+    # generate_download_signed_url uses asyncio.to_thread and never touches
+    # the session, so concurrent dispatch is safe.
+    all_vf_flat = [
+        (vf, classified)
+        for _, _, _, valid in job_meta
+        for vf, classified in valid
+    ]
+    sign_results = await asyncio.gather(
+        *[
+            generate_download_signed_url(
+                vf.get("storage_uri"),
+                expiration_minutes=_PREVIEW_SIGNED_URL_MINUTES,
+            )
+            for vf, _ in all_vf_flat
+        ],
+        return_exceptions=True,
+    )
+
+    # Phase 3: map results back to per-job previews and build items.
+    items: List[Dict[str, Any]] = []
+    offset = 0
+    for job, task_title, pm, valid in job_meta:
+        count = len(valid)
+        job_sign_results = sign_results[offset : offset + count]
+        offset += count
+
+        previews = [
+            _build_preview_from_vf(vf, result)
+            for (vf, _), result in zip(valid, job_sign_results, strict=False)
+            if not isinstance(result, Exception)
+        ]
+        if not previews:
+            continue
+
+        label = _compact_text(task_title, max_chars=100) or "Live compute previews"
+        item = _with_target(
+            {
+                "id": str(job.id),
+                "kind": "storage",
+                "label": label,
+                "artifact_type": "compute_result",
+                "has_logs": True,
+                "task_id": str(job.task_id) if job.task_id else None,
+                "task_title": _compact_text(task_title, max_chars=120),
+                "task_status": getattr(job.status, "value", job.status),
+                "created_at": job.created_at.isoformat()
+                if job.created_at
+                else None,
+                # Live signal so the canvas/panel can badge previews as still
+                # accruing while the job runs.
+                "compute_job_running": True,
+                "viewable_previews": previews,
+            },
+            {
+                "surface": "task",
+                "task_id": str(job.task_id) if job.task_id else None,
+            }
+            if job.task_id
+            else None,
+        )
+        # Stamp viewable_files_dropped from polling_metadata so the strategic
+        # canvas can surface the omission count to the operator for running jobs.
+        dropped = pm.get("viewable_files_dropped")
+        if isinstance(dropped, int) and dropped > 0:
+            item["viewable_files_dropped"] = dropped
+        # Artifact retention expiry: computed from the job's creation timestamp
+        # (fallback for running jobs where completed_at is not yet set).
+        if job.created_at:
+            item["artifact_expires_at"] = artifact_expires_at(job.created_at)
+        # Stamp progress_series from polling_metadata so the strategic canvas can
+        # render a real time-series chart (e.g. eval-reward over env-steps) for
+        # running jobs while the operator watches mid-run evidence accrue.
+        series = pm.get("progress_series")
+        if isinstance(series, list) and series:
+            item["progress_series"] = series
+        items.append(item)
+    return items[:_RUNNING_JOB_PREVIEW_LIMIT]
 
 
 async def load_strategic_context_evidence(
@@ -764,22 +1007,20 @@ async def load_strategic_context_evidence(
 ) -> Dict[str, Any]:
     """Return bounded durable context descriptors without heavy bodies/logs."""
 
-    knowledge_total = (
+    # Real aggregate count of all knowledge documents for the project, plus the
+    # pending (unaddressed) subset — merged into one indexed round trip.
+    _knowledge_count_row = (
         await session.execute(
-            select(func.count()).where(KnowledgeDocument.project_id == project_id)
+            select(
+                func.count().label("total"),
+                func.count().filter(
+                    KnowledgeDocument.lifecycle_status == "pending"
+                ).label("pending"),
+            ).where(KnowledgeDocument.project_id == project_id)
         )
-    ).scalar()
-
-    # Real aggregate count of pending (unaddressed) knowledge documents — not a
-    # slice of the top-N sample, so the dashboard reflects the full backlog.
-    pending_count = (
-        await session.execute(
-            select(func.count()).where(
-                KnowledgeDocument.project_id == project_id,
-                KnowledgeDocument.lifecycle_status == "pending",
-            )
-        )
-    ).scalar()
+    ).one()
+    knowledge_total = int(_knowledge_count_row.total or 0)
+    pending_count = int(_knowledge_count_row.pending or 0)
 
     # Age of the oldest unaddressed pending document so backlog health is
     # observable over time (no signal was tracked before).
@@ -877,7 +1118,7 @@ async def load_strategic_context_evidence(
                 meaningful_artifact_filter,
             )
             .order_by(Artifact.created_at.desc())
-            .limit(4)
+            .limit(_ARTIFACT_EVIDENCE_FETCH)
         )
     ).all()
 
@@ -963,7 +1204,145 @@ async def load_strategic_context_evidence(
         )
         if viewable_previews:
             item["viewable_previews"] = viewable_previews
+        # Stamp viewable_files_dropped from the artifact's logs manifest so the
+        # strategic canvas can surface the omission count to the operator (mirrors
+        # how ComputeJobsPanel surfaces the same count in the task-detail drawer).
+        if artifact.logs:
+            try:
+                logs_data = (
+                    json.loads(artifact.logs)
+                    if isinstance(artifact.logs, str)
+                    else artifact.logs
+                )
+                if isinstance(logs_data, dict):
+                    dropped = logs_data.get("viewable_files_dropped")
+                    if isinstance(dropped, int) and dropped > 0:
+                        item["viewable_files_dropped"] = dropped
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+        # lifecycle DELETE.  Compute from the artifact's creation timestamp
+        # (which is close to when the compute-job completed and GCS objects
+        # were created).
+        if artifact.created_at:
+            item["artifact_expires_at"] = artifact_expires_at(artifact.created_at)
         artifact_items.append(item)
+
+    # Stamp run provenance + earned evidence tier onto compute_experiment
+    # artifacts from their backing compute knowledge document. This is the
+    # canonical source (forward_quality_verdict.evidence_tier +
+    # .terminal_diagnostics, written by knowledge_completion) — do NOT re-derive
+    # the tier or execution location from raw job state. One bounded, batched
+    # query keyed on the ≤4 artifact task ids already loaded above (no N+1).
+    artifact_task_ids: List[uuid.UUID] = []
+    for item in artifact_items:
+        raw_task_id = item.get("task_id")
+        if not raw_task_id:
+            continue
+        try:
+            artifact_task_ids.append(uuid.UUID(str(raw_task_id)))
+        except (ValueError, TypeError):
+            continue
+    if artifact_task_ids:
+        compute_doc_rows = (
+            await session.execute(
+                select(
+                    KnowledgeDocument.source_task_id,
+                    KnowledgeDocument.forward_quality_verdict,
+                )
+                .where(
+                    KnowledgeDocument.project_id == project_id,
+                    KnowledgeDocument.source_kind
+                    == SourceKind.COMPUTE_EXPERIMENT.value,
+                    KnowledgeDocument.source_task_id.in_(artifact_task_ids),
+                )
+                .order_by(
+                    KnowledgeDocument.updated_at.desc(),
+                    KnowledgeDocument.created_at.desc(),
+                )
+            )
+        ).all()
+        provenance_by_task: Dict[str, Dict[str, Any]] = {}
+        for source_task_id, verdict in compute_doc_rows:
+            if not source_task_id or not isinstance(verdict, dict):
+                continue
+            task_key = str(source_task_id)
+            # Newest doc per task wins (rows ordered updated_at desc above).
+            if task_key in provenance_by_task:
+                continue
+            provenance: Dict[str, Any] = {}
+            tier = verdict.get("evidence_tier")
+            if isinstance(tier, str) and tier:
+                provenance["evidence_tier"] = tier
+            diagnostics = verdict.get("terminal_diagnostics")
+            if isinstance(diagnostics, dict):
+                for key in (
+                    "executing_backend",
+                    "runner_target_id",
+                    "runner_hostname",
+                ):
+                    value = diagnostics.get(key)
+                    if value:
+                        provenance[key] = str(value)
+            if provenance:
+                provenance_by_task[task_key] = provenance
+        for item in artifact_items:
+            provenance = provenance_by_task.get(item.get("task_id") or "")
+            if provenance:
+                item.update(provenance)
+
+    # Stamp progress_series from the terminal ComputeJob for each artifact so
+    # _artifact_descriptor can build a real time-series line chart (instead of
+    # the static one-point placeholder). The artifact's task_id maps to a
+    # ComputeJob whose progress_series ring buffer carries the training/eval
+    # metrics recorded mid-run by runner heartbeats. One bounded, batched query
+    # keyed on the same ≤4 artifact task ids (no N+1).
+    if artifact_task_ids:
+        compute_job_rows = (
+            await session.execute(
+                select(
+                    ComputeJob.task_id,
+                    ComputeJob.polling_metadata,
+                )
+                .where(
+                    ComputeJob.task_id.in_(artifact_task_ids),
+                    ComputeJob.project_id == project_id,
+                    ComputeJob.status.in_(_TERMINAL_COMPUTE_JOB_STATUSES),
+                )
+                .order_by(ComputeJob.updated_at.desc())
+            )
+        ).all()
+        terminal_series_by_task: Dict[str, list] = {}
+        for row in compute_job_rows:
+            task_key = str(row.task_id)
+            if task_key in terminal_series_by_task:
+                continue  # newest per task (ordered updated_at desc)
+            pm = row.polling_metadata if isinstance(row.polling_metadata, dict) else {}
+            series = pm.get("progress_series")
+            if isinstance(series, list) and series:
+                terminal_series_by_task[task_key] = series
+        for item in artifact_items:
+            series = terminal_series_by_task.get(item.get("task_id") or "")
+            if series:
+                item["progress_series"] = series
+
+    # Sort viewable-bearing terminal-artifact items first so the bounded
+    # descriptor cut (_strategic_context_descriptors slices items[:4]) retains
+    # an older artifact whose logs carry a viewable_files manifest even when
+    # newer non-viewable rows filled the original SQL limit. Running-job items
+    # are prepended below and win the first descriptor slots; this sort ensures
+    # the remaining slots are filled by terminal artifacts WITH previews.
+    artifact_items.sort(key=lambda i: 0 if i.get("viewable_previews") else 1)
+    artifact_items = artifact_items[:_ARTIFACT_EVIDENCE_LIMIT]
+
+    # Prepend live previews for RUNNING compute jobs so the operator watching a
+    # long run sees plots/videos accrue in the canvas before the job terminates.
+    # Prepending puts them ahead of terminal artifacts in the bounded descriptor
+    # cut (_strategic_context_descriptors slices items[:4]); artifact_total stays
+    # the durable-artifact count and is unaffected by these transient items.
+    running_items = await _running_job_preview_items(session, project_id)
+    if running_items:
+        artifact_items = running_items + artifact_items
 
     return {
         "knowledge": {
@@ -974,6 +1353,7 @@ async def load_strategic_context_evidence(
         },
         "artifacts": {
             "total": int(artifact_total or 0),
+            "live_count": len(running_items),
             "items": artifact_items,
         },
     }
@@ -1246,9 +1626,11 @@ def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
         return "image"
     if any(
         token in fingerprint
-        for token in ["video", ".mp4", ".webm", ".mov"]
+        for token in ["video", ".mp4", ".webm"]
     ):
         return "video"
+    if any(token in fingerprint for token in ["pdf", ".pdf"]):
+        return "pdf"
     if any(token in fingerprint for token in ["chart", "plot", "graph"]):
         return "chart"
     if any(
@@ -1279,10 +1661,13 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
     ]
     image_url = next((p.get("url") for p in previews if p.get("kind") == "image"), None)
     video_url = next((p.get("url") for p in previews if p.get("kind") == "video"), None)
+    pdf_url = next((p.get("url") for p in previews if p.get("kind") == "pdf"), None)
     if image_url:
         kind = "image"
     elif video_url:
         kind = "video"
+    elif pdf_url:
+        kind = "pdf"
     else:
         kind = _artifact_renderable_kind(artifact)
     title = (
@@ -1290,10 +1675,21 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         or _compact_text(artifact.get("artifact_type"), max_chars=90)
         or "Artifact"
     )
+    # Run provenance for compute_experiment artifacts (stamped onto the item in
+    # load_strategic_context_evidence from the backing compute knowledge doc).
+    # Renders generically via the shared _descriptor_detail helper.
+    runner_hostname = artifact.get("runner_hostname")
+    runner_target_id = artifact.get("runner_target_id")
+    if runner_hostname and runner_target_id:
+        runner_label: Any = f"{runner_hostname} ({runner_target_id})"
+    else:
+        runner_label = runner_hostname or runner_target_id
     details = [
         _descriptor_detail("Task", artifact.get("task_title"), target=artifact.get("target")),
         _descriptor_detail("Type", artifact.get("artifact_type") or artifact.get("kind")),
         _descriptor_detail("Status", artifact.get("task_status")),
+        _descriptor_detail("Executed on", artifact.get("executing_backend")),
+        _descriptor_detail("Runner", runner_label),
         _descriptor_detail("Created", artifact.get("created_at")),
     ]
     descriptor: Dict[str, Any] = {
@@ -1307,6 +1703,68 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
         "target": artifact.get("target"),
         "details": [detail for detail in details if detail],
     }
+    # Earned-vs-claimed evidence tier (canonical value from the compute doc's
+    # forward_quality_verdict.evidence_tier). Additive/backward-compatible — the
+    # frontend maps it to the shared EvidenceTierBadge; absent for non-compute
+    # artifacts.
+    evidence_tier = _compact_text(artifact.get("evidence_tier"), max_chars=60)
+    if evidence_tier:
+        descriptor["evidence_tier"] = evidence_tier
+    # viewable_files_dropped from the compute-job viewable-files persistence
+    # pipeline (capped at 25 files / 8 MiB each). Additive/backward-compatible
+    # — the frontend surfaces the count as an amber "N file(s) omitted" note;
+    # absent/0/None for descriptors without dropped files.
+    viewable_files_dropped = artifact.get("viewable_files_dropped")
+    if isinstance(viewable_files_dropped, int) and viewable_files_dropped > 0:
+        descriptor["viewable_files_dropped"] = viewable_files_dropped
+    # Artifact retention expiry: the GCS artifacts bucket has a ~7-day
+    # lifecycle DELETE.  Stamped on the artifact item by the builder paths;
+    # pass through to the descriptor so the frontend can distinguish a
+    # transient preview failure from permanent GCS lifecycle expiry.
+    expires_at = artifact.get("artifact_expires_at")
+    if isinstance(expires_at, str) and expires_at:
+        descriptor["artifact_expires_at"] = expires_at
+    image_previews = [p for p in previews if p.get("kind") == "image"]
+    video_previews = [p for p in previews if p.get("kind") == "video"]
+    pdf_previews = [p for p in previews if p.get("kind") == "pdf"]
+
+    def add_preview_group(
+        field: str, grouped_previews: list[Dict[str, Any]]
+    ) -> bool:
+        if not grouped_previews:
+            return False
+        primary = grouped_previews[0]
+        descriptor[field] = {
+            "url": primary.get("url"),
+            "alt": title,
+            "storage_uri": primary.get("storage_uri"),
+            **({"revision": primary.get("revision")} if "revision" in primary else {}),
+            **({"live": primary.get("live")} if "live" in primary else {}),
+        }
+        descriptor[f"{field}s"] = [
+            {
+                "url": preview.get("url"),
+                "alt": preview.get("filename") or title,
+                "filename": preview.get("filename"),
+                "storage_uri": preview.get("storage_uri"),
+                **(
+                    {"revision": preview.get("revision")}
+                    if "revision" in preview
+                    else {}
+                ),
+                **({"live": preview.get("live")} if "live" in preview else {}),
+            }
+            for preview in grouped_previews
+        ]
+        return True
+
+    # Retain every preview type on a mixed-media artifact. ``kind`` remains a
+    # primary tile classification for older consumers, but must not discard a
+    # rollout video or PDF merely because an image has precedence.
+    has_images = add_preview_group("image", image_previews)
+    has_videos = add_preview_group("video", video_previews)
+    has_pdfs = add_preview_group("pdf", pdf_previews)
+
     if kind == "markdown":
         descriptor["body"] = (
             descriptor["summary"] or "Read-only artifact metadata is available."
@@ -1317,54 +1775,79 @@ def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
             descriptor["summary"] or "Read-only log metadata is available."
         )
         descriptor["language"] = "text"
-    elif kind == "image":
+    elif kind == "image" and not has_images:
         # OUR filter wins: ``previews`` (top of function) is already restricted
         # to signed-URL previews (svg/kind-mismatch dropped by
         # _resolve_viewable_previews). Adopt engine's multi-image gallery list,
         # built from that filtered set — emits url/alt/filename only, never a
         # raw storage_uri.
-        image_previews = [p for p in previews if p.get("kind") == "image"] or previews
-        url = image_url or (image_previews[0].get("url") if image_previews else None)
-        primary_storage_uri = image_previews[0].get("storage_uri") if image_previews else None
-        descriptor["image"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["images"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in image_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("image", previews):
+            descriptor["image"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["images"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Image artifact previews require a signed preview URL."
-    elif kind == "video":
+    elif kind == "video" and not has_videos:
         # OUR filtered ``previews`` (signed-URL-only) + engine's multi-video
         # gallery list; url/alt/filename only, never a raw storage_uri.
-        video_previews = [p for p in previews if p.get("kind") == "video"] or previews
-        url = video_url or (video_previews[0].get("url") if video_previews else None)
-        primary_storage_uri = video_previews[0].get("storage_uri") if video_previews else None
-        descriptor["video"] = {"url": url, "alt": title, "storage_uri": primary_storage_uri}
-        descriptor["videos"] = [
-            {
-                "url": p.get("url"),
-                "alt": p.get("filename") or title,
-                "filename": p.get("filename"),
-                "storage_uri": p.get("storage_uri"),
-            }
-            for p in video_previews
-        ]
-        if not url and not primary_storage_uri:
+        if not add_preview_group("video", previews):
+            descriptor["video"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["videos"] = []
             descriptor[
                 "unsupported_reason"
             ] = "Video artifact previews require a signed preview URL."
+    elif kind == "pdf" and not has_pdfs:
+        # OUR filtered ``previews`` (signed-URL-only) + a parallel gallery list
+        # for multiple pdfs. A PDF is opened as a top-level new-tab navigation
+        # (never an inline app-origin iframe), so it renders in the browser's
+        # sandboxed PDF viewer on the storage origin. url/alt/filename only,
+        # never a raw storage_uri in the gallery entries.
+        if not add_preview_group("pdf", previews):
+            descriptor["pdf"] = {"url": None, "alt": title, "storage_uri": None}
+            descriptor["pdfs"] = []
+            descriptor[
+                "unsupported_reason"
+            ] = "PDF artifact previews require a signed preview URL."
     elif kind == "chart":
-        descriptor["chart"] = {
-            "kind": "bar",
-            "points": [{"label": "artifact", "value": 1}],
-        }
+        artifact_series = artifact.get("progress_series")
+        # Group progress samples by metric name; use the metric with the most
+        # entries (typically the declared progress metric). ``metric_groups``
+        # can end up empty even when ``artifact_series`` is non-empty (e.g. all
+        # entries are non-dicts or the series is malformed), so guard the
+        # ``max()`` call and fall through to the bar-chart fallback below.
+        metric_groups: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(artifact_series, list):
+            for sample in artifact_series:
+                if isinstance(sample, dict):
+                    name = str(sample.get("name", "unknown"))
+                    metric_groups.setdefault(name, []).append(sample)
+        if metric_groups:
+            best_metric = max(metric_groups, key=lambda k: len(metric_groups[k]))
+            best_samples = metric_groups[best_metric]
+            # Cap at 300 points to keep the descriptor bounded.
+            sample_count = len(best_samples)
+            if sample_count > 300:
+                step = sample_count // 300
+                best_samples = best_samples[::step]
+            descriptor["chart"] = {
+                "kind": "line",
+                "points": [
+                    {
+                        "label": str(s.get("value", "")),
+                        "value": float(v),
+                        "t": s.get("t", ""),
+                    }
+                    for s in best_samples
+                    if isinstance((v := s.get("value")), (int, float))
+                ],
+                "x_label": "time",
+                "y_label": best_metric,
+            }
+        else:
+            descriptor["chart"] = {
+                "kind": "bar",
+                "points": [{"label": "artifact", "value": 1}],
+            }
     return descriptor
 
 
@@ -1389,6 +1872,35 @@ def _resource_descriptor(resource: Dict[str, Any]) -> Dict[str, Any] | None:
     }
 
 
+def _build_turn_latency_metric(
+    turn_latency_summary: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    """Build a turn-latency metric card entry from the resident session summary.
+
+    Returns a ``{label, value, tone, target}`` dict when operator-turn latency
+    data is present and meaningful (at least one operator turn recorded); returns
+    ``None`` when the summary is absent, empty, or has zero operator turns, so
+    the metric never emits noise for a session without operator interaction.
+    """
+    if not isinstance(turn_latency_summary, dict):
+        return None
+    op_data = turn_latency_summary.get("operator")
+    if not isinstance(op_data, dict) or op_data.get("count", 0) <= 0:
+        return None
+    mean_ms = op_data.get("mean_turn_ms")
+    max_ms = op_data.get("max_turn_ms")
+    if mean_ms is None or max_ms is None:
+        return None
+    mean_s = mean_ms / 1000
+    max_s = max_ms / 1000
+    return {
+        "label": "Turn latency",
+        "value": f"{mean_s:.1f}s avg / {max_s:.1f}s max",
+        "tone": "warning" if mean_ms > 5000 else "neutral",
+        "target": {"surface": "project", "section": "problem-model"},
+    }
+
+
 def _strategic_context_descriptors(
     *,
     canvas: Dict[str, Any],
@@ -1399,6 +1911,7 @@ def _strategic_context_descriptors(
     task_counts: Dict[str, int],
     attention_count: int,
     status: str,
+    turn_latency_metric: Dict[str, Any] | None = None,
 ) -> List[Dict[str, Any]]:
     blocked_count = int(task_counts.get("blocked") or 0)
     failed_count = int(task_counts.get("failed") or 0)
@@ -1462,12 +1975,20 @@ def _strategic_context_descriptors(
             ],
         },
     ]
+    if turn_latency_metric is not None:
+        descriptors[1]["metrics"].append(turn_latency_metric)
     source_table = _strategic_context_source_table_descriptor(sources)
     if source_table:
         descriptors.append(source_table)
 
     seen_ids = {str(descriptor["id"]) for descriptor in descriptors}
-    for artifact in (evidence.get("artifacts") or {}).get("items", [])[:4]:
+    # Render ALL returned evidence items as descriptors (not a hard [:4] slice):
+    # evidence.artifacts.items is already bounded to _RUNNING_JOB_PREVIEW_LIMIT
+    # live items + _ARTIFACT_EVIDENCE_LIMIT terminal items, so the list is at most
+    # 8 entries. Applying another [:4] here would hide terminal results whenever
+    # 4+ live jobs are running. The outer [:10] at the end of this function caps
+    # total descriptor count so the package stays bounded.
+    for artifact in (evidence.get("artifacts") or {}).get("items", []):
         descriptor = _artifact_descriptor(artifact)
         if descriptor and descriptor["id"] not in seen_ids:
             seen_ids.add(str(descriptor["id"]))
@@ -1509,6 +2030,7 @@ def build_strategic_context_package_summary(
     task_counts: Dict[str, int],
     attention: Dict[str, Any] | None,
     evidence: Dict[str, Any] | None = None,
+    turn_latency_summary: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Describe the current Strategic context without embedding large source docs."""
 
@@ -1664,6 +2186,7 @@ def build_strategic_context_package_summary(
         task_counts=task_counts,
         attention_count=attention_count,
         status=status,
+        turn_latency_metric=_build_turn_latency_metric(turn_latency_summary),
     )
 
     return {

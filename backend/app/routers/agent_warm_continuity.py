@@ -35,6 +35,11 @@ from app.auth import (
     VM_SCOPED_TOKEN_SCOPE,
 )
 from app.broadcast import broadcast_to_project
+from app.capability_execution_fence import (
+    block_task_for_capability_proof,
+    clear_warm_dispatch_pin,
+    evaluate_execution_authority_block,
+)
 from app.claim_analytics import stamp_warm_claim_timing
 from app.database import get_session, resolve_dialect_name
 from app.models import Task, TaskStatus, _utcnow
@@ -393,6 +398,7 @@ async def _resolve_retarget(
         project_id=str(task.project_id) if task.project_id else None,
         # No runner_available_clis: warm retarget dispatches to cloud VMs that
         # have all LLM CLIs pre-installed, so CLI-based filtering is not needed.
+        raise_resident_policy_hold=True,
     )
     if selection is None:
         return None, ctx, None
@@ -581,6 +587,45 @@ async def _finalize_warm_claim(
     same account because refresh tokens rotate independently of account identity.
     The field remains additive for older agents that ignore it.
     """
+    from app.strategic_resident_runner_policy import is_resident_turn
+
+    if is_resident_turn(task):
+        raise HTTPException(
+            status_code=409,
+            detail="Resident turns require the dedicated lineage-validated claim path",
+        )
+    # Execution-authority fence (shared with cold dispatch): re-grade this locked
+    # QUEUED task's capability-proof requirements against the live gate mode +
+    # platform ledger BEFORE it flips to IN_PROGRESS, acquires an account, or
+    # mints a JWT. Under enforce, unproven proof parks the task BLOCKED with
+    # machine-resolvable needs and DECLINES the warm claim (204). No account has
+    # been acquired yet at this point, so the only transient state to unwind is
+    # the warm pin and any pool-VM lease — both released consistently below so
+    # the member returns to the idle pool instead of lingering LEASED on a task
+    # that will no longer run warm.
+    _fence_blocking = await evaluate_execution_authority_block(session, task)
+    if _fence_blocking:
+        from app.warm_pool import release_pool_vm
+
+        block_task_for_capability_proof(
+            task, _fence_blocking, source=f"warm claim ({origin})"
+        )
+        clear_warm_dispatch_pin(task)
+        await release_pool_vm(
+            session, vm_instance_id, owning_task_id=task.id
+        )
+        session.add(task)
+        await session.commit()
+        logger.warning(
+            "[NEXT-ROLE][capability-proof-enforce] Declining warm claim (%s) for "
+            "task %s on vm %s — required capability proof not current: %s; parked "
+            "BLOCKED",
+            origin,
+            task.id,
+            vm_instance_id,
+            ", ".join(n["ref"] for n in _fence_blocking),
+        )
+        return Response(status_code=204)
     from app.compute import VM_PROVISIONING_MODEL
 
     task.vm_instance_id = vm_instance_id

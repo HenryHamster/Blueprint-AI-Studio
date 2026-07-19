@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from httpx import AsyncClient
 
 from app.main import app
-from app.models import Project, ProjectMessage, ProjectStatus
+from app.models import Project, ProjectMessage, ProjectStatus, UserIntegration
 from app.auth import get_current_user, require_admin
 from app.routers.admin_onboard import (
     GREENFIELD_SOURCE_FILE_THRESHOLD,
@@ -191,6 +191,182 @@ def override_auth():
     app.dependency_overrides.pop(require_admin, None)
 
 
+class TestOnboardNonAdminOwnership:
+    """Self-service onboarding requires caller-scoped GitHub write access."""
+
+    @pytest.mark.asyncio
+    async def test_non_admin_user_can_onboard_and_becomes_owner(
+        self, client: AsyncClient, db_session
+    ):
+        async def _plain_user():
+            return {
+                "user_id": "fresh-user-999",
+                "email": "newcomer@example.com",
+                "role": "user",
+            }
+
+        # Override the autouse admin identity with a plain allowlisted user for
+        # the duration of this request.
+        app.dependency_overrides[get_current_user] = _plain_user
+        db_session.add(
+            UserIntegration(
+                user_id="fresh-user-999", github_oauth_token="oauth-secret-ref"
+            )
+        )
+        await db_session.commit()
+        repo_access = MagicMock()
+        repo_access.status_code = 200
+        repo_access.json.return_value = {"permissions": {"push": True}}
+        try:
+            with (
+                patch(
+                    "app.secrets_manager.get_user_secret",
+                    new_callable=AsyncMock,
+                    return_value="caller-oauth-token",
+                ),
+                patch(
+                    "app.github._github_request",
+                    new_callable=AsyncMock,
+                    return_value=repo_access,
+                ),
+                patch(
+                    "app.routers.admin_onboard._detect_build_config",
+                    new_callable=AsyncMock,
+                    return_value={"language": "python"},
+                ),
+                patch(
+                    "app.github.get_repo_installation_token",
+                    new_callable=AsyncMock,
+                    return_value="tok",
+                ),
+                patch(
+                    "app.github.get_repo_default_branch",
+                    new_callable=AsyncMock,
+                    return_value="main",
+                ),
+                patch(
+                    "app.github.ensure_repo_initialized",
+                    new_callable=AsyncMock,
+                    return_value=False,
+                ),
+            ):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "firstproj"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "project_id" in data
+
+        from sqlalchemy import select
+        from app.models import ProjectMember
+
+        project = await db_session.get(Project, data["project_id"])
+        assert project is not None
+        assert project.user_id == "fresh-user-999"
+
+        member = (
+            await db_session.execute(
+                select(ProjectMember).where(
+                    ProjectMember.project_id == project.id,
+                    ProjectMember.user_id == "fresh-user-999",
+                )
+            )
+        ).scalars().first()
+        assert member is not None
+        assert member.role == "owner"
+
+    @pytest.mark.asyncio
+    async def test_non_admin_without_linked_github_identity_is_forbidden_before_token_mint(
+        self, client: AsyncClient
+    ):
+        async def _plain_user():
+            return {"user_id": "no-github", "email": "user@example.com", "role": "user"}
+
+        app.dependency_overrides[get_current_user] = _plain_user
+        mint = AsyncMock(return_value="installation-token")
+        try:
+            with patch("app.github.get_repo_installation_token", mint):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "private-repo"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 403
+        assert "Link your GitHub account" in resp.json()["error"]["message"]
+        mint.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_non_admin_without_push_permission_is_forbidden_before_token_mint(
+        self, client: AsyncClient, db_session
+    ):
+        async def _plain_user():
+            return {"user_id": "read-only", "email": "user@example.com", "role": "user"}
+
+        db_session.add(UserIntegration(user_id="read-only", github_oauth_token="oauth-ref"))
+        await db_session.commit()
+        repo_access = MagicMock()
+        repo_access.status_code = 200
+        repo_access.json.return_value = {"permissions": {"pull": True, "push": False}}
+        app.dependency_overrides[get_current_user] = _plain_user
+        mint = AsyncMock(return_value="installation-token")
+        try:
+            with (
+                patch(
+                    "app.secrets_manager.get_user_secret",
+                    new_callable=AsyncMock,
+                    return_value="caller-oauth-token",
+                ),
+                patch("app.github._github_request", new_callable=AsyncMock, return_value=repo_access),
+                patch("app.github.get_repo_installation_token", mint),
+            ):
+                resp = await client.post(
+                    "/api/admin/projects/onboard",
+                    json={"github_owner": "acme", "github_repo": "private-repo"},
+                )
+        finally:
+            app.dependency_overrides[get_current_user] = _restore_admin_override
+
+        assert resp.status_code == 403
+        assert "push access" in resp.json()["error"]["message"]
+        mint.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_admin_bypasses_caller_github_identity_check(
+        self, client: AsyncClient
+    ):
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={"language": "python"},
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ) as installation_token,
+            patch("app.github.get_repo_default_branch", new_callable=AsyncMock, return_value="main"),
+            patch("app.github.ensure_repo_initialized", new_callable=AsyncMock, return_value=False),
+        ):
+            resp = await client.post(
+                "/api/admin/projects/onboard",
+                json={"github_owner": "acme", "github_repo": "admin-project"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        installation_token.assert_any_await("acme", "admin-project")
+
+
+async def _restore_admin_override():
+    return {"user_id": TEST_USER_ID, "email": "admin@example.com", "role": "admin"}
+
+
 class TestOnboardAutoRemediation:
     @pytest.mark.asyncio
     async def test_onboard_sets_auto_remediation_defaults(
@@ -207,6 +383,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -252,6 +433,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -301,6 +487,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="master",
@@ -336,6 +527,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="trunk",
@@ -365,6 +561,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -410,6 +611,11 @@ class TestOnboardAutoRemediation:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -442,6 +648,11 @@ class TestOnboardAutoRemediation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -484,6 +695,11 @@ class TestOnboardIssueImplementation:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -532,6 +748,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -591,6 +812,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -639,6 +865,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -684,6 +915,11 @@ class TestOnboardBranchConfig:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -723,6 +959,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -781,6 +1022,11 @@ class TestOnboardBranchConfig:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -864,6 +1110,11 @@ class TestOnboardDefaultBranchErrors:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 side_effect=HTTPException(
@@ -907,6 +1158,11 @@ class TestOnboardDefaultBranchErrors:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -987,6 +1243,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1019,6 +1280,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1048,6 +1314,11 @@ class TestOnboardTaskBranchNamespace:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1085,6 +1356,11 @@ class TestOnboardTaskBranchNamespace:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -1113,6 +1389,11 @@ class TestOnboardTaskBranchNamespace:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1153,6 +1434,11 @@ class TestOnboardBranchBackfillIntegration:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="develop",
@@ -1190,6 +1476,11 @@ class TestOnboardBranchBackfillIntegration:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1263,6 +1554,9 @@ class TestOnboardStrategicIntentSeed:
         assert msg.content == goal
         assert msg.status == "open"
         assert msg.project_id == project.id
+        assert msg.sequence == 1
+        assert msg.surface == "conversation"
+        assert msg.handling_state == "pending"
 
     def test_empty_goal_is_a_noop(self):
         """An empty/whitespace goal preserves today's blank-slate behavior."""
@@ -1317,6 +1611,11 @@ class TestOnboardStrategicIntentSeed:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -1828,7 +2127,12 @@ class TestBuildConfigDetection:
 
     @pytest.mark.asyncio
     async def test_detect_build_config_not_empty_when_nested_fetch_fails(self):
-        """A failed second-level fetch must not yield repo_is_empty=True."""
+        """A failed second-level fetch must not yield an asserted-non-empty signal.
+
+        An incomplete walk is undetermined (None), never a durable False — the
+        greenfield decision is deferred to the live clone-time signal rather
+        than suppressed by a false negative.
+        """
         root_resp = MagicMock()
         root_resp.status_code = 200
         root_resp.json.return_value = [{"name": "apps", "type": "dir"}]
@@ -1849,7 +2153,7 @@ class TestBuildConfigDetection:
             config = await _detect_build_config("fake-token", "owner", "repo")
 
         assert config["directories"] == []
-        assert config["repo_is_empty"] is False
+        assert config["repo_is_empty"] is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_sets_repo_is_empty_for_readme_only(self):
@@ -1953,6 +2257,9 @@ class TestBuildConfigDetection:
         Regression: a monorepo whose real source lives under subdirectories
         (backend/, agent/, ...) was classified greenfield when a transient
         subdir listing error left the partial listing looking empty.
+
+        The incomplete walk is now recorded as undetermined (None), never a
+        durable False either — emptiness is never asserted from a partial read.
         """
         root_files = [
             {"name": "README.md", "type": "file"},
@@ -1974,7 +2281,7 @@ class TestBuildConfigDetection:
         ):
             config = await _detect_build_config("fake-token", "owner", "repo")
 
-        assert config["repo_is_empty"] is False
+        assert config["repo_is_empty"] is None
 
     @pytest.mark.asyncio
     async def test_detect_build_config_not_empty_when_root_fetch_fails(self):
@@ -3396,6 +3703,275 @@ class TestMaybeRefreshEmptyBuildConfig:
         bcd._redetect_empty_cooldown.clear()
 
 
+class TestMaybeRedetectOnEmptinessDisagreement:
+    """Bidirectional re-detect when agent-observed emptiness disagrees with the
+    durable ``build_config.repo_is_empty`` signal in EITHER direction."""
+
+    @staticmethod
+    def _project(repo, build_config):
+        return Project(
+            name=repo,
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo=repo,
+            integration_branch="develop",
+            build_config=build_config,
+        )
+
+    @pytest.mark.asyncio
+    async def test_durable_empty_agent_nonempty_redetects_and_flips(self, db_session):
+        """Direction A: durable repo_is_empty=True but agent sees real source =>
+        re-detect and persist the fresh (non-empty) verdict."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "greenfield-gained-code",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                    "source_file_count": 42,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is True
+        mock_detect.assert_awaited_once()
+        assert mock_detect.await_args.kwargs.get("ref") == "develop"
+        await db_session.refresh(project)
+        bc = project.build_config or {}
+        assert bc.get("repo_is_empty") is False
+        assert bc.get("source_file_count") == 42
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_durable_nonempty_agent_empty_redetects_and_flips(self, db_session):
+        """Direction B: durable repo_is_empty=False but agent sees an empty tree =>
+        re-detect; the authoritative walk confirms empty and the signal flips."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "misclassified-nonempty",
+            {"language": "python", "directories": [], "repo_is_empty": False},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": None,
+                    "directories": [],
+                    "repo_is_empty": True,
+                    "source_file_count": 0,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=True
+            )
+
+        assert redetected is True
+        mock_detect.assert_awaited_once()
+        await db_session.refresh(project)
+        assert (project.build_config or {}).get("repo_is_empty") is True
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_signals_agree_is_noop(self, db_session):
+        """Durable and observed agree (both non-empty) => no GitHub call."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "agree-repo",
+            {"language": "python", "directories": [], "repo_is_empty": False},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_absent_durable_signal_is_noop(self, db_session):
+        """An indeterminate (absent/None) durable signal has nothing to disagree
+        with => no GitHub call (that case belongs to maybe_refresh)."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "indeterminate-repo",
+            {"language": "python", "directories": []},  # no repo_is_empty key
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+            ) as mock_token,
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=True
+            )
+
+        assert redetected is False
+        mock_detect.assert_not_awaited()
+        mock_token.assert_not_awaited()
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_honors_cooldown(self, db_session):
+        """A second disagreement within the 6h window skips detection entirely."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "disagreement-cooldown",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                return_value={
+                    "language": "python",
+                    "directories": [{"path": "backend", "type": "python"}],
+                    "repo_is_empty": False,
+                },
+            ) as mock_detect,
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            r1 = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+            assert r1 is True
+            assert mock_detect.call_count == 1
+
+            # Re-arm the disagreement so only the cooldown can skip it.
+            project.build_config = {
+                "language": "python",
+                "directories": [],
+                "repo_is_empty": True,
+            }
+            await db_session.commit()
+
+            r2 = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+            assert r2 is False
+            assert mock_detect.call_count == 1
+        bcd._redetect_disagreement_cooldown.clear()
+
+    @pytest.mark.asyncio
+    async def test_swallows_detection_exception(self, db_session):
+        """A detection failure is logged and swallowed, never raised."""
+        import app.build_config_detection as bcd
+        from app.build_config_detection import (
+            maybe_redetect_on_emptiness_disagreement,
+        )
+
+        bcd._redetect_disagreement_cooldown.clear()
+        project = self._project(
+            "disagreement-boom",
+            {"language": "python", "directories": [], "repo_is_empty": True},
+        )
+        db_session.add(project)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.routers.admin_onboard._detect_build_config",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("github down"),
+            ),
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+        ):
+            redetected = await maybe_redetect_on_emptiness_disagreement(
+                project, db_session, observed_empty=False
+            )
+
+        assert redetected is False
+        await db_session.refresh(project)
+        # Config untouched on failure.
+        assert (project.build_config or {}).get("repo_is_empty") is True
+        bcd._redetect_disagreement_cooldown.clear()
+
+
 class TestOnboardDetectionIncompleteMarker:
     """Onboarding sets detection_incomplete only when detection did not complete."""
 
@@ -3411,6 +3987,11 @@ class TestOnboardDetectionIncompleteMarker:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -3464,17 +4045,21 @@ class TestOnboardDetectionIncompleteMarker:
 
 
 class TestClassifyRepoEmptiness:
-    """Unit tests for the pure _classify_repo_emptiness helper."""
+    """Unit tests for the pure _classify_repo_emptiness helper.
+
+    The helper now returns ``(is_empty, source_file_count)``; the count is the
+    authoritative real-source total persisted for the agent to compare against.
+    """
 
     def test_truly_empty_repo(self):
-        assert _classify_repo_emptiness([]) is True
+        assert _classify_repo_emptiness([]) == (True, 0)
 
     def test_readme_and_license_only(self):
         items = [
             {"name": "README.md", "type": "file"},
             {"name": "LICENSE", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_ci_and_config_dotfiles_only(self):
         items = [
@@ -3484,7 +4069,7 @@ class TestClassifyRepoEmptiness:
             {"name": "CONTRIBUTING.md", "type": "file"},
             {"name": "CODE_OF_CONDUCT.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_source_directory_with_one_file_is_still_empty_below_threshold(self):
         items = [
@@ -3492,34 +4077,39 @@ class TestClassifyRepoEmptiness:
             {"name": "src", "type": "dir"},
             {"name": "main.py", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 1)
 
     def test_source_manifest_is_empty_below_threshold(self):
         items = [
             {"name": "pyproject.toml", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_threshold_source_file_count_is_still_empty(self):
         items = [
             {"name": f"src/file{i}.py", "type": "file"}
             for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD)
         ]
-        assert _classify_repo_emptiness(items) is True
+        empty, count = _classify_repo_emptiness(items)
+        assert empty is True
+        assert count == GREENFIELD_SOURCE_FILE_THRESHOLD
 
     def test_over_threshold_source_file_count_is_non_empty(self):
         items = [
             {"name": f"src/file{i}.py", "type": "file"}
             for i in range(GREENFIELD_SOURCE_FILE_THRESHOLD + 1)
         ]
-        assert _classify_repo_emptiness(items) is False
+        empty, count = _classify_repo_emptiness(items)
+        assert empty is False
+        # The full count is reported even past the emptiness threshold.
+        assert count == GREENFIELD_SOURCE_FILE_THRESHOLD + 1
 
     def test_git_dir_ignored(self):
         items = [
             {"name": ".git", "type": "dir"},
             {"name": "README.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
     def test_malformed_items_skipped(self):
         items = [
@@ -3528,18 +4118,22 @@ class TestClassifyRepoEmptiness:
             {"name": "", "type": "file"},
             {"name": "README.md", "type": "file"},
         ]
-        assert _classify_repo_emptiness(items) is True
+        assert _classify_repo_emptiness(items) == (True, 0)
 
-    def test_incomplete_listing_is_not_empty(self):
-        """An incomplete read can never be classified as greenfield."""
-        # Even an empty fetched listing degrades to not-empty when the read
-        # was incomplete (a subdir fetch failed).
-        assert _classify_repo_emptiness([], listing_complete=False) is False
+    def test_incomplete_listing_is_undetermined_not_asserted_non_empty(self):
+        """An incomplete read is undetermined (None), never an asserted False.
+
+        Tri-state parity with ``has_ci``: emptiness is never inferred from a
+        partial walk. A transient subdir fetch failure must not stamp a durable,
+        authoritative "not empty" — the greenfield decision is deferred (None)
+        and no count is asserted.
+        """
+        assert _classify_repo_emptiness([], listing_complete=False) == (None, None)
 
     def test_incomplete_listing_overrides_below_threshold(self):
-        """Below-threshold source + incomplete read => still not empty."""
+        """Below-threshold source + incomplete read => undetermined, not False."""
         items = [{"name": "README.md", "type": "file"}]
-        assert _classify_repo_emptiness(items, listing_complete=False) is False
+        assert _classify_repo_emptiness(items, listing_complete=False) == (None, None)
 
 
 class TestOnboardRepoBootstrapSpawn:
@@ -3563,6 +4157,11 @@ class TestOnboardRepoBootstrapSpawn:
                 "app.github.get_repo_installation_token",
                 new_callable=AsyncMock,
                 return_value="tok",
+            ),
+            patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
             ),
             patch(
                 "app.github.get_repo_default_branch",
@@ -3621,6 +4220,11 @@ class TestOnboardRepoBootstrapSpawn:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3667,6 +4271,11 @@ class TestOnboardWarmPool:
                 return_value="tok",
             ),
             patch(
+                "app.github.ensure_repo_initialized",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
                 "app.github.get_repo_default_branch",
                 new_callable=AsyncMock,
                 return_value="main",
@@ -3697,11 +4306,12 @@ class TestOnboardWarmPool:
         fake_lock.__aenter__ = AsyncMock(return_value=None)
         fake_lock.__aexit__ = AsyncMock(return_value=False)
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_settings._apply_settings", _fake_apply),
             patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
             patch("app.warm_pool.warm_pool_project_scope", return_value=set()),
@@ -3748,11 +4358,12 @@ class TestOnboardWarmPool:
             seed_calls.append(project_id)
             return {}
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_warm_pool._seed_project_pool", _fake_seed),
         ):
             resp = await client.post(
@@ -3775,11 +4386,12 @@ class TestOnboardWarmPool:
         async def _fake_apply(payload, session, config):
             apply_calls.append(payload)
 
-        p1, p2, p3 = self._common_patches()
+        p1, p2, p3, p4 = self._common_patches()
         with (
             p1,
             p2,
             p3,
+            p4,
             patch("app.routers.admin_settings._apply_settings", _fake_apply),
         ):
             resp = await client.post(

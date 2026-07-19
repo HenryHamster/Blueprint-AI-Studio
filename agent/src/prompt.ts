@@ -18,6 +18,7 @@ export {
   countSourceFiles,
   detectGreenfield,
   isGreenfieldRepo,
+  buildGreenfieldCitationGuidance,
   verifyCloneDelivered,
   extractTestConventions,
   discoverRelatedTests,
@@ -274,6 +275,8 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'release_merge_grade', // Uses merge-grade.ts bespoke prompt assembly (blind goal-coverage grader)
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
+  'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
+  'strategic_resident_turn', // Uses strategic-resident-turn.ts bespoke prompt assembly (no-clone resident loop)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────
@@ -1063,6 +1066,36 @@ export function formatSkills(skills: TaskSkill[] | undefined): string {
     return parts.join('\n\n');
   }).join('\n\n');
   return `## Project Skills\n\nThese are project-declared shell procedures available in this workspace as executable scripts. Use them for project-specific operations (deploy, test, lint, format, etc.).\n\n${lines}\n\n`;
+}
+
+export interface TaskToolContent {
+  slug: string;
+  title: string;
+  kind: string;
+  text: string;
+}
+
+/**
+ * Render a `## Project Tool Content` markdown block from the task's
+ * project_tools array — the content of the project's built-in tools
+ * (notes, whiteboard) that the operator wrote in the workspace UI.
+ * Each tool becomes a titled subsection with its serialized text.
+ * Returns '' when the input is undefined/empty so the prompt stays
+ * unchanged for tasks whose project has no tool content.
+ */
+export function formatProjectTools(tools: TaskToolContent[] | undefined): string {
+  if (!tools || tools.length === 0) return '';
+  const blocks = tools.map(tool => {
+    const slug = typeof tool.slug === 'string' ? tool.slug : '';
+    const title = typeof tool.title === 'string' ? tool.title : slug;
+    const kind = typeof tool.kind === 'string' ? tool.kind : '';
+    const text = typeof tool.text === 'string' ? tool.text.trim() : '';
+    if (!text) return '';
+    const heading = kind ? `### ${title} (${kind})` : `### ${title}`;
+    return `${heading}\n\n${text}`;
+  }).filter(block => block.length > 0);
+  if (blocks.length === 0) return '';
+  return `## Project Tool Content\n\nThe operator has written the following in this project's built-in tools. Treat it as project-specific context (notes, hypotheses, sketches) that may inform your work.\n\n${blocks.join('\n\n')}\n\n`;
 }
 
 /**

@@ -108,6 +108,10 @@ _MAX_ERROR_REDRIVE_ATTEMPTS = 5
 # once this many consecutive re-drives still result in infra_failure.
 _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS = 3
 
+_RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
+    {"rubric_changed", "rubric_provenance_unknown"}
+)
+
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
 _TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials"})
@@ -256,7 +260,13 @@ async def _redrive_error_qualification(
         if error_redrive_count >= _MAX_ERROR_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            qualification_attempt_id=qual.get("qualification_attempt_id")
+            or version.active_qualification_attempt_id,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_ERROR_REDRIVE_ATTEMPTS,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         #
@@ -391,15 +401,97 @@ async def _redrive_infra_failure_qualification(
             else int(qual.get("consecutive_infra_errors") or 0)
         )
         if effective_streak >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+            # Raise an operator Alert (once) so the cap is visible.  Guard
+            # against duplicate alerts with a flag on last_qualification.
+            if not qual.get("infra_failure_loop_escalated"):
+                # The Alert model has no JSON ``extra`` column, so structured
+                # evidence must live in a persisted field (``message``) to survive
+                # readback — a prior ``extra={...}`` kwarg was silently dropped.
+                # Surface the failing dimension and infra-failure signature so an
+                # operator can see WHICH gate is looping and WHY.
+                _failing_dim_label = _failing_dim or "unknown"
+                _signature = qual.get("infra_failure_signature") or "unavailable"
+                _last_error = qual.get("error") or "unavailable"
+                alert = Alert(
+                    project_id=version.project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=(
+                        f"Release v{version.version_number} infra-failure "
+                        f"re-drive loop halted"
+                    ),
+                    message=(
+                        f"Release v{version.version_number} has failed "
+                        f"{effective_streak} consecutive infra-failure "
+                        f"re-drive(s) in the '{_failing_dim_label}' dimension "
+                        f"(failure signature: {_signature}; last error: "
+                        f"{_last_error}) — autonomous re-qualification halted. "
+                        f"Human review required."
+                    ),
+                )
+                redrive_session.add(alert)
+                version.last_qualification = {
+                    **qual,
+                    "infra_failure_loop_escalated": True,
+                }
+                flag_modified(version, "last_qualification")
+                redrive_session.add(version)
+                await redrive_session.commit()
+                logger.warning(
+                    "[RELEASE_QUALIFIER] sweep: v%d consecutive_infra_errors=%d "
+                    "reached cap=%d — raised operator Alert and halted "
+                    "auto-requalify",
+                    version.version_number,
+                    effective_streak,
+                    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+                )
             return False
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            qualification_attempt_id=qual.get("qualification_attempt_id")
+            or version.active_qualification_attempt_id,
+            retry_episode=int(qual.get("retry_episode") or 0) + 1,
+            retry_episode_cap=_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         # run_qualification writes a new last_qualification (and bumps
         # qualification_attempts) on every path it takes; rolling back would
         # discard those writes and leave the version in the old infra_failure
         # state.
+        await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
+
+
+async def _redrive_rubric_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Launch a fresh grade after a frozen-rubric attempt could not conclude.
+
+    ``rubric_changed`` and ``rubric_provenance_unknown`` deliberately do not
+    prove the candidate.  Re-entering ``run_qualification`` snapshots today's
+    active contract and starts a new blind merge-grade; the coordinator's row
+    lock makes repeated sweeps harmless once the replacement is pending.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") not in _RUBRIC_REDRIVE_STATUSES
+            or version.phase != "stabilize"
+        ):
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
         await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
 
@@ -599,6 +691,11 @@ async def _redrive_promotion_failed_qualification(
             # Raise an operator Alert (once) so the cap is visible.  Guard
             # against duplicate alerts with a flag on last_qualification.
             if not qual.get("promotion_loop_escalated"):
+                # The Alert model has no JSON ``extra`` column (a prior
+                # ``extra={...}`` kwarg was silently dropped) — carry the
+                # structured evidence in the persisted ``message`` field so it
+                # survives readback.
+                _last_error = qual.get("error") or "unavailable"
                 alert = Alert(
                     project_id=version.project_id,
                     severity=AlertSeverity.ERROR,
@@ -607,15 +704,10 @@ async def _redrive_promotion_failed_qualification(
                     ),
                     message=(
                         f"Release v{version.version_number} has failed promotion "
-                        f"{failure_count} time(s) — autonomous re-qualification "
-                        f"halted. Human review required before next promote attempt."
+                        f"{failure_count} time(s) (last error: {_last_error}) — "
+                        f"autonomous re-qualification halted. Human review "
+                        f"required before next promote attempt."
                     ),
-                    extra={
-                        "version_id": str(version.id),
-                        "version_number": version.version_number,
-                        "promotion_failure_count": failure_count,
-                        "last_error": qual.get("error"),
-                    },
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {

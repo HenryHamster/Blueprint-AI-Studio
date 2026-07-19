@@ -581,6 +581,75 @@ async def _fetch_open_messages(
     return _bound_open_messages(messages, limit)
 
 
+# ── Recently-answered operator conversation tail ──────────────────────────────
+# A bounded, explicitly NON-ACTIONABLE tail of the just-answered operator
+# conversation. Once an inbound operator message is marked ``handled`` (or the
+# strategist ``resolve``s it) it drops out of the open-message feed entirely and
+# survives NOWHERE the restarted/compacted session can see it — so a correction
+# the operator made that the strategist forgot to formally capture into the
+# durable decisions register (the OPERATOR-DECISION marker) is lost forever
+# across a restart, and the strategist re-proposes what the operator already
+# settled. This tail restores just enough of that recent conversation for the
+# model to notice a settled fact it never marked. It is read-only context, NOT
+# an inbox: these messages are already answered and MUST NOT be re-acted on.
+_RECENT_HANDLED_FETCH_LIMIT = 30  # DB window over recently-answered rows
+_RECENT_HANDLED_KEEP = 8  # count bound for the packed tail
+_RECENT_HANDLED_EXCERPT_MAX_CHARS = 600  # per-message content excerpt cap
+# Terminal statuses that mean "the operator conversation was answered/closed".
+# ``open`` is deliberately excluded — those already ship in _fetch_open_messages.
+_RECENT_HANDLED_STATUSES = ("handled", "resolved")
+# Conversational participants only. ``system`` is excluded so internal
+# bookkeeping notices never leak into the operator-conversation tail.
+_RECENT_HANDLED_FROM_TYPES = ("user", "operator", "strategic", "agent")
+
+
+async def _fetch_recent_handled_conversation(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    limit: int = _RECENT_HANDLED_KEEP,
+) -> list[dict]:
+    """Bounded, non-actionable tail of the recently-ANSWERED operator conversation.
+
+    Complements ``_fetch_open_messages``: that feed carries status=="open"
+    (actionable) messages; this one carries the just-answered ones
+    (status in ``_RECENT_HANDLED_STATUSES``) that would otherwise vanish the
+    moment they are marked handled. Restricted to conversational
+    ``from_type``s (``system`` bookkeeping is excluded) so a marker-less
+    operator correction survives a restart/compaction and the strategist stops
+    re-proposing what the operator already settled.
+
+    Fetches the newest ``_RECENT_HANDLED_FETCH_LIMIT`` answered rows, keeps the
+    newest *limit*, caps each content excerpt, and returns them in oldest-first
+    chronological order for a stable read. Purely bounded (hard count + excerpt
+    cap) so it can never bloat the payload.
+    """
+    result = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.status.in_(_RECENT_HANDLED_STATUSES),
+            ProjectMessage.from_type.in_(_RECENT_HANDLED_FROM_TYPES),
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_RECENT_HANDLED_FETCH_LIMIT)
+    )
+    # Keep the newest *limit* rows (the query is newest-first), project them, then
+    # re-sort into oldest-first chronological order for a stable transcript read —
+    # sorting on the projected string ``created_at`` (mirrors _fetch_open_messages)
+    # so no timezone-naive datetime sentinel is needed for null-safety.
+    rows = list(result.scalars().all())[: max(0, limit)]
+    messages: list[dict] = []
+    for m in rows:
+        entry = agent_thread_message_dict(m)
+        content = entry.get("content")
+        if isinstance(content, str) and len(content) > _RECENT_HANDLED_EXCERPT_MAX_CHARS:
+            entry = {**entry, "content": content[:_RECENT_HANDLED_EXCERPT_MAX_CHARS]}
+        messages.append(entry)
+    messages.sort(key=lambda msg: msg.get("created_at") or "")
+    return messages
+
+
 def _summarize_recent_interventions(v: Any) -> dict:
     """Keep rolling rates and per-direction deltas; truncate the raw merge list."""
     if not isinstance(v, dict):

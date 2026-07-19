@@ -27,6 +27,11 @@ from app.providers.openai import (
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
 )
 from app.providers.registry import get_provider
+from app.strategic_resident_provider_policy import (
+    ResidentProviderPolicyHold,
+    resolve_resident_provider_routing,
+    validate_resident_model_provider,
+)
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -822,7 +827,6 @@ _pending_rl_persists: List[
 _pending_cap_persists: set = (
     set()
 )  # Account IDs with dirty daily_task_count / disabled_reason to flush
-
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
 # Claude rate-limit (vs GitHub 429, GCP quota, Anthropic 529 overload, etc).
@@ -1723,7 +1727,10 @@ def summarize_pool_state(
 
 
 def get_all_account_health_summaries(
-    user_id: str | None = None, now: datetime | None = None, project_id: str | None = None
+    user_id: str | None = None,
+    now: datetime | None = None,
+    project_id: str | None = None,
+    persisted_usage_by_id: Mapping[str, Any] | None = None,
 ) -> list[dict]:
     """Return per-account health summaries for the admin dashboard.
 
@@ -1800,7 +1807,13 @@ def get_all_account_health_summaries(
             # Additive: latest cached proactive usage-headroom snapshot
             # (5h/7d utilization, reset times, probed_at, known/stale).
             # "known": False covers never-probed and probe-unknown states.
-            "usage_snapshot": _usage_snapshot_summary(acct, now),
+            # Falls back to the DB-persisted blob so the meter is populated on
+            # non-leader instances that never re-ran the (leader-only) probe.
+            "usage_snapshot": usage_snapshot_summary_with_fallback(
+                acct,
+                (persisted_usage_by_id or {}).get(str(acct["id"])),
+                now,
+            ),
         }
         # Per-project fields when scoped to a specific project.
         if project_id:
@@ -3227,6 +3240,71 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
     }
 
 
+def _usage_summary_from_snapshot(
+    snap: UsageSnapshot, at: datetime, now: datetime
+) -> Dict[str, Any]:
+    """JSON-safe summary for a KNOWN snapshot with wall-clock stamp ``at``."""
+    stale = (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+    return {
+        "known": True,
+        "five_hour_utilization": snap.window_utilizations.get("five_hour"),
+        "seven_day_utilization": snap.window_utilizations.get("seven_day"),
+        "resets_at": dict(snap.resets_at),
+        "probed_at": snap.probed_at,
+        "stale": stale,
+    }
+
+
+def usage_snapshot_summary_with_fallback(
+    acct: Dict[str, Any] | None,
+    persisted_raw: Any,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Usage-snapshot summary that falls back to the DB-persisted blob.
+
+    The in-memory probe result only exists on the instance whose orchestrator
+    leader actually ran the probe: probes are scheduled ONLY from the
+    leader-gated orchestrator cycle (``refresh_usage_meter_snapshots``), and
+    non-leader Cloud Run instances load the pool once at startup and never
+    refresh it (see ``lifecycle`` — the periodic ``load_max_plan_pool`` /
+    meter-refresh both live inside the leader-only loop). Because the admin API
+    is load-balanced across every instance, the in-memory snapshot is missing
+    (``known=False``) on each non-leader — so the meter renders blank for the
+    operator even though a fresh probe result is durably persisted in the shared
+    DB column ``MaxPlanAccount.rate_limit_usage``.
+
+    Fix: when the in-memory snapshot is missing/unknown — or when the persisted
+    blob is fresher than the frozen in-memory copy — reconstruct the summary
+    from the persisted blob so the meter is correct on every instance
+    regardless of which one is the leader. Picks the fresher of the two known
+    sources (mirrors ``_restore_usage_state``).
+    """
+    candidates: list[tuple[datetime, UsageSnapshot]] = []
+    if acct is not None:
+        snap = acct.get("usage_snapshot")
+        at = acct.get("usage_snapshot_at")
+        if isinstance(snap, UsageSnapshot) and snap.known and at is not None:
+            candidates.append((at, snap))
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        candidates.append((parsed[1], parsed[0]))
+    if not candidates:
+        # No known source anywhere — preserve the in-memory unknown summary
+        # (carries probed_at/stale from a probe-unknown result) when present.
+        if acct is not None:
+            return _usage_snapshot_summary(acct, now)
+        return {
+            "known": False,
+            "five_hour_utilization": None,
+            "seven_day_utilization": None,
+            "resets_at": {},
+            "probed_at": None,
+            "stale": True,
+        }
+    best_at, best_snap = max(candidates, key=lambda c: c[0])
+    return _usage_summary_from_snapshot(best_snap, best_at, now)
+
+
 async def select_max_plan_account_balanced(
     user_id: str,
     provider_models: List[tuple[str, str | None]],
@@ -3617,6 +3695,7 @@ async def select_llm_runtime_for_task(
     project_id: str | None = None,
     runner_available_clis: dict[str, dict] | None = None,
     failure_reasons: List[str] | None = None,
+    raise_resident_policy_hold: bool = False,
 ) -> LLMSelectionResult | None:
     """Resolve the (provider, model, account) runtime for a task.
 
@@ -3686,6 +3765,19 @@ async def select_llm_runtime_for_task(
         explicit_model, runtime_config
     )
     routing_task_type = _task_type(task)
+    try:
+        resident_routing = resolve_resident_provider_routing(
+            task,
+            project_provider_preference=provider_preference,
+            allow_cross_provider_fallback=allow_fallback,
+        )
+        validate_resident_model_provider(resident_routing, lambda model: infer_provider_for_model(model, runtime_config))
+    except ResidentProviderPolicyHold as exc:
+        if failure_reasons is not None:
+            failure_reasons.append(str(exc))
+        if raise_resident_policy_hold:
+            raise
+        return None
     # Resolve project_id: explicit parameter takes precedence, then task attribute.
     _resolved_project_id = (
         project_id
@@ -3695,6 +3787,18 @@ async def select_llm_runtime_for_task(
     )
     _log_project_id = _resolved_project_id or "unknown"
     logger.info("[LLM_SELECT] project=%s user=%s task_type=%s", _log_project_id, user_id, routing_task_type)
+
+    if resident_routing is not None:
+        provider_preference = list(resident_routing.provider_preference)
+        explicit_provider = resident_routing.primary_provider or None
+        explicit_model = (
+            resident_routing.primary_model if explicit_provider else None
+        )
+        # Resident failover is ordered, never load-balanced. Generic model
+        # preference order cannot put a compatible provider ahead of primary.
+        mode = "preferred"
+        allow_fallback = resident_routing.allow_fallback
+        model_preferences = []
 
     # If the inferred explicit_provider isn't allowed by the resolved
     # routing, drop the pin so category_routing wins. Catches:
@@ -3942,7 +4046,9 @@ async def select_llm_runtime_for_task(
         # admin UI / logs surface the downgrade explicitly — silently
         # running a different tier than the user asked for is a trust-losing
         # failure mode.
-        fallback = provider.fallback_model(model)
+        fallback = (
+            None if resident_routing is not None else provider.fallback_model(model)
+        )
         if fallback and fallback != model:
             sub_reasons = _sub_reasons()
             account = await select_max_plan_account(

@@ -134,4 +134,62 @@ describe('useMessageList', () => {
     // FEEDBACK is not critical severity; only BLOCKER survives the open filter
     expect(res.openMessages.map(m => m.id)).toEqual(['b']);
   });
+
+  it('needsActionOnly=true narrows highSignalOpen to needsOperatorIds only and empties routineOpen', () => {
+    const blocker = makeMsg({ id: 'b', message_type: 'BLOCKER' });
+    const needsOp = makeMsg({ id: 'na', message_type: 'NOTE', from_type: 'system', context: { event_type: 'failure_alert' } });
+    const routine = makeMsg({ id: 'r', message_type: 'NOTE', context: { event_type: 'task_started' } });
+    const needsOperatorIds = new Set(['na']);
+
+    const res = run({ messages: [blocker, needsOp, routine], needsOperatorIds, needsActionOnly: true });
+    expect(res.highSignalOpen.map(m => m.id)).toEqual(['na']);
+    expect(res.routineOpen).toHaveLength(0);
+  });
+
+  it('needsActionOnly=true with no needsOperatorIds falls through to normal behavior', () => {
+    const blocker = makeMsg({ id: 'b', message_type: 'BLOCKER' });
+    const routine = makeMsg({ id: 'r', message_type: 'NOTE', context: { event_type: 'task_started' } });
+
+    const res = run({ messages: [blocker, routine], needsActionOnly: true });
+    // needsOperatorIds is undefined → falls through to normal signal-based split
+    expect(res.highSignalOpen.map(m => m.id)).toEqual(['b']);
+    expect(res.routineOpen.map(m => m.id)).toEqual(['r']);
+  });
+
+  it('needsActionOnly=false shows all messages regardless of needsOperatorIds', () => {
+    const blocker = makeMsg({ id: 'b', message_type: 'BLOCKER' });
+    const needsOp = makeMsg({ id: 'na', message_type: 'NOTE', from_type: 'system', context: { event_type: 'failure_alert' } });
+    const routine = makeMsg({ id: 'r', message_type: 'NOTE', context: { event_type: 'task_started' } });
+    const needsOperatorIds = new Set(['na']);
+
+    const res = run({ messages: [blocker, needsOp, routine], needsOperatorIds, needsActionOnly: false });
+    // Full signal-based split: blocker and failure_alert go high-signal, task_started goes routine
+    expect(res.highSignalOpen.map(m => m.id).sort()).toEqual(['b', 'na'].sort());
+    expect(res.routineOpen.map(m => m.id)).toEqual(['r']);
+  });
+
+  it('promotes needs_operator attention item to high-signal even when event_type is muted', () => {
+    // failure_alert is high-signal by default; muting it demotes it to routine
+    const alert = makeMsg({
+      id: 'fa1',
+      message_type: 'NOTE',
+      from_type: 'system',
+      context: { event_type: 'failure_alert' },
+    });
+    const eventPrefs = { failure_alert: 'mute' as const };
+    // Without needsOperatorIds the muted item goes to routine, not high-signal
+    const withoutAttention = run({ messages: [alert], eventPrefs });
+    expect(withoutAttention.highSignalOpen.map(m => m.id)).toEqual([]);
+    expect(withoutAttention.routineOpen.map(m => m.id)).toEqual([]);
+
+    // With the canonical attention model marking it needs_operator, it is
+    // promoted to highSignalOpen and excluded from routineOpen.
+    const withAttention = run({
+      messages: [alert],
+      eventPrefs,
+      needsOperatorIds: new Set(['fa1']),
+    });
+    expect(withAttention.highSignalOpen.map(m => m.id)).toEqual(['fa1']);
+    expect(withAttention.routineOpen.map(m => m.id)).toEqual([]);
+  });
 });

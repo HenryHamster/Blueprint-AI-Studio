@@ -149,6 +149,7 @@ def _stage_project_branch_alert(
     title: str,
     message: str,
     log_level: int,
+    event_type: str,
     severity: str = "ERROR",
 ) -> None:
     project_id = getattr(project, "id", None)
@@ -176,6 +177,7 @@ def _stage_project_branch_alert(
             "title": title,
             "message": message,
             "severity": severity,
+            "event_type": event_type,
         }
     )
 
@@ -257,6 +259,7 @@ async def flush_pending_branch_alerts(session) -> int:
                 severity=severity,
                 title=title,
                 message=item.get("message") or title,
+                event_type=item.get("event_type"),
             )
             session.add(alert)
             created += 1
@@ -301,6 +304,7 @@ def _signal_missing_project_branch(
             f"falling back to {fallback_branch} until the column is populated."
         ),
         log_level=logging.WARNING,
+        event_type="branch.missing_config",
     )
 
 
@@ -316,6 +320,7 @@ def _signal_blocking_project_branch_configuration(
         title="Blocking branch configuration",
         message=detail,
         log_level=logging.ERROR,
+        event_type="branch.unsafe_config",
     )
 
 
@@ -359,7 +364,9 @@ async def signal_unsafe_branch_configuration(
     """
     from sqlmodel import select
 
+    from app.message_audience import stamp_message_audience
     from app.models import Alert, AlertSeverity, MessageType, ProjectMessage
+    from app.project_message_creation import build_project_message
 
     project_id = getattr(project, "id", None)
     logger.error("[BRANCH_RESOLVER] %s", detail)
@@ -381,6 +388,7 @@ async def signal_unsafe_branch_configuration(
                 severity=AlertSeverity.ERROR,
                 title=_UNSAFE_BRANCH_ALERT_TITLE,
                 message=detail,
+                event_type="branch.unsafe_config",
             )
         )
 
@@ -399,16 +407,19 @@ async def signal_unsafe_branch_configuration(
     already_posted = _blocker_result.scalar() is not None
     if not already_posted:
         session.add(
-            ProjectMessage(
+            await build_project_message(
+                session,
                 project_id=project_id,
                 message_type=MessageType.BLOCKER,
                 from_type="system",
                 content=detail,
-                context={
-                    "event_type": "unsafe_branch_configuration",
-                    "issue_code": issue_code,
-                    "dedupe_key": dedupe_key,
-                },
+                context=stamp_message_audience(
+                    {
+                        "issue_code": issue_code,
+                        "dedupe_key": dedupe_key,
+                    },
+                    "unsafe_branch_configuration",
+                ),
             )
         )
 
@@ -651,6 +662,7 @@ async def _create_promotion_target_landing_alert(
         title=_PROMOTION_TARGET_LANDING_ALERT_TITLE,
         message=reason,
         task_id=getattr(task, "id", None),
+        event_type="branch.promotion_target_landing",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -1073,6 +1085,7 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
                         "Fix GitHub credentials and re-run the backfill (restart the service or "
                         "call POST /api/admin/projects/{id}/backfill-branches)."
                     ),
+                    event_type="branch.missing_config",
                 )
                 session.add(alert)
             except Exception as alert_exc:  # noqa: BLE001

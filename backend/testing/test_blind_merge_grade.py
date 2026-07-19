@@ -189,7 +189,7 @@ async def _seed_for_finalize(
         mg_task = Task(
             project_id=project.id,
             title="merge-grade",
-            payloads=[{"type": "release_merge_grade", "base_branch": "main"}],
+            payloads=[{"type": "release_merge_grade", "base_branch": "main", "categories": []}],
             vm_instance_id="vm-merge-grade",
             status=TaskStatus.COMPLETED,
             context={"candidate_sha": _candidate_sha},
@@ -219,6 +219,9 @@ async def _seed_for_finalize(
         "smoketest_task_id": str(smoke_task.id),
         "challenge_task_id": None,
         "merge_grade_task_id": merge_grade_task_id,
+        # Empty rubric snapshot so _resolve_launched_rubric succeeds in tests
+        # that don't seed a merge_grade task payload with categories.
+        "rubric_snapshot": [],
     }
     db_session.add(version)
     await db_session.commit()
@@ -319,6 +322,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
 
     version_id = uuid.uuid4()
     candidate_sha = "abcd" * 10
+    attempt_id = uuid.uuid4()
     task = await _spawn_release_merge_grade_task(
         db_session,
         project.id,
@@ -326,6 +330,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
         base_branch="main",
         diff_range=f"main...{candidate_sha}",
         candidate_sha=candidate_sha,
+        qualification_attempt_id=attempt_id,
         version_goal=_GOOD_GOAL,
         merged_pr_numbers=[101, 102],
     )
@@ -338,6 +343,7 @@ async def test_spawn_merge_grade_task_creates_queued_task(db_session):
     assert payload["version_goal"] == _GOOD_GOAL
     assert payload["quality_tier"] == "opus"
     assert payload["candidate_sha"] == candidate_sha
+    assert payload["qualification_attempt_id"] == str(attempt_id)
     assert 101 in payload["merged_prs"]
     # Blindness contract: running_update must NOT appear in any payload key.
     assert not any("running_update" in str(k).lower() for k in payload)
@@ -444,7 +450,15 @@ async def test_finalize_blocks_failing_merge_grade(db_session, mocker):
         },
     )
 
-    result = await rq._finalize_qualification(db_session, version)
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
     await db_session.commit()
 
     assert result["status"] == "not_promoted"
@@ -474,7 +488,15 @@ async def test_finalize_holds_when_merge_grade_artifact_missing(db_session, mock
         merge_grade_logs=None,
     )
 
-    result = await rq._finalize_qualification(db_session, version)
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
     await db_session.commit()
 
     assert result["status"] == "infra_failure", (
@@ -509,7 +531,15 @@ async def test_finalize_passes_on_covering_merge_grade(db_session, mocker):
         },
     )
 
-    result = await rq._finalize_qualification(db_session, version)
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
     await db_session.commit()
 
     # Dry-run: would-promote path, no hard block.
@@ -549,7 +579,15 @@ async def test_finalize_not_applicable_when_no_merge_grade_task(db_session, mock
         goal="",
     )
 
-    result = await rq._finalize_qualification(db_session, version)
+    _pre_gates = {
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "resolved_sha": "feed" * 10, "detail": "test"},
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    result = await rq._finalize_qualification(db_session, version, _pre_gates=_pre_gates)
     await db_session.commit()
 
     assert result["status"] == "dry_run", (

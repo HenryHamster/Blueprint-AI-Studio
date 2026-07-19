@@ -1,5 +1,5 @@
 /* eslint-disable react-hooks/refs */
-import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback, useImperativeHandle } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
 import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
@@ -9,8 +9,15 @@ import type { ProjectMessage } from '../types/messages';
 import { MessagesSummaryCard } from './MessagesSummaryCard';
 import { type MessageSummaryCounts } from './useMessageList';
 import { type TemporaryMutes } from './temporaryMutes';
+import { preserveScrollAnchorAfterPrepend } from '../utils/conversationScrollAnchor';
 
-type BubbleProps = Omit<MessageBubbleProps, 'msg' | 'faded' | 'readOnly' | 'allMessages'>;
+type BubbleProps = Omit<MessageBubbleProps, 'msg' | 'faded' | 'readOnly' | 'replyTarget'>;
+
+function replyTargetFor(message: ProjectMessage, messagesById: ReadonlyMap<string, ProjectMessage>): ProjectMessage | null {
+  const targetId = message.reply_to_message_id
+    ?? (typeof message.context.reply_to === 'string' ? message.context.reply_to : null);
+  return targetId ? messagesById.get(targetId) ?? null : null;
+}
 
 function TimeDividerRow({ label, className }: { label: string; className?: string }) {
   return (
@@ -54,7 +61,7 @@ export interface SectionIndices {
 
 interface TriageRowData {
   items: TriageItem[];
-  messages: ProjectMessage[];
+  messagesById: ReadonlyMap<string, ProjectMessage>;
   dividerTime: number | null;
   totalNewCount: number;
   showTempMuteMenu: boolean;
@@ -84,8 +91,9 @@ interface TriageRowData {
 function TriageRow({
   index,
   style,
+  ariaAttributes,
   items,
-  messages,
+  messagesById,
   dividerTime,
   totalNewCount,
   showTempMuteMenu,
@@ -117,7 +125,7 @@ function TriageRow({
   if (item.kind === 'banner_new') {
     if (!dividerTime) return null;
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mb-2.5 mx-3 md:mx-4 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-blue-300 truncate">
@@ -146,7 +154,7 @@ function TriageRow({
   if (item.kind === 'banner_caught_up') {
     if (!dividerTime) return null;
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mb-2.5 mx-3 md:mx-4 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-emerald-300 truncate">
@@ -168,7 +176,7 @@ function TriageRow({
 
   if (item.kind === 'loading') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
       </div>
     );
@@ -177,7 +185,7 @@ function TriageRow({
   if (item.kind === 'empty') {
     if (item.emptyKind === 'no_messages') {
       return (
-        <div style={style}>
+        <div style={style} {...ariaAttributes}>
           <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
             <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
             <p className="text-sm">No messages yet</p>
@@ -189,7 +197,7 @@ function TriageRow({
     if (item.emptyKind === 'no_new') {
       if (!dividerTime) return null;
       return (
-        <div style={style}>
+        <div style={style} {...ariaAttributes}>
           <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
             <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
             <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
@@ -200,7 +208,7 @@ function TriageRow({
     }
     // no_match
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No matches for &quot;{searchQuery}&quot;</p>
@@ -212,7 +220,7 @@ function TriageRow({
 
   if (item.kind === 'time_divider') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="px-3 md:px-4">
           <TimeDividerRow label={item.label} />
         </div>
@@ -222,7 +230,7 @@ function TriageRow({
 
   if (item.kind === 'section_sep') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 border-t border-neutral-800/60" />
       </div>
     );
@@ -230,7 +238,7 @@ function TriageRow({
 
   if (item.kind === 'section_head_blockers') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex items-center gap-1.5 text-ui-md text-amber-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
           <AlertTriangle className="w-3 h-3" />
           <span>Pinned · Blockers</span>
@@ -241,7 +249,7 @@ function TriageRow({
 
   if (item.kind === 'section_head_questions') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex items-center gap-1.5 text-ui-md text-blue-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
           <HelpCircle className="w-3 h-3" />
           <span>Awaiting reply · Questions</span>
@@ -253,7 +261,7 @@ function TriageRow({
 
   if (item.kind === 'section_head_linked') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex items-center gap-1.5 text-ui-md text-indigo-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
           <span>Being addressed · Linked</span>
         </div>
@@ -264,7 +272,7 @@ function TriageRow({
   if (item.kind === 'new_divider') {
     if (!dividerTime) return null;
     return (
-      <div style={style} data-divider-marker>
+      <div style={style} {...ariaAttributes} data-divider-marker>
         <div className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
           <div className="flex-1 border-t border-blue-500/40" />
           <div className="flex items-center gap-2 whitespace-nowrap font-medium">
@@ -288,7 +296,7 @@ function TriageRow({
 
   if (item.kind === 'summary_card') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="px-3 md:px-4 pb-2.5">
           <MessagesSummaryCard
             newMessageCounts={newMessageCounts}
@@ -315,13 +323,13 @@ function TriageRow({
 
   if (item.kind === 'message') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="px-3 md:px-4 pb-2.5">
           <MessageBubble
             msg={item.msg}
             faded={item.faded}
             readOnly={item.readOnly}
-            allMessages={messages}
+            replyTarget={replyTargetFor(item.msg, messagesById)}
             highlighted={item.msg.id === highlightedMessageId}
             {...bubbleProps}
           />
@@ -334,7 +342,7 @@ function TriageRow({
     const { groupKey, label, msgs, isExpanded } = item;
     const bd = outcomeBreakdown(msgs);
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 pb-2.5 overflow-hidden rounded-md border border-red-800/50 bg-red-950/20">
           <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
             <button
@@ -361,7 +369,7 @@ function TriageRow({
           </div>
           {isExpanded && (
             <div className="space-y-2 p-2 border-t border-red-900/40">
-              {msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+              {msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly replyTarget={replyTargetFor(msg, messagesById)} {...bubbleProps} />)}
             </div>
           )}
         </div>
@@ -371,7 +379,7 @@ function TriageRow({
 
   if (item.kind === 'routine_head') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
           <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
             <button
@@ -444,7 +452,7 @@ function TriageRow({
 
   if (item.kind === 'mute_active_banner') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 px-4 py-2 bg-amber-950/30 border border-amber-800/30 rounded text-ui-md text-amber-400">
           🔕 Mute active, but failing groups still surface
         </div>
@@ -456,7 +464,7 @@ function TriageRow({
     const { row, isExpanded } = item;
     const bd = outcomeBreakdown(row.msgs);
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
           <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
             <button
@@ -480,7 +488,7 @@ function TriageRow({
           </div>
           {isExpanded && (
             <div className="space-y-2 p-2 border-t border-neutral-800/40">
-              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly replyTarget={replyTargetFor(msg, messagesById)} {...bubbleProps} />)}
             </div>
           )}
         </div>
@@ -492,7 +500,7 @@ function TriageRow({
     const { digestKey, row, isExpanded } = item;
     const summary = formatDailyDigestSummary(row.breakdown);
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer opacity-60">
           <button
             onClick={() => setExpandedGroupKeys(prev => {
@@ -507,7 +515,7 @@ function TriageRow({
           </button>
           {isExpanded && (
             <div className="space-y-2 p-2 border-t border-neutral-800/40">
-              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly replyTarget={replyTargetFor(msg, messagesById)} {...bubbleProps} />)}
             </div>
           )}
         </div>
@@ -517,7 +525,7 @@ function TriageRow({
 
   if (item.kind === 'resolved_toggle') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex justify-center gap-3 pt-1 pb-2">
           <button
             onClick={() => setShowResolved(true)}
@@ -532,7 +540,7 @@ function TriageRow({
 
   if (item.kind === 'resolved_controls') {
     return (
-      <div style={style}>
+      <div style={style} {...ariaAttributes}>
         <div className="flex justify-center gap-3 pt-1 pb-2">
           <button
             onClick={() => setShowResolved(false)}
@@ -746,13 +754,12 @@ export interface MessagesListViewProps {
    * duplicates a persisted message.
    */
   streamingBubble?: ReactNode;
-  /**
-   * LIVE, ephemeral activity strip (commands / tools the resident strategist is
-   * running for the in-flight turn). Rendered at the very tail — below the
-   * streaming bubble — while a turn is working, and cleared by the caller when
-   * the turn ends. Never part of the durable transcript.
-   */
-  activityStrip?: ReactNode;
+  /** Calm operation status rendered at the conversation tail; details stay in Activity. */
+  operationItem?: ReactNode;
+  hasOlderConversationMessages?: boolean;
+  loadingOlderConversationMessages?: boolean;
+  onLoadOlderConversationMessages?: () => void | Promise<void>;
+  conversationListRef?: RefObject<ConversationListImperativeApi | null>;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   dividerDismissedRef: RefObject<boolean>;
@@ -813,61 +820,251 @@ export interface MessagesListViewProps {
  * keeping initial render fast even with 100-200 markdown bubbles.
  */
 export function MessagesListView(props: MessagesListViewProps) {
-  const { presentation = 'triage', streamingBubble, activityStrip, ...triageProps } = props;
+  const {
+    presentation = 'triage',
+    streamingBubble,
+    operationItem,
+    hasOlderConversationMessages,
+    loadingOlderConversationMessages,
+    onLoadOlderConversationMessages,
+    conversationListRef,
+    ...triageProps
+  } = props;
 
   if (presentation === 'conversation') {
-    const { scrollRef, loading, messages, bubbleProps, highlightedMessageId, showScrollDown, scrollToBottom } = triageProps;
     return (
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-workbench-base px-2 py-3 custom-scrollbar md:px-2.5 md:py-4">
-        <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[940px] flex-col gap-3">
-          {loading ? (
-            <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
-          ) : messages.length === 0 && !streamingBubble && !activityStrip ? (
-            <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
-              <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
-              <p className="text-sm">No messages yet</p>
-            </div>
-          ) : (
-            <>
-              {insertTimeDividers(messages).map((item, idx) =>
-                item.kind === 'divider' ? (
-                  <TimeDividerRow key={`divider-conversation-${idx}`} label={item.label} className="my-1" />
-                ) : (
-                  <MessageBubble
-                    key={item.msg.id}
-                    msg={item.msg}
-                    faded={item.msg.status === 'resolved'}
-                    allMessages={messages}
-                    presentation="chat"
-                    highlighted={item.msg.id === highlightedMessageId}
-                    {...bubbleProps}
-                  />
-                ),
-              )}
-              {streamingBubble}
-              {activityStrip}
-            </>
-          )}
-        </div>
-        {showScrollDown && (
-          <button
-            onClick={scrollToBottom}
-            className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900 p-2 text-neutral-400 shadow-lg transition-colors hover:bg-neutral-800 hover:text-neutral-200"
-            aria-label="Scroll to latest message"
-          >
-            <ArrowDown className="h-4 w-4" />
-          </button>
-        )}
-      </div>
+      <ConversationVirtualList
+        {...triageProps}
+        streamingBubble={streamingBubble}
+        operationItem={operationItem}
+        hasOlderConversationMessages={hasOlderConversationMessages}
+        loadingOlderConversationMessages={loadingOlderConversationMessages}
+        onLoadOlderConversationMessages={onLoadOlderConversationMessages}
+        conversationListRef={conversationListRef}
+      />
     );
   }
 
   return <TriageVirtualList {...triageProps} />;
 }
 
+export interface ConversationListImperativeApi {
+  scrollToMessage: (messageId: string) => Promise<boolean>;
+}
+
+type ConversationRow =
+  | { kind: 'load_older' }
+  | { kind: 'loading' }
+  | { kind: 'empty' }
+  | { kind: 'divider'; label: string }
+  | { kind: 'message'; message: ProjectMessage }
+  | { kind: 'node'; key: 'streaming' | 'operation'; node: ReactNode };
+
+interface ConversationRowData {
+  rows: ConversationRow[];
+  messagesById: ReadonlyMap<string, ProjectMessage>;
+  bubbleProps: BubbleProps;
+  highlightedMessageId?: string | null;
+  loadingOlderConversationMessages?: boolean;
+  onLoadOlder: () => void;
+}
+
+function ConversationRowView({
+  index,
+  style,
+  ariaAttributes,
+  rows,
+  messagesById,
+  bubbleProps,
+  highlightedMessageId,
+  loadingOlderConversationMessages,
+  onLoadOlder,
+}: RowComponentProps<ConversationRowData>) {
+  const row = rows[index];
+  return (
+    <div style={style} {...ariaAttributes} className="px-2 md:px-2.5">
+      <div className="mx-auto w-full max-w-[940px] py-1.5">
+        {row.kind === 'load_older' && (
+          <div className="flex justify-center">
+            <button
+              type="button"
+              onClick={onLoadOlder}
+              disabled={loadingOlderConversationMessages}
+              className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950/60 px-3 py-2 text-xs text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-200 disabled:opacity-50"
+            >
+              {loadingOlderConversationMessages ? 'Loading older messages…' : 'Load older messages'}
+            </button>
+          </div>
+        )}
+        {row.kind === 'loading' && <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>}
+        {row.kind === 'empty' && (
+          <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
+            <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
+            <p className="text-sm">No messages yet</p>
+          </div>
+        )}
+        {row.kind === 'divider' && <TimeDividerRow label={row.label} className="my-1" />}
+        {row.kind === 'message' && (
+          <MessageBubble
+            msg={row.message}
+            faded={row.message.status === 'resolved'}
+            replyTarget={replyTargetFor(row.message, messagesById)}
+            presentation="chat"
+            highlighted={row.message.id === highlightedMessageId}
+            {...bubbleProps}
+          />
+        )}
+        {row.kind === 'node' && row.node}
+      </div>
+    </div>
+  );
+}
+
+function ConversationVirtualList({
+  scrollRef,
+  loading,
+  messages,
+  bubbleProps,
+  highlightedMessageId,
+  showScrollDown,
+  scrollToBottom,
+  streamingBubble,
+  operationItem,
+  hasOlderConversationMessages,
+  loadingOlderConversationMessages,
+  onLoadOlderConversationMessages,
+  conversationListRef,
+}: MessagesListViewProps) {
+  const listRef = useListRef(null);
+  const rowHeight = useDynamicRowHeight({ defaultRowHeight: 96 });
+  const renderedRangeRef = useRef({ startIndex: -1, stopIndex: -1 });
+  const pendingNavigationRef = useRef<{
+    index: number;
+    attempts: number;
+    timeout: number;
+    resolve: (rendered: boolean) => void;
+  } | null>(null);
+  const messagesById = useMemo(
+    () => new Map(messages.map(message => [message.id, message])),
+    [messages],
+  );
+  const rows = useMemo<ConversationRow[]>(() => {
+    const next: ConversationRow[] = [];
+    if (hasOlderConversationMessages) next.push({ kind: 'load_older' });
+    if (loading) next.push({ kind: 'loading' });
+    else if (messages.length === 0 && !streamingBubble && !operationItem) next.push({ kind: 'empty' });
+    else {
+      for (const item of insertTimeDividers(messages)) {
+        if (item.kind === 'divider') next.push({ kind: 'divider', label: item.label });
+        else next.push({ kind: 'message', message: item.msg });
+      }
+      if (streamingBubble) next.push({ kind: 'node', key: 'streaming', node: streamingBubble });
+      if (operationItem) next.push({ kind: 'node', key: 'operation', node: operationItem });
+    }
+    return next;
+  }, [hasOlderConversationMessages, loading, messages, operationItem, streamingBubble]);
+
+  useImperativeHandle(conversationListRef, () => ({
+    scrollToMessage: (messageId: string) => {
+      const index = rows.findIndex(row => row.kind === 'message' && row.message.id === messageId);
+      if (index < 0 || !listRef.current) return Promise.resolve(false);
+      const rendered = renderedRangeRef.current;
+      if (index >= rendered.startIndex && index <= rendered.stopIndex) return Promise.resolve(true);
+      if (pendingNavigationRef.current) {
+        window.clearTimeout(pendingNavigationRef.current.timeout);
+        pendingNavigationRef.current.resolve(false);
+      }
+      return new Promise<boolean>(resolve => {
+        const timeout = window.setTimeout(() => {
+          if (pendingNavigationRef.current?.index !== index) return;
+          pendingNavigationRef.current = null;
+          resolve(false);
+        }, 1500);
+        pendingNavigationRef.current = { index, attempts: 1, timeout, resolve };
+        listRef.current?.scrollToRow({ index, align: 'center', behavior: 'instant' });
+      });
+    },
+  }), [conversationListRef, listRef, rows]);
+
+  const handleConversationRowsRendered = useCallback((visible: { startIndex: number; stopIndex: number }) => {
+    renderedRangeRef.current = visible;
+    const pending = pendingNavigationRef.current;
+    if (!pending) return;
+    if (pending.index >= visible.startIndex && pending.index <= visible.stopIndex) {
+      pendingNavigationRef.current = null;
+      window.clearTimeout(pending.timeout);
+      pending.resolve(true);
+      return;
+    }
+    if (pending.attempts >= 12) return;
+    pending.attempts += 1;
+    listRef.current?.scrollToRow({ index: pending.index, align: 'center', behavior: 'instant' });
+  }, [listRef]);
+
+  useEffect(() => () => {
+    if (!pendingNavigationRef.current) return;
+    window.clearTimeout(pendingNavigationRef.current.timeout);
+    pendingNavigationRef.current.resolve(false);
+    pendingNavigationRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    scrollRef.current = listRef.current?.element ?? null;
+    return () => { scrollRef.current = null; };
+  });
+
+  const handleLoadOlder = useCallback(() => {
+    const element = listRef.current?.element;
+    if (element && onLoadOlderConversationMessages) {
+      void preserveScrollAnchorAfterPrepend(element, onLoadOlderConversationMessages);
+    }
+  }, [listRef, onLoadOlderConversationMessages]);
+
+  const rowProps: ConversationRowData = useMemo(() => ({
+    rows,
+    messagesById,
+    bubbleProps,
+    highlightedMessageId,
+    loadingOlderConversationMessages,
+    onLoadOlder: handleLoadOlder,
+  }), [
+    bubbleProps,
+    handleLoadOlder,
+    highlightedMessageId,
+    loadingOlderConversationMessages,
+    messagesById,
+    rows,
+  ]);
+
+  return (
+    <div className="relative mx-auto w-full max-w-[940px] flex-1 overflow-hidden bg-workbench-base" data-testid="strategic-conversation-column">
+      <List
+        rowCount={rows.length}
+        rowComponent={ConversationRowView}
+        rowProps={rowProps}
+        rowHeight={rowHeight}
+        overscanCount={6}
+        listRef={listRef}
+        defaultHeight={600}
+        className="h-full custom-scrollbar overflow-y-auto"
+        onRowsRendered={handleConversationRowsRendered}
+      />
+      {showScrollDown && (
+        <button
+          onClick={scrollToBottom}
+          className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900 p-2 text-neutral-400 shadow-lg transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+          aria-label="Scroll to latest message"
+        >
+          <ArrowDown className="h-4 w-4" />
+        </button>
+      )}
+    </div>
+  );
+}
+
 // ─── Triage virtual list ──────────────────────────────────────────────────────
 
-type TriageVirtualListProps = Omit<MessagesListViewProps, 'presentation' | 'streamingBubble' | 'activityStrip'>;
+type TriageVirtualListProps = Omit<MessagesListViewProps, 'presentation' | 'streamingBubble' | 'operationItem'>;
 
 function TriageVirtualList(props: TriageVirtualListProps) {
   const {
@@ -914,6 +1111,10 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     handleBulkDeleteResolved,
   } = props;
   const listRef = useListRef(null);
+  const messagesById = useMemo(
+    () => new Map(messages.map(message => [message.id, message])),
+    [messages],
+  );
 
   // Sync the List's outer DOM element to scrollRef so MessagesPanel's scroll
   // behaviors (auto-scroll, near-bottom detection, event listeners) work unchanged.
@@ -970,7 +1171,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
 
   const rowProps: TriageRowData = useMemo(() => ({
     items,
-    messages,
+    messagesById,
     dividerTime,
     totalNewCount,
     showTempMuteMenu,
@@ -996,7 +1197,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     handleResolveGroup,
     handleBulkDeleteResolved,
   }), [
-    items, messages, dividerTime, totalNewCount,
+    items, messagesById, dividerTime, totalNewCount,
     showTempMuteMenu, routineExpanded,
     tempMutes, topNoisyEventTypes, searchQuery, newMessageCounts, listRef,
     sectionIndices, bubbleProps, highlightedMessageId,

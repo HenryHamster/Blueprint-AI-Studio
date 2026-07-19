@@ -851,6 +851,7 @@ async def merge_pull_request(
     project_id: str | None = None,
     *,
     allow_changes_requested: bool = False,
+    expected_head_sha: str | None = None,
 ) -> dict:
     """Merges a PR. Returns dict with 'merged' bool and 'message'. Does not raise on conflict.
 
@@ -894,11 +895,18 @@ async def merge_pull_request(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    merge_body: dict[str, str] = {"merge_method": merge_method}
+    if expected_head_sha:
+        # GitHub rejects the merge with 409 if the PR head no longer matches this
+        # sha, so a head that advanced after the merge was authorised (e.g. a new
+        # push between an operator approval and the merge) fails closed instead of
+        # merging unreviewed commits.
+        merge_body["sha"] = expected_head_sha
     response = await _github_request(
         "PUT",
         f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/merge",
         headers,
-        json={"merge_method": merge_method},
+        json=merge_body,
         project_id=project_id,
     )
 

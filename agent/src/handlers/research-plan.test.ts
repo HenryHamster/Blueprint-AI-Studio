@@ -90,6 +90,7 @@ const {
     'getFormatComplianceTelemetry',
     'getLastProviderRunErrorReport',
     'getLlmTelemetry',
+    'getOperatorDecisionCaptureTelemetry',
     'getProviderRunner',
     'git',
     'gitAsync',
@@ -104,6 +105,7 @@ const {
     'matchesVmConfigMissing',
     'missingProviderConfigFiles',
     'missingVmProviderConfigFiles',
+    'normalizeClaudeConfigContent',
     'normalizePytestSelectorForRunner',
     'parseFailingTests',
     'parseFailingTestsFromVitestJson',
@@ -111,6 +113,7 @@ const {
     'parseStaleResultFile',
     'performWarmRetarget',
     'persistAndPostStatus',
+    'persistResidentTurnFailure',
     'pollForNextRole',
     'postTerminalStatusSync',
     'providerSupportsNativeSubagents',
@@ -127,15 +130,18 @@ const {
     'recordLlmTokens',
     'recordProviderReportedUsage',
     'recordNumTurns',
+    'recordOperatorDecisionCapture',
     'recordResidentTurnLatency',
     'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
     'replayLogBufferRateLimited',
+    'requireClaimAgentToken',
     'requiredProviderConfigFiles',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
+    'resetOperatorDecisionCaptureTelemetry',
     'resetPerRoleModuleState',
     'resetResidentTurnLatencyTelemetry',
     'resolveBaseBranch',
@@ -156,6 +162,7 @@ const {
     'snapshotToolTrace',
     'staleResultBackoffMs',
     'strVal',
+    'taskRequiresGithubCredentials',
     'testFixLoop',
     'validateBranchName',
   ],
@@ -182,6 +189,7 @@ vi.mock('fs', async (importOriginal) => {
 });
 
 vi.mock('../index.js', () => ({
+  normalizeClaudeConfigContent: vi.fn((_path: string, content: string) => content),
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
@@ -1604,7 +1612,33 @@ describe('formatCriteriaRubric', () => {
   it('makes the NO-criteria case explicit (thinker section 8 authors only when none exist)', () => {
     // Regression guard: if "none authored" renders identically to "not rendered",
     // the thinker re-authors the rubric every cycle.
+    // present criterion_coverage with an EMPTY list → genuinely no criteria authored.
     const out = formatCriteriaRubric(withCriteria([])).join('\n');
+    expect(out).toContain('None authored yet');
+    expect(out).not.toContain('floored out');
+  });
+
+  it('distinguishes floored-out (criterion_coverage key absent) from no-criteria', () => {
+    // Trust-surface regression guard: when the packer floors version_phase for budget
+    // it can drop the criterion_coverage key entirely. Rendering "None authored yet"
+    // then conflates "floored out" with "no criteria exist" and drives the thinker to
+    // re-author a rubric that is actually live — a duplicate-authoring hazard.
+    const out = formatCriteriaRubric({ version_number: 26, phase: 'stabilize' }).join('\n');
+    expect(out).not.toContain('None authored yet');
+    expect(out).toContain('floored out');
+    // Points the strategist at the recovery path instead of a false empty state.
+    expect(out).toContain('./fetch version-phase');
+  });
+
+  it('treats criterion_coverage present-but-not-a-dict as floored-out, not no-criteria', () => {
+    // The key IS present (so not floored-out per the absence check) but carries no
+    // usable list — still must not render "None authored yet" if there is a list-less
+    // shape; here the key is present with an empty-criteria coverage object → no-criteria.
+    const out = formatCriteriaRubric({
+      version_number: 26,
+      phase: 'stabilize',
+      criterion_coverage: { criteria: [] },
+    }).join('\n');
     expect(out).toContain('None authored yet');
   });
 
@@ -1634,6 +1668,29 @@ describe('formatCriteriaRubric', () => {
     )).join('\n');
     expect(out).toContain('No test cites this behavior.');
     expect(out).toContain('Nothing covers the rollback path.');
+  });
+
+  it('limits prior grade gaps to the current active rubric after criteria change', () => {
+    const out = formatCriteriaRubric(withCriteria(
+      [
+        { criterion_key: 'c-current', text: 'Current criterion.', status: 'active' },
+        { criterion_key: 'c-new', text: 'Newly active criterion.', status: 'active' },
+        { criterion_key: 'c-retracted', text: 'Retracted criterion.', status: 'retracted' },
+      ],
+      {
+        status: 'not_promoted',
+        category_verdicts: [
+          { category_key: 'c-current', status: 'not_met', gap: 'Current gap.' },
+          { category_key: 'c-retracted', status: 'not_met', gap: 'Retracted gap.' },
+        ],
+      },
+    )).join('\n');
+
+    expect(out).toContain('c-current');
+    expect(out).toContain('Current gap.');
+    expect(out).toContain('c-new');
+    expect(out).not.toContain('Retracted gap.');
+    expect(out).not.toContain('`c-retracted` (not_met)');
   });
 
   it('omits the gap block when the last grade met every category', () => {

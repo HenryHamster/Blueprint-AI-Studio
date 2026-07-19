@@ -30,7 +30,8 @@ from app.shared_state import (
 from app.release_artifacts import version_serving_summary as _version_serving_summary
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
-    resolve_open_version_qualification_state,
+    resolve_newest_qualification_verdict,
+    resolve_open_version_qualification_read_model,
     resolve_promotion_blocking_result,
     resolve_dimension_states,
     resolve_dimension_states_from_ledger,
@@ -170,6 +171,9 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
     out.update(
         {
             "status": qual.get("status"),
+            "qualification_attempt_id": qual.get("qualification_attempt_id"),
+            "retry_episode": qual.get("retry_episode"),
+            "retry_episode_cap": qual.get("retry_episode_cap"),
             "confidence": qual.get("confidence"),
             "threshold": qual.get("threshold"),
             "sub_scores": qual.get("sub_scores"),
@@ -183,6 +187,10 @@ def _format_qualification(qual: Dict[str, Any]) -> Dict[str, Any]:
             # Infra-failure context (populated only when status=infra_failure).
             "error": qual.get("error"),
             "consecutive_infra_errors": qual.get("consecutive_infra_errors"),
+            # True when the same migration-apply gate failure has repeated
+            # _MIN_INFRA_ERROR_STREAK+ times with an identical signature —
+            # the operator hotfix-deploy channel is the sanctioned remedy.
+            "is_permanent_gate_incapacity": qual.get("is_permanent_gate_incapacity"),
             # Audit observability: why the audit sub-score is missing/unscoreable.
             "audit_missing_reason": qual.get("audit_missing_reason"),
             # Audit reconciliation: model-reported vs findings-derived score delta
@@ -288,6 +296,12 @@ async def _serialize_version_history_entry(
         "opened_at": version.opened_at.isoformat(),
         "promoted_at": version.promoted_at.isoformat() if version.promoted_at else None,
         "qualification_attempts": version.qualification_attempts,
+        "qualification_retry_episode": getattr(version, "qualification_retry_episode", 0),
+        "active_qualification_attempt_id": (
+            str(version.active_qualification_attempt_id)
+            if getattr(version, "active_qualification_attempt_id", None)
+            else None
+        ),
         "last_qualification": _format_qualification(version.last_qualification)
         if version.last_qualification
         else None,
@@ -727,15 +741,19 @@ async def get_version_lifecycle(
             # thread it into the seam so the shared ledger sub_score overlay is
             # applied without a duplicate ledger query. The seam now GUARANTEES the
             # overlay, so no separate patch call is needed here.
-            _open_dim_states = await resolve_dimension_states_from_ledger(session, open_row)
-            qual_state, _ = await resolve_open_version_qualification_state(
+            _qualification_read = await resolve_open_version_qualification_read_model(
                 session,
                 open_row,
                 project_row,
                 audit_child=latest_audit,
                 serving=(aggregate_serving, artifact_evidence),
-                dimension_states=_open_dim_states,
             )
+            _open_dim_states = _qualification_read.dimension_states
+            qual_state = _qualification_read.qualification_state
+            if _qualification_trigger_state is not None:
+                _qualification_trigger_state["qualification_provenance"] = (
+                    _qualification_read.provenance
+                )
 
             # Fetch live current_focus from the project's problem_model
             live_current_focus = None
@@ -758,6 +776,13 @@ async def get_version_lifecycle(
                 "live_current_focus": live_current_focus,
                 "opened_at": open_row.opened_at.isoformat(),
                 "qualification_attempts": open_row.qualification_attempts,
+                "qualification_retry_episode": open_row.qualification_retry_episode,
+                "active_qualification_attempt_id": (
+                    str(open_row.active_qualification_attempt_id)
+                    if open_row.active_qualification_attempt_id
+                    else None
+                ),
+                "qualification_provenance": _qualification_read.provenance,
                 "merged_task_count": merged_count,
                 # Version-window acceptance aggregate (proven-vs-merged) — additive
                 # and nullable, surfaced ALONGSIDE the raw ``merged_task_count`` (not
@@ -1300,23 +1325,14 @@ async def get_audit_findings(
     if open_row is None:
         return {"findings": [], "source": "no_open_version"}
 
-    # Prefer the latest durable verdict row that carries audit findings for this
-    # version — it survives the next re-qualification's last_qualification
-    # overwrite, so a blocked attempt's findings are not lost.
-    verdict = (
-        (
-            await session.execute(
-                select(QualificationVerdict)
-                .where(
-                    QualificationVerdict.release_version_id == open_row.id,
-                    QualificationVerdict.audit_findings.is_not(None),
-                )
-                .order_by(QualificationVerdict.created_at.desc())
-                .limit(1)
-            )
-        )
-        .scalars()
-        .first()
+    # Scope the verdict lookup to the active attempt so a same-SHA requalification
+    # that has started but not yet finalized does not return the prior attempt's
+    # findings as though they belonged to the active attempt.  Prior-attempt
+    # findings remain in the database but are deliberately invisible until the
+    # active attempt produces its own verdict (or the projection lacks durable
+    # identity, in which case the newest-row fallback applies).
+    verdict = await resolve_newest_qualification_verdict(
+        session, open_row, require_audit_findings=True
     )
 
     if verdict is not None:
@@ -1456,9 +1472,10 @@ async def get_version_summary(
     # qualification_state carries the ledger-backed per-dimension sub_score
     # overlay rather than the mutable last_qualification blob, keeping it
     # consistent with the dimension_states other surfaces expose.
-    qualification_state, _ = await resolve_open_version_qualification_state(
+    qualification_read = await resolve_open_version_qualification_read_model(
         session, version, project, serving=(aggregate_serving, artifacts)
     )
+    qualification_state = qualification_read.qualification_state
 
     highlights = _release_version.build_version_highlights(
         version,
@@ -1486,6 +1503,14 @@ async def get_version_summary(
         # Qualification
         "qualification_state": qualification_state,
         "qualification_attempts": version.qualification_attempts,
+        "qualification_retry_episode": version.qualification_retry_episode,
+        "active_qualification_attempt_id": (
+            str(version.active_qualification_attempt_id)
+            if version.active_qualification_attempt_id
+            else None
+        ),
+        "qualification_provenance": qualification_read.provenance,
+        "dimension_states": qualification_read.dimension_states,
         # Serving fields
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
@@ -1818,9 +1843,10 @@ async def get_release_version_summary(
     # qualification_state carries the ledger-backed per-dimension sub_score
     # overlay rather than the mutable last_qualification blob, keeping it
     # consistent with the dimension_states other surfaces expose.
-    qualification_state, _ = await resolve_open_version_qualification_state(
+    qualification_read = await resolve_open_version_qualification_read_model(
         session, version, project, serving=(aggregate_serving, artifacts)
     )
+    qualification_state = qualification_read.qualification_state
 
     # Derive highlights from the data above — no extra I/O. Shared helper so the
     # version-lifecycle current_version block renders an identical headline; the
@@ -1850,6 +1876,15 @@ async def get_release_version_summary(
         "acceptance_aggregate": acceptance_aggregate,
         # Qualification state
         "qualification_state": qualification_state,
+        "qualification_attempts": version.qualification_attempts,
+        "qualification_retry_episode": version.qualification_retry_episode,
+        "active_qualification_attempt_id": (
+            str(version.active_qualification_attempt_id)
+            if version.active_qualification_attempt_id
+            else None
+        ),
+        "qualification_provenance": qualification_read.provenance,
+        "dimension_states": qualification_read.dimension_states,
         # Serving fields
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,

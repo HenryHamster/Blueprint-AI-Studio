@@ -5462,4 +5462,7 @@ async def test_commit_file_changes_identical_tree_creates_no_empty_commit(mocker
     assert req.await_count == 4
     urls = [call.args[1] for call in req.await_args_list]
     assert not any(url.endswith("/git/commits") for url in urls)
+
     assert not any("/git/refs/heads/" in url for url in urls)
+    assert not any("/git/refs/heads/" in url for url in urls)
+

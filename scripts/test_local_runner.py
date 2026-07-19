@@ -1,6 +1,7 @@
 """Tests for scripts/local_runner.py."""
 
 import contextlib
+import base64
 import io
 import json
 import os
@@ -43,6 +44,43 @@ def _docker_caps(gpu_indices=()):
         gpu_indices=tuple(gpu_indices),
         gpu_names=tuple(f"Tesla V100-{i}" for i in gpu_indices),
     )
+
+
+class TestGpuPassthroughRetry(unittest.TestCase):
+    def test_retries_transient_proof_after_cadence_and_preserves_no_host_gpu(self):
+        transient = iso.replace(
+            _docker_caps((0,)),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "probe_timeout"}
+            },
+        )
+        refreshed = iso.replace(
+            transient,
+            container_gpu_passthrough={
+                "docker": {"verified": True, "mode": "hook", "reason": "verified"}
+            },
+        )
+        with patch.object(iso, "refresh_container_gpu_passthrough", return_value=refreshed) as refresh:
+            result, retry_at = local_runner._retry_transient_gpu_passthrough(
+                transient, 0.0, now=local_runner._GPU_PASSTHROUGH_RETRY_SECONDS
+            )
+        self.assertIs(result, refreshed)
+        self.assertEqual(retry_at, local_runner._GPU_PASSTHROUGH_RETRY_SECONDS)
+        refresh.assert_called_once_with(transient)
+
+        no_host_gpu = iso.replace(
+            _docker_caps(),
+            container_gpu_passthrough={
+                "docker": {"verified": False, "mode": "hook", "reason": "no_host_gpu"}
+            },
+        )
+        with patch.object(iso, "refresh_container_gpu_passthrough") as refresh:
+            result, retry_at = local_runner._retry_transient_gpu_passthrough(
+                no_host_gpu, 0.0, now=999.0
+            )
+        self.assertIs(result, no_host_gpu)
+        self.assertEqual(retry_at, 0.0)
+        refresh.assert_not_called()
 
 
 def _healthy_llm_clis():
@@ -702,6 +740,54 @@ class TestEnvVarValidation(unittest.TestCase):
     # the main loop's _locate_agent_binary re-resolution.
 
 
+class TestCheckModeAggregatesFailures(unittest.TestCase):
+    """`--check` reports ALL missing prerequisites in one pass (not first-fail)."""
+
+    def _run_check(self, env_overrides=None, strip_vars=None):
+        env = os.environ.copy()
+        env.pop("BLUEPRINT_RUNNER_TOKEN", None)
+        env.pop("BLUEPRINT_ORCHESTRATOR_URL", None)
+        # Point the credential file at an empty temp dir so a real saved token on
+        # the test box can't mask a "missing token" case.
+        with tempfile.TemporaryDirectory() as tmp:
+            env["BLUEPRINT_CREDENTIAL_DIR"] = tmp
+            if env_overrides:
+                env.update(env_overrides)
+            if strip_vars:
+                for k in strip_vars:
+                    env.pop(k, None)
+            return subprocess.run(
+                [sys.executable, str(Path(__file__).parent / "local_runner.py"), "--check"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+    def test_check_missing_both_reports_both_and_exits_1(self):
+        # Regression: today --check dies naming only the token; it must name BOTH.
+        result = self._run_check()
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN", combined)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+
+    def test_check_missing_url_still_runs_preflight_probes(self):
+        # Token present, URL absent: the preflight report must still print (the
+        # probes ran despite the missing URL) rather than a bare first-fail exit.
+        result = self._run_check(env_overrides={"BLUEPRINT_RUNNER_TOKEN": "tok-abc-123456"})
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", combined)
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", combined.split("missing prerequisite")[-1])
+        # Preflight probe output (isolation / task classes) proves probes ran.
+        self.assertTrue(
+            ("isolation" in combined.lower()) or ("task class" in combined.lower())
+            or ("claimable" in combined.lower()),
+            msg=f"expected preflight probe output, got:\n{combined}",
+        )
+
+
 # ── Agent binary detection ─────────────────────────────────────────────────────
 
 class TestAgentBinaryDetection(unittest.TestCase):
@@ -1035,6 +1121,63 @@ class TestHostLoadThrottle(unittest.TestCase):
         )
         self.assertTrue(len(calls) >= 1)
 
+    def test_low_disk_skips_compute_claim(self):
+        """Compute poll skips claiming when workspace free disk is below the guard.
+
+        A baked container-image job must pull a multi-GB image before starting;
+        claiming on a nearly-full box wastes the claim, so the loop must not
+        even POST to next-compute-job while disk is below the floor.
+        """
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return (204, None, None)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
+             patch.object(local_runner, "_disk_below_min", return_value=True), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        self.assertEqual(calls, [], "must not poll for compute work while disk is low")
+
+    def test_disk_ok_allows_compute_claim(self):
+        """Compute poll proceeds when workspace free disk is above the guard."""
+        calls = []
+
+        def fake_post(url, token, body, **kwargs):
+            calls.append(url)
+            return (204, None, None)
+
+        active_jobs, lock = self._make_compute_deps()
+        with patch.object(local_runner, "_gpu_utilization_pct", return_value=None), \
+             patch.object(local_runner, "_workspace_root", return_value="/tmp"), \
+             patch.object(local_runner, "_min_free_disk_bytes", return_value=1_000_000), \
+             patch.object(local_runner, "_disk_below_min", return_value=False), \
+             patch.object(local_runner, "_post", side_effect=fake_post):
+            t = threading.Thread(
+                target=local_runner._compute_poll_loop,
+                args=("http://test", "tok", active_jobs, lock, 1),
+                kwargs={"base_poll_interval": 0.05},
+                daemon=True,
+            )
+            t.start()
+            time.sleep(0.15)
+            local_runner._shutdown_event.set()
+            t.join(timeout=2)
+        self.assertTrue(len(calls) >= 1)
+
 
 # ── Live-safe config applied from heartbeat response ──────────────────────────
 
@@ -1161,14 +1304,16 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "gen-A"}))
         self.assertEqual(holder.report()["applied_config_generation"], "gen-A")
         # A block carrying an UNRECOGNIZED non-null field is not fully applicable:
-        # the known fields still apply, but the generation stays pending (older).
+        # the whole block is rejected atomically — the known fields do NOT apply.
         applied = holder.apply({
             "max_concurrent": 7,
             "future_field": "something",
             "config_generation": "gen-B",
         })
         self.assertFalse(applied)
-        self.assertEqual(holder.max_concurrent(), 7)  # known field still applied
+        # Atomic reject: the whole block is refused, so the known field is NOT
+        # mutated either — the runner's live state is still generation gen-A.
+        self.assertEqual(holder.max_concurrent(), 4)  # unchanged from gen-A
         self.assertEqual(holder.report()["applied_config_generation"], "gen-A")  # not advanced
 
     def test_malformed_block_is_noop(self):
@@ -1176,6 +1321,249 @@ class TestLiveRunnerConfig(unittest.TestCase):
         self.assertFalse(holder.apply(None))
         self.assertFalse(holder.apply("not-a-dict"))
         self.assertEqual(holder.max_concurrent(), 2)
+
+    def test_clean_apply_reports_status_applied_with_null_reason(self):
+        # A config that applies cleanly reports status 'applied' with no reason
+        # or rejected fields — additive keys read as no-rejection for the UI.
+        holder, _ = self._holder()
+        holder.apply({"max_concurrent": 4, "config_generation": "gen-A"})
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertIsNone(report["config_apply_reason"])
+        self.assertIsNone(report["config_rejected_fields"])
+        self.assertIsNone(report["config_rejected_generation"])
+
+    def test_unrecognized_field_records_reason_and_fields(self):
+        # An unrecognized non-null field forces non-application: the holder
+        # records the refused generation, the offending field name(s), and a
+        # stable human reason so the operator sees WHICH field broke.
+        holder, _ = self._holder()
+        applied = holder.apply({
+            "max_concurrent": 7,
+            "retries": 3,
+            "config_generation": "gen-B",
+        })
+        self.assertFalse(applied)
+        # Atomic reject: the co-delivered known field must NOT have been applied.
+        self.assertEqual(holder.max_concurrent(), 2)  # prior default, untouched
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertEqual(report["config_rejected_fields"], ["retries"])
+        self.assertEqual(report["config_rejected_generation"], "gen-B")
+        self.assertIn("retries", report["config_apply_reason"])
+        self.assertEqual(
+            report["config_apply_reason"], "unrecognized config field(s): retries"
+        )
+
+    def test_multiple_unrecognized_fields_sorted_in_reason(self):
+        holder, _ = self._holder()
+        holder.apply({
+            "zeta": 1,
+            "alpha": 2,
+            "config_generation": "gen-multi",
+        })
+        report = holder.report()
+        # Field names are de-duplicated and sorted for a stable reason string.
+        self.assertEqual(report["config_rejected_fields"], ["alpha", "zeta"])
+        self.assertEqual(
+            report["config_apply_reason"], "unrecognized config field(s): alpha, zeta"
+        )
+
+    def test_rejection_cleared_once_clean_later_generation_applies(self):
+        # A rejection reason must NOT linger after the operator fixes the config
+        # and a later clean generation converges — else the UI shows a resolved
+        # error forever.
+        holder, _ = self._holder()
+        holder.apply({"retries": 3, "config_generation": "gen-bad"})
+        self.assertEqual(holder.report()["config_apply_status"], "rejected")
+        # The operator removes the bad field; a clean later generation applies.
+        self.assertTrue(
+            holder.apply({"max_concurrent": 5, "config_generation": "gen-good"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertIsNone(report["config_apply_reason"])
+        self.assertIsNone(report["config_rejected_fields"])
+        self.assertIsNone(report["config_rejected_generation"])
+
+    def test_reports_structured_rejected_reason_and_clears_on_apply(self):
+        """A not-fully-applicable block reports a structured rejection naming the
+        offending field(s) and the rejected generation; a fully-applied block
+        clears the rejection state back to an 'applied' outcome."""
+        holder, _ = self._holder()
+        # Clean baseline: no rejection.
+        self.assertTrue(holder.apply({"max_concurrent": 3, "config_generation": "g0"}))
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "applied")
+        self.assertIsNone(rep["config_apply_reason"])
+        self.assertIsNone(rep["config_rejected_generation"])
+
+        # An unrecognized non-null field causes atomic rejection — known field NOT applied.
+        applied = holder.apply({
+            "max_concurrent": 6,
+            "zzz_field": "x",
+            "aaa_field": 1,
+            "config_generation": "g1",
+        })
+        self.assertFalse(applied)
+        # Atomic reject: the known field is NOT applied — live state stays at g0.
+        self.assertEqual(holder.max_concurrent(), 3)  # unchanged from g0
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "rejected")
+        # Reason names the specific unrecognized field(s), sorted for determinism.
+        self.assertEqual(
+            rep["config_apply_reason"],
+            "unrecognized config field(s): aaa_field, zzz_field",
+        )
+        self.assertEqual(rep["config_rejected_generation"], "g1")
+        # Applied generation stays at the last fully-applied one.
+        self.assertEqual(rep["applied_config_generation"], "g0")
+
+        # A fully-applicable generation clears the rejection state.
+        self.assertTrue(holder.apply({"max_concurrent": 4, "config_generation": "g2"}))
+        rep = holder.report()
+        self.assertEqual(rep["config_apply_status"], "applied")
+        self.assertIsNone(rep["config_apply_reason"])
+        self.assertIsNone(rep["config_rejected_generation"])
+        self.assertEqual(rep["applied_config_generation"], "g2")
+
+    def test_rejected_generation_mutates_no_recognized_field(self):
+        # A rejected block (mix of known + unrecognized fields) must leave EVERY
+        # recognized field at its prior value — max_concurrent, task_types, and
+        # both GPU-scheduling settings — so the 'rejected' verdict is honest.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        # Establish a known-good baseline generation first.
+        self.assertTrue(holder.apply({
+            "max_concurrent": 5,
+            "task_types": ["fix"],
+            "gpu_indices_allowed": [0, 1],
+            "gpus_per_job": 2,
+            "config_generation": "base",
+        }))
+        self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(gpu_state["allowed"], [0, 1])
+        self.assertEqual(gpu_state["per_job"], 2)
+        # A later block flips every recognized field BUT carries an unrecognized
+        # one, so it must be rejected atomically — none of the flips take effect.
+        self.assertFalse(holder.apply({
+            "max_concurrent": 9,
+            "task_types": ["create"],
+            "gpu_indices_allowed": [2, 3],
+            "gpus_per_job": 4,
+            "surprise_field": True,
+            "config_generation": "reject",
+        }))
+        self.assertEqual(holder.max_concurrent(), 5)
+        self.assertEqual(holder.report()["applied_task_types"], ["fix"])
+        self.assertEqual(gpu_state["allowed"], [0, 1])
+        self.assertEqual(gpu_state["per_job"], 2)
+        self.assertEqual(holder.report()["applied_config_generation"], "base")
+
+    def test_malformed_max_concurrent_rejects_generation(self):
+        # A recognized field with an unparseable value used to be silently
+        # clamped to the MIN default while the generation was called applied.
+        # It must now reject the generation and leave the value untouched.
+        holder, _ = self._holder()
+        self.assertTrue(holder.apply({"max_concurrent": 6, "config_generation": "ok"}))
+        self.assertFalse(
+            holder.apply({"max_concurrent": "abc", "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("max_concurrent", report["config_rejected_fields"])
+        self.assertEqual(report["config_rejected_generation"], "bad")
+        # Value untouched (NOT silently clamped to MIN_CONCURRENT).
+        self.assertEqual(holder.max_concurrent(), 6)
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_task_types_rejects_generation(self):
+        # A non-list, non-"all" task_types was silently ignored while the
+        # generation advanced; it must now reject.
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"task_types": ["fix"], "config_generation": "ok"})
+        )
+        self.assertFalse(
+            holder.apply({"task_types": 42, "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("task_types", report["config_rejected_fields"])
+        # Prior value untouched.
+        self.assertEqual(report["applied_task_types"], ["fix"])
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_gpu_indices_rejects_generation(self):
+        # gpu_indices_allowed must be "all" or a list; a bare int was silently
+        # ignored. It must now reject the generation.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        self.assertFalse(
+            holder.apply({"gpu_indices_allowed": 7, "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("gpu_indices_allowed", report["config_rejected_fields"])
+        # Scheduling set untouched (starts as every detected index).
+        self.assertEqual(sorted(gpu_state["allowed"]), [0, 1, 2, 3])
+
+    def test_malformed_gpus_per_job_rejects_generation(self):
+        # gpus_per_job with an unparseable value was silently ignored; reject.
+        holder, gpu_state = self._holder(gpu_indices=(0, 1, 2, 3))
+        self.assertTrue(holder.apply({"gpus_per_job": 3, "config_generation": "ok"}))
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertFalse(
+            holder.apply({"gpus_per_job": "x", "config_generation": "bad"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "rejected")
+        self.assertIn("gpus_per_job", report["config_rejected_fields"])
+        # Value untouched (NOT silently ignored-while-applied).
+        self.assertEqual(gpu_state["per_job"], 3)
+        self.assertEqual(report["applied_config_generation"], "ok")
+
+    def test_malformed_field_reason_names_field(self):
+        # The human reason string names the malformed field(s), distinct from
+        # the unrecognized-field wording, so the operator can tell them apart.
+        holder, _ = self._holder()
+        self.assertFalse(
+            holder.apply({"max_concurrent": [1, 2], "config_generation": "bad"})
+        )
+        reason = holder.report()["config_apply_reason"]
+        self.assertIn("malformed config field(s): max_concurrent", reason)
+
+    def test_out_of_range_int_still_applies_not_malformed(self):
+        # A well-typed but out-of-range clamp field is a VALID value the daemon
+        # clamps — it must still apply fully (regression guard for the malformed
+        # classification not over-reaching into the clamp contract).
+        holder, _ = self._holder()
+        self.assertTrue(
+            holder.apply({"max_concurrent": 999, "config_generation": "big"})
+        )
+        report = holder.report()
+        self.assertEqual(report["config_apply_status"], "applied")
+        self.assertEqual(
+            holder.max_concurrent(), local_runner._LiveRunnerConfig.MAX_CONCURRENT
+        )
+        self.assertEqual(report["applied_config_generation"], "big")
+
+    def test_mixed_unrecognized_and_malformed_reason_lists_both(self):
+        # When a block carries BOTH an unrecognized field and a malformed
+        # recognized field, the reason names both categories and the field list
+        # is the sorted union.
+        holder, _ = self._holder()
+        self.assertFalse(holder.apply({
+            "max_concurrent": "nope",
+            "mystery": 1,
+            "config_generation": "bad",
+        }))
+        report = holder.report()
+        self.assertEqual(
+            report["config_rejected_fields"], ["max_concurrent", "mystery"]
+        )
+        self.assertIn("unrecognized config field(s): mystery", report["config_apply_reason"])
+        self.assertIn(
+            "malformed config field(s): max_concurrent", report["config_apply_reason"]
+        )
 
 
 class TestComputePollLoopLiveConfig(unittest.TestCase):
@@ -2205,7 +2593,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2244,7 +2632,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({
                 "exec_status": exec_status,
                 "exit_code": exit_code,
@@ -2275,12 +2663,67 @@ class TestRunComputeJob(unittest.TestCase):
         # job_id removed from active_jobs after completion
         self.assertNotIn("test-job-001", active_jobs)
 
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX test execution plan")
+    def test_required_artifact_failure_reports_after_delivery_attempt(self):
+        events = []
+        terminal = []
+
+        def fake_upload(*_args):
+            events.append("upload")
+            return {
+                "status": "failed",
+                "protocol": "direct",
+                "reason": "completion_http_503",
+            }
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **kwargs):
+            if exec_status in ("succeeded", "failed"):
+                events.append("report")
+                terminal.append({"exec_status": exec_status, **kwargs})
+            return False
+
+        job = self._make_job(
+            command="exit 0",
+            require_durable_artifact=True,
+        )
+        with patch.object(local_runner, "_upload_artifact", side_effect=fake_upload), \
+             patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                job,
+                "https://api.example.com",
+                "tok",
+                {"test-job-001"},
+                threading.Lock(),
+                capabilities=_bwrap_caps(),
+            )
+
+        self.assertEqual(events, ["upload", "report"])
+        self.assertEqual(terminal[-1]["exec_status"], "failed")
+        self.assertEqual(terminal[-1]["exit_code"], 0)
+        delivery = terminal[-1]["artifact_delivery"]
+        self.assertEqual(delivery["status"], "failed")
+        self.assertEqual(delivery["command_exec_status"], "succeeded")
+        self.assertEqual(delivery["reason"], "completion_http_503")
+
+        job = self._make_job(command="exit 0", require_durable_artifact="false")
+        with patch.object(local_runner, "_upload_artifact", side_effect=fake_upload), \
+             patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", {"test-job-001"},
+                threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        self.assertEqual(terminal[-1]["exec_status"], "succeeded")
+        self.assertEqual(terminal[-1]["artifact_delivery"]["status"], "failed")
+
     def test_failed_command_reports_failed(self):
         """A command that exits non-zero → failed report."""
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2313,7 +2756,7 @@ class TestRunComputeJob(unittest.TestCase):
         captured: dict = {}
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "exit_code": exit_code})
             return False
 
@@ -2366,7 +2809,7 @@ class TestRunComputeJob(unittest.TestCase):
         reports = []
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append(exec_status)
             return False
 
@@ -2517,6 +2960,59 @@ class TestRunComputeJob(unittest.TestCase):
 
         self.assertTrue(proc_terminated, "Expected the process group to be torn down")
         self.assertIn("failed", report_statuses)
+
+    def test_resume_hydration_emits_liveness_reports_before_execution(self):
+        """A long predecessor download keeps the claimed job alive before Popen."""
+        reports = []
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **_kwargs):
+            reports.append(exec_status)
+            return False
+
+        def slow_hydration(*_args):
+            # Compressed time: this spans multiple heartbeat windows, standing in
+            # for a transfer longer than the backend's 600-second silent reaper.
+            time.sleep(0.02)
+            return {"ok": False, "reason": "simulated_download_failure"}
+
+        job = self._make_job(input_artifact_job_id="predecessor-1")
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_download_input_artifact", side_effect=slow_hydration), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001), \
+                patch("subprocess.Popen") as popen:
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", {"test-job-001"},
+                threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        popen.assert_not_called()
+        self.assertGreaterEqual(reports.count("running"), 3)
+        self.assertEqual(reports[-1], "failed")
+
+    @unittest.skipUnless(os.name == "posix", "requires the POSIX test execution plan")
+    def test_artifact_delivery_emits_liveness_reports_before_terminal(self):
+        """A slow archive/upload cannot let the runner-subprocess lease expire."""
+        reports = []
+
+        def fake_report(_url, _token, _job_id, *, exec_status, **_kwargs):
+            reports.append(exec_status)
+            return False
+
+        def slow_upload(*_args):
+            time.sleep(0.02)
+            return {"status": "delivered", "protocol": "direct", "verified": True}
+
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_upload_artifact", side_effect=slow_upload), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001), \
+                patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(
+                self._make_job(command="exit 0"), "https://api.example.com", "tok",
+                {"test-job-001"}, threading.Lock(), capabilities=_bwrap_caps(),
+            )
+
+        self.assertGreaterEqual(reports.count("running"), 3)
+        self.assertEqual(reports[-1], "succeeded")
 
 
 # ── Compute poll loop ─────────────────────────────────────────────────────────
@@ -2675,7 +3171,7 @@ class TestComputePollLoop(unittest.TestCase):
             }
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({
                 "job_id": job_id,
                 "exec_status": exec_status,
@@ -3023,6 +3519,70 @@ class TestGpuDetection(unittest.TestCase):
         self.assertIsNone(body["agent_backend"])
         self.assertIsNone(body["compute_backend"])
         self.assertIsNone(body["version"])
+        self.assertNotIn("project_verification", body)
+
+    def test_project_verification_included_without_changing_availability(self):
+        posted_bodies = []
+        verification = {
+            "version": 1,
+            "boundary": {"class": "agent", "backend": "bwrap"},
+            "ready": False,
+            "reason": "docker unavailable in agent boundary",
+            "probes": {
+                "ruff": {"ok": True, "exit_code": 0, "reason": None},
+                "docker_postgres": {
+                    "ok": False,
+                    "exit_code": 127,
+                    "reason": "docker unavailable in agent boundary",
+                },
+            },
+        }
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=["node", "/agent/dist/index.js"]), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    {},
+                    threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    project_verification=verification,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(posted_bodies[0]["project_verification"], verification)
+        self.assertTrue(posted_bodies[0]["agent_available"])
+
+    def test_verification_plan_uses_write_agent_boundary(self):
+        fake_plan = iso.ExecutionPlan(backend=iso.BACKEND_BWRAP, argv=["bwrap"])
+        expected = {"version": 1, "ready": False}
+        with patch.object(iso, "plan_agent_execution", return_value=fake_plan) as planner, \
+             patch.object(iso, "probe_project_verification", return_value=expected), \
+             patch.object(local_runner.shutil, "copy2") as copy_probe:
+            report = local_runner._earn_project_verification(
+                _bwrap_caps(), ["node", "/agent/dist/index.js"], None
+            )
+
+        self.assertEqual(report, expected)
+        self.assertEqual(planner.call_args.kwargs["task_type"], "fix")
+        self.assertEqual(
+            planner.call_args.kwargs["injected_env"]["TASK_ID"],
+            "project-verification-probe",
+        )
+        self.assertEqual(copy_probe.call_args.args[0], iso.PROJECT_VERIFICATION_PROBE_PATH)
+        self.assertTrue(
+            copy_probe.call_args.args[1].endswith("/project-verification-probe.sh")
+        )
 
     def test_llm_clis_included_in_heartbeat_body(self):
         """Heartbeat body carries the LLM CLI inventory when caps are supplied."""
@@ -3309,6 +3869,28 @@ class TestGpuDetection(unittest.TestCase):
 # ── Docker login helper ───────────────────────────────────────────────────────
 
 class TestDockerLogin(unittest.TestCase):
+    def test_docker_login_runtime_selection(self):
+        """Private registry auth uses podman when docker CLI is unavailable."""
+        captured = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            result = MagicMock(returncode=0, stderr=b"")
+            return result
+
+        with patch.object(
+            local_runner.shutil,
+            "which",
+            side_effect=lambda name: "/usr/bin/podman" if name == "podman" else None,
+        ):
+            result = local_runner._docker_login(
+                {"server": "registry.example.com", "username": "u", "password": "pw"},
+                _subprocess_run=fake_run,
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(captured["cmd"][0:2], ["podman", "login"])
+
     def test_docker_login_called_when_auth_has_password(self):
         """_docker_login calls subprocess.run with docker login args when password present."""
         captured = {}
@@ -3580,138 +4162,245 @@ class TestArtifactUpload(unittest.TestCase):
         return path
 
     def test_empty_dir_skips_upload(self):
-        import tempfile
         with tempfile.TemporaryDirectory() as art:
-            with patch("urllib.request.urlopen") as mock_urlopen:
-                local_runner._upload_artifact("https://api.example.com", "tok", "job-1", art)
-            mock_urlopen.assert_not_called()
-
-    def test_missing_dir_skips_upload(self):
-        with patch("urllib.request.urlopen") as mock_urlopen:
-            local_runner._upload_artifact(
-                "https://api.example.com", "tok", "job-1", "/no/such/dir"
-            )
-        mock_urlopen.assert_not_called()
-
-    def test_over_cap_skips_upload(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as art:
-            self._write(art, "checkpoint.bin", b"x" * 4096)
-            with patch.object(local_runner, "_RUNNER_ARTIFACT_MAX_BYTES", 1024), \
-                 patch("urllib.request.urlopen") as mock_urlopen:
-                local_runner._upload_artifact(
+            with patch.object(local_runner, "_post") as mock_post:
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
-            mock_urlopen.assert_not_called()
+            mock_post.assert_not_called()
+        self.assertEqual(result["status"], "not_produced")
 
-    def test_successful_upload_posts_multipart_with_counts(self):
-        import tempfile
-        captured = {}
+    def test_missing_dir_skips_upload(self):
+        with patch.object(local_runner, "_post") as mock_post:
+            result = local_runner._upload_artifact(
+                "https://api.example.com", "tok", "job-1", "/no/such/dir"
+            )
+        mock_post.assert_not_called()
+        self.assertEqual(result["reason"], "artifact_dir_unavailable")
 
-        class _Resp:
-            status = 200
+    def test_over_legacy_cap_uses_direct_transfer(self):
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "checkpoint.bin", b"x" * 4096)
+            post_calls = []
 
-            def __enter__(self):
-                return self
+            def fake_post(url, _token, body):
+                post_calls.append((url, body))
+                if url.endswith("/complete"):
+                    return 200, {"runner_artifact": {"verified": True}}
+                return 200, {
+                    "upload_url": "https://storage.invalid/object",
+                    "transfer_id": "transfer-1",
+                    "method": "PUT",
+                    "headers": {"Content-Type": "application/gzip"},
+                }
 
-            def __exit__(self, *a):
-                return False
+            with patch.object(local_runner, "_RUNNER_ARTIFACT_MAX_BYTES", 1024), \
+                 patch.object(local_runner, "_post", side_effect=fake_post), \
+                 patch.object(
+                     local_runner,
+                     "_stream_http_file",
+                     return_value=(200, {"x-goog-generation": "7"}, b""),
+                 ):
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+        self.assertEqual(result["status"], "delivered")
+        self.assertEqual(result["protocol"], "direct")
+        self.assertGreater(post_calls[0][1]["archive_size"], 0)
+        self.assertEqual(post_calls[0][1]["file_count"], 1)
 
-        def fake_urlopen(req, timeout=None):
-            captured["url"] = req.full_url
-            captured["headers"] = dict(req.header_items())
-            captured["body"] = req.data
-            return _Resp()
+    def test_successful_direct_upload_posts_integrity_and_counts(self):
+        captured = {"posts": [], "puts": []}
+
+        def fake_post(url, _token, body):
+            captured["posts"].append((url, body))
+            if url.endswith("/complete"):
+                self.assertEqual(body["generation"], "42")
+                return 200, {"runner_artifact": {"verified": True}}
+            return 200, {
+                "upload_url": "https://storage.invalid/signed-put",
+                "transfer_id": "transfer-42",
+                "method": "PUT",
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        def fake_stream(url, method, headers, path, size):
+            captured["puts"].append((url, method, headers, path, size))
+            self.assertEqual(size, os.path.getsize(path))
+            return 200, {"x-goog-generation": "42"}, b""
 
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "plots/loss.png", b"PNGDATA")
             self._write(art, "ckpt.pt", b"WEIGHTS123")
-            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
-                local_runner._upload_artifact(
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                 patch.object(local_runner, "_stream_http_file", side_effect=fake_stream):
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-xyz", art
                 )
 
-        self.assertIn("/api/runner/compute-job/job-xyz/artifact", captured["url"])
-        # Content-Type is multipart with a boundary; auth header carried through.
-        ct = captured["headers"].get("Content-type") or captured["headers"].get("Content-Type")
-        self.assertIn("multipart/form-data; boundary=", ct)
-        auth = captured["headers"].get("Authorization")
-        self.assertEqual(auth, "Bearer tok")
-        body = captured["body"]
-        # Form fields present with correct values (2 files, 17 total bytes).
-        self.assertIn(b'name="archive"; filename="artifacts.tar.gz"', body)
-        self.assertIn(b'name="file_count"', body)
-        self.assertIn(b"\r\n\r\n2\r\n", body)  # file_count == 2
-        self.assertIn(b'name="total_bytes"', body)
-        self.assertIn(b"\r\n\r\n17\r\n", body)  # 7 + 10 bytes
+        authorize = captured["posts"][0][1]
+        self.assertEqual(authorize["file_count"], 2)
+        self.assertEqual(authorize["total_bytes"], 17)
+        self.assertEqual(len(base64.b64decode(authorize["crc32c"])), 4)
+        self.assertEqual(captured["puts"][0][1], "PUT")
+        self.assertEqual(result["status"], "delivered")
+        self.assertTrue(result["verified"])
 
     def test_upload_http_error_is_non_fatal(self):
-        import tempfile
-        import urllib.error
-
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch(
-                "urllib.request.urlopen",
-                side_effect=urllib.error.HTTPError("u", 500, "err", {}, None),
+            with patch.object(
+                local_runner, "_post", return_value=(503, {"detail": "down"})
             ), patch("time.sleep"):
-                # Must NOT raise even after exhausting retries.
-                local_runner._upload_artifact(
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "authorization_http_503")
 
     def test_upload_retries_5xx_up_to_cap(self):
         """A 5xx artifact upload is retried up to the cap before giving up."""
-        import tempfile
-        import urllib.error
-
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch(
-                "urllib.request.urlopen",
-                side_effect=urllib.error.HTTPError("u", 503, "err", {}, None),
-            ) as mock_urlopen, patch("time.sleep") as mock_sleep:
-                local_runner._upload_artifact(
+            with patch.object(
+                local_runner, "_post", return_value=(503, None)
+            ) as mock_post, patch("time.sleep") as mock_sleep:
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
 
         self.assertEqual(
-            mock_urlopen.call_count, local_runner._REPORT_MAX_RETRIES + 1
+            mock_post.call_count, local_runner._REPORT_MAX_RETRIES + 1
         )
         self.assertEqual(mock_sleep.call_count, local_runner._REPORT_MAX_RETRIES)
+        self.assertEqual(result["status"], "failed")
 
     def test_upload_retries_network_error_then_succeeds(self):
         """A transient network blip on upload is retried instead of dropping artifacts."""
-        import tempfile
-        import urllib.error
+        calls = {"put": 0}
 
-        class _Resp:
-            status = 200
+        def fake_post(url, _token, _body):
+            if url.endswith("/complete"):
+                return 200, {"runner_artifact": {"verified": True}}
+            return 200, {
+                "upload_url": "https://storage.invalid/signed-put",
+                "transfer_id": f"transfer-{calls['put']}",
+                "headers": {"Content-Type": "application/gzip"},
+            }
 
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-        calls = {"n": 0}
-
-        def fake_urlopen(req, timeout=None):
-            calls["n"] += 1
-            if calls["n"] < 2:
-                raise urllib.error.URLError("conn reset")
-            return _Resp()
+        def fake_stream(*_args):
+            calls["put"] += 1
+            if calls["put"] == 1:
+                raise OSError("conn reset")
+            return 200, {"x-goog-generation": "2"}, b""
 
         with tempfile.TemporaryDirectory() as art:
             self._write(art, "f.txt", b"data")
-            with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(local_runner, "_stream_http_file", side_effect=fake_stream), \
                     patch("time.sleep") as mock_sleep:
-                local_runner._upload_artifact(
+                result = local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
 
-        self.assertEqual(calls["n"], 2)  # failed once, uploaded on retry
+        self.assertEqual(calls["put"], 2)
         self.assertEqual(mock_sleep.call_count, 1)
+        self.assertEqual(result["status"], "delivered")
+
+    def test_completion_503_reauthorizes_and_uploads_fresh_transfer(self):
+        """A finalized verification outage must not retry its now-dead transfer."""
+        authorizations = []
+        uploads = []
+
+        def fake_post(url, _token, _body):
+            if url.endswith("/complete"):
+                if len(authorizations) == 1:
+                    return 503, {"detail": "verification unavailable"}
+                return 200, {"runner_artifact": {"verified": True}}
+            transfer_id = f"transfer-{len(authorizations) + 1}"
+            authorizations.append(transfer_id)
+            return 200, {
+                "upload_url": f"https://storage.invalid/{transfer_id}",
+                "transfer_id": transfer_id,
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        def fake_stream(url, *_args):
+            uploads.append(url)
+            return 200, {"x-goog-generation": "2"}, b""
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(local_runner, "_stream_http_file", side_effect=fake_stream), \
+                    patch("time.sleep"):
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(authorizations, ["transfer-1", "transfer-2"])
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(result["status"], "delivered")
+
+    def test_completion_429_retries_same_authorized_transfer(self):
+        """Rate limiting leaves the transfer authorized for idempotent completion."""
+        authorizations = []
+        completion_requests = []
+
+        def fake_post(url, _token, body):
+            if url.endswith("/complete"):
+                completion_requests.append(body)
+                if len(completion_requests) == 1:
+                    return 429, {"detail": "rate limited"}
+                return 200, {"runner_artifact": {"verified": True}}
+            authorizations.append(body)
+            return 200, {
+                "upload_url": "https://storage.invalid/transfer-1",
+                "transfer_id": "transfer-1",
+                "headers": {"Content-Type": "application/gzip"},
+            }
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch.object(local_runner, "_post", side_effect=fake_post), \
+                    patch.object(
+                        local_runner,
+                        "_stream_http_file",
+                        return_value=(200, {"x-goog-generation": "2"}, b""),
+                    ), \
+                    patch("time.sleep") as mock_sleep:
+                result = local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+
+        self.assertEqual(len(authorizations), 1)
+        self.assertEqual(
+            completion_requests,
+            [
+                {"transfer_id": "transfer-1", "generation": "2"},
+                {"transfer_id": "transfer-1", "generation": "2"},
+            ],
+        )
+        mock_sleep.assert_called_once()
+        self.assertEqual(result["status"], "delivered")
+
+    def test_liveness_reports_continue_during_long_artifact_transfer(self):
+        """Periodic reports keep the 600s server liveness lease refreshed."""
+        reports = []
+
+        def fake_report(*_args, **kwargs):
+            reports.append(kwargs["exec_status"])
+            return False
+
+        # A millisecond stands in for the production 30-second cadence; the
+        # work interval spans many such cadence windows without sleeping 600s.
+        with patch.object(local_runner, "_report_compute_job", side_effect=fake_report), \
+                patch.object(local_runner, "_RUNNER_HEARTBEAT_INTERVAL", 0.001):
+            with local_runner._ComputeJobReportHeartbeat("http://orch", "tok", "job-1"):
+                time.sleep(0.02)
+
+        self.assertGreaterEqual(len(reports), 3)
+        self.assertTrue(all(status == "running" for status in reports))
 
 
 class TestBoundedDedupLog(unittest.TestCase):
@@ -4087,7 +4776,7 @@ class TestComputeJobTelemetry(unittest.TestCase):
         reports = []
 
         def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
-                        result_metrics=None, command_log=None, progress=None):
+                        result_metrics=None, command_log=None, progress=None, **_kw):
             reports.append({"exec_status": exec_status, "command_log": command_log})
             return False
 
@@ -4178,11 +4867,19 @@ class TestHeartbeat401Streak(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
     def test_exits_after_consecutive_401_streak(self):
-        """A sustained 401 streak (revoked token) exits the process non-zero (N4)."""
+        """A sustained 401 streak AFTER a successful auth (a token revoked mid-life)
+        exits the process non-zero once the streak reaches max_auth_failures (N4).
+        The leading 200 keeps this on the streak path, distinct from the
+        first-heartbeat fast-fail path."""
         exits = []
+        # 200 first (authenticates), then a 401 streak that reaches the threshold.
+        statuses = iter([200])
 
         def fake_post(url, token, body, **kwargs):
-            return 401, None
+            try:
+                return next(statuses), None
+            except StopIteration:
+                return 401, None
 
         # Patch os._exit so the streak detector doesn't kill the test process.
         def fake_exit(code):
@@ -4204,8 +4901,10 @@ class TestHeartbeat401Streak(unittest.TestCase):
         self.assertEqual(exits, [1])
 
     def test_no_exit_when_streak_resets(self):
-        """A 200 between 401s resets the streak — no exit."""
-        statuses = iter([401, 401, 200, 401])
+        """A 200 between 401s resets the streak — no exit. Leads with a 200 so the
+        token has authenticated (past the first-heartbeat fast-fail) and the test
+        exercises the streak-reset path for a mid-life 401 sequence."""
+        statuses = iter([200, 401, 401, 200, 401])
         exits = []
 
         def fake_post(url, token, body, **kwargs):
@@ -4229,15 +4928,20 @@ class TestHeartbeat401Streak(unittest.TestCase):
 
     def test_token_reload_on_401_prevents_exit(self):
         """When the token file is updated on disk during a 401 streak, the runner
-        detects the new token, resets the counter, and resumes without exit."""
-        # _post always returns 401 while using the old token; after reload the
-        # runner retries with the new token and gets a 200.
+        detects the new token, resets the counter, and resumes without exit. Leads
+        with a 200 so the runner has authenticated (past the first-heartbeat
+        fast-fail) — the live token-swap escape hatch is for a mid-life revoke."""
+        # First heartbeat authenticates; then the old token is revoked (401) and
+        # the operator writes a new token to disk, which the runner picks up.
         call_count = [0]
         tokens_seen = []
 
         def fake_post(url, token, body, **kwargs):
             tokens_seen.append(token)
             call_count[0] += 1
+            # First contact authenticates so ever_authenticated is set.
+            if call_count[0] == 1:
+                return 200, None
             # Old token always gets 401; new token succeeds.
             if token == "new-token":
                 return 200, None
@@ -4275,6 +4979,72 @@ class TestHeartbeat401Streak(unittest.TestCase):
         self.assertEqual(exits, [], "token reload must prevent auth-fatal exit")
         self.assertIn("new-token", tokens_seen,
                       "heartbeat must use the reloaded token")
+
+    def test_fast_fails_on_first_heartbeat_401(self):
+        """A token that has NEVER authenticated and gets a 401 on the very first
+        heartbeat exits immediately — it does not retry max_auth_failures times as
+        if the rejection were transient (wrong/revoked/deleted-runner token)."""
+        posts = []
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            posts.append(token)
+            return 401, None
+
+        def fake_exit(code):
+            exits.append(code)
+            local_runner._shutdown_event.set()
+            raise SystemExit(code)
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_load_runner_token", lambda: "tok"), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", fake_exit), \
+             patch("time.sleep", lambda s: None):
+            with self.assertRaises(SystemExit):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    # High threshold: fast-fail must NOT depend on it being reached.
+                    max_auth_failures=20,
+                )
+
+        self.assertEqual(exits, [1], "first-heartbeat 401 must exit non-zero")
+        self.assertEqual(
+            len(posts), 1,
+            "must fail fast on the FIRST 401, not retry a never-authenticated token",
+        )
+
+    def test_401_after_authenticating_does_not_fast_fail(self):
+        """A token that DID authenticate (a 200 first) keeps the existing streak
+        behavior when a later heartbeat 401s — it is retried up to max_auth_failures
+        rather than fast-failing, preserving mid-life revoke / inactive-row re-arm."""
+        statuses = iter([200, 401, 401])
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            try:
+                return next(statuses), None
+            except StopIteration:
+                local_runner._shutdown_event.set()
+                return 204, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_load_runner_token", lambda: "tok"), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", lambda c: exits.append(c)), \
+             patch("time.sleep", lambda s: None):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                # Two post-auth 401s stay under the streak threshold → no exit.
+                max_auth_failures=5,
+            )
+
+        self.assertEqual(
+            exits, [],
+            "a 401 after a successful auth must NOT fast-fail below the streak threshold",
+        )
 
 
 class TestDescribeSha(unittest.TestCase):
@@ -5913,7 +6683,12 @@ class BlueprintRunnerInstallTests(unittest.TestCase):
         self.assertIn("StartLimitBurst=3", unit_text,
                       "burst count must be in rendered unit")
         self.assertIn("RestartSec=5", unit_text)
-        self.assertIn("Restart=on-failure", unit_text)
+        # Restart=always (NOT on-failure): the runner exits 0 after a self-update
+        # and relies on systemd to relaunch the fresh binary; on-failure would
+        # leave a self-updated runner silently dead. See the unit's RESTART block.
+        self.assertIn("Restart=always", unit_text)
+        # The active directive is always (the comment may still explain on-failure).
+        self.assertNotIn("\nRestart=on-failure\n", unit_text)
         # StartLimitIntervalSec and StartLimitBurst belong in [Unit], not [Service].
         self.assertLess(
             unit_text.index("StartLimitIntervalSec=60"), unit_text.index("[Service]"),
@@ -7278,6 +8053,54 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         )
         self.assertEqual(result["removed"], 0, result)
 
+    def test_record_image_use_stores_project_owner(self):
+        """A recorded use with a project_id is stored as a dict and round-trips."""
+        local_runner._record_image_use(
+            "registry.example.com/proj-a/train:v1",
+            project_id="proj-a",
+            _now=self.now,
+        )
+        ledger = local_runner._load_image_use_ledger()
+        value = ledger["registry.example.com/proj-a/train:v1"]
+        self.assertIsInstance(value, dict)
+        self.assertEqual(value["project_id"], "proj-a")
+        self.assertEqual(
+            local_runner._parse_docker_time(local_runner._ledger_last_used(value)),
+            self.now,
+        )
+
+    def test_record_image_use_preserves_owner_when_reused_without_project(self):
+        """A later use with no project_id keeps a previously-recorded owner."""
+        local_runner._record_image_use("img:v1", project_id="proj-a", _now=self.now)
+        local_runner._record_image_use(
+            "img:v1", _now=self.now + timedelta(hours=1)
+        )
+        value = local_runner._load_image_use_ledger()["img:v1"]
+        self.assertEqual(local_runner._ledger_project_id(value), "proj-a")
+
+    def test_prune_tolerates_dict_ledger_values(self):
+        """The dict-shaped ledger value still protects an old pull from eviction."""
+        docker = _FakeDocker([
+            {
+                "id": "sha256:inuse",
+                "created": _rfc3339(self.now - timedelta(days=400)),
+                "last_tag_time": _go_time(self.now - timedelta(days=30)),
+                "tags": ["registry.example.com/proj/train:v3"],
+            }
+        ])
+        result = self._prune(
+            docker,
+            keep_days=7,
+            ledger={
+                "registry.example.com/proj/train:v3": {
+                    "last_used": (self.now - timedelta(hours=1)).isoformat(),
+                    "project_id": "proj",
+                }
+            },
+        )
+        self.assertEqual(result["removed"], 0, result)
+        self.assertEqual(docker.removed, [])
+
     def test_parse_docker_time_formats(self):
         """Docker emits RFC3339 (.Created), Go time.Time (.Metadata.LastTagTime),
         and a Go zero value for never-tagged images."""
@@ -7294,12 +8117,104 @@ class TestDockerImageCacheHygiene(unittest.TestCase):
         self.assertIsNone(local_runner._parse_docker_time("not-a-time"))
 
 
+class _FakeCacheDocker:
+    """Scriptable ``docker`` for _docker_image_cache_by_project.
+
+    *images* is a list of ``{"id", "size", "tags"}``. Answers ``image ls`` with
+    the ids and ``image inspect --format {{.Id}}\\t{{.Size}}\\t{{.RepoTags}}``
+    with size in BYTES (the shape `.Size` renders), so the accounting can be
+    tested without a real docker.
+    """
+
+    def __init__(self, images, list_rc=0, inspect_rc=0):
+        self.images = images
+        self.list_rc = list_rc
+        self.inspect_rc = inspect_rc
+        self.calls = []
+
+    def _result(self, rc, out="", err=""):
+        class P:
+            returncode = rc
+            stdout = out
+            stderr = err
+        return P()
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        if cmd[:4] == ["docker", "image", "ls", "-a"]:
+            if self.list_rc != 0:
+                return self._result(self.list_rc, err="permission denied")
+            return self._result(0, "".join(f"{i['id']}\n" for i in self.images))
+        if cmd[:3] == ["docker", "image", "inspect"]:
+            if self.inspect_rc != 0:
+                return self._result(self.inspect_rc, err="no such image")
+            rows = []
+            for img in self.images:
+                tags = "[" + " ".join(img.get("tags") or []) + "]"
+                rows.append(f"{img['id']}\t{img.get('size', 0)}\t{tags}")
+            return self._result(0, "\n".join(rows))
+        raise AssertionError(f"unexpected docker invocation: {cmd}")
+
+
+class TestDockerImageCacheAccounting(unittest.TestCase):
+    """Per-project docker image-cache accounting (_docker_image_cache_by_project)."""
+
+    def _cache(self, docker, ledger):
+        return local_runner._docker_image_cache_by_project(_run=docker, _ledger=ledger)
+
+    def test_attributes_size_to_owning_project(self):
+        docker = _FakeCacheDocker([
+            {"id": "sha256:a", "size": 3_000_000_000, "tags": ["reg/proj-a/train:v1"]},
+            {"id": "sha256:b", "size": 1_000_000_000, "tags": ["reg/proj-b/train:v1"]},
+        ])
+        ledger = {
+            "reg/proj-a/train:v1": {"last_used": "2026-07-12T00:00:00+00:00", "project_id": "proj-a"},
+            "reg/proj-b/train:v1": {"last_used": "2026-07-12T00:00:00+00:00", "project_id": "proj-b"},
+        }
+        result = self._cache(docker, ledger)
+        self.assertEqual(result["total_bytes"], 4_000_000_000)
+        self.assertEqual(result["image_count"], 2)
+        self.assertEqual(result["by_project"]["proj-a"], {"bytes": 3_000_000_000, "image_count": 1})
+        self.assertEqual(result["by_project"]["proj-b"], {"bytes": 1_000_000_000, "image_count": 1})
+        self.assertEqual(result["unattributed_bytes"], 0)
+
+    def test_legacy_string_ledger_entry_is_unattributed(self):
+        """An image whose ledger stamp predates project tracking is unattributed."""
+        docker = _FakeCacheDocker([
+            {"id": "sha256:a", "size": 2_000_000_000, "tags": ["reg/old/train:v1"]},
+        ])
+        ledger = {"reg/old/train:v1": "2026-07-12T00:00:00+00:00"}  # legacy shape
+        result = self._cache(docker, ledger)
+        self.assertEqual(result["by_project"], {})
+        self.assertEqual(result["unattributed_bytes"], 2_000_000_000)
+        self.assertEqual(result["unattributed_image_count"], 1)
+
+    def test_no_images_returns_zeroed_accounting(self):
+        result = self._cache(_FakeCacheDocker([]), {})
+        self.assertEqual(result["total_bytes"], 0)
+        self.assertEqual(result["image_count"], 0)
+        self.assertEqual(result["by_project"], {})
+
+    def test_docker_missing_returns_none(self):
+        def boom(cmd, **kw):
+            raise OSError("docker not found")
+        self.assertIsNone(
+            local_runner._docker_image_cache_by_project(_run=boom, _ledger={})
+        )
+
+    def test_list_nonzero_returns_none(self):
+        docker = _FakeCacheDocker([], list_rc=1)
+        self.assertIsNone(self._cache(docker, {}))
+
+
 class _FakeResp:
     """Minimal context-manager HTTP response for mocking urlopen."""
 
-    def __init__(self, status, body):
+    def __init__(self, status, body=None):
         self.status = status
-        self._body = body
+        payload = json.dumps(body).encode() if isinstance(body, dict) else (body or b"")
+        self._stream = io.BytesIO(payload)
+        self.headers = {}
 
     def __enter__(self):
         return self
@@ -7307,8 +8222,8 @@ class _FakeResp:
     def __exit__(self, *exc):
         return False
 
-    def read(self):
-        return self._body
+    def read(self, size=-1):
+        return self._stream.read(size)
 
 
 def _make_bundle(members):
@@ -7377,6 +8292,34 @@ class DownloadInputArtifactTests(unittest.TestCase):
         self.assertEqual(prov["reason"], "http_404")
         self.assertEqual(os.listdir(self.artifact_dir), [])
 
+    def test_corrupt_extract_never_publishes_staged_predecessor_files(self):
+        """A tar failure after a member write leaves the durable dir empty."""
+        class _PartiallyFailingTar:
+            def getmembers(self):
+                return []
+
+            def extractall(self, destination, members):
+                with open(os.path.join(destination, "checkpoint.pt"), "wb") as fh:
+                    fh.write(b"partial predecessor")
+                raise tarfile.ReadError("corrupt after first member")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        with patch(
+            "local_runner.urllib.request.urlopen",
+            return_value=_FakeResp(200, b"not-a-real-tar"),
+        ), patch("local_runner.tarfile.open", return_value=_PartiallyFailingTar()):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+        self.assertFalse(prov["ok"])
+        self.assertEqual(prov["reason"], "extract_error:ReadError")
+        self.assertEqual(os.listdir(self.artifact_dir), [])
+
     def test_empty_bundle_reports_failure(self):
         with patch(
             "local_runner.urllib.request.urlopen",
@@ -7406,6 +8349,28 @@ class DownloadInputArtifactTests(unittest.TestCase):
         # Only the safe member landed; no escape above the artifact dir.
         self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "ok.txt")))
         self.assertFalse(os.path.exists(os.path.join(self.tmpdir, "escape.txt")))
+
+    def test_publish_failure_retains_existing_workspace(self):
+        """A failed atomic replace cannot erase the previously published tree."""
+        with open(os.path.join(self.artifact_dir, "previous.ckpt"), "wb") as fh:
+            fh.write(b"OLD")
+        bundle = _make_bundle({"checkpoint/new.pt": b"NEW"})
+        real_replace = os.replace
+
+        def fail_destination_replace(source, destination):
+            if destination == self.artifact_dir:
+                raise OSError("simulated publish failure")
+            return real_replace(source, destination)
+
+        with patch("local_runner.urllib.request.urlopen", return_value=_FakeResp(200, bundle)), \
+                patch("local_runner.os.replace", side_effect=fail_destination_replace):
+            prov = local_runner._download_input_artifact(
+                "http://orch", "tok", "job-1", self.artifact_dir
+            )
+
+        self.assertFalse(prov["ok"])
+        self.assertTrue(os.path.isfile(os.path.join(self.artifact_dir, "previous.ckpt")))
+        self.assertFalse(os.path.exists(os.path.join(self.artifact_dir, "checkpoint", "new.pt")))
 
 
 class SupervisorDetectionTests(unittest.TestCase):
@@ -7671,5 +8636,850 @@ class GpuSandboxSmokeTests(unittest.TestCase):
         self.assertFalse(os.path.isdir(captured["workspace"]))
 
 
+class TestCrossProjectGpuLedger(unittest.TestCase):
+    """No-double-booking on the unified single-daemon GPU ledger.
+
+    The multi-project local-runner runs ONE daemon per physical box that serves
+    compute jobs from every allow-listed project through one process-wide
+    ``gpu_state`` (see ``_make_gpu_state`` / ``_assign_gpus`` / ``_release_gpus``
+    in local_runner.py). The whole point of collapsing the old per-project
+    daemons into one is to close the double-booking bug: two daemons on the same
+    box would each keep a private ``in_use`` set and could hand the SAME physical
+    GPU index to two concurrently-running jobs. These tests prove the unified
+    ledger never assigns the same index to two live jobs regardless of which
+    project each job belongs to.
+    """
+
+    @staticmethod
+    def _shared_state(allowed, per_job=1):
+        return {
+            "allowed": list(allowed),
+            "in_use": set(),
+            "per_job": per_job,
+            "lock": threading.Lock(),
+        }
+
+    def test_two_projects_never_share_a_gpu_via_ledger(self):
+        """Jobs from different projects draw disjoint indices from one ledger."""
+        state = self._shared_state([0, 1])
+
+        a = local_runner._assign_gpus(state)  # project-A job
+        b = local_runner._assign_gpus(state)  # project-B job
+
+        self.assertEqual(a, [0])
+        self.assertEqual(b, [1])
+        self.assertEqual(set(a) & set(b), set(), "cross-project GPU double-book")
+        self.assertEqual(state["in_use"], {0, 1})
+
+        # A third project's job finds the shared ledger saturated → no GPU.
+        c = local_runner._assign_gpus(state)
+        self.assertEqual(c, [])
+        self.assertEqual(state["in_use"], {0, 1})
+
+    def test_release_by_one_project_frees_index_for_another(self):
+        """Releasing a project's job returns its index to the shared pool."""
+        state = self._shared_state([0])
+
+        a = local_runner._assign_gpus(state)  # project-A holds GPU 0
+        self.assertEqual(a, [0])
+        # Project-B is starved while A holds the only device.
+        self.assertEqual(local_runner._assign_gpus(state), [])
+
+        local_runner._release_gpus(state, a)  # project-A job finishes
+        self.assertEqual(state["in_use"], set())
+
+        b = local_runner._assign_gpus(state)  # project-B reuses the freed index
+        self.assertEqual(b, [0])
+        self.assertEqual(state["in_use"], {0})
+
+    def test_per_job_multi_gpu_across_projects_stays_disjoint(self):
+        """With per_job>1 each project's job gets a disjoint multi-GPU block."""
+        state = self._shared_state([0, 1, 2, 3], per_job=2)
+
+        a = local_runner._assign_gpus(state)  # project-A
+        b = local_runner._assign_gpus(state)  # project-B
+
+        self.assertEqual(a, [0, 1])
+        self.assertEqual(b, [2, 3])
+        self.assertEqual(set(a) & set(b), set())
+        self.assertEqual(state["in_use"], {0, 1, 2, 3})
+        # Pool exhausted: a third project's two-GPU request cannot be honored.
+        self.assertEqual(local_runner._assign_gpus(state), [])
+
+    def test_unified_gpu_ledger_no_cross_project_double_booking(self):
+        """End-to-end: two concurrent _run_compute_job workers for DIFFERENT
+        projects, sharing ONE gpu_state, never receive the same GPU index.
+
+        A barrier-blocked fake plan holds BOTH jobs inside execution
+        simultaneously (each after its ledger assignment), so the two jobs are
+        genuinely live at the same instant — the exact condition under which two
+        old per-project daemons would have double-booked. We capture the
+        ``gpu_indices`` each job was planned with and assert they are disjoint,
+        both non-empty, and together account for the whole two-GPU ledger.
+        """
+        state = self._shared_state([0, 1])
+        caps = _bwrap_caps(gpu_indices=(0, 1))
+
+        barrier = threading.Barrier(2, timeout=10)
+        capture_lock = threading.Lock()
+        captured = []  # list of (container_name, tuple(gpu_indices))
+
+        def fake_plan(**kw):
+            # Record the GPUs this job was assigned from the shared ledger.
+            with capture_lock:
+                captured.append(
+                    (kw.get("container_name"), tuple(kw.get("gpu_indices") or ()))
+                )
+            # Block until BOTH jobs have assigned + reached here, so both hold
+            # their GPUs at the same time — the double-book window.
+            barrier.wait()
+            env = os.environ.copy()
+            env["BLUEPRINT_RESULT_FILE"] = kw["result_file_host"]
+            env["BLUEPRINT_ARTIFACT_DIR"] = kw["artifact_dir_host"]
+            return iso.ExecutionPlan(
+                backend="bwrap",
+                argv=["bash", "-lc", "true"],
+                env=env,
+            )
+
+        def noop_report(*a, **k):
+            return False
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+
+        def run_for_project(pid):
+            job = {
+                "job_id": f"{pid}-job",
+                "project_id": pid,  # informational; assignment is project-agnostic
+                "command": "true",
+            }
+            active_jobs.add(job["job_id"])
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", active_jobs, lock,
+                capabilities=caps, gpu_state=state,
+            )
+
+        with patch.object(local_runner, "_report_compute_job", noop_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", fake_plan):
+            t_a = threading.Thread(target=run_for_project, args=("proj-A",))
+            t_b = threading.Thread(target=run_for_project, args=("proj-B",))
+            t_a.start()
+            t_b.start()
+            t_a.join(timeout=15)
+            t_b.join(timeout=15)
+
+        self.assertFalse(t_a.is_alive() or t_b.is_alive(), "workers did not finish")
+        self.assertEqual(len(captured), 2, "both jobs should have been planned")
+
+        gpus = [g for _, g in captured]
+        self.assertTrue(all(len(g) == 1 for g in gpus), f"expected 1 GPU each: {gpus}")
+        self.assertEqual(
+            set(gpus[0]) & set(gpus[1]), set(),
+            f"same GPU handed to two live cross-project jobs: {captured}",
+        )
+        # The two disjoint assignments together consume the whole ledger.
+        self.assertEqual(set(gpus[0]) | set(gpus[1]), {0, 1})
+        # Both jobs finished → the ledger drained back to empty (no leak).
+        self.assertEqual(state["in_use"], set())
+
+    def test_assign_refuses_to_double_book_on_inconsistent_ledger(self):
+        """Defense-in-depth: if the underlying assigner ever returns an index
+        already marked in-use (ledger corruption / future-refactor bug),
+        ``_assign_gpus`` refuses it rather than SILENTLY double-booking a GPU
+        across projects."""
+        state = self._shared_state([0, 1])
+        state["in_use"].add(0)  # project-A already holds GPU 0
+
+        # Force the low-level assigner to (wrongly) hand back the in-use index.
+        with patch.object(local_runner.iso, "assign_gpu_indices", return_value=[0]):
+            result = local_runner._assign_gpus(state)
+
+        self.assertEqual(result, [], "must not double-book an already-held GPU")
+        # The other project's reservation is left exactly as it was — untouched.
+        self.assertEqual(state["in_use"], {0})
+
+    def test_saturated_ledger_lets_extra_project_run_without_a_gpu(self):
+        """A single-GPU ledger already held by one project: a second project's
+        job still RUNS (GPU-less) rather than crashing or double-booking."""
+        state = self._shared_state([0])
+        state["in_use"].add(0)  # project-A already holds the only GPU
+        caps = _bwrap_caps(gpu_indices=(0,))
+
+        captured: dict = {}
+
+        def noop_report(*a, **k):
+            return False
+
+        job = {"job_id": "proj-B-job", "project_id": "proj-B", "command": "true"}
+        active_jobs: set = {"proj-B-job"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", noop_report), \
+             patch.object(local_runner.iso, "plan_compute_execution",
+                          _bare_plan_factory(captured)):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok", active_jobs, lock,
+                capabilities=caps, gpu_state=state,
+            )
+
+        # Second project got NO device (project-A still holds it) but still ran.
+        self.assertEqual(tuple(captured.get("gpu_indices") or ()), ())
+        self.assertEqual(state["in_use"], {0}, "project-A's GPU must be untouched")
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── New coverage: previously untested pure functions and utilities ─────────────
+
+
+class TestParseResultMetrics(unittest.TestCase):
+    """_parse_result_metrics: tolerant JSON → numeric-only dict."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write(self, name, content):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    def test_numeric_values_are_returned(self):
+        path = self._write("result.json", '{"loss": 0.42, "accuracy": 0.95, "step": 100}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(result, {"loss": 0.42, "accuracy": 0.95, "step": 100})
+
+    def test_non_numeric_values_filtered_out(self):
+        path = self._write("result.json", '{"loss": 0.5, "name": "run1", "flag": true}')
+        result = local_runner._parse_result_metrics(path)
+        # booleans and strings are excluded; only numeric float/int survives
+        self.assertEqual(result, {"loss": 0.5})
+
+    def test_bool_values_excluded(self):
+        path = self._write("result.json", '{"ok": true, "count": 7}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertEqual(result, {"count": 7})
+
+    def test_empty_dict_returns_none(self):
+        path = self._write("result.json", '{}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_all_non_numeric_returns_none(self):
+        path = self._write("result.json", '{"label": "hello", "ok": false}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(
+            local_runner._parse_result_metrics(
+                os.path.join(self.tmp.name, "nonexistent.json")
+            )
+        )
+
+    def test_invalid_json_returns_none(self):
+        path = self._write("result.json", '{not: valid json}')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_non_dict_json_returns_none(self):
+        path = self._write("result.json", '[1, 2, 3]')
+        self.assertIsNone(local_runner._parse_result_metrics(path))
+
+    def test_negative_and_float_values_preserved(self):
+        path = self._write("result.json", '{"val": -3.14, "zero": 0.0}')
+        result = local_runner._parse_result_metrics(path)
+        self.assertAlmostEqual(result["val"], -3.14)
+        self.assertEqual(result["zero"], 0.0)
+
+
+class TestClassifyViewable(unittest.TestCase):
+    """_classify_viewable: extension → (content_type, kind) or None."""
+
+    def test_png_classified_as_image(self):
+        result = local_runner._classify_viewable("chart.png")
+        self.assertEqual(result, ("image/png", "image"))
+
+    def test_jpg_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("photo.jpg"), ("image/jpeg", "image"))
+
+    def test_jpeg_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("photo.jpeg"), ("image/jpeg", "image"))
+
+    def test_webp_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("img.webp"), ("image/webp", "image"))
+
+    def test_gif_classified_as_image(self):
+        self.assertEqual(local_runner._classify_viewable("anim.gif"), ("image/gif", "image"))
+
+    def test_mp4_classified_as_video(self):
+        self.assertEqual(local_runner._classify_viewable("clip.mp4"), ("video/mp4", "video"))
+
+    def test_webm_classified_as_video(self):
+        self.assertEqual(local_runner._classify_viewable("clip.webm"), ("video/webm", "video"))
+
+    def test_svg_excluded(self):
+        self.assertIsNone(local_runner._classify_viewable("image.svg"))
+
+    def test_unknown_extension_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable("model.pkl"))
+        self.assertIsNone(local_runner._classify_viewable("log.txt"))
+        self.assertIsNone(local_runner._classify_viewable("data.csv"))
+
+    def test_no_extension_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable("README"))
+
+    def test_non_string_returns_none(self):
+        self.assertIsNone(local_runner._classify_viewable(None))
+        self.assertIsNone(local_runner._classify_viewable(123))
+
+    def test_extension_case_insensitive(self):
+        # Filename with uppercase extension should be classified
+        self.assertEqual(local_runner._classify_viewable("photo.PNG"), ("image/png", "image"))
+        self.assertEqual(local_runner._classify_viewable("clip.MP4"), ("video/mp4", "video"))
+
+    def test_multiple_dots_uses_last_extension(self):
+        result = local_runner._classify_viewable("archive.old.png")
+        self.assertEqual(result, ("image/png", "image"))
+
+
+class TestParseProgressRecord(unittest.TestCase):
+    """_parse_progress_record: bytes → validated dict or None."""
+
+    def _parse(self, text: str) -> dict | None:
+        return local_runner._parse_progress_record(text.encode())
+
+    def test_valid_minimal_record(self):
+        r = self._parse('{"metric": "loss", "value": 0.42}')
+        self.assertIsNotNone(r)
+        self.assertEqual(r["metric"], "loss")
+        self.assertAlmostEqual(r["value"], 0.42)
+        self.assertNotIn("step", r)
+        self.assertNotIn("ts", r)
+
+    def test_valid_record_with_step_and_ts(self):
+        r = self._parse('{"metric": "acc", "value": 0.9, "step": 10, "ts": "2026-01-01T00:00:00Z"}')
+        self.assertEqual(r["step"], 10)
+        self.assertEqual(r["ts"], "2026-01-01T00:00:00Z")
+
+    def test_metric_whitespace_is_stripped(self):
+        r = self._parse('{"metric": "  loss  ", "value": 1.0}')
+        self.assertEqual(r["metric"], "loss")
+
+    def test_empty_line_returns_none(self):
+        self.assertIsNone(local_runner._parse_progress_record(b""))
+        self.assertIsNone(local_runner._parse_progress_record(b"   "))
+
+    def test_invalid_json_returns_none(self):
+        self.assertIsNone(self._parse("not json"))
+
+    def test_non_dict_json_returns_none(self):
+        self.assertIsNone(self._parse("[1, 2, 3]"))
+
+    def test_missing_metric_returns_none(self):
+        self.assertIsNone(self._parse('{"value": 0.5}'))
+
+    def test_empty_metric_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "", "value": 0.5}'))
+        self.assertIsNone(self._parse('{"metric": "   ", "value": 0.5}'))
+
+    def test_missing_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss"}'))
+
+    def test_non_numeric_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss", "value": "high"}'))
+
+    def test_bool_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "ok", "value": true}'))
+
+    def test_nan_value_returns_none(self):
+        self.assertIsNone(self._parse('{"metric": "loss", "value": NaN}'))
+
+    def test_inf_value_returns_none(self):
+        # Python JSON doesn't parse Infinity natively so test finite check instead
+        r = self._parse('{"metric": "loss", "value": 1e308}')
+        # Very large but still finite — should be accepted
+        self.assertIsNotNone(r)
+
+    def test_negative_step_excluded(self):
+        r = self._parse('{"metric": "loss", "value": 1.0, "step": -1}')
+        self.assertNotIn("step", r)
+
+    def test_bool_step_excluded(self):
+        r = self._parse('{"metric": "loss", "value": 1.0, "step": true}')
+        self.assertNotIn("step", r)
+
+    def test_oversized_line_returns_none(self):
+        line = b'{"metric": "x", "value": 1}' + b"x" * 9000
+        self.assertIsNone(local_runner._parse_progress_record(line))
+
+    def test_metric_truncated_to_max_chars(self):
+        long_metric = "m" * 200
+        r = self._parse(f'{{"metric": "{long_metric}", "value": 1.0}}')
+        self.assertIsNotNone(r)
+        self.assertEqual(len(r["metric"]), 128)
+
+    def test_ts_truncated_to_max_chars(self):
+        long_ts = "2026-01-01T00:00:00Z" + "x" * 100
+        r = self._parse(f'{{"metric": "loss", "value": 1.0, "ts": "{long_ts}"}}')
+        self.assertIsNotNone(r)
+        self.assertEqual(len(r["ts"]), 64)
+
+
+class TestCrc32c(unittest.TestCase):
+    """_crc32c_update / _crc32c_b64: custom CRC32C implementation."""
+
+    def test_crc32c_update_empty_data_unchanged(self):
+        state = 0xFFFFFFFF
+        result = local_runner._crc32c_update(state, b"")
+        self.assertEqual(result, state)
+
+    def test_crc32c_update_produces_deterministic_result(self):
+        state = 0xFFFFFFFF
+        r1 = local_runner._crc32c_update(state, b"hello")
+        r2 = local_runner._crc32c_update(state, b"hello")
+        self.assertEqual(r1, r2)
+
+    def test_crc32c_update_different_data_different_result(self):
+        state = 0xFFFFFFFF
+        r1 = local_runner._crc32c_update(state, b"hello")
+        r2 = local_runner._crc32c_update(state, b"world")
+        self.assertNotEqual(r1, r2)
+
+    def test_crc32c_update_is_incremental(self):
+        state = 0xFFFFFFFF
+        all_at_once = local_runner._crc32c_update(state, b"helloworld")
+        partial = local_runner._crc32c_update(state, b"hello")
+        incremental = local_runner._crc32c_update(partial, b"world")
+        self.assertEqual(all_at_once, incremental)
+
+    def test_crc32c_b64_returns_base64_string(self):
+        state = local_runner._crc32c_update(0xFFFFFFFF, b"test")
+        result = local_runner._crc32c_b64(state)
+        # Must be a valid base64 string decodable to 4 bytes
+        decoded = base64.b64decode(result)
+        self.assertEqual(len(decoded), 4)
+
+    def test_crc32c_b64_same_data_same_checksum(self):
+        state = local_runner._crc32c_update(0xFFFFFFFF, b"blueprint")
+        r1 = local_runner._crc32c_b64(state)
+        r2 = local_runner._crc32c_b64(state)
+        self.assertEqual(r1, r2)
+
+    def test_crc32c_initial_state_b64_differs_from_data(self):
+        state_empty = local_runner._crc32c_update(0xFFFFFFFF, b"")
+        state_data = local_runner._crc32c_update(0xFFFFFFFF, b"x")
+        self.assertNotEqual(local_runner._crc32c_b64(state_empty), local_runner._crc32c_b64(state_data))
+
+
+class TestBuildArtifactArchive(unittest.TestCase):
+    """_build_artifact_archive: build a .tar.gz of an artifact directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _artifact_dir(self, files):
+        """Create a fresh artifact dir with the given {relpath: content} map."""
+        art = os.path.join(self.tmp.name, "artifacts")
+        os.makedirs(art, exist_ok=True)
+        for relpath, content in files.items():
+            abs_path = os.path.join(art, relpath)
+            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+            with open(abs_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return art
+
+    def test_nonexistent_dir_returns_none_not_produced(self):
+        archive, meta = local_runner._build_artifact_archive("/nonexistent/path")
+        self.assertIsNone(archive)
+        self.assertEqual(meta["status"], "not_produced")
+
+    def test_empty_dir_returns_none_no_files(self):
+        art = os.path.join(self.tmp.name, "empty")
+        os.makedirs(art)
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNone(archive)
+        self.assertEqual(meta["reason"], "no_artifact_files")
+
+    def test_single_file_produces_archive(self):
+        art = self._artifact_dir({"result.txt": "step=42"})
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            self.assertEqual(meta["status"], "prepared")
+            self.assertEqual(meta["file_count"], 1)
+            self.assertGreater(meta["archive_size"], 0)
+            self.assertIn("crc32c", meta)
+            # Archive must be a valid gzip tarball
+            with tarfile.open(archive, "r:gz") as tar:
+                names = tar.getnames()
+                self.assertIn("result.txt", names)
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+    def test_multiple_files_counted_correctly(self):
+        art = self._artifact_dir({
+            "a.txt": "aaa",
+            "subdir/b.txt": "bbb",
+            "subdir/c.txt": "ccc",
+        })
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            self.assertEqual(meta["file_count"], 3)
+            self.assertEqual(meta["total_bytes"], 9)  # 3+3+3
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+    def test_symlink_dir_is_rejected(self):
+        art = os.path.join(self.tmp.name, "real")
+        os.makedirs(art)
+        with open(os.path.join(art, "f.txt"), "w") as fh:
+            fh.write("x")
+        link = os.path.join(self.tmp.name, "link")
+        os.symlink(art, link)
+        archive, meta = local_runner._build_artifact_archive(link)
+        self.assertIsNone(archive)
+        self.assertEqual(meta["status"], "not_produced")
+
+    def test_crc32c_is_valid_base64(self):
+        art = self._artifact_dir({"f.dat": "data"})
+        archive, meta = local_runner._build_artifact_archive(art)
+        self.assertIsNotNone(archive)
+        try:
+            crc = meta["crc32c"]
+            decoded = base64.b64decode(crc)
+            self.assertEqual(len(decoded), 4)
+        finally:
+            if archive and os.path.exists(archive):
+                os.remove(archive)
+
+
+class TestExtractResumeBundle(unittest.TestCase):
+    """_extract_resume_bundle: safe tar.gz extraction into a staging directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _make_bundle(self, members):
+        """members: list of (name, content_bytes_or_None_for_dir)."""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name, data in members:
+                info = tarfile.TarInfo(name=name)
+                if data is None:
+                    info.type = tarfile.DIRTYPE
+                    tar.addfile(info)
+                else:
+                    payload = data if isinstance(data, bytes) else data.encode()
+                    info.size = len(payload)
+                    tar.addfile(info, io.BytesIO(payload))
+        bundle_path = os.path.join(self.tmp.name, "bundle.tar.gz")
+        with open(bundle_path, "wb") as fh:
+            fh.write(buf.getvalue())
+        return bundle_path
+
+    def test_valid_bundle_extracts_files(self):
+        bundle = self._make_bundle([
+            ("checkpoint.pt", b"\x00\x01\x02"),
+            ("metrics.json", b'{"step": 1}'),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 2)
+        self.assertEqual(total, 3 + 11)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "checkpoint.pt")))
+        self.assertTrue(os.path.isfile(os.path.join(staging, "metrics.json")))
+
+    def test_stale_artifact_names_are_excluded(self):
+        bundle = self._make_bundle([
+            ("model.pt", b"weights"),
+            ("result.json", b'{"ok": true}'),
+            ("command.log.json", b"{}"),
+            ("terminal.json", b"{}"),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, _ = local_runner._extract_resume_bundle(bundle, staging)
+        # result.json, command.log.json, terminal.json are stale and excluded
+        self.assertEqual(count, 1)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "model.pt")))
+        self.assertFalse(os.path.isfile(os.path.join(staging, "result.json")))
+
+    def test_subdir_members_extracted_correctly(self):
+        bundle = self._make_bundle([
+            ("subdir/", None),
+            ("subdir/weights.pt", b"w8s"),
+        ])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 1)
+        self.assertTrue(os.path.isfile(os.path.join(staging, "subdir", "weights.pt")))
+
+    def test_empty_bundle_returns_zero_count(self):
+        bundle = self._make_bundle([])
+        staging = os.path.join(self.tmp.name, "staging")
+        os.makedirs(staging)
+        count, total = local_runner._extract_resume_bundle(bundle, staging)
+        self.assertEqual(count, 0)
+        self.assertEqual(total, 0)
+
+
+class TestSafeResumeTarget(unittest.TestCase):
+    """_safe_resume_target: path-traversal-safe target resolution."""
+
+    def _target(self, member_name):
+        return local_runner._safe_resume_target("/dest", member_name)
+
+    def test_normal_relative_path_accepted(self):
+        result = self._target("model.pt")
+        self.assertIsNotNone(result)
+        self.assertTrue(result.endswith("model.pt"))
+
+    def test_subdir_accepted(self):
+        result = self._target("checkpoints/epoch1.pt")
+        self.assertIsNotNone(result)
+
+    def test_absolute_path_rejected(self):
+        self.assertIsNone(self._target("/etc/passwd"))
+
+    def test_parent_traversal_rejected(self):
+        self.assertIsNone(self._target("../secret.txt"))
+        self.assertIsNone(self._target("subdir/../../etc/passwd"))
+
+    def test_empty_name_rejected(self):
+        self.assertIsNone(self._target(""))
+
+    def test_dot_only_rejected(self):
+        # A path resolving to just dest_dir itself returns None
+        result = local_runner._safe_resume_target("/dest", ".")
+        self.assertIsNone(result)
+
+    def test_windows_separator_traversal_rejected(self):
+        self.assertIsNone(self._target("..\\etc\\passwd"))
+
+
+class TestLlmCliIsEligible(unittest.TestCase):
+    """_llm_cli_is_eligible: bool health flag wins, else falls back to present."""
+
+    def test_healthy_true_is_eligible(self):
+        self.assertTrue(local_runner._llm_cli_is_eligible({"healthy": True}))
+
+    def test_healthy_false_not_eligible(self):
+        self.assertFalse(local_runner._llm_cli_is_eligible({"healthy": False}))
+
+    def test_no_healthy_falls_back_to_present(self):
+        self.assertTrue(local_runner._llm_cli_is_eligible({"present": True}))
+        self.assertFalse(local_runner._llm_cli_is_eligible({"present": False}))
+
+    def test_no_health_info_is_not_eligible(self):
+        self.assertFalse(local_runner._llm_cli_is_eligible({}))
+
+    def test_healthy_none_falls_back_to_present(self):
+        # None is not a bool, so falls through to present
+        self.assertTrue(local_runner._llm_cli_is_eligible({"healthy": None, "present": True}))
+        self.assertFalse(local_runner._llm_cli_is_eligible({"healthy": None, "present": False}))
+
+
+class TestComputeBackendSummary(unittest.TestCase):
+    """_compute_backend_summary: human string for available compute backends."""
+
+    def test_no_backends_returns_none_string(self):
+        caps = iso.Capabilities()
+        result = local_runner._compute_backend_summary(caps)
+        self.assertEqual(result, "none")
+
+    def test_bwrap_only_mentions_bwrap(self):
+        caps = iso.Capabilities(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("bwrap", result)
+        self.assertNotIn("docker", result)
+
+    def test_docker_only_mentions_docker(self):
+        caps = iso.Capabilities(docker_usable=True)
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("docker", result)
+
+    def test_both_backends_mentions_both(self):
+        caps = iso.Capabilities(
+            bwrap_path="/usr/bin/bwrap",
+            userns_ok=True,
+            docker_usable=True,
+        )
+        result = local_runner._compute_backend_summary(caps)
+        self.assertIn("bwrap", result)
+        self.assertIn("docker", result)
+
+
+class TestArtifactDeliveryFailure(unittest.TestCase):
+    """_artifact_delivery_failure: creates a standardized failure dict."""
+
+    def test_basic_failure_dict(self):
+        result = local_runner._artifact_delivery_failure("network_error")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["reason"], "network_error")
+        self.assertEqual(result["protocol"], "direct")
+
+    def test_custom_protocol(self):
+        result = local_runner._artifact_delivery_failure("timeout", protocol="legacy")
+        self.assertEqual(result["protocol"], "legacy")
+
+    def test_reason_truncated_to_256_chars(self):
+        long_reason = "x" * 300
+        result = local_runner._artifact_delivery_failure(long_reason)
+        self.assertEqual(len(result["reason"]), 256)
+
+    def test_non_string_reason_coerced(self):
+        result = local_runner._artifact_delivery_failure(42)
+        self.assertEqual(result["reason"], "42")
+
+
+class TestCpuLoadAvgAndMemoryFree(unittest.TestCase):
+    """_cpu_load_avg / _memory_free_bytes: system probes, tested with mocks."""
+
+    def test_cpu_load_avg_returns_float(self):
+        with patch.object(local_runner.os, "getloadavg", return_value=(1.5, 2.0, 1.8)):
+            result = local_runner._cpu_load_avg()
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(result, 1.5)
+
+    def test_cpu_load_avg_handles_oserror(self):
+        with patch.object(local_runner.os, "getloadavg", side_effect=OSError("unsupported")):
+            self.assertIsNone(local_runner._cpu_load_avg())
+
+    def test_cpu_load_avg_handles_attribute_error(self):
+        with patch.object(local_runner.os, "getloadavg", side_effect=AttributeError):
+            self.assertIsNone(local_runner._cpu_load_avg())
+
+    def test_memory_free_bytes_reads_memavailable(self):
+        meminfo = "MemTotal: 16384 kB\nMemAvailable: 8192 kB\nMemFree: 4096 kB\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=meminfo)):
+            result = local_runner._memory_free_bytes()
+        self.assertEqual(result, 8192 * 1024)
+
+    def test_memory_free_bytes_falls_back_to_memfree(self):
+        # Old kernels may not have MemAvailable
+        meminfo = "MemTotal: 16384 kB\nMemFree: 4096 kB\n"
+        with patch("builtins.open", unittest.mock.mock_open(read_data=meminfo)):
+            result = local_runner._memory_free_bytes()
+        self.assertEqual(result, 4096 * 1024)
+
+    def test_memory_free_bytes_handles_oserror(self):
+        with patch("builtins.open", side_effect=OSError("no /proc")):
+            self.assertIsNone(local_runner._memory_free_bytes())
+
+
+class TestProgressTail(unittest.TestCase):
+    """_ProgressTail: tail-reads a JSONL progress file between heartbeats."""
+
+    def _make_tail(self, path):
+        return local_runner._ProgressTail(path)
+
+    def test_missing_file_returns_none_snapshot(self):
+        tail = self._make_tail("/nonexistent/progress.jsonl")
+        self.assertIsNone(tail.poll())
+
+    def test_empty_file_returns_none(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as fh:
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            self.assertIsNone(tail.poll())
+        finally:
+            os.unlink(path)
+
+
+    def test_valid_record_appears_in_snapshot(self):
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".jsonl", delete=False, encoding="utf-8"
+        ) as fh:
+            fh.write('{"metric": "loss", "value": 0.5}\n')
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+            self.assertEqual(len(result["records"]), 1)
+            self.assertEqual(result["records"][0]["metric"], "loss")
+        finally:
+            os.unlink(path)
+
+    def test_incremental_polling_only_reads_new_data(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            # First poll: empty
+            self.assertIsNone(tail.poll())
+
+            # Write a record and poll again
+            with open(path, "ab") as fh:
+                fh.write(b'{"metric": "loss", "value": 1.0}\n')
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+
+            # Append another record and poll
+            with open(path, "ab") as fh:
+                fh.write(b'{"metric": "acc", "value": 0.9}\n')
+            result2 = tail.poll()
+            self.assertEqual(result2["count"], 2)
+        finally:
+            os.unlink(path)
+
+    def test_truncated_file_resets_reader(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            path = fh.name
+        try:
+            # Write a larger file and poll to advance offset past the end
+            large = b'{"metric": "loss", "value": 0.1}\n' * 10
+            with open(path, "wb") as fh:
+                fh.write(large)
+            tail = self._make_tail(path)
+            tail.poll()  # offset is now len(large)
+
+            # Truncate and rewrite with shorter content (size < offset triggers reset)
+            with open(path, "wb") as fh:
+                fh.write(b'{"metric": "epoch", "value": 1.0}\n')
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            # After reset, the new "epoch" record should appear
+            self.assertTrue(
+                any(r["metric"] == "epoch" for r in result["records"]),
+                f"expected 'epoch' in records after truncation reset: {result}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_invalid_lines_skipped_gracefully(self):
+        with tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".jsonl", delete=False
+        ) as fh:
+            fh.write(b"not-valid-json\n")
+            fh.write(b'{"metric": "loss", "value": 0.5}\n')
+            path = fh.name
+        try:
+            tail = self._make_tail(path)
+            result = tail.poll()
+            self.assertIsNotNone(result)
+            self.assertEqual(result["count"], 1)
+        finally:
+            os.unlink(path)

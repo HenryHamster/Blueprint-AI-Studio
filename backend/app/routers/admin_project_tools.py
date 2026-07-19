@@ -32,6 +32,7 @@ import json as _json
 import logging
 import mimetypes
 import os
+import pathlib
 import re
 import time as _time
 import uuid
@@ -41,7 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import jwt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,7 +50,18 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
-from app.models import Project, ProjectComputeImage, ProjectTool, _utcnow
+from app.shared_state import limiter
+from app.models import (
+    ArtifactRef,
+    ArtifactRefPromotionIntent,
+    ComputeImageBuildStatus,
+    Project,
+    ProjectComputeImage,
+    ProjectComputeImageBuild,
+    ProjectMessageAttachmentUpload,
+    ProjectTool,
+    _utcnow,
+)
 from app.auth import (
     get_current_user,
     AGENT_JWT_SECRET,
@@ -146,6 +158,57 @@ def _prune_manifest_cache() -> None:
             _manifest_cache.pop(k, None)
 
 
+# ── Local-source fallback ─────────────────────────────────────────────────────
+#
+# When a project has no GitHub connection (or the GitHub fetch fails), the
+# manifest and assets can be loaded from a directory on the local filesystem.
+# Set BLUEPRINT_LOCAL_TOOLS_ROOT to a directory that mirrors the repo layout:
+#   <root>/.blueprint/tools.json           — the manifest
+#   <root>/.blueprint/tools/<slug>/<path>  — individual tool assets
+#
+# This is intentionally gated on the env var so production deployments without
+# a configured local path are unaffected.
+
+_BLUEPRINT_LOCAL_TOOLS_ROOT_ENV = "BLUEPRINT_LOCAL_TOOLS_ROOT"
+
+
+def _get_local_tools_root() -> pathlib.Path | None:
+    """Return the configured local tools root path, or None if not set."""
+    raw = os.environ.get(_BLUEPRINT_LOCAL_TOOLS_ROOT_ENV, "").strip()
+    if not raw:
+        return None
+    return pathlib.Path(raw)
+
+
+def _read_local_manifest() -> str | None:
+    """Read .blueprint/tools.json from the local tools root; returns None if absent."""
+    root = _get_local_tools_root()
+    if root is None:
+        return None
+    manifest_path = root / ".blueprint" / "tools.json"
+    try:
+        return manifest_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError, PermissionError):
+        return None
+
+
+def _read_local_asset(tool_slug: str, asset_path: str) -> bytes | None:
+    """Read a tool asset from the local tools root; returns None if absent."""
+    root = _get_local_tools_root()
+    if root is None:
+        return None
+    # Resolve under the local root to prevent path traversal.
+    asset_file = root / ".blueprint" / "tools" / tool_slug / asset_path
+    try:
+        resolved = asset_file.resolve()
+        root_resolved = root.resolve()
+        if not str(resolved).startswith(str(root_resolved)):
+            return None
+        return resolved.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, PermissionError, ValueError):
+        return None
+
+
 # ── Manifest schema ──────────────────────────────────────────────────────────
 
 # Required fields in each tool entry.
@@ -240,6 +303,28 @@ def _validate_manifest_compute_image_build(spec: Any) -> str | None:
         for k, v in build_args.items():
             if not isinstance(k, str) or not isinstance(v, str):
                 return "compute.image.build: build_args keys and values must be strings"
+    deps = spec.get("deps")
+    if deps is not None:
+        if not isinstance(deps, list):
+            return "compute.image.build: deps must be an array of strings"
+        for i, entry in enumerate(deps):
+            if not isinstance(entry, str) or not entry.strip():
+                return f"compute.image.build: deps[{i}] must be a non-empty string"
+            dep_path = entry.strip()
+            # Validate using both POSIX and Windows path syntax because a
+            # manifest can be authored on either platform while the service
+            # runs on Linux.  A drive-qualified, rooted, UNC, or traversal path
+            # must never be treated as repo-relative.
+            if (
+                dep_path.startswith(("/", "\\"))
+                or re.match(r"^[A-Za-z]:", dep_path)
+                or "\x00" in dep_path
+                or any(part == ".." for part in re.split(r"[\\/]", dep_path))
+            ):
+                return (
+                    f"compute.image.build: deps[{i}] must be a relative path "
+                    "without '..'"
+                )
     return None
 
 
@@ -272,6 +357,7 @@ def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
         dockerfile = raw_build.get("dockerfile")
         parent = raw_build.get("parent")
         raw_args = raw_build.get("build_args")
+        raw_deps = raw_build.get("deps")
         result["build"] = {
             "dockerfile": (
                 dockerfile.strip()
@@ -283,6 +369,11 @@ def _normalize_manifest_compute_image(spec: Dict[str, Any]) -> Dict[str, Any]:
                 {str(k): str(v) for k, v in raw_args.items()}
                 if isinstance(raw_args, dict)
                 else {}
+            ),
+            "deps": (
+                [str(d).strip() for d in raw_deps if isinstance(d, str)]
+                if isinstance(raw_deps, list)
+                else []
             ),
         }
     return result
@@ -362,6 +453,100 @@ def _normalize_manifest_skill(entry: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _parse_manifest_text(manifest_text: str, source_label: str) -> Dict[str, Any]:
+    """Parse and validate a manifest JSON string into the standard result dict.
+
+    *source_label* is used only in log messages (e.g. ``"local"`` or ``"github"``).
+    """
+    try:
+        manifest = _json.loads(manifest_text)
+    except _json.JSONDecodeError as e:
+        error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
+        logger.warning("[project-tools] %s (%s)", error_msg, source_label)
+        return {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
+
+    if not isinstance(manifest, dict):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {"image": None},
+            "error": ".blueprint/tools.json must be a JSON object with a 'tools' array",
+        }
+
+    raw_tools = manifest.get("tools")
+    if raw_tools is None:
+        raw_tools = []
+    elif not isinstance(raw_tools, list):
+        return {
+            "tools": [],
+            "skills": [],
+            "compute": {"image": None},
+            "error": ".blueprint/tools.json 'tools' field must be an array",
+        }
+
+    tools: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_slugs: set[str] = set()
+    for i, entry in enumerate(raw_tools):
+        err = _validate_manifest_tool(entry, i)
+        if err:
+            errors.append(err)
+            continue
+        slug = entry["slug"]
+        if slug in seen_slugs:
+            errors.append(f"tools[{i}]: duplicate slug '{slug}'")
+            continue
+        seen_slugs.add(slug)
+        tools.append(_normalize_manifest_tool(entry))
+
+    raw_skills = manifest.get("skills")
+    skills: List[Dict[str, Any]] = []
+    if isinstance(raw_skills, list):
+        seen_skill_slugs: set[str] = set()
+        for i, entry in enumerate(raw_skills):
+            err = _validate_manifest_skill(entry, i)
+            if err:
+                errors.append(err)
+                continue
+            slug = entry["slug"]
+            if slug in seen_skill_slugs:
+                errors.append(f"skills[{i}]: duplicate slug '{slug}'")
+                continue
+            seen_skill_slugs.add(slug)
+            skills.append(_normalize_manifest_skill(entry))
+
+    compute_image: Dict[str, Any] | None = None
+    raw_compute = manifest.get("compute")
+    if isinstance(raw_compute, dict):
+        raw_compute_image = raw_compute.get("image")
+        if raw_compute_image is not None:
+            err = _validate_manifest_compute_image(raw_compute_image)
+            if err:
+                errors.append(err)
+            else:
+                compute_image = _normalize_manifest_compute_image(raw_compute_image)
+
+    if errors:
+        error_msg = "Manifest validation errors: " + "; ".join(errors)
+        logger.warning("[project-tools] %s (%s)", error_msg, source_label)
+        return {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": error_msg}
+
+    return {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": None}
+
+
+def _discover_manifest_tools_local() -> Dict[str, Any]:
+    """Load and parse the manifest from the local filesystem fallback.
+
+    Returns the same shape as ``_discover_manifest_tools``.  When no local root is
+    configured or the manifest file is absent, returns empty lists with no error.
+    """
+    manifest_text = _read_local_manifest()
+    if manifest_text is None:
+        return {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+    logger.debug("[project-tools] Loading manifest from local fallback (BLUEPRINT_LOCAL_TOOLS_ROOT)")
+    return _parse_manifest_text(manifest_text, "local")
+
+
 async def _discover_manifest_tools(
     project: Project,
 ) -> Dict[str, Any]:
@@ -378,7 +563,7 @@ async def _discover_manifest_tools(
     project_id_str = str(project.id)
 
     if not owner or not repo_name:
-        return {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+        return _discover_manifest_tools_local()
 
     cache_key = f"{owner}/{repo_name}"
 
@@ -399,7 +584,15 @@ async def _discover_manifest_tools(
                 "[project-tools] No read token for %s/%s — cannot fetch manifest",
                 owner, repo_name,
             )
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": None}
+            # This is not equivalent to a repository with no manifest: callers
+            # that make retention decisions must preserve existing protection
+            # until a later read can establish whether an image is declared.
+            result = {
+                "tools": [],
+                "skills": [],
+                "compute": {"image": None},
+                "error": "Repository read token unavailable; manifest could not be fetched",
+            }
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
             return result
 
@@ -419,83 +612,9 @@ async def _discover_manifest_tools(
             _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
             return result
 
-        try:
-            manifest = _json.loads(manifest_text)
-        except _json.JSONDecodeError as e:
-            error_msg = f"Invalid JSON in .blueprint/tools.json: {e}"
-            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        if not isinstance(manifest, dict):
-            error_msg = ".blueprint/tools.json must be a JSON object with a 'tools' array"
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        raw_tools = manifest.get("tools")
-        if raw_tools is None:
-            raw_tools = []
-        elif not isinstance(raw_tools, list):
-            error_msg = ".blueprint/tools.json 'tools' field must be an array"
-            result = {"tools": [], "skills": [], "compute": {"image": None}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        tools: List[Dict[str, Any]] = []
-        errors: List[str] = []
-        seen_slugs: set[str] = set()
-        for i, entry in enumerate(raw_tools):
-            err = _validate_manifest_tool(entry, i)
-            if err:
-                errors.append(err)
-                continue
-            slug = entry["slug"]
-            if slug in seen_slugs:
-                errors.append(f"tools[{i}]: duplicate slug '{slug}'")
-                continue
-            seen_slugs.add(slug)
-            tools.append(_normalize_manifest_tool(entry))
-
-        # Parse optional skills array alongside tools.
-        raw_skills = manifest.get("skills")
-        skills: List[Dict[str, Any]] = []
-        if isinstance(raw_skills, list):
-            seen_skill_slugs: set[str] = set()
-            for i, entry in enumerate(raw_skills):
-                err = _validate_manifest_skill(entry, i)
-                if err:
-                    errors.append(err)
-                    continue
-                slug = entry["slug"]
-                if slug in seen_skill_slugs:
-                    errors.append(f"skills[{i}]: duplicate slug '{slug}'")
-                    continue
-                seen_skill_slugs.add(slug)
-                skills.append(_normalize_manifest_skill(entry))
-
-        # Parse optional compute section alongside tools and skills.
-        compute_image: Dict[str, Any] | None = None
-        raw_compute = manifest.get("compute")
-        if isinstance(raw_compute, dict):
-            raw_compute_image = raw_compute.get("image")
-            if raw_compute_image is not None:
-                err = _validate_manifest_compute_image(raw_compute_image)
-                if err:
-                    errors.append(err)
-                else:
-                    compute_image = _normalize_manifest_compute_image(raw_compute_image)
-
-        if errors:
-            error_msg = "Manifest validation errors: " + "; ".join(errors)
-            logger.warning("[project-tools] %s for %s", error_msg, cache_key)
-            result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": error_msg}
-            _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_FAIL, result)
-            return result
-
-        result = {"tools": tools, "skills": skills, "compute": {"image": compute_image}, "error": None}
-        _manifest_cache[cache_key] = (_time.monotonic() + _MANIFEST_CACHE_TTL_OK, result)
+        result = _parse_manifest_text(manifest_text, cache_key)
+        ttl = _MANIFEST_CACHE_TTL_FAIL if result.get("error") else _MANIFEST_CACHE_TTL_OK
+        _manifest_cache[cache_key] = (_time.monotonic() + ttl, result)
         return result
 
     except Exception as e:  # noqa: BLE001 — manifest fetch must never crash the endpoint
@@ -618,6 +737,11 @@ class _ToolContentSave(BaseModel):
     base_revision: int
 
 
+class _ToolArtifactRefCreate(BaseModel):
+    expected_revision: int = Field(ge=0)
+    rendered_image: Dict[str, Any] | None = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -631,6 +755,9 @@ def _tool_summary(tool: ProjectTool) -> Dict[str, Any]:
         "enabled": tool.enabled,
         "placement": tool.placement,
         "content_revision": tool.content_revision,
+        # config is small metadata (kind-specific settings), not the mutable
+        # content document — surfaced so the client Configure panel can prefill.
+        "config": tool.config or {},
     }
 
 
@@ -776,6 +903,7 @@ async def register_project_tool(
         )
     spec = TOOL_KINDS[kind]
 
+    explicit_slug = bool((payload.slug or "").strip())
     slug = (payload.slug or kind).strip()
     if not _SLUG_RE.match(slug):
         raise HTTPException(
@@ -789,24 +917,43 @@ async def register_project_tool(
     placement = (payload.placement or spec["default_placement"]).strip()
     if not placement:
         placement = spec["default_placement"]
+    if placement not in _VALID_PLACEMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
+        )
     config = payload.config if isinstance(payload.config, dict) else {}
     _validate_config(kind, config, spec)
 
-    # Enforce unique (project_id, slug) with a friendly 409 before hitting the
-    # DB constraint, which would otherwise surface as a 500.
-    existing = (
-        await session.execute(
-            select(ProjectTool.id).where(
-                ProjectTool.project_id == project_id,
-                ProjectTool.slug == slug,
+    # Load slugs already taken in this project so we can either 409 (explicit
+    # slug) or auto-uniquify (omitted slug — lets an operator add a second tool
+    # of the same kind without hitting a dead-end).
+    taken = {
+        s
+        for (s,) in (
+            await session.execute(
+                select(ProjectTool.slug).where(
+                    ProjectTool.project_id == project_id
+                )
             )
-        )
-    ).scalar_one_or_none()
-    if existing is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"A tool with slug '{slug}' already exists for this project",
-        )
+        ).all()
+    }
+
+    if slug in taken:
+        if explicit_slug:
+            # Caller pinned this slug — surface the collision as a friendly 409
+            # before the DB unique constraint turns it into a 500.
+            raise HTTPException(
+                status_code=409,
+                detail=f"A tool with slug '{slug}' already exists for this project",
+            )
+        # Slug was derived from the kind; append the smallest free numeric
+        # suffix so a second whiteboard/notes tool registers cleanly.
+        base = slug
+        n = 2
+        while f"{base}-{n}" in taken:
+            n += 1
+        slug = f"{base}-{n}"
 
     tool = ProjectTool(
         project_id=project_id,
@@ -848,6 +995,11 @@ async def update_project_tool(
         placement = payload.placement.strip()
         if not placement:
             raise HTTPException(status_code=400, detail="placement must not be empty")
+        if placement not in _VALID_PLACEMENTS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
+            )
         tool.placement = placement
     if payload.config is not None:
         if not isinstance(payload.config, dict):
@@ -936,6 +1088,371 @@ async def save_project_tool_content(
     await session.commit()
     await session.refresh(tool)
     return {"content_revision": tool.content_revision}
+
+
+async def _await_tracked_artifact_ref_promotion(task):
+    """Bound the request wait without transferring cancellation to the WAL task."""
+
+    return await asyncio.wait_for(asyncio.shield(task), timeout=25)
+
+
+def _artifact_ref_pending_response(
+    intent_id: uuid.UUID,
+    receipt_id: uuid.UUID,
+) -> JSONResponse:
+    """Return the canonical durable-acceptance response for a pending copy."""
+
+    return JSONResponse(
+        status_code=202,
+        headers={"Retry-After": "5"},
+        content={
+            "state": "pending",
+            "promotion_intent_id": str(intent_id),
+            "receipt_id": str(receipt_id),
+            "retry_after_ms": 5_000,
+        },
+    )
+
+
+@router.post(
+    "/projects/{project_id}/tools/{tool_id}/artifact-refs",
+    status_code=201,
+)
+@limiter.limit("30/minute")
+async def create_project_tool_artifact_ref(
+    request: Request,
+    project_id: uuid.UUID,
+    tool_id: uuid.UUID,
+    payload: _ToolArtifactRefCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Freeze an exact Notes/Whiteboard revision for a Resident handoff."""
+
+    del request
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.artifact_refs import (
+        ArtifactRefConflict,
+        artifact_ref_projection,
+        create_tool_artifact_ref,
+    )
+    from app.storage import (
+        StorageUriError,
+        artifact_ref_render_uri,
+    )
+    from app.artifact_ref_promotion import (
+        ArtifactRefPromotionBusy,
+        expire_artifact_ref_promotion_claim,
+        prepare_artifact_ref_promotion_intent,
+        reconcile_one_artifact_ref_promotion,
+        start_tracked_artifact_ref_promotion,
+    )
+
+    rendered_image = dict(payload.rendered_image or {}) or None
+    promoted_uri: str | None = None
+    candidate_promoted_uri: str | None = None
+    promotion_intent_id: uuid.UUID | None = None
+    promotion_claim_id: uuid.UUID | None = None
+    if rendered_image is not None:
+        preflight_tool = await session.get(ProjectTool, tool_id)
+        if preflight_tool is None or preflight_tool.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Tool not found")
+        if preflight_tool.kind != "whiteboard":
+            raise HTTPException(
+                status_code=400,
+                detail="rendered images are only valid for Whiteboard handoff",
+            )
+        try:
+            attachment_id = uuid.UUID(
+                str(rendered_image.get("attachment_id") or rendered_image.get("id") or "")
+            )
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="whiteboard handoff requires a rendered image upload",
+            ) from None
+        receipt = await session.get(ProjectMessageAttachmentUpload, attachment_id)
+        existing = (
+            await session.execute(
+                select(ArtifactRef).where(
+                    ArtifactRef.project_id == project_id,
+                    ArtifactRef.tool_id == tool_id,
+                    ArtifactRef.revision == payload.expected_revision,
+                )
+            )
+        ).scalar_one_or_none()
+        receipt_identity_invalid = (
+            receipt is None
+            or receipt.project_id != project_id
+            or receipt.actor_user_id != current_user["user_id"]
+            or receipt.storage_uri
+            != str(rendered_image.get("storage_uri") or "").strip()
+        )
+        receipt_already_used_elsewhere = bool(
+            receipt is not None
+            and (
+                receipt.message_id is not None
+                or (
+                    receipt.artifact_ref_id is not None
+                    and (existing is None or receipt.artifact_ref_id != existing.id)
+                )
+            )
+        )
+        receipt_unavailable_for_new_ref = bool(
+            receipt is not None
+            and existing is None
+            and (
+                receipt.consumed_at is not None
+                or receipt.artifact_ref_id is not None
+                or receipt.expires_at <= _utcnow()
+            )
+        )
+        if (
+            receipt_identity_invalid
+            or receipt_already_used_elsewhere
+            or receipt_unavailable_for_new_ref
+        ):
+            raise HTTPException(status_code=400, detail="Invalid rendered image upload receipt")
+        if existing is None:
+            source_storage_uri = receipt.storage_uri
+            expected_size_bytes = receipt.expected_size_bytes
+            candidate_promoted_uri = artifact_ref_render_uri(
+                project_id,
+                tool_id,
+                payload.expected_revision,
+                attachment_id,
+            )
+            try:
+                promotion_claim = await prepare_artifact_ref_promotion_intent(
+                    session,
+                    project_id=project_id,
+                    tool_id=tool_id,
+                    revision=payload.expected_revision,
+                    receipt_id=attachment_id,
+                    actor_user_id=current_user["user_id"],
+                    source_storage_uri=source_storage_uri,
+                    candidate_storage_uri=candidate_promoted_uri,
+                    expected_size_bytes=expected_size_bytes,
+                    expected_sha256=str(rendered_image.get("checksum") or ""),
+                    render_width=rendered_image.get("width") if isinstance(rendered_image.get("width"), int) else None,
+                    render_height=rendered_image.get("height") if isinstance(rendered_image.get("height"), int) else None,
+                )
+                promotion_intent_id = promotion_claim.intent_id
+                promotion_claim_id = promotion_claim.claim_id
+            except ArtifactRefPromotionBusy as exc:
+                await session.rollback()
+                same_intent = (
+                    await session.execute(
+                        select(ArtifactRefPromotionIntent).where(
+                            ArtifactRefPromotionIntent.project_id == project_id,
+                            ArtifactRefPromotionIntent.tool_id == tool_id,
+                            ArtifactRefPromotionIntent.revision == payload.expected_revision,
+                            ArtifactRefPromotionIntent.receipt_id == attachment_id,
+                            ArtifactRefPromotionIntent.state.notin_(["settled"]),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if same_intent is None:
+                    same_intent = (
+                        await session.execute(
+                            select(ArtifactRefPromotionIntent).where(
+                                ArtifactRefPromotionIntent.project_id == project_id,
+                                ArtifactRefPromotionIntent.tool_id == tool_id,
+                                ArtifactRefPromotionIntent.revision
+                                == payload.expected_revision,
+                                ArtifactRefPromotionIntent.state != "settled",
+                            )
+                        )
+                    ).scalar_one_or_none()
+                if same_intent is None:
+                    raise HTTPException(status_code=409, detail=str(exc)) from None
+                # A live copy already has one tracked owner. Poll requests must
+                # remain DB-only; starting GCS inspection here would create an
+                # uncancellable worker thread on every retry. Promoted/owned
+                # states are safe to reconcile because they need only DB work.
+                if same_intent.state in {"promoted", "owned"}:
+                    try:
+                        async with asyncio.timeout(25):
+                            reconciled = await reconcile_one_artifact_ref_promotion(
+                                project_id=project_id,
+                                tool_id=tool_id,
+                                revision=payload.expected_revision,
+                                receipt_id=same_intent.receipt_id,
+                            )
+                    except TimeoutError:
+                        reconciled = None
+                    if reconciled is not None:
+                        return JSONResponse(
+                            status_code=201,
+                            content={
+                                "state": "ready",
+                                "artifact_ref": artifact_ref_projection(reconciled),
+                            },
+                        )
+                # Keep the caller's durable receipt identity. This may be a
+                # redundant upload waiting on another receipt's logical
+                # promotion; replaying the same body adopts the immutable ref.
+                return _artifact_ref_pending_response(
+                    same_intent.id, attachment_id
+                )
+            except PermissionError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=403, detail=str(exc)) from None
+            except LookupError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=404, detail=str(exc)) from None
+            except ValueError as exc:
+                await session.rollback()
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            try:
+                promotion_task = start_tracked_artifact_ref_promotion(
+                    intent_id=promotion_intent_id,
+                    claim_id=promotion_claim_id,
+                    project_id=project_id,
+                    tool_id=tool_id,
+                    revision=payload.expected_revision,
+                    receipt_id=attachment_id,
+                    source_storage_uri=source_storage_uri,
+                    expected_size_bytes=expected_size_bytes,
+                    expected_sha256=str(rendered_image.get("checksum") or ""),
+                )
+                reconciled = await _await_tracked_artifact_ref_promotion(
+                    promotion_task
+                )
+                if reconciled is None:
+                    raise ArtifactRefPromotionBusy(
+                        "Render promotion authority changed; reconciliation queued"
+                    )
+                return JSONResponse(
+                    status_code=201,
+                    content={
+                        "state": "ready",
+                        "artifact_ref": artifact_ref_projection(reconciled),
+                    },
+                )
+            except StorageUriError:
+                logger.warning(
+                    "ArtifactRef promotion returned a storage error after WAL prepare",
+                    extra={"promotion_intent_id": str(promotion_intent_id)},
+                    exc_info=True,
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except ArtifactRefPromotionBusy:
+                await expire_artifact_ref_promotion_claim(
+                    intent_id=promotion_intent_id,
+                    claim_id=promotion_claim_id,
+                    error="tracked promotion capacity unavailable",
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except TimeoutError:
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                logger.warning(
+                    "ArtifactRef render promotion failed for project %s tool %s",
+                    project_id,
+                    tool_id,
+                    extra={
+                        "event": "artifact_ref_promotion_unknown",
+                        "project_id": str(project_id),
+                        "tool_id": str(tool_id),
+                        "storage_uri": candidate_promoted_uri,
+                    },
+                    exc_info=True,
+                )
+                return _artifact_ref_pending_response(
+                    promotion_intent_id, attachment_id
+                )
+
+    try:
+        artifact_ref = await create_tool_artifact_ref(
+            session,
+            project_id=project_id,
+            tool_id=tool_id,
+            actor_user_id=current_user["user_id"],
+            expected_revision=payload.expected_revision,
+            rendered_image=rendered_image,
+            promotion_intent_id=promotion_intent_id,
+            promotion_claim_id=promotion_claim_id,
+        )
+    except ArtifactRefConflict as conflict:
+        await session.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "tool_revision_conflict",
+                "expected_revision": conflict.expected_revision,
+                "current_revision": conflict.current_revision,
+                "action": "reload_or_rebase",
+            },
+        ) from None
+    except LookupError:
+        await session.rollback()
+        raise HTTPException(status_code=404, detail="Tool not found") from None
+    except PermissionError:
+        await session.rollback()
+        raise HTTPException(status_code=403, detail="Project member access changed") from None
+    except ValueError as exc:
+        await session.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    except HTTPException:
+        await session.rollback()
+        raise
+    try:
+        await session.commit()
+    except Exception:
+        # Commit outcome can be uncertain. Preserve the deterministic object so
+        # a same-receipt retry can reconcile instead of deleting a durable ref.
+        logger.warning(
+            "ArtifactRef commit outcome unknown; promoted object retained for retry",
+            extra={
+                "event": "artifact_ref_commit_unknown",
+                "project_id": str(project_id),
+                "tool_id": str(tool_id),
+                "storage_uri": promoted_uri,
+            },
+            exc_info=True,
+        )
+        raise
+    await session.refresh(artifact_ref)
+    return {"state": "ready", "artifact_ref": artifact_ref_projection(artifact_ref)}
+
+
+@router.get("/projects/{project_id}/artifact-refs/{artifact_ref_id}")
+async def get_project_tool_artifact_ref(
+    project_id: uuid.UUID,
+    artifact_ref_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Retrieve one immutable tool revision through project membership."""
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.artifact_refs import artifact_ref_projection, get_project_artifact_ref
+
+    artifact_ref = await get_project_artifact_ref(
+        session,
+        project_id=project_id,
+        artifact_ref_id=artifact_ref_id,
+    )
+    if artifact_ref is None:
+        raise HTTPException(status_code=404, detail="ArtifactRef not found")
+    return {
+        "artifact_ref": artifact_ref_projection(artifact_ref),
+        "content": artifact_ref.content_snapshot or {},
+        "retrieval": artifact_ref.retrieval_metadata or {},
+    }
 
 
 @router.post("/projects/{project_id}/tools/seed")
@@ -1059,6 +1576,114 @@ async def mint_tool_asset_token(
 # ── Asset serving endpoint (public router — JWT auth, no cookies) ────────────
 
 
+async def _serve_tool_asset_impl(
+    *,
+    project_id: uuid.UUID,
+    tool_slug: str,
+    path: str,
+    token: str,
+    session: AsyncSession,
+    add_referrer_policy: bool = False,
+) -> Response:
+    """Shared implementation for both asset-serving routes."""
+    # 1. Validate the capability JWT.
+    payload = _verify_tool_asset_token(token)
+    if payload.get("project_id") != str(project_id):
+        raise HTTPException(status_code=401, detail="Token project_id mismatch")
+    if payload.get("tool_slug") != tool_slug:
+        raise HTTPException(status_code=401, detail="Token tool_slug mismatch")
+
+    # 2. Security: reject path traversal and absolute paths.
+    if ".." in path or path.startswith("/") or path.startswith("\\"):
+        raise HTTPException(status_code=400, detail="Invalid asset path")
+
+    # 3. Look up the project to get GitHub repo info.
+    project = await session.get(Project, project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    owner = (project.github_owner or "").strip()
+    repo_name = (project.github_repo or "").strip()
+
+    content_type = _content_type_for_path(path)
+
+    if not owner or not repo_name:
+        # No GitHub connection — try local filesystem fallback.
+        local_body = _read_local_asset(tool_slug, path)
+        if local_body is None:
+            raise HTTPException(status_code=404, detail="Asset not found (no connected repo and no local fallback)")
+        body: bytes = local_body
+    else:
+        # 4. Fetch the file from GitHub.
+        repo_file_path = f".blueprint/tools/{tool_slug}/{path}"
+
+        from app.github_auth import get_repo_installation_read_token
+        from app.github_refs import get_repo_default_branch
+
+        gh_token = await get_repo_installation_read_token(owner, repo_name)
+        if not gh_token:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to obtain GitHub token for repo access",
+            )
+
+        default_branch = await get_repo_default_branch(gh_token, owner, repo_name)
+
+        ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        is_text = f".{ext}" in _TEXT_EXTENSIONS if ext else True
+
+        try:
+            if is_text:
+                from app.github import get_file_text_at_ref
+
+                text = await get_file_text_at_ref(
+                    repo_file_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo_name,
+                    ref=default_branch,
+                    project_id=str(project_id),
+                )
+                if text is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+                body = text.encode("utf-8")
+            else:
+                from app.github import get_file_bytes_at_ref
+
+                raw = await get_file_bytes_at_ref(
+                    repo_file_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo_name,
+                    ref=default_branch,
+                    project_id=str(project_id),
+                )
+                if raw is None:
+                    raise HTTPException(status_code=404, detail="File not found")
+                body = raw
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                "[project-tools] Asset fetch error %s/%s/%s: %s",
+                owner, repo_name, repo_file_path, e,
+            )
+            raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
+
+    headers = {
+        "Cache-Control": "public, max-age=300",
+        "X-Content-Type-Options": "nosniff",
+        "Content-Security-Policy": "sandbox allow-scripts",
+    }
+    if add_referrer_policy and content_type == "text/html":
+        headers["Referrer-Policy"] = "no-referrer"
+
+    return Response(
+        content=body,
+        media_type=content_type,
+        headers=headers,
+    )
+
+
 def _verify_tool_asset_token(token: str) -> dict:
     """Verify a tool-asset capability JWT.
 
@@ -1075,6 +1700,46 @@ def _verify_tool_asset_token(token: str) -> dict:
     if payload.get("scope") != TOOL_ASSET_TOKEN_SCOPE:
         raise HTTPException(status_code=401, detail="Token scope is not tool-asset")
     return payload
+
+
+@asset_router.get("/projects/{project_id}/tools/{tool_slug}/t/{token}/assets/{path:path}")
+async def serve_tool_asset_path_token(
+    project_id: uuid.UUID,
+    tool_slug: str,
+    token: str,
+    path: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    """Serve a static asset for a project-declared tool via a path-embedded token.
+
+    The token lives in the URL path so that relative subresources (e.g.
+    ``<script src="./app.js">``) resolve inside the token-prefix tree and
+    authenticate automatically — the query-string token would be dropped on
+    relative resolution, causing 401 for every subresource.
+
+    The ``sandbox="allow-scripts"`` (no ``allow-same-origin``) iframe constraint
+    makes cookies and custom headers impossible; path-embedding is the only
+    mechanism that survives relative URL resolution inside an opaque-origin
+    sandboxed iframe.
+
+    Security mitigations for token-in-path leakage:
+    - Short JWT TTL (same as the query-param route, ~5 min) limits the useful
+      window if a token leaks through Referer or server logs.
+    - ``Referrer-Policy: no-referrer`` is added to all HTML responses so the
+      token is not forwarded in Referer headers when the page navigates to
+      external resources.
+    - Token is validated identically to the query-param route via
+      ``_verify_tool_asset_token``.
+    """
+    return await _serve_tool_asset_impl(
+        project_id=project_id,
+        tool_slug=tool_slug,
+        path=path,
+        token=token,
+        session=session,
+        add_referrer_policy=True,
+    )
 
 
 @asset_router.get("/projects/{project_id}/tools/{tool_slug}/assets/{path:path}")
@@ -1098,110 +1763,12 @@ async def serve_tool_asset(
     from the file extension.  Security: path traversal (``..``) and absolute
     paths are rejected.
     """
-    # 1. Validate the capability JWT.
-    payload = _verify_tool_asset_token(token)
-    if payload.get("project_id") != str(project_id):
-        raise HTTPException(status_code=401, detail="Token project_id mismatch")
-    if payload.get("tool_slug") != tool_slug:
-        raise HTTPException(status_code=401, detail="Token tool_slug mismatch")
-
-    # 2. Security: reject path traversal and absolute paths.
-    if ".." in path or path.startswith("/") or path.startswith("\\"):
-        raise HTTPException(status_code=400, detail="Invalid asset path")
-
-    # 3. Look up the project to get GitHub repo info.
-    project = await session.get(Project, project_id)
-    if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-    owner = (project.github_owner or "").strip()
-    repo_name = (project.github_repo or "").strip()
-    if not owner or not repo_name:
-        raise HTTPException(status_code=404, detail="Project has no connected repo")
-
-    # 4. Fetch the file from GitHub.
-    repo_file_path = f".blueprint/tools/{tool_slug}/{path}"
-
-    from app.github_auth import get_repo_installation_read_token
-    from app.github_refs import get_repo_default_branch
-
-    gh_token = await get_repo_installation_read_token(owner, repo_name)
-    if not gh_token:
-        raise HTTPException(
-            status_code=502,
-            detail="Unable to obtain GitHub token for repo access",
-        )
-
-    default_branch = await get_repo_default_branch(gh_token, owner, repo_name)
-
-    content_type = _content_type_for_path(path)
-    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    is_text = f".{ext}" in _TEXT_EXTENSIONS if ext else True
-
-    try:
-        if is_text:
-            from app.github import get_file_text_at_ref
-
-            text = await get_file_text_at_ref(
-                repo_file_path,
-                token=gh_token,
-                owner=owner,
-                repo=repo_name,
-                ref=default_branch,
-                project_id=str(project_id),
-            )
-            if text is None:
-                raise HTTPException(status_code=404, detail="File not found")
-            body: bytes = text.encode("utf-8")
-        else:
-            from app.github import get_file_bytes_at_ref
-
-            raw = await get_file_bytes_at_ref(
-                repo_file_path,
-                token=gh_token,
-                owner=owner,
-                repo=repo_name,
-                ref=default_branch,
-                project_id=str(project_id),
-            )
-            if raw is None:
-                raise HTTPException(status_code=404, detail="File not found")
-            body = raw
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(
-            "[project-tools] Asset fetch error %s/%s/%s: %s",
-            owner, repo_name, repo_file_path, e,
-        )
-        raise HTTPException(status_code=502, detail=f"Failed to fetch asset: {e}")
-
-    # Security headers for tokened, same-origin-reachable asset responses.
-    #
-    # A top-level navigation to a tokened asset URL would otherwise execute
-    # repo-authored (attacker-controllable) HTML with the full privileges of
-    # the admin-SPA origin.  Defense:
-    #   * Content-Security-Policy: sandbox allow-scripts — forces the served
-    #     document into an opaque origin (no allow-same-origin) even on a
-    #     top-level navigation, so it cannot touch admin-origin cookies /
-    #     storage / DOM.  This mirrors the iframe's own
-    #     ``sandbox="allow-scripts"`` attribute, so the legitimate embed path
-    #     is unaffected (scripts still run).
-    #   * X-Content-Type-Options: nosniff — prevents the browser from
-    #     MIME-sniffing an asset into an executable type.
-    #   * No ``Access-Control-Allow-Origin: *`` — tokened responses must not be
-    #     wildcard-CORS-readable by arbitrary origins.  The sandboxed iframe
-    #     loads its subresources as same-origin-of-document requests (no CORS
-    #     preflight), so dropping the wildcard does not break the embed path.
-    headers = {
-        "Cache-Control": "public, max-age=300",
-        "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "sandbox allow-scripts",
-    }
-
-    return Response(
-        content=body,
-        media_type=content_type,
-        headers=headers,
+    return await _serve_tool_asset_impl(
+        project_id=project_id,
+        tool_slug=tool_slug,
+        path=path,
+        token=token,
+        session=session,
     )
 
 
@@ -1402,6 +1969,19 @@ async def trigger_project_compute_image_build(
     ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
     RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
 
+    **Async build contract (200 vs 202).** When the off-orchestrator builder
+    backend is enabled (``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED``) and a real
+    build is needed, the build is dispatched to a throwaway builder VM and this
+    returns **202 Accepted** with ``{status, build_id, builder_vm_id, dep_hash,
+    async: true, adopted}`` plus the legacy fields as unresolved placeholders
+    (``pinned_ref``/``digest`` null, ``built`` false). The build is finalized
+    asynchronously by the reaper poll sweep; poll
+    ``GET .../compute-image/status`` (which surfaces in-flight builds under
+    ``active_builds``) to observe completion. An already-present image and a
+    ``dry_run`` request still complete inline and return **200** with the
+    persisted fields. When the backend flag is off the whole build runs inline
+    and always returns 200 (the pre-existing behavior).
+
     **Requires OWNER role.** A build runs docker on the orchestrator host and
     pushes to the shared compute-image registry — a privileged, expensive,
     host-affecting operation, not the member-grade read/save that the rest of
@@ -1511,11 +2091,50 @@ async def trigger_project_compute_image_build(
                 f"{_COMPUTE_IMAGE_BUILD_TIMEOUT_SECONDS}s deadline and was aborted"
             ),
         ) from None
+    except asyncio.CancelledError:
+        # Client disconnect / application shutdown: do not abandon the remote
+        # build or release its concurrency slot until Cloud Build has observed
+        # cancellation and the worker has unwound its staged-source cleanup.
+        await asyncio.shield(
+            _abort_and_unwind_image_build(control, build_task, project_id)
+        )
+        raise
     except _cib.BuildNetworkError as exc:
         # The build network could not be proven to block the metadata server.
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    # ASYNC CONTRACT: when the off-orchestrator builder backend is enabled and a
+    # real build is needed, the build was handed to a throwaway builder VM and is
+    # NOT finished — the reaper poll sweep finalizes the ProjectComputeImage pin.
+    # Return 202 with the tracking id instead of the synchronous build record.
+    # An already-present image or a ``dry_run`` request still completes inline and
+    # returns 200 with the persisted fields below, so existing callers that expect
+    # a synchronous result keep working for those cases; a caller that triggers a
+    # real async build MUST handle 202 (the ``async`` flag marks it).
+    if isinstance(result, _cb.AsyncImageBuildDispatch):
+        return Response(
+            content=_json.dumps(
+                {
+                    "status": result.status,
+                    "build_id": str(result.build_id),
+                    "builder_vm_id": result.builder_vm_id,
+                    "dep_hash": result.dep_hash,
+                    "async": True,
+                    "adopted": result.adopted,
+                    # Backward-compat fields the admin-ui already reads — present
+                    # but unresolved because the build has not completed yet.
+                    "pinned_ref": None,
+                    "digest": None,
+                    "tag": result.dep_hash,
+                    "built": False,
+                    "already_present": False,
+                }
+            ),
+            media_type="application/json",
+            status_code=202,
+        )
 
     result = await _preserve_existing_digest_pin(session, project.id, result)
 
@@ -1537,4 +2156,255 @@ async def trigger_project_compute_image_build(
         "tag": row.tag,
         "built": row.built,
         "already_present": already_present,
+    }
+
+
+# ── Compute-image status endpoint ─────────────────────────────────────────────
+#
+# A read-only, owner-gated endpoint that surfaces the persisted build record
+# (pinned_ref, digest, dep_hash, tag, built, timestamps) and reports whether the
+# stored reference is genuinely digest-pinned vs. a mutable-tag fallback.  An
+# optional ``?check_drift=true`` query param triggers a repo clone + hash cycle
+# (identical to the build path's hash computation) to detect staleness.
+
+
+async def _list_active_image_builds(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+) -> list[Dict[str, Any]]:
+    """Serialize in-flight (PENDING/BUILDING) off-orchestrator builds for an image.
+
+    Returns the async-build tracking rows the reaper poll sweep has not yet
+    finalized, newest first, so the status endpoint can surface a dispatched
+    build before its ``ProjectComputeImage`` pin exists. Empty list when the
+    async builder lane is unused (the common case today).
+    """
+    rows = (
+        (
+            await session.execute(
+                select(ProjectComputeImageBuild)
+                .where(
+                    ProjectComputeImageBuild.project_id == project_id,
+                    ProjectComputeImageBuild.registry_repo == registry_repo,
+                    ProjectComputeImageBuild.image_name == image_name,
+                    ProjectComputeImageBuild.status.in_(
+                        [
+                            ComputeImageBuildStatus.PENDING,
+                            ComputeImageBuildStatus.BUILDING,
+                        ]
+                    ),
+                )
+                .order_by(ProjectComputeImageBuild.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [
+        {
+            "build_id": str(b.id),
+            "status": b.status.value if hasattr(b.status, "value") else str(b.status),
+            "dep_hash": b.dep_hash,
+            "builder_vm_id": b.builder_vm_id,
+            "started_at": b.started_at.isoformat() if b.started_at else None,
+            "deadline_at": b.deadline_at.isoformat() if b.deadline_at else None,
+            "created_at": b.created_at.isoformat() if b.created_at else None,
+        }
+        for b in rows
+    ]
+
+
+@router.get("/projects/{project_id}/compute-image/status")
+async def get_project_compute_image_status(
+    project_id: uuid.UUID,
+    check_drift: bool = Query(
+        False,
+        description=(
+            "When true, clone the repo and compute the current dependency hash "
+            "(identical to the build path) and report whether it differs from "
+            "the stored build record's dep_hash.  This is an expensive operation "
+            "(git clone + file discovery + hashing) and competes with the build "
+            "concurrency slot — a build in flight causes drift to return as "
+            "'unknown' with a reason rather than waiting."
+        ),
+    ),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Get the persisted baked-image build record for this project (owner).
+
+    Returns the ``ProjectComputeImage`` row state for the project's declared
+    compute image.  ``is_digest_pinned`` distinguishes a genuine digest-pinned
+    ref from the mutable-tag fallback path (previously a log-only signal).  When
+    no build has ever been triggered the endpoint reports ``never_built``, and
+    when the project does not declare a compute image it reports
+    ``no_compute_image_declared`` — both as clean status values, not errors.
+
+    ``active_builds`` (present on ``built`` and ``never_built`` responses) lists
+    any in-flight off-orchestrator builds (PENDING/BUILDING
+    ``ProjectComputeImageBuild`` rows) the reaper poll sweep has not yet
+    finalized — this is how a caller polls an async build dispatched by the
+    trigger endpoint's 202 path. It is an empty list when no async build is in
+    flight (the common case today).
+
+    The optional ``?check_drift=true`` param adds a ``drift`` object to the
+    response, computed by cloning the project repo and running the same
+    dependency-hash computation as the build pipeline (``dry_run=True``).  The
+    clone uses the build concurrency slot and is bounded by a 5-minute timeout.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+
+    manifest = await _discover_manifest_tools(project)
+    compute_section = manifest.get("compute") or {}
+    compute_image = compute_section.get("image")
+
+    if compute_image is None:
+        return {"status": "no_compute_image_declared"}
+
+    name = compute_image.get("name", "")
+    registry_repo, image_name, _ = _cb._split_image_ref(name)
+
+    # In-flight off-orchestrator builds (PENDING/BUILDING) for this exact image,
+    # surfaced alongside the durable ProjectComputeImage record so an operator can
+    # see an async build that has been dispatched but not yet finalized. Additive:
+    # the existing ``status`` values are unchanged.
+    active_builds = await _list_active_image_builds(
+        session, project_id, registry_repo, image_name
+    )
+
+    # Query the latest ProjectComputeImage row matching this project/image.
+    row = (
+        await session.execute(
+            select(ProjectComputeImage)
+            .where(
+                ProjectComputeImage.project_id == project_id,
+                ProjectComputeImage.image_name == image_name,
+                ProjectComputeImage.registry_repo == registry_repo,
+            )
+            .order_by(ProjectComputeImage.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if row is None:
+        return {"status": "never_built", "active_builds": active_builds}
+
+    result: Dict[str, Any] = {
+        "status": "built",
+        "pinned_ref": row.pinned_ref,
+        "digest": row.digest,
+        "dep_hash": row.dep_hash,
+        "tag": row.tag,
+        "built": bool(row.built),
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        "is_digest_pinned": row.digest is not None,
+        "active_builds": active_builds,
+    }
+
+    if check_drift:
+        drift = await _compute_build_drift(
+            project, registry_repo, compute_image, row
+        )
+        result["drift"] = drift
+
+    return result
+
+
+async def _compute_build_drift(
+    project: Project,
+    registry_repo: str,
+    compute_image: Dict[str, Any],
+    stored_row: ProjectComputeImage,
+) -> Dict[str, Any]:
+    """Compute whether the project's dependency hash has drifted from the build record.
+
+    Returns a dict with ``drifted`` (True/False/None) and, when drifted is not
+    None, both ``current_dep_hash`` and ``stored_dep_hash``.  When drift cannot
+    be determined, ``drifted`` is None and ``reason`` explains why.
+
+    This clones the project repo and runs the same file-discovery +
+    content-hashing logic as the build pipeline (identical input set), so the
+    comparison is apples-to-apples.  It competes for the build concurrency slot
+    to bound concurrent clones, and is fail-open: a build in flight, a missing
+    GitHub token, or a missing ``build`` section all produce ``drifted: None``
+    with a ``reason`` rather than a 500.
+    """
+    build_config = _cb.resolve_project_compute_image_build(
+        {"image": compute_image}
+    )
+    if build_config is None:
+        return {
+            "drifted": None,
+            "reason": (
+                "Project declares no compute.image.build section "
+                "— cannot recompute dependency hash"
+            ),
+        }
+
+    # Fail-open: if a build is in flight, don't queue behind it — return
+    # unknown drift rather than potentially blocking an operator-facing request.
+    if _compute_image_build_semaphore.locked():
+        return {
+            "drifted": None,
+            "reason": (
+                "A compute-image build is in progress — drift check would "
+                "contend with it"
+            ),
+        }
+
+    try:
+        await asyncio.wait_for(
+            _compute_image_build_semaphore.acquire(),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "drifted": None,
+            "reason": "Could not acquire build slot for drift computation",
+        }
+
+    try:
+        result = await asyncio.wait_for(
+            _cb.build_project_compute_image(
+                project,
+                registry_repo=registry_repo,
+                build_config=build_config,
+                dry_run=True,
+            ),
+            timeout=300,
+        )
+    except asyncio.TimeoutError:
+        return {
+            "drifted": None,
+            "reason": "Drift computation timed out while computing dependency hash",
+        }
+    except Exception as e:
+        logger.warning(
+            "[compute-image-status] drift computation failed for project=%s: %s",
+            getattr(project, "id", "?"),
+            e,
+        )
+        return {
+            "drifted": None,
+            "reason": f"Could not compute current dependency hash: {e}",
+        }
+    finally:
+        _compute_image_build_semaphore.release()
+
+    current_hash = getattr(result, "dep_hash", None)
+    if not current_hash:
+        return {
+            "drifted": None,
+            "reason": "Build pipeline returned no dep_hash",
+        }
+
+    return {
+        "drifted": current_hash != stored_row.dep_hash,
+        "current_dep_hash": current_hash,
+        "stored_dep_hash": stored_row.dep_hash,
     }
