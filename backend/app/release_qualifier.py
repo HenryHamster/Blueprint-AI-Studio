@@ -108,6 +108,7 @@ except Exception:  # noqa: BLE001 - sibling module not yet landed in this checko
 from app.landed_signal import is_verified_merge, landed_signal_predicate
 from app.models import (
     ArtifactType,
+    DeploymentState,
     Project,
     QualificationDimensionResult,
     Task,
@@ -2872,6 +2873,11 @@ async def run_qualification(
 
     # 5. Spawn the heavy children.
     started_at = _utcnow().isoformat()
+    from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
+    # Pause baseline captured at spawn so the 6h qualification-timeout backstop
+    # excludes pipeline-pause time (see _qualification_timeout_age_seconds).
+    _pause_baseline = await pause_clock.current_baseline(session)
     # Audit C4: the diff range is pinned to the exact snapshot commit
     # (promotion_target...<candidate_sha>) rather than the live integration
     # branch — the integration branch advances during the 10-30 min the
@@ -3309,6 +3315,7 @@ async def run_qualification(
         # be fetched from the candidate tree (caught and handled in finalize).
         "env_preflight_evidence": env_preflight_evidence,
         "started_at": started_at,
+        "pause_baseline": _pause_baseline,
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
         "audit_challenge_task_id": audit_challenge_task_id,
@@ -8671,8 +8678,22 @@ def _qualification_timeout_age_seconds(
     timeout_now: datetime,
     *,
     warn_on_fallback: bool,
+    deploy_state: DeploymentState | None = None,
 ) -> float | None:
-    """Return pending qualification age in seconds, or None if no clock exists."""
+    """Return pending qualification age in seconds, or None if no clock exists.
+
+    PAUSE-AWARE when ``deploy_state`` is supplied: pipeline-pause time is not
+    counted toward the 6h timeout. A qualification whose audit/grade/smoketest
+    children cannot run *because the pipeline is paused* is not "stuck" — force-
+    finalizing it as ``qualification_timeout`` sends the version back to
+    stabilize and re-fires the whole triple, which then times out again 6h
+    later, re-spawning the triple against the newest candidate for the entire
+    duration of the pause. The per-attempt ``pause_baseline`` (stamped at spawn
+    in run_qualification) makes the subtraction exact across pause windows;
+    without it (legacy pending records) the open pause window is still excluded.
+    ``deploy_state`` is only ever threaded from the reaper finalize path, where
+    ``timeout_now`` == ``_utcnow()``, so the helper's own clock agrees with it.
+    """
     timeout_clock = _parse_started_at(qual)
     if timeout_clock is None:
         timeout_clock = (
@@ -8688,6 +8709,12 @@ def _qualification_timeout_age_seconds(
             )
     if timeout_clock is None:
         return None
+    if deploy_state is not None:
+        from app import pause_clock  # noqa: PLC0415 — local import avoids load cycle
+
+        return pause_clock.active_elapsed_seconds(
+            deploy_state, timeout_clock, qual.get("pause_baseline")
+        )
     return (timeout_now - timeout_clock).total_seconds()
 
 async def _finalize_locked_version(
@@ -8756,12 +8783,16 @@ async def _finalize_locked_version(
         )
         return None
     peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
+    # Pause-aware timeout: read the deploy state once so the 6h backstop excludes
+    # pipeline-pause time at both the pre-lock peek and the under-lock check.
+    _deploy_state = await session.get(DeploymentState, 1)
     pre_timeout_age_seconds = (
         _qualification_timeout_age_seconds(
             peek,
             peek_qual,
             timeout_now,
             warn_on_fallback=False,
+            deploy_state=_deploy_state,
         )
         if timeout_now is not None and not peek_qual.get("promotion_pending")
         else None
@@ -8889,11 +8920,16 @@ async def _finalize_locked_version(
         # lifecycle alert) handles the case where the PR is genuinely stuck.
         if qual.get("promotion_pending"):
             return None
+        # Re-read the deploy state under the lock: the pre-lock read may have
+        # been expired by the intervening best-effort rollback, and touching an
+        # expired attribute on an async session raises MissingGreenlet.
+        _deploy_state_locked = await session.get(DeploymentState, 1)
         age_seconds = _qualification_timeout_age_seconds(
             version,
             qual,
             timeout_now,
             warn_on_fallback=True,
+            deploy_state=_deploy_state_locked,
         )
         if (
             age_seconds is not None
