@@ -1509,6 +1509,11 @@ async def test_aggregate_summary_endpoint_excludes_old_jobs_but_reports_alltime(
         machine_type="e2-standard-2",
         spend_cap_usd=5.0,
         final_cost_usd=2.0,
+        # The summary endpoint windows on created_at (see
+        # aggregate_all_compute_jobs_summary: ``ComputeJob.created_at >= since``),
+        # so the "old" job must be old by created_at — not only completed_at —
+        # to fall outside the 90-day window. created_at otherwise defaults to now.
+        created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
         completed_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
     )
     db_session.add(old_job)
