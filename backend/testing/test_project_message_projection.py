@@ -519,11 +519,16 @@ async def test_activity_endpoint_excludes_conversation_projection(
             surface=MessageSurface.ACTIVITY,
             content="activity only",
         ),
+        # Non-operator (strategic) conversation projection: the activity list
+        # excludes it. Operator-signal rows (user / FEEDBACK-BLOCKER-BUG_REPORT /
+        # high-signal system NOTEs) are intentionally surfaced regardless of
+        # surface (see _operator_signal_predicate in admin_notifications), so a
+        # user-authored conversation message WOULD appear; strategic replies do not.
         ProjectMessage(
             project_id=project.id,
             sequence=conversation_sequence,
             surface=MessageSurface.CONVERSATION,
-            from_type="user",
+            from_type="strategic",
             content="conversation only",
         ),
     ])
