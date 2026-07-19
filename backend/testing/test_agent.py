@@ -17633,7 +17633,15 @@ async def test_rotate_credentials_updates_openai_oauth_secret(
     assert res.json() == {"rotated": True}
 
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate/versions/2"
+    from app.field_encryption import decrypt_field
+
+    # secret_blob_ref is Fernet-encrypted at rest; the Postgres CI shard sets
+    # the encryption key (SQLite runs are keyless passthrough), so assert the
+    # decrypted plaintext, not the raw ciphertext column.
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate/versions/2"
+    )
 
 
 @pytest.mark.asyncio
@@ -17676,7 +17684,12 @@ async def test_rotate_credentials_stale_writer_adopts_winner_without_overwrite(
     }
     store_secret.assert_awaited_once()
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate-cas/versions/2"
+    from app.field_encryption import decrypt_field
+
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate-cas/versions/2"
+    )
 
 
 @pytest.mark.asyncio
@@ -17785,7 +17798,12 @@ async def test_rotate_credentials_updates_openai_oauth_secret_from_pool_vm_token
     assert res.json() == {"rotated": True}
 
     await db_session.refresh(account)
-    assert account.secret_blob_ref == "projects/test/secrets/rotate-pool/versions/4"
+    from app.field_encryption import decrypt_field
+
+    assert (
+        decrypt_field(account.secret_blob_ref)
+        == "projects/test/secrets/rotate-pool/versions/4"
+    )
 
 
 @pytest.mark.asyncio
@@ -21170,6 +21188,12 @@ async def _seed_qualifier_children(
 
     version.last_qualification = {
         "status": "pending",
+        # Real run_qualification always stamps the launched rubric projection;
+        # #15102 made _finalize_qualification resolve it first and short-circuit
+        # to rubric_provenance_unknown when it is absent. Seed the empty
+        # projection so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": [],
+        "rubric_lifecycle_snapshot": [],
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -21205,6 +21229,18 @@ async def test_failed_release_audit_last_child_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Smoketest sibling already terminal (COMPLETED); the release_audit is the
@@ -21254,6 +21290,18 @@ async def test_failed_qualifier_smoketest_no_artifact_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Audit sibling already terminal; the qualifier-smoketest is the last child
@@ -21296,6 +21344,18 @@ async def test_cancelled_release_audit_last_child_triggers_finalization(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     audit_task, _smoke = await _seed_qualifier_children(
@@ -21374,6 +21434,18 @@ async def test_failed_qualifier_child_does_not_finalize_while_sibling_runs(
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # Smoketest sibling still IN_PROGRESS — finalization must defer.
@@ -21424,6 +21496,16 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
     mocker.patch("app.vm_lifecycle.fire_and_forget_vm_delete", return_value=None)
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # Post-finalize strategic hooks make real GitHub calls that hang on the
+    # network-isolated harness; neutralize them (outside this test's contract).
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
     # Finalize re-resolves CI for the candidate commit rather than trusting the
     # spawn-time ci_green snapshot; with no GitHub credentials in this test that
     # resolution degrades to not-green and would hard-block on ci_not_green.
@@ -21508,6 +21590,12 @@ async def test_qualifier_smoketest_finalize_sees_own_artifact_via_endpoint(
 
     version.last_qualification = {
         "status": "pending",
+        # Real run_qualification always stamps the launched rubric projection;
+        # #15102 made _finalize_qualification resolve it first and short-circuit
+        # to rubric_provenance_unknown when it is absent. Seed the empty
+        # projection so the infra-failure child path is reached as in prod.
+        "rubric_snapshot": [],
+        "rubric_lifecycle_snapshot": [],
         "candidate_sha": "abcd" * 10,
         "ci_green": True,
         "started_at": "2026-05-20T00:00:00",
@@ -21567,6 +21655,18 @@ async def test_non_qualifier_terminal_task_does_not_finalize(db_session, mocker)
     from app.models import ReleaseVersion
 
     mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    # The finalize path re-triggers the strategic agent on any RESOLVED outcome
+    # (promote OR miss); those post-finalize hooks make real GitHub calls that
+    # hang on the network-isolated harness. Neutralize them — they are outside
+    # the qualification-outcome contract under test.
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(return_value=None),
+    )
 
     project, version = await _make_qualifier_project_and_version(db_session)
     # A pending qualification exists, but the task below is unrelated to it.

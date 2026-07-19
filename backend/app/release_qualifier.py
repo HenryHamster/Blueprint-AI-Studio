@@ -9017,6 +9017,7 @@ async def maybe_finalize_qualification(
 # module-level attributes so `release_qualifier.hotfix_promote_current_version`
 # / `.check_hotfix_scope_preview` keep working for admin_hotfix_promote.
 from app.release_hotfix_promotion import (  # noqa: E402
+    _record_hotfix_audit_trail as _record_hotfix_audit_trail,
     check_hotfix_scope_preview as check_hotfix_scope_preview,
     hotfix_promote_current_version as hotfix_promote_current_version,
 )

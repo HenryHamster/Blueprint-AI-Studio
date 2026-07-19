@@ -70,6 +70,7 @@ from app.storage import (
     promote_artifact_ref_render,
 )
 from app.strategic_resident_checkpointing import initialize_strategic_resident
+from testing._resident_seed import seed_without_authority_enforcement
 
 
 TEST_USER_ID = "test-user-123"
@@ -1636,7 +1637,6 @@ async def test_message_route_freezes_tool_ref_before_message_insert(
 ):
     project = await _project(db_session)
     resident = await initialize_strategic_resident(db_session, project.id)
-    resident.engine_owner = "strategic_resident"
     tool = ProjectTool(
         project_id=project.id,
         kind="notes",
@@ -1645,8 +1645,11 @@ async def test_message_route_freezes_tool_ref_before_message_insert(
         content={"text": "decisive evidence"},
         content_revision=1,
     )
-    db_session.add_all([resident, tool])
-    await db_session.commit()
+    async with seed_without_authority_enforcement(db_session):
+        resident.engine_owner = "strategic_resident"
+        resident.authority_generation += 1
+        db_session.add_all([resident, tool])
+        await db_session.commit()
     await db_session.refresh(tool)
     ref = await create_tool_artifact_ref(
         db_session,

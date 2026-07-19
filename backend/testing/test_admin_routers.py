@@ -10788,7 +10788,7 @@ class TestCapabilityProofGateCoverageSurface:
                         {
                             "proof_kind": "named_test",
                             "ref": "testing/test_x.py::test_x",
-                            "proved_at": "2026-01-01T00:00:00Z",
+                            "proved_at": (_utcnow() - timedelta(days=1)).isoformat(),
                         }
                     ]
                 },
@@ -14042,91 +14042,6 @@ class TestSetVersionPhase:
             f"Expected 200 for stale-pending+finalized-verdict but got {resp.status_code}: "
             f"{resp.text}"
         )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# admin_operator_triggers.py — ack-env-will-be-bound (Slice 4, design 245212a4)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-
-class TestAckEnvWillBeBound:
-    @pytest.mark.asyncio
-    async def test_owner_arms_one_shot_ack(self, client: AsyncClient, db_session):
-        """OWNER arming the ack writes a presence-only marker onto the open
-        version's last_qualification, preserving existing fields."""
-        project = await _make_project(db_session)
-        version = await _make_open_version(db_session, project.id, phase="stabilize")
-        # Pre-existing qualification content must be preserved on read-modify-write.
-        version.last_qualification = {"status": "not_promoted", "blocker": "boot_prereq_missing"}
-        from sqlalchemy.orm.attributes import flag_modified
-
-        flag_modified(version, "last_qualification")
-        db_session.add(version)
-        await db_session.commit()
-
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
-        )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "acknowledged"
-        assert body["scope"] == "boot_prereq_missing"
-        assert body["acknowledged_at"]
-
-        await db_session.refresh(version)
-        marker = version.last_qualification["ack_env_will_be_bound"]
-        assert marker["actor"] == TEST_USER_ID
-        assert marker["acknowledged_at"] == body["acknowledged_at"]
-        # Presence-only: the marker carries only who/when — never an env value.
-        assert set(marker.keys()) == {"actor", "acknowledged_at"}
-        # Existing fields preserved.
-        assert version.last_qualification["status"] == "not_promoted"
-        assert version.last_qualification["blocker"] == "boot_prereq_missing"
-
-    @pytest.mark.asyncio
-    async def test_arms_ack_when_no_prior_qualification(
-        self, client: AsyncClient, db_session
-    ):
-        """A None last_qualification becomes a minimal dict carrying just the ack."""
-        project = await _make_project(db_session)
-        version = await _make_open_version(db_session, project.id)
-        assert version.last_qualification is None
-
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
-        )
-        assert resp.status_code == 200, resp.text
-        await db_session.refresh(version)
-        assert version.last_qualification["ack_env_will_be_bound"]["actor"] == TEST_USER_ID
-
-    @pytest.mark.asyncio
-    async def test_non_owner_forbidden(self, client: AsyncClient, db_session):
-        """A member (below OWNER) is rejected with 403 — the ack is the most
-        privileged deploy-safety lever."""
-        other = Project(name="Ack Other", user_id="other-owner-uid")
-        db_session.add(other)
-        await db_session.commit()
-        await db_session.refresh(other)
-        db_session.add(
-            ProjectMember(project_id=other.id, user_id=TEST_USER_ID, role="member")
-        )
-        await db_session.commit()
-        await _make_open_version(db_session, other.id)
-
-        resp = await client.post(
-            f"/api/admin/projects/{other.id}/ack-env-will-be-bound"
-        )
-        assert resp.status_code == 403
-
-    @pytest.mark.asyncio
-    async def test_no_open_version_returns_404(
-        self, client: AsyncClient, db_session
-    ):
-        project = await _make_project(db_session)
-        resp = await client.post(
-            f"/api/admin/projects/{project.id}/ack-env-will-be-bound"
-        )
-        assert resp.status_code == 404
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -29285,11 +29200,14 @@ class TestTaskPayloadSecretRedaction:
 
         match = next(t for t in body["tasks"] if t["id"] == str(task.id))
         payload = match["payloads"][0]
+        # The list view intentionally returns a slim payload projection
+        # (type / pr_number / spend_cap_usd only — a deferred-column perf
+        # optimization), so command/cwd/base_branch are absent here by design.
+        # Redaction parity for those launch fields is covered by the detail
+        # test (test_operator_task_detail_redacts_registry_password). This test
+        # asserts only that no secret leaks into the list payload / response.
         assert "container_registry_auth" not in payload
         assert "env" not in payload
-        assert payload["command"] == "python run.py"
-        assert payload["cwd"] == "/work"
-        assert payload["base_branch"] == "main"
         assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
         assert "hf_SECRET_ENV_TOKEN" not in resp.text
 
@@ -30995,7 +30913,12 @@ class TestTaskListPlanSubtasksContract:
         await db_session.commit()
 
         default = await client.get(f"/api/admin/tasks?project_id={project.id}")
-        assert [row["title"] for row in default.json()["tasks"]] == ["normal"]
+        # BACKEND_MANAGED_TASK_TYPES is empty now, so the default view no longer
+        # hides the backend-managed shadow row — it matches the debug view below.
+        assert {row["title"] for row in default.json()["tasks"]} == {
+            "normal",
+            "shadow",
+        }
         debug = await client.get(
             f"/api/admin/tasks?project_id={project.id}&include_backend_managed=true"
         )

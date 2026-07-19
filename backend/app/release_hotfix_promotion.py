@@ -53,6 +53,8 @@ async def _hotfix_promote_locked(
     actor: str | None,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
 ) -> dict[str, Any]:
     """Lock + HOTFIX-promote an open version on a dedicated session (no audit).
 
@@ -99,6 +101,10 @@ async def _hotfix_promote_locked(
         "hotfix_promote_at": now.isoformat(),
         "hotfix_promote_reason": reason,
         "hotfix_promote_scope_modules": _scope_modules,
+        # These are committed with the bypass itself so the sweep can recreate
+        # its promised audit trail if the request session dies after promotion.
+        "hotfix_promote_diff_file_list": list(diff_file_list),
+        "hotfix_promote_prior_deployed_sha": prior_deployed_sha,
         "started_at": now.isoformat(),
         "finalized_at": now.isoformat(),
     }
@@ -131,6 +137,8 @@ async def _hotfix_promote_in_dedicated_session(
     *,
     reason: str | None,
     scope_modules: list[str] | None,
+    diff_file_list: list[str],
+    prior_deployed_sha: str | None,
     session_factory=None,
 ) -> dict[str, Any]:
     """Run HOTFIX-promote on a DEDICATED session (mirrors the force-promote path).
@@ -151,6 +159,8 @@ async def _hotfix_promote_in_dedicated_session(
                 actor,
                 reason,
                 scope_modules,
+                diff_file_list,
+                prior_deployed_sha,
             )
         except Exception:
             try:
@@ -183,6 +193,8 @@ async def _record_hotfix_audit_trail(
     scope_modules: list[str] | None,
     diff_file_list: list[str] | None,
     prior_deployed_sha: str | None,
+    record_debt: bool = True,
+    record_alert: bool = True,
 ) -> None:
     """Durable, append-only audit trail for a hotfix promote that took effect.
 
@@ -207,6 +219,8 @@ async def _record_hotfix_audit_trail(
     from app.completion_debt import (
         KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
         arecord_completion_debt,
+        hotfix_deploy_alert_dedupe_key,
+        hotfix_deploy_debt_dedupe_key,
     )
     from app.models import Alert, AlertSeverity
 
@@ -220,33 +234,47 @@ async def _record_hotfix_audit_trail(
         "diff_file_list": _diff_files,
         "prior_deployed_sha": prior_deployed_sha,
     }
-    await arecord_completion_debt(
-        session,
-        dedupe_key=f"hotfix_deploy:{project_id}:{candidate_sha}",
-        kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
-        title=(
-            f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
-            "normal-gate re-qualification"
-        ),
-        project_id=project_id,
-        source="hotfix_promote",
-        detail=detail,
-    )
-    try:
-        session.add(
-            Alert(
-                project_id=project_id,
-                severity=AlertSeverity.WARNING,
-                title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
-                message=(
-                    f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
-                    "(release machinery only) ahead of the normal qualification gate. "
-                    f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
-                    "by the normal gate (tracked as open completion debt)."
-                ),
-                source="hotfix_promote",
-            )
+    if record_debt:
+        await arecord_completion_debt(
+            session,
+            dedupe_key=hotfix_deploy_debt_dedupe_key(project_id, candidate_sha),
+            kind=KIND_HOTFIX_DEPLOY_PENDING_BACKFILL,
+            title=(
+                f"Hotfix-deploy of release machinery at {candidate_sha[:8]} owes "
+                "normal-gate re-qualification"
+            ),
+            project_id=project_id,
+            source="hotfix_promote",
+            detail=detail,
         )
+    if not record_alert:
+        return
+    try:
+        alert_key = hotfix_deploy_alert_dedupe_key(project_id, candidate_sha)
+        existing_alert = (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dedupe_key == alert_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_alert is None:
+            session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.WARNING,
+                    title=f"Hotfix-deploy: release machinery fast-tracked at {candidate_sha[:8]}",
+                    message=(
+                        f"An OWNER hotfix-deploy fast-tracked candidate {candidate_sha[:8]} "
+                        "(release machinery only) ahead of the normal qualification gate. "
+                        f"Actor={actor} reason={reason!r}. This bypass is owed re-qualification "
+                        "by the normal gate (tracked as open completion debt)."
+                    ),
+                    source="hotfix_promote",
+                    dedupe_key=alert_key,
+                )
+            )
     except Exception:  # noqa: BLE001 — an Alert failure must not undo the promotion
         logger.warning(
             "[RELEASE_QUALIFIER] hotfix-promote: failed to stage operator Alert "
@@ -360,6 +388,17 @@ async def hotfix_promote_current_version(
             token, owner, repo, candidate_sha, project_id=str(project_id)
         )
     )
+    # Explicitly resolve CI before opening the PR — the bypass skips AUDIT only.
+    ci_green, ci_resolution = await _rq._resolve_ci_at_finalize(session, version, candidate_sha)
+    ci_required = _rq._ci_required_for_finalize(project, ci_resolution)
+    if ci_required and not ci_green:
+        logger.warning(
+            "[RELEASE_QUALIFIER] HOTFIX-PROMOTE blocked: project %s v%d candidate %s "
+            "CI is not green (state=%s) — actor=%s reason=%s",
+            project_id, version.version_number, candidate_sha[:8],
+            ci_resolution.get("state"), actor, reason,
+        )
+        return {"status": "ci_not_green", "ci_resolution": ci_resolution}
     logger.warning(
         "[RELEASE_QUALIFIER] HOTFIX-PROMOTE requested: project %s v%d candidate %s "
         "actor=%s reason=%s scope_modules=%s changed=%s — SKIPPING the audit/scoring "
@@ -379,6 +418,8 @@ async def hotfix_promote_current_version(
         actor,
         reason=reason,
         scope_modules=scope_modules,
+        diff_file_list=changed_files,
+        prior_deployed_sha=prior_deployed_sha,
         session_factory=session_factory,
     )
     if result.get("status") in _HOTFIX_PROMOTE_ATTEMPTED_STATUSES:

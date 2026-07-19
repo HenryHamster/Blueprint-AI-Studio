@@ -380,8 +380,10 @@ async def test_attempt24_release_safety_contract(tmp_path, monkeypatch, mocker):
     verdict, detail = await qualifier._resolve_migration_apply_at_finalize(
         FakeSession(), SimpleNamespace(project_id="project-id"), "candidate-sha"
     )
-    assert verdict == "ok"
-    assert detail is None
+    # A missing scratch DB config is a deliberate "skipped" verdict (not "ok" —
+    # a config-absent gate must not read as a passed gate).
+    assert verdict == "skipped"
+    assert detail == "scratch_database_not_configured"
     resolve_engine.assert_not_called()
     apply_gate.assert_not_awaited()
 
