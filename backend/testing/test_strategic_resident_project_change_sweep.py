@@ -349,31 +349,53 @@ async def test_wake_budget_stays_at_32_while_scanning_200_projects(db_session):
     ]
     db_session.add_all(projects)
     await db_session.flush()
-    residents = [
-        StrategicResident(
-            project_id=project.id,
-            engine_owner="strategic_resident",
-            engine_version="strategic-resident-v1",
-            authority_generation=2,
-            background_policy="active",
+    # Snapshot the last project id now: after the post-sweep rollback below the
+    # Project instances are expired, and reading .id then would trigger a sync
+    # lazy-load (MissingGreenlet) on the async Postgres engine.
+    last_project_id = projects[-1].id
+    # Only the final 32 projects have a meaningful change, so the sweep opens a
+    # turn (and rotates the checkpoint) only for those. Those 32 residents must
+    # therefore be fully authoritative — a real current checkpoint to rotate FROM
+    # — or the 0611 checkpoint-rotation fence rejects the sweep's UPDATE on
+    # Postgres. The other 168 are scan-only (no turn opened) so a bare row is
+    # sufficient. Seed under enforcement-bypass since the setup rows themselves
+    # (bare residents / direct checkpoint init) are states the live fences block.
+    changed_project_ids = {project.id for project in projects[-32:]}
+    async with seed_without_authority_enforcement(db_session):
+        for project in projects:
+            if project.id in changed_project_ids:
+                resident = await initialize_strategic_resident(
+                    db_session, project.id, locked_project=project
+                )
+                resident.engine_owner = "strategic_resident"
+                resident.engine_version = "strategic-resident-v1"
+                resident.authority_generation = 2
+                resident.background_policy = "active"
+                db_session.add(resident)
+            else:
+                db_session.add(
+                    StrategicResident(
+                        project_id=project.id,
+                        engine_owner="strategic_resident",
+                        engine_version="strategic-resident-v1",
+                        authority_generation=2,
+                        background_policy="active",
+                    )
+                )
+        # The sweep must cheaply inspect the entire 200-row page, but may open no
+        # more than 32 turns.
+        db_session.add_all(
+            [
+                StrategicCycle(
+                    id=f"sc-wide-{index}",
+                    project_id=project.id,
+                    outcome="completed",
+                    updated_at=now,
+                )
+                for index, project in enumerate(projects[-32:])
+            ]
         )
-        for project in projects
-    ]
-    db_session.add_all(residents)
-    # Only the final 32 rows have a meaningful change. The sweep must cheaply
-    # inspect the entire 200-row page, but may open no more than 32 turns.
-    db_session.add_all(
-        [
-            StrategicCycle(
-                id=f"sc-wide-{index}",
-                project_id=project.id,
-                outcome="completed",
-                updated_at=now,
-            )
-            for index, project in enumerate(projects[-32:])
-        ]
-    )
-    await db_session.commit()
+        await db_session.commit()
 
     assert await sweep_durable_project_change_wakeups(
         session_factory=_factory(db_session),
@@ -388,7 +410,7 @@ async def test_wake_budget_stays_at_32_while_scanning_200_projects(db_session):
         StrategicResidentSweepState, "durable_project_change"
     )
     assert state is not None
-    assert state.after_project_id == projects[-1].id
+    assert state.after_project_id == last_project_id
 
 
 def _managed_context_and_receipt(
@@ -473,10 +495,14 @@ async def test_managed_terminal_events_are_ordered_and_exclude_unmanaged_tasks(
         context={"_resident_managed_task": {"source_turn_task_id": "turn"}},
         status=TaskStatus.FAILED,
     )
-    db_session.add_all(
-        [item for pair in managed_pairs for item in pair]
-        + [resident_turn, unrelated, spoofed]
-    )
+    async with seed_without_authority_enforcement(db_session):
+        # Seed the applied receipts trigger-free — the mutation-authority fence
+        # rejects direct receipt inserts on Postgres. The tasks are then inserted
+        # under LIVE enforcement so the terminal-event trigger runs exactly as in
+        # production (their FK to the now-seeded receipts is satisfied).
+        db_session.add_all([receipt for receipt, _task in managed_pairs])
+        await db_session.commit()
+    db_session.add_all(managed_tasks + [resident_turn, unrelated, spoofed])
     await db_session.commit()
     events = list(
         (
@@ -528,7 +554,10 @@ async def test_managed_task_revive_before_first_sweep_is_not_lost(
         status=TaskStatus.FAILED,
         title="Revived failure",
     )
-    db_session.add_all([receipt, revived])
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(receipt)
+        await db_session.commit()
+    db_session.add(revived)
     await db_session.commit()
 
     # The Task is revived before the producer ever scans it. Current-state
@@ -576,7 +605,10 @@ async def test_paused_resident_discovers_managed_terminal_event_after_activation
         status=TaskStatus.COMPLETED,
         title="Completed while paused",
     )
-    db_session.add_all([receipt, task])
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(receipt)
+        await db_session.commit()
+    db_session.add(task)
     await db_session.commit()
     signal = AsyncMock(return_value=uuid.uuid4())
     monkeypatch.setattr(sweep_module, "signal_project_change", signal)
@@ -607,7 +639,10 @@ async def test_rolled_back_terminal_transition_emits_no_durable_event(db_session
         status=TaskStatus.FAILED,
         title="Rolled back failure",
     )
-    db_session.add_all([receipt, task])
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(receipt)
+        await db_session.commit()
+    db_session.add(task)
     await db_session.flush()
     assert (
         await db_session.execute(select(StrategicResidentTaskTerminalEvent))
@@ -627,6 +662,9 @@ async def test_context_marker_cannot_bind_another_projects_receipt(db_session):
     db_session.add(foreign)
     await db_session.flush()
     context, receipt = _managed_context_and_receipt(foreign.id)
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(receipt)
+        await db_session.commit()
     forged = Task(
         project_id=project.id,
         title="Cross-project forged lineage",
@@ -635,7 +673,7 @@ async def test_context_marker_cannot_bind_another_projects_receipt(db_session):
         status=TaskStatus.FAILED,
         strategic_operation_receipt_id=receipt.id,
     )
-    db_session.add_all([receipt, forged])
+    db_session.add(forged)
     await db_session.commit()
     assert (
         await db_session.execute(select(StrategicResidentTaskTerminalEvent))
@@ -649,6 +687,9 @@ async def test_context_marker_must_match_receipt_frozen_context_hash(db_session)
     )
     context, receipt = _managed_context_and_receipt(project.id)
     context["_resident_managed_task"]["context_hash"] = "b" * 64
+    async with seed_without_authority_enforcement(db_session):
+        db_session.add(receipt)
+        await db_session.commit()
     forged = Task(
         project_id=project.id,
         title="Same-project forged context hash",
@@ -657,7 +698,7 @@ async def test_context_marker_must_match_receipt_frozen_context_hash(db_session)
         status=TaskStatus.FAILED,
         strategic_operation_receipt_id=receipt.id,
     )
-    db_session.add_all([receipt, forged])
+    db_session.add(forged)
     await db_session.commit()
     assert (
         await db_session.execute(select(StrategicResidentTaskTerminalEvent))

@@ -3135,9 +3135,18 @@ class TestPurgeArchive:
         assert gone is None
 
     @pytest.mark.asyncio
-    async def test_purge_keeps_backend_managed_and_deletes_payloadless_archive(
+    async def test_purge_deletes_payloadless_and_agent_executed_resident_archive(
         self, client: AsyncClient, db_session
     ):
+        # Since #be905b401 made strategic_resident_turn agent-executed,
+        # BACKEND_MANAGED_TASK_TYPES is empty, so the archive-purge no longer
+        # special-cases resident-turn shadow rows — both archived tasks are
+        # purged. The durable Resident control-plane state (checkpoints /
+        # operation receipts) is preserved by its own FKs, independent of the
+        # ephemeral turn task, so purging the archived turn row is safe.
+        # NOTE: with no backend-managed task types currently defined, the purge's
+        # "keep backend-managed" branch is presently vacuous — follow-up: prune
+        # it or reintroduce a backend-managed type to re-cover it.
         project = await _make_project(db_session)
         payloadless = Task(
             project_id=project.id,
@@ -3159,7 +3168,7 @@ class TestPurgeArchive:
 
         response = await client.post("/api/admin/tasks/purge-archive", json={})
         assert response.status_code == 200
-        assert response.json()["deleted_count"] == 1
+        assert response.json()["deleted_count"] == 2
         remaining_ids = set(
             (
                 await db_session.execute(
@@ -3170,7 +3179,7 @@ class TestPurgeArchive:
             .all()
         )
         assert payloadless.id not in remaining_ids
-        assert shadow.id in remaining_ids
+        assert shadow.id not in remaining_ids
 
     @pytest.mark.asyncio
     async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
@@ -4799,13 +4808,21 @@ class TestMessages:
             context={"event_type": "pr_merged", "audience": "strategist-internal"},
         )
         # Operator-visible row — must be returned.
+        # NOTE: the event_type is deliberately a NON-high-signal operator-fyi
+        # event. On Postgres the ``projectmessage_0567_compat_insert`` BEFORE-INSERT
+        # trigger (migration 0567/0608) routes any system NOTE whose event_type is
+        # high-signal (e.g. ``failure_alert``) onto the CONVERSATION surface, so it
+        # would never appear on the ACTIVITY messages list this endpoint queries —
+        # a surface concern orthogonal to the audience filter under test here.
+        # ``operator_command`` is operator-fyi but not high-signal, so it stays on
+        # the ACTIVITY surface and correctly exercises the audience gate.
         visible = ProjectMessage(
             project_id=project.id,
             message_type=MessageType.NOTE,
             from_type="system",
             content="operator fyi",
             status="open",
-            context={"event_type": "failure_alert", "audience": "operator-fyi"},
+            context={"event_type": "operator_command", "audience": "operator-fyi"},
         )
         # Legacy row with no audience key — must remain visible (backward compat).
         legacy = ProjectMessage(

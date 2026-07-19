@@ -174,7 +174,12 @@ async def test_runner_list_is_deterministic_count_and_byte_bounded(db_session):
     for index in range(MAX_RUNNERS_PER_INSPECTION + 5):
         runner = _runner(
             project.id,
-            hostname=(f"runner-{index}-" + "h" * 2_000),
+            # hostname is varchar(255) in Postgres; keep the seed near that ceiling
+            # (still a long label) so the byte-bound is exercised without violating
+            # the column constraint. The oversized capabilities blob below (JSONB,
+            # unbounded) remains the real stress that proves the projection excludes
+            # it from the response.
+            hostname=(f"runner-{index}-" + "h" * 230),
             capabilities={
                 "task_types": [f"type-{item}-" + "t" * 500 for item in range(100)],
                 "max_concurrent": 8,

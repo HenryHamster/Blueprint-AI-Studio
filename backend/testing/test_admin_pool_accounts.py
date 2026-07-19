@@ -57,12 +57,19 @@ async def test_add_max_plan_account_legacy_anthropic_payload(
     )
     assert acct.provider == LLMProviderName.ANTHROPIC
     assert acct.auth_mode == LLMAuthMode.OAUTH
+    # secret_blob_ref / oauth_token are encrypted at rest (Fernet) whenever an
+    # encryption key is configured (Postgres CI harness), so assert against the
+    # value read through the same decrypting accessor the app uses. Under the
+    # keyless SQLite run decrypt_field is a pass-through, so this holds in both.
+    from app.field_encryption import decrypt_field
+
     assert (
-        acct.secret_blob_ref
+        decrypt_field(acct.secret_blob_ref)
         == "projects/test/secrets/user-system-llm-account/versions/1"
     )
     assert (
-        acct.oauth_token == "projects/test/secrets/user-system-llm-account/versions/1"
+        decrypt_field(acct.oauth_token)
+        == "projects/test/secrets/user-system-llm-account/versions/1"
     )
 
 
@@ -100,8 +107,13 @@ async def test_add_max_plan_account_openai_provider_payload(client, db_session, 
     )
     assert acct.provider == LLMProviderName.OPENAI
     assert acct.auth_mode == LLMAuthMode.API_KEY
+    # secret_blob_ref is encrypted at rest (Fernet) when an encryption key is
+    # configured (Postgres CI harness); read it back through decrypt_field, which
+    # is a pass-through under the keyless SQLite run.
+    from app.field_encryption import decrypt_field
+
     assert (
-        acct.secret_blob_ref
+        decrypt_field(acct.secret_blob_ref)
         == "projects/test/secrets/user-system-llm-account/versions/2"
     )
     assert acct.oauth_token is None
