@@ -1135,6 +1135,98 @@ def test_cap_bump_resolves_migration_apply_gate_breach():
     )
 
 
+def test_cap_bump_resolves_reaper_sweeps_breach():
+    """After bumping caps via check_size_limits --fix, reaper_sweeps.py must be
+    within its new cap on the real file tree.
+
+    This is the breach the 2026-07-19 ci-compliance remediation (4a13d25f) targets:
+    automain HEAD 4a13d25f reported backend/reaper_sweeps.py at 3467 lines over its
+    old cap of 3450. The fix bumps that cap to 4000 in module_size_limits.json; this
+    merge-test gate proves the bumped JSON is consistent with the actual file size on
+    disk, so the test fails if the cap is reverted (or the file grows past the new
+    cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "reaper_sweeps.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 4000, (
+        f"{target_rel} cap must be at least 4000 (bumped from old 3450 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
+def test_cap_bump_resolves_strategic_resident_transition_locks_breach():
+    """After bumping caps via check_size_limits --fix,
+    strategic_resident_transition_locks.py must be within its new cap on the real
+    file tree.
+
+    This is the breach the 2026-07-19 ci-compliance remediation (4a13d25f) targets:
+    automain HEAD 4a13d25f reported
+    backend/strategic_resident_transition_locks.py at 357 lines over its old cap
+    of 300. The fix bumps that cap to 600 in module_size_limits.json; this
+    merge-test gate proves the bumped JSON is consistent with the actual file size
+    on disk, so the test fails if the cap is reverted (or the file grows past the
+    new cap) before the CI invariant suite runs.
+    """
+    json_path = os.path.join(os.path.dirname(__file__), "module_size_limits.json")
+    data = csl.load_limits(json_path)
+    backend_caps = data.get("backend", {})
+
+    target_rel = "strategic_resident_transition_locks.py"
+    assert target_rel in backend_caps, (
+        f"{target_rel} must have a cap entry in module_size_limits.json"
+    )
+    assert backend_caps[target_rel] >= 600, (
+        f"{target_rel} cap must be at least 600 (bumped from old 300 cap); "
+        f"got {backend_caps[target_rel]}"
+    )
+
+    backend_root = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    assert os.path.isdir(backend_root), "backend app/ must exist next to testing/"
+
+    target_path = os.path.join(backend_root, target_rel)
+    assert os.path.isfile(target_path), f"{target_path} must exist on disk"
+
+    actual_count = csl.count_lines(target_path)
+    cap = backend_caps[target_rel]
+    result = csl.classify_size_record(
+        target_rel, actual_count, cap, "backend", with_verdict=False
+    )
+
+    assert not result["breach"], (
+        f"{target_rel} has {actual_count} lines which exceeds its cap of {cap}. "
+        "Run `python3 backend/testing/check_size_limits.py --fix` and commit "
+        "the updated module_size_limits.json."
+    )
+
+
 def test_cap_bump_resolves_admin_task_mutations_breach():
     """After bumping caps via check_size_limits --fix, admin_task_mutations.py must
     be within its new cap on the real file tree.
