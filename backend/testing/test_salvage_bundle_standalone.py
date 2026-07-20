@@ -198,6 +198,28 @@ Findings covered here (2-finding resident bootstrap/recovery salvage bundle, 202
            ALL startup helpers (playbook, messages, skills, strategic, ambient) into
            the replacement clone AND restarts the subprocess primed with the compaction
            checkpoint so the recovery session runs with coherent context
+
+Findings covered here (20-finding release-qualification salvage bundle, 2026-07-20):
+  f20-1  — serving-only-import ImportError degrades gate to ('ok', None); new test below
+  f20-2  — design: prove data-dependent migrations (design-doc only; no code test)
+  f20-3  — verify encryption-key continuity → already pinned by e2 test above
+  f20-4  — research: define safe Fernet key rotation (research-doc only; no code test)
+  f20-5  — fail closed on keyless/malformed backfill → already pinned by #1 tests above
+  f20-6  — scratch-DB URL degraded not boot-fatal → already pinned by #11/#2 tests above
+  f20-7  — isolate gate-defer signature from child failures → already pinned by #3/#12 tests above
+  f20-8  — contain timed-out qualifier children → already pinned by #4 tests above
+  f20-9  — block deterministic migration defects → already pinned by #5 tests above
+  f20-10 — enforce independent boot preflight → already pinned by #6 test above
+  f20-11 — unify trigger truth and retries → already pinned by #7 test above
+  f20-12 — contain orphan promotion actors → already pinned by #8 test above
+  f20-13 — gate data-migration proof → already pinned by #9 tests above
+  f20-14 — guide narrow release remediation UI → already pinned by #10 test above
+  f20-15 — declare + diagnose scratch prereq → already pinned by #11/#2 tests above
+  f20-16 — stabilize infra-failure signature → already pinned by #3/#12/e16 tests above
+  f20-17 — add hotfix modules to HOTFIX_ELIGIBLE_MODULES → already pinned by #13 test above
+  f20-18 — candidate-side acceptance-evidence minting → already pinned by #14 test above
+  f20-19 — release-machinery hotfix channel → already pinned by #15/#16 tests above
+  f20-20 — operator-approved hotfix-deploy channel → already pinned by #15/#16 tests above
 """
 
 from __future__ import annotations
@@ -4606,4 +4628,82 @@ def test_res2_workspace_vanish_guard_restarts_and_primes_subprocess():
         "The workspace-vanish guard must prime the fresh subprocess with "
         "buildCompactionCheckpoint so the recovery session has the full decision "
         "register, exam ledger, and operator grounding rather than an empty conversation"
+    )
+
+
+# =========================================================================== #
+# 20-finding release-qualification salvage bundle (2026-07-20)
+# =========================================================================== #
+
+
+# f20-1 — serving-only-import ImportError degrades gate to ('ok', None)
+# --------------------------------------------------------------------------- #
+
+
+def test_f20_1_serving_only_import_classifies_as_degrade():
+    """_ServingOnlyImportError must exist and _looks_like_serving_only_import must
+    detect app.* imports correctly so the gate degrades instead of hard-blocking.
+
+    Finding f20-1: candidate Alembic migrations are replayed in the SERVING process.
+    A migration that imports a candidate-only app symbol (e.g.
+    ``from app.field_encryption import require_encryption_active``) raises ImportError
+    in this context because the candidate's app code is not yet deployed.  Previously
+    this was classified as _DeterministicMigrationDefect → hard block.  The fix
+    classifies it as _ServingOnlyImportError and degrades the gate to ('ok', None)
+    since the same migration succeeds on the real deploy target.
+    """
+    from app.migration_apply_gate import (
+        _ServingOnlyImportError,
+        _looks_like_serving_only_import,
+    )
+
+    # _ServingOnlyImportError must be a distinct Exception subclass.
+    assert issubclass(_ServingOnlyImportError, Exception), (
+        "_ServingOnlyImportError must be an Exception subclass — "
+        "it signals a serving-replay self-reference artifact, not a deploy-fatal defect"
+    )
+    assert _ServingOnlyImportError is not Exception, (
+        "_ServingOnlyImportError must be a dedicated subclass, not Exception itself"
+    )
+
+    # app.* submodule import must match.
+    app_submod = ImportError("No module named 'app.field_encryption'")
+    app_submod.name = "app.field_encryption"
+    assert _looks_like_serving_only_import(app_submod) is True, (
+        "_looks_like_serving_only_import must return True for exc.name='app.field_encryption' "
+        "— that symbol exists in the candidate tree but not in the serving process"
+    )
+
+    # Root 'app' module import must also match.
+    root_app = ImportError("No module named 'app'")
+    root_app.name = "app"
+    assert _looks_like_serving_only_import(root_app) is True, (
+        "_looks_like_serving_only_import must return True for exc.name='app' (root module)"
+    )
+
+    # Third-party missing dependency must NOT match (real deploy-fatal defect).
+    third_party = ImportError("No module named 'cryptography.hazmat'")
+    third_party.name = "cryptography.hazmat"
+    assert _looks_like_serving_only_import(third_party) is False, (
+        "_looks_like_serving_only_import must return False for non-app.* ImportErrors — "
+        "a missing third-party dep IS a deploy-fatal defect and must hard-block"
+    )
+
+
+def test_f20_1_serving_only_import_not_in_deterministic_defect_class():
+    """_ServingOnlyImportError must be separate from _DeterministicMigrationDefect.
+
+    Finding f20-1: the old code raised _DeterministicMigrationDefect (hard block) for
+    ALL ImportErrors.  The new code must treat _ServingOnlyImportError as a DISTINCT
+    exception class that the gate maps to degrade ('ok', None), not a block.
+    """
+    from app.migration_apply_gate import (
+        _DeterministicMigrationDefect,
+        _ServingOnlyImportError,
+    )
+
+    assert not issubclass(_ServingOnlyImportError, _DeterministicMigrationDefect), (
+        "_ServingOnlyImportError must NOT be a subclass of _DeterministicMigrationDefect — "
+        "that would cause it to be caught as a hard block; it must be caught separately "
+        "and mapped to a degrade ('ok', None) verdict"
     )
