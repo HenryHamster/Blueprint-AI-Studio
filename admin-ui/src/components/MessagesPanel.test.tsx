@@ -8034,7 +8034,9 @@ describe('MessagesPanel convert-to-direction modal', () => {
 });
 
 describe('MessagesPanel confirmation chip actionability', () => {
-  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
+  // The needs-action strip is collapsed into the conversation utility bar by default;
+  // expand it so these tests exercise the strip itself.
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); localStorage.setItem('bp.chatChromeExpanded', 'true'); });
   afterEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
 
   function makeConfirmationStrategicState(confirmationId = 'confirm-1', projectId = 'proj-1'): StrategicStateResponse {
@@ -8304,7 +8306,9 @@ describe('MessagesPanel confirmation chip actionability', () => {
 });
 
 describe('MessagesPanel optimistic-send tab-switch persistence', () => {
-  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); });
+  // Conversation search is collapsed into the utility bar by default; expand so the
+  // search-input test sees the input rather than the collapsed search button.
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); localStorage.setItem('bp.chatChromeExpanded', 'true'); });
   afterEach(() => {
     (auth as unknown as { currentUser: { email: string; uid?: string } }).currentUser = { email: 'test-user@example.com' };
     localStorage.clear();

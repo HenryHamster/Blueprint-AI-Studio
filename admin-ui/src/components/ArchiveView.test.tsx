@@ -168,7 +168,9 @@ describe('ArchiveView', () => {
     await waitFor(() => {
       expect(screen.queryByRole('dialog', { name: 'Permanently delete?' })).not.toBeInTheDocument();
     });
-    expect(clearArchive).toHaveFocus();
+    await waitFor(() => {
+      expect(clearArchive).toHaveFocus();
+    });
   });
 
   test('row actions call details, retry, and unarchive handlers', async () => {
