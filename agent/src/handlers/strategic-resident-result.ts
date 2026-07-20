@@ -1,4 +1,7 @@
 const MAX_RESULT_REPAIR_CONTEXT_BYTES = 96_000;
+const HIGH_IMPACT_IMPLICATION_KINDS = new Set([
+  'strategy_change', 'abandon_work', 'merge', 'deploy',
+]);
 const RESULT_KEYS = new Set([
   'reply', 'facts', 'evidence', 'operations', 'receipts', 'unknown_effects',
   'strategic_implications', 'proposed_memory', 'follow_up',
@@ -13,6 +16,7 @@ export const FINAL_RESULT_SCHEMA_HINT = [
   'receipts: [{"operation_id":"id","receipt_id":"id","status":"pending|applying|applied|reconciling|reconciled|failed|unknown_effect","summary":"text"}]',
   'unknown_effects: [{"effect_id":"id","operation_id":"id","receipt_id":"id","summary":"text","reconciliation_status":"unknown|reconciled|requires_attention"}]',
   'strategic_implications: [{"implication_id":"id","kind":"strategy_change|abandon_work|merge|deploy|other","summary":"text","evidence_ids":[]}]',
+  'strategy_change, abandon_work, merge, and deploy implications require at least one evidence_id.',
   'proposed_memory: [{"proposal_id":"id","layer":"charter|working_strategy","updates":{"public_key":"value"},"rationale":"text","evidence_ids":[]}]',
   'follow_up: null or {"summary":null,"open_loops":[{"loop_id":"id","summary":"text","owner":null,"due_at":null,"evidence_ids":[]}],"next_wakeup_at":null}',
   'required_attention: [{"attention_id":"id","severity":"info|warning|critical","summary":"text","evidence_ids":[],"receipt_ids":[]}]',
@@ -231,6 +235,10 @@ function validateImplications(items: unknown[]): string | null {
       ?? stringError(item.summary, `${path}.summary`, 4_000)
       ?? optionalStringListError(item, 'evidence_ids', path, 20);
     if (error) return error;
+    const evidenceIds = Array.isArray(item.evidence_ids) ? item.evidence_ids : [];
+    if (HIGH_IMPACT_IMPLICATION_KINDS.has(String(item.kind)) && evidenceIds.length === 0) {
+      return `${path} ${String(item.kind)} implication requires evidence`;
+    }
   }
   return null;
 }
@@ -343,6 +351,68 @@ function resultIdentityError(result: Record<string, unknown>): string | null {
     ?? duplicateIdentityError(openLoops, 'loop_id', 'follow_up.open_loops')
     ?? duplicateIdentityError(result.required_attention as unknown[], 'attention_id', 'required_attention');
 }
+function highImpactEvidenceError(
+  result: Record<string, unknown>,
+  canonicalEvidence: boolean,
+  canonicalInspections: unknown[] | null,
+): string | null {
+  const evidenceItems = result.evidence as Record<string, unknown>[];
+  const evidence = new Map(evidenceItems.map((item) => [String(item.evidence_id), item]));
+  const implicationItems = result.strategic_implications as Record<string, unknown>[];
+  const implications = new Map(
+    implicationItems.map((item) => [String(item.implication_id), item]),
+  );
+  for (const implication of implicationItems) {
+    const implicationId = String(implication.implication_id);
+    const kind = String(implication.kind);
+    const highImpact = HIGH_IMPACT_IMPLICATION_KINDS.has(kind);
+    const evidenceIds = Array.isArray(implication.evidence_ids)
+      ? implication.evidence_ids as string[]
+      : [];
+    for (const evidenceId of evidenceIds) {
+      const item = evidence.get(evidenceId);
+      if (!item) return `implication ${implicationId} references unknown evidence ${evidenceId}`;
+      if (
+        highImpact
+        && canonicalEvidence
+        && (
+          typeof item.revision !== 'string' || item.revision.length === 0
+          || typeof item.checksum !== 'string' || item.checksum.length === 0
+        )
+      ) {
+        return `${kind} implication requires revisioned, checksummed decisive evidence`;
+      }
+    }
+  }
+  const reconciliation = result.reconciliation as Record<string, unknown>;
+  const acceptedIds = reconciliation.accepted_implication_ids as string[];
+  for (const implicationId of acceptedIds) {
+    const implication = implications.get(implicationId);
+    if (!implication) return `accepted implication is absent: ${implicationId}`;
+    if (!canonicalEvidence || !HIGH_IMPACT_IMPLICATION_KINDS.has(String(implication.kind))) {
+      continue;
+    }
+    const evidenceIds = Array.isArray(implication.evidence_ids)
+      ? implication.evidence_ids as string[]
+      : [];
+    const inspections = (canonicalInspections
+      ?? reconciliation.evidence_inspections) as Record<string, unknown>[];
+    for (const evidenceId of evidenceIds) {
+      const item = evidence.get(evidenceId) as Record<string, unknown>;
+      const matches = inspections.filter((inspection) => (
+        inspection.evidence_id === evidenceId
+        && inspection.decisive === true
+        && ['kind', 'source_id', 'revision', 'checksum'].every(
+          (key) => inspection[key] === item[key],
+        )
+      ));
+      if (matches.length !== 1) {
+        return `accepted ${String(implication.kind)} implication was not independently inspected`;
+      }
+    }
+  }
+  return null;
+}
 function projectionError(
   result: Record<string, unknown>,
   capabilityResults: Record<string, unknown>[],
@@ -384,6 +454,7 @@ export function residentResultShapeError(
   capabilityResults: Record<string, unknown>[],
   allowEvidenceServerExtras = false,
   requireReply = false,
+  canonicalInspections: unknown[] | null = null,
 ): string | null {
   const unknownTopLevel = Object.keys(result).find((key) => !RESULT_KEYS.has(key));
   if (unknownTopLevel !== undefined) return `${unknownTopLevel} is not an allowed final result field`;
@@ -410,6 +481,9 @@ export function residentResultShapeError(
     ?? validateAttention(result.required_attention as unknown[])
     ?? validateReconciliation(result.reconciliation)
     ?? resultIdentityError(result)
+    ?? highImpactEvidenceError(
+      result, !allowEvidenceServerExtras, canonicalInspections,
+    )
     ?? projectionError(result, capabilityResults);
 }
 
