@@ -59,7 +59,7 @@ def _normalize_builder_sa(sa_email: str, project_id: str) -> str:
 
     Cloud Build's Build.service_account must be
     ``projects/{PROJECT}/serviceAccounts/{EMAIL}``.  The env var is stored as a
-    bare email address (e.g. ``compute-image-builder-sa@proj.iam.gserviceaccount.com``);
+    bare email address (e.g. ``image-builder-sa@proj.iam.gserviceaccount.com``);
     this normalises it so callers never need to know the difference.
     """
     if sa_email.startswith("projects/"):

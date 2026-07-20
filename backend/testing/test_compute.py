@@ -25583,15 +25583,15 @@ def _read_infra_file(relative_name: str) -> str:
 def test_compute_image_builder_least_privilege_contract():
     iam = _read_infra_file("infra/terraform/iam.tf")
     wi = _read_infra_file("infra/terraform/workload_identity.tf")
+    cb = _read_infra_file("infra/terraform/cloudbuild.tf")
 
     # The compute-image builder is a dedicated LEAF service account whose only
-    # capability is push/pull on the compute-images Artifact Registry repo, so an
-    # off-orchestrator project-image build reaches none of the orchestrator's
-    # authority: no Secret Manager, no agent-artifacts bucket, no other project
-    # role. This SA (``image_builder_sa``, #15566) superseded the earlier
-    # Cloud-Build ``compute_image_builder_sa`` (#15482) when the builder moved to a
-    # throwaway builder VM; its bindings are the real current least-privilege
-    # contract this test guards.
+    # capability is push/pull on the compute-images Artifact Registry repo plus
+    # the two grants required to run as a custom SA on Cloud Build
+    # (logging.logWriter, storage.objectViewer on the build-source bucket).
+    # An off-orchestrator project-image build must reach none of the
+    # orchestrator's authority: no Secret Manager, no agent-artifacts bucket,
+    # no other project role.
     builder_member = "google_service_account.image_builder_sa.email"
 
     # (a) The dedicated builder SA exists.
@@ -25628,15 +25628,71 @@ def test_compute_image_builder_least_privilege_contract():
     assert '"roles/iam.serviceAccountUser"' in actas_block
     assert orch_member in actas_block
 
-    # (d) LEAST PRIVILEGE: every resource block that binds a role TO the builder SA
+    # (d) Build-source bucket: disposable staging area for Cloud Build source tarballs.
+    #     Must be a separate bucket from agent-artifacts; must have a short-retention
+    #     lifecycle_rule on the build-sources/ prefix so orphaned objects never accumulate.
+    assert 'resource "google_storage_bucket" "compute_build_source"' in cb, (
+        "cloudbuild.tf must define google_storage_bucket.compute_build_source"
+    )
+    bucket_block = cb.split(
+        'resource "google_storage_bucket" "compute_build_source"', 1
+    )[1].split("resource ", 1)[0]
+    assert 'matches_prefix = ["build-sources/"]' in bucket_block, (
+        "compute_build_source bucket must have a lifecycle_rule targeting the build-sources/ prefix"
+    )
+    assert '"Delete"' in bucket_block, (
+        "compute_build_source lifecycle_rule must Delete objects (not just transition them)"
+    )
+
+    # (e) Orchestrator has Cloud Build editor access (to submit/get/cancel builds)
+    #     and objectAdmin on the build-source bucket (to upload and delete staged tarballs).
+    assert 'resource "google_project_iam_member" "orchestrator_cloudbuild_editor"' in cb, (
+        "cloudbuild.tf must grant orchestrator_sa roles/cloudbuild.builds.editor"
+    )
+    orch_cb_block = cb.split(
+        'resource "google_project_iam_member" "orchestrator_cloudbuild_editor"', 1
+    )[1].split("resource ", 1)[0]
+    assert '"roles/cloudbuild.builds.editor"' in orch_cb_block
+    assert orch_member in orch_cb_block
+
+    assert 'resource "google_storage_bucket_iam_member" "orchestrator_compute_build_source_admin"' in cb, (
+        "cloudbuild.tf must grant orchestrator_sa objectAdmin on compute_build_source bucket"
+    )
+    orch_bkt_block = cb.split(
+        'resource "google_storage_bucket_iam_member" "orchestrator_compute_build_source_admin"', 1
+    )[1].split("resource ", 1)[0]
+    assert '"roles/storage.objectAdmin"' in orch_bkt_block
+    assert orch_member in orch_bkt_block
+    assert "google_storage_bucket.compute_build_source.name" in orch_bkt_block
+
+    # (f) Builder SA has the two grants required to run as a custom Cloud Build SA:
+    #     - logging.logWriter (MANDATORY with logging=CLOUD_LOGGING_ONLY)
+    #     - storage.objectViewer on the build-source bucket (to fetch StorageSource)
+    assert 'resource "google_project_iam_member" "image_builder_log_writer"' in cb, (
+        "cloudbuild.tf must grant image_builder_sa roles/logging.logWriter"
+    )
+    log_block = cb.split(
+        'resource "google_project_iam_member" "image_builder_log_writer"', 1
+    )[1].split("resource ", 1)[0]
+    assert '"roles/logging.logWriter"' in log_block
+    assert builder_member in log_block
+
+    assert 'resource "google_storage_bucket_iam_member" "image_builder_compute_build_source_reader"' in cb, (
+        "cloudbuild.tf must grant image_builder_sa storage.objectViewer on compute_build_source bucket"
+    )
+    bld_bkt_block = cb.split(
+        'resource "google_storage_bucket_iam_member" "image_builder_compute_build_source_reader"', 1
+    )[1].split("resource ", 1)[0]
+    assert '"roles/storage.objectViewer"' in bld_bkt_block
+    assert builder_member in bld_bkt_block
+    assert "google_storage_bucket.compute_build_source.name" in bld_bkt_block
+
+    # (g) LEAST PRIVILEGE: every resource block that binds a role TO the builder SA
     #     (i.e. names it as the grantee ``member``) grants NO Secret Manager
-    #     access, NO agent-artifacts bucket access, and NOTHING beyond the two
-    #     Artifact Registry roles above. The actAs block above references
-    #     image_builder_sa.name as the *target* but grants serviceAccountUser to
-    #     the orchestrator, so it is (correctly) not a role held by the builder —
-    #     builder_member matches the ``.email`` grantee, which appears only on the
-    #     two AR bindings. Any other role bound to this SA is a
-    #     privilege-escalation regression.
+    #     access and NO access to the agent-artifacts bucket. The builder legitimately
+    #     holds exactly four roles: the two Artifact Registry roles (AR reader+writer)
+    #     for pushing/pulling compute images, plus logging.logWriter and
+    #     storage.objectViewer for running as a custom Cloud Build SA.
     def _blocks_binding_builder(text: str) -> list[str]:
         return [
             "resource " + chunk
@@ -25645,7 +25701,7 @@ def test_compute_image_builder_least_privilege_contract():
         ]
 
     granted_roles: list[str] = []
-    for body in _blocks_binding_builder(iam) + _blocks_binding_builder(wi):
+    for body in _blocks_binding_builder(iam) + _blocks_binding_builder(wi) + _blocks_binding_builder(cb):
         assert "secretmanager" not in body, (
             "builder SA must have NO Secret Manager access; offending block:\n" + body
         )
@@ -25660,12 +25716,15 @@ def test_compute_image_builder_least_privilege_contract():
     assert sorted(set(granted_roles)) == [
         "roles/artifactregistry.reader",
         "roles/artifactregistry.writer",
+        "roles/logging.logWriter",
+        "roles/storage.objectViewer",
     ], (
-        "builder SA must hold ONLY artifactregistry reader+writer; a different role "
-        f"is a privilege-escalation regression. Found: {sorted(set(granted_roles))}"
+        "builder SA must hold ONLY the four least-privilege roles needed for Cloud Build "
+        "(AR reader+writer, logging.logWriter, storage.objectViewer on build-source bucket); "
+        f"any other role is a privilege-escalation regression. Found: {sorted(set(granted_roles))}"
     )
 
-    # (e) Pre-existing orchestrator/agent compute-image grants are preserved:
+    # (h) Pre-existing orchestrator/agent compute-image grants are preserved:
     #     orchestrator keeps its compute-image protection-tag write permission,
     #     and the agent keeps its image-pull (reader) permission.
     assert (

@@ -349,7 +349,7 @@ if [ "$USE_POSTGRES" = "1" ] && [ "$SANDBOX_POSTGRES" = "1" ]; then
   PG_BIN="$(pg_config --bindir)"
   PG_DATA=$(mktemp -d /tmp/blueprint-test-pg.XXXXXX)
   PG_SOCKET=$(mktemp -d /tmp/blueprint-test-pg-sock.XXXXXX)
-  "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale -U test >/dev/null
+  "$PG_BIN/initdb" -D "$PG_DATA" -A trust --no-locale --encoding=UTF-8 -U test >/dev/null
   "$PG_BIN/pg_ctl" -D "$PG_DATA" \
     -o "-F -c listen_addresses='' -k '$PG_SOCKET'" -w start >/dev/null
   "$PG_BIN/createdb" -h "$PG_SOCKET" -U test test_blueprint
