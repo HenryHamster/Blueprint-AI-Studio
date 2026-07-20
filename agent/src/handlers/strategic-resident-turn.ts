@@ -180,6 +180,102 @@ function capabilityAction(texts: string[]): ResidentCapabilityAction | null {
   return null;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function completeResultEvidence(value: Record<string, unknown>): boolean {
+  return ['evidence_id', 'kind', 'source_id', 'revision', 'checksum']
+    .every((key) => typeof value[key] === 'string' && value[key].length > 0);
+}
+
+function canonicalEvidenceInspections(
+  result: Record<string, unknown>,
+  reconciliation: Record<string, unknown>,
+  serverInspectionEvidence: Record<string, unknown>[],
+): unknown[] {
+  const requested = reconciliation.evidence_inspections;
+  if (requested === undefined) return [];
+  if (!Array.isArray(requested)) {
+    throw new Error('Resident evidence_inspections must be an array');
+  }
+  if (requested.length > 50) {
+    throw new Error('Resident evidence_inspections exceeds 50 items');
+  }
+  const resultEvidence = Array.isArray(result.evidence)
+    ? result.evidence.filter(isRecord)
+    : [];
+  const canonicalIds = new Set<string>();
+  return requested.map((raw, index) => {
+    if (!isRecord(raw)) {
+      throw new Error(`Resident evidence_inspections[${index}] must be an object`);
+    }
+    const allowedKeys = new Set([
+      'evidence_id', 'kind', 'source_id', 'revision', 'checksum', 'inspected_at', 'decisive',
+    ]);
+    if (Object.keys(raw).some((key) => !allowedKeys.has(key))) {
+      throw new Error(`Resident evidence_inspections[${index}] contains an unknown field`);
+    }
+    if (raw.decisive !== undefined && typeof raw.decisive !== 'boolean') {
+      throw new Error(`Resident evidence_inspections[${index}].decisive must be a boolean`);
+    }
+    for (const key of ['evidence_id', 'source_id', 'revision']) {
+      if (
+        raw[key] !== undefined
+        && (typeof raw[key] !== 'string' || raw[key].length === 0)
+      ) {
+        throw new Error(`Resident evidence_inspections[${index}].${key} must be a non-empty string`);
+      }
+    }
+    const requestedEvidenceId = typeof raw.evidence_id === 'string' ? raw.evidence_id : null;
+    const requestedSourceId = typeof raw.source_id === 'string' ? raw.source_id : null;
+    const requestedRevision = typeof raw.revision === 'string' ? raw.revision : null;
+    if (!requestedEvidenceId && (!requestedSourceId || !requestedRevision)) {
+      throw new Error(`Resident evidence_inspections[${index}] requires evidence_id or source_id plus revision`);
+    }
+    const resultMatches = resultEvidence.filter((candidate) => (
+      requestedEvidenceId
+        ? candidate.evidence_id === requestedEvidenceId
+        : candidate.source_id === requestedSourceId
+          && candidate.revision === requestedRevision
+    ));
+    if (resultMatches.length !== 1 || !completeResultEvidence(resultMatches[0])) {
+      throw new Error(`Resident evidence_inspections[${index}] does not identify one complete result evidence item`);
+    }
+    const evidence = resultMatches[0];
+    const serverMatches = serverInspectionEvidence.filter((candidate) => (
+      candidate.kind === evidence.kind
+      && candidate.source_id === evidence.source_id
+      && candidate.revision === evidence.revision
+      && candidate.checksum === evidence.checksum
+      && typeof candidate.inspected_at === 'string'
+      && candidate.inspected_at.length > 0
+    ));
+    if (serverMatches.length !== 1) {
+      throw new Error(`Resident evidence_inspections[${index}] is not backed by one server inspection`);
+    }
+    const inspected = serverMatches[0];
+    for (const key of ['kind', 'source_id', 'revision', 'checksum', 'inspected_at']) {
+      if (raw[key] !== undefined && raw[key] !== inspected[key]) {
+        throw new Error(`Resident evidence_inspections[${index}].${key} conflicts with server evidence`);
+      }
+    }
+    const evidenceId = String(evidence.evidence_id);
+    if (canonicalIds.has(evidenceId)) {
+      throw new Error(`Resident evidence_inspections contains duplicate evidence_id ${evidenceId}`);
+    }
+    canonicalIds.add(evidenceId);
+    return {
+      evidence_id: evidenceId,
+      kind: inspected.kind,
+      source_id: inspected.source_id,
+      revision: inspected.revision,
+      checksum: inspected.checksum,
+      inspected_at: inspected.inspected_at,
+      decisive: raw.decisive ?? true,
+    };
+  });
+}
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value && typeof value === 'object') {
@@ -251,6 +347,7 @@ function residentPrompt(
   const prompt = [
     'Return exactly one JSON object and no prose or markdown.',
     ...actionInstructions,
+    'In the final reconciliation, evidence_inspections must be an array of objects shaped {"evidence_id":"<result.evidence id>","decisive":true}; decisive is optional. Each evidence_id must name a result.evidence item copied from server-validated inspection evidence; the worker binds the canonical receipt metadata.',
     'The server supplies project, turn, authority, checkpoint, and context revisions. Never include or override those server-owned revisions.',
     'Mutation evidence references must copy kind, project_id, source_id, revision, checksum, and inspected_at from server-validated inspection evidence; never invent evidence. Explicit approvals are durable server-side grants and are never represented in the model request.',
     'Every mutation response contains a server-authored completion_projection. Copy its operation and receipt exactly into final operations and receipts, and copy every projected unknown_effect and required_attention item exactly. An unknown_effect receipt must remain an applying operation and must never be reported as success or retried.',
@@ -315,6 +412,7 @@ export async function handleStrategicResidentTurn(
   statusRef.value = 'Running bounded Resident reasoning...';
   const boundary = createResidentProviderBoundary(PROVIDER);
   const capabilityResults: Record<string, unknown>[] = [];
+  const serverInspectionEvidence: Record<string, unknown>[] = [];
   const requestKeys = new Set<string>();
   let result: Record<string, unknown> | null = null;
   try {
@@ -376,6 +474,9 @@ export async function handleStrategicResidentTurn(
             capability_id: request.capability_id,
             parameters: request.parameters,
           }) as Record<string, unknown>;
+          if (isRecord(response.evidence)) {
+            serverInspectionEvidence.push(response.evidence);
+          }
         } else {
           const mutation = request as ResidentMutationRequest;
           const projectId = typeof identity.project_id === 'string' ? identity.project_id : '';
@@ -418,6 +519,11 @@ export async function handleStrategicResidentTurn(
       ? result.reconciliation as Record<string, unknown>
       : {}
   );
+  const evidenceInspections = canonicalEvidenceInspections(
+    result,
+    reconciliation,
+    serverInspectionEvidence,
+  );
   delete result.reconciliation;
   const contextHash = typeof lineage.context_hash === 'string' ? lineage.context_hash : '';
   statusRef.value = 'Reconciling Resident result...';
@@ -436,7 +542,7 @@ export async function handleStrategicResidentTurn(
     accepted_implication_ids: reconciliation.accepted_implication_ids || [],
     accepted_open_loop_ids: reconciliation.accepted_open_loop_ids || [],
     resolved_open_loop_ids: reconciliation.resolved_open_loop_ids || [],
-    evidence_inspections: reconciliation.evidence_inspections || [],
+    evidence_inspections: evidenceInspections,
   });
   sendLog(ws, 'Resident result reconciled through the authoritative checkpoint lane.\n');
 }
