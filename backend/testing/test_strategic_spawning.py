@@ -799,7 +799,7 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "operator_overrides" in payload
@@ -834,7 +834,7 @@ async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -866,7 +866,7 @@ async def test_spawn_strategic_review_default_extra_context_unchanged(db_session
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -986,7 +986,7 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -1111,7 +1111,7 @@ async def test_payload_includes_resident_exam_leads_section(db_session, mocker):
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -1168,7 +1168,7 @@ async def test_spawn_strategic_review_no_resident_leads_when_ledger_absent(db_se
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -1238,7 +1238,7 @@ async def test_spawn_strategic_review_resident_minimal_dedup_keeps_latest_by_tic
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -1267,7 +1267,7 @@ async def test_spawn_strategic_review_cadence_still_runs_context_build(db_sessio
     assert spawned is True
 
     task = (
-        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        (await db_session.execute(_select_agent_tasks(project.id)))
         .scalars()
         .all()[0]
     )
@@ -1376,7 +1376,7 @@ async def test_spawn_review_includes_capability_trial_verdicts(db_session):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert payload["capability_trial_verdicts"] == {
@@ -1410,7 +1410,7 @@ async def test_spawn_review_includes_model_health_signal(db_session):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "model_health" in payload
@@ -1438,7 +1438,7 @@ async def test_spawn_review_omits_operator_overrides_when_empty(db_session):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "operator_overrides" not in payload
@@ -1857,7 +1857,7 @@ async def test_operator_rejection_rate_absent_when_no_rejections(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-norej01")
@@ -1898,7 +1898,7 @@ async def test_success_evidence_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se01")
@@ -1984,7 +1984,7 @@ async def test_recent_challenge_summary_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-challenge")
     assert d_stat["recent_findings_challenge_summary"] == {
@@ -2026,7 +2026,7 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-se02")
@@ -2080,7 +2080,7 @@ async def test_retired_direction_grounding_present_in_direction_stats(db_session
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-rg01")
@@ -2134,7 +2134,7 @@ async def test_gap_id_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl01")
@@ -2165,7 +2165,7 @@ async def test_gap_id_absent_when_not_set(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-gl02")
@@ -2233,7 +2233,7 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
@@ -2291,7 +2291,7 @@ async def test_cumulative_confirmed_finding_count_and_trend_in_direction_stats(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cf01")
@@ -2334,7 +2334,7 @@ async def test_outcome_scaffolding_flag_surfaces_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     by_id = {s["id"]: s for s in payload["directions_summary"]}
@@ -2382,7 +2382,7 @@ async def test_operator_rejection_rate_uses_history_aggregate(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-agg01")
@@ -2421,7 +2421,7 @@ async def test_operator_rejection_rate_zero_rejected_in_history_aggregate(db_ses
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-agg02")
@@ -2501,7 +2501,7 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     by_id = {s["id"]: s for s in payload["directions_summary"]}
@@ -2561,7 +2561,7 @@ async def test_stat_payload_autonomy_agrees_with_helper_and_excludes_degraded(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     stat = {s["id"]: s for s in payload["directions_summary"]}[
@@ -2616,7 +2616,7 @@ async def test_cost_fields_present_when_history_has_merge_data(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost01")
@@ -2649,7 +2649,7 @@ async def test_cost_fields_absent_without_history_data(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-cost02")
@@ -2688,7 +2688,7 @@ async def test_cost_fields_use_recorded_spend_over_proxy(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(
@@ -2744,7 +2744,7 @@ async def test_cost_per_merged_pr_folds_evicted_aggregate_cost(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(
@@ -2799,7 +2799,7 @@ async def test_tasks_failed_infra_includes_history_aggregate(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-agg03")
@@ -3620,7 +3620,7 @@ async def test_recommended_mode_audit_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode01")
@@ -3653,7 +3653,7 @@ async def test_recommended_mode_fundamentals_present_in_direction_stats(db_sessi
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode02")
@@ -3692,7 +3692,7 @@ async def test_recommended_mode_ship_absent_from_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat_ship = next(
@@ -3733,7 +3733,7 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-mode05")
@@ -3776,7 +3776,7 @@ async def test_auto_retire_pending_surfaces_in_direction_stats(db_session, mocke
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     d_stat = next(
         s for s in payload["directions_summary"] if s["id"] == "d-retire-pending"
@@ -3820,7 +3820,7 @@ async def test_auto_retire_pending_surfaces_for_active_scaffolding_direction(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     d_stat = next(
         s for s in payload["directions_summary"] if s["id"] == "d-scaffolding-retire"
@@ -3877,8 +3877,9 @@ async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
+    assert len(tasks) == 1
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg01")
 
@@ -3930,8 +3931,9 @@ async def test_spawn_gate_metrics_absent_when_no_activity(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
+    assert len(tasks) == 1
     payload = tasks[0].payloads[0]
     d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-sg02")
 
@@ -3975,8 +3977,9 @@ async def test_spawn_gate_exhaustion_note_names_cause_distribution(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
+    assert len(tasks) == 1
     payload = tasks[0].payloads[0]
     suffix = payload.get("prompt_suffix", "")
     assert "wholesale retry exhausted 1 time(s)" in suffix
@@ -4017,8 +4020,9 @@ async def test_spawn_gate_exhaustion_note_falls_back_without_cause_data(db_sessi
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
+    assert len(tasks) == 1
     payload = tasks[0].payloads[0]
     suffix = payload.get("prompt_suffix", "")
     assert "wholesale retry exhausted 1 time(s)" in suffix
@@ -4068,8 +4072,9 @@ async def test_strategic_review_prompt_suffix_includes_mode_hints(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
+    assert len(tasks) == 1
     payload = tasks[0].payloads[0]
     suffix = payload["prompt_suffix"]
 
@@ -4129,7 +4134,7 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(
 
     await _spawn_strategic_review(project, db_session, cycle_id=cycle_id)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     assert tasks[0].context.get("strategic_cycle_id") == cycle_id
 
@@ -4566,7 +4571,7 @@ async def test_previous_decision_outcomes_populated_from_prior_cycle(db_session)
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     prev = payload.get("previous_decision_outcomes")
@@ -4610,7 +4615,7 @@ async def test_previous_decision_outcomes_absent_when_no_prior_decisions(db_sess
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     assert "previous_decision_outcomes" not in payload
 
@@ -4650,7 +4655,7 @@ async def test_previous_decision_outcomes_surfaces_created_rationales(db_session
 
     await _spawn_strategic_review(project, db_session)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
@@ -4688,7 +4693,7 @@ async def test_previous_decision_outcomes_surfaces_retired_rationales(db_session
 
     await _spawn_strategic_review(project, db_session)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
@@ -4728,7 +4733,7 @@ async def test_previous_decision_outcomes_surfaces_cycle_reasoning(db_session):
 
     await _spawn_strategic_review(project, db_session)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
@@ -4771,7 +4776,7 @@ async def test_previous_decision_outcomes_rationale_absent_when_not_recorded(
 
     await _spawn_strategic_review(project, db_session)
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
@@ -4802,7 +4807,7 @@ async def test_previous_decision_outcomes_missing_retired_direction(db_session):
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().first().payloads[0]
     prev = payload.get("previous_decision_outcomes")
     assert prev is not None
@@ -5337,7 +5342,7 @@ async def test_anomaly_summary_surfaces_high_occurrence_entries(db_session):
         spawned = await _spawn_strategic_review(project, db_session)
         assert spawned is True
         result = await db_session.execute(
-            select(Task).where(Task.project_id == project.id)
+            _select_agent_tasks(project.id)
         )
         payload = result.scalars().all()[0].payloads[0]
 
@@ -5377,7 +5382,7 @@ async def test_anomaly_summary_absent_when_no_qualifying_entries(db_session):
     try:
         await _spawn_strategic_review(project, db_session)
         result = await db_session.execute(
-            select(Task).where(Task.project_id == project.id)
+            _select_agent_tasks(project.id)
         )
         payload = result.scalars().all()[0].payloads[0]
         assert "anomaly_summary" not in payload
@@ -5411,7 +5416,7 @@ async def test_anomaly_summary_skips_non_dict_sentinel(db_session):
         spawned = await _spawn_strategic_review(project, db_session)
         assert spawned is True
         result = await db_session.execute(
-            select(Task).where(Task.project_id == project.id)
+            _select_agent_tasks(project.id)
         )
         payload = result.scalars().all()[0].payloads[0]
 
@@ -5469,7 +5474,7 @@ async def test_playbook_summary_includes_relevant_entries(db_session, mocker):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "playbook_summary" in payload
@@ -5501,7 +5506,7 @@ async def test_playbook_summary_absent_when_no_relevant_entries(db_session, mock
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     assert "playbook_summary" not in payload
 
@@ -5525,7 +5530,7 @@ async def test_playbook_summary_caps_at_ten_entries(db_session, mocker):
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     entries = payload["playbook_summary"]["entries"]
     assert len(entries) == 10
@@ -5565,7 +5570,7 @@ async def test_playbook_keys_index_includes_all_entries(db_session, mocker):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "playbook_keys_index" in payload
@@ -5595,7 +5600,7 @@ async def test_playbook_keys_index_absent_when_no_entries(db_session, mocker):
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     assert "playbook_keys_index" not in payload
 
@@ -5624,7 +5629,7 @@ async def test_playbook_keys_index_skips_pending_entries(db_session, mocker):
     await _seed_legacy_cycles(db_session, project)
 
     await _spawn_strategic_review(project, db_session)
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "playbook_keys_index" in payload
@@ -6319,7 +6324,7 @@ async def test_spawn_strategic_review_payload_uses_reconciled_design_doc(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -6353,7 +6358,7 @@ async def test_strategic_review_payload_includes_calibration_factor(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     assert "prediction_calibration_factor" in payload
@@ -6396,7 +6401,7 @@ async def test_strategic_review_calibration_factor_reflects_history(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     factor = payload["prediction_calibration_factor"]
@@ -6448,7 +6453,7 @@ async def test_strategic_review_includes_system_maturity_when_rows_exist(db_sess
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     assert "system_maturity" in payload
@@ -6481,7 +6486,7 @@ async def test_strategic_review_omits_system_maturity_when_no_rows(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     assert "system_maturity" not in payload, (
@@ -6537,7 +6542,7 @@ async def test_strategic_review_includes_drift_signals_when_drift_present(db_ses
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -6627,7 +6632,7 @@ async def test_drift_signals_persist_snapshot_and_include_consecutive_cycles(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     sr_tasks = [
         t
         for t in result.scalars().all()
@@ -6755,7 +6760,7 @@ async def test_strategic_review_includes_efficiency_snapshot_when_data_present(
         spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -6829,7 +6834,7 @@ async def test_strategic_review_omits_efficiency_snapshot_when_no_data(db_sessio
         spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -6892,7 +6897,7 @@ async def test_strategic_review_omits_parallelism_snapshot(db_session):
             _shared_state.runtime_config["max_concurrent_vms"] = prev_cap
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -6975,7 +6980,7 @@ async def test_strategic_review_includes_held_directions_block(db_session):
         _shared_state.direction_failure_streaks.clear()
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -7017,7 +7022,7 @@ async def test_strategic_review_omits_held_directions_when_none_held(db_session)
         _shared_state.direction_failure_streaks.clear()
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     strategic_tasks = [
         t
         for t in result.scalars().all()
@@ -7064,7 +7069,7 @@ async def test_strategic_review_skips_query_when_held_directions_filtered(db_ses
         spawned = await _spawn_strategic_review(project, db_session)
         assert spawned is True
 
-        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        result = await db_session.execute(_select_agent_tasks(project.id))
         strategic_tasks = [
             t
             for t in result.scalars().all()
@@ -7318,7 +7323,7 @@ async def test_strategic_review_packer_meta_present_on_small_project(db_session)
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "_packer_meta" in payload, "Packer must always attach _packer_meta"
@@ -7396,7 +7401,7 @@ async def test_strategic_review_packer_keeps_payload_under_cap_on_bloated_projec
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # Hard requirement: must fit under the 256KB cap that crashed autonomy before
@@ -7496,7 +7501,7 @@ async def test_direction_counts_by_system_survives_directions_summary_trim(db_se
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # Payload must fit under the hard cap and the detail list must have trimmed.
@@ -7711,7 +7716,7 @@ async def test_drift_signals_survives_budget_pressure(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -7931,7 +7936,7 @@ async def test_version_phase_includes_promotion_readiness(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8013,7 +8018,7 @@ async def test_version_phase_qualification_state_reconciles_finalized_verdict(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8075,7 +8080,7 @@ async def test_version_phase_narrates_debt_enforce_preview(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8141,7 +8146,7 @@ async def test_version_phase_qualification_state_reconciles_crashed_audit(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8202,7 +8207,7 @@ async def test_version_phase_includes_recent_versions(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8276,7 +8281,7 @@ async def test_version_phase_block_carries_goal_coverage_drift(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8375,7 +8380,7 @@ async def test_version_phase_block_carries_criterion_coverage(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8461,7 +8466,7 @@ async def test_version_phase_build_failure_surfaces_in_payload(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8739,7 +8744,7 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8806,7 +8811,7 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8841,7 +8846,7 @@ async def _spawn_and_get_stabilize_suffix(project, db_session):
     """Helper: spawn a strategic review and return its prompt_suffix string."""
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -8922,7 +8927,7 @@ async def test_version_phase_unavailable_marker_on_build_failure(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9221,7 +9226,7 @@ async def test_spawn_strategic_review_payload_staleness_includes_generated_at(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9267,7 +9272,7 @@ async def test_spawn_strategic_review_payload_staleness_current_when_candidate_m
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9316,7 +9321,7 @@ async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_in
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9393,7 +9398,7 @@ async def test_payload_staleness_api_unreachable_verdict_distinct_from_unknown(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9645,7 +9650,7 @@ async def test_payload_staleness_resolves_true_verdict_without_carried_findings(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9792,7 +9797,7 @@ async def test_qualification_substate_hint_promotion_in_flight(
     _patch_spawning_deps(mocker)
     assert await _spawn_strategic_review(project, db_session) is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9851,7 +9856,7 @@ async def test_qualification_substate_hint_promotion_failed(
     _patch_spawning_deps(mocker)
     assert await _spawn_strategic_review(project, db_session) is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9900,7 +9905,7 @@ async def test_qualification_substate_hint_absent_while_auditing(
     _patch_spawning_deps(mocker)
     assert await _spawn_strategic_review(project, db_session) is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -9980,7 +9985,7 @@ async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pe
     _patch_spawning_deps(mocker)
     assert await _spawn_strategic_review(project, db_session) is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10056,7 +10061,7 @@ async def test_stabilize_findings_hint_softens_when_remediation_direction_exists
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10106,7 +10111,7 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10179,7 +10184,7 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10248,7 +10253,7 @@ async def test_post_promote_handoff_respects_existing_fresh_goal(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10301,7 +10306,7 @@ async def test_post_promote_handoff_hint_self_clears_after_first_qualification(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10349,7 +10354,7 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10404,7 +10409,7 @@ async def test_post_promote_handoff_unknown_serving_status_is_not_live(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10472,7 +10477,7 @@ async def test_failed_deploy_directive_renders_after_next_version_qualification_
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10560,7 +10565,7 @@ async def test_failed_deploy_directive_clears_when_newer_version_serving_confirm
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10627,7 +10632,7 @@ async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
     _patch_spawning_deps(mocker)
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10701,7 +10706,7 @@ async def test_failed_deploy_directive_clears_on_same_sha_recovery(
     _patch_spawning_deps(mocker)
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10752,7 +10757,7 @@ async def test_stabilize_stall_hint_suppressed_for_dry_run(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10833,7 +10838,7 @@ async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10923,7 +10928,7 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = [
         t
         for t in result.scalars().all()
@@ -10988,7 +10993,7 @@ async def test_outcome_evaluation_includes_success_evidence_and_retirement_condi
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
@@ -11028,7 +11033,7 @@ async def test_outcome_evaluation_omits_fields_when_not_set(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     outcome_eval = payload.get("outcome_evaluation", {})
@@ -11067,7 +11072,7 @@ async def test_outcome_evaluation_handles_empty_strings(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
 
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     outcome_eval = payload.get("outcome_evaluation", {})
@@ -15592,7 +15597,7 @@ async def test_seeded_goal_reaches_strategic_review_payload(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # Channel 1: intent/purpose
@@ -15622,7 +15627,7 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
@@ -15686,7 +15691,7 @@ async def test_operator_context_refs_promoted_to_strategic_review_payload(db_ses
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     entries = payload["operator_context_refs"]
@@ -15787,7 +15792,7 @@ async def test_operator_context_refs_ignore_malformed_and_cap(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     entries = payload["operator_context_refs"]
 
@@ -15813,7 +15818,7 @@ async def test_empty_goal_leaves_strategic_payload_blank(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # No purpose was seeded (empty/absent problem_model intent).
@@ -15866,7 +15871,7 @@ async def test_open_bug_report_survives_thread_cap_in_strategic_review(db_sessio
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # The aged-out bug report is gone from the recency-capped thread...
@@ -15905,7 +15910,7 @@ async def test_open_messages_not_derived_from_capped_thread(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     # All 25 open messages surface, far more than the thread cap of 15.
@@ -16456,7 +16461,7 @@ async def test_running_update_superseded_signal_present_when_recent_ledger_entry
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "running_update_superseded" in payload
@@ -16486,7 +16491,7 @@ async def test_running_update_superseded_signal_absent_without_ledger_entry(db_s
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "running_update_superseded" not in payload
@@ -16527,7 +16532,7 @@ async def test_running_update_superseded_signal_excludes_stale_entries(db_sessio
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "running_update_superseded" not in payload
@@ -16577,7 +16582,7 @@ async def test_operator_steered_cycle_appends_steering_directive_to_prompt_suffi
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
@@ -16619,7 +16624,7 @@ async def test_qualification_origin_marker_adds_no_steering_directive(db_session
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "OPERATOR STEERING" not in payload.get("prompt_suffix", "")
@@ -16647,7 +16652,7 @@ async def test_no_marker_adds_no_steering_directive(db_session):
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     assert "OPERATOR STEERING" not in payload.get("prompt_suffix", "")
@@ -16693,7 +16698,7 @@ async def test_operator_steering_directive_quotes_most_recent_message_and_trunca
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     suffix = payload["prompt_suffix"]
@@ -16735,9 +16740,7 @@ async def test_design_doc_update_stamps_operator_steered_when_marker_operator_or
     assert spawned is True
 
     result = await db_session.execute(
-        select(Task).where(
-            Task.project_id == project.id,
-        )
+        _select_agent_tasks(project.id)
     )
     task = result.scalars().all()[0]
     assert task.payloads[0]["type"] == "design_doc_update"
@@ -16765,7 +16768,7 @@ async def test_design_doc_update_start_event_includes_cycle_and_steering(
 
     assert await _spawn_design_doc_update(project, db_session) is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     emit.assert_awaited_once()
     assert emit.await_args.args == (project.id, task.id, 1)
@@ -16785,7 +16788,7 @@ async def test_design_doc_update_no_operator_steered_when_no_marker(db_session):
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     assert "operator_steered" not in (task.context or {})
 
@@ -16819,7 +16822,7 @@ async def test_strategic_review_start_event_includes_cycle_and_steering(
         is True
     )
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     emit.assert_awaited_once()
     assert emit.await_args.args == (project.id, task.id, 2)
@@ -16877,9 +16880,7 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     design_doc_task = (
         (
             await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                )
+                _select_agent_tasks(project.id)
             )
         )
         .scalars()
@@ -16920,9 +16921,7 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     strategic_task = (
         (
             await db_session.execute(
-                select(Task).where(
-                    Task.project_id == project.id,
-                )
+                _select_agent_tasks(project.id)
             )
         )
         .scalars()
@@ -17031,7 +17030,7 @@ async def test_strategy_only_cycle_uses_marker_excerpt_when_message_aged_out(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     suffix = payload.get("prompt_suffix", "")
     assert "OPERATOR STEERING" in suffix
@@ -17055,7 +17054,7 @@ async def test_design_doc_update_stamps_steering_excerpt_from_marker(db_session)
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     assert (task.context or {}).get("operator_steered") is True
     assert (task.context or {}).get("steering_excerpt") == excerpt
@@ -17167,7 +17166,7 @@ async def test_spawn_strategic_review_thread_aged_out_uses_steering_excerpt(
         steering_excerpt=steering_excerpt,
     )
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     suffix = payload.get("prompt_suffix", "")
@@ -17204,7 +17203,7 @@ async def test_spawn_design_doc_update_no_excerpt_when_operator_marker_lacks_exc
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     ctx = task.context or {}
     assert ctx.get("operator_steered") is True
@@ -17234,7 +17233,7 @@ async def test_spawn_design_doc_update_stamps_longer_distinct_excerpt(db_session
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     task = result.scalars().all()[0]
     assert (task.context or {}).get("steering_excerpt") == excerpt
 
@@ -18030,7 +18029,7 @@ async def test_strategic_review_ships_design_doc_index_not_full_prose(
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
 
     dd = payload["design_doc"]
@@ -18073,7 +18072,7 @@ async def test_design_doc_update_ships_design_doc_index_not_full_prose(
 
     spawned = await _spawn_design_doc_update(project, db_session)
     assert spawned is True
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     payload = result.scalars().all()[0].payloads[0]
     assert payload["type"] == "design_doc_update"
 
@@ -19282,7 +19281,7 @@ async def test_spawn_strategic_review_includes_ci_compliance_when_available(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     assert "ci_compliance" in payload, "ci_compliance block missing from strategic payload"
@@ -19322,7 +19321,7 @@ async def test_spawn_strategic_review_omits_ci_compliance_when_unavailable(
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
     assert "ci_compliance" not in payload, (
@@ -19373,7 +19372,7 @@ async def test_direction_stats_reachable_prs_merged_in_stat_entry(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
@@ -19429,7 +19428,7 @@ async def test_direction_stats_known_zero_reachable_in_window(db_session):
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
@@ -19495,7 +19494,7 @@ async def test_direction_stats_known_zero_reachable_survives_eviction(db_session
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True
 
-    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    result = await db_session.execute(_select_agent_tasks(project.id))
     tasks = result.scalars().all()
     payload = tasks[0].payloads[0]
 
