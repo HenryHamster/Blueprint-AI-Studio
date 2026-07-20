@@ -43,7 +43,11 @@ from app.strategic_resident_transition_locks import (
     ResidentOwnershipStateError,
     TERMINAL_TASK_STATUSES,
 )
-from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
+from app.strategic_resident_turns import (
+    MUTATION_AUTHORIZED_CONTEXT_KEY,
+    SHADOW_CONTEXT_KEY,
+    STRATEGIC_RESIDENT_TURN_TASK_TYPE,
+)
 from app.time_utils import _utcnow
 
 
@@ -212,9 +216,12 @@ def _shadow_task_matches_checkpoint(
     ):
         return False
     payload = task.first_payload if isinstance(task.first_payload, dict) else {}
+    context = task.context if isinstance(task.context, dict) else {}
     if (
         payload.get("type") != STRATEGIC_RESIDENT_TURN_TASK_TYPE
-        or payload.get("shadow") is not True
+        or payload.get("shadow_only") is not True
+        or context.get(SHADOW_CONTEXT_KEY) is not True
+        or context.get(MUTATION_AUTHORIZED_CONTEXT_KEY) is not False
     ):
         return False
     output = task.plan_output if isinstance(task.plan_output, dict) else {}

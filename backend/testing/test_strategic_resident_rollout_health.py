@@ -29,6 +29,8 @@ from app.strategic_resident_rollout_health import (
     build_resident_rollout_health,
 )
 from app.strategic_resident_turns import (
+    MUTATION_AUTHORIZED_CONTEXT_KEY,
+    SHADOW_CONTEXT_KEY,
     STRATEGIC_RESIDENT_TURN_TASK_TYPE,
     coalesce_shadow_resident_turn,
 )
@@ -65,7 +67,13 @@ async def _record_shadow_proof(
         project_id=project.id,
         title="Resident shadow proof",
         status=TaskStatus.COMPLETED,
-        payloads=[{"type": STRATEGIC_RESIDENT_TURN_TASK_TYPE, "shadow": True}],
+        payloads=[
+            {"type": STRATEGIC_RESIDENT_TURN_TASK_TYPE, "shadow_only": True}
+        ],
+        context={
+            SHADOW_CONTEXT_KEY: True,
+            MUTATION_AUTHORIZED_CONTEXT_KEY: False,
+        },
         plan_output={
             "resident_shadow": {
                 "manifest": {
@@ -100,6 +108,97 @@ async def _record_shadow_proof(
     db_session.add(resident)
     await db_session.commit()
     return task
+
+
+@pytest.mark.asyncio
+async def test_shadow_only_payload_marker_matches_current_checkpoint(db_session):
+    project, resident = await _resident_project(db_session)
+    task = await _record_shadow_proof(db_session, project, resident)
+
+    assert task.first_payload["shadow_only"] is True
+    assert "shadow" not in task.first_payload
+
+    result = await build_resident_rollout_health(db_session, project.id)
+
+    assert result["shadow"]["checkpoint_current"] is True
+    assert "shadow_comparison_missing_or_stale" not in result["cutover_blockers"]
+
+
+@pytest.mark.asyncio
+async def test_noncanonical_shadow_alias_does_not_satisfy_checkpoint_proof(db_session):
+    project, resident = await _resident_project(db_session)
+    task = await _record_shadow_proof(db_session, project, resident)
+    task.payloads = [{"type": STRATEGIC_RESIDENT_TURN_TASK_TYPE, "shadow": True}]
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await build_resident_rollout_health(db_session, project.id)
+
+    assert result["shadow"]["checkpoint_current"] is False
+    assert "shadow_comparison_missing_or_stale" in result["cutover_blockers"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "context",
+    [
+        {MUTATION_AUTHORIZED_CONTEXT_KEY: False},
+        {SHADOW_CONTEXT_KEY: True},
+        {SHADOW_CONTEXT_KEY: True, MUTATION_AUTHORIZED_CONTEXT_KEY: True},
+    ],
+)
+async def test_shadow_proof_requires_non_mutating_context_lineage(
+    db_session, context
+):
+    project, resident = await _resident_project(db_session)
+    task = await _record_shadow_proof(db_session, project, resident)
+    task.context = context
+    db_session.add(task)
+    await db_session.commit()
+
+    result = await build_resident_rollout_health(db_session, project.id)
+
+    assert result["shadow"]["checkpoint_current"] is False
+    assert "shadow_comparison_missing_or_stale" in result["cutover_blockers"]
+
+
+@pytest.mark.asyncio
+async def test_completed_producer_shadow_turn_satisfies_health_lineage(db_session):
+    from app.strategic_resident_shadow import _complete_shadow_turn
+
+    project, resident = await _resident_project(db_session)
+    message = ProjectMessage(
+        project_id=project.id,
+        sequence=1,
+        surface="conversation",
+        handling_state="pending",
+        from_type="user",
+        content="Validate the canonical shadow producer.",
+    )
+    db_session.add(message)
+    await db_session.commit()
+    await db_session.refresh(message)
+
+    wake = await coalesce_shadow_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="interactive",
+        trigger_kind="operator_message",
+        message_sequence=message.sequence,
+    )
+    await db_session.commit()
+
+    assert await _complete_shadow_turn(
+        db_session,
+        project_id=project.id,
+        task_id=wake.task_id,
+        now=_utcnow(),
+    ) is True
+
+    result = await build_resident_rollout_health(db_session, project.id)
+
+    assert result["shadow"]["checkpoint_current"] is True
+    assert "shadow_comparison_missing_or_stale" not in result["cutover_blockers"]
 
 
 @pytest.mark.asyncio
