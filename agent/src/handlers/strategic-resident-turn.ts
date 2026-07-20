@@ -184,9 +184,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
 
-function completeResultEvidence(value: Record<string, unknown>): boolean {
-  return ['evidence_id', 'kind', 'source_id', 'revision', 'checksum']
-    .every((key) => typeof value[key] === 'string' && value[key].length > 0);
+const RESULT_EVIDENCE_KEYS = [
+  'evidence_id', 'kind', 'source_id', 'revision', 'checksum', 'summary',
+] as const;
+const RESULT_EVIDENCE_KEY_SET = new Set<string>(RESULT_EVIDENCE_KEYS);
+
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function completeServerInspection(value: Record<string, unknown>): boolean {
+  return ['kind', 'source_id', 'revision', 'checksum', 'inspected_at']
+    .every((key) => nonEmptyString(value[key]));
 }
 
 function canonicalEvidenceInspections(
@@ -202,9 +211,8 @@ function canonicalEvidenceInspections(
   if (requested.length > 50) {
     throw new Error('Resident evidence_inspections exceeds 50 items');
   }
-  const resultEvidence = Array.isArray(result.evidence)
-    ? result.evidence.filter(isRecord)
-    : [];
+  const rawResultEvidence = Array.isArray(result.evidence) ? result.evidence : [];
+  const resultEvidence = rawResultEvidence.filter(isRecord);
   const canonicalIds = new Set<string>();
   return requested.map((raw, index) => {
     if (!isRecord(raw)) {
@@ -236,20 +244,31 @@ function canonicalEvidenceInspections(
     const resultMatches = resultEvidence.filter((candidate) => (
       requestedEvidenceId
         ? candidate.evidence_id === requestedEvidenceId
-        : candidate.source_id === requestedSourceId
-          && candidate.revision === requestedRevision
+        : (!nonEmptyString(candidate.source_id) || candidate.source_id === requestedSourceId)
+          && (!nonEmptyString(candidate.revision) || candidate.revision === requestedRevision)
     ));
-    if (resultMatches.length !== 1 || !completeResultEvidence(resultMatches[0])) {
-      throw new Error(`Resident evidence_inspections[${index}] does not identify one complete result evidence item`);
+    if (resultMatches.length !== 1) {
+      throw new Error(`Resident evidence_inspections[${index}] does not identify one result evidence item`);
     }
     const evidence = resultMatches[0];
+    if (Object.keys(evidence).some((key) => !RESULT_EVIDENCE_KEY_SET.has(key))) {
+      throw new Error(`Resident evidence_inspections[${index}] result evidence contains an unknown field`);
+    }
+    if (!nonEmptyString(evidence.evidence_id) || !nonEmptyString(evidence.summary)) {
+      throw new Error(`Resident evidence_inspections[${index}] result evidence requires evidence_id and summary`);
+    }
+    for (const key of ['kind', 'source_id', 'revision', 'checksum'] as const) {
+      if (evidence[key] !== undefined && !nonEmptyString(evidence[key])) {
+        throw new Error(`Resident evidence_inspections[${index}] result evidence.${key} must be a non-empty string`);
+      }
+
+    }
     const serverMatches = serverInspectionEvidence.filter((candidate) => (
-      candidate.kind === evidence.kind
-      && candidate.source_id === evidence.source_id
-      && candidate.revision === evidence.revision
-      && candidate.checksum === evidence.checksum
-      && typeof candidate.inspected_at === 'string'
-      && candidate.inspected_at.length > 0
+      completeServerInspection(candidate)
+      && ['kind', 'source_id', 'revision', 'checksum'].every((key) => {
+        const claimed = evidence[key] ?? raw[key];
+        return claimed === undefined || candidate[key] === claimed;
+      })
     ));
     if (serverMatches.length !== 1) {
       throw new Error(`Resident evidence_inspections[${index}] is not backed by one server inspection`);
@@ -259,12 +278,23 @@ function canonicalEvidenceInspections(
       if (raw[key] !== undefined && raw[key] !== inspected[key]) {
         throw new Error(`Resident evidence_inspections[${index}].${key} conflicts with server evidence`);
       }
+      if (evidence[key] !== undefined && key !== 'inspected_at' && evidence[key] !== inspected[key]) {
+        throw new Error(`Resident evidence_inspections[${index}] result evidence.${key} conflicts with server evidence`);
+      }
     }
-    const evidenceId = String(evidence.evidence_id);
+    const evidenceId = evidence.evidence_id;
     if (canonicalIds.has(evidenceId)) {
       throw new Error(`Resident evidence_inspections contains duplicate evidence_id ${evidenceId}`);
     }
     canonicalIds.add(evidenceId);
+    const evidenceIndex = rawResultEvidence.indexOf(evidence);
+    rawResultEvidence[evidenceIndex] = Object.fromEntries(
+      RESULT_EVIDENCE_KEYS.map((key) => [
+        key,
+        key === 'evidence_id' || key === 'summary' ? evidence[key] : inspected[key],
+      ]),
+    );
+    result.evidence = rawResultEvidence;
     return {
       evidence_id: evidenceId,
       kind: inspected.kind,
@@ -348,6 +378,7 @@ function residentPrompt(
     'Return exactly one JSON object and no prose or markdown.',
     ...actionInstructions,
     'In the final reconciliation, evidence_inspections must be an array of objects shaped {"evidence_id":"<result.evidence id>","decisive":true}; decisive is optional. Each evidence_id must name a result.evidence item copied from server-validated inspection evidence; the worker binds the canonical receipt metadata.',
+    'Each cited result.evidence item must be shaped {"evidence_id":"<stable local id>","kind":"<server evidence kind>","source_id":"<server evidence source_id>","revision":"<server evidence revision>","checksum":"<server evidence checksum>","summary":"<what the evidence establishes>"}. Copy the trust fields exactly from the inspection result.',
     'The server supplies project, turn, authority, checkpoint, and context revisions. Never include or override those server-owned revisions.',
     'Mutation evidence references must copy kind, project_id, source_id, revision, checksum, and inspected_at from server-validated inspection evidence; never invent evidence. Explicit approvals are durable server-side grants and are never represented in the model request.',
     'Every mutation response contains a server-authored completion_projection. Copy its operation and receipt exactly into final operations and receipts, and copy every projected unknown_effect and required_attention item exactly. An unknown_effect receipt must remain an applying operation and must never be reported as success or retried.',
