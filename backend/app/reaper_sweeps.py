@@ -264,7 +264,8 @@ async def sweep_queued_age_alerts(
 
     Returns the number of alerts fired this cycle.
     """
-    from app.models import Alert, AlertSeverity
+    from app import pause_clock
+    from app.models import Alert, AlertSeverity, DeploymentState
     from app.broadcast import broadcast_to_project as _bcast
     import app.shared_state as _shared_state
 
@@ -304,6 +305,14 @@ async def sweep_queued_age_alerts(
         (3, _queued_threshold_hours * 6, AlertSeverity.ERROR, "ERROR"),
     ]
 
+    # PAUSE-AWARE tier age: while the pipeline is PAUSED nothing dequeues, so
+    # every QUEUED row ages past the tiers on wall-clock and spams INFO→WARNING→
+    # ERROR alerts for a pause the operator deliberately started. Subtract the
+    # open pause window from the tier decision (the row's created_at is immutable
+    # so no baseline is stamped; deploy_state=None → raw). The DB pre-filter above
+    # still over-selects on raw age, but a paused row's pause-aware tier is 0, so
+    # the tier gate below suppresses the alert.
+    _deploy_state = await session.get(DeploymentState, 1)
     _alerted = 0
     pending_broadcasts: list[tuple[str, dict]] = []
     for _qt in _stale_queued:
@@ -311,7 +320,10 @@ async def sweep_queued_age_alerts(
         _prev_tier = _qctx.get("queued_age_alert_tier") or (
             1 if _qctx.get("queued_age_alert_fired") else 0
         )
-        _queue_hours = (now - _qt.created_at).total_seconds() / 3600
+        _queue_hours = (
+            pause_clock.active_elapsed_seconds(_deploy_state, _qt.created_at, None)
+            / 3600
+        )
         _target_tier, _target_severity, _target_label = (0, AlertSeverity.INFO, "INFO")
         for _tier, _hrs, _sev, _sev_label in _tier_specs:
             if _queue_hours >= _hrs:
@@ -447,7 +459,13 @@ async def sweep_stalled_strategic_cycles(
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 
-    stalled = await strategic_cycle.find_stalled(session)
+    # Pause-aware: a cycle whose completion handler simply could not run while
+    # the pipeline was paused must not be force-terminated as "stalled". Passing
+    # the deploy state makes find_stalled's 3h deadline exclude pause time.
+    from app.models import DeploymentState  # noqa: PLC0415
+
+    _deploy_state = await session.get(DeploymentState, 1)
+    stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
     if not stalled:
         return 0

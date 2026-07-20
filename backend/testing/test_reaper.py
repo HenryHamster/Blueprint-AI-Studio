@@ -3445,6 +3445,79 @@ async def test_step6_agent_managed_resident_turn_triggers_queued_age_alert(reape
 
 
 @pytest.mark.asyncio
+async def test_queued_age_alert_suppressed_while_pipeline_paused(reaper_db):
+    """PAUSE-AWARE queued-age alerts: while the pipeline is PAUSED nothing
+    dequeues, so a QUEUED task's wall-clock age crosses the alert tiers even
+    though it is stuck only because the operator paused. The tier decision
+    subtracts the open pause window, so no INFO/WARNING/ERROR alert fires."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(hours=3),
+            paused_kind="manual",
+        )
+    )
+    t = Task(
+        project_id=project.id,
+        title="queued during pause",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=now - timedelta(hours=3),  # 3h raw > 2h tier-1, but all paused
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db, now, runtime_config={"queued_age_alert_hours": 2}
+    )
+
+    assert alerted == 0
+    await reaper_db.refresh(t)
+    assert (t.context or {}).get("queued_age_alert_tier") in (None, 0)
+
+
+@pytest.mark.asyncio
+async def test_queued_age_alert_fires_despite_brief_pause(reaper_db):
+    """MUTATION-PROOF companion: the pause-aware tier gate is not a blanket mute.
+    A task queued 3h with only a 30-min pause has ~2.5h of ACTIVE age > the 2h
+    tier-1 threshold and DOES fire the INFO alert."""
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(minutes=30),
+            paused_kind="manual",
+        )
+    )
+    t = Task(
+        project_id=project.id,
+        title="queued mostly active",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=now - timedelta(hours=3),
+    )
+    reaper_db.add(t)
+    await reaper_db.commit()
+
+    alerted = await _rs.sweep_queued_age_alerts(
+        reaper_db, now, runtime_config={"queued_age_alert_hours": 2}
+    )
+
+    assert alerted == 1
+    await reaper_db.refresh(t)
+    assert (t.context or {}).get("queued_age_alert_tier") == 1
+
+
+@pytest.mark.asyncio
 async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
@@ -10048,6 +10121,147 @@ async def test_unblock_sweep_parks_agent_precondition_after_retry_budget_spent(
     assert t.status == TaskStatus.BLOCKED
     assert t.recheck_after is not None and t.recheck_after > now
     assert t.context.get("_blocked_recheck_attempts") == 1
+
+
+@pytest.mark.asyncio
+async def test_blocked_escalation_due_excludes_pause_time(reaper_db):
+    """_blocked_escalation_due subtracts pause windows from the 6h escalate-and-
+    park deadline: a task blocked well past the deadline is NOT due while the
+    excess is pipeline-pause time, IS due with only a brief pause (no over-
+    protection), and falls back to raw wall-clock when no DeploymentState row
+    exists (unchanged legacy behavior)."""
+    from app.blocked_task_unblock_sweeps import (
+        _blocked_escalation_due,
+        _BLOCKED_ESCALATE_AFTER,
+    )
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        depends_on=[],
+        blocked_at=_utcnow() - (_BLOCKED_ESCALATE_AFTER + timedelta(hours=1)),
+    )
+
+    # No DeploymentState row → raw wall-clock (7h) → past the 6h deadline.
+    assert await _blocked_escalation_due(t, reaper_db) is True
+
+    # PAUSED for 6h of the 7h → ~1h of ACTIVE age → NOT due.
+    ds = DeploymentState(
+        id=1,
+        status=DeploymentStatus.PAUSED,
+        paused_at=_utcnow() - _BLOCKED_ESCALATE_AFTER,
+        paused_kind="manual",
+    )
+    reaper_db.add(ds)
+    await reaper_db.commit()
+    assert await _blocked_escalation_due(t, reaper_db) is False
+
+    # Only a 30-min open pause → ~6.5h of ACTIVE age → still due.
+    ds.paused_at = _utcnow() - timedelta(minutes=30)
+    reaper_db.add(ds)
+    await reaper_db.commit()
+    assert await _blocked_escalation_due(t, reaper_db) is True
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_defers_deadline_escalation_while_paused(reaper_db, mocker):
+    """Integration: the sweep's 6h deadline escalation is pause-aware. A no-dep
+    precondition blocker 7h past onset with its optimistic-retry budget already
+    spent is NOT escalated-and-parked while the pipeline has been PAUSED for 6h of
+    that (active age ~1h) — it stays BLOCKED and backs off, exactly as a task
+    still short of the deadline would."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - _BLOCKED_ESCALATE_AFTER,
+            paused_kind="manual",
+        )
+    )
+    await reaper_db.commit()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        blocked_at=now - (_BLOCKED_ESCALATE_AFTER + timedelta(hours=1)),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": _BLOCKED_OPTIMISTIC_RETRY_CAP,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    # NOT escalated/parked — the pause spared it.
+    assert t.context.get("_blocked_escalated") is not True
+    # Backed off at the recheck cadence, not the multi-year escalation park.
+    assert t.recheck_after is not None
+    assert t.recheck_after < now + (_BLOCKED_ESCALATED_PARK / 2)
+
+
+@pytest.mark.asyncio
+async def test_unblock_sweep_escalates_past_deadline_despite_brief_pause(
+    reaper_db, mocker
+):
+    """MUTATION-PROOF companion: the pause-aware deadline must not become a blanket
+    disable. The same 7h-past-onset precondition blocker with its retry budget
+    spent and only a 30-min pause has ~6.5h of ACTIVE age > the 6h deadline and IS
+    escalated-and-parked."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.models import DeploymentState, DeploymentStatus
+
+    project = await _make_project(reaper_db)
+    now = _utcnow()
+    reaper_db.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=now - timedelta(minutes=30),
+            paused_kind="manual",
+        )
+    )
+    await reaper_db.commit()
+    t = await _blocked_task(
+        reaper_db,
+        project,
+        blocker_kind="precondition",
+        blocked_reason="BLOCKER: backend/app/foo.py does not exist on main",
+        depends_on=[],
+        blocked_at=now - (_BLOCKED_ESCALATE_AFTER + timedelta(hours=1)),
+        context={
+            "blocker": {
+                "source": "agent",
+                "waiting_on": "precondition",
+                "reason": "BLOCKER: backend/app/foo.py does not exist on main",
+            },
+            "_blocked_optimistic_retries": _BLOCKED_OPTIMISTIC_RETRY_CAP,
+        },
+        recheck_after=now - timedelta(minutes=1),
+    )
+
+    requeued = await sweep_unblock_blocked_tasks(reaper_db, now)
+
+    assert requeued == 0
+    await reaper_db.refresh(t)
+    assert t.status == TaskStatus.BLOCKED
+    assert t.context.get("_blocked_escalated") is True
 
 
 @pytest.mark.asyncio

@@ -39,6 +39,8 @@ from app.models import (
     TaskStatus,
     Alert,
     AlertSeverity,
+    DeploymentState,
+    DeploymentStatus,
     TaskWakeRegistration,
     WakeAction,
     WakeDeliveryState,
@@ -367,6 +369,144 @@ async def test_evaluating_hard_timeout_marks_failed(eval_db, mocker):
     assert "timeout" in (parent.latest_status_message or "").lower(), (
         f"Expected 'timeout' in status message but got: {parent.latest_status_message!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_evaluating_hard_timeout_spared_while_pipeline_paused(eval_db, mocker):
+    """PAUSE-AWARE EVALUATING hard timeout: a parent that has been EVALUATING
+    past the fail threshold is NOT force-FAILED when the excess is pipeline-pause
+    time. While PAUSED its children cannot run, so the rollup that would clear
+    EVALUATING never fires — force-failing the parent (cascade-cancelling its
+    children, closing their PRs, deleting VMs) purely because the operator paused
+    is a false positive. The currently-open pause window is subtracted from the
+    age (no per-transition baseline is stampable — the ``→ EVALUATING`` log is a
+    synchronous model event)."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    project = Project(name="Paused Eval Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    # Pipeline PAUSED 6h ago and still paused: of the 7h the task has been
+    # EVALUATING, 6h are pause time → ~1h of ACTIVE age, well under both the 6h
+    # fail threshold and the 2h "stuck evaluating" warn threshold.
+    deploy_state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.PAUSED,
+        paused_at=_naive_utc_ago(hours=6),
+        paused_kind="manual",
+    )
+    eval_db.add(deploy_state)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "paused long task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    # Non-terminal child so the missed-rollup path is skipped and the hard-timeout
+    # path is the one under test.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    # Not force-failed: pause-adjusted age is under the timeout.
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.EVALUATING, (
+        f"Expected still EVALUATING but got {parent.status}"
+    )
+    await eval_db.refresh(child)
+    assert child.status == TaskStatus.IN_PROGRESS  # child left running
+    # No 2h "stuck evaluating" warning alert either (it reuses the same age).
+    alerts = (
+        (await eval_db.execute(select(Alert).where(Alert.task_id == parent.id)))
+        .scalars()
+        .all()
+    )
+    assert alerts == []
+
+
+@pytest.mark.asyncio
+async def test_evaluating_hard_timeout_fails_despite_brief_pause(eval_db, mocker):
+    """MUTATION-PROOF companion: the pause-aware EVALUATING timeout must not
+    degrade into a blanket disable. A parent 7h into EVALUATING with only a
+    30-min pause still has ~6.5h of ACTIVE age above the 6h fail threshold and IS
+    force-FAILED, exactly as without a pause."""
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    from app.shared_state import runtime_config as _rc
+
+    mocker.patch.dict(_rc, {"evaluating_fail_hours": 6})
+
+    project = Project(name="Brief Pause Eval Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    deploy_state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.PAUSED,
+        paused_at=_naive_utc_ago(minutes=30),
+        paused_kind="manual",
+    )
+    eval_db.add(deploy_state)
+
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "briefly paused task"}],
+        status=TaskStatus.EVALUATING,
+    )
+    eval_db.add(parent)
+    await eval_db.commit()
+    await eval_db.refresh(parent)
+
+    parent.status_log = [
+        {
+            "t": _naive_utc_ago(hours=7).isoformat(),
+            "msg": "Status changed: IN_PROGRESS → EVALUATING",
+        }
+    ]
+    eval_db.add(parent)
+    await eval_db.commit()
+
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "stuck subtask"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+
+    await _check_evaluating_timeouts()
+
+    await eval_db.refresh(parent)
+    assert parent.status == TaskStatus.FAILED, (
+        f"Expected FAILED but got {parent.status}"
+    )
+    assert "timeout" in (parent.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio

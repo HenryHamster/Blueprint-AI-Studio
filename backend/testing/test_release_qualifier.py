@@ -28259,6 +28259,146 @@ async def test_sweep_timeout_terminalizes_abandoned_children(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_sweep_spares_timed_out_qualification_while_pipeline_paused(
+    db_session, mocker
+):
+    """PAUSE-AWARE 6h qualification-timeout backstop: a qualification whose raw
+    wall-clock age exceeds the limit is NOT force-finalized when the excess is
+    pipeline-pause time.  While the pipeline is PAUSED the audit/smoketest
+    children cannot run, so the pending triple is not "stuck" — force-finalizing
+    it would send the version back to stabilize and re-fire the whole triple,
+    which then times out again 6h later, re-spawning it against the newest
+    candidate for the entire duration of the pause (the qualifier churn observed
+    while paused).  Exercises the exact per-attempt ``pause_baseline`` subtraction
+    path (baseline stamped at spawn, cumulative pause since then subtracted)."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    # Started 7h ago — 1h past the 6h timeout — with the smoke child still
+    # IN_PROGRESS so the ONLY thing that could finalize it is the wall-clock
+    # timeout backstop (never a real verdict).
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    _audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,  # hung child, never terminal
+        started_at=old_started,
+    )
+
+    # ~5.5h of pipeline pause accumulated between spawn (baseline 5000s) and now
+    # (cumulative 25000s), then resumed.  Active age ≈ 25200 - 20000 ≈ 1.4h < 6h.
+    version.last_qualification["pause_baseline"] = 5000.0
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    deploy_state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.STABLE,  # resumed — the pause window is closed
+        total_manual_paused_seconds=25000.0,
+        paused_at=None,
+    )
+    db_session.add(deploy_state)
+    await db_session.commit()
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Not swept: the pause-adjusted age is under the timeout.
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    # The still-running child is left alone (not cancelled/torn down).
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.IN_PROGRESS
+    assert smoke_task.vm_stopped_at is None
+
+
+@pytest.mark.asyncio
+async def test_sweep_finalizes_timed_out_qualification_despite_brief_pause(
+    db_session, mocker
+):
+    """MUTATION-PROOF companion to the pause-spare test: the pause-aware backstop
+    must not degrade into a blanket disable.  A qualification 7h past its start
+    with only a brief (30-min) pause still has ~6.5h of ACTIVE age above the 6h
+    timeout, so it is force-finalized exactly as before.  Exercises the
+    open-window fallback (legacy record carrying no per-attempt baseline —
+    subtract only the currently-open pause window)."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep.fire_and_forget_vm_delete",
+    )
+    from datetime import timedelta
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    _audit_task, smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+    )
+    # No pause_baseline on the record (legacy in-flight qual).  Pipeline is
+    # currently paused, but only for 30 min — the open-window subtraction leaves
+    # the active age ≈ 6.5h, still over the limit.
+    deploy_state = DeploymentState(
+        id=1,
+        status=DeploymentStatus.PAUSED,
+        paused_at=_utcnow() - timedelta(minutes=30),
+        paused_kind="manual",
+    )
+    db_session.add(deploy_state)
+    await db_session.commit()
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    await db_session.refresh(smoke_task)
+    assert smoke_task.status == TaskStatus.CANCELLED
+    assert smoke_task.vm_stopped_at is not None
+
+
+@pytest.mark.asyncio
 async def test_sweep_timeout_partial_children_cancellation(db_session, mocker):
     """When some children are already terminal and others are running, only
     the running children are cancelled during force-finalize."""
@@ -34490,6 +34630,120 @@ async def test_auto_merge_stall_alert_fires_when_stuck(db_session):
     assert version.last_qualification["promotion_pending"].get("alerted_at") is not None
     fired_again = await rq._check_version_auto_merge_stall(db_session, version)
     assert fired_again is False
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_alert_suppressed_while_pipeline_paused(db_session):
+    """PAUSE-AWARE auto-merge stall alert: while the pipeline is PAUSED the
+    promotion PR cannot merge, so counting pause time toward the stall threshold
+    would fire a false "promotion stalled" alert for a pause the operator started.
+    The stall age subtracts the open pause window, so no alert fires — mirroring
+    the pause-aware promotion_pending backstop so the alert and the force-fail
+    agree on what 'stalled' means."""
+    from datetime import timedelta
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    old_enabled = (
+        _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://github.com/pr/77",
+            "auto_merge_enabled": True,
+            "enabled_at": old_enabled,
+        },
+    }
+    db_session.add(version)
+    # Paused since just after arming → nearly the whole stall age is pause time.
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is False
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 0
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_stall_alert_fires_despite_brief_pause(db_session):
+    """MUTATION-PROOF companion: the pause-aware stall alert is not a blanket
+    mute. A promotion past the stall threshold with only a brief (60s) pause still
+    has active age above the threshold and DOES fire."""
+    from datetime import timedelta
+
+    from app.models import DeploymentState, DeploymentStatus
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    old_enabled = (
+        _utcnow() - timedelta(seconds=rq._AUTO_MERGE_STALL_SECONDS + 600)
+    ).isoformat()
+    version.last_qualification = {
+        **version.last_qualification,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://github.com/pr/77",
+            "auto_merge_enabled": True,
+            "enabled_at": old_enabled,
+        },
+    }
+    db_session.add(version)
+    db_session.add(
+        DeploymentState(
+            id=1,
+            status=DeploymentStatus.PAUSED,
+            paused_at=_utcnow() - timedelta(seconds=60),
+            paused_kind="manual",
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    fired = await rq._check_version_auto_merge_stall(db_session, version)
+    await db_session.commit()
+
+    assert fired is True
+    alerts = (
+        (await db_session.execute(_select(Alert).where(Alert.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
 
 
 @pytest.mark.asyncio
