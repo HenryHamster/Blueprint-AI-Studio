@@ -834,6 +834,7 @@ async def apply_post_spawn_state(
                                         "consecutive_empty_cycles": _consec,
                                     },
                                     "research.dedup_deadlock",
+                                    message_type=MessageType.BUG_REPORT.value,
                                 ),
                             )
                             session.add(_deadlock_msg)
@@ -939,6 +940,7 @@ async def apply_post_spawn_state(
                                         "consecutive_noop_cycles": _af_consec,
                                     },
                                     "research.already_fixed_deadlock",
+                                    message_type=MessageType.BUG_REPORT.value,
                                 ),
                             )
                             session.add(_af_msg)

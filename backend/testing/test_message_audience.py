@@ -224,8 +224,46 @@ def test_route_event_unknown_event_type_defaults_to_strategist_internal():
 
 
 def test_route_event_unknown_with_message_type_fallback():
-    """The message_type parameter is reserved — unknown event_type still defaults to internal."""
+    """NOTE message_type does not upgrade an unknown event_type — only BUG_REPORT/BLOCKER/QUESTION do."""
     assert route_event("unknown.event", message_type="NOTE") == STRATEGIST_INTERNAL
+
+
+def test_route_event_message_type_fallback_bug_report_upgrades_audience():
+    """BUG_REPORT with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_blocker_upgrades_audience():
+    """BLOCKER with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="BLOCKER") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_question_upgrades_audience():
+    """QUESTION with strategist-internal event_type upgrades to operator-action-needed."""
+    assert route_event("strategic_message", message_type="QUESTION") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_absent_event_type_upgrades():
+    """Absent event_type (None/empty) + BUG_REPORT message_type upgrades to operator-action-needed."""
+    assert route_event(None, message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED  # type: ignore[arg-type]
+    assert route_event("", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+    assert route_event("   ", message_type="BUG_REPORT") == OPERATOR_ACTION_NEEDED
+
+
+def test_route_event_message_type_fallback_note_stays_internal():
+    """NOTE/FEEDBACK/VISION message_type does NOT upgrade a strategist-internal event_type."""
+    for mt in ("NOTE", "FEEDBACK", "VISION"):
+        assert route_event("strategic_message", message_type=mt) == STRATEGIST_INTERNAL, mt
+    assert route_event("unknown.event", message_type="FEEDBACK") == STRATEGIST_INTERNAL
+
+
+def test_route_event_registered_operator_event_not_affected_by_message_type():
+    """An event_type already resolving to an operator audience is unchanged by message_type."""
+    # auto_fix_escalated is registered OPERATOR_ACTION_NEEDED — message_type must not alter it.
+    assert route_event("auto_fix_escalated", message_type="NOTE") == OPERATOR_ACTION_NEEDED
+    assert route_event("failure_alert", message_type="NOTE") == OPERATOR_FYI
+    # An event_type explicitly registered strategist-internal + NOTE → still internal.
+    assert route_event("pr_merged", message_type="NOTE") == STRATEGIST_INTERNAL
 
 
 # ── is_operator_visible ────────────────────────────────────────────────

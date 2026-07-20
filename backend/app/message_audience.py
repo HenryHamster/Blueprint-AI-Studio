@@ -261,6 +261,15 @@ _NON_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
 )
 
 
+# Message types that are inherently operator-facing when no event_type
+# overrides the audience.  A strategist-authored BLOCKER/BUG_REPORT/QUESTION
+# with no registered (or absent) event_type must reach the operator inbox even
+# though the fail-closed default resolves STRATEGIST_INTERNAL.
+_OPERATOR_FACING_MESSAGE_TYPES: frozenset[str] = frozenset(
+    {"BUG_REPORT", "BLOCKER", "QUESTION"}
+)
+
+
 # ── Public API ──────────────────────────────────────────────────────────
 
 
@@ -271,13 +280,19 @@ def route_event(event_type: str, *, message_type: str | None = None) -> str:
     is not registered — a new emitter that forgets to declare its audience
     is invisible to the operator.
 
-    The ``message_type`` parameter is reserved for future use (e.g.,
-    distinguishing NOTE from BLOCKER for the same event_type).
+    ``message_type`` fallback: when the event_type resolves to
+    ``STRATEGIST_INTERNAL`` (absent, unregistered, or explicitly internal)
+    *and* ``message_type`` is in ``{BUG_REPORT, BLOCKER, QUESTION}``, the
+    audience is upgraded to ``OPERATOR_ACTION_NEEDED`` — these message classes
+    are inherently operator-facing regardless of the event_type.  An
+    event_type that explicitly resolves to an operator-visible audience always
+    wins; the fallback only fires when the registry alone would bury the message.
     """
     normalized = (event_type or "").strip()
-    if not normalized:
-        return STRATEGIST_INTERNAL
-    return _EVENT_AUDIENCE_REGISTRY.get(normalized, STRATEGIST_INTERNAL)
+    resolved = _EVENT_AUDIENCE_REGISTRY.get(normalized, STRATEGIST_INTERNAL) if normalized else STRATEGIST_INTERNAL
+    if resolved == STRATEGIST_INTERNAL and message_type and message_type.upper() in _OPERATOR_FACING_MESSAGE_TYPES:
+        return OPERATOR_ACTION_NEEDED
+    return resolved
 
 
 def is_operator_visible(audience: str) -> bool:

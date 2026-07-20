@@ -6398,7 +6398,9 @@ async def _handle_strategic_completion(
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         _event_type = _msg_ctx.get("event_type")
-        _msg_ctx = stamp_message_audience(_msg_ctx, _event_type or "strategic_message")
+        _msg_ctx = stamp_message_audience(
+            _msg_ctx, _event_type or "strategic_message", message_type=msg_type.value
+        )
         _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
         _reply_to_id: uuid.UUID | None = None
         _raw_reply_to = _msg_ctx.get("reply_to")

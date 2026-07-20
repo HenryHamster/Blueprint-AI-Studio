@@ -789,7 +789,12 @@ async def check_audience_routing_attestation(ctx: SweepContext) -> List[CheckRes
         if not event_type:
             continue
         stamped_audience = ctx_dict.get("audience")
-        canonical_audience = route_event(str(event_type))
+        # Mirror the stamping logic exactly: the message_type (e.g. a
+        # strategist-authored BLOCKER/BUG_REPORT/QUESTION) can upgrade an
+        # otherwise strategist-internal event_type to operator-action-needed.
+        # Omitting it here would flag correctly-stamped rows as mis-routed.
+        message_type = getattr(msg.message_type, "value", msg.message_type)
+        canonical_audience = route_event(str(event_type), message_type=message_type)
         pid = str(msg.project_id)
         if pid not in per_project:
             per_project[pid] = {"correct": 0, "total": 0}

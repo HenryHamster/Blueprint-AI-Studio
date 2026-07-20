@@ -7333,7 +7333,14 @@ async def test_plaintext_in_encrypted_column_is_flagged(db):
 # --- Check: audience_routing_attestation ----------------------------------
 
 
-def _message(db, project, *, event_type: str, audience: str | None = None) -> ProjectMessage:
+def _message(
+    db,
+    project,
+    *,
+    event_type: str,
+    audience: str | None = None,
+    message_type: MessageType = MessageType.NOTE,
+) -> ProjectMessage:
     """Insert a ProjectMessage with the given event_type and audience in context."""
     ctx: dict = {"event_type": event_type}
     if audience is not None:
@@ -7341,10 +7348,42 @@ def _message(db, project, *, event_type: str, audience: str | None = None) -> Pr
     msg = ProjectMessage(
         project_id=project.id,
         context=ctx,
-        message_type=MessageType.NOTE,
+        message_type=message_type,
     )
     db.add(msg)
     return msg
+
+
+@pytest.mark.asyncio
+async def test_audience_routing_attestation_ok_for_operator_facing_message_type(db):
+    """A strategist-authored BLOCKER/BUG_REPORT/QUESTION whose event_type resolves
+    to strategist-internal but is stamped operator-action-needed (via the
+    message_type upgrade in route_event) must NOT be flagged: the ground-truth
+    recompute must pass message_type so it mirrors the stamping logic."""
+    project = await _project(db)
+    from app.message_audience import route_event
+
+    # strategic_message alone -> strategist-internal, but the operator-facing
+    # message_type upgrades the audience to operator-action-needed.
+    for mt in (MessageType.BLOCKER, MessageType.BUG_REPORT, MessageType.QUESTION):
+        canonical = route_event("strategic_message", message_type=mt.value)
+        assert canonical == "operator-action-needed"
+        _message(db, project, event_type="strategic_message",
+                 audience=canonical, message_type=mt)
+    await db.commit()
+
+    ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
+                       max_projects=25, sample_limit=200, window_days=14)
+    results = await mis.check_audience_routing_attestation(ctx)
+
+    pid = str(project.id)
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1, f"expected 1 result, got {results}"
+    r = project_results[0]
+    assert r.status == CheckStatus.OK, f"expected OK, got {r.status}: {r.detail}"
+    assert r.self_reported == 3
+    assert r.ground_truth == 3
+    assert r.delta == 0
 
 
 @pytest.mark.asyncio

@@ -150,6 +150,13 @@ export function classifySignalLevel(msg: {
   from_type: string;
   context: Record<string, unknown>;
 }): 'high' | 'routine' {
+  const audience = msg.context.audience as string | undefined;
+  if (audience) {
+    if (audience === 'operator-action-needed') return 'high';
+    if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'routine';
+    if (audience === 'operator-fyi') return 'routine';
+  }
+  // Legacy fallback for messages without a server-stamped audience
   if ((msg.from_type || '').toLowerCase() === 'user') return 'high';
   if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT', 'QUESTION'].includes(msg.message_type)) return 'high';
   if (msg.message_type === 'NOTE') {
@@ -164,6 +171,12 @@ export function effectiveSignal(
   prefs: Record<string, EventPref>,
   tempMutes?: TemporaryMutes,
 ): 'high' | 'routine' | 'mute' {
+  // Defense in depth: non-operator audiences can never be promoted by local prefs.
+  // The backend already filters these from operator surfaces, but the client must
+  // not re-promote them via event_type heuristics or a 'surfaced' pref.
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'routine';
+
   const et = msg.context.event_type as string | undefined;
   if (tempMutes && isEventTypeTemporarilyMuted(et, tempMutes)) return 'mute';
   const pref = et ? prefs[et] : undefined;
@@ -174,6 +187,14 @@ export function effectiveSignal(
 }
 
 export function getToastSeverity(msg: { message_type: string; from_type: string; context: Record<string, unknown> }): 'error' | 'info' {
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'operator-action-needed') return 'error';
+  // Non-operator audiences never warrant an error toast
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return 'info';
+  // operator-fyi is an operator-reaching but informational stamp — the server has
+  // already decided it is not action-needed, so it never warrants an error toast
+  // even when the legacy message_type would (matches classifySignalLevel='routine').
+  if (audience === 'operator-fyi') return 'info';
   const et = msg.context.event_type as string | undefined;
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return 'error';
   if (et && CRITICAL_NOTE_EVENTS.has(et)) return 'error';
@@ -184,6 +205,14 @@ export function isCriticalSeverity(msg: {
   message_type: string;
   context: Record<string, unknown>;
 }): boolean {
+  const audience = msg.context.audience as string | undefined;
+  if (audience === 'operator-action-needed') return true;
+  // Non-operator audiences are never critical from the operator's perspective
+  if (audience === 'strategist-internal' || audience === 'pipeline-log') return false;
+  // operator-fyi reaches the operator but is informational, not action-needed —
+  // the server-stamped audience is authoritative, so it is never critical even
+  // when the legacy message_type would be (matches classifySignalLevel='routine').
+  if (audience === 'operator-fyi') return false;
   if (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'QUESTION') return true;
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;

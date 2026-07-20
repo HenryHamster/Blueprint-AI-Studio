@@ -9570,4 +9570,75 @@ describe('MessagesPanel needs-action filter', () => {
       expect(needsActionBtn.getAttribute('aria-pressed')).toBe('true');
     });
   });
+
+  // Acceptance test: strategist-internal audience never reaches operator needs-action list
+  test('strategist-internal audience never reaches operator needs-action list', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+
+    // A strategist-internal message whose event_type would otherwise classify as high-signal
+    const strategistInternal = makeMsg({
+      id: 'internal-msg',
+      message_type: 'NOTE',
+      from_type: 'system',
+      content: 'Internal strategist note — should never reach operator inbox',
+      context: { audience: 'strategist-internal', event_type: 'failure_alert' },
+    });
+
+    // An operator-action-needed message that should appear in the needs-action list
+    const operatorActionNeeded = makeMsg({
+      id: 'action-msg',
+      message_type: 'NOTE',
+      from_type: 'agent',
+      content: 'Operator action required',
+      context: { audience: 'operator-action-needed', event_type: 'direction_outcome_stalled' },
+    });
+
+    // The strategic attention model lists only the operator-action-needed message as needs_operator
+    const state = makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 item needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1, watch: 0, unread: 0,
+          questions: 0, blockers: 0, approvals: 0,
+          manual_directions: 0, failed_tasks: 0,
+          blocked_tasks: 0, parked_tasks: 0,
+        },
+        items: [
+          {
+            id: 'message:action-msg',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'high_signal_note',
+            label: 'Operator action required',
+            ref: { kind: 'message', id: 'action-msg', project_id: 'proj-1' },
+          },
+        ],
+      },
+    });
+
+    _mockMessagesFetch([strategistInternal, operatorActionNeeded]);
+
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={state}
+      />,
+    );
+
+    // Wait for the panel and filter bar to render
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-filter-bar"]')).not.toBeNull();
+    });
+
+    // Default view is needs-action mode — strategist-internal message must not appear
+    const text = container.textContent ?? '';
+    expect(text).not.toContain('Internal strategist note — should never reach operator inbox');
+
+    // The operator-action-needed message IS visible in needs-action mode
+    expect(text).toContain('Operator action required');
+  });
 });
