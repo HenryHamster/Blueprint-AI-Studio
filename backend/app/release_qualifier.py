@@ -5789,6 +5789,21 @@ async def _finalize_qualification(
                 _merge_grade_task_obj is not None
                 and _merge_grade_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
             ):
+                # An ADMIN_CANCEL child is an external operator/reaper supersession,
+                # not a pipeline infrastructure failure.  Return a neutral hold so the
+                # attempt counter and consecutive_infra_errors streak are NOT advanced.
+                if (
+                    (_merge_grade_task_obj.context or {}).get("failure_category")
+                    == ADMIN_CANCEL
+                ):
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d merge-grade task %s was "
+                        "ADMIN_CANCEL'd; returning neutral hold (no infra-failure "
+                        "penalty)",
+                        version.version_number,
+                        merge_grade_task_id,
+                    )
+                    return {"status": "merge_grade_admin_cancel_hold"}
                 return await _handle_infra_failure(
                     session,
                     version,

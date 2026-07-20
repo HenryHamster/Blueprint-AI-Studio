@@ -23484,6 +23484,128 @@ class TestFinalizeInfraFailure:
             == 0
         )
 
+    @pytest.mark.asyncio
+    async def test_merge_grade_admin_cancel_returns_neutral_hold(self, db_session):
+        """CANCELLED merge-grade with failure_category=ADMIN_CANCEL → neutral hold.
+
+        The merge-grade leg has no respawn mechanism; ADMIN_CANCEL must still
+        return without burning an infra-failure attempt or streak count.
+        """
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "adcc9012" * 5
+
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "automain"}],
+            vm_instance_id="vm-audit-mg-cancel",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        merge_grade_task = Task(
+            project_id=project.id,
+            title="merge_grade",
+            payloads=[{"type": "release_merge_grade", "base_branch": "automain"}],
+            vm_instance_id="vm-mg-admin-cancel",
+            status=TaskStatus.CANCELLED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(merge_grade_task)
+
+        persist_failure_category(merge_grade_task, ADMIN_CANCEL)
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "merge_grade_task_id": str(merge_grade_task.id),
+            "prior_infra_streak": 0,
+        }
+        version.qualification_attempts = 3
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Neutral hold — NOT infra_failure.
+        assert result["status"] == "merge_grade_admin_cancel_hold"
+
+        # last_qualification stays pending (not rewritten to infra_failure).
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "pending"
+
+        # qualification_attempts not advanced (no attempt burned).
+        assert version.qualification_attempts == 3
+
+        # No QualificationVerdict row.
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_cancelled_without_admin_cancel_still_burns_attempt(
+        self, db_session
+    ):
+        """CANCELLED audit without ADMIN_CANCEL failure_category → infra_failure.
+
+        Regression guard: plain CANCELLED (no failure_category or any other
+        category) must still route to _handle_infra_failure so that non-admin
+        cancellations are not silently ignored.
+        """
+        project, version = await _make_project_and_version(db_session)
+        candidate = "adce7890" * 5
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "automain"}],
+            vm_instance_id="vm-audit-plain-cancel",
+            status=TaskStatus.CANCELLED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Plain CANCELLED (no failure_category) still routes to infra_failure.
+        assert result["status"] == "infra_failure"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+
+
 # ===========================================================================
 # _finalize_qualification — reaper-induced heartbeat timeout
 # ===========================================================================
