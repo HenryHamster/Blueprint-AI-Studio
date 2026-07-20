@@ -1539,12 +1539,13 @@ describe('handleStrategicResident — autonomous marker-miss corrective loop', (
     expect(ledger.operatorDecisionReview).toBeNull();
   });
 
-  it('id-less overflow sentinel: repeated escape-hatch trips through the handler loop produce at most one decisions-register entry (sentinelKey dedup guard)', async () => {
+  it('deduplicates id-less overflow sentinel register entry across repeated autonomous turns', async () => {
     // The id-less overflow sentinel (messageIds:[], overflowed:true) has no stable
     // message ids, so the same sentinel can re-trip the MAX_REVIEW_ATTEMPTS escape
     // hatch on every failed autonomous turn. The alreadyAdmitted guard at
     // strategic-resident.ts:1464-1465 detects a prior sentinel entry by the
     // sentinel:${startedAt} key embedded in the note and skips re-admission.
+    // When skipped, the handler emits a dedup-specific status instead of "admitted".
     //
     // This test exercises the guard through the full handler loop:
     //   - decisions_reg is pre-seeded with one entry already carrying the sentinel key

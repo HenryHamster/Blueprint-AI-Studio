@@ -6255,12 +6255,12 @@ async def _finalize_qualification(
                     _challenge_task_obj is not None
                     and _challenge_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
                 ):
-                    challenge_infra_respawn_count = qual.get(
-                        "challenge_infra_respawn_count", 0
-                    )
                     _chal_explicit_cat = (_challenge_task_obj.context or {}).get(
                         "failure_category", ""
                     ) or (_challenge_task_obj.context or {}).get("failure_class", "")
+                    challenge_infra_respawn_count = qual.get(
+                        "challenge_infra_respawn_count", 0
+                    )
                     if (
                         _challenge_task_obj.status == TaskStatus.FAILED
                         and _chal_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)

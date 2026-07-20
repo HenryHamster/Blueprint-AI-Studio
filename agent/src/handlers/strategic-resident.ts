@@ -1483,7 +1483,9 @@ export async function handleStrategicResident(
             operatorDecisionReview = advancePendingOperatorDecisionReview(reviewForTurn, {
               coversOverflow: activeOverflowSentinel || reviewOutcome.coversOverflow,
             });
-            streamer.status(`operator-decision review admitted after ${retained.attempts} failed attempts — exchange text recorded as fallback`);
+            streamer.status(alreadyAdmitted
+              ? `operator-decision overflow sentinel already recorded (${sentinelKey}) — dedup guard skipped re-admission`
+              : `operator-decision review admitted after ${retained.attempts} failed attempts — exchange text recorded as fallback`);
           } else {
             operatorDecisionReview = retained;
             streamer.status(reviewOutcome.statusNote
