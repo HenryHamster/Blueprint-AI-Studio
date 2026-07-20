@@ -1565,47 +1565,43 @@ def test_alert_scan_mixed_gated_and_ungated():
     assert "emit_ungated()" in offenders[0]
 
 
-# ── Whole-file invariant: zero ungated Alert constructors in domain modules ──
-
-_DOMAIN_MODULES_WITH_ALERTS = [
-    "autonomous_research.py",
-    "cost_ceiling.py",
-    "branch_cleanup.py",
-    "direction_lifecycle.py",
-    "warm_pool_maintainer.py",
-    "branch_resolution.py",
-]
+# ── Whole-file invariant: zero ungated Alert constructors across all app modules ──
 
 
 def test_no_alert_constructor_bypasses_event_type_gate():
-    """Whole-file invariant: every Alert(...) constructed in the pipeline-internal
-    domain modules carries an event_type= keyword (or is in a function that routes
-    through create_project_alert_if_allowed).
+    """Whole-file invariant: every Alert(...) constructed anywhere under backend/app/
+    carries an event_type= keyword (or is in a function that routes through
+    create_project_alert_if_allowed).
+
+    The test globs the entire app tree so any new module with an ungated Alert()
+    constructor fails CI automatically — no allowlist update required.
 
     This is the structural ratchet that prevents the operator-badge leak from
     silently reoccurring: operator_visible_alert_filter(Alert.event_type) fails
     OPEN on NULL, so any ungated Alert(...) inflates the operator badge/preview.
-    A new direct constructor without a registered event_type= fails CI here.
+    Fix by adding event_type=<registered_key> to the Alert(...) call (register the
+    key in message_audience.py if needed).
     """
+    import glob
+
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
     all_offenders: list[str] = []
-    for module_name in _DOMAIN_MODULES_WITH_ALERTS:
-        fpath = os.path.join(app_dir, module_name)
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
         offenders = _collect_ungated_alert_constructors(
-            source, filename=fpath, rel=module_name
+            source, filename=fpath, rel=rel
         )
         all_offenders.extend(offenders)
 
     assert not all_offenders, (
-        "Found Alert() constructor(s) in pipeline-internal domain modules that "
-        "do NOT supply an event_type= keyword or route through "
-        "create_project_alert_if_allowed. A NULL event_type causes "
-        "operator_visible_alert_filter to FAIL OPEN, leaking the alert into "
-        "the operator badge/preview. Fix by adding event_type=<registered_key> "
-        "to the Alert(...) call (register the key in message_audience.py if needed):\n"
-        + "\n".join(all_offenders)
+        "Found Alert() constructor(s) under backend/app/ that do NOT supply an "
+        "event_type= keyword or route through create_project_alert_if_allowed. "
+        "A NULL event_type causes operator_visible_alert_filter to FAIL OPEN, "
+        "leaking the alert into the operator badge/preview. Fix by adding "
+        "event_type=<registered_key> to the Alert(...) call (register the key in "
+        "message_audience.py if needed):\n" + "\n".join(all_offenders)
     )

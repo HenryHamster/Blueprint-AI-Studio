@@ -455,6 +455,7 @@ async def _redrive_infra_failure_qualification(
                         f"{_last_error}) — autonomous re-qualification halted. "
                         f"Human review required."
                     ),
+                    event_type="release.qualification_crash_loop",
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {
@@ -779,6 +780,7 @@ async def _redrive_promotion_failed_qualification(
                         f"autonomous re-qualification halted. Human review "
                         f"required before next promote attempt."
                     ),
+                    event_type="release.promotion_deploy_failed",
                 )
                 redrive_session.add(alert)
                 version.last_qualification = {
@@ -874,6 +876,7 @@ async def _redrive_promotion_failed_qualification(
                                 + " Harvest remediation spawning."
                             ),
                             dedupe_key=dedupe_key,
+                            event_type="release.ci_unresolved",
                         )
                     )
                     # Snapshot plain scalars before commit to avoid MissingGreenlet

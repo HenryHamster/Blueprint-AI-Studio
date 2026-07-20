@@ -450,6 +450,7 @@ async def run_infra_recovery_and_hold_maintenance(
                         f"task re-queued automatically."
                     ),
                     task_id=_t.id,
+                    event_type="deployment.auto_resume",
                 )
                 session.add(_res_alert)
                 await broadcast_to_project(

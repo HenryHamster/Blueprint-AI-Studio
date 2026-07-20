@@ -3095,6 +3095,7 @@ async def orchestrator_worker():
                                         severity=AlertSeverity.ERROR,
                                         title=_all_blocked_title,
                                         message=_all_blocked_msg,
+                                        event_type="capacity.all_accounts_blocked",
                                     )
                                     session.add(_alert)
                                     await broadcast_to_project(
@@ -4066,6 +4067,7 @@ async def orchestrator_worker():
                                                 title=_stuck_title,
                                                 message=_stuck_msg,
                                                 task_id=task.id,
+                                                event_type="task.blocked",
                                             )
                                             session.add(_stuck_alert)
                                             await broadcast_to_project(

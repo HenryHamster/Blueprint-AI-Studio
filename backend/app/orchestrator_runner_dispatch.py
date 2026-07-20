@@ -1700,6 +1700,7 @@ async def _maybe_alert_saturated_compute_cap_defer(
             f"Launch precondition: {message[:200]}"
         ),
         task_id=task.id,
+        event_type="capacity.quota_exhausted",
     )
     session.add(alert)
     _alert_project_id = str(task.project_id)
@@ -2729,6 +2730,7 @@ async def _create_strategic_local_cloud_fallback_alert(
         title=_STRATEGIC_LOCAL_FALLBACK_ALERT_TITLE,
         message=message,
         task_id=task.id,
+        event_type="runner.degraded",
     )
     session.add(alert)
     try:
@@ -3133,6 +3135,7 @@ async def _emit_all_accounts_blocked_stall(
                         severity=AlertSeverity.ERROR,
                         title=title,
                         message=msg,
+                        event_type="capacity.all_accounts_blocked",
                     )
                     session.add(alert)
                     await broadcast_to_project(

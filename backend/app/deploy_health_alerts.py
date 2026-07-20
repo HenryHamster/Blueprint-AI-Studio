@@ -109,6 +109,7 @@ async def _create_auto_pause_alerts(session: AsyncSession, failed_deps: list) ->
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
+            event_type="deployment.auto_pause",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -198,6 +199,7 @@ async def _create_forced_resume_alerts(
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
+            event_type="deployment.forced_resume",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -274,6 +276,7 @@ async def _create_auto_resume_alerts(
             severity=severity,
             title=resume_title,
             message=resume_title,
+            event_type="deployment.flapping_resume" if flapping else "deployment.auto_resume",
         )
         session.add(alert)
         await broadcast_to_project(

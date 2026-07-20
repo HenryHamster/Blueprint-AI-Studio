@@ -2614,6 +2614,7 @@ async def reaper_service():
                                                     f"Last error: {str(_reap_exc)[:300]}"
                                                 ),
                                                 task_id=task_id,
+                                                event_type="task.failed",
                                             )
                                         )
                                         _qsession.add(_qtask)

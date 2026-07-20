@@ -204,10 +204,71 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "self_improvement.payload_too_large": STRATEGIST_INTERNAL,
     # Cost / efficiency
     "cost.unpriced_models": OPERATOR_FYI,
+    "cost.telemetry_reconciliation_drift": OPERATOR_FYI,
     "efficiency.self_repair_burn_share": STRATEGIST_INTERNAL,
     "efficiency.provider_routing_verdict": STRATEGIST_INTERNAL,
+    # === Compute infrastructure alerts ====================================
+    # compute.image_drift: baked compute image was auto-rebuilt due to
+    # dependency manifest change — informational, operator-visible.
+    "compute.image_drift": OPERATOR_FYI,
+    # compute.image_protect_fail: GC-protection tag sweep failed — the image
+    # digest may be reclaimed by registry retention before being replaced.
+    # Operator should verify gcloud / Artifact Registry availability.
+    "compute.image_protect_fail": OPERATOR_FYI,
+    # === Research / direction drift =======================================
+    # research.direction_drift: direction claim vs. shipped-code drift
+    # detected — operator should review the flagged directions.
+    "research.direction_drift": OPERATOR_FYI,
     # === Back-merge / hotfix alerts (no existing policy entry) ============
     "hotfix_backmerge.size_violation": STRATEGIST_INTERNAL,
+    # === Service/background-process lifecycle alerts ========================
+    # Background service crashed (one-off) or is flapping (repeated crashes).
+    "service.crashed": OPERATOR_ACTION_NEEDED,
+    "service.crash_episode": OPERATOR_ACTION_NEEDED,
+    # Auto-restart of a background service is informational internal bookkeeping.
+    "service.restarted": STRATEGIST_INTERNAL,
+    # === Task-level alerts =================================================
+    # A prerequisite task failed and cascade-cancelled dependent tasks.
+    "task.cascade_cancelled": OPERATOR_FYI,
+    # Post-commit orphan task auto-recovered by spawning a review pipeline.
+    "task.orphan_recovered": STRATEGIST_INTERNAL,
+    # === Deployment-level alerts ===========================================
+    # Orchestrator process hit consecutive exceptions — pipeline may be stalled.
+    "deployment.orchestrator_error_loop": OPERATOR_ACTION_NEEDED,
+    # Wake-delivery sweep is stalled; PARKED tasks with fired wake sources not advancing.
+    "deployment.wake_delivery_stalled": OPERATOR_ACTION_NEEDED,
+    # Baked compute image auto-rebuilt due to manifest drift (pipeline internal).
+    "deployment.compute_image_rebuilt": STRATEGIST_INTERNAL,
+    # Hotfix promotion bypassed the standard qualification gate.
+    "release.hotfix_bypass": OPERATOR_FYI,
+    # === Compute job alerts =================================================
+    # Compute job terminated by the no-progress watchdog.
+    "compute.job_stalled": OPERATOR_FYI,
+    # === Runner-specific alerts =============================================
+    # Task with require_local_runner fell back to cloud after threshold.
+    "runner.local_fallback": OPERATOR_FYI,
+    # Runner repeatedly declined a task (repeated no-bid signals).
+    "runner.task_declined": OPERATOR_FYI,
+    # No self-hosted runner online for a task that requires one (OPERATOR_ACTION_NEEDED
+    # because operator must provision/restart the required runner fleet).
+    "runner.local_runner_unavailable": OPERATOR_ACTION_NEEDED,
+    # No Docker-capable runner online for a task that needs a container image.
+    "runner.container_runner_unavailable": OPERATOR_ACTION_NEEDED,
+    # Task pinned to local runner skipped because LLM credentials cannot be resolved.
+    "runner.credential_skip": OPERATOR_ACTION_NEEDED,
+    # === SR quality metrics (strategist-internal, acted on autonomously) ====
+    "sr.precision_recall_degraded": STRATEGIST_INTERNAL,
+    "sr.engagement_thinning": STRATEGIST_INTERNAL,
+    "sr.false_attestation": STRATEGIST_INTERNAL,
+    # === Account management alerts ==========================================
+    # Pool account force-deleted while active tasks still held it.
+    "account.force_deleted_with_active_tasks": OPERATOR_ACTION_NEEDED,
+    # === Capacity management (internal pipeline) ============================
+    # Task deferred because project hit max concurrent compute jobs cap.
+    "capacity.compute_cap_deferred": STRATEGIST_INTERNAL,
+    # === Infrastructure alerts =============================================
+    # Compute image GC-protection tag failed to apply; risk of digest loss.
+    "vm.gc_protection_failure": OPERATOR_ACTION_NEEDED,
     # work_session_command_execution: operator command receipts (confirmed/failed).
     # These are resolved NOTEs that record an operator-initiated command result —
     # visible in the conversation panel but not an escalation requiring attention.

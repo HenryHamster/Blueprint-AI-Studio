@@ -473,6 +473,7 @@ async def _force_finalize_timed_out_qualification(
                 f"(blocker={blocker}); the version returns to the "
                 f"stabilize phase for the next strategic cycle."
             ),
+            event_type="release.qualification_timeout",
         )
     )
     logger.warning(
@@ -535,6 +536,7 @@ async def _force_finalize_sweep_crash_loop(
                 f"returns to the stabilize phase. Inspect the release_qualifier "
                 f"logs for the root cause."
             ),
+            event_type="release.qualification_crash_loop",
         )
     )
     await _notify_operator(
@@ -1382,6 +1384,7 @@ async def _check_full_suite_drift_sentinel(
                             + " Harvest remediation spawning."
                         ),
                         dedupe_key=dedupe_key,
+                        event_type="release.ci_unresolved",
                     )
                 )
                 await session.commit()

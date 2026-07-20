@@ -3599,6 +3599,7 @@ async def update_agent_status(
                                 f"{type(_alert_err).__name__}: {str(_alert_err)[:200]}"
                             ),
                             task_id=None,  # project-level, not bound to the failed task
+                            event_type="task.failed",
                         )
                         session.add(meta_alert)
                         await broadcast_to_project(

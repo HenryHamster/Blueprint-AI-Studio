@@ -128,6 +128,7 @@ async def _emit_crash_alert(
                     severity=AlertSeverity.ERROR,
                     title=alert_title,
                     message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
+                    event_type="deployment.halted",
                 )
             )
             created += 1
@@ -185,6 +186,7 @@ async def _emit_crash_episode_alert(
                         "not a one-off blip. Auto-restart with backoff is "
                         "still running; investigate the root cause."
                     ),
+                    event_type="deployment.halted",
                 )
             )
             created += 1
@@ -1784,6 +1786,7 @@ async def lifespan(app):
                                             severity=AlertSeverity.INFO,
                                             title=f"Background service restarted: {name}",
                                             message=f"Service '{name}' was automatically restarted (attempt #{state['attempts']}).",
+                                            event_type="deployment.auto_resume",
                                         )
                                         alert_session.add(alert)
                                     await alert_session.commit()

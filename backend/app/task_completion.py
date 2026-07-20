@@ -5041,6 +5041,7 @@ async def _post_panel_review_to_pr(
                 "detail drawer and on the PR before merging."
             ),
             task_id=task.id,
+            event_type="review.escalated",
         )
         session.add(alert)
         await session.commit()

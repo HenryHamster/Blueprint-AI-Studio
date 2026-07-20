@@ -273,6 +273,7 @@ async def _record_hotfix_audit_trail(
                     ),
                     source="hotfix_promote",
                     dedupe_key=alert_key,
+                    event_type="release.promotion_deploy_failed",
                 )
             )
     except Exception:  # noqa: BLE001 — an Alert failure must not undo the promotion

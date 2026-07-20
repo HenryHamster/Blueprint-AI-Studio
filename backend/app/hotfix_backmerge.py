@@ -356,6 +356,7 @@ async def _emit_size_violation_alerts(
                 project_id=project_id,
                 severity=AlertSeverity.WARNING,
                 title=uncapped_title,
+                event_type="hotfix_backmerge.size_violation",
                 message=(
                     f"Back-merge PR #{pr_number}{trigger_clause} includes `{rel}` "
                     f"({section}) at approximately {bucket}+ lines with no cap entry "
@@ -432,6 +433,7 @@ async def _emit_size_violation_alerts(
             project_id=project_id,
             severity=severity,
             title=alert_title,
+            event_type="hotfix_backmerge.size_violation",
             message=alert_message,
         )
         session.add(alert)
@@ -1213,6 +1215,7 @@ async def _handle_conflict(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
         title=conflict_alert_title,
+        event_type="rollup.backmerge_blocked",
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) hit a merge conflict and "
@@ -1518,6 +1521,7 @@ async def _handle_ci_failure(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
         title=f"Back-merge blocked by CI: {promotion_target} -> {integration_branch}",
+        event_type="rollup.backmerge_blocked",
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) merges cleanly but CI is red on the "
@@ -1754,6 +1758,7 @@ async def _handle_migration_block(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
         title=f"Back-merge blocked by Alembic chain: {promotion_target} -> {integration_branch}",
+        event_type="rollup.backmerge_blocked",
         message=(
             f"The automated {promotion_target} -> {integration_branch} back-merge "
             f"(PR #{pr_number}{trigger_clause}) was BLOCKED before merge: it would "
@@ -2102,6 +2107,7 @@ async def _raise_blocked_alert(
         project_id=project_id,
         severity=AlertSeverity.ERROR,
         title=blocked_alert_title,
+        event_type="rollup.backmerge_blocked",
         message=message,
     )
     session.add(alert)

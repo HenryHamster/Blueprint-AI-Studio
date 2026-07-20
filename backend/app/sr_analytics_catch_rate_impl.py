@@ -1192,6 +1192,7 @@ async def _compute_sr_catch_rate_trends_impl(
                             severity=AlertSeverity.WARNING,
                             title=new_alert_title,
                             message=description,
+                            event_type="sr.catch_rate_below_target",
                         )
                     )
 
@@ -1370,6 +1371,7 @@ async def _compute_sr_catch_rate_trends_impl(
                             severity=AlertSeverity.ERROR,
                             title=new_floor_title,
                             message=description,
+                            event_type="sr.catch_rate_below_target",
                         )
                     )
 
@@ -1522,6 +1524,7 @@ async def _compute_sr_catch_rate_trends_impl(
                             severity=AlertSeverity.WARNING,
                             title=new_quadrant_title,
                             message=description,
+                            event_type="sr.catch_rate_below_target",
                         )
                     )
 
@@ -1685,6 +1688,7 @@ async def _compute_sr_catch_rate_trends_impl(
                             severity=AlertSeverity.WARNING,
                             title=new_eng_title,
                             message=description,
+                            event_type="sr.catch_rate_below_target",
                         )
                     )
 

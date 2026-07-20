@@ -5510,6 +5510,7 @@ async def _process_post_commit(
                                 title=cap_alert_title,
                                 message=f"Review requested changes on PR #{pr_number} but the fix iteration cap was reached. Manual intervention required.",
                                 task_id=task.id,
+                                event_type="review.escalated",
                             )
                             session.add(alert)
                             await session.commit()
@@ -5912,6 +5913,7 @@ async def _process_post_commit(
                                     title=alert_title,
                                     message=_alert_msg,
                                     task_id=task.id,
+                                    event_type="review.escalated",
                                 )
                                 session.add(alert)
                                 await session.commit()

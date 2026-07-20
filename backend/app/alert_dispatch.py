@@ -99,6 +99,7 @@ async def _create_orchestrator_error_alerts(
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
+            event_type="deployment.halted",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -137,6 +138,7 @@ async def _create_halted_alerts(
             severity=AlertSeverity.ERROR,
             title=title,
             message=msg,
+            event_type="deployment.halted",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -192,6 +194,7 @@ async def _create_rollback_alerts(
             severity=AlertSeverity.WARNING,
             title=title,
             message=msg,
+            event_type="deployment.rollback_detected",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -246,6 +249,7 @@ async def _create_halted_recovery_alerts(session: AsyncSession) -> None:
             severity=AlertSeverity.INFO,
             title=recovery_title,
             message=recovery_title,
+            event_type="deployment.halted_recovered",
         )
         session.add(alert)
         await broadcast_to_project(
@@ -278,6 +282,7 @@ async def _maybe_create_failure_alert(
         title=f"Task failed: {task.title or str(task.id)[:8]}",
         message=f"Task type: {task_type}. {error_snippet or 'See task logs for details.'}",
         task_id=task.id,
+        event_type="task.failed",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -355,6 +360,7 @@ async def _maybe_create_spend_hold_alert(
         title=_SPEND_HOLD_ALERT_TITLE,
         message=message,
         task_id=task.id,
+        event_type="cost.spend_hold",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -526,6 +532,7 @@ async def _maybe_create_merge_gate_degradation_alerts(
             severity=severity,
             title=title,
             message=msg,
+            event_type="merge.unverified",
         )
         session.add(alert)
         created += 1
@@ -626,6 +633,7 @@ async def _maybe_create_migration_slot_contention_alert(
         title=title,
         message=msg,
         task_id=holder_uuid,
+        event_type="migration.slot_contention",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -690,6 +698,7 @@ async def _maybe_create_unverified_merge_alert(
             f"UNVERIFIED. Review the merge if test coverage was expected."
         ),
         task_id=task.id,
+        event_type="merge.unverified",
     )
     session.add(alert)
     await session.commit()
@@ -748,6 +757,7 @@ async def _maybe_create_circuit_breaker_alert(
         severity=AlertSeverity.WARNING,
         title="Circuit breaker opened: autonomous tasks paused",
         message=reason,
+        event_type="capacity.quota_exhausted",
     )
     session.add(alert)
     if expected_legacy_generation is not None:
@@ -805,6 +815,7 @@ async def _maybe_create_adversarial_gate_fail_open_alert(
             f"Review task: {str(review.id)[:8]}."
         ),
         task_id=review.id,
+        event_type="review.fail_open",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -856,6 +867,7 @@ async def _maybe_create_spend_ceiling_alert(
             f"per-project ceiling ${ceiling_usd:.4f}. New autonomous "
             f"spawning is paused until spend falls below the ceiling."
         ),
+        event_type="cost.ceiling_reached",
     )
     session.add(alert)
     if expected_legacy_generation is None:
@@ -917,6 +929,7 @@ async def _maybe_create_approaching_ceiling_alert(
             f"${ceiling_usd:.4f}. Autonomous spawning will pause when spend "
             f"reaches the ceiling."
         ),
+        event_type="cost.ceiling_reached",
     )
     session.add(alert)
     if expected_legacy_generation is None:
@@ -989,6 +1002,7 @@ async def _maybe_create_escalation_alert(
             f"decision required."
         ),
         task_id=task.id,
+        event_type="review.escalated",
     )
     session.add(alert)
     await session.commit()
@@ -1232,6 +1246,7 @@ async def _maybe_create_unpriced_models_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="cost.unpriced_models",
     )
     session.add(alert)
     await session.commit()
@@ -1305,6 +1320,7 @@ async def _maybe_create_self_repair_burn_share_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="efficiency.self_repair_burn_share",
     )
     session.add(alert)
     await session.commit()
@@ -1370,6 +1386,7 @@ async def _maybe_create_precondition_blocker_alert(
         title=title,
         message=detail[:1000],
         task_id=task.id,
+        event_type="task.blocked",
     )
     session.add(alert)
     await session.commit()
@@ -1463,6 +1480,7 @@ async def _maybe_create_stale_staged_direction_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="research.stale_staged_direction",
     )
     session.add(alert)
     await session.commit()
@@ -1631,6 +1649,7 @@ async def _maybe_create_blocked_escalation_alert(
         title=title,
         message=detail[:1000],
         task_id=task.id,
+        event_type="task.blocked",
     )
     session.add(alert)
     await session.commit()
@@ -1689,6 +1708,7 @@ async def _maybe_create_cascade_cancel_alert(
             f"the root failure is resolved."
         ),
         task_id=prereq_task.id,
+        event_type="task.failed",
     )
     session.add(alert)
     await session.commit()
@@ -1749,6 +1769,7 @@ async def _maybe_create_wake_delivery_stall_alert(
         severity=severity,
         title=title,
         message=msg,
+        event_type="migration.chain_blocked",
     )
     session.add(alert)
     await broadcast_to_project(
@@ -1928,6 +1949,7 @@ async def _maybe_create_cost_telemetry_reconciliation_alert(
         severity=severity,
         title=title,
         message=message,
+        event_type="cost.telemetry_reconciliation_drift",
     )
     session.add(alert)
     await session.commit()
@@ -2001,6 +2023,7 @@ async def _maybe_create_compute_image_drift_alert(
         severity=AlertSeverity.INFO,
         title=title,
         message=message,
+        event_type="compute.image_drift",
     )
     session.add(alert)
     await session.commit()
@@ -2040,6 +2063,7 @@ async def _create_strategic_alert(
         severity=AlertSeverity.WARNING,
         title=title,
         message=message[:1000],
+        event_type="research.strategic_issue",
     )
     session.add(alert)
     if expected_legacy_generation is None:
@@ -2114,6 +2138,7 @@ async def _maybe_create_no_progress_watchdog_alert(
         severity=AlertSeverity.WARNING,
         title=_NO_PROGRESS_WATCHDOG_ALERT_TITLE,
         message=message,
+        event_type="task.blocked",
     )
     session.add(alert)
     # Stamp in-memory dedup marker so the caller doesn't re-alert if the

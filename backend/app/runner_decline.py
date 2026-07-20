@@ -249,6 +249,7 @@ async def maybe_create_decline_alert(
         title=DECLINE_ALERT_TITLE,
         message=msg,
         task_id=task.id,
+        event_type="runner.degraded",
     )
     session.add(alert)
     await broadcast_to_project(

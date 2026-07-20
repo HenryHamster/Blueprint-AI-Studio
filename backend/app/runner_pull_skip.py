@@ -387,6 +387,7 @@ async def _maybe_create_skip_alert(
         title=SKIP_ALERT_TITLE,
         message=msg,
         task_id=task.id,
+        event_type="runner.degraded",
     )
     session.add(alert)
     await broadcast_to_project(

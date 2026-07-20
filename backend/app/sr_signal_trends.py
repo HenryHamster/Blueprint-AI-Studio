@@ -469,6 +469,7 @@ async def compute_sr_false_attestation_trends(
                         severity=AlertSeverity.WARNING,
                         title=new_title,
                         message=description,
+                        event_type="sr.catch_rate_below_target",
                     )
                 )
         except Exception:

@@ -1131,6 +1131,7 @@ async def _handle_infra_failure(
                     f"failure: {current_streak} consecutive errors"
                 ),
                 message=alert_message,
+                event_type="release.qualification_crash_loop",
             )
         )
         logger.warning(

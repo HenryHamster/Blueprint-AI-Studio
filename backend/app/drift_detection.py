@@ -217,6 +217,7 @@ async def _maybe_create_drift_alerts(
                     severity=AlertSeverity.WARNING,
                     title=title,
                     message=message,
+                    event_type="research.direction_drift",
                 )
             )
 

@@ -126,6 +126,7 @@ async def _check_version_calcification(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.calcifying",
             severity=AlertSeverity.WARNING,
             title=alert_title,
             message=(
@@ -190,6 +191,7 @@ async def _check_version_ci_unresolved_stall(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.ci_unresolved",
             severity=AlertSeverity.WARNING,
             title=f"Release v{version.version_number}: CI state unresolvable",
             message=(
@@ -257,6 +259,7 @@ async def _check_version_build_stall(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.build_stalled",
             severity=AlertSeverity.WARNING,
             title=f"Release v{version.version_number} stalled in build phase",
             message=(
@@ -347,6 +350,7 @@ async def _check_version_stabilize_stall(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.stabilize_stalled",
             severity=AlertSeverity.WARNING,
             title=f"Release v{version.version_number} stalled in stabilize phase",
             message=(
@@ -434,6 +438,7 @@ async def _alert_promotion_deploy_failed(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.promotion_deploy_failed",
             severity=AlertSeverity.ERROR,
             title=_deploy_failed_alert_title(version.version_number),
             message=(
@@ -624,6 +629,7 @@ async def _check_version_auto_merge_stall(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.promotion_auto_merge_stalled",
             severity=severity,
             title=(f"Release v{version.version_number} promotion auto-merge stalled"),
             message=(
@@ -746,6 +752,7 @@ async def _check_version_managed_check_wait_stall(
     session.add(
         Alert(
             project_id=version.project_id,
+            event_type="release.managed_check_wait_stalled",
             severity=severity,
             title=(
                 f"Release v{version.version_number} managed_check_wait promotion stalled"

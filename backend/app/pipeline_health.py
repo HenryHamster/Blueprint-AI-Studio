@@ -138,6 +138,7 @@ async def _evaluate_sr_catch_rate_targets(
                 severity=AlertSeverity.WARNING,
                 title=title,
                 message=message[:1000],
+                event_type="sr.catch_rate_below_target",
             )
         )
         await session.commit()
@@ -199,6 +200,7 @@ async def _evaluate_lone_checker_alert(
             severity=AlertSeverity.WARNING,
             title=_LONE_CHECKER_ALERT_TITLE,
             message=message[:1000],
+            event_type="sr.lone_checker",
         )
     )
     await session.commit()

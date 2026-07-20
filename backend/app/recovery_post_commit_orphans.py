@@ -76,6 +76,7 @@ async def _spawn_review_for_recovered_task(
         title=alert_title,
         message=alert_message,
         task_id=source_task.id,
+        event_type="task.failed",
     )
     session.add(alert)
     await session.commit()

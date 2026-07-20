@@ -185,6 +185,7 @@ async def _run_signal_staleness_watchdog(
                     severity=AlertSeverity.WARNING,
                     title=title,
                     message=message,
+                    event_type="sr.signal_stale",
                 )
             )
             created += 1
@@ -215,6 +216,7 @@ async def _run_signal_staleness_watchdog(
                         severity=AlertSeverity.WARNING,
                         title=title,
                         message=message,
+                        event_type="sr.signal_stale",
                     )
                 )
                 created += 1
@@ -304,6 +306,7 @@ async def _emit_agent_vm_resource_alert(
             severity=AlertSeverity.WARNING,
             title=title,
             message=message[:1000],
+            event_type="vm.low_memory",
         )
     )
     return 1
@@ -362,6 +365,7 @@ async def _emit_pipeline_success_rate_alert(
             severity=AlertSeverity.WARNING,
             title=title,
             message=message[:1000],
+            event_type="task.failed",
         )
     )
     return 1

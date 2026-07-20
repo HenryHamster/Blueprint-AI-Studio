@@ -400,6 +400,7 @@ async def sweep_queued_age_alerts(
                 f"Likely cause: {_likely_cause}."
             ),
             task_id=_qt.id,
+            event_type="task.blocked",
         )
         session.add(_alert)
 
@@ -656,6 +657,7 @@ async def sweep_stalled_strategic_cycles(
                     f"cycle will spawn a fresh attempt. Phase1 task: {c.phase1_task_id}, "
                     f"phase2 task: {c.phase2_task_id}."
                 ),
+                event_type="research.diagnosis_stalled",
             )
             session.add(alert)
             pending_broadcasts.append(
@@ -1893,6 +1895,7 @@ async def _sweep_strategic_cycle_starvation(session, now: datetime) -> int:
                     "starved (zero cycles, not merely stalled mid-cycle). Review the "
                     "strategic loop scheduler and recent orchestrator logs."
                 )[:1000],
+                event_type="research.diagnosis_stalled",
             )
         )
         created += 1
@@ -2590,6 +2593,7 @@ async def _alert_compute_image_protection_failures(
                     "reproducibility. Check gcloud availability and Artifact Registry "
                     "API health on the orchestrator host."
                 )[:1000],
+                event_type="compute.image_protect_fail",
             )
         )
         created += 1
