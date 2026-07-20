@@ -6333,8 +6333,8 @@ async def test_step7_stalled_cycle_revalidates_legacy_authority_after_discovery(
 
     real_find_stalled = strategic_cycle_module.find_stalled
 
-    async def _cutover_after_discovery(session):
-        candidates = await real_find_stalled(session)
+    async def _cutover_after_discovery(session, *, deploy_state=None):
+        candidates = await real_find_stalled(session, deploy_state=deploy_state)
         session.add(
             StrategicResident(
                 project_id=project.id,
