@@ -208,8 +208,78 @@ describe('strategic Resident turn handler', () => {
     for (const result of malformed) {
       expect(residentResultShapeError(result, [])).not.toBeNull();
     }
+    for (const kind of ['strategy_change', 'abandon_work', 'merge', 'deploy']) {
+      expect(residentResultShapeError({
+        ...valid,
+        strategic_implications: [{
+          implication_id: `missing-evidence-${kind}`, kind, summary: 'High impact.', evidence_ids: [],
+        }],
+      }, [])).toContain(`${kind} implication requires evidence`);
+    }
+    expect(residentResultShapeError({
+      ...valid,
+      strategic_implications: [{
+        implication_id: 'other-observation', kind: 'other', summary: 'Observation.', evidence_ids: [],
+      }],
+    }, [])).toBeNull();
   });
 
+  it('preflights high-impact evidence references and accepted inspections', () => {
+    const evidence = {
+      evidence_id: 'decisive-evidence',
+      kind: 'task',
+      source_id: inspectionTaskId,
+      revision: inspectionRevision,
+      checksum: inspectionChecksum,
+      summary: 'Revisioned evidence.',
+    };
+    const implication = {
+      implication_id: 'change-strategy',
+      kind: 'strategy_change',
+      summary: 'Change based on decisive evidence.',
+      evidence_ids: [evidence.evidence_id],
+    };
+    const result = {
+      ...emptyFinalResult(),
+      evidence: [evidence],
+      strategic_implications: [implication],
+    };
+    expect(residentResultShapeError(result, [])).toBeNull();
+    expect(residentResultShapeError({
+      ...result,
+      evidence: [],
+    }, [])).toContain('references unknown evidence');
+    expect(residentResultShapeError({
+      ...result,
+      evidence: [{ ...evidence, revision: null, checksum: null }],
+    }, [])).toContain('requires revisioned, checksummed decisive evidence');
+    expect(residentResultShapeError({
+      ...result,
+      reconciliation: {
+        ...(emptyFinalResult().reconciliation as Record<string, unknown>),
+        accepted_implication_ids: [implication.implication_id],
+      },
+    }, [])).toContain('was not independently inspected');
+    const canonicalInspection = {
+      evidence_id: evidence.evidence_id,
+      kind: evidence.kind,
+      source_id: evidence.source_id,
+      revision: evidence.revision,
+      checksum: evidence.checksum,
+      inspected_at: inspectionTimestamp,
+      decisive: true,
+    };
+    expect(residentResultShapeError({
+      ...result,
+      reconciliation: {
+        ...(emptyFinalResult().reconciliation as Record<string, unknown>),
+        accepted_implication_ids: [implication.implication_id],
+        evidence_inspections: [{
+          evidence_id: evidence.evidence_id, decisive: true,
+        }],
+      },
+    }, [], false, false, [canonicalInspection])).toBeNull();
+  });
   it('rejects duplicate durable identities and malformed reconciliation identifiers', () => {
     const base = {
       reply: 'Ready.', facts: [], evidence: [], operations: [], receipts: [],
@@ -276,6 +346,87 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost).toHaveBeenCalledOnce();
     expect(mocks.apiPost.mock.calls[0][1]).toMatchObject({
       result: { reply: 'Resident conversation is operational.' },
+    });
+  });
+  it('accepts a high-impact implication backed by a minimal canonical inspection reference', async () => {
+    const implicationId = 'accepted-strategy-change';
+    const inspection = { evidence_id: 'engine-owner-observation', decisive: true };
+    const finalResult = finalResultWithInspection(inspection);
+    finalResult.strategic_implications = [{
+      implication_id: implicationId,
+      kind: 'strategy_change',
+      summary: 'Change based on independently inspected evidence.',
+      evidence_ids: ['engine-owner-observation'],
+    }];
+    const reconciliation = finalResult.reconciliation as Record<string, unknown>;
+    reconciliation.accepted_implication_ids = [implicationId];
+    mockInspectionThenFinal(inspection);
+    mocks.runClaudeCode.mockReset()
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(finalResult),
+      });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mocks.apiPost.mock.calls.map((call) => String(call[0]))).toStrictEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+    expect(mocks.apiPost.mock.calls[1][1]).toMatchObject({
+      accepted_implication_ids: [implicationId],
+      evidence_inspections: [{
+        evidence_id: 'engine-owner-observation',
+        kind: 'task',
+        source_id: inspectionTaskId,
+        revision: inspectionRevision,
+        checksum: inspectionChecksum,
+        inspected_at: inspectionTimestamp,
+        decisive: true,
+      }],
+    });
+  });
+  it('repairs an unevidenced high-impact implication before completion', async () => {
+    const invalid = {
+      ...emptyFinalResult(),
+      strategic_implications: [{
+        implication_id: 'change-without-evidence',
+        kind: 'strategy_change',
+        summary: 'Change strategy without decisive evidence.',
+      }],
+    };
+    const repaired = emptyFinalResult();
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(invalid),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired),
+      });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(String(mocks.runClaudeCode.mock.calls[1][0]))
+      .toContain('strategy_change implication requires evidence');
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/complete');
+    expect(mocks.apiPost.mock.calls[0][1]).toMatchObject({
+      result: { strategic_implications: [] },
     });
   });
   it('disables all tools and posts exact reconciliation lineage', async () => {

@@ -624,7 +624,9 @@ export async function handleStrategicResidentTurn(
           reconciliation,
           serverInspectionEvidence,
         );
-        validationError = residentResultShapeError(result, capabilityResults, false, requireReply);
+        validationError = residentResultShapeError(
+          result, capabilityResults, false, requireReply, evidenceInspections,
+        );
       } catch (error) {
         validationError = error instanceof Error
           ? error.message
@@ -660,7 +662,9 @@ export async function handleStrategicResidentTurn(
             reconciliation,
             serverInspectionEvidence,
           );
-          validationError = residentResultShapeError(result, capabilityResults, false, requireReply);
+          validationError = residentResultShapeError(
+            result, capabilityResults, false, requireReply, evidenceInspections,
+          );
         } catch (error) {
           validationError = error instanceof Error
             ? error.message
