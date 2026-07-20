@@ -7,7 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import sqlalchemy as sa
@@ -424,3 +424,120 @@ async def test_attempt24_release_safety_contract(tmp_path, monkeypatch, mocker):
     deploy_doc = (REPO_ROOT / "Deploy.md").read_text(encoding="utf-8")
     assert "/promote/hotfix/preview" in deploy_doc
     assert "do not substitute the whole-tree force-promotion" in deploy_doc
+
+
+class TestVerifyEncryptionConfigBootGate:
+    """Behavioral tests for _verify_encryption_config boot-gate wiring.
+
+    These tests pin the exact seam that twice caused promotion boot-crash
+    incidents: first-boot mint+persist, second-boot same-key pass, wrong-key
+    fails closed, Cloud-Run-no-key raises, and dev-no-key warning-only.
+    """
+
+    def _mock_session_local(self, mocker, state):
+        """Patch app.database.AsyncSessionLocal to yield a mock session returning `state`."""
+        session = MagicMock()
+        session.get = AsyncMock(return_value=state)
+        session.commit = AsyncMock()
+        cm = AsyncMock()
+        cm.__aenter__ = AsyncMock(return_value=session)
+        cm.__aexit__ = AsyncMock(return_value=None)
+        mock_local = MagicMock(return_value=cm)
+        mocker.patch("app.database.AsyncSessionLocal", mock_local)
+        return session
+
+    @pytest.mark.asyncio
+    async def test_first_boot_mints_and_persists_continuity_reference(
+        self, monkeypatch, mocker
+    ):
+        """No stored ref (first boot) → continuity ref minted and committed to DB."""
+        key = Fernet.generate_key().decode()
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+        monkeypatch.delenv("K_REVISION", raising=False)
+        monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+
+        session = self._mock_session_local(mocker, None)
+
+        from app.main import _verify_encryption_config
+
+        await _verify_encryption_config()
+
+        session.commit.assert_awaited_once()
+        session.add.assert_called_once()
+        added = session.add.call_args[0][0]
+        ref = added.runtime_config_json["encryption_continuity_reference"]
+        # Must be a valid Fernet ciphertext for this key (not just truthy).
+        plaintext = Fernet(key.encode()).decrypt(ref.encode()).decode()
+        assert plaintext == "blueprint-field-encryption-continuity-v1"
+
+    @pytest.mark.asyncio
+    async def test_second_boot_correct_key_passes(self, monkeypatch, mocker):
+        """Stored ref present + correct key → probe passes → no DB commit."""
+        from app.models import DeploymentState
+
+        key = Fernet.generate_key().decode()
+        stored_ref = (
+            Fernet(key.encode())
+            .encrypt(b"blueprint-field-encryption-continuity-v1")
+            .decode()
+        )
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", key)
+        monkeypatch.delenv("K_REVISION", raising=False)
+
+        state = DeploymentState(
+            id=1, runtime_config_json={"encryption_continuity_reference": stored_ref}
+        )
+        session = self._mock_session_local(mocker, state)
+
+        from app.main import _verify_encryption_config
+
+        await _verify_encryption_config()
+
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_second_boot_wrong_key_fails_closed(self, monkeypatch, mocker):
+        """Stored ref from old key + new key configured → RuntimeError (fails closed)."""
+        from app.models import DeploymentState
+
+        old_key = Fernet.generate_key()
+        new_key = Fernet.generate_key().decode()
+        stored_ref = (
+            Fernet(old_key)
+            .encrypt(b"blueprint-field-encryption-continuity-v1")
+            .decode()
+        )
+        monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", new_key)
+        monkeypatch.delenv("K_REVISION", raising=False)
+
+        state = DeploymentState(
+            id=1, runtime_config_json={"encryption_continuity_reference": stored_ref}
+        )
+        self._mock_session_local(mocker, state)
+
+        from app.main import _verify_encryption_config
+
+        with pytest.raises(RuntimeError, match="continuity reference"):
+            await _verify_encryption_config()
+
+    @pytest.mark.asyncio
+    async def test_cloud_run_no_key_raises(self, monkeypatch):
+        """K_REVISION set + GITHUB_PAT_ENCRYPTION_KEY absent → RuntimeError at boot."""
+        monkeypatch.setenv("K_REVISION", "v26-attempt24")
+        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+
+        from app.main import _verify_encryption_config
+
+        with pytest.raises(RuntimeError, match="GITHUB_PAT_ENCRYPTION_KEY"):
+            await _verify_encryption_config()
+
+    @pytest.mark.asyncio
+    async def test_dev_no_key_with_plaintext_opt_in_no_raise(self, monkeypatch):
+        """K_REVISION absent + no key + ALLOW_PLAINTEXT_CREDENTIALS → no raise (dev mode)."""
+        monkeypatch.delenv("K_REVISION", raising=False)
+        monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+        monkeypatch.setenv("ALLOW_PLAINTEXT_CREDENTIALS", "true")
+
+        from app.main import _verify_encryption_config
+
+        await _verify_encryption_config()  # must not raise
