@@ -27,6 +27,9 @@ from app.strategic_resident_agent_binding import (
     ResidentAgentAuthorityError,
 )
 from app.strategic_resident_failure_state import failure_backoff_seconds
+from app.strategic_resident_inspection_runtime import (
+    CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY,
+)
 from app.strategic_resident_promotion import promote_resident_successor
 from app.strategic_resident_runtime import is_authoritative_resident_turn
 from app.strategic_resident_slot_release import (
@@ -108,6 +111,7 @@ async def _ensure_interactive_retry(
         for key in (
             RESIDENT_CLAIM_NONCE_CONTEXT_KEY,
             RESIDENT_CLAIM_ATTEMPT_CONTEXT_KEY,
+            CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY,
             "_resident_failure",
         ):
             context.pop(key, None)
