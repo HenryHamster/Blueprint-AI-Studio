@@ -80,6 +80,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "capability_verdict_decided": OPERATOR_FYI,
     "capability_trial_ambiguous_lift_escalation": OPERATOR_FYI,
     "question_answer": OPERATOR_FYI,
+    # feedback_reply: user replied to a feedback/notification — informational,
+    # operator-visible. The strategist is armed (via maybe_arm_operator_refresh)
+    # to process the answer, same as question_answer.
+    "feedback_reply": OPERATOR_FYI,
     # Capability-proof gate auto-graduation — an autonomous gate-mode change.
     # off→observe is informational (nothing blocks yet); →enforce begins
     # BLOCKING task spawning and release promotion, so it needs attention.
