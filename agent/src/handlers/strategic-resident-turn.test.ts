@@ -21,6 +21,7 @@ const providerInput = {
   identity: {
     project_id: '11111111-1111-1111-1111-111111111111',
     authority_generation: 7,
+    lane: 'interactive',
   },
   lineage: {
     checkpoint_id: '22222222-2222-2222-2222-222222222222',
@@ -226,6 +227,35 @@ describe('strategic Resident turn handler', () => {
     });
   });
 
+  it('repairs a missing interactive reply before completion', async () => {
+    const invalid = {
+      reply: null, facts: [], evidence: [], operations: [], receipts: [],
+      unknown_effects: [], strategic_implications: [], proposed_memory: [],
+      follow_up: null, required_attention: [],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    const repaired = { ...invalid, reply: 'Resident conversation is operational.' };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(invalid) })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(String(mocks.runClaudeCode.mock.calls[0][0])).toContain('This interactive turn requires a nonblank user-facing reply.');
+    expect(String(mocks.runClaudeCode.mock.calls[0][0])).toContain('"reply":"Concise user-facing reply"');
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(String(mocks.runClaudeCode.mock.calls[1][0]))
+      .toContain('interactive Resident turn result requires a user-facing reply');
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][1]).toMatchObject({
+      result: { reply: 'Resident conversation is operational.' },
+    });
+  });
   it('disables all tools and posts exact reconciliation lineage', async () => {
     mocks.runClaudeCode.mockResolvedValue({
       exitCode: 0,

@@ -20,6 +20,20 @@ export const FINAL_RESULT_SCHEMA_HINT = [
   'unknown_effects, non-proposed operations, receipts, and receipt-bound required_attention are authority-bearing: copy them exactly from server completion_projection values. If the server projected none, return an empty array. Never put narrative uncertainty in unknown_effects.',
 ].join('\n');
 
+const FINAL_RESULT_SKELETON = '{"reply":null,"facts":[],"evidence":[],"operations":[],"receipts":[],"unknown_effects":[],"strategic_implications":[],"proposed_memory":[],"follow_up":null,"required_attention":[],"reconciliation":{"accepted_memory_proposal_ids":[],"accepted_implication_ids":[],"accepted_open_loop_ids":[],"resolved_open_loop_ids":[],"evidence_inspections":[]}}';
+
+export function residentReplyContract(lane: unknown): string {
+  const interactive = lane === 'interactive';
+  const skeleton = interactive
+    ? FINAL_RESULT_SKELETON.replace('"reply":null', '"reply":"Concise user-facing reply"')
+    : FINAL_RESULT_SKELETON;
+  return [
+    'When reasoning is complete, include every final key even when null or empty:',
+    interactive ? 'This interactive turn requires a nonblank user-facing reply.' : null,
+    skeleton,
+  ].filter((line): line is string => line !== null).join('\n');
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -369,6 +383,7 @@ export function residentResultShapeError(
   result: Record<string, unknown>,
   capabilityResults: Record<string, unknown>[],
   allowEvidenceServerExtras = false,
+  requireReply = false,
 ): string | null {
   const unknownTopLevel = Object.keys(result).find((key) => !RESULT_KEYS.has(key));
   if (unknownTopLevel !== undefined) return `${unknownTopLevel} is not an allowed final result field`;
@@ -376,6 +391,9 @@ export function residentResultShapeError(
   if (missingTopLevel !== undefined) return `${missingTopLevel} is required`;
   if (result.reply !== null && (typeof result.reply !== 'string' || result.reply.length > 4_000)) {
     return 'reply must be null or a string of at most 4000 characters';
+  }
+  if (requireReply && (typeof result.reply !== 'string' || result.reply.trim().length === 0)) {
+    return 'interactive Resident turn result requires a user-facing reply';
   }
   for (const field of ['facts', 'evidence', 'operations', 'receipts', 'unknown_effects', 'strategic_implications', 'proposed_memory', 'required_attention']) {
     const error = listError(result, field);
