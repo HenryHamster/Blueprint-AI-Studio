@@ -254,6 +254,14 @@ function canonicalEvidenceInspections(
     const evidence = resultMatches[0];
     const extraEvidenceKeys = Object.keys(evidence)
       .filter((key) => !RESULT_EVIDENCE_KEY_SET.has(key));
+    const unknownExtra = extraEvidenceKeys.find(
+      (key) => !RESULT_EVIDENCE_SERVER_EXTRA_KEYS.has(key),
+    );
+    if (unknownExtra !== undefined) {
+      throw new Error(
+        `Resident evidence_inspections[${index}] result evidence contains an unknown field: ${unknownExtra}`,
+      );
+    }
     if (!nonEmptyString(evidence.evidence_id) || !nonEmptyString(evidence.summary)) {
       throw new Error(`Resident evidence_inspections[${index}] result evidence requires evidence_id and summary`);
     }
@@ -263,14 +271,25 @@ function canonicalEvidenceInspections(
       }
 
     }
-    const serverMatches = serverInspectionEvidence.filter((candidate) => (
+    const baseServerMatches = serverInspectionEvidence.filter((candidate) => (
       completeServerInspection(candidate)
       && ['kind', 'source_id', 'revision', 'checksum'].every((key) => {
         const claimed = evidence[key] ?? raw[key];
         return claimed === undefined || candidate[key] === claimed;
       })
     ));
+    const serverMatches = baseServerMatches.filter((candidate) => (
+      extraEvidenceKeys.every((key) => (
+        Object.prototype.hasOwnProperty.call(candidate, key)
+        && stableJson(evidence[key]) === stableJson(candidate[key])
+      ))
+    ));
     if (serverMatches.length !== 1) {
+      if (serverMatches.length === 0 && baseServerMatches.length > 0 && extraEvidenceKeys.length > 0) {
+        throw new Error(
+          `Resident evidence_inspections[${index}] result evidence contains an unverified server field: ${extraEvidenceKeys.join(', ')}`,
+        );
+      }
       throw new Error(`Resident evidence_inspections[${index}] is not backed by one server inspection`);
     }
     const inspected = serverMatches[0];
@@ -282,17 +301,7 @@ function canonicalEvidenceInspections(
         throw new Error(`Resident evidence_inspections[${index}] result evidence.${key} conflicts with server evidence`);
       }
     }
-    for (const key of extraEvidenceKeys) {
-      if (
-        !RESULT_EVIDENCE_SERVER_EXTRA_KEYS.has(key)
-        || !(key in inspected)
-        || stableJson(evidence[key]) !== stableJson(inspected[key])
-      ) {
-        throw new Error(
-          `Resident evidence_inspections[${index}] result evidence contains an unknown field or unverified server field: ${key}`,
-        );
-      }
-    }
+
     const evidenceId = evidence.evidence_id;
     if (canonicalIds.has(evidenceId)) {
       throw new Error(`Resident evidence_inspections contains duplicate evidence_id ${evidenceId}`);
