@@ -29,7 +29,8 @@ const providerInput = {
   },
   capabilities: {
     catalog: [
-      { id: 'task.inspect', mode: 'inspect', availability: 'invoke' },
+      { id: 'task.inspect', mode: 'inspect', parameters: ['task_id'], availability: 'invoke' },
+      { id: 'runner.list', mode: 'inspect', parameters: [], availability: 'invoke' },
       { id: 'task.reprioritize', mode: 'mutate', availability: 'invoke' },
       { id: 'task.cancel', mode: 'mutate', availability: 'propose_only' },
     ],
@@ -177,6 +178,91 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
   });
 
+  it('canonicalizes a catalog id and omitted empty parameters before invocation', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ id: 'runner.list' }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Listed', facts: [], evidence: [], operations: [], receipts: [],
+          unknown_effects: [], strategic_implications: [], proposed_memory: [],
+          follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string) => (
+      Promise.resolve(path === '/api/agent/resident-turn/capability'
+        ? { capability_id: 'runner.list', evidence: {} }
+        : {})
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(String(mocks.runClaudeCode.mock.calls[0][0])).toContain(
+      'Copy catalog id into request capability_id',
+    );
+    expect(mocks.apiPost.mock.calls[0]).toEqual([
+      '/api/agent/resident-turn/capability',
+      { capability_id: 'runner.list', parameters: {} },
+    ]);
+    expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+  });
+
+  it.each([
+    [
+      'conflicting identifiers',
+      { id: 'runner.list', capability_id: 'task.inspect', parameters: {} },
+      'conflicting capability identifiers',
+    ],
+    [
+      'null parameters',
+      { capability_id: 'runner.list', parameters: null },
+      'parameters must be a JSON object',
+    ],
+    [
+      'array parameters',
+      { capability_id: 'runner.list', parameters: [] },
+      'parameters must be a JSON object',
+    ],
+  ])('rejects %s before invoking a capability', async (_label, request, error) => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({ capability_requests: [request] }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow(error);
+
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it('keeps an aliased unknown capability behind the catalog availability fence', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({ capability_requests: [{ id: 'unknown.inspect' }] }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('non-invokable inspect capability');
+
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
   it('forces final structured synthesis after two distinct capability rounds', async () => {
     const firstTaskId = '33333333-3333-3333-3333-333333333333';
     const secondTaskId = '44444444-4444-4444-4444-444444444444';
@@ -347,7 +433,7 @@ describe('strategic Resident turn handler', () => {
         allOutput: '',
         lastResultText: JSON.stringify({
           mutation_requests: [{
-            capability_id: 'task.reprioritize',
+            id: 'task.reprioritize',
             parameters: {
               task_id: '33333333-3333-3333-3333-333333333333',
               priority: 50,
@@ -455,7 +541,7 @@ describe('strategic Resident turn handler', () => {
         allOutput: '',
         lastResultText: JSON.stringify({
           mutation_requests: [{
-            capability_id: 'task.reprioritize',
+            id: 'task.reprioritize',
             parameters: {
               task_id: '33333333-3333-3333-3333-333333333333',
               priority: 50,
