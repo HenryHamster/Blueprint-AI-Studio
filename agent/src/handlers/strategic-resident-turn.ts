@@ -9,6 +9,7 @@ import {
   sendLog,
 } from '../index.js';
 import { extractJsonObjectDetailed } from '../json-extract.js';
+import { catalogAvailability, proposedCapabilityRejection } from './strategic-resident-capability.js';
 import { createResidentProviderBoundary } from '../providers/resident-boundary.js';
 import {
   FINAL_RESULT_SCHEMA_HINT,
@@ -419,29 +420,6 @@ function canonicalMutationEvidence(
     return canonical;
   });
 }
-function catalogAvailability(
-  providerInput: Record<string, unknown>,
-  capabilityId: string,
-  mode: 'inspect' | 'mutate',
-): string | null {
-  const capabilities = providerInput.capabilities;
-  const catalog = capabilities && typeof capabilities === 'object'
-    ? (capabilities as Record<string, unknown>).catalog
-    : null;
-  if (!Array.isArray(catalog)) return null;
-  const catalogEntries: unknown[] = catalog;
-  const entry: unknown = catalogEntries.find((candidate) => (
-    candidate
-    && typeof candidate === 'object'
-    && (candidate as Record<string, unknown>).id === capabilityId
-  ));
-  if (!entry || typeof entry !== 'object') return null;
-  const item = entry as Record<string, unknown>;
-  return item.mode === mode && typeof item.availability === 'string'
-    ? item.availability
-    : null;
-}
-
 function appendCapabilityResult(
   current: Record<string, unknown>[],
   response: Record<string, unknown>,
@@ -491,7 +469,7 @@ function residentPrompt(
     'Bounded Strategic Resident input:',
     JSON.stringify(providerInput),
     ...(capabilityResults.length > 0
-      ? ['Server-validated capability evidence and operation receipts:', JSON.stringify(capabilityResults)]
+      ? ['Bounded capability outcomes; Server-validated capability evidence and operation receipts:', JSON.stringify(capabilityResults)]
       : []),
   ].join('\n\n');
   if (Buffer.byteLength(prompt, 'utf8') > MAX_RESIDENT_PROMPT_BYTES) {
@@ -592,7 +570,17 @@ export async function handleStrategicResidentTurn(
         ? 'Inspecting bounded Resident evidence...'
         : 'Applying fenced Resident operations...';
       for (const request of action.requests) {
-        if (catalogAvailability(providerInput, request.capability_id, action.kind) !== 'invoke') {
+        const availability = catalogAvailability(providerInput, request.capability_id, action.kind);
+        if (availability === 'propose_only') {
+          const key = stableJson({ kind: action.kind, request });
+          if (requestKeys.has(key)) continue;
+          requestKeys.add(key);
+          appendCapabilityResult(
+            capabilityResults, proposedCapabilityRejection(request.capability_id, action.kind),
+          );
+          continue;
+        }
+        if (availability !== 'invoke') {
           throw new Error(
             `Resident requested a non-invokable ${action.kind} capability: ${request.capability_id}`,
           );

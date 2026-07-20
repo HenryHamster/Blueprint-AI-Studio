@@ -33,6 +33,7 @@ const providerInput = {
     catalog: [
       { id: 'task.inspect', mode: 'inspect', parameters: ['task_id'], availability: 'invoke' },
       { id: 'runner.list', mode: 'inspect', parameters: [], availability: 'invoke' },
+      { id: 'pipeline.inspect', mode: 'inspect', parameters: [], availability: 'propose_only' },
       { id: 'task.reprioritize', mode: 'mutate', availability: 'invoke' },
       { id: 'task.cancel', mode: 'mutate', availability: 'propose_only' },
     ],
@@ -595,6 +596,74 @@ describe('strategic Resident turn handler', () => {
     )).rejects.toThrow('non-invokable inspect capability');
 
     expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+  it('fails closed when a catalog capability is requested through the wrong mode', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        mutation_requests: [{
+          capability_id: 'pipeline.inspect',
+          parameters: {},
+          operation_id: 'pipeline-inspect-wrong-mode',
+          expected_revisions: {},
+          evidence: [],
+        }],
+      }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('non-invokable mutate capability');
+
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+  it('recovers in-place from an advertised propose-only inspection request', async () => {
+    const finalResult = {
+      reply: 'Resident conversation is operational.',
+      facts: [], evidence: [], operations: [], receipts: [], unknown_effects: [],
+      strategic_implications: [], proposed_memory: [], follow_up: null,
+      required_attention: [],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'pipeline.inspect', parameters: {} }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'pipeline.inspect', parameters: {} }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(finalResult),
+      });
+    mocks.apiPost.mockResolvedValue({});
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('Capability availability is propose_only');
+    expect(finalPrompt.match(/Capability availability is propose_only/g)).toHaveLength(1);
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(0);
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1);
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/complete');
   });
   it('canonicalizes a partial inspection reference from server-validated evidence', async () => {
     const taskId = '33333333-3333-3333-3333-333333333333';
@@ -1772,30 +1841,57 @@ describe('strategic Resident turn handler', () => {
     });
   });
 
-  it('rejects propose-only mutations before calling the backend', async () => {
-    mocks.runClaudeCode.mockResolvedValue({
-      exitCode: 0,
-      allOutput: '',
-      lastResultText: JSON.stringify({
-        mutation_requests: [{
-          capability_id: 'task.cancel',
-          parameters: {
-            task_id: '33333333-3333-3333-3333-333333333333',
-            reason: 'stop',
+  it('keeps propose-only mutations bounded while allowing a final proposal', async () => {
+    const mutationRequest = {
+      capability_id: 'task.cancel',
+      parameters: {
+        task_id: '33333333-3333-3333-3333-333333333333',
+        reason: 'stop',
+      },
+      operation_id: 'cancel:33333333',
+      expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+      evidence: [],
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({ mutation_requests: [mutationRequest] }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Cancellation needs approval.', facts: [], evidence: [],
+          operations: [{
+            operation_id: mutationRequest.operation_id,
+            capability: mutationRequest.capability_id,
+            status: 'proposed',
+            summary: 'Cancel the task after approval.',
+          }],
+          receipts: [], unknown_effects: [], strategic_implications: [],
+          proposed_memory: [], follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
           },
-          operation_id: 'cancel:33333333',
-          expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
-          evidence: [],
-        }],
-      }),
-    });
+        }),
+      });
+    mocks.apiPost.mockResolvedValue({});
 
-    await expect(handleStrategicResidentTurn(
+    await handleStrategicResidentTurn(
       'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
-    )).rejects.toThrow('non-invokable mutate capability');
-    expect(mocks.apiPost).not.toHaveBeenCalled();
-  });
+    );
 
+    expect(String(mocks.runClaudeCode.mock.calls[1][0])).toContain(
+      'Capability availability is propose_only',
+    );
+    expect(mocks.apiPost.mock.calls.some(([path]) => (
+      path === '/api/agent/resident-turn/mutate'
+    ))).toBe(false);
+    expect(mocks.apiPost).toHaveBeenCalledTimes(1);
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/complete');
+  });
   it('rejects provider attempts to override server-owned mutation revisions', async () => {
     mocks.runClaudeCode.mockResolvedValue({
       exitCode: 0,
