@@ -72,7 +72,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.storage import delete_storage_uri_best_effort
+from app.storage import (
+    VIEWABLE_ARTIFACT_RETENTION_DAYS,
+    delete_storage_uri_best_effort,
+)
 from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
@@ -3450,10 +3453,6 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
     return finalized
 
 
-# How old a completed ComputeJob must be before its viewable artifacts are reaped.
-VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
-
-
 async def sweep_retire_viewable_artifacts(
     session,
     *,
@@ -3461,7 +3460,8 @@ async def sweep_retire_viewable_artifacts(
     batch_size: int = 100,
 ) -> int:
     """Step 23: Delete viewable GCS objects and their ComputeJobFile rows for
-    completed jobs older than ``retention_days`` (default 180).
+    completed jobs older than ``retention_days`` (default
+    ``storage.VIEWABLE_ARTIFACT_RETENTION_DAYS`` = 180).
 
     Viewable objects at ``compute-jobs/<uuid>/artifacts/viewable/`` are
     intentionally excluded from the GCS bucket lifecycle rules (which only

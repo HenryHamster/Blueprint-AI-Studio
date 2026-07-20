@@ -22,9 +22,10 @@ from sqlmodel import SQLModel, select
 
 from app.models import ComputeJob, ComputeJobFile, ComputeJobStatus, Project
 from app.reaper_sweeps import (
-    VIEWABLE_ARTIFACT_RETENTION_DAYS,
+    VIEWABLE_ARTIFACT_RETENTION_DAYS as REAPER_RETENTION_DAYS,
     sweep_retire_viewable_artifacts,
 )
+from app.storage import VIEWABLE_ARTIFACT_RETENTION_DAYS as STORAGE_RETENTION_DAYS
 from app.time_utils import _utcnow
 
 # Anchor to the sweep's own live clock so _RECENT stays the intended distance
@@ -32,8 +33,8 @@ from app.time_utils import _utcnow
 # _NOW was a wall-clock time-bomb: once real time advanced past it, _RECENT fell
 # before the sweep's live cutoff and "recent" jobs were wrongly retired.
 _NOW = _utcnow()
-_OLD = _NOW - timedelta(days=VIEWABLE_ARTIFACT_RETENTION_DAYS + 1)
-_RECENT = _NOW - timedelta(days=VIEWABLE_ARTIFACT_RETENTION_DAYS - 1)
+_OLD = _NOW - timedelta(days=REAPER_RETENTION_DAYS + 1)
+_RECENT = _NOW - timedelta(days=REAPER_RETENTION_DAYS - 1)
 
 
 @pytest_asyncio.fixture()
@@ -119,7 +120,7 @@ async def test_retire_old_completed_job_files(db):
         new=AsyncMock(return_value=True),
     ) as mock_delete:
         retired = await sweep_retire_viewable_artifacts(
-            db, retention_days=VIEWABLE_ARTIFACT_RETENTION_DAYS
+            db, retention_days=REAPER_RETENTION_DAYS
         )
 
     assert retired == 1
@@ -141,7 +142,7 @@ async def test_skip_recently_completed_job_files(db):
         new=AsyncMock(return_value=True),
     ) as mock_delete:
         retired = await sweep_retire_viewable_artifacts(
-            db, retention_days=VIEWABLE_ARTIFACT_RETENTION_DAYS
+            db, retention_days=REAPER_RETENTION_DAYS
         )
 
     assert retired == 0
@@ -255,3 +256,18 @@ async def test_custom_retention_days(db):
 
     assert retired == 1
     mock_delete.assert_awaited_once_with(file_90d.storage_uri)
+
+
+def test_viewable_artifact_retention_constant_is_authoritative():
+    """Drift-guard: the SINGLE authoritative retention value in ``storage.py``
+    must be identical to what ``reaper_sweeps.py`` consumes (imported, not
+    redefined).  If these diverge, the UI will stamp an ``artifact_expires_at``
+    that disagrees with the actual reaper retirement window — a false-expiry
+    bug.
+    """
+    assert STORAGE_RETENTION_DAYS == REAPER_RETENTION_DAYS, (
+        f"Viewable-artifact retention constant drifted: "
+        f"storage.py defines {STORAGE_RETENTION_DAYS}d, "
+        f"reaper_sweeps.py imports {REAPER_RETENTION_DAYS}d. "
+        f"Both must consume the same authoritative value from storage.py."
+    )

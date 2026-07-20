@@ -36,15 +36,19 @@ ARTIFACT_REF_CLEANUP_BATCH_SIZE = 8
 ATTACHMENT_DELETE_RPC_TIMEOUT_SECONDS = 2
 ATTACHMENT_DELETE_RETRY_DEADLINE_SECONDS = 3
 
-# The GCS artifacts bucket has a lifecycle rule that deletes every object after
-# ~7 days from its creation date (see infra/terraform/iam.tf).  Viewable
-# compute-job artifacts (png/jpg/webp/gif/mp4/webm) at
-# compute-jobs/<job_uuid>/artifacts/viewable/ share the per-job object prefix
-# with the durable bundle tarball, so a prefix-based retention carve-out cannot
-# selectively spare them.  Once reaped, signed preview URLs for these objects
-# 404 permanently — the frontend uses this constant to distinguish a transient
-# preview failure from permanent expiry.
-VIEWABLE_ARTIFACT_RETENTION_DAYS = 7
+# Viewable compute-job artifacts (png/jpg/webp/gif/mp4/webm) at
+# compute-jobs/<job_uuid>/artifacts/viewable/ are EXCLUDED from the GCS bucket
+# lifecycle rules (which only cover .tar.gz bundles and tasks/ payloads — see
+# infra/terraform/iam.tf).  They are retired by the reaper sweep
+# (reaper_sweeps.sweep_retire_viewable_artifacts) at this retention window.
+# Once reaped, signed preview URLs for these objects 404 permanently — the
+# frontend uses artifact_expires_at() stamped with this constant to distinguish
+# a transient preview failure from permanent expiry.
+# NOTE: This is the SINGLE authoritative value for viewable-artifact retention.
+# Both the expiry stamp (artifact_expires_at) and the reaper sweep
+# (sweep_retire_viewable_artifacts) must consume this same constant.  The
+# drift-guard test in test_reaper_sweeps_viewable_retire.py enforces this.
+VIEWABLE_ARTIFACT_RETENTION_DAYS = 180
 
 
 def artifact_expires_at(ts: datetime.datetime | None) -> str | None:
