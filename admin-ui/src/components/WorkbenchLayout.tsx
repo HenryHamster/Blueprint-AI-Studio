@@ -119,15 +119,23 @@ export function WorkbenchSplit({
   main,
   rail,
   railClassName = '',
+  railCollapsed = false,
 }: {
   main: ReactNode;
   rail?: ReactNode;
   railClassName?: string;
+  /** When true, the rail is hidden and the main column spans full width. */
+  railCollapsed?: boolean;
 }) {
+  const showRail = Boolean(rail) && !railCollapsed;
   return (
-    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,26vw)]">
+    <div
+      className={`grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden ${
+        showRail ? 'lg:grid-cols-[minmax(0,1fr)_minmax(300px,26vw)]' : ''
+      }`}
+    >
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">{main}</div>
-      {rail && (
+      {showRail && (
         <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-workbench-border bg-workbench-rail p-1.5 custom-scrollbar lg:block ${railClassName}`}>
           {rail}
         </aside>
