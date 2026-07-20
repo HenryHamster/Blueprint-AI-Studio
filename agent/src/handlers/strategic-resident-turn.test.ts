@@ -409,6 +409,192 @@ describe('strategic Resident turn handler', () => {
     });
   });
 
+  it('completes selected result evidence trust metadata from one server inspection', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          ...finalResultWithInspection({ evidence_id: 'engine-owner-observation' }),
+          evidence: [{
+            evidence_id: 'engine-owner-observation',
+            summary: 'Observed the authoritative Resident turn.',
+          }],
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string) => (
+      Promise.resolve(path === '/api/agent/resident-turn/capability'
+        ? { capability_id: 'task.inspect', evidence: canonicalInspectionEvidence() }
+        : {})
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+    expect(mocks.apiPost.mock.calls[1][1]).toMatchObject({
+      result: {
+        evidence: [{
+          evidence_id: 'engine-owner-observation',
+          kind: 'task',
+          source_id: inspectionTaskId,
+          revision: inspectionRevision,
+          checksum: inspectionChecksum,
+          summary: 'Observed the authoritative Resident turn.',
+        }],
+      },
+      evidence_inspections: [{
+        evidence_id: 'engine-owner-observation',
+        kind: 'task',
+        source_id: inspectionTaskId,
+        revision: inspectionRevision,
+        checksum: inspectionChecksum,
+        inspected_at: inspectionTimestamp,
+        decisive: true,
+      }],
+    });
+  });
+
+  it('does not synthesize a missing semantic result evidence item', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          ...finalResultWithInspection({ evidence_id: 'engine-owner-observation' }),
+          evidence: [],
+        }),
+      });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect', evidence: canonicalInspectionEvidence(),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('does not identify one result evidence item');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
+
+  it('does not synthesize a missing result evidence summary', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          ...finalResultWithInspection({ evidence_id: 'engine-owner-observation' }),
+          evidence: [{ evidence_id: 'engine-owner-observation' }],
+        }),
+      });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect', evidence: canonicalInspectionEvidence(),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('result evidence requires evidence_id and summary');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
+
+  it('rejects unknown fields on selected result evidence instead of stripping them', async () => {
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      ...(finalResult.evidence as Record<string, unknown>[])[0],
+      injected_authority: 99,
+    }];
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(finalResult) });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect', evidence: canonicalInspectionEvidence(),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('result evidence contains an unknown field');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
+
+  it.each([
+    ['kind', 'runner'],
+    ['source_id', '44444444-4444-4444-4444-444444444444'],
+    ['revision', `task:${inspectionTaskId}:stale`],
+    ['checksum', 'd'.repeat(64)],
+  ])('does not overwrite stale result evidence %s', async (field, value) => {
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      ...(finalResult.evidence as Record<string, unknown>[])[0],
+      [field]: value,
+    }];
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(finalResult) });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect', evidence: canonicalInspectionEvidence(),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('is not backed by one server inspection');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
+
   it('rejects a partial inspection reference not backed by one server receipt', async () => {
     const taskId = '33333333-3333-3333-3333-333333333333';
     mocks.runClaudeCode
@@ -680,6 +866,7 @@ describe('strategic Resident turn handler', () => {
     const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
     expect(finalPrompt).toContain('Capability actions are closed for this turn');
     expect(finalPrompt).toContain('evidence_inspections must be an array of objects shaped');
+    expect(finalPrompt).toContain('Each cited result.evidence item must be shaped');
     expect(finalPrompt).not.toContain('{"capability_requests"');
     expect(finalPrompt).not.toContain('{"mutation_requests"');
     expect(finalPrompt).not.toContain('Request at most');
@@ -738,6 +925,7 @@ describe('strategic Resident turn handler', () => {
     const finalPrompt = String(mocks.runClaudeCode.mock.calls[1][0]);
     expect(finalPrompt).toContain('Capability actions are closed for this turn');
     expect(finalPrompt).toContain('evidence_inspections must be an array of objects shaped');
+    expect(finalPrompt).toContain('Each cited result.evidence item must be shaped');
     expect(finalPrompt).not.toContain('{"capability_requests"');
     expect(finalPrompt).not.toContain('{"mutation_requests"');
     expect(finalPrompt).not.toContain('Request at most');
