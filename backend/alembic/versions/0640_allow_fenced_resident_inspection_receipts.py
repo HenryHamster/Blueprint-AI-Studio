@@ -69,9 +69,9 @@ _MUTATION_REVISION_SQL = """
 
 
 def _fence_function_sql(*, allow_inspections: bool) -> str:
-    revision_fence = _MUTATION_REVISION_SQL
+    receipt_predicate_sql = _MUTATION_REVISION_SQL
     if allow_inspections:
-        revision_fence = f"(({_INSPECTION_PAIR_SQL}) OR ({_MUTATION_REVISION_SQL}))"
+        receipt_predicate_sql = f"(({_INSPECTION_PAIR_SQL}) OR ({_MUTATION_REVISION_SQL}))"
     return f"""
         CREATE OR REPLACE FUNCTION fence_strategicoperationreceipt_insert()
         RETURNS trigger LANGUAGE plpgsql AS $$
@@ -112,7 +112,7 @@ def _fence_function_sql(*, allow_inspections: bool) -> str:
                     = NEW.authority_generation
               AND turn_task.context->>'_resident_engine_owner_observed'
                     = 'strategic_resident'
-              AND ({revision_fence})
+              AND ({receipt_predicate_sql})
             FOR SHARE;
           IF NOT FOUND THEN
             RAISE EXCEPTION 'Resident mutation authority is stale or invalid'
