@@ -80,6 +80,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
+    ADMIN_CANCEL,
     AGENT_TIMEOUT,
     PROVISION_FAILURE,
     RATE_LIMIT,
@@ -2835,9 +2836,10 @@ async def run_qualification(
     # Carry forward the infra-failure streak so _finalize_qualification can
     # detect a persistently broken qualifier pipeline.  The streak is the count
     # of consecutive infrastructure failures (FAILED/CANCELLED required child
-    # tasks) before the current pending run — it resets to 0 whenever a prior
-    # finalization wrote a non-infra_failure status OR when the candidate SHA
-    # changes (a new commit should not inherit infra failures from prior SHAs).
+    # tasks) before the current pending run — it resets to 0 only when a prior
+    # finalization wrote a non-infra_failure status.  It accumulates across
+    # advancing candidate SHAs so that repeated cancellations on a moving
+    # automain still trip the escalation cap and fire an operator Alert.
     prior_infra_failure_candidate_sha = (
         prior_qual.get("candidate_sha")
         if prior_qual.get("status") == "infra_failure"
@@ -2845,10 +2847,7 @@ async def run_qualification(
     )
     prior_infra_streak: int = (
         int(prior_qual.get("consecutive_infra_errors") or 0)
-        if (
-            prior_qual.get("status") == "infra_failure"
-            and prior_infra_failure_candidate_sha == candidate_sha
-        )
+        if prior_qual.get("status") == "infra_failure"
         else 0
     )
     prior_infra_failure_signature = (
@@ -5585,6 +5584,71 @@ async def _finalize_qualification(
                         "status": "audit_infra_respawned",
                         "respawn_count": new_count,
                     }
+                # ADMIN_CANCEL on a CANCELLED audit child (reaper cascade, admin
+                # action, dedup, force-finalize) is a transient external
+                # interruption — candidate quality was never evaluated.  Respawn
+                # the same candidate_sha, parallel to RATE_LIMIT / infra respawn.
+                admin_cancel_respawn_count = qual.get(
+                    "audit_admin_cancel_respawn_count", 0
+                )
+                if (
+                    _audit_task_obj.status == TaskStatus.CANCELLED
+                    and _audit_explicit_cat == ADMIN_CANCEL
+                    and admin_cancel_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    fp = _audit_task_obj.first_payload or {}
+                    _project = await session.get(Project, version.project_id)
+                    _integration_branch = get_project_integration_branch(_project)
+                    new_base_branch = fp.get("base_branch", "") or _integration_branch
+                    new_diff_range = (
+                        fp.get("diff_range", "")
+                        or f"{_integration_branch}...{candidate_sha}"
+                    )
+                    new_audit_task = await _spawn_release_audit_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=new_base_branch,
+                        diff_range=new_diff_range,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                        audit_base_sha=fp.get("audit_base_sha"),
+                        version_goal=_frozen_version_goal,
+                    )
+                    new_count = admin_cancel_respawn_count + 1
+                    updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="audit",
+                        failed_task=_audit_task_obj,
+                        replacement_task_id=str(new_audit_task.id),
+                        label="audit_admin_cancel_respawned",
+                        respawn_count=new_count,
+                    )
+                    updated_qual = {
+                        **updated_qual,
+                        "audit_task_id": str(new_audit_task.id),
+                        "audit_admin_cancel_respawn_count": new_count,
+                    }
+                    updated_qual = _advance_qualification_retry_episode(
+                        version, updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
+                    version.last_qualification = updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d audit task %s was admin-cancelled; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        audit_task_id,
+                        new_audit_task.id,
+                        new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "audit_admin_cancel_respawned",
+                        "respawn_count": new_count,
+                    }
                 infra_label = _enrich_infra_error(
                     f"audit_task_{_audit_task_obj.status.lower()}",
                     _audit_task_obj,
@@ -5601,6 +5665,12 @@ async def _finalize_qualification(
                     and infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                 ):
                     infra_label = "audit_infra_respawn_cap_exceeded"
+                if (
+                    _audit_task_obj.status == TaskStatus.CANCELLED
+                    and _audit_explicit_cat == ADMIN_CANCEL
+                    and admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    infra_label = "audit_admin_cancel_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,
@@ -5627,14 +5697,73 @@ async def _finalize_qualification(
                 _smoke_task_obj is not None
                 and _smoke_task_obj.status in _INFRA_FAILURE_TERMINAL_STATUSES
             ):
+                _smoke_explicit_cat = (_smoke_task_obj.context or {}).get(
+                    "failure_category", ""
+                ) or (_smoke_task_obj.context or {}).get("failure_class", "")
+                smoke_admin_cancel_respawn_count = qual.get(
+                    "smoketest_admin_cancel_respawn_count", 0
+                )
+                if (
+                    _smoke_task_obj.status == TaskStatus.CANCELLED
+                    and _smoke_explicit_cat == ADMIN_CANCEL
+                    and smoke_admin_cancel_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_new_task = await _spawn_qualifier_smoketest_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                    )
+                    _smoke_new_count = smoke_admin_cancel_respawn_count + 1
+                    _smoke_updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="smoketest",
+                        failed_task=_smoke_task_obj,
+                        replacement_task_id=str(_smoke_new_task.id),
+                        label="smoketest_admin_cancel_respawned",
+                        respawn_count=_smoke_new_count,
+                    )
+                    _smoke_updated_qual = {
+                        **_smoke_updated_qual,
+                        "smoketest_task_id": str(_smoke_new_task.id),
+                        "smoketest_admin_cancel_respawn_count": _smoke_new_count,
+                    }
+                    _smoke_updated_qual = _advance_qualification_retry_episode(
+                        version, _smoke_updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
+                    version.last_qualification = _smoke_updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d smoketest task %s was admin-cancelled; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        smoketest_task_id,
+                        _smoke_new_task.id,
+                        _smoke_new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "smoketest_admin_cancel_respawned",
+                        "respawn_count": _smoke_new_count,
+                    }
+                _smoke_infra_label = _enrich_infra_error(
+                    f"smoketest_task_{_smoke_task_obj.status.lower()}",
+                    _smoke_task_obj,
+                )
+                if (
+                    _smoke_task_obj.status == TaskStatus.CANCELLED
+                    and _smoke_explicit_cat == ADMIN_CANCEL
+                    and smoke_admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_infra_label = "smoketest_admin_cancel_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,
                     qual,
-                    _enrich_infra_error(
-                        f"smoketest_task_{_smoke_task_obj.status.lower()}",
-                        _smoke_task_obj,
-                    ),
+                    _smoke_infra_label,
                 )
         except (ValueError, TypeError):
             logger.warning(
@@ -6213,6 +6342,107 @@ async def _finalize_qualification(
                                     "status": "challenge_infra_respawned",
                                     "respawn_count": _chal_new_count,
                                 }
+                    # ADMIN_CANCEL on a CANCELLED challenge child — respawn
+                    # the same candidate, parallel to PROVISION_FAILURE/AGENT_TIMEOUT.
+                    challenge_admin_cancel_respawn_count = qual.get(
+                        "challenge_admin_cancel_respawn_count", 0
+                    )
+                    if (
+                        _challenge_task_obj.status == TaskStatus.CANCELLED
+                        and _chal_explicit_cat == ADMIN_CANCEL
+                        and challenge_admin_cancel_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                    ):
+                        _chal_payload = _challenge_task_obj.first_payload or {}
+                        _audit_payload = (
+                            _audit_task_obj.first_payload
+                            if _audit_task_obj is not None
+                            else {}
+                        )
+                        _chal_project2 = await session.get(Project, version.project_id)
+                        _, _chal_promo_target2 = (
+                            _lts_branch_names(_chal_project2)
+                            if _chal_project2 is not None
+                            else ("", "main")
+                        )
+                        _chal_base_branch2 = (
+                            _chal_payload.get("base_branch")
+                            or _audit_payload.get("base_branch")
+                            or _chal_promo_target2
+                        )
+                        _chal_diff_range2 = (
+                            _chal_payload.get("diff_range")
+                            or _audit_payload.get("diff_range")
+                            or f"{_chal_base_branch2}...{candidate_sha}"
+                        )
+                        _chal_primary_findings2 = _primary_findings_for_challenge_retry(
+                            audit_report
+                        )
+                        if _chal_primary_findings2:
+                            from app.payload_schemas import PayloadTooLargeError
+
+                            try:
+                                _new_challenge_task2 = (
+                                    await _spawn_release_audit_challenge_task(
+                                        session,
+                                        version.project_id,
+                                        version_id=version.id,
+                                        base_branch=_chal_base_branch2,
+                                        diff_range=_chal_diff_range2,
+                                        candidate_sha=candidate_sha,
+                                        qualification_attempt_id=attempt_id,
+                                        primary_audit_task_id=audit_task_id,
+                                        primary_findings=_chal_primary_findings2,
+                                        version_goal=_frozen_version_goal,
+                                    )
+                                )
+                            except PayloadTooLargeError as _chal_exc2:
+                                logger.warning(
+                                    "[RELEASE_QUALIFIER] v%d challenge admin-cancel respawn "
+                                    "skipped — primary_findings payload too large "
+                                    "(%s); routing to infra_failure",
+                                    version.version_number,
+                                    _chal_exc2,
+                                )
+                            else:
+                                _chal_ac_new_count = challenge_admin_cancel_respawn_count + 1
+                                _chal_ac_updated_qual = append_infra_failure_child_event(
+                                    qual,
+                                    leg="challenge",
+                                    failed_task=_challenge_task_obj,
+                                    replacement_task_id=str(_new_challenge_task2.id),
+                                    label="challenge_admin_cancel_respawned",
+                                    respawn_count=_chal_ac_new_count,
+                                )
+                                version.last_qualification = {
+                                    **_chal_ac_updated_qual,
+                                    "status": "pending",
+                                    "challenge_task_id": str(_new_challenge_task2.id),
+                                    "audit_challenge_task_id": str(
+                                        _new_challenge_task2.id
+                                    ),
+                                    "challenge_admin_cancel_respawn_count": _chal_ac_new_count,
+                                }
+                                version.last_qualification = _advance_qualification_retry_episode(
+                                    version,
+                                    version.last_qualification,
+                                    cap=_MAX_AUDIT_RL_RESPAWNS,
+                                )
+                                flag_modified(version, "last_qualification")
+                                session.add(version)
+                                await session.flush()
+                                logger.info(
+                                    "[RELEASE_QUALIFIER] v%d challenge task %s was "
+                                    "admin-cancelled; re-spawned as %s (respawn %d/%d)",
+                                    version.version_number,
+                                    challenge_task_id,
+                                    _new_challenge_task2.id,
+                                    _chal_ac_new_count,
+                                    _MAX_AUDIT_RL_RESPAWNS,
+                                )
+                                return {
+                                    "status": "challenge_admin_cancel_respawned",
+                                    "respawn_count": _chal_ac_new_count,
+                                }
                     _challenge_infra_label = _enrich_infra_error(
                         f"audit_challenge_task_{_challenge_task_obj.status.lower()}",
                         _challenge_task_obj,
@@ -6223,6 +6453,12 @@ async def _finalize_qualification(
                         and challenge_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                     ):
                         _challenge_infra_label = "challenge_infra_respawn_cap_exceeded"
+                    if (
+                        _challenge_task_obj.status == TaskStatus.CANCELLED
+                        and _chal_explicit_cat == ADMIN_CANCEL
+                        and challenge_admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                    ):
+                        _challenge_infra_label = "challenge_admin_cancel_respawn_cap_exceeded"
                     return await _handle_infra_failure(
                         session,
                         version,

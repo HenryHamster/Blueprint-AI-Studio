@@ -355,14 +355,14 @@ async def _redrive_infra_failure_qualification(
 
     The attempt cap keys on the PERSISTED ``last_qualification["consecutive_infra_errors"]``
     streak that the finalize path (``_handle_infra_failure``) maintains — a
-    per-infra-failure-episode counter that resets to 0 when the candidate SHA
-    changes or a non-infra verdict lands — NOT the lifetime ``qualification_attempts``
-    column (which would silently block re-drives for long-lived versions) and NOT
-    the synchronous ``run_qualification`` return value (which never reports
-    ``infra_failure``: that verdict is only ever written asynchronously at finalize,
-    when the qualifier children terminate).  Because the streak is SHA-scoped, a
-    candidate whose HEAD keeps advancing is never blocked (each new SHA resets the
-    streak to 0); the cap trips only when the SAME candidate fails infra repeatedly.
+    counter that resets to 0 only when a non-infra verdict lands — NOT the
+    lifetime ``qualification_attempts`` column (which would silently block
+    re-drives for long-lived versions) and NOT the synchronous
+    ``run_qualification`` return value (which never reports ``infra_failure``:
+    that verdict is only ever written asynchronously at finalize, when the
+    qualifier children terminate).  The streak accumulates across advancing
+    candidate SHAs so that repeated cancellations on a moving automain still
+    trip the cap and fire an operator Alert.
 
     Commit behavior: COMMIT on every outcome (same as ``_redrive_error_qualification``).
     ``run_qualification`` writes a new ``last_qualification`` on every path it takes,

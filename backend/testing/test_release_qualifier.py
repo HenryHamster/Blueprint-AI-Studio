@@ -21143,11 +21143,14 @@ class TestFinalizeInfraFailure:
         assert prior_streak == 0  # streak reset after a real verdict
 
     @pytest.mark.asyncio
-    async def test_infra_failure_streak_resets_when_candidate_sha_changes(
+    async def test_infra_failure_streak_carries_across_candidate_sha_change(
         self, db_session
     ):
-        """The infra-failure streak resets to 0 when a new candidate SHA is
-        provided after an infra_failure on a different SHA."""
+        """The infra-failure streak must carry forward even when the candidate SHA
+        advances so that repeated audit/smoketest cancellations on a moving
+        automain accumulate toward the escalation cap and fire an operator Alert.
+        (Regression guard: old code reset the streak to 0 on SHA change, so the
+        cap never tripped on a rolling automain.)"""
         from app import shared_state
 
         shared_state.runtime_config["promotion_enabled"] = False
@@ -21166,29 +21169,81 @@ class TestFinalizeInfraFailure:
         db_session.add(version)
         await db_session.commit()
 
-        # Now simulate a new run_qualification with SHA B (beef...beef)
+        # Simulate a new run_qualification with SHA B (beef...beef) — the streak
+        # init logic that mirrors what run_qualification does internally.
         new_candidate_sha = "beef" * 10
-        # In real code, run_qualification would call _resolve_candidate_ci, etc.
-        # Here we simulate just the streak initialization part
         prior_qual = version.last_qualification or {}
-        prior_infra_failure_candidate_sha = (
-            prior_qual.get("candidate_sha")
-            if prior_qual.get("status") == "infra_failure"
-            else None
-        )
-        # This is the fix: prior_infra_streak should be 0 when SHA changes
+        # Streak carries regardless of SHA change (the fix).
         prior_infra_streak = (
             int(prior_qual.get("consecutive_infra_errors") or 0)
-            if (
-                prior_qual.get("status") == "infra_failure"
-                and prior_infra_failure_candidate_sha == new_candidate_sha
-            )
+            if prior_qual.get("status") == "infra_failure"
             else 0
         )
-        # Verify the streak resets to 0 when SHA changes
-        assert prior_infra_streak == 0, (
-            f"Expected streak=0 when SHA changes from {old_candidate_sha[:8]} "
-            f"to {new_candidate_sha[:8]}, but got streak={prior_infra_streak}"
+        assert prior_infra_streak == 2, (
+            f"Expected streak=2 to carry forward when SHA changes from "
+            f"{old_candidate_sha[:8]} to {new_candidate_sha[:8]}, "
+            f"but got streak={prior_infra_streak}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_infra_failure_escalation_fires_across_advancing_shas(
+        self, db_session, monkeypatch
+    ):
+        """When infra failures accumulate across multiple advancing candidate SHAs
+        (each run_qualification sees a new SHA), the streak still reaches the cap
+        and fires an operator Alert — the escalation must not be gated on SHA
+        stability."""
+        from app import release_qualifier as rq_module
+        from app import release_qualifier_audit as rqa
+        from app.release_qualifier_audit import _MIN_INFRA_ERROR_STREAK
+
+        notified: list[str] = []
+
+        async def _capture_notify(session, version, event, message, extra=None):
+            notified.append(message)
+
+        monkeypatch.setattr(rq_module, "_notify_operator", _capture_notify)
+
+        project, version = await _make_project_and_version(db_session)
+
+        # Seed a pending qualification record that carries prior_infra_streak from
+        # a DIFFERENT candidate SHA (SHA_A), simulating what run_qualification
+        # stamps when the previous last_qualification was infra_failure on SHA_A
+        # and the new cycle runs on SHA_B.
+        sha_a = "cafe" * 10
+        sha_b = "beef" * 10
+        _seed_count = _MIN_INFRA_ERROR_STREAK - 1
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": sha_b,  # current cycle is on SHA_B
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-07-19T00:00:00",
+            # prior_infra_streak carried from SHA_A infra failures (the fix path)
+            "prior_infra_streak": _seed_count,
+            "previous_infra_failure_candidate_sha": sha_a,  # came from a different SHA
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        await db_session.refresh(version)
+        lq = version.last_qualification
+        assert lq["status"] == "infra_failure"
+        assert lq["consecutive_infra_errors"] == _MIN_INFRA_ERROR_STREAK, (
+            f"Expected streak={_MIN_INFRA_ERROR_STREAK} after accumulating across "
+            f"SHA change but got {lq.get('consecutive_infra_errors')}"
+        )
+        assert notified, (
+            "Expected operator Alert to fire when streak reached cap across advancing "
+            "SHAs, but no notification was sent"
         )
 
     @pytest.mark.asyncio
@@ -22888,6 +22943,546 @@ class TestFinalizeInfraFailure:
         assert result["is_permanent_gate_incapacity"] is False
         assert result["same_signature_streak"] == 0
         assert result["consecutive_infra_errors"] == 3
+
+    @pytest.mark.asyncio
+    async def test_audit_admin_cancel_respawns_new_task(self, db_session):
+        """CANCELLED+ADMIN_CANCEL audit child → respawn, not infra_failure.
+
+        An externally cancelled audit (admin action, reaper cascade, dedup)
+        bears failure_category=ADMIN_CANCEL.  The qualifier must re-spawn the
+        audit with the same candidate_sha and return
+        status='audit_admin_cancel_respawned' without burning the infra-failure
+        streak or emitting a release_infra_failure project message.
+        """
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        attempt_id = uuid.uuid4()
+        candidate = "abcd9876" * 5
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "candidate_sha": candidate,
+                    "qualification_attempt_id": str(attempt_id),
+                }
+            ],
+            vm_instance_id="vm-audit-admin-cancel",
+            status=TaskStatus.CANCELLED,
+            context={
+                "release_version_id": str(version.id),
+                "qualification_attempt_id": str(attempt_id),
+            },
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, ADMIN_CANCEL)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        original_audit_id = str(audit_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": 0,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": original_audit_id,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+        }
+        version.active_qualification_attempt_id = attempt_id
+        version.qualification_attempts = 1
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "audit_admin_cancel_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["audit_admin_cancel_respawn_count"] == 1
+        assert new_qual["audit_task_id"] != original_audit_id
+        assert new_qual["qualification_attempt_id"] == str(attempt_id)
+        assert new_qual["retry_episode"] == 1
+        assert new_qual["retry_episode_cap"] == _MAX_AUDIT_RL_RESPAWNS
+        assert version.qualification_attempts == 1
+
+        replacement = await db_session.get(Task, uuid.UUID(new_qual["audit_task_id"]))
+        assert replacement is not None
+        assert replacement.context["qualification_attempt_id"] == str(attempt_id)
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+        infra_msg_count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_infra_failure",
+                )
+            )
+        ).scalar()
+        assert infra_msg_count == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_admin_cancel_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When audit_admin_cancel_respawn_count hits cap, fall through to
+        infra_failure with label 'audit_admin_cancel_respawn_cap_exceeded'."""
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "cafe4321" * 5
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[
+                {
+                    "type": "release_audit",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "candidate_sha": candidate,
+                }
+            ],
+            vm_instance_id="vm-audit-ac-cap",
+            status=TaskStatus.CANCELLED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        persist_failure_category(audit_task, ADMIN_CANCEL)
+        db_session.add(audit_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": None,
+            "prior_infra_streak": 0,
+            "audit_admin_cancel_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "audit_admin_cancel_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "audit_admin_cancel_respawn_cap_exceeded"
+        )
+
+    @pytest.mark.asyncio
+    async def test_smoketest_admin_cancel_respawns_new_task(self, db_session):
+        """CANCELLED+ADMIN_CANCEL smoketest child → respawn, not infra_failure.
+
+        A smoketest task externally cancelled with ADMIN_CANCEL classification
+        is a transient interruption — the qualifier must re-spawn the smoketest
+        and return status='smoketest_admin_cancel_respawned'.
+        """
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        attempt_id = uuid.uuid4()
+        candidate = "beef5678" * 5
+
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "automain"}],
+            vm_instance_id="vm-audit-smoke-ac",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[
+                {
+                    "type": "smoketest",
+                    "candidate_sha": candidate,
+                    "qualification_attempt_id": str(attempt_id),
+                }
+            ],
+            vm_instance_id="vm-smoke-admin-cancel",
+            status=TaskStatus.CANCELLED,
+            context={
+                "release_version_id": str(version.id),
+                "qualification_attempt_id": str(attempt_id),
+            },
+        )
+        db_session.add(audit_task)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(smoke_task)
+
+        persist_failure_category(smoke_task, ADMIN_CANCEL)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        original_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "qualification_attempt_id": str(attempt_id),
+            "retry_episode": 0,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": original_smoke_id,
+            "prior_infra_streak": 0,
+        }
+        version.active_qualification_attempt_id = attempt_id
+        version.qualification_attempts = 1
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "smoketest_admin_cancel_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["smoketest_admin_cancel_respawn_count"] == 1
+        assert new_qual["smoketest_task_id"] != original_smoke_id
+        assert new_qual["retry_episode"] == 1
+        assert new_qual["retry_episode_cap"] == _MAX_AUDIT_RL_RESPAWNS
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+        infra_msg_count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_infra_failure",
+                )
+            )
+        ).scalar()
+        assert infra_msg_count == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_admin_cancel_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When smoketest_admin_cancel_respawn_count hits cap, fall through to
+        infra_failure with label 'smoketest_admin_cancel_respawn_cap_exceeded'."""
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "dead9999" * 5
+
+        audit_task = Task(
+            project_id=project.id,
+            title="audit",
+            payloads=[{"type": "release_audit", "base_branch": "automain"}],
+            vm_instance_id="vm-audit-smoke-ac-cap",
+            status=TaskStatus.COMPLETED,
+            context={"release_version_id": str(version.id)},
+        )
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "candidate_sha": candidate}],
+            vm_instance_id="vm-smoke-ac-cap",
+            status=TaskStatus.CANCELLED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(audit_task)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(audit_task)
+        await db_session.refresh(smoke_task)
+
+        persist_failure_category(smoke_task, ADMIN_CANCEL)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": str(audit_task.id),
+            "smoketest_task_id": str(smoke_task.id),
+            "prior_infra_streak": 0,
+            "smoketest_admin_cancel_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_admin_cancel_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "smoketest_admin_cancel_respawn_cap_exceeded"
+        )
+
+    async def _seed_challenge_admin_cancel_scenario(
+        self,
+        db_session,
+        *,
+        challenge_admin_cancel_respawn_count: int = 0,
+    ):
+        """Seed a version whose challenge child was externally ADMIN_CANCELled.
+
+        Returns ``(project, version, challenge_task_id)``.  The primary audit is
+        COMPLETED and carries deductible findings so
+        ``_primary_findings_for_challenge_retry`` yields a non-empty payload,
+        letting the challenge-leg admin-cancel respawn path exercise its spawn.
+        """
+        from app.failure_classification import ADMIN_CANCEL, persist_failure_category
+
+        project, version = await _make_project_and_version(db_session)
+        audit_task, smoke_task = await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "test_erosion": {
+                    "deleted_test_files": [],
+                    "assertion_delta": 0,
+                    "test_count_delta": 0,
+                },
+                "findings": [
+                    {
+                        "severity": "high",
+                        "summary": "Unbounded retry can promote stale challenge state.",
+                        "file": "backend/app/release_qualifier.py",
+                        "verification_note": "Read backend/app/release_qualifier.py:1950 and confirmed the stale challenge state can be reused.",
+                    },
+                    {
+                        "severity": "medium",
+                        "description": "Challenge matching loses the release scoring file.",
+                        "file_path": "backend/app/release_scoring.py",
+                        "verification_note": "Read backend/app/release_scoring.py:1300 and confirmed the binding match can fail.",
+                    },
+                ],
+            },
+            smoke_logs={
+                "passed": True,
+                "tests": [{"name": "startup", "status": "pass"}],
+                "suites": {"startup": {"passed": True}},
+            },
+            challenge_verdicts=None,
+        )
+
+        candidate = version.last_qualification["candidate_sha"]
+        challenge_task = Task(
+            project_id=project.id,
+            title="audit-challenge",
+            payloads=[
+                {
+                    "type": "release_audit_challenge",
+                    "base_branch": "main",
+                    "candidate_sha": candidate,
+                }
+            ],
+            vm_instance_id="vm-challenge-admin-cancel",
+            status=TaskStatus.CANCELLED,
+            context={
+                "release_version_id": str(version.id),
+                "candidate_sha": candidate,
+            },
+        )
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(challenge_task)
+
+        persist_failure_category(challenge_task, ADMIN_CANCEL)
+        db_session.add(challenge_task)
+        await db_session.commit()
+        await db_session.refresh(challenge_task)
+
+        challenge_task_id = str(challenge_task.id)
+        version.last_qualification = {
+            **version.last_qualification,
+            "status": "pending",
+            "challenge_task_id": challenge_task_id,
+            "audit_challenge_task_id": challenge_task_id,
+            "challenge_admin_cancel_respawn_count": (
+                challenge_admin_cancel_respawn_count
+            ),
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+        return project, version, challenge_task_id
+
+    @pytest.mark.asyncio
+    async def test_challenge_admin_cancel_respawns_new_task(self, db_session):
+        """CANCELLED+ADMIN_CANCEL challenge child → respawn, not infra_failure.
+
+        An externally cancelled challenge (admin action, reaper cascade) bears
+        failure_category=ADMIN_CANCEL.  The qualifier must re-spawn the challenge
+        with the same candidate_sha and return
+        status='challenge_admin_cancel_respawned' without burning the
+        infra-failure streak or emitting a release_infra_failure project message.
+        """
+        project, version, original_challenge_id = (
+            await self._seed_challenge_admin_cancel_scenario(db_session)
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "challenge_admin_cancel_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["challenge_admin_cancel_respawn_count"] == 1
+        assert new_qual["challenge_task_id"] != original_challenge_id
+        # Dual write: audit_challenge_task_id tracks the new challenge task id.
+        assert new_qual["audit_challenge_task_id"] == new_qual["challenge_task_id"]
+        assert new_qual["status"] == "pending"
+
+        replacement = await db_session.get(
+            Task, uuid.UUID(new_qual["challenge_task_id"])
+        )
+        assert replacement is not None
+        assert (
+            replacement.first_payload["type"] == "release_audit_challenge"
+        )
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+        infra_msg_count = (
+            await db_session.execute(
+                select(sa_func.count()).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.context["event_type"].as_string()
+                    == "release_infra_failure",
+                )
+            )
+        ).scalar()
+        assert infra_msg_count == 0
+
+    @pytest.mark.asyncio
+    async def test_challenge_admin_cancel_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When challenge_admin_cancel_respawn_count hits cap, fall through to
+        infra_failure with label 'challenge_admin_cancel_respawn_cap_exceeded'."""
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        _project, version, _challenge_task_id = (
+            await self._seed_challenge_admin_cancel_scenario(
+                db_session,
+                challenge_admin_cancel_respawn_count=_MAX_AUDIT_RL_RESPAWNS,
+            )
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "challenge_admin_cancel_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert version.last_qualification["status"] == "infra_failure"
+        assert (
+            version.last_qualification["error"]
+            == "challenge_admin_cancel_respawn_cap_exceeded"
+        )
+
+    @pytest.mark.asyncio
+    async def test_challenge_admin_cancel_payload_too_large_routes_to_infra_failure(
+        self, db_session, mocker
+    ):
+        """PayloadTooLargeError on the admin-cancel respawn spawn → infra_failure.
+
+        The spawn of the replacement challenge can reject an over-large
+        primary_findings payload.  Rather than crash, the leg logs and falls
+        through to _handle_infra_failure with the plain cancelled label (the
+        respawn count has NOT hit the cap, so the cap-exceeded label is not used).
+        """
+        from app.payload_schemas import PayloadTooLargeError
+
+        _project, version, _challenge_task_id = (
+            await self._seed_challenge_admin_cancel_scenario(db_session)
+        )
+
+        mocker.patch(
+            "app.release_qualifier._spawn_release_audit_challenge_task",
+            new=AsyncMock(
+                side_effect=PayloadTooLargeError(
+                    9_999_999, 1_000_000, [("primary_findings", 9_999_999)]
+                )
+            ),
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        # count < cap, so the plain cancelled label is used, not cap_exceeded.
+        assert result["error"] == "audit_challenge_task_cancelled"
+
+        await db_session.refresh(version)
+        assert version.last_qualification["status"] == "infra_failure"
+        # No respawn happened: the counter is untouched.
+        assert (
+            version.last_qualification.get("challenge_admin_cancel_respawn_count", 0)
+            == 0
+        )
 
 # ===========================================================================
 # _finalize_qualification — reaper-induced heartbeat timeout
