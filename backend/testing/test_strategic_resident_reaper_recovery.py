@@ -22,6 +22,9 @@ from app.strategic_resident_agent_binding import (
 from app.strategic_resident_failure_recovery import (
     reap_authoritative_resident_turn,
 )
+from app.strategic_resident_inspection_runtime import (
+    CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY,
+)
 from testing._resident_seed import seed_without_authority_enforcement
 
 
@@ -220,6 +223,35 @@ async def test_reaper_preserves_paused_interactive_retry_with_backoff(db_session
     assert promoted.retry_after_until is not None
     delay = (promoted.retry_after_until - active.completed_at).total_seconds()
     assert 0 < delay <= 1_800
+
+
+@pytest.mark.asyncio
+async def test_reaper_clears_capability_request_ledger_only_from_retry(db_session):
+    project, _resident, active, _successor = await _seed(
+        db_session, with_successor=False
+    )
+    ledger = ["inspection-request-fingerprint"]
+    active.context = {
+        **active.context,
+        CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY: ledger,
+    }
+    db_session.add(active)
+    await db_session.commit()
+
+    outcome = await reap_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        task_id=active.id,
+        reap_reason="Agent process exited after inspection",
+        reap_reason_code="heartbeat_timeout_post_claim",
+    )
+
+    assert outcome.promoted_task_id is not None
+    promoted = await db_session.get(Task, outcome.promoted_task_id)
+    await db_session.refresh(active)
+    assert promoted is not None
+    assert CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY not in promoted.context
+    assert active.context[CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY] == ledger
 
 
 @pytest.mark.asyncio

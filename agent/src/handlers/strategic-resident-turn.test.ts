@@ -59,6 +59,27 @@ function canonicalInspectionEvidence(
   };
 }
 
+function emptyFinalResult(reply = 'Resident conversation is operational.'): Record<string, unknown> {
+  return {
+    reply,
+    facts: [],
+    evidence: [],
+    operations: [],
+    receipts: [],
+    unknown_effects: [],
+    strategic_implications: [],
+    proposed_memory: [],
+    follow_up: null,
+    required_attention: [],
+    reconciliation: {
+      accepted_memory_proposal_ids: [],
+      accepted_implication_ids: [],
+      accepted_open_loop_ids: [],
+      resolved_open_loop_ids: [],
+      evidence_inspections: [],
+    },
+  };
+}
 function finalResultWithInspection(
   inspection: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -1654,29 +1675,7 @@ describe('strategic Resident turn handler', () => {
     expect(String(mocks.runClaudeCode.mock.calls[2][0])).toContain('reprioritize:33333333');
     expect(mocks.apiPost.mock.calls[2][0]).toBe('/api/agent/resident-turn/complete');
   });
-  it('rejects mutation evidence that was not inspected in the current turn', async () => {
-    mocks.runClaudeCode.mockResolvedValue({
-      exitCode: 0,
-      allOutput: '',
-      lastResultText: JSON.stringify({
-        mutation_requests: [{
-          capability_id: 'task.reprioritize',
-          parameters: { task_id: inspectionTaskId, priority: 50 },
-          operation_id: 'reprioritize:uninspected',
-          expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
-          evidence: [canonicalInspectionEvidence({ evidence_id: 'local-evidence' })],
-        }],
-      }),
-    });
-
-    await expect(handleStrategicResidentTurn(
-      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
-    )).rejects.toThrow('mutation evidence[0] is not backed by one server inspection');
-
-    expect(mocks.apiPost).not.toHaveBeenCalled();
-  });
-
-  it('rejects altered server data on mutation evidence', async () => {
+  it('recovers from invalid current-turn mutation evidence without posting a mutation', async () => {
     mocks.runClaudeCode
       .mockResolvedValueOnce({
         exitCode: 0,
@@ -1694,23 +1693,115 @@ describe('strategic Resident turn handler', () => {
           mutation_requests: [{
             capability_id: 'task.reprioritize',
             parameters: { task_id: inspectionTaskId, priority: 50 },
-            operation_id: 'reprioritize:altered-data',
+            operation_id: 'reprioritize:mixed-evidence',
             expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
-            evidence: [canonicalInspectionEvidence({ data: { status: 'COMPLETED' } })],
+            evidence: [
+              canonicalInspectionEvidence(),
+              canonicalInspectionEvidence({
+                source_id: '55555555-5555-5555-5555-555555555555',
+                revision: 'task:55555555-5555-5555-5555-555555555555:v1',
+              }),
+            ],
           }],
         }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(emptyFinalResult()),
       });
-    mocks.apiPost.mockResolvedValue({
-      capability_id: 'task.inspect',
-      evidence: canonicalInspectionEvidence({ data: { status: 'IN_PROGRESS' } }),
+    mocks.apiPost.mockImplementation((path: string) => Promise.resolve(
+      path === '/api/agent/resident-turn/capability'
+        ? { capability_id: 'task.inspect', evidence: canonicalInspectionEvidence() }
+        : {},
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('invalid_mutation_evidence');
+    expect(finalPrompt.match(/invalid_mutation_evidence/g)).toHaveLength(1);
+    expect(mocks.apiPost.mock.calls.map((call) => String(call[0]))).toStrictEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+  });
+
+  it('recovers once from an unavailable canonical inspection replay', async () => {
+    const inspectionRequest = {
+      capability_requests: [{
+        capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId },
+      }],
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult()),
+      });
+    mocks.apiPost.mockImplementation((path: string) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return Promise.reject(new Error(
+          'POST /api/agent/resident-turn/capability failed (409): '
+          + '{"error":{"code":409,"message":"canonical inspection receipt is unavailable or inconsistent"}}',
+        ));
+      }
+      return Promise.resolve({});
     });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('canonical_inspection_replay_unavailable');
+    expect(finalPrompt.match(/canonical_inspection_replay_unavailable/g)).toHaveLength(1);
+    expect(mocks.apiPost.mock.calls.map((call) => String(call[0]))).toStrictEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+    expect(mocks.sendLog).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining('reason=canonical_inspection_replay_unavailable'),
+    );
+  });
+
+  it.each([
+    ['server failure', new Error('POST /api/agent/resident-turn/capability failed (500): boom')],
+    ['network failure', new TypeError('fetch failed')],
+    [
+      'different conflict',
+      new Error(
+        'POST /api/agent/resident-turn/capability failed (409): '
+        + '{"detail":"Resident turn context is not frozen"}',
+      ),
+    ],
+  ])('fails closed for a non-recoverable inspection %s', async (_label, failure) => {
+    mocks.runClaudeCode.mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        capability_requests: [{
+          capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId },
+        }],
+      }),
+    });
+    mocks.apiPost.mockRejectedValueOnce(failure);
 
     await expect(handleStrategicResidentTurn(
       'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
-    )).rejects.toThrow('mutation evidence[0] is not backed by one server inspection');
+    )).rejects.toBe(failure);
 
+    expect(mocks.runClaudeCode).toHaveBeenCalledOnce();
     expect(mocks.apiPost).toHaveBeenCalledOnce();
-    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
   });
   it('rejects unknown mutation evidence fields instead of stripping them', async () => {
     mocks.runClaudeCode
