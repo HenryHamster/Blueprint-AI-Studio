@@ -530,6 +530,92 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
   });
 
+  it('accepts exact server-owned evidence extras and strips them from the strict result', async () => {
+    const data = { status: 'IN_PROGRESS', nested: { attempts: 1, labels: ['resident'] } };
+    const serverEvidence = canonicalInspectionEvidence({ data });
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      ...(finalResult.evidence as Record<string, unknown>[])[0],
+      project_id: providerInput.identity.project_id,
+      inspected_at: inspectionTimestamp,
+      data: { nested: { labels: ['resident'], attempts: 1 }, status: 'IN_PROGRESS' },
+    }];
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(finalResult) });
+    mocks.apiPost.mockImplementation((path: string) => (
+      Promise.resolve(path === '/api/agent/resident-turn/capability'
+        ? { capability_id: 'task.inspect', evidence: serverEvidence }
+        : {})
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.apiPost.mock.calls[1][1]).toMatchObject({
+      result: {
+        evidence: [{
+          evidence_id: 'engine-owner-observation',
+          kind: 'task',
+          source_id: inspectionTaskId,
+          revision: inspectionRevision,
+          checksum: inspectionChecksum,
+          summary: 'Observed the authoritative Resident turn.',
+        }],
+      },
+    });
+    const completion = mocks.apiPost.mock.calls[1][1] as {
+      result: { evidence: Record<string, unknown>[] };
+    };
+    expect(completion.result.evidence[0]).not.toHaveProperty('project_id');
+    expect(completion.result.evidence[0]).not.toHaveProperty('inspected_at');
+    expect(completion.result.evidence[0]).not.toHaveProperty('data');
+  });
+
+  it.each([
+    ['project_id', '99999999-9999-9999-9999-999999999999', {}],
+    ['inspected_at', '2026-07-20T06:37:50Z', {}],
+    ['data', { status: 'COMPLETED' }, { data: { status: 'IN_PROGRESS' } }],
+  ])('rejects changed server evidence extra %s', async (field, value, serverOverrides) => {
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      ...(finalResult.evidence as Record<string, unknown>[])[0],
+      [field]: value,
+    }];
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(finalResult) });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect',
+      evidence: canonicalInspectionEvidence(serverOverrides),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow(`unknown field or unverified server field: ${field}`);
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
   it('rejects unknown fields on selected result evidence instead of stripping them', async () => {
     const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
     finalResult.evidence = [{
