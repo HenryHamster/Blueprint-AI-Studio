@@ -20,6 +20,8 @@ import {
 import { createResidentProviderBoundary } from '../providers/resident-boundary.js';
 import {
   FINAL_RESULT_SCHEMA_HINT,
+  residentConversationReplyScope,
+  residentHasProjectedUnhandledUserRequest,
   residentReplyContract,
   residentResultRepairPrompt,
   residentResultShapeError,
@@ -386,6 +388,7 @@ function residentPrompt(
     ];
   const prompt = [
     'Return exactly one JSON object and no prose or markdown.',
+    residentConversationReplyScope(providerInput),
     ...actionInstructions,
     'In the final reconciliation, evidence_inspections must be an array of objects shaped {"evidence_id":"<result.evidence id>","decisive":true}; decisive is optional. Each evidence_id must name a result.evidence item copied from server-validated inspection evidence; the worker binds the canonical receipt metadata.',
     'Each cited result.evidence item must be shaped {"evidence_id":"<stable local id>","kind":"<server evidence kind>","source_id":"<server evidence source_id>","revision":"<server evidence revision>","checksum":"<server evidence checksum>","summary":"<what the evidence establishes>"}. Copy the trust fields exactly from the inspection result.',
@@ -408,6 +411,35 @@ function residentPrompt(
     throw new Error('Resident prompt exceeds the hard byte budget');
   }
   return prompt;
+}
+
+async function postResidentCompletion(
+  taskId: string,
+  identity: Record<string, unknown>,
+  lineage: Record<string, unknown>,
+  turnTaskVersion: number,
+  result: Record<string, unknown>,
+  reconciliation: Record<string, unknown> = {},
+  evidenceInspections: unknown[] = [],
+): Promise<void> {
+  const contextHash = typeof lineage.context_hash === 'string' ? lineage.context_hash : '';
+  await apiPost('/api/agent/resident-turn/complete', {
+    task_id: taskId,
+    project_id: typeof identity.project_id === 'string' ? identity.project_id : '',
+    authority_generation: Number(identity.authority_generation),
+    reconciliation_id: `resident-turn:${taskId}:${contextHash}`,
+    expected_turn_task_version: turnTaskVersion,
+    expected_checkpoint_id: typeof lineage.checkpoint_id === 'string' ? lineage.checkpoint_id : '',
+    expected_checkpoint_version: Number(lineage.checkpoint_version),
+    expected_checkpoint_hash: typeof lineage.checkpoint_hash === 'string' ? lineage.checkpoint_hash : '',
+    context_hash: contextHash,
+    result,
+    accepted_memory_proposal_ids: reconciliation.accepted_memory_proposal_ids || [],
+    accepted_implication_ids: reconciliation.accepted_implication_ids || [],
+    accepted_open_loop_ids: reconciliation.accepted_open_loop_ids || [],
+    resolved_open_loop_ids: reconciliation.resolved_open_loop_ids || [],
+    evidence_inspections: evidenceInspections,
+  });
 }
 
 export async function handleStrategicResidentTurn(
@@ -451,6 +483,29 @@ export async function handleStrategicResidentTurn(
   const identity = providerInput.identity as Record<string, unknown>;
   const lineage = providerInput.lineage as Record<string, unknown>;
   const requireReply = identity.lane === 'interactive';
+  if (requireReply && !residentHasProjectedUnhandledUserRequest(providerInput)) {
+    statusRef.value = 'Reconciling empty Resident message scope...';
+    await postResidentCompletion(
+      taskId,
+      identity,
+      lineage,
+      contextResponse.turn_task_version,
+      {
+        reply: null,
+        facts: [],
+        evidence: [],
+        operations: [],
+        receipts: [],
+        unknown_effects: [],
+        strategic_implications: [],
+        proposed_memory: [],
+        follow_up: null,
+        required_attention: [],
+      },
+    );
+    sendLog(ws, 'Empty Resident message scope reconciled without a provider call.\n');
+    return;
+  }
   statusRef.value = 'Running bounded Resident reasoning...';
   const boundary = createResidentProviderBoundary(PROVIDER);
   const capabilityResults: Record<string, unknown>[] = [];
@@ -679,24 +734,15 @@ export async function handleStrategicResidentTurn(
     boundary.dispose();
   }
   delete result.reconciliation;
-  const contextHash = typeof lineage.context_hash === 'string' ? lineage.context_hash : '';
   statusRef.value = 'Reconciling Resident result...';
-  await apiPost('/api/agent/resident-turn/complete', {
-    task_id: taskId,
-    project_id: typeof identity.project_id === 'string' ? identity.project_id : '',
-    authority_generation: Number(identity.authority_generation),
-    reconciliation_id: `resident-turn:${taskId}:${contextHash}`,
-    expected_turn_task_version: contextResponse.turn_task_version,
-    expected_checkpoint_id: typeof lineage.checkpoint_id === 'string' ? lineage.checkpoint_id : '',
-    expected_checkpoint_version: Number(lineage.checkpoint_version),
-    expected_checkpoint_hash: typeof lineage.checkpoint_hash === 'string' ? lineage.checkpoint_hash : '',
-    context_hash: contextHash,
+  await postResidentCompletion(
+    taskId,
+    identity,
+    lineage,
+    contextResponse.turn_task_version,
     result,
-    accepted_memory_proposal_ids: reconciliation.accepted_memory_proposal_ids || [],
-    accepted_implication_ids: reconciliation.accepted_implication_ids || [],
-    accepted_open_loop_ids: reconciliation.accepted_open_loop_ids || [],
-    resolved_open_loop_ids: reconciliation.resolved_open_loop_ids || [],
-    evidence_inspections: evidenceInspections,
-  });
+    reconciliation,
+    evidenceInspections,
+  );
   sendLog(ws, 'Resident result reconciled through the authoritative checkpoint lane.\n');
 }

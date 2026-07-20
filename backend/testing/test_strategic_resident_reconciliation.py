@@ -32,6 +32,9 @@ from app.strategic_operation_authority import (
     OperationIdentityCollision,
     OperationResultTooLarge,
 )
+from app.strategic_resident_message_handling import (
+    respond_to_represented_user_messages,
+)
 from app.strategic_resident_reconciliation import (
     DecisiveEvidenceRequired,
     ReconciliationCursorError,
@@ -57,6 +60,83 @@ def _canonical(value) -> bytes:
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode()
+
+
+@pytest.mark.asyncio
+async def test_message_response_skips_superseded_rows_in_range(db_session):
+    project = Project(
+        name=f"Message handling {uuid.uuid4()}",
+        user_id="operator",
+        vision={},
+        problem_model={},
+        directions=[],
+    )
+    turn_task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_resident_turn"}],
+    )
+    first_actionable = ProjectMessage(
+        project_id=project.id,
+        sequence=10,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.CLAIMED,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="First actionable message",
+    )
+    superseded_legacy = ProjectMessage(
+        project_id=project.id,
+        sequence=11,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.SUPERSEDED,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Superseded historical input",
+    )
+    live_actionable = ProjectMessage(
+        project_id=project.id,
+        sequence=12,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Current live request",
+    )
+    db_session.add_all(
+        [project, turn_task, first_actionable, superseded_legacy, live_actionable]
+    )
+    await db_session.flush()
+    await db_session.refresh(superseded_legacy)
+    superseded_legacy.handling_state = MessageHandlingState.SUPERSEDED
+    db_session.add(superseded_legacy)
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.flush()
+    await db_session.refresh(first_actionable)
+    await db_session.refresh(superseded_legacy)
+    await db_session.refresh(live_actionable)
+    turn_task_id = turn_task.id
+
+    assert first_actionable.sequence < superseded_legacy.sequence
+    assert superseded_legacy.sequence < live_actionable.sequence
+    responded_ids = await respond_to_represented_user_messages(
+        db_session,
+        project_id=project.id,
+        turn_task_id=turn_task_id,
+        represented_start=first_actionable.sequence,
+        represented_end=live_actionable.sequence,
+    )
+    await db_session.refresh(first_actionable)
+    await db_session.refresh(superseded_legacy)
+    await db_session.refresh(live_actionable)
+
+    assert responded_ids == (first_actionable.id, live_actionable.id)
+    assert first_actionable.handling_state == MessageHandlingState.RESPONDED
+    assert first_actionable.handled_by_task_id == turn_task_id
+    assert live_actionable.handling_state == MessageHandlingState.RESPONDED
+    assert live_actionable.handled_by_task_id == turn_task_id
+    assert superseded_legacy.handling_state == MessageHandlingState.SUPERSEDED
+    assert superseded_legacy.handled_by_task_id is None
 
 
 def _factory(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
@@ -907,6 +987,238 @@ async def test_reconciliation_atomically_updates_checkpoint_reply_cursors_and_po
     assert next_checkpoint.checkpoint["reconciliation"]["reply_message_id"] == str(
         reply.id
     )
+
+
+@pytest.mark.asyncio
+async def test_sparse_cutover_backlog_reconciles_exact_live_message_without_tail(
+    db_session,
+):
+    project, resident, task, checkpoint, legacy_message, _successor = (
+        await _resident_turn_rows(db_session, successor_lane=None)
+    )
+    live_sequence = 1_000_000_000_054
+
+    live_message = ProjectMessage(
+        project_id=project.id,
+        actor_user_id="operator",
+        sequence=live_sequence,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Current high-band operator request.",
+    )
+    payload = dict(task.first_payload)
+    payload["message_sequence_start"] = 1
+    payload["message_sequence_end"] = live_sequence
+    task.payloads = [payload]
+    db_session.add_all([resident, task, live_message])
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
+
+    provider_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=task.id,
+    )
+    await db_session.commit()
+    window = provider_input["lane_context"]["conversation_window"]
+    assert window["represented_end"] == live_sequence
+    assert window["omitted_messages"] == 0
+    assert [
+        item["message_id"]
+        for item in provider_input["lane_context"]["recent_conversation"]
+        if item["is_unhandled"]
+    ] == [str(legacy_message.id), str(live_message.id)]
+
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(
+            project,
+            task,
+            checkpoint,
+            result=_reply_only_result("Handled the live request."),
+            context_hash=provider_input["lineage"]["context_hash"],
+            accepted_memory_proposal_ids=(),
+            accepted_implication_ids=(),
+            accepted_open_loop_ids=(),
+            resolved_open_loop_ids=(),
+            evidence_inspections=(),
+        ),
+    )
+
+    assert outcome.reply_message_id is not None
+    assert outcome.promoted_task_id is None
+    async with _factory(db_session)() as verify:
+        refreshed_resident = await verify.get(StrategicResident, project.id)
+        legacy = await verify.get(ProjectMessage, legacy_message.id)
+        live = await verify.get(ProjectMessage, live_message.id)
+        reply = await verify.get(ProjectMessage, outcome.reply_message_id)
+        next_checkpoint = await verify.get(
+            StrategicResidentCheckpoint, outcome.checkpoint_id
+        )
+    assert legacy.handling_state == MessageHandlingState.RESPONDED
+    assert legacy.handled_by_task_id == task.id
+    assert live.handling_state == MessageHandlingState.RESPONDED
+    assert live.handled_by_task_id == task.id
+    assert reply.reply_to_message_id == live.id
+    assert refreshed_resident.handled_message_sequence == live_sequence
+    assert refreshed_resident.active_turn_task_id is None
+    assert refreshed_resident.interactive_successor_task_id is None
+    assert (
+        next_checkpoint.checkpoint["cursors"]["handled_message_sequence"]
+        == live_sequence
+    )
+
+
+@pytest.mark.asyncio
+async def test_zero_actionable_range_advances_without_reply_ownership_or_tail(
+    db_session,
+):
+    project, _resident, task, checkpoint, message, _successor = (
+        await _resident_turn_rows(db_session, successor_lane=None)
+    )
+    message.handling_state = MessageHandlingState.SUPERSEDED
+    terminal_system = ProjectMessage(
+        project_id=project.id,
+        sequence=5,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.PENDING,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Terminal context only.",
+    )
+    payload = dict(task.first_payload)
+    payload["message_sequence_end"] = 5
+    task.payloads = [payload]
+    worker_proposal = _worker_proposal_row(project.id, checkpoint)
+    db_session.add_all([message, terminal_system, task, worker_proposal])
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
+
+    provider_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=task.id,
+    )
+    await db_session.commit()
+    window = provider_input["lane_context"]["conversation_window"]
+    assert not any(
+        item["is_unhandled"]
+        for item in provider_input["lane_context"]["recent_conversation"]
+    )
+    assert window["represented_end"] == 5
+    assert window["omitted_messages"] == 0
+
+    empty_result = _reply_only_result("")
+    empty_result["reply"] = None
+
+    outcome = await reconcile_strategic_resident_turn(
+        _factory(db_session),
+        _request(
+            project,
+            task,
+            checkpoint,
+            result=empty_result,
+            context_hash=provider_input["lineage"]["context_hash"],
+            accepted_memory_proposal_ids=(),
+            accepted_implication_ids=(),
+            accepted_open_loop_ids=(),
+            resolved_open_loop_ids=(),
+            evidence_inspections=(),
+        ),
+    )
+
+    assert outcome.reply_message_id is None
+    assert outcome.promoted_task_id is None
+    async with _factory(db_session)() as verify:
+        refreshed_resident = await verify.get(StrategicResident, project.id)
+        unchanged_message = await verify.get(ProjectMessage, message.id)
+        pending_proposal = await verify.get(
+            StrategicWorkerMemoryProposal, worker_proposal.id
+        )
+        next_checkpoint = await verify.get(
+            StrategicResidentCheckpoint, outcome.checkpoint_id
+        )
+        replies = (
+            await verify.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_task_id == task.id,
+                )
+            )
+        ).scalars().all()
+    assert refreshed_resident.handled_message_sequence == 5
+    assert refreshed_resident.active_turn_task_id is None
+    assert unchanged_message.handling_state == MessageHandlingState.SUPERSEDED
+    assert unchanged_message.handled_by_task_id is None
+    assert pending_proposal.status == "pending"
+    assert "worker_priority" not in (
+        next_checkpoint.checkpoint["working_strategy"]["priorities"]
+    )
+    assert replies == []
+
+
+@pytest.mark.asyncio
+async def test_zero_actionable_scope_rejects_forged_effects_atomically(
+    db_session,
+):
+    project, resident, task, checkpoint, message, _successor = (
+        await _resident_turn_rows(db_session, successor_lane=None)
+    )
+    message.handling_state = MessageHandlingState.SUPERSEDED
+    db_session.add(message)
+    async with seed_without_authority_enforcement(db_session):
+        await db_session.commit()
+
+    provider_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=task.id,
+    )
+    await db_session.commit()
+    original_checkpoint_id = resident.current_checkpoint_id
+    original_cursor = resident.handled_message_sequence
+
+    with pytest.raises(
+        ReconciliationResultInvalid,
+        match="empty interactive scope requires an exact empty result",
+    ):
+        await reconcile_strategic_resident_turn(
+            _factory(db_session),
+            _request(
+                project,
+                task,
+                checkpoint,
+                result=_reply_only_result("Forged reply."),
+                context_hash=provider_input["lineage"]["context_hash"],
+                accepted_memory_proposal_ids=(),
+                accepted_implication_ids=(),
+                accepted_open_loop_ids=(),
+                resolved_open_loop_ids=(),
+                evidence_inspections=(),
+            ),
+        )
+
+    async with _factory(db_session)() as verify:
+        unchanged_resident = await verify.get(StrategicResident, project.id)
+        unchanged_task = await verify.get(Task, task.id)
+        unchanged_message = await verify.get(ProjectMessage, message.id)
+        replies = (
+            await verify.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.from_task_id == task.id,
+                )
+            )
+        ).scalars().all()
+    assert unchanged_resident.current_checkpoint_id == original_checkpoint_id
+    assert unchanged_resident.handled_message_sequence == original_cursor
+    assert unchanged_resident.active_turn_task_id == task.id
+    assert unchanged_task.status == TaskStatus.IN_PROGRESS
+    assert unchanged_message.handling_state == MessageHandlingState.SUPERSEDED
+    assert unchanged_message.handled_by_task_id is None
+    assert replies == []
 
 
 @pytest.mark.asyncio

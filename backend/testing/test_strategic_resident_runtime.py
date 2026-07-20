@@ -9,10 +9,12 @@ import pytest
 import hashlib
 import json
 from fastapi import HTTPException
+from sqlalchemy import update
 from sqlmodel import select
 
 from app.models import (
     ArtifactRef,
+    MessageHandlingState,
     MessageSurface,
     MessageType,
     Project,
@@ -206,6 +208,109 @@ async def test_authoritative_turn_reconstructs_visible_context_and_is_bounded(
         ).encode("utf-8")
     ).hexdigest()
     assert provider_input["lineage"]["evidence_hash"] == expected_evidence_hash
+
+
+@pytest.mark.asyncio
+async def test_authoritative_turn_bounds_legacy_backlog_without_message_loss(
+    db_session,
+):
+    project, _resident = await _authoritative_project(db_session)
+    legacy_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=sequence,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.PENDING,
+            message_type=MessageType.FEEDBACK,
+            from_type="user",
+            content=f"unowned legacy message {sequence}",
+            status="resolved",
+        )
+        for sequence in range(1, 61)
+    ]
+    routine_rows = [
+        ProjectMessage(
+            project_id=project.id,
+            sequence=61,
+            surface=MessageSurface.CONVERSATION,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="Routine historical system context.",
+        ),
+        ProjectMessage(
+            project_id=project.id,
+            sequence=62,
+            surface=MessageSurface.CONVERSATION,
+            handling_state=MessageHandlingState.RESPONDED,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="Historical Resident context.",
+        ),
+    ]
+    live_sequence = 1_000_000_000_054
+    live_message = ProjectMessage(
+        project_id=project.id,
+        actor_user_id="operator",
+        sequence=live_sequence,
+        surface=MessageSurface.CONVERSATION,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Reply to this live message.",
+    )
+    db_session.add_all([*legacy_messages, *routine_rows, live_message])
+    await db_session.flush()
+    # The mixed-writer compatibility trigger allocates insert sequences; move
+    # this row into the production high band after insert to reproduce the gap.
+    await db_session.execute(
+        update(ProjectMessage)
+        .where(ProjectMessage.id == live_message.id)
+        .values(sequence=live_sequence)
+    )
+    await db_session.refresh(live_message)
+    wake = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="interactive",
+        message_sequence=live_sequence,
+    )
+    task = await db_session.get(Task, wake.task_id)
+    payload = dict(task.first_payload)
+    payload["message_sequence_start"] = 1
+    task.payloads = [payload]
+    db_session.add(task)
+    await db_session.flush()
+
+    provider_input = await reconstruct_authoritative_turn_input(
+        db_session,
+        project_id=project.id,
+        turn_task_id=wake.task_id,
+    )
+
+    legacy_states = (
+        await db_session.execute(
+            select(ProjectMessage.handling_state).where(
+                ProjectMessage.id.in_([message.id for message in legacy_messages])
+            )
+        )
+    ).scalars().all()
+    await db_session.refresh(live_message)
+    assert set(legacy_states) == {MessageHandlingState.PENDING}
+    assert live_message.handling_state == MessageHandlingState.PENDING
+    messages = provider_input["lane_context"]["recent_conversation"]
+    window = provider_input["lane_context"]["conversation_window"]
+    assert len(messages) == 48
+    assert messages[-1]["sequence"] == 48
+    assert [item["message_id"] for item in messages if item["is_unhandled"]] == [
+        str(message.id) for message in legacy_messages[:48]
+    ]
+    assert window == {
+        "handled_sequence": 0,
+        "requested_start": 1,
+        "requested_end": live_sequence,
+        "represented_end": 48,
+        "omitted_messages": 13,
+        "omitted_unrevisioned_refs": 0,
+    }
 
 
 @pytest.mark.asyncio

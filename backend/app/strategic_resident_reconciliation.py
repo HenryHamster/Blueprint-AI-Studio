@@ -120,6 +120,55 @@ class StrategicResidentReconcileOutcome:
     responded_message_ids: tuple[uuid.UUID, ...] = ()
 
 
+def _interactive_scope_is_empty(
+    provider_input: Mapping[str, Any],
+) -> bool:
+    identity = provider_input.get("identity")
+    if not isinstance(identity, Mapping) or identity.get("lane") != "interactive":
+        return False
+    lane_context = provider_input.get("lane_context")
+    messages = (
+        lane_context.get("recent_conversation", [])
+        if isinstance(lane_context, Mapping)
+        else []
+    )
+    return not any(
+        isinstance(message, Mapping)
+        and message.get("is_unhandled") is True
+        and message.get("from_type") == "user"
+        for message in messages
+    )
+
+
+def _validate_empty_interactive_scope_result(
+    result: StrategicResidentTurnResult,
+    request: StrategicResidentReconcileRequest,
+) -> None:
+    has_result_effect = (
+        result.reply is not None
+        or bool(result.facts)
+        or bool(result.evidence)
+        or bool(result.operations)
+        or bool(result.receipts)
+        or bool(result.unknown_effects)
+        or bool(result.strategic_implications)
+        or bool(result.proposed_memory)
+        or result.follow_up is not None
+        or bool(result.required_attention)
+    )
+    has_acceptance = bool(
+        request.accepted_memory_proposal_ids
+        or request.accepted_implication_ids
+        or request.accepted_open_loop_ids
+        or request.resolved_open_loop_ids
+        or request.evidence_inspections
+    )
+    if has_result_effect or has_acceptance:
+        raise ReconciliationResultInvalid(
+            "empty interactive scope requires an exact empty result"
+        )
+
+
 def _deep_merge(base: Mapping[str, Any], updates: Mapping[str, Any]) -> dict[str, Any]:
     result = deepcopy(dict(base))
     for raw_key, value in updates.items():
@@ -319,8 +368,11 @@ async def _create_resident_reply(
     reply_target_id: uuid.UUID | None,
 ) -> ProjectMessage | None:
     payload = task.first_payload if isinstance(task.first_payload, dict) else {}
-    has_operator_input = payload.get("message_sequence_end") is not None
-    if has_operator_input and not (result.reply or "").strip():
+    has_actionable_operator_input = (
+        payload.get("message_sequence_end") is not None
+        and reply_target_id is not None
+    )
+    if has_actionable_operator_input and not (result.reply or "").strip():
         raise ReconciliationResultInvalid(
             "interactive Resident turn result requires a user-facing reply"
         )
@@ -462,14 +514,6 @@ async def reconcile_strategic_resident_turn(
             raise InactiveTurnAuthority("turn task is not mutation-authorized")
         if int(task.version) != int(request.expected_turn_task_version):
             raise ExpectedRevisionMismatch("turn task version changed")
-        receipt_validation = await validate_operation_receipts(
-            session,
-            result,
-            request,
-            project_id=request.project_id,
-            turn_task_id=request.turn_task_id,
-            authority_generation=int(resident.authority_generation),
-        )
         checkpoint = (
             await session.execute(
                 select(StrategicResidentCheckpoint)
@@ -502,6 +546,17 @@ async def reconcile_strategic_resident_turn(
         )
         if provider_input["lineage"].get("context_hash") != request.context_hash:
             raise ExpectedRevisionMismatch("Resident turn context lineage changed")
+        empty_interactive_scope = _interactive_scope_is_empty(provider_input)
+        if empty_interactive_scope:
+            _validate_empty_interactive_scope_result(result, request)
+        receipt_validation = await validate_operation_receipts(
+            session,
+            result,
+            request,
+            project_id=request.project_id,
+            turn_task_id=request.turn_task_id,
+            authority_generation=int(resident.authority_generation),
+        )
         trusted_evidence = build_trusted_evidence_index(
             provider_input,
             receipt_validation.receipts,
@@ -547,12 +602,16 @@ async def reconcile_strategic_resident_turn(
         # worker's proposal changes strategic memory. Revision-linked to this
         # exact checkpoint and evidence-gated; stale/untrusted ones are rejected
         # in-place without failing the turn.
-        admitted_worker_proposals = await drain_worker_memory_proposals(
-            session,
-            project_id=request.project_id,
-            current_checkpoint_version=int(checkpoint.version),
-            current_checkpoint_hash=str(checkpoint.content_hash),
-            trusted_evidence=trusted_evidence,
+        admitted_worker_proposals = (
+            []
+            if empty_interactive_scope
+            else await drain_worker_memory_proposals(
+                session,
+                project_id=request.project_id,
+                current_checkpoint_version=int(checkpoint.version),
+                current_checkpoint_hash=str(checkpoint.content_hash),
+                trusted_evidence=trusted_evidence,
+            )
         )
         _apply_memory_proposals(
             body, [*accepted_proposals, *admitted_worker_proposals]

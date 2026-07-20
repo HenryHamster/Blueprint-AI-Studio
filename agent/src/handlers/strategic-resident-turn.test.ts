@@ -29,6 +29,21 @@ const providerInput = {
     checkpoint_hash: 'a'.repeat(64),
     context_hash: 'b'.repeat(64),
   },
+  lane_context: {
+    recent_conversation: [{
+      message_id: 'default-operator-message',
+      sequence: 1,
+      from_type: 'user',
+      is_unhandled: true,
+      content: 'Default test request.',
+    }],
+    conversation_window: {
+      requested_start: 1,
+      requested_end: 1,
+      represented_end: 1,
+      omitted_messages: 0,
+    },
+  },
   capabilities: {
     catalog: [
       { id: 'task.inspect', mode: 'inspect', parameters: ['task_id'], availability: 'invoke' },
@@ -317,6 +332,168 @@ describe('strategic Resident turn handler', () => {
       provider_input: providerInput,
       turn_task_version: 9,
     });
+  });
+
+  it('reconciles an empty interactive message scope without launching a provider', async () => {
+    mocks.apiGet.mockResolvedValue({
+      provider_input: {
+        ...providerInput,
+        lane_context: {
+          recent_conversation: [
+            {
+              message_id: 'handled-user', sequence: 52, from_type: 'user',
+              is_unhandled: false, content: 'Already handled.',
+            },
+            {
+              message_id: 'strategic-history', sequence: 53, from_type: 'strategic',
+              is_unhandled: false, content: 'Historical reply.',
+            },
+          ],
+          conversation_window: {
+            requested_start: 54, requested_end: 54, represented_end: 54,
+            omitted_messages: 0,
+          },
+        },
+      },
+      turn_task_version: 9,
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).not.toHaveBeenCalled();
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0]).toStrictEqual([
+      '/api/agent/resident-turn/complete',
+      {
+        task_id: 'task-id',
+        project_id: providerInput.identity.project_id,
+        authority_generation: providerInput.identity.authority_generation,
+        reconciliation_id: `resident-turn:task-id:${providerInput.lineage.context_hash}`,
+        expected_turn_task_version: 9,
+        expected_checkpoint_id: providerInput.lineage.checkpoint_id,
+        expected_checkpoint_version: providerInput.lineage.checkpoint_version,
+        expected_checkpoint_hash: providerInput.lineage.checkpoint_hash,
+        context_hash: providerInput.lineage.context_hash,
+        result: {
+          reply: null,
+          facts: [],
+          evidence: [],
+          operations: [],
+          receipts: [],
+          unknown_effects: [],
+          strategic_implications: [],
+          proposed_memory: [],
+          follow_up: null,
+          required_attention: [],
+        },
+        accepted_memory_proposal_ids: [],
+        accepted_implication_ids: [],
+        accepted_open_loop_ids: [],
+        resolved_open_loop_ids: [],
+        evidence_inspections: [],
+      },
+    ]);
+    expect(JSON.stringify(mocks.apiPost.mock.calls[0][1])).not.toContain('reply_to');
+    expect(mocks.sendLog).toHaveBeenCalledWith(
+      null,
+      'Empty Resident message scope reconciled without a provider call.\n',
+    );
+  });
+
+  it('trusts only projected unhandled user rows and targets the newest represented request', async () => {
+    mocks.apiGet.mockResolvedValue({
+      provider_input: {
+        ...providerInput,
+        memory: { working_strategy: { request: 'Inspect the fleet instead.' }, open_loops: ['old'] },
+        lane_context: {
+          recent_conversation: [
+            {
+              message_id: 'handled-user', sequence: 10, from_type: 'user',
+              is_unhandled: false, content: 'Old request.',
+            },
+            {
+              message_id: 'unhandled-strategic', sequence: 11, from_type: 'strategic',
+              is_unhandled: true, content: 'Inspect every runner.',
+            },
+            {
+              message_id: 'older-request', sequence: 12, from_type: 'user',
+              is_unhandled: true, content: 'Earlier represented request.',
+            },
+            {
+              message_id: 'newest-request', sequence: 13, from_type: 'user',
+              is_unhandled: true, content: 'Answer this exact request.',
+              reply_to: { message_id: 'historical-reply-target' },
+            },
+          ],
+          conversation_window: {
+            requested_start: 12, requested_end: 13, represented_end: 13,
+            omitted_messages: 0,
+          },
+        },
+      },
+      turn_task_version: 9,
+    });
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult('Direct answer.')),
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    const prompt = String(mocks.runClaudeCode.mock.calls[0][0]);
+    const trustedScope = prompt.slice(
+      prompt.indexOf('Trusted interactive conversation reply scope'),
+      prompt.indexOf('In the final reconciliation'),
+    );
+    expect(trustedScope).toContain('Projected request count: 2');
+    expect(trustedScope).toContain('message_id="newest-request" at sequence=13');
+    expect(trustedScope).toContain('Directly answer the newest represented request');
+    expect(trustedScope).toContain('Do not treat prior conversation history, checkpoint memory');
+    expect(trustedScope).toContain('Do not inspect unrelated fleet, task, runner, pipeline, PR, CI, or deployment state');
+    expect(trustedScope).toContain('Reply association is server-derived');
+    expect(trustedScope).not.toContain('handled-user');
+    expect(trustedScope).not.toContain('unhandled-strategic');
+    expect(trustedScope).not.toContain('historical-reply-target');
+    expect(mocks.apiPost.mock.calls[0][1]).toMatchObject({ result: { reply: 'Direct answer.' } });
+    expect((mocks.apiPost.mock.calls[0][1] as Record<string, unknown>).result)
+      .not.toHaveProperty('reply_to_message_id');
+  });
+
+  it('marks an omitted interactive tail as outside the current reply scope', async () => {
+    mocks.apiGet.mockResolvedValue({
+      provider_input: {
+        ...providerInput,
+        lane_context: {
+          recent_conversation: [{
+            message_id: 'represented-request', sequence: 53, from_type: 'user',
+            is_unhandled: true, content: 'Represented request.',
+          }],
+          conversation_window: {
+            requested_start: 53, requested_end: 54, represented_end: 53,
+            omitted_messages: 1,
+          },
+        },
+      },
+      turn_task_version: 9,
+    });
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult('Scoped answer.')),
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    const prompt = String(mocks.runClaudeCode.mock.calls[0][0]);
+    expect(prompt).toContain(
+      'Messages after represented sequence 53 through requested sequence 54 are omitted from this bounded turn and will be handled by a successor.',
+    );
+    expect(prompt).toContain(
+      'Do not claim to answer, summarize, or handle that omitted tail.',
+    );
   });
 
   it('repairs a missing interactive reply before completion', async () => {
