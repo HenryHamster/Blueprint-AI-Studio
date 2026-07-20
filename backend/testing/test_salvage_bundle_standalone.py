@@ -124,6 +124,12 @@ Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-14 — docs/capability-proof-earn-path.md design document exists
   cp-15 — record_capability_named_test_execution_proof mints proven tier; enroll_capability_proof_trial exists
 
+Findings covered here (4-finding project-tools / runner-config salvage bundle, 2026-07-19):
+  r-1 — walkthrough test files exist with runner-enrollment and project-tool assertions
+  r-2 — _LiveRunnerConfig.apply validates ALL fields before mutating any state (atomic reject)
+  r-3 — ProjectToolHost uses pendingDeleteId two-step confirmation before calling handleDelete
+  r-4 — ProjectToolHost Enable in disabled section has in-flight guard; slug shown after create
+
 Findings covered here (16-finding capability-proof salvage bundle, 2026-07-18):
   cq-0  — spawn-gate absorbs alias bypass closed: working_capability_proof_status registers
            agent-declared absorbs aliases as "unproven" so capability_need_blocked_by_proof_gate
