@@ -188,6 +188,7 @@ const RESULT_EVIDENCE_KEYS = [
   'evidence_id', 'kind', 'source_id', 'revision', 'checksum', 'summary',
 ] as const;
 const RESULT_EVIDENCE_KEY_SET = new Set<string>(RESULT_EVIDENCE_KEYS);
+const RESULT_EVIDENCE_SERVER_EXTRA_KEYS = new Set(['project_id', 'inspected_at', 'data']);
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
@@ -251,9 +252,8 @@ function canonicalEvidenceInspections(
       throw new Error(`Resident evidence_inspections[${index}] does not identify one result evidence item`);
     }
     const evidence = resultMatches[0];
-    if (Object.keys(evidence).some((key) => !RESULT_EVIDENCE_KEY_SET.has(key))) {
-      throw new Error(`Resident evidence_inspections[${index}] result evidence contains an unknown field`);
-    }
+    const extraEvidenceKeys = Object.keys(evidence)
+      .filter((key) => !RESULT_EVIDENCE_KEY_SET.has(key));
     if (!nonEmptyString(evidence.evidence_id) || !nonEmptyString(evidence.summary)) {
       throw new Error(`Resident evidence_inspections[${index}] result evidence requires evidence_id and summary`);
     }
@@ -280,6 +280,17 @@ function canonicalEvidenceInspections(
       }
       if (evidence[key] !== undefined && key !== 'inspected_at' && evidence[key] !== inspected[key]) {
         throw new Error(`Resident evidence_inspections[${index}] result evidence.${key} conflicts with server evidence`);
+      }
+    }
+    for (const key of extraEvidenceKeys) {
+      if (
+        !RESULT_EVIDENCE_SERVER_EXTRA_KEYS.has(key)
+        || !(key in inspected)
+        || stableJson(evidence[key]) !== stableJson(inspected[key])
+      ) {
+        throw new Error(
+          `Resident evidence_inspections[${index}] result evidence contains an unknown field or unverified server field: ${key}`,
+        );
       }
     }
     const evidenceId = evidence.evidence_id;
