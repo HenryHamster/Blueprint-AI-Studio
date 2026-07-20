@@ -20,10 +20,9 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.project_message_sequence_fence import lock_project_message_sequence_boundary
 from app.strategic_resident_cleanup_state import unsettled_cleanup_descriptors
-from app.strategic_resident_cutover_messages import (
-    release_cancelled_shadow_message_claims,
-)
+from app.strategic_resident_cutover_messages import reconcile_cutover_message_claims
 from app.strategic_resident_checkpoint_validation import (
     ResidentCheckpointIntegrityError,
     verify_locked_current_checkpoint,
@@ -401,6 +400,13 @@ async def cutover_to_strategic_resident(
                 )
                 cancelled.append(task.id)
 
+        await lock_project_message_sequence_boundary(session, project_id)
+        await reconcile_cutover_message_claims(
+            session,
+            project_id=project_id,
+            cancelled_shadow_task_ids=cancelled,
+        )
+        await session.flush()
         boundary = await append_live_cutover_checkpoint(
             session,
             project=project,
@@ -408,11 +414,6 @@ async def cutover_to_strategic_resident(
             current=checkpoint,
             next_generation=next_generation,
             cutover_at=effective_now,
-        )
-        await release_cancelled_shadow_message_claims(
-            session,
-            project_id=project_id,
-            cancelled_shadow_task_ids=cancelled,
         )
         resident.previous_checkpoint_id = checkpoint.id
         resident.current_checkpoint_id = boundary.checkpoint.id

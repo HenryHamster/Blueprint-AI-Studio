@@ -367,17 +367,201 @@ def test_cutover_boundary_locks_sequence_before_scanning_messages():
     assert "counter.last_sequence," in fence_source
     assert "counter.last_sequence +" not in fence_source
     cutover_source = inspect.getsource(cutover_to_strategic_resident)
-    boundary_at = cutover_source.index("append_live_cutover_checkpoint")
-    release_at = cutover_source.index(
-        "release_cancelled_shadow_message_claims",
-        boundary_at,
-    )
-    seed_at = cutover_source.index("seed_cutover_conversation_turn", release_at)
-    assert boundary_at < release_at < seed_at
+    fence_at = cutover_source.index("lock_project_message_sequence_boundary")
+    reconcile_at = cutover_source.index("reconcile_cutover_message_claims")
+    flush_at = cutover_source.index("session.flush", reconcile_at)
+    boundary_at = cutover_source.index("append_live_cutover_checkpoint", flush_at)
+    seed_at = cutover_source.index("seed_cutover_conversation_turn", boundary_at)
+    assert fence_at < reconcile_at < flush_at < boundary_at < seed_at
 
 
 @pytest.mark.asyncio
-async def test_cutover_releases_only_cancelled_shadow_message_claims(
+async def test_cutover_repairs_proven_legacy_responses_before_boundary(
+    ownership_factory,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    async with ownership_factory() as session, session.begin():
+        legacy_task = Task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "strategic_review"}],
+            context={},
+        )
+        session.add(legacy_task)
+        await session.flush()
+        message = ProjectMessage(
+            project_id=project_id,
+            sequence=1,
+            surface="conversation",
+            handling_state="pending",
+            handled_by_task_id=legacy_task.id,
+            from_type="user",
+            content="This was answered by the legacy review.",
+            status="resolved",
+            resolution="The legacy review incorporated it.",
+            resolved_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+        session.add(message)
+        await session.flush()
+        message_id = message.id
+        task_id = legacy_task.id
+
+    transition = await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        message = await session.get(ProjectMessage, message_id)
+        assert resident is not None and message is not None
+        assert message.handling_state == "responded"
+        assert message.handled_by_task_id == task_id
+        assert resident.handled_message_sequence == 1
+        assert resident.active_turn_task_id is None
+        checkpoint = await session.get(
+            StrategicResidentCheckpoint, transition.checkpoint_id
+        )
+        assert checkpoint is not None
+        boundary = checkpoint.checkpoint["migration"]["cutover_boundary"]
+        assert boundary.get("pending_message_sequence_start") is None
+        assert boundary.get("pending_message_sequence_end") is None
+
+
+@pytest.mark.parametrize(
+    ("task_status", "task_type", "message_status", "resolution", "has_resolved_at"),
+    (
+        (TaskStatus.IN_PROGRESS, "strategic_review", "resolved", "done", True),
+        (TaskStatus.COMPLETED, "create", "resolved", "done", True),
+        (TaskStatus.COMPLETED, "strategic_review", "open", "done", True),
+        (TaskStatus.COMPLETED, "strategic_review", "resolved", "   ", True),
+        (TaskStatus.COMPLETED, "strategic_review", "resolved", "done", False),
+    ),
+)
+@pytest.mark.asyncio
+async def test_cutover_rejects_unproven_legacy_response_claims(
+    ownership_factory,
+    task_status,
+    task_type,
+    message_status,
+    resolution,
+    has_resolved_at,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    async with ownership_factory() as session, session.begin():
+        owner = Task(
+            project_id=project_id,
+            status=task_status,
+            payloads=[{"type": task_type}],
+            context={},
+        )
+        session.add(owner)
+        await session.flush()
+        message = ProjectMessage(
+            project_id=project_id,
+            sequence=1,
+            surface="conversation",
+            handling_state="pending",
+            handled_by_task_id=owner.id,
+            from_type="user",
+            content="This claim lacks complete legacy-response evidence.",
+            status=message_status,
+            resolution=resolution,
+            resolved_at=(
+                datetime(2026, 7, 17, tzinfo=timezone.utc)
+                if has_resolved_at
+                else None
+            ),
+        )
+        session.add(message)
+        await session.flush()
+        message_id = message.id
+        owner_id = owner.id
+
+    with pytest.raises(ResidentOwnershipStateError, match="non-shadow Tasks"):
+        await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        message = await session.get(ProjectMessage, message_id)
+        assert resident is not None and message is not None
+        assert resident.engine_owner == "legacy"
+        assert message.handling_state == "pending"
+        assert message.handled_by_task_id == owner_id
+
+
+@pytest.mark.asyncio
+async def test_cutover_reconciles_legacy_and_shadow_claims_before_boundary(
+    ownership_factory,
+):
+    project_id, _ = await _seed_project(ownership_factory)
+    async with ownership_factory() as session, session.begin():
+        legacy_task = Task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "strategic_review"}],
+            context={},
+        )
+        session.add(legacy_task)
+        await session.flush()
+        legacy_message = ProjectMessage(
+            project_id=project_id,
+            sequence=1,
+            surface="conversation",
+            handling_state="pending",
+            handled_by_task_id=legacy_task.id,
+            from_type="user",
+            content="The legacy review already handled this.",
+            status="resolved",
+            resolution="Handled by the completed strategic review.",
+            resolved_at=datetime(2026, 7, 17, tzinfo=timezone.utc),
+        )
+        session.add(legacy_message)
+        wake = await coalesce_shadow_resident_turn(
+            session,
+            project_id=project_id,
+            lane="interactive",
+            trigger_kind="operator_message",
+            message_sequence=2,
+        )
+        assert wake.task_id is not None
+        shadow_task_id = wake.task_id
+        shadow_message = ProjectMessage(
+            project_id=project_id,
+            sequence=2,
+            surface="conversation",
+            handling_state="claimed",
+            handled_by_task_id=shadow_task_id,
+            from_type="user",
+            content="A shadow claim must transfer at cutover.",
+        )
+        session.add(shadow_message)
+        await session.flush()
+        legacy_message_id = legacy_message.id
+        legacy_task_id = legacy_task.id
+        shadow_message_id = shadow_message.id
+
+    await cutover_to_strategic_resident(ownership_factory, project_id)
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        legacy_message = await session.get(ProjectMessage, legacy_message_id)
+        shadow_message = await session.get(ProjectMessage, shadow_message_id)
+        shadow = await session.get(Task, shadow_task_id)
+        assert all((resident, legacy_message, shadow_message, shadow))
+        assert shadow.status == TaskStatus.CANCELLED
+        assert legacy_message.handling_state == "responded"
+        assert legacy_message.handled_by_task_id == legacy_task_id
+        assert shadow_message.handling_state == "pending"
+        assert shadow_message.handled_by_task_id is None
+        assert resident.handled_message_sequence == 1
+        assert resident.active_turn_task_id is not None
+        authoritative = await session.get(Task, resident.active_turn_task_id)
+        assert authoritative is not None
+        assert authoritative.id != shadow_task_id
+        assert authoritative.first_payload["message_sequence_start"] == 2
+        assert authoritative.first_payload["message_sequence_end"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cutover_rejects_foreign_claim_and_rolls_back_shadow_cancellation(
     ownership_factory,
 ):
     project_id, _ = await _seed_project(ownership_factory)
@@ -391,79 +575,67 @@ async def test_cutover_releases_only_cancelled_shadow_message_claims(
         )
         assert wake.task_id is not None
         shadow_task_id = wake.task_id
-        message = ProjectMessage(
+        shadow_message = ProjectMessage(
             project_id=project_id,
             sequence=1,
             surface="conversation",
             handling_state="claimed",
             handled_by_task_id=shadow_task_id,
             from_type="user",
-            content="A shadow claim must transfer at cutover.",
+            content="This shadow claim must survive an aborted cutover.",
         )
-        session.add(message)
-        await session.flush()
-        message_id = message.id
-
-    await cutover_to_strategic_resident(ownership_factory, project_id)
-
-    async with ownership_factory() as session:
-        resident = await session.get(StrategicResident, project_id)
-        message = await session.get(ProjectMessage, message_id)
-        shadow = await session.get(Task, shadow_task_id)
-        assert resident is not None and message is not None and shadow is not None
-        assert shadow.status == TaskStatus.CANCELLED
-        assert message.handling_state == "pending"
-        assert message.handled_by_task_id is None
-        assert resident.active_turn_task_id is not None
-        authoritative = await session.get(Task, resident.active_turn_task_id)
-        assert authoritative is not None
-        assert authoritative.id != shadow_task_id
-        assert authoritative.first_payload["message_sequence_start"] == 1
-        assert authoritative.first_payload["message_sequence_end"] == 1
-
-
-@pytest.mark.asyncio
-async def test_cutover_rejects_arbitrary_foreign_unresolved_message_claim(
-    ownership_factory,
-):
-    project_id, _ = await _seed_project(ownership_factory)
-    async with ownership_factory() as session, session.begin():
         foreign_task = Task(
             project_id=project_id,
             status=TaskStatus.IN_PROGRESS,
             payloads=[{"type": "create"}],
             context={},
         )
-        session.add(foreign_task)
+        session.add_all([shadow_message, foreign_task])
         await session.flush()
-        message = ProjectMessage(
+        foreign_message = ProjectMessage(
             project_id=project_id,
-            sequence=1,
+            sequence=2,
             surface="conversation",
             handling_state="claimed",
             handled_by_task_id=foreign_task.id,
             from_type="user",
             content="Do not steal this non-shadow claim.",
         )
-        session.add(message)
+        session.add(foreign_message)
         await session.flush()
+        resident = await session.get(StrategicResident, project_id)
+        shadow = await session.get(Task, shadow_task_id)
+        assert resident is not None and shadow is not None
+        before = (
+            resident.authority_generation,
+            resident.active_turn_task_id,
+            resident.interactive_successor_task_id,
+            shadow.status,
+        )
+        shadow_message_id = shadow_message.id
+        foreign_message_id = foreign_message.id
         foreign_task_id = foreign_task.id
-        message_id = message.id
 
-    with pytest.raises(
-        ResidentOwnershipStateError,
-        match="non-shadow Tasks",
-    ):
+    with pytest.raises(ResidentOwnershipStateError, match="non-shadow Tasks"):
         await cutover_to_strategic_resident(ownership_factory, project_id)
 
     async with ownership_factory() as session:
         resident = await session.get(StrategicResident, project_id)
-        message = await session.get(ProjectMessage, message_id)
-        foreign = await session.get(Task, foreign_task_id)
-        assert resident is not None and message is not None and foreign is not None
+        shadow = await session.get(Task, shadow_task_id)
+        shadow_message = await session.get(ProjectMessage, shadow_message_id)
+        foreign_message = await session.get(ProjectMessage, foreign_message_id)
+        assert all((resident, shadow, shadow_message, foreign_message))
         assert resident.engine_owner == "legacy"
-        assert message.handling_state == "claimed"
-        assert message.handled_by_task_id == foreign.id
+        assert (
+            resident.authority_generation,
+            resident.active_turn_task_id,
+            resident.interactive_successor_task_id,
+            shadow.status,
+        ) == before
+        assert shadow_message.handling_state == "claimed"
+        assert shadow_message.handled_by_task_id == shadow_task_id
+        assert foreign_message.handling_state == "claimed"
+        assert foreign_message.handled_by_task_id == foreign_task_id
 
 
 @pytest.mark.asyncio
