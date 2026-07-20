@@ -6009,7 +6009,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # while X is being BUILT), rides the recheck sweep to the escalation deadline,
     # and lands on the operator — for work that was runnable all along.
     _working_registry_caps = working_capability_names(
-        getattr(project_obj, "problem_model", None)
+        getattr(project_obj, "problem_model", None),
+        proof_records=getattr(project_obj, "capability_proof_records", None),
     )
     # Proof-status companion of the working-capability set, built from the SAME
     # registry so an unproven "declared working with zero evidence" resolution can

@@ -860,7 +860,10 @@ async def grant_capability_proof_exemption(
         raise HTTPException(
             status_code=400, detail="capability_name is blank or unnormalizable"
         )
-    working = working_capability_names(project.problem_model or {})
+    working = working_capability_names(
+        project.problem_model or {},
+        proof_records=getattr(project, "capability_proof_records", None),
+    )
     if normalized not in working:
         raise HTTPException(
             status_code=404,

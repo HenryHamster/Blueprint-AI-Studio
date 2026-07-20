@@ -416,7 +416,10 @@ async def _fetch_working_capability_names(session, project_id) -> set:
     from app.models import Project
 
     project = await session.get(Project, project_id)
-    return working_capability_names(getattr(project, "problem_model", None))
+    return working_capability_names(
+        getattr(project, "problem_model", None),
+        proof_records=getattr(project, "capability_proof_records", None),
+    )
 
 
 def _fold_proof_records_tier2(

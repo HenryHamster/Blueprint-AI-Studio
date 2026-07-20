@@ -1381,7 +1381,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
         session, task.project_id
     )
     _working_registry_caps = working_capability_names(
-        getattr(project, "problem_model", None)
+        getattr(project, "problem_model", None),
+        proof_records=getattr(project, "capability_proof_records", None),
     )
     _working_registry_proof = consumer_gate_proof_status(
         getattr(project, "problem_model", None),

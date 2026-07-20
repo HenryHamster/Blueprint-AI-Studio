@@ -4143,8 +4143,12 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     consolidation write — ``_deletions.capabilities`` removing several old names
     plus a working survivor that declares them in ``absorbs`` — makes each old
     name resolve through ``working_capability_names`` +
-    ``registry_satisfies_capability_need``."""
+    ``registry_satisfies_capability_need`` ONLY when the alias relationship is
+    PLATFORM-RECORDED via forwarding markers in ``proof_records``. An agent-declared
+    ``absorbs`` list alone (without corresponding forwarding markers) does NOT
+    cause absorbed names to resolve — closing the alias-forgery bypass."""
     from app.capability_registry import (
+        CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
         PLATFORM_WORKING_CAPABILITIES,
         registry_satisfies_capability_need,
         working_capability_names,
@@ -4176,12 +4180,26 @@ def test_capability_consolidation_resolves_absorbed_prereq():
     names = [c["name"] for c in new_raw["capabilities"]]
     assert names == ["ci-pipeline"]
 
-    # working_capability_names folds the absorbed aliases in alongside the
-    # survivor's own name. It also ALWAYS includes the always-working
+    # Simulate the platform forwarding markers that a real consolidation would
+    # leave via carry_proof_records_for_consolidation. Without these markers,
+    # the absorbed names must NOT resolve through working_capability_names.
+    proof_records: dict = {}
+    for _absorbed in ("ci-poll", "ci-resolve", "ci-fix-spawn"):
+        proof_records[_absorbed] = [
+            {
+                "proof_kind": CAPABILITY_ABSORPTION_FORWARD_PROOF_KIND,
+                "survivor": "ci-pipeline",
+                "task_id": f"consolidation:{_absorbed}",
+                "proved_at": "2026-06-10T12:00:00",
+            }
+        ]
+
+    # working_capability_names folds the PLATFORM-RECORDED absorbed aliases in
+    # alongside the survivor's own name. It also ALWAYS includes the always-working
     # PLATFORM_WORKING_CAPABILITIES (foundation capabilities unrelated to this
     # consolidation), so the survivor + its three absorbed aliases are exactly
     # the project-model contribution on top of the platform set.
-    working = working_capability_names(new_raw)
+    working = working_capability_names(new_raw, proof_records=proof_records)
     assert working == {
         "ci-pipeline",
         "ci-poll",
@@ -6087,3 +6105,76 @@ def test_auto_clear_empty_model_is_noop():
     )
     assert cleared == []
     assert model.model_dump() == before
+
+
+def test_alias_forgery_rejected_at_existence_check():
+    """A forged alias in the agent-writable ``absorbs`` list — without a
+    corresponding platform forwarding marker in ``proof_records`` — does NOT
+    resolve through ``working_capability_names`` at ANY of the three consumer
+    seams.
+
+    This pinning test closes the alias-forgery bypass (existence/authority alias
+    divergence): formerly, ``working_capability_names`` read ``absorbs`` from the
+    agent-writable problem_model, so a forged entry like:
+      ``{"name": "bogus", "status": "working", "absorbs": ["real-proven-cap"]}``
+    would include ``"real-proven-cap"`` in the working set, letting a need for
+    that capability satisfy the existence check without any platform-recorded
+    proof relationship. Now only platform-ledger forwarding markers
+    (``absorbed_into``) contribute alias names.
+    """
+    from app.capability_registry import (
+        PLATFORM_WORKING_CAPABILITIES,
+        registry_satisfies_capability_need,
+        working_capability_names,
+    )
+
+    # An agent writes a new capability entry with a forged absorbs that names a
+    # (possibly real) capability — but there is NO platform forwarding marker
+    # for this relationship.
+    forged_model = {
+        "capabilities": [
+            {
+                "name": "my-forged-capability",
+                "status": "working",
+                "absorbs": ["real-proven-capability"],
+            },
+        ],
+    }
+
+    # SCENARIO 1: No proof_records at all → no alias resolution.
+    working = working_capability_names(forged_model)
+    # The forged capability's own name IS in the working set (it's declared working).
+    assert "my-forged-capability" in working
+    # But the forged alias name is NOT included — no platform markers exist.
+    assert "real-proven-capability" not in working
+    # Therefore the existence check for the forged alias fails.
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "real-proven-capability"}, working
+    )
+
+    # SCENARIO 2: proof_records is provided but contains NO forwarding markers
+    # for the forged alias → still not resolved.
+    working_with_ledger = working_capability_names(
+        forged_model,
+        proof_records={
+            # Some unrelated entries exist in the ledger
+            "unrelated-cap": [
+                {"proof_kind": "named_test", "proven": True, "task_id": "t-1"}
+            ],
+        },
+    )
+    assert "my-forged-capability" in working_with_ledger
+    assert "real-proven-capability" not in working_with_ledger
+    assert not registry_satisfies_capability_need(
+        {"kind": "capability", "ref": "real-proven-capability"}, working_with_ledger
+    )
+
+    # SCENARIO 3: Even when some of the working set is PLATFORM capabilities,
+    # the forged alias still does not resolve.
+    assert "real-proven-capability" not in PLATFORM_WORKING_CAPABILITIES
+    working_platform = working_capability_names(forged_model)
+    # Platform capabilities are unaffected.
+    for plat in PLATFORM_WORKING_CAPABILITIES:
+        assert plat in working_platform
+    # Forged alias is still absent.
+    assert "real-proven-capability" not in working_platform
