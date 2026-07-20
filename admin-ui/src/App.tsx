@@ -2,7 +2,7 @@
 import { useMemo, useRef, useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Skeleton } from './components/DashboardMetricCardsPrimitives';
-import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
+import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightClose, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -564,6 +564,18 @@ export default function App() {
   const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery } = useCommandPaletteState();
   const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [strategicContextWorkspaceOpen, setStrategicContextWorkspaceOpen] = useState(false);
+  // Chat right-rail (StrategicContextRail) is collapsible and hidden by default so the
+  // conversation gets full width; the operator opens it on demand. Persisted per-browser.
+  const [chatRailCollapsed, setChatRailCollapsed] = useState(() => {
+    try { return localStorage.getItem('bp.chatRailCollapsed') !== 'false'; } catch { return true; }
+  });
+  const toggleChatRail = useCallback(() => {
+    setChatRailCollapsed(prev => {
+      const next = !prev;
+      try { localStorage.setItem('bp.chatRailCollapsed', String(next)); } catch { /* ignore */ }
+      return next;
+    });
+  }, []);
   const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
   useEffect(() => {
     setStrategicContextWorkspaceOpen(false);
@@ -1390,6 +1402,23 @@ export default function App() {
                   <span>Context</span>
                 </button>
               )}
+              <button
+                type="button"
+                onClick={toggleChatRail}
+                aria-pressed={!chatRailCollapsed}
+                className={`hidden min-h-11 shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-xs font-semibold transition-colors sm:min-h-9 lg:inline-flex ${
+                  chatRailCollapsed
+                    ? 'border-neutral-800 bg-neutral-950 text-neutral-300 hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100'
+                    : 'border-neutral-700 bg-neutral-800/90 text-neutral-100'
+                }`}
+                title={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
+                aria-label={chatRailCollapsed ? 'Show context panel' : 'Hide context panel'}
+              >
+                {chatRailCollapsed
+                  ? <PanelRightOpen className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+                  : <PanelRightClose className="h-4 w-4 shrink-0" aria-hidden="true" />}
+                <span>Context</span>
+              </button>
             </>
           )}
           flush
@@ -1469,6 +1498,7 @@ export default function App() {
               </Suspense>
             )}
             railClassName="bg-workbench-rail"
+            railCollapsed={chatRailCollapsed}
           />
         </WorkbenchSurface>
       ) : activeTab === 'project' ? (
