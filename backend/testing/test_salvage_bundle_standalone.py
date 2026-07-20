@@ -167,6 +167,21 @@ Findings covered here (4-finding operator-walkthrough / runner-config / project-
   w4 — project-tools walkthrough residuals: Enable button in Disabled section shows Enabling…
        and is disabled while the PATCH is outstanding; the auto-uniquified slug assigned by
        the backend is surfaced to the operator as a created-slug notice after tool creation
+
+Findings covered here (4-finding compute/research salvage bundle, 2026-07-19):
+  r1 — clone-form preservation: buildCloneForm reads input_artifact_job_id / setup_step /
+       no_progress_timeout_seconds from launch_params; backend launch_params builder includes
+       all three fields so clone preserves checkpoint-resume, setup, and watchdog config
+  r2 — self-heal empty-repo: maybe_redetect_on_emptiness_disagreement flips stale
+       repo_is_empty=False when agent observes empty tree; agent endpoint
+       /api/agent/build-config-discovery propagates observed_repo_is_empty to break
+       the infinite clone_failed loop
+  r3 — GCE VM resource monitoring: _check_low_disk_vms and _check_low_memory_vms detect
+       and alert on low-disk/OOM conditions for active task VMs (parity with local runner
+       _check_low_disk_runners / _check_low_memory_runners)
+  r4 — research quality feedback: _compute_direction_quality_score incorporates
+       grade_distribution (HIGH/MEDIUM/LOW) and quality_grader_verdict (pass rate)
+       from research_history so high-quality directions are prioritised in research spawning
 """
 
 from __future__ import annotations
@@ -4014,4 +4029,350 @@ def test_w4_created_slug_notice_surfaces_auto_uniquified_slug():
     )
     assert "tool.slug" in source or "tool.slug" in source or "slug" in source, (
         "ProjectToolHost.tsx must include the tool's slug in the creation notice"
+    )
+
+
+# =========================================================================== #
+# 4-finding compute/research salvage bundle
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Finding r1 — Clone form preserves checkpoint-resume fields and watchdog cfg  #
+# --------------------------------------------------------------------------- #
+
+
+def test_r1_launch_params_builder_includes_checkpoint_and_watchdog_fields():
+    """r1: admin_compute_jobs.py launch_params builder includes input_artifact_job_id,
+    setup_step, and no_progress_timeout_seconds so clone-a-job preserves
+    checkpoint-resume, setup steps, and no-progress watchdog configuration.
+
+    Finding: buildCloneForm reads these fields from job.launch_params, but the
+    fields were absent from the launch_params dict built server-side, so cloning
+    a job that used checkpoint resume / custom setup / watchdog silently dropped
+    those settings.
+
+    Fix: the launch_params dict now carries all three keys (lines 347-349 of
+    admin_compute_jobs.py).
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "admin_compute_jobs.py",
+        Path("/repo/backend/app/routers/admin_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "admin_compute_jobs.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("admin_compute_jobs.py not found — skipping source check")
+
+    assert '"input_artifact_job_id"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'input_artifact_job_id' "
+        "so that cloning a checkpoint-resume job preserves the resume source job ID"
+    )
+    assert '"setup_step"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'setup_step' "
+        "so that cloning a job with a custom setup step preserves it"
+    )
+    assert '"no_progress_timeout_seconds"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'no_progress_timeout_seconds' "
+        "so that cloning a job with a custom watchdog timeout preserves the configuration"
+    )
+
+
+def test_r1_clone_form_reads_checkpoint_and_watchdog_fields_from_launch_params():
+    """r1 (frontend): buildCloneForm in ComputeJobsPanel.tsx reads input_artifact_job_id,
+    setup_step, and no_progress_timeout_seconds from launch_params.
+
+    The backend now supplies these fields; the UI must consume them.
+    """
+    try:
+        source = _ui_component_source("ComputeJobsPanel.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("ComputeJobsPanel.tsx not found — skipping frontend source check")
+
+    assert "inputArtifactJobId" in source and "input_artifact_job_id" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.input_artifact_job_id → "
+        "inputArtifactJobId so that checkpoint-resume job IDs survive clone"
+    )
+    assert "setupStep" in source and "setup_step" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.setup_step → setupStep "
+        "so that custom setup steps survive clone"
+    )
+    assert "noProgressTimeoutSeconds" in source and "no_progress_timeout_seconds" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.no_progress_timeout_seconds → "
+        "noProgressTimeoutSeconds so that watchdog timeout config survives clone"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r2 — Self-heal stale repo_is_empty=False breaks clone_failed loop    #
+# --------------------------------------------------------------------------- #
+
+
+def test_r2_maybe_redetect_on_emptiness_disagreement_is_importable():
+    """r2: maybe_redetect_on_emptiness_disagreement exists in build_config_detection
+    and accepts observed_empty, breaking the infinite clone_failed loop for projects
+    whose repo_is_empty=False durable signal is stale (repo genuinely empty).
+
+    Finding: maybe_refresh_empty_build_config returned early when repo_is_empty is
+    False, so a stale non-empty signal never self-corrected; every task threw
+    clone_failed forever. The fix adds maybe_redetect_on_emptiness_disagreement
+    which fires on durable/live disagreement and re-runs authoritative detection.
+    """
+    from app.build_config_detection import maybe_redetect_on_emptiness_disagreement
+    import inspect
+
+    sig = inspect.signature(maybe_redetect_on_emptiness_disagreement)
+    assert "observed_empty" in sig.parameters, (
+        "maybe_redetect_on_emptiness_disagreement must accept 'observed_empty' "
+        "so the agent can report a live-empty observation and trigger re-detection"
+    )
+
+
+def test_r2_maybe_correct_stale_repo_empty_signal_is_importable():
+    """r2: maybe_correct_stale_repo_empty_signal exists as the INVERSE of
+    maybe_refresh_empty_build_config — it corrects a stale repo_is_empty=False
+    when the repo is genuinely empty.
+    """
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+    import inspect
+
+    sig = inspect.signature(maybe_correct_stale_repo_empty_signal)
+    assert "project" in sig.parameters and "session" in sig.parameters, (
+        "maybe_correct_stale_repo_empty_signal must accept project and session "
+        "so it can persist the corrected build_config"
+    )
+
+
+def test_r2_agent_router_exposes_build_config_discovery_with_observed_repo_is_empty():
+    """r2: the agent router must have a /build-config-discovery endpoint that accepts
+    observed_repo_is_empty and calls maybe_redetect_on_emptiness_disagreement.
+
+    The agent calls POST /api/agent/build-config-discovery with
+    {observed_repo_is_empty: true} as a best-effort self-heal before throwing
+    the clone_failed error.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "agent.py",
+        Path("/repo/backend/app/routers/agent.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "agent.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("agent.py not found — skipping source check")
+
+    assert "build-config-discovery" in source, (
+        "agent.py must define a /build-config-discovery endpoint so the agent can "
+        "report observed_repo_is_empty and trigger server-side self-healing"
+    )
+    assert "maybe_redetect_on_emptiness_disagreement" in source, (
+        "agent.py /build-config-discovery handler must call "
+        "maybe_redetect_on_emptiness_disagreement to re-run authoritative detection "
+        "when the agent observes a live-empty tree vs. the durable non-empty signal"
+    )
+    assert "observed_repo_is_empty" in source, (
+        "agent.py must accept observed_repo_is_empty from the agent payload so the "
+        "direction of the disagreement (observed empty vs. observed non-empty) is "
+        "forwarded to the re-detection helper"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r3 — GCE VM resource monitoring parity with local runners            #
+# --------------------------------------------------------------------------- #
+
+
+def test_r3_check_low_disk_vms_and_check_low_memory_vms_are_defined():
+    """r3: runner_health_monitors.py must define _check_low_disk_vms and
+    _check_low_memory_vms — GCE-task-VM twins of the local-runner checks
+    _check_low_disk_runners / _check_low_memory_runners.
+
+    Finding: local runners had proactive resource monitoring (_check_low_disk_runners,
+    _check_low_memory_runners) but GCE task VMs had no equivalent — only teardown-
+    time serial-console forensics. The fix adds Task-based VM monitors that alert
+    when a VM reports low disk or approaching OOM via its heartbeat metadata.
+    """
+    from app.runner_health_monitors import (
+        _check_low_disk_vms,
+        _check_low_memory_vms,
+    )
+    import inspect
+
+    sig_disk = inspect.signature(_check_low_disk_vms)
+    assert "session" in sig_disk.parameters, (
+        "_check_low_disk_vms must accept a session parameter to query active VM tasks"
+    )
+
+    sig_mem = inspect.signature(_check_low_memory_vms)
+    assert "session" in sig_mem.parameters, (
+        "_check_low_memory_vms must accept a session parameter to query active VM tasks"
+    )
+
+
+def test_r3_vm_resource_monitors_called_in_health_check_flow():
+    """r3: the health-check orchestrator (run_runner_health_monitors) must call
+    _check_low_disk_vms and _check_low_memory_vms to make VM monitoring active.
+
+    Importing and defining the functions is not enough — they must be wired into
+    the periodic health-check sweep that fires for every orchestrator tick.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "runner_health_monitors.py",
+        Path("/repo/backend/app/runner_health_monitors.py"),
+        Path(__file__).resolve().parent.parent / "app" / "runner_health_monitors.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("runner_health_monitors.py not found — skipping source check")
+
+    assert "await _check_low_disk_vms" in source, (
+        "runner_health_monitors.py must await _check_low_disk_vms inside "
+        "run_runner_health_monitors so GCE VM low-disk conditions trigger alerts "
+        "during every health-check sweep"
+    )
+    assert "await _check_low_memory_vms" in source, (
+        "runner_health_monitors.py must await _check_low_memory_vms inside "
+        "run_runner_health_monitors so GCE VM OOM conditions trigger alerts "
+        "during every health-check sweep"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r4 — Research quality feedback closes the grade/grader loop          #
+# --------------------------------------------------------------------------- #
+
+
+def test_r4_direction_quality_score_incorporates_grade_distribution():
+    """r4: _compute_direction_quality_score in direction_metrics.py must consume
+    grade_distribution from research_history entries so HIGH-grade directions
+    score better than LOW-grade noise generators.
+
+    Finding: grade_distribution was stored per research_history entry by
+    research_direction_state.py but never consumed — it had zero influence on
+    direction quality scores or research spawning priority.
+
+    Fix: the quality scorer now reads HIGH/MEDIUM/LOW counts from grade_distribution
+    and adds a recency-weighted HIGH-grade fraction as a quality component.
+    """
+    from app.direction_metrics import _compute_direction_quality_score
+
+    # Direction whose recent history has mostly HIGH-grade findings.
+    high_grade_direction = {
+        "research_history": [
+            {"grade_distribution": {"HIGH": 5, "MEDIUM": 1, "LOW": 0}},
+            {"grade_distribution": {"HIGH": 4, "MEDIUM": 2, "LOW": 0}},
+        ]
+    }
+    # Direction whose recent history has mostly LOW-grade findings.
+    low_grade_direction = {
+        "research_history": [
+            {"grade_distribution": {"HIGH": 0, "MEDIUM": 1, "LOW": 6}},
+            {"grade_distribution": {"HIGH": 1, "MEDIUM": 1, "LOW": 5}},
+        ]
+    }
+
+    high_score = _compute_direction_quality_score(high_grade_direction)
+    low_score = _compute_direction_quality_score(low_grade_direction)
+
+    assert isinstance(high_score, float), (
+        "_compute_direction_quality_score must return a float quality score"
+    )
+    assert 0.0 <= high_score <= 1.0, (
+        "_compute_direction_quality_score score must be in [0.0, 1.0]"
+    )
+    assert high_score > low_score, (
+        "_compute_direction_quality_score must assign a higher score to a direction "
+        "with mostly HIGH-grade findings than one with mostly LOW-grade noise; "
+        "grade_distribution must contribute to the quality signal"
+    )
+
+
+def test_r4_direction_quality_score_incorporates_quality_grader_verdict():
+    """r4: _compute_direction_quality_score must consume quality_grader_verdict
+    (pass/fail) from research_history so directions whose findings consistently
+    pass forward-quality grading score higher.
+
+    Finding: quality_grader_verdict was stored on individual task contexts in
+    task_lifecycle.py but never aggregated into direction quality scoring — it
+    had no effect on research prioritisation.
+
+    Fix: the quality scorer reads quality_grader_verdict.passed from recent
+    history entries and adds a recency-weighted pass-rate component.
+    """
+    from app.direction_metrics import _compute_direction_quality_score
+
+    # Direction where quality grader consistently passed.
+    all_pass = {
+        "research_history": [
+            {"quality_grader_verdict": {"passed": True}},
+            {"quality_grader_verdict": {"passed": True}},
+            {"quality_grader_verdict": {"passed": True}},
+        ]
+    }
+    # Direction where quality grader consistently failed.
+    all_fail = {
+        "research_history": [
+            {"quality_grader_verdict": {"passed": False}},
+            {"quality_grader_verdict": {"passed": False}},
+            {"quality_grader_verdict": {"passed": False}},
+        ]
+    }
+
+    pass_score = _compute_direction_quality_score(all_pass)
+    fail_score = _compute_direction_quality_score(all_fail)
+
+    assert pass_score > fail_score, (
+        "_compute_direction_quality_score must assign a higher score to a direction "
+        "whose findings all passed quality grading than one where all failed; "
+        "quality_grader_verdict.passed must contribute to the quality signal"
+    )
+
+
+def test_r4_direction_quality_score_used_in_research_spawning_priority():
+    """r4: autonomous_research.py must import and call _compute_direction_quality_score
+    so that quality feedback actually influences which directions get research tasks.
+
+    A quality signal that is computed but never consumed by the spawner has no effect.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "autonomous_research.py",
+        Path("/repo/backend/app/autonomous_research.py"),
+        Path(__file__).resolve().parent.parent / "app" / "autonomous_research.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("autonomous_research.py not found — skipping source check")
+
+    assert "_compute_direction_quality_score" in source, (
+        "autonomous_research.py must import and call _compute_direction_quality_score "
+        "so that research quality feedback (grade_distribution / quality_grader_verdict) "
+        "influences which directions are prioritised for research spawning"
     )
