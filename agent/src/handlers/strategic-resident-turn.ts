@@ -189,6 +189,12 @@ const RESULT_EVIDENCE_KEYS = [
 ] as const;
 const RESULT_EVIDENCE_KEY_SET = new Set<string>(RESULT_EVIDENCE_KEYS);
 const RESULT_EVIDENCE_SERVER_EXTRA_KEYS = new Set(['project_id', 'inspected_at', 'data']);
+const MUTATION_EVIDENCE_KEYS = [
+  'kind', 'project_id', 'source_id', 'revision', 'checksum', 'inspected_at',
+] as const;
+const MUTATION_EVIDENCE_INPUT_KEYS = new Set([
+  ...MUTATION_EVIDENCE_KEYS, 'evidence_id', 'summary', 'decisive', 'data',
+]);
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0;
@@ -339,6 +345,75 @@ function stableJson(value: unknown): string {
   return 'null';
 }
 
+function canonicalMutationEvidence(
+  items: unknown[],
+  serverInspectionEvidence: Record<string, unknown>[],
+  projectId: string,
+): Record<string, unknown>[] {
+  if (items.length > 50) {
+    throw new Error('Resident mutation evidence exceeds 50 items');
+  }
+  const canonicalIdentities = new Set<string>();
+  return items.map((value, index) => {
+    if (!isRecord(value)) {
+      throw new Error(`Resident mutation evidence[${index}] must be an object`);
+    }
+    const unknownKey = Object.keys(value).find(
+      (key) => !MUTATION_EVIDENCE_INPUT_KEYS.has(key),
+    );
+    if (unknownKey !== undefined) {
+      throw new Error(`Resident mutation evidence[${index}] contains an unknown field: ${unknownKey}`);
+    }
+    if (
+      value.evidence_id !== undefined
+      && (!nonEmptyString(value.evidence_id) || value.evidence_id.length > 120)
+    ) {
+      throw new Error(`Resident mutation evidence[${index}].evidence_id must be a bounded non-empty string`);
+    }
+    if (
+      value.summary !== undefined
+      && (!nonEmptyString(value.summary) || value.summary.length > 4_000)
+    ) {
+      throw new Error(`Resident mutation evidence[${index}].summary must be a bounded non-empty string`);
+    }
+    if (value.decisive !== undefined && typeof value.decisive !== 'boolean') {
+      throw new Error(`Resident mutation evidence[${index}].decisive must be a boolean`);
+    }
+    for (const key of MUTATION_EVIDENCE_KEYS) {
+      if (!nonEmptyString(value[key])) {
+        throw new Error(`Resident mutation evidence[${index}].${key} must be a non-empty string`);
+      }
+    }
+    if (value.project_id !== projectId) {
+      throw new Error(`Resident mutation evidence[${index}] belongs to another project`);
+    }
+    const matches = serverInspectionEvidence.filter((candidate) => (
+      MUTATION_EVIDENCE_KEYS.every((key) => (
+        nonEmptyString(candidate[key]) && candidate[key] === value[key]
+      ))
+      && (
+        value.data === undefined
+        || (
+          Object.prototype.hasOwnProperty.call(candidate, 'data')
+          && stableJson(candidate.data) === stableJson(value.data)
+        )
+      )
+    ));
+    if (matches.length !== 1) {
+      throw new Error(`Resident mutation evidence[${index}] is not backed by one server inspection`);
+    }
+    const inspected = matches[0];
+    const canonical = Object.fromEntries(
+      MUTATION_EVIDENCE_KEYS.map((key) => [key, inspected[key]]),
+    );
+    const identity = stableJson(canonical);
+    if (canonicalIdentities.has(identity)) {
+      throw new Error('Resident mutation evidence contains a duplicate server inspection');
+    }
+    canonicalIdentities.add(identity);
+    return canonical;
+  });
+}
 function catalogAvailability(
   providerInput: Record<string, unknown>,
   capabilityId: string,
@@ -400,7 +475,7 @@ function residentPrompt(
     'In the final reconciliation, evidence_inspections must be an array of objects shaped {"evidence_id":"<result.evidence id>","decisive":true}; decisive is optional. Each evidence_id must name a result.evidence item copied from server-validated inspection evidence; the worker binds the canonical receipt metadata.',
     'Each cited result.evidence item must be shaped {"evidence_id":"<stable local id>","kind":"<server evidence kind>","source_id":"<server evidence source_id>","revision":"<server evidence revision>","checksum":"<server evidence checksum>","summary":"<what the evidence establishes>"}. Copy the trust fields exactly from the inspection result.',
     'The server supplies project, turn, authority, checkpoint, and context revisions. Never include or override those server-owned revisions.',
-    'Mutation evidence references must copy kind, project_id, source_id, revision, checksum, and inspected_at from server-validated inspection evidence; never invent evidence. Explicit approvals are durable server-side grants and are never represented in the model request.',
+    'Mutation evidence references must be shaped exactly as {"kind":"<server kind>","project_id":"<server project_id>","source_id":"<server source_id>","revision":"<server revision>","checksum":"<server checksum>","inspected_at":"<server inspected_at>"}. Copy every field from one server-validated inspection; do not include evidence_id, summary, decisive, data, or any other field. Explicit approvals are durable server-side grants and are never represented in the model request.',
     'Every mutation response contains a server-authored completion_projection. Copy its operation and receipt exactly into final operations and receipts, and copy every projected unknown_effect and required_attention item exactly. An unknown_effect receipt must remain an applying operation and must never be reported as success or retried.',
     'Never claim an operation that lacks a server receipt.',
     'Never request a propose_only capability; include those only as final operations with status "proposed".',
@@ -514,7 +589,21 @@ export async function handleStrategicResidentTurn(
             `Resident requested a non-invokable ${action.kind} capability: ${request.capability_id}`,
           );
         }
-        const key = stableJson({ kind: action.kind, request });
+        let canonicalMutationRequest: ResidentMutationRequest | null = null;
+        if (action.kind === 'mutate') {
+          const mutation = request as ResidentMutationRequest;
+          const projectId = typeof identity.project_id === 'string' ? identity.project_id : '';
+          canonicalMutationRequest = {
+            ...mutation,
+            evidence: canonicalMutationEvidence(
+              mutation.evidence,
+              serverInspectionEvidence,
+              projectId,
+            ),
+          };
+        }
+        const effectiveRequest = canonicalMutationRequest ?? request;
+        const key = stableJson({ kind: action.kind, request: effectiveRequest });
         if (requestKeys.has(key)) {
           throw new Error('Resident repeated an identical capability request');
         }
@@ -529,7 +618,10 @@ export async function handleStrategicResidentTurn(
             serverInspectionEvidence.push(response.evidence);
           }
         } else {
-          const mutation = request as ResidentMutationRequest;
+          const mutation = canonicalMutationRequest;
+          if (mutation === null) {
+            throw new Error('Resident mutation evidence was not canonicalized');
+          }
           const projectId = typeof identity.project_id === 'string' ? identity.project_id : '';
           const contextHash = typeof lineage.context_hash === 'string' ? lineage.context_hash : '';
           response = await apiPost('/api/agent/resident-turn/mutate', {
