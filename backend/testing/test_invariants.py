@@ -1677,6 +1677,14 @@ class TestSchemaRevisionSync:
         Catches auto-generation errors like declaring a JSONB field as sa.Text().
         Comparison is by type family (String/Text compatible; JSONB must match
         JSONB; Integer, Boolean, UUID, ARRAY must each match).
+
+        The datetime family is split into two subfamilies to catch timezone
+        errors: DATETIME_TZ (NaiveUTCDateTime / sa.DateTime(timezone=True)) vs
+        DATETIME_NOTZ (bare sa.DateTime()).  A migration that creates a
+        NaiveUTCDateTime model column as sa.DateTime() will now fail here
+        instead of silently passing and breaking at runtime (0633-class bug).
+        alter_column migrations that upgrade a column to timezone=True (e.g.
+        0063, 0639) are scanned so corrective migrations are accounted for.
         """
         import glob as globmod
         import re
@@ -1701,17 +1709,30 @@ class TestSchemaRevisionSync:
                 return "INTEGER"
             if n in {"UUID", "GUID"}:
                 return "UUID"
-            # ``NAIVEUTCDATETIME`` is the round-2 audit TypeDecorator
-            # (``app.models.NaiveUTCDateTime``) whose ``impl`` is
-            # ``DateTime(timezone=True)`` — the DB column is still TIMESTAMPTZ;
-            # the decorator only strips tz on read in Python. The migration
-            # files emit ``sa.DateTime(timezone=True)`` directly, so the
-            # families must alias.
-            if n in {"DATETIME", "TIMESTAMP", "NAIVEUTCDATETIME"}:
-                return "DATETIME"
+            # Timezone-aware: NaiveUTCDateTime (TypeDecorator whose impl is
+            # DateTime(timezone=True)) and the synthetic "DateTime_tz" tag
+            # we emit when a migration uses sa.DateTime(timezone=True) or an
+            # alter_column upgrades a column to TIMESTAMPTZ.
+            if n in {"NAIVEUTCDATETIME", "DATETIME_TZ"}:
+                return "DATETIME_TZ"
+            # Timezone-naive: bare sa.DateTime() in a migration.
+            # NaiveUTCDateTime vs DATETIME_NOTZ is a detectable mismatch —
+            # exactly the class of error migration 0633 introduced and 0639 fixed.
+            if n in {"DATETIME", "TIMESTAMP", "DATETIME_NOTZ"}:
+                return "DATETIME_NOTZ"
             if n in {"NUMERIC", "DECIMAL"}:
                 return "NUMERIC"
             return n  # JSONB, JSON, BOOLEAN, FLOAT, DATE, ARRAY, ENUM, etc.
+
+        # Confirm the timezone split is active before scanning migrations.
+        assert family("NaiveUTCDateTime") != family("DateTime"), (
+            "family() must distinguish NaiveUTCDateTime (DATETIME_TZ) from "
+            "bare DateTime (DATETIME_NOTZ) to catch 0633-class migration errors"
+        )
+        assert family("NaiveUTCDateTime") == family("DateTime_tz"), (
+            "family() must map NaiveUTCDateTime and DateTime_tz to the same "
+            "family so corrective alter_column migrations (e.g. 0639) match models"
+        )
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -1719,22 +1740,52 @@ class TestSchemaRevisionSync:
         files = sorted(globmod.glob(os.path.join(migrations_dir, "[0-9]*.py")))
 
         # Extract (table, col) -> type class name from migration files. Later files win.
+        # The optional (timezone=True) suffix is captured to distinguish TIMESTAMPTZ
+        # columns (recorded as "DateTime_tz") from naive TIMESTAMP ("DateTime").
         add_col_re = re.compile(
             r"add_column\(\s*['\"](\w+)['\"]\s*,\s*sa\.Column\(\s*['\"](\w+)['\"]\s*,"
             r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+            r"(\(timezone=True\))?"
         )
         create_table_re = re.compile(r"create_table\(\s*['\"](\w+)['\"]", re.MULTILINE)
         col_in_create_re = re.compile(
             r"sa\.Column\(\s*['\"](\w+)['\"]\s*,"
             r"\s*(?:sa|postgresql|sqlmodel\.sql\.sqltypes)\.(\w+)"
+            r"(\(timezone=True\))?"
+        )
+
+        # alter_column scanning: patterns used to detect upgrade-to-TIMESTAMPTZ calls.
+        # We extract only the upgrade() body to avoid matching downgrade() reversals.
+        _upgrade_start_re = re.compile(r"\ndef upgrade\b")
+        _next_def_re = re.compile(r"\n(?:def |class )\w")
+        # _TABLE = "tablename" module-level constant (0639 style)
+        _table_const_re = re.compile(r"^_TABLE\s*=\s*[\"'](\w+)[\"']", re.MULTILINE)
+        # _COLUMNS = [...] list (0063 style with (table,col,...) or 0639 style with (col,...))
+        _cols_block_re = re.compile(
+            r"^_COLUMNS\s*=\s*\[(.*?)\]", re.DOTALL | re.MULTILINE
+        )
+        # First two string elements of a tuple: ("table", "col", ...)
+        _tuple_table_col_re = re.compile(r'\(\s*["\'](\w+)["\']\s*,\s*["\'](\w+)["\']')
+        # First string element of a tuple: ("col", ...)
+        _tuple_col_re = re.compile(r'\(\s*["\'](\w+)["\']')
+        # Direct: op.alter_column("table", "col", ..., type_=sa.DateTime(timezone=True))
+        _direct_alter_re = re.compile(
+            r'alter_column\(\s*["\'](\w+)["\']\s*,\s*["\'](\w+)["\']\s*,.*?'
+            r"type_=sa\.DateTime\(timezone=True\)",
+            re.DOTALL,
         )
 
         migration_types: dict[tuple[str, str], str] = {}
         for path in files:
             with open(path) as f:
                 content = f.read()
+
+            # --- add_column pass ---
             for m in add_col_re.finditer(content):
-                migration_types[(m.group(1), m.group(2))] = m.group(3)
+                type_str = m.group(3) + ("_tz" if m.group(4) else "")
+                migration_types[(m.group(1), m.group(2))] = type_str
+
+            # --- create_table pass ---
             for ct in create_table_re.finditer(content):
                 table = ct.group(1)
                 start, depth, end = ct.end(), 1, ct.end()
@@ -1744,8 +1795,155 @@ class TestSchemaRevisionSync:
                     elif content[end] == ")":
                         depth -= 1
                     end += 1
-                for col_m in col_in_create_re.finditer(content[start:end]):
-                    migration_types[(table, col_m.group(1))] = col_m.group(2)
+                block = content[start:end]
+                for col_m in col_in_create_re.finditer(block):
+                    type_str = col_m.group(2) + ("_tz" if col_m.group(3) else "")
+                    migration_types[(table, col_m.group(1))] = type_str
+
+            # --- alter_column → TIMESTAMPTZ upgrade pass ---
+            # Extract upgrade() body (stop before next top-level def/class).
+            upg_m = _upgrade_start_re.search(content)
+            if upg_m is not None:
+                upg_start = upg_m.end()
+                next_m = _next_def_re.search(content, upg_start)
+                upgrade_body = (
+                    content[upg_start : next_m.start()]
+                    if next_m
+                    else content[upg_start:]
+                )
+
+                if "DateTime(timezone=True)" in upgrade_body:
+                    # Pattern A: op.alter_column("table", "col", type_=...) with literals
+                    for m in _direct_alter_re.finditer(upgrade_body):
+                        migration_types[(m.group(1), m.group(2))] = "DateTime_tz"
+
+                    # Pattern B/C: loop over _COLUMNS with op.alter_column in the body.
+                    table_m = _table_const_re.search(content)
+                    cols_m = _cols_block_re.search(content)
+                    if cols_m:
+                        cols_block = cols_m.group(1)
+                        if table_m:
+                            # Pattern C (0639 style): _TABLE="tbl", _COLUMNS=[("col",...)]
+                            tbl = table_m.group(1)
+                            for col_m in _tuple_col_re.finditer(cols_block):
+                                migration_types[(tbl, col_m.group(1))] = "DateTime_tz"
+                        else:
+                            # Pattern B (0063 style): _COLUMNS=[("tbl","col",...)]
+                            for t_m in _tuple_table_col_re.finditer(cols_block):
+                                migration_types[
+                                    (t_m.group(1), t_m.group(2))
+                                ] = "DateTime_tz"
+
+        # Pre-existing (table, col) pairs where the original migration used bare
+        # sa.DateTime() but the model now uses NaiveUTCDateTime (TIMESTAMPTZ).
+        # These predate the timezone convention; the asyncpg session is pinned to
+        # timezone='UTC' so TIMESTAMP and TIMESTAMPTZ behave identically for our
+        # naive-UTC read paths, making this technical debt rather than a live bug.
+        # Do NOT add new columns here — fix the migration to use sa.DateTime(timezone=True)
+        # instead, or add a corrective ALTER COLUMN migration (e.g. 0063, 0639).
+        # When a column is fixed by an ALTER COLUMN migration, remove it from this set.
+        _pre_convention_notz: frozenset[tuple[str, str]] = frozenset(
+            {
+                ("alert", "acknowledged_at"),
+                ("alert", "dismissed_at"),
+                ("alert", "last_escalated_at"),
+                ("alert", "last_seen_at"),
+                ("alloweduser", "last_login_at"),
+                ("artifact", "created_at"),
+                ("artifactref", "created_at"),
+                ("artifactrefcleanupintent", "completed_at"),
+                ("artifactrefcleanupintent", "created_at"),
+                ("artifactrefcleanupintent", "lease_expires_at"),
+                ("artifactrefcleanupintent", "next_attempt_at"),
+                ("artifactrefcleanupintent", "updated_at"),
+                ("artifactrefpromotionintent", "completed_at"),
+                ("artifactrefpromotionintent", "created_at"),
+                ("artifactrefpromotionintent", "effect_deadline_at"),
+                ("artifactrefpromotionintent", "lease_expires_at"),
+                ("artifactrefpromotionintent", "next_attempt_at"),
+                ("artifactrefpromotionintent", "settle_until"),
+                ("artifactrefpromotionintent", "updated_at"),
+                ("categoryverdict", "graded_at"),
+                ("completiondebtentry", "created_at"),
+                ("completiondebtentry", "resolved_at"),
+                ("completiondebtentry", "updated_at"),
+                ("computejob", "last_heartbeat_at"),
+                ("computejobfile", "created_at"),
+                ("criterionevidence", "recorded_at"),
+                ("deploymentstate", "deployed_at"),
+                ("deploymentstate", "halted_at"),
+                ("deploymentstate", "paused_at"),
+                ("direction_event", "recorded_at"),
+                ("knowledgedocument", "consumed_at"),
+                ("knowledgedocument", "dismissed_at"),
+                ("localrunner", "created_at"),
+                ("localrunner", "last_seen_at"),
+                ("localrunner", "last_successful_job_at"),
+                ("localrunner", "token_created_at"),
+                ("maxplanaccount", "created_at"),
+                ("maxplanaccount", "daily_task_count_reset_at"),
+                ("maxplanaccount", "disabled_at"),
+                ("maxplanaccount", "token_created_at"),
+                ("maxplanaccount", "updated_at"),
+                ("notification_dead_letter", "created_at"),
+                ("orchestratorerrorack", "acknowledged_at"),
+                ("poolvm", "reservation_expires_at"),
+                ("poolvm", "reservation_hard_expires_at"),
+                ("project", "running_update_acknowledged_at"),
+                ("projectcomputeimage", "created_at"),
+                ("projectcomputeimage", "updated_at"),
+                ("projectmember", "created_at"),
+                ("projectmessage", "resolved_at"),
+                ("projecttool", "created_at"),
+                ("projecttool", "updated_at"),
+                ("qualificationdimensionresult", "computed_at"),
+                ("qualificationverdict", "post_promotion_outcome_at"),
+                ("releaseversion", "deploy_confirm_alerted_at"),
+                ("releaseversion", "deploy_confirm_deadline"),
+                ("releaseversion", "goal_updated_at"),
+                ("releaseversion", "served_at"),
+                ("residualremediationcase", "created_at"),
+                ("residualremediationcase", "first_seen_at"),
+                ("residualremediationcase", "last_seen_at"),
+                ("residualremediationcase", "last_spawned_at"),
+                ("residualremediationcase", "suspended_at"),
+                ("residualremediationcase", "updated_at"),
+                ("residualverdict", "graded_at"),
+                ("runner_heartbeat_snapshot", "captured_at"),
+                ("runner_heartbeat_snapshot", "created_at"),
+                ("runner_project_binding", "created_at"),
+                ("strategiccycle", "created_at"),
+                ("strategiccycle", "phase1_completed_at"),
+                ("strategiccycle", "phase1_started_at"),
+                ("strategiccycle", "phase2_completed_at"),
+                ("strategiccycle", "phase2_started_at"),
+                ("strategiccycle", "updated_at"),
+                ("strategicresidentsweepstate", "updated_at"),
+                ("task", "blocked_at"),
+                ("task", "completed_at"),
+                ("task", "last_heartbeat"),
+                ("task", "last_token_refresh_at"),
+                ("task", "last_tool_use_at"),
+                ("task", "recheck_after"),
+                ("task", "retry_after_until"),
+                ("task", "started_at"),
+                ("task", "vm_dispatched_at"),
+                ("task", "vm_provisioned_at"),
+                ("task", "vm_started_at"),
+                ("task", "vm_stopped_at"),
+                ("taskcontact", "last_contact_at"),
+                ("taskcontact", "last_tool_use_at"),
+                ("taskhistory", "timestamp"),
+                ("ui_load_timing_baseline", "pinned_at"),
+                ("ui_load_timing_sample", "recorded_at"),
+                ("userintegration", "created_at"),
+                ("userintegration", "updated_at"),
+                ("versionacceptancecriterion", "created_at"),
+                ("versionacceptancecriterion", "retracted_at"),
+                ("vmcontact", "last_contact_at"),
+                ("vmcontact", "last_tool_use_at"),
+            }
+        )
 
         mismatches: list[str] = []
         for table_name, table in SQLModel.metadata.tables.items():
@@ -1756,6 +1954,8 @@ class TestSchemaRevisionSync:
                 model_fam = family(type(col.type).__name__)
                 mig_fam = family(mig_type)
                 if model_fam != mig_fam:
+                    if (table_name, col.name) in _pre_convention_notz:
+                        continue  # pre-existing pre-NaiveUTCDateTime convention debt
                     mismatches.append(
                         f"  - {table_name}.{col.name}: model={type(col.type).__name__} "
                         f"({model_fam}) vs migration={mig_type} ({mig_fam})"
@@ -1764,7 +1964,10 @@ class TestSchemaRevisionSync:
         assert not mismatches, (
             "Migration column types incompatible with models.py:\n"
             + "\n".join(mismatches)
-            + "\n\nRegenerate the migration with the correct type to avoid runtime errors."
+            + "\n\nFor datetime columns: use sa.DateTime(timezone=True) when the model "
+            "uses NaiveUTCDateTime, or add a corrective ALTER COLUMN migration.\n"
+            "Do NOT add new entries to _pre_convention_notz in this test — fix the "
+            "migration instead."
         )
 
     def test_model_indexes_covered_by_migrations(self):

@@ -5749,6 +5749,60 @@ async def _finalize_qualification(
                         "status": "smoketest_admin_cancel_respawned",
                         "respawn_count": _smoke_new_count,
                     }
+                # --- Smoketest PROVISION_FAILURE / AGENT_TIMEOUT: bounded respawn ---
+                # A transient VM/agent infrastructure failure (not a quality issue)
+                # should not burn the candidate's qualification attempt.  Respawn
+                # the same candidate_sha, mirroring the audit/challenge legs.
+                smoke_infra_respawn_count = qual.get(
+                    "smoketest_infra_respawn_count", 0
+                )
+                if (
+                    _smoke_task_obj.status == TaskStatus.FAILED
+                    and _smoke_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and smoke_infra_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_new_task = await _spawn_qualifier_smoketest_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                    )
+                    _smoke_new_count = smoke_infra_respawn_count + 1
+                    _smoke_updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="smoketest",
+                        failed_task=_smoke_task_obj,
+                        replacement_task_id=str(_smoke_new_task.id),
+                        label="smoketest_infra_respawned",
+                        respawn_count=_smoke_new_count,
+                    )
+                    _smoke_updated_qual = {
+                        **_smoke_updated_qual,
+                        "smoketest_task_id": str(_smoke_new_task.id),
+                        "smoketest_infra_respawn_count": _smoke_new_count,
+                    }
+                    _smoke_updated_qual = _advance_qualification_retry_episode(
+                        version, _smoke_updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
+                    version.last_qualification = _smoke_updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d smoketest task %s failed with %s; "
+                        "re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        smoketest_task_id,
+                        _smoke_explicit_cat,
+                        _smoke_new_task.id,
+                        _smoke_new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "smoketest_infra_respawned",
+                        "respawn_count": _smoke_new_count,
+                    }
                 _smoke_infra_label = _enrich_infra_error(
                     f"smoketest_task_{_smoke_task_obj.status.lower()}",
                     _smoke_task_obj,
@@ -5759,6 +5813,12 @@ async def _finalize_qualification(
                     and smoke_admin_cancel_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                 ):
                     _smoke_infra_label = "smoketest_admin_cancel_respawn_cap_exceeded"
+                if (
+                    _smoke_task_obj.status == TaskStatus.FAILED
+                    and _smoke_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and smoke_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_infra_label = "smoketest_infra_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,
@@ -5804,14 +5864,104 @@ async def _finalize_qualification(
                         merge_grade_task_id,
                     )
                     return {"status": "merge_grade_admin_cancel_hold"}
+                _merge_explicit_cat = (_merge_grade_task_obj.context or {}).get(
+                    "failure_category", ""
+                ) or (_merge_grade_task_obj.context or {}).get("failure_class", "")
+                merge_grade_infra_respawn_count = qual.get(
+                    "merge_grade_infra_respawn_count", 0
+                )
+                # --- Merge-grade PROVISION_FAILURE / AGENT_TIMEOUT: bounded respawn ---
+                if (
+                    _merge_grade_task_obj.status == TaskStatus.FAILED
+                    and _merge_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and merge_grade_infra_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _merge_fp = _merge_grade_task_obj.first_payload or {}
+                    _merge_project = await session.get(
+                        Project, version.project_id
+                    )
+                    _merge_int_branch = get_project_integration_branch(
+                        _merge_project
+                    )
+                    _merge_base = (
+                        _merge_fp.get("base_branch", "") or _merge_int_branch
+                    )
+                    _merge_range = (
+                        _merge_fp.get("diff_range", "")
+                        or f"{_merge_int_branch}...{candidate_sha}"
+                    )
+                    _merge_new_task = await _spawn_release_merge_grade_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        base_branch=_merge_base,
+                        diff_range=_merge_range,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                        version_goal=(
+                            _merge_fp.get("version_goal")
+                            or _frozen_version_goal
+                        ),
+                        merged_pr_numbers=list(
+                            _merge_fp.get("merged_prs") or []
+                        ),
+                        categories=_merge_fp.get("categories"),
+                        rubric_fingerprint=_merge_fp.get("rubric_fingerprint"),
+                    )
+                    _merge_new_count = merge_grade_infra_respawn_count + 1
+                    _merge_updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="merge_grade",
+                        failed_task=_merge_grade_task_obj,
+                        replacement_task_id=str(_merge_new_task.id),
+                        label="merge_grade_infra_respawned",
+                        respawn_count=_merge_new_count,
+                    )
+                    _merge_updated_qual = {
+                        **_merge_updated_qual,
+                        "merge_grade_task_id": str(_merge_new_task.id),
+                        "merge_grade_infra_respawn_count": _merge_new_count,
+                    }
+                    _merge_updated_qual = _advance_qualification_retry_episode(
+                        version,
+                        _merge_updated_qual,
+                        cap=_MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    version.last_qualification = _merge_updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d merge-grade task %s failed "
+                        "with %s; re-spawned as %s (respawn %d/%d)",
+                        version.version_number,
+                        merge_grade_task_id,
+                        _merge_explicit_cat,
+                        _merge_new_task.id,
+                        _merge_new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "merge_grade_infra_respawned",
+                        "respawn_count": _merge_new_count,
+                    }
+                _merge_infra_label = _enrich_infra_error(
+                    f"merge_grade_task_{_merge_grade_task_obj.status.lower()}",
+                    _merge_grade_task_obj,
+                )
+                if (
+                    _merge_grade_task_obj.status == TaskStatus.FAILED
+                    and _merge_explicit_cat in (PROVISION_FAILURE, AGENT_TIMEOUT)
+                    and merge_grade_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _merge_infra_label = (
+                        "merge_grade_infra_respawn_cap_exceeded"
+                    )
                 return await _handle_infra_failure(
                     session,
                     version,
                     qual,
-                    _enrich_infra_error(
-                        f"merge_grade_task_{_merge_grade_task_obj.status.lower()}",
-                        _merge_grade_task_obj,
-                    ),
+                    _merge_infra_label,
                 )
         except (ValueError, TypeError):
             logger.warning(

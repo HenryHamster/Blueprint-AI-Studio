@@ -2403,6 +2403,9 @@ class ProjectComputeImageBuild(SQLModel, table=True):
     error_reason: str | None = Field(
         default=None, sa_column=Column(Text, nullable=True)
     )
+    image_published_at: datetime | None = Field(
+        default=None, sa_column=Column(NaiveUTCDateTime, nullable=True)
+    )
     created_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

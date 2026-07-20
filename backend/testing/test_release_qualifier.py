@@ -23484,6 +23484,408 @@ class TestFinalizeInfraFailure:
             == 0
         )
 
+    # --- Smoketest PROVISION_FAILURE / AGENT_TIMEOUT respawn tests -----------
+
+    @pytest.mark.asyncio
+    async def test_smoketest_provision_failure_respawns_new_task(
+        self, db_session
+    ):
+        """FAILED smoketest with PROVISION_FAILURE → respawn, not infra_failure."""
+        from app.failure_classification import (
+            PROVISION_FAILURE,
+            persist_failure_category,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "cafe" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-pf",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        persist_failure_category(smoke_task, PROVISION_FAILURE)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        original_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": original_smoke_id,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "smoketest_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["smoketest_infra_respawn_count"] == 1
+        assert new_qual["smoketest_task_id"] != original_smoke_id
+
+        # No QualificationVerdict — verdict not rendered on respawn.
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_agent_timeout_respawns_new_task(
+        self, db_session
+    ):
+        """FAILED smoketest with AGENT_TIMEOUT → respawn, not infra_failure."""
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            persist_failure_category,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "dead" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-at",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        persist_failure_category(smoke_task, AGENT_TIMEOUT)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        original_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": original_smoke_id,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "smoketest_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["smoketest_infra_respawn_count"] == 1
+        assert new_qual["smoketest_task_id"] != original_smoke_id
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_infra_respawn_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When smoketest_infra_respawn_count hits cap, route to infra_failure
+        with label 'smoketest_infra_respawn_cap_exceeded'."""
+        from app.failure_classification import (
+            PROVISION_FAILURE,
+            persist_failure_category,
+        )
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "dead" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-cap",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        persist_failure_category(smoke_task, PROVISION_FAILURE)
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": str(smoke_task.id),
+            "smoketest_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_infra_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert (
+            version.last_qualification["error"]
+            == "smoketest_infra_respawn_cap_exceeded"
+        )
+
+    # --- Merge-grade PROVISION_FAILURE / AGENT_TIMEOUT respawn tests --------
+
+    @pytest.mark.asyncio
+    async def test_merge_grade_provision_failure_respawns_new_task(
+        self, db_session
+    ):
+        """FAILED merge-grade with PROVISION_FAILURE → respawn, not infra_failure."""
+        from app.failure_classification import (
+            PROVISION_FAILURE,
+            persist_failure_category,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "feed" * 10
+        version.goal = "Finish the widget refactor"
+        merge_grade_task = Task(
+            project_id=project.id,
+            title="merge-grade",
+            payloads=[
+                {
+                    "type": "release_merge_grade",
+                    "base_branch": "main",
+                    "diff_range": f"main...{candidate}",
+                    "candidate_sha": candidate,
+                    "version_goal": "Finish the widget refactor",
+                    "merged_prs": [101, 102],
+                    "categories": [],
+                    "rubric_fingerprint": "abc123",
+                }
+            ],
+            vm_instance_id="vm-mg-pf",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        persist_failure_category(merge_grade_task, PROVISION_FAILURE)
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        original_mg_id = str(merge_grade_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "merge_grade_task_id": original_mg_id,
+            "version_goal": "Finish the widget refactor",
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "merge_grade_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["merge_grade_infra_respawn_count"] == 1
+        assert new_qual["merge_grade_task_id"] != original_mg_id
+
+        # No QualificationVerdict — verdict not rendered on respawn.
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_grade_agent_timeout_respawns_new_task(
+        self, db_session
+    ):
+        """FAILED merge-grade with AGENT_TIMEOUT → respawn, not infra_failure."""
+        from app.failure_classification import (
+            AGENT_TIMEOUT,
+            persist_failure_category,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "bee5" * 10
+        version.goal = "Ship the new API"
+        merge_grade_task = Task(
+            project_id=project.id,
+            title="merge-grade",
+            payloads=[
+                {
+                    "type": "release_merge_grade",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "candidate_sha": candidate,
+                    "version_goal": "Ship the new API",
+                    "merged_prs": [201],
+                    "categories": [{"category_key": "perf", "text": "perf goal"}],
+                    "rubric_fingerprint": "def456",
+                }
+            ],
+            vm_instance_id="vm-mg-at",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        persist_failure_category(merge_grade_task, AGENT_TIMEOUT)
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        original_mg_id = str(merge_grade_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "merge_grade_task_id": original_mg_id,
+            "version_goal": "Ship the new API",
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "merge_grade_infra_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["merge_grade_infra_respawn_count"] == 1
+        assert new_qual["merge_grade_task_id"] != original_mg_id
+
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_grade_infra_respawn_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When merge_grade_infra_respawn_count hits cap, route to infra_failure
+        with label 'merge_grade_infra_respawn_cap_exceeded'."""
+        from app.failure_classification import (
+            PROVISION_FAILURE,
+            persist_failure_category,
+        )
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "bead" * 10
+        version.goal = "Fix the pipeline"
+        merge_grade_task = Task(
+            project_id=project.id,
+            title="merge-grade",
+            payloads=[
+                {
+                    "type": "release_merge_grade",
+                    "base_branch": "automain",
+                    "diff_range": f"automain...{candidate}",
+                    "version_goal": "Fix the pipeline",
+                    "merged_prs": [],
+                    "categories": [],
+                }
+            ],
+            vm_instance_id="vm-mg-cap",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id)},
+        )
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        persist_failure_category(merge_grade_task, PROVISION_FAILURE)
+        db_session.add(merge_grade_task)
+        await db_session.commit()
+        await db_session.refresh(merge_grade_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "merge_grade_task_id": str(merge_grade_task.id),
+            "merge_grade_infra_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+            "version_goal": "Fix the pipeline",
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "merge_grade_infra_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert (
+            version.last_qualification["error"]
+            == "merge_grade_infra_respawn_cap_exceeded"
+        )
+
     @pytest.mark.asyncio
     async def test_merge_grade_admin_cancel_returns_neutral_hold(self, db_session):
         """CANCELLED merge-grade with failure_category=ADMIN_CANCEL → neutral hold.
