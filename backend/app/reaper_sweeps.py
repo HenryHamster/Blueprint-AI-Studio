@@ -264,7 +264,8 @@ async def sweep_queued_age_alerts(
 
     Returns the number of alerts fired this cycle.
     """
-    from app.models import Alert, AlertSeverity
+    from app import pause_clock
+    from app.models import Alert, AlertSeverity, DeploymentState
     from app.broadcast import broadcast_to_project as _bcast
     import app.shared_state as _shared_state
 
@@ -304,6 +305,14 @@ async def sweep_queued_age_alerts(
         (3, _queued_threshold_hours * 6, AlertSeverity.ERROR, "ERROR"),
     ]
 
+    # PAUSE-AWARE tier age: while the pipeline is PAUSED nothing dequeues, so
+    # every QUEUED row ages past the tiers on wall-clock and spams INFO→WARNING→
+    # ERROR alerts for a pause the operator deliberately started. Subtract the
+    # open pause window from the tier decision (the row's created_at is immutable
+    # so no baseline is stamped; deploy_state=None → raw). The DB pre-filter above
+    # still over-selects on raw age, but a paused row's pause-aware tier is 0, so
+    # the tier gate below suppresses the alert.
+    _deploy_state = await session.get(DeploymentState, 1)
     _alerted = 0
     pending_broadcasts: list[tuple[str, dict]] = []
     for _qt in _stale_queued:
@@ -311,7 +320,10 @@ async def sweep_queued_age_alerts(
         _prev_tier = _qctx.get("queued_age_alert_tier") or (
             1 if _qctx.get("queued_age_alert_fired") else 0
         )
-        _queue_hours = (now - _qt.created_at).total_seconds() / 3600
+        _queue_hours = (
+            pause_clock.active_elapsed_seconds(_deploy_state, _qt.created_at, None)
+            / 3600
+        )
         _target_tier, _target_severity, _target_label = (0, AlertSeverity.INFO, "INFO")
         for _tier, _hrs, _sev, _sev_label in _tier_specs:
             if _queue_hours >= _hrs:
@@ -437,36 +449,121 @@ async def sweep_stalled_strategic_cycles(
     Returns the number of cycles marked stalled.
     """
     from app import strategic_cycle
-    from app.models import Alert, AlertSeverity
+    from app.models import (
+        Alert,
+        AlertSeverity,
+        Project,
+        StrategicCycle,
+        StrategicResident,
+    )
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 
-    stalled = await strategic_cycle.find_stalled(session)
+    # Pause-aware: a cycle whose completion handler simply could not run while
+    # the pipeline was paused must not be force-terminated as "stalled". Passing
+    # the deploy state makes find_stalled's 3h deadline exclude pause time.
+    from app.models import DeploymentState  # noqa: PLC0415
+
+    _deploy_state = await session.get(DeploymentState, 1)
+    stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
     _step7_now = _utcnow()
+    if not stalled:
+        return 0
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
 
-    # Batch-fetch all linked tasks in a single IN query to avoid N+1
-    # round-trips (one session.get per stalled cycle).
-    _pre_linked_ids: list = []
-    for _c in stalled:
-        if _c.outcome in (
-            strategic_cycle.OUTCOME_IN_PROGRESS,
-            strategic_cycle.OUTCOME_PHASE1_RUNNING,
-            strategic_cycle.OUTCOME_PHASE1_DONE,
-        ):
-            _tid = _c.phase1_task_id
-        else:
-            _tid = _c.phase2_task_id
-        if _tid is not None:
-            _pre_linked_ids.append(_tid)
+    # Fence the legacy reaper against ownership cutover without locking the
+    # broad discovery scan. These bounded statements follow the canonical
+    # Project -> Resident -> Cycle -> Task order used by cutover/completion.
+    _project_ids = sorted({c.project_id for c in stalled}, key=str)
+    _locked_projects = (
+        (
+            await session.execute(
+                select(Project)
+                .where(Project.id.in_(_project_ids))
+                .order_by(Project.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _locked_project_ids = {project.id for project in _locked_projects}
+    _locked_residents = (
+        (
+            await session.execute(
+                select(StrategicResident)
+                .where(StrategicResident.project_id.in_(_project_ids))
+                .order_by(StrategicResident.project_id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _resident_by_project = {
+        resident.project_id: resident for resident in _locked_residents
+    }
+    _legacy_project_ids = {
+        project_id
+        for project_id in _locked_project_ids
+        if (
+            _resident_by_project.get(project_id) is None
+            or _resident_by_project[project_id].engine_owner == "legacy"
+        )
+    }
+    _candidate_cycle_ids = sorted({c.id for c in stalled})
+    _locked_cycles = (
+        (
+            await session.execute(
+                select(StrategicCycle)
+                .where(
+                    StrategicCycle.id.in_(_candidate_cycle_ids),
+                    StrategicCycle.project_id.in_(_legacy_project_ids),
+                )
+                .order_by(StrategicCycle.project_id.asc(), StrategicCycle.id.asc())
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .all()
+        if _legacy_project_ids
+        else []
+    )
+    _linked_task_ids = sorted(
+        {
+            task_id
+            for cycle in _locked_cycles
+            for task_id in (
+                cycle.phase1_task_id
+                if cycle.outcome
+                in (
+                    strategic_cycle.OUTCOME_IN_PROGRESS,
+                    strategic_cycle.OUTCOME_PHASE1_RUNNING,
+                    strategic_cycle.OUTCOME_PHASE1_DONE,
+                )
+                else cycle.phase2_task_id,
+            )
+            if task_id is not None
+        },
+        key=str,
+    )
     _linked_tasks: dict = {}
-    if _pre_linked_ids:
-        _rows = await session.execute(select(Task).where(Task.id.in_(_pre_linked_ids)))
-        for _t in _rows.scalars():
-            _linked_tasks[_t.id] = _t
+    if _linked_task_ids:
+        _rows = await session.execute(
+            select(Task)
+            .where(Task.id.in_(_linked_task_ids))
+            .order_by(Task.id.asc())
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        _linked_tasks = {task.id: task for task in _rows.scalars().all()}
 
-    for c in stalled:
+    _phase_cutoff = _step7_now - timedelta(hours=3)
+    for c in _locked_cycles:
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
             strategic_cycle.OUTCOME_PHASE1_RUNNING,
@@ -474,12 +571,29 @@ async def sweep_stalled_strategic_cycles(
         ):
             stalled_phase = "phase1"
             linked_task_id = c.phase1_task_id
-        else:
+            if (
+                c.phase1_started_at is None
+                or c.phase1_started_at >= _phase_cutoff
+                or c.phase2_started_at is not None
+            ):
+                continue
+        elif c.outcome == strategic_cycle.OUTCOME_PHASE2_RUNNING:
             stalled_phase = "phase2"
             linked_task_id = c.phase2_task_id
+            _phase_ref = c.phase2_started_at or c.phase1_started_at
+            if _phase_ref is None or _phase_ref >= _phase_cutoff:
+                continue
+        else:
+            continue
 
         if linked_task_id is not None:
             linked_task = _linked_tasks.get(linked_task_id)
+            if linked_task is not None and linked_task.project_id != c.project_id:
+                logger.warning(
+                    f"[REAPER] Cycle {c.id} references cross-project task "
+                    f"{linked_task_id}; skipping stall mutation"
+                )
+                continue
             if task_is_strategic_local_runner_hold(linked_task):
                 logger.info(
                     f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
@@ -555,8 +669,8 @@ async def sweep_stalled_strategic_cycles(
             logger.exception(
                 f"[REAPER] Failed to create stalled-cycle alert for {c.id}"
             )
+    await session.commit()
     if actually_stalled:
-        await session.commit()
         for project_id, payload in pending_broadcasts:
             try:
                 await _bcast(project_id, "alert_created", payload)

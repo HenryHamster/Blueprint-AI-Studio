@@ -13,8 +13,9 @@ from datetime import datetime, timedelta
 from sqlalchemy import or_
 from sqlmodel import select
 
+from app import pause_clock
 from app.gate_revalidation import GATE_REVALIDATION_QUERY_MARKERS
-from app.models import Task, TaskStatus
+from app.models import DeploymentState, Task, TaskStatus
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,31 @@ _BLOCKED_RECHECK_MAX = timedelta(hours=1)
 # A blocker that never clears within this window is escalated to the operator
 # as permanently blocked (one ERROR alert) and parked.
 _BLOCKED_ESCALATE_AFTER = timedelta(hours=6)
+
+
+async def _blocked_escalation_due(task, session) -> bool:
+    """True iff a BLOCKED task has exceeded the 6h escalate-and-park deadline in
+    ACTIVE (pause-excluded) time.
+
+    While the pipeline is PAUSED a BLOCKED task cannot be dispatched and its
+    prerequisite work cannot merge, so it makes no progress toward clearing.
+    Counting that pause time toward the deadline would escalate the task to the
+    operator and PARK it (``_BLOCKED_ESCALATED_PARK`` ≈ 3650 days) purely because
+    the operator paused — a false positive that strands a task that was only
+    blocked by the pause. ``blocked_at`` is set at scattered sites with no
+    cleanly-stampable baseline, so the shared pause_clock subtracts the currently-
+    open pause window (the established open-window fallback): this fully prevents
+    escalation WHILE paused; ``deploy_state=None`` → raw wall-clock (unchanged
+    legacy/test behavior). An onset-stamped ``pause_baseline`` would upgrade this
+    to exact across already-closed windows (see the qualification/promotion
+    backstops for the same trade-off)."""
+    if task.blocked_at is None:
+        return False
+    deploy_state = await session.get(DeploymentState, 1)
+    active_seconds = pause_clock.active_elapsed_seconds(
+        deploy_state, task.blocked_at, None
+    )
+    return active_seconds >= _BLOCKED_ESCALATE_AFTER.total_seconds()
 # Parking horizon for terminally-escalated blockers. On escalation we push
 # ``recheck_after`` far into the future (rather than leaving it NULL) so the row
 # drops out of the due query (``recheck_after IS NULL OR <= now``) and is never
@@ -1131,10 +1157,7 @@ async def _apply_needs_disposition(
         # still missing — keep it BLOCKED, escalating only at the deadline.
         if not (task.depends_on or []):
             return "none"
-        if (
-            task.blocked_at is not None
-            and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-        ):
+        if await _blocked_escalation_due(task, session):
             return "escalate"
         attempts = int(ctx.get("_blocked_recheck_attempts", 0)) + 1
         ctx["_blocked_recheck_attempts"] = attempts
@@ -1620,11 +1643,7 @@ async def sweep_unblock_blocked_tasks(
             is_genuine_clear = (not is_optimistic_conflict) and (
                 bool(task.depends_on) or blocker_source == "parent"
             )
-            if (
-                not is_genuine_clear
-                and task.blocked_at is not None
-                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-            ):
+            if not is_genuine_clear and await _blocked_escalation_due(task, session):
                 await _escalate_blocked_task(
                     task,
                     ctx,
@@ -1685,10 +1704,7 @@ async def sweep_unblock_blocked_tasks(
                 ),
             )
         else:  # "retry" or "waiting"
-            past_deadline = (
-                task.blocked_at is not None
-                and (now - task.blocked_at) >= _BLOCKED_ESCALATE_AFTER
-            )
+            past_deadline = await _blocked_escalation_due(task, session)
             optimistic_used = int(ctx.get("_blocked_optimistic_retries", 0))
             # "retry": a no-dep agent/lifecycle blocker that may be a transient
             # infra failure — optimistically requeue (bounded) so a passing blip

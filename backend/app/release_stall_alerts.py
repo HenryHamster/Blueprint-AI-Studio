@@ -9,8 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.release_artifacts import summarize_required_artifact_gap
-from app import release_version
-from app.models import Alert, AlertSeverity
+from app import pause_clock, release_version
+from app.models import Alert, AlertSeverity, DeploymentState
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
 
@@ -572,7 +572,17 @@ async def _check_version_auto_merge_stall(
 
     rq = _release_qualifier_module()
     now = _utcnow()
-    age_seconds = (now - enabled_at).total_seconds()
+    # PAUSE-AWARE stall age: while the pipeline is PAUSED the promotion PR's
+    # auto-merge cannot progress, so counting pause time toward the stall
+    # threshold fires escalating WARNING→ERROR "promotion stalled" alerts for a
+    # pause the operator started. This mirrors the promotion_pending 24h backstop
+    # (which is likewise pause-aware) so the alert and the force-fail agree on
+    # what "stalled" means. The open pause window is excluded (enabled_at is armed
+    # at several sites with no stampable baseline; deploy_state=None → raw).
+    _deploy_state = await session.get(DeploymentState, 1)
+    age_seconds = pause_clock.active_elapsed_seconds(
+        _deploy_state, enabled_at, pending.get("pause_baseline")
+    )
     if age_seconds < rq._AUTO_MERGE_STALL_SECONDS:
         return False
 

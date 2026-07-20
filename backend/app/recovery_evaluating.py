@@ -28,7 +28,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app import services
+from app import pause_clock, services
 from app.models import (
     Task,
     TaskStatus,
@@ -439,7 +439,26 @@ async def _check_evaluating_timeouts(progress_cb=None):
                     # Fallback to started_at or created_at
                     evaluating_since = task.started_at or task.created_at
 
-                elapsed = (now - evaluating_since).total_seconds()
+                # PAUSE-AWARE age: while the pipeline is PAUSED an EVALUATING
+                # task's children cannot run, so it makes no progress and the
+                # rollup that would clear EVALUATING never fires. Counting pause
+                # time toward the 48h hard timeout (and the 2h warn / reaped-
+                # owner grace, which reuse this same ``elapsed``) would force-
+                # FAIL the parent, cascade-cancel its children, close their PRs
+                # and delete VMs purely because the operator paused. The
+                # ``→ EVALUATING`` transition is a synchronous model event with
+                # no DeploymentState/async-session access, so no exact baseline
+                # can be stamped there; ``active_elapsed_seconds`` falls back to
+                # subtracting the currently-open pause window — which guarantees
+                # the task is never force-failed WHILE paused (an optional
+                # ``evaluating_pause_baseline`` in ctx, if some future path
+                # stamps one, upgrades this to exact across multiple windows).
+                # deploy_state=None → raw elapsed (unchanged legacy/test path).
+                elapsed = pause_clock.active_elapsed_seconds(
+                    _deploy_state,
+                    evaluating_since,
+                    ctx.get("evaluating_pause_baseline"),
+                )
 
                 # Child statuses snapshotted at cycle-read time (plain tuples,
                 # Phase A). Kept as plain data so they survive across the

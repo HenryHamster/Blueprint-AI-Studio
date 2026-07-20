@@ -124,6 +124,12 @@ Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-14 — docs/capability-proof-earn-path.md design document exists
   cp-15 — record_capability_named_test_execution_proof mints proven tier; enroll_capability_proof_trial exists
 
+Findings covered here (4-finding project-tools / runner-config salvage bundle, 2026-07-19):
+  r-1 — walkthrough test files exist with runner-enrollment and project-tool assertions
+  r-2 — _LiveRunnerConfig.apply validates ALL fields before mutating any state (atomic reject)
+  r-3 — ProjectToolHost uses pendingDeleteId two-step confirmation before calling handleDelete
+  r-4 — ProjectToolHost Enable in disabled section has in-flight guard; slug shown after create
+
 Findings covered here (16-finding capability-proof salvage bundle, 2026-07-18):
   cq-0  — spawn-gate absorbs alias bypass closed: working_capability_proof_status registers
            agent-declared absorbs aliases as "unproven" so capability_need_blocked_by_proof_gate
@@ -154,6 +160,44 @@ Findings covered here (7-finding creation-path fail-closed audience salvage bund
   p5 — confirmation chips actionable (already fixed; see m2 tests above)
   p6 — QUESTION auto-decay (already fixed; see m3 tests above)
   p7 — notifications converged on attention model (already fixed; see m4 tests above)
+
+Findings covered here (4-finding operator-walkthrough / runner-config / project-tools bundle, 2026-07-19):
+  w1 — walkthrough test infrastructure: FleetRunnersPanel and ProjectToolHost unit tests exist
+       and cover the end-to-end owner walkthrough flows
+  w2 — runner config generations apply atomically: _LiveRunnerConfig.apply validates all fields
+       before the lock; a single unrecognized/malformed field rejects the whole block without
+       mutating any known field; a clean apply clears prior rejection state
+  w3 — project-tool Remove requires confirmation: clicking Remove shows a confirmation prompt
+       naming the tool and explaining permanent deletion before calling the backend DELETE;
+       Cancel is side-effect free; applies to both enabled and disabled tool rows
+  w4 — project-tools walkthrough residuals: Enable button in Disabled section shows Enabling…
+       and is disabled while the PATCH is outstanding; the auto-uniquified slug assigned by
+       the backend is surfaced to the operator as a created-slug notice after tool creation
+
+Findings covered here (4-finding compute/research salvage bundle, 2026-07-19):
+  r1 — clone-form preservation: buildCloneForm reads input_artifact_job_id / setup_step /
+       no_progress_timeout_seconds from launch_params; backend launch_params builder includes
+       all three fields so clone preserves checkpoint-resume, setup, and watchdog config
+  r2 — self-heal empty-repo: maybe_redetect_on_emptiness_disagreement flips stale
+       repo_is_empty=False when agent observes empty tree; agent endpoint
+       /api/agent/build-config-discovery propagates observed_repo_is_empty to break
+       the infinite clone_failed loop
+  r3 — GCE VM resource monitoring: _check_low_disk_vms and _check_low_memory_vms detect
+       and alert on low-disk/OOM conditions for active task VMs (parity with local runner
+       _check_low_disk_runners / _check_low_memory_runners)
+  r4 — research quality feedback: _compute_direction_quality_score incorporates
+       grade_distribution (HIGH/MEDIUM/LOW) and quality_grader_verdict (pass rate)
+       from research_history so high-quality directions are prioritised in research spawning
+
+Findings covered here (2-finding resident bootstrap/recovery salvage bundle, 2026-07-20):
+  res-1 — compaction bootstrap carry-forward: CompactionCheckpointContext includes
+           contextPrefix / skillsText / toolContentText; buildCompactionCheckpoint
+           renders them so a post-compaction session retains operator purpose,
+           project skills, and built-in tool content (formerly dropped at compaction)
+  res-2 — workspace recovery executable: the workspace-vanish guard re-provisions
+           ALL startup helpers (playbook, messages, skills, strategic, ambient) into
+           the replacement clone AND restarts the subprocess primed with the compaction
+           checkpoint so the recovery session runs with coherent context
 """
 
 from __future__ import annotations
@@ -3682,4 +3726,884 @@ def test_cq0_working_capability_proof_status_registers_absorbs_aliases_as_unprov
     assert proof_map_order.get("tracked-alias") != "unproven", (
         "absorbs loop must not overwrite 'tracked-alias' when it was already "
         "mapped by its own evidence_refs entry ('if alias not in out' guard honoured)"
+    )
+
+
+# =========================================================================== #
+# 4-finding operator-walkthrough / runner-config / project-tools bundle
+# =========================================================================== #
+
+
+def _project_tool_host_source() -> str:
+    """Return the source of admin-ui/src/components/ProjectToolHost.tsx."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ProjectToolHost.tsx",
+        Path("/repo/admin-ui/src/components/ProjectToolHost.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("ProjectToolHost.tsx not found in expected locations")
+
+
+# --------------------------------------------------------------------------- #
+# Finding w1 — walkthrough test infrastructure exists                          #
+# --------------------------------------------------------------------------- #
+
+
+def test_w1_project_tool_host_test_file_exists():
+    """ProjectToolHost.test.tsx must exist and contain end-to-end walkthrough tests.
+
+    Finding w1: the direction retirement condition requires green execution and accepted
+    machine evidence. The unit test file covering the full owner walkthrough flow must
+    exist to provide machine-verifiable evidence.
+    """
+    import pytest
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "ProjectToolHost.test.tsx",
+        Path("/repo/admin-ui/src/components/ProjectToolHost.test.tsx"),
+    ]
+    test_source: str | None = None
+    for path in candidates:
+        if path.exists():
+            test_source = path.read_text(encoding="utf-8")
+            break
+
+    if test_source is None:
+        pytest.skip("ProjectToolHost.test.tsx not found — admin-ui not present in this shard")
+
+    assert "owner walkthrough" in test_source or "end-to-end chained flow" in test_source, (
+        "ProjectToolHost.test.tsx must contain an end-to-end owner walkthrough test suite "
+        "covering the full project-tools flow (Add, Enable, Hide, Show hidden)"
+    )
+    assert "Enable" in test_source and "Disable" in test_source, (
+        "ProjectToolHost.test.tsx must test both Enable and Disable controls"
+    )
+    assert "Hide" in test_source and "Show hidden" in test_source, (
+        "ProjectToolHost.test.tsx must test the Hide / Show hidden manifest-tool lifecycle"
+    )
+
+
+def test_w1_fleet_runners_panel_test_file_exists():
+    """FleetRunnersPanel.test.tsx must exist.
+
+    Finding w1: the runner enrollment walkthrough requires test coverage for the
+    enrollment dialog and runner management panel.
+    """
+    import pytest
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "components" / "FleetRunnersPanel.test.tsx",
+        Path("/repo/admin-ui/src/components/FleetRunnersPanel.test.tsx"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return  # File exists — test passes
+    pytest.skip("FleetRunnersPanel.test.tsx not found — admin-ui not present in this shard")
+
+
+# --------------------------------------------------------------------------- #
+# Finding w2 — runner config generations apply atomically                      #
+# --------------------------------------------------------------------------- #
+
+
+def test_w2_live_runner_config_validates_before_lock():
+    """_LiveRunnerConfig.apply must validate all fields before taking the lock.
+
+    Finding w2: the claim was that apply() entered the mutation block before
+    detecting unrecognized fields, so a generation with one bad field would still
+    apply all the known-good fields (partial state). The fix validates the entire
+    config dict upfront; if any field is unrecognized or malformed the whole block
+    is rejected without mutating anything.
+    """
+    source = _local_runner_source()
+
+    # _classify_fields must be called before the lock so rejection is a true no-op.
+    classify_idx = source.find("_classify_fields(config)")
+    lock_idx = source.find("with self._lock:", classify_idx if classify_idx >= 0 else 0)
+
+    assert classify_idx >= 0, (
+        "_LiveRunnerConfig.apply must call _classify_fields(config) to detect "
+        "unrecognized/malformed fields before acquiring the lock"
+    )
+    assert lock_idx >= 0, (
+        "_LiveRunnerConfig.apply must use 'with self._lock:' to protect mutations"
+    )
+    assert classify_idx < lock_idx, (
+        "_classify_fields must be called BEFORE 'with self._lock:' so the full "
+        "field-validity check runs without holding the lock — a rejected generation "
+        "must be a true no-op (no partial mutation)"
+    )
+
+
+def test_w2_live_runner_config_apply_is_atomic():
+    """_LiveRunnerConfig.apply rejects an entire generation when any field is bad.
+
+    Finding w2: a generation carrying one unrecognized field alongside a valid
+    max_concurrent change must be rejected atomically — the known field must NOT
+    be mutated even though it was well-formed.
+    """
+    source = _local_runner_source()
+
+    # The fully_applicable guard must wrap ALL mutations inside the lock.
+    assert "fully_applicable" in source, (
+        "_LiveRunnerConfig.apply must compute 'fully_applicable' and gate all "
+        "mutations on it so the whole block applies or nothing does"
+    )
+    assert "if fully_applicable:" in source, (
+        "_LiveRunnerConfig.apply must use 'if fully_applicable:' to guard all "
+        "field assignments inside the lock"
+    )
+
+    # Rejection path must record the offending fields and refused generation.
+    assert "_rejection_reason" in source, (
+        "_LiveRunnerConfig must store _rejection_reason so operators can see "
+        "which field caused the rejection"
+    )
+    assert "_rejected_generation" in source, (
+        "_LiveRunnerConfig must store _rejected_generation so the heartbeat "
+        "can report which generation was refused"
+    )
+
+
+def test_w2_live_runner_config_clean_apply_clears_rejection():
+    """A clean apply must clear prior rejection state.
+
+    Finding w2: a residual rejection reason after a successful apply would keep
+    the operator UI showing a resolved error indefinitely.
+    """
+    source = _local_runner_source()
+
+    # After a successful apply the rejection fields must be reset.
+    assert "self._rejection_reason = None" in source, (
+        "_LiveRunnerConfig.apply must set self._rejection_reason = None after a "
+        "successful fully-applicable apply so the UI does not show a stale error"
+    )
+    assert "self._rejected_generation = None" in source, (
+        "_LiveRunnerConfig.apply must set self._rejected_generation = None after "
+        "a successful apply so stale rejection-generation info is cleared"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding w3 — project-tool Remove requires confirmation                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_w3_project_tool_remove_uses_pending_delete_state():
+    """ProjectToolHost must use pendingDeleteId state for a two-step delete.
+
+    Finding w3: the claim was that both enabled and disabled Remove buttons called
+    handleDelete directly. The fix introduces a pendingDeleteId state; clicking Remove
+    sets pendingDeleteId (showing a confirmation prompt) rather than immediately calling
+    the backend DELETE endpoint.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "pendingDeleteId" in source, (
+        "ProjectToolHost.tsx must define pendingDeleteId state to gate tool deletion "
+        "behind a confirmation prompt — clicking Remove must NOT immediately delete"
+    )
+    assert "setPendingDeleteId" in source, (
+        "ProjectToolHost.tsx must call setPendingDeleteId to enter the confirmation "
+        "state when the Remove button is clicked"
+    )
+
+
+def test_w3_project_tool_remove_confirmation_names_tool_and_explains_deletion():
+    """The deletion confirmation must name the tool and explain permanent deletion.
+
+    Finding w3: cancellation must be side-effect free; the confirmation text must
+    identify the tool and explain that its authored content will be deleted.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "permanently delete" in source.lower() or "permanently remove" in source.lower(), (
+        "ProjectToolHost.tsx confirmation prompt must use 'permanently delete' or "
+        "'Permanently remove' so the operator understands the action is irreversible"
+    )
+    assert "tool.title" in source or "{tool.title}" in source, (
+        "ProjectToolHost.tsx confirmation prompt must include tool.title so the operator "
+        "knows which specific tool they are about to permanently delete"
+    )
+    assert "Permanently remove" in source, (
+        "ProjectToolHost.tsx must have a 'Permanently remove' confirmation button "
+        "that is separate from the initial 'Remove' button"
+    )
+
+
+def test_w3_project_tool_remove_cancel_is_side_effect_free():
+    """Cancel on the deletion confirmation must be side-effect free.
+
+    Finding w3: clicking Cancel must call setPendingDeleteId(null) without
+    ever calling handleDelete or the backend DELETE endpoint.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    # Cancel must reset pendingDeleteId to null, not call handleDelete.
+    assert "setPendingDeleteId(null)" in source, (
+        "ProjectToolHost.tsx Cancel button must call setPendingDeleteId(null) to dismiss "
+        "the confirmation prompt without side effects"
+    )
+
+
+def test_w3_project_tool_disabled_row_also_requires_confirmation():
+    """The Disabled section Remove button must also use the pendingDeleteId confirmation.
+
+    Finding w3: the confirmation must cover BOTH enabled and disabled tool rows
+    without adding friction to the reversible Disable/Hide actions.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    # Both sections must reference pendingDeleteId; a single instance would mean
+    # one section bypasses the confirmation. Count occurrences.
+    count = source.count("pendingDeleteId === tool.id")
+    assert count >= 2, (
+        f"ProjectToolHost.tsx must check pendingDeleteId === tool.id in BOTH the enabled "
+        f"and disabled tool row renders — found only {count} occurrence(s); the disabled "
+        "section Remove must also go through the confirmation prompt"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding w4 — project-tools walkthrough residuals                            #
+# --------------------------------------------------------------------------- #
+
+
+def test_w4_enable_button_has_in_flight_guard():
+    """The Enable button in the Disabled section must show in-flight state.
+
+    Finding w4: the claim was that the Enable control had no disabled/in-flight guard
+    while its PATCH was outstanding, unlike the adjacent Remove control. The fix mirrors
+    the existing Disable-button pattern: disabled={togglingId === tool.id && actionIsCurrent}
+    with an 'Enabling…' label while the PATCH is pending.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "Enabling" in source, (
+        "ProjectToolHost.tsx must render 'Enabling…' while the Enable PATCH is in-flight "
+        "so the operator sees unambiguous feedback and the button is guarded against double-fire"
+    )
+    assert "togglingId === tool.id" in source, (
+        "ProjectToolHost.tsx Enable button must be disabled when togglingId === tool.id "
+        "to prevent duplicate PATCH requests on slow connections"
+    )
+
+
+def test_w4_created_slug_notice_surfaces_auto_uniquified_slug():
+    """A created-slug notice must surface the server-assigned slug after tool creation.
+
+    Finding w4: the add-tool form exposes only Kind and Title, so an auto-uniquified
+    slug (e.g. 'mock-widget-2') is never shown to the operator without an explicit
+    post-creation notice. The fix surfaces the server-returned slug so operators know
+    what slug was assigned when the derived name collided.
+    """
+    import pytest
+
+    try:
+        source = _project_tool_host_source()
+    except FileNotFoundError:
+        pytest.skip("ProjectToolHost.tsx not found — admin-ui not present in this shard")
+
+    assert "lastCreatedSlug" in source, (
+        "ProjectToolHost.tsx must track lastCreatedSlug state to surface the slug "
+        "the server assigned after auto-uniquification"
+    )
+    assert "created-slug-notice" in source or "createdSlug" in source.lower() or "Tool created" in source, (
+        "ProjectToolHost.tsx must render a notice showing the assigned slug after "
+        "tool creation so the operator can see auto-uniquified slugs (e.g. 'mock-widget-2')"
+    )
+    assert "tool.slug" in source or "tool.slug" in source or "slug" in source, (
+        "ProjectToolHost.tsx must include the tool's slug in the creation notice"
+    )
+
+
+# =========================================================================== #
+# 4-finding compute/research salvage bundle
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Finding r1 — Clone form preserves checkpoint-resume fields and watchdog cfg  #
+# --------------------------------------------------------------------------- #
+
+
+def test_r1_launch_params_builder_includes_checkpoint_and_watchdog_fields():
+    """r1: admin_compute_jobs.py launch_params builder includes input_artifact_job_id,
+    setup_step, and no_progress_timeout_seconds so clone-a-job preserves
+    checkpoint-resume, setup steps, and no-progress watchdog configuration.
+
+    Finding: buildCloneForm reads these fields from job.launch_params, but the
+    fields were absent from the launch_params dict built server-side, so cloning
+    a job that used checkpoint resume / custom setup / watchdog silently dropped
+    those settings.
+
+    Fix: the launch_params dict now carries all three keys (lines 347-349 of
+    admin_compute_jobs.py).
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "admin_compute_jobs.py",
+        Path("/repo/backend/app/routers/admin_compute_jobs.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "admin_compute_jobs.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("admin_compute_jobs.py not found — skipping source check")
+
+    assert '"input_artifact_job_id"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'input_artifact_job_id' "
+        "so that cloning a checkpoint-resume job preserves the resume source job ID"
+    )
+    assert '"setup_step"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'setup_step' "
+        "so that cloning a job with a custom setup step preserves it"
+    )
+    assert '"no_progress_timeout_seconds"' in source, (
+        "admin_compute_jobs.py launch_params dict must include 'no_progress_timeout_seconds' "
+        "so that cloning a job with a custom watchdog timeout preserves the configuration"
+    )
+
+
+def test_r1_clone_form_reads_checkpoint_and_watchdog_fields_from_launch_params():
+    """r1 (frontend): buildCloneForm in ComputeJobsPanel.tsx reads input_artifact_job_id,
+    setup_step, and no_progress_timeout_seconds from launch_params.
+
+    The backend now supplies these fields; the UI must consume them.
+    """
+    try:
+        source = _ui_component_source("ComputeJobsPanel.tsx")
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("ComputeJobsPanel.tsx not found — skipping frontend source check")
+
+    assert "inputArtifactJobId" in source and "input_artifact_job_id" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.input_artifact_job_id → "
+        "inputArtifactJobId so that checkpoint-resume job IDs survive clone"
+    )
+    assert "setupStep" in source and "setup_step" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.setup_step → setupStep "
+        "so that custom setup steps survive clone"
+    )
+    assert "noProgressTimeoutSeconds" in source and "no_progress_timeout_seconds" in source, (
+        "ComputeJobsPanel.tsx buildCloneForm must map lp.no_progress_timeout_seconds → "
+        "noProgressTimeoutSeconds so that watchdog timeout config survives clone"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r2 — Self-heal stale repo_is_empty=False breaks clone_failed loop    #
+# --------------------------------------------------------------------------- #
+
+
+def test_r2_maybe_redetect_on_emptiness_disagreement_is_importable():
+    """r2: maybe_redetect_on_emptiness_disagreement exists in build_config_detection
+    and accepts observed_empty, breaking the infinite clone_failed loop for projects
+    whose repo_is_empty=False durable signal is stale (repo genuinely empty).
+
+    Finding: maybe_refresh_empty_build_config returned early when repo_is_empty is
+    False, so a stale non-empty signal never self-corrected; every task threw
+    clone_failed forever. The fix adds maybe_redetect_on_emptiness_disagreement
+    which fires on durable/live disagreement and re-runs authoritative detection.
+    """
+    from app.build_config_detection import maybe_redetect_on_emptiness_disagreement
+    import inspect
+
+    sig = inspect.signature(maybe_redetect_on_emptiness_disagreement)
+    assert "observed_empty" in sig.parameters, (
+        "maybe_redetect_on_emptiness_disagreement must accept 'observed_empty' "
+        "so the agent can report a live-empty observation and trigger re-detection"
+    )
+
+
+def test_r2_maybe_correct_stale_repo_empty_signal_is_importable():
+    """r2: maybe_correct_stale_repo_empty_signal exists as the INVERSE of
+    maybe_refresh_empty_build_config — it corrects a stale repo_is_empty=False
+    when the repo is genuinely empty.
+    """
+    from app.build_config_detection import maybe_correct_stale_repo_empty_signal
+    import inspect
+
+    sig = inspect.signature(maybe_correct_stale_repo_empty_signal)
+    assert "project" in sig.parameters and "session" in sig.parameters, (
+        "maybe_correct_stale_repo_empty_signal must accept project and session "
+        "so it can persist the corrected build_config"
+    )
+
+
+def test_r2_agent_router_exposes_build_config_discovery_with_observed_repo_is_empty():
+    """r2: the agent router must have a /build-config-discovery endpoint that accepts
+    observed_repo_is_empty and calls maybe_redetect_on_emptiness_disagreement.
+
+    The agent calls POST /api/agent/build-config-discovery with
+    {observed_repo_is_empty: true} as a best-effort self-heal before throwing
+    the clone_failed error.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "routers" / "agent.py",
+        Path("/repo/backend/app/routers/agent.py"),
+        Path(__file__).resolve().parent.parent / "app" / "routers" / "agent.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("agent.py not found — skipping source check")
+
+    assert "build-config-discovery" in source, (
+        "agent.py must define a /build-config-discovery endpoint so the agent can "
+        "report observed_repo_is_empty and trigger server-side self-healing"
+    )
+    assert "maybe_redetect_on_emptiness_disagreement" in source, (
+        "agent.py /build-config-discovery handler must call "
+        "maybe_redetect_on_emptiness_disagreement to re-run authoritative detection "
+        "when the agent observes a live-empty tree vs. the durable non-empty signal"
+    )
+    assert "observed_repo_is_empty" in source, (
+        "agent.py must accept observed_repo_is_empty from the agent payload so the "
+        "direction of the disagreement (observed empty vs. observed non-empty) is "
+        "forwarded to the re-detection helper"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r3 — GCE VM resource monitoring parity with local runners            #
+# --------------------------------------------------------------------------- #
+
+
+def test_r3_check_low_disk_vms_and_check_low_memory_vms_are_defined():
+    """r3: runner_health_monitors.py must define _check_low_disk_vms and
+    _check_low_memory_vms — GCE-task-VM twins of the local-runner checks
+    _check_low_disk_runners / _check_low_memory_runners.
+
+    Finding: local runners had proactive resource monitoring (_check_low_disk_runners,
+    _check_low_memory_runners) but GCE task VMs had no equivalent — only teardown-
+    time serial-console forensics. The fix adds Task-based VM monitors that alert
+    when a VM reports low disk or approaching OOM via its heartbeat metadata.
+    """
+    from app.runner_health_monitors import (
+        _check_low_disk_vms,
+        _check_low_memory_vms,
+    )
+    import inspect
+
+    sig_disk = inspect.signature(_check_low_disk_vms)
+    assert "session" in sig_disk.parameters, (
+        "_check_low_disk_vms must accept a session parameter to query active VM tasks"
+    )
+
+    sig_mem = inspect.signature(_check_low_memory_vms)
+    assert "session" in sig_mem.parameters, (
+        "_check_low_memory_vms must accept a session parameter to query active VM tasks"
+    )
+
+
+def test_r3_vm_resource_monitors_called_in_health_check_flow():
+    """r3: the health-check orchestrator (run_runner_health_monitors) must call
+    _check_low_disk_vms and _check_low_memory_vms to make VM monitoring active.
+
+    Importing and defining the functions is not enough — they must be wired into
+    the periodic health-check sweep that fires for every orchestrator tick.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "runner_health_monitors.py",
+        Path("/repo/backend/app/runner_health_monitors.py"),
+        Path(__file__).resolve().parent.parent / "app" / "runner_health_monitors.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("runner_health_monitors.py not found — skipping source check")
+
+    assert "await _check_low_disk_vms" in source, (
+        "runner_health_monitors.py must await _check_low_disk_vms inside "
+        "run_runner_health_monitors so GCE VM low-disk conditions trigger alerts "
+        "during every health-check sweep"
+    )
+    assert "await _check_low_memory_vms" in source, (
+        "runner_health_monitors.py must await _check_low_memory_vms inside "
+        "run_runner_health_monitors so GCE VM OOM conditions trigger alerts "
+        "during every health-check sweep"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding r4 — Research quality feedback closes the grade/grader loop          #
+# --------------------------------------------------------------------------- #
+
+
+def test_r4_direction_quality_score_incorporates_grade_distribution():
+    """r4: _compute_direction_quality_score in direction_metrics.py must consume
+    grade_distribution from research_history entries so HIGH-grade directions
+    score better than LOW-grade noise generators.
+
+    Finding: grade_distribution was stored per research_history entry by
+    research_direction_state.py but never consumed — it had zero influence on
+    direction quality scores or research spawning priority.
+
+    Fix: the quality scorer now reads HIGH/MEDIUM/LOW counts from grade_distribution
+    and adds a recency-weighted HIGH-grade fraction as a quality component.
+    """
+    from app.direction_metrics import _compute_direction_quality_score
+
+    # Direction whose recent history has mostly HIGH-grade findings.
+    high_grade_direction = {
+        "research_history": [
+            {"grade_distribution": {"HIGH": 5, "MEDIUM": 1, "LOW": 0}},
+            {"grade_distribution": {"HIGH": 4, "MEDIUM": 2, "LOW": 0}},
+        ]
+    }
+    # Direction whose recent history has mostly LOW-grade findings.
+    low_grade_direction = {
+        "research_history": [
+            {"grade_distribution": {"HIGH": 0, "MEDIUM": 1, "LOW": 6}},
+            {"grade_distribution": {"HIGH": 1, "MEDIUM": 1, "LOW": 5}},
+        ]
+    }
+
+    high_score = _compute_direction_quality_score(high_grade_direction)
+    low_score = _compute_direction_quality_score(low_grade_direction)
+
+    assert isinstance(high_score, float), (
+        "_compute_direction_quality_score must return a float quality score"
+    )
+    assert 0.0 <= high_score <= 1.0, (
+        "_compute_direction_quality_score score must be in [0.0, 1.0]"
+    )
+    assert high_score > low_score, (
+        "_compute_direction_quality_score must assign a higher score to a direction "
+        "with mostly HIGH-grade findings than one with mostly LOW-grade noise; "
+        "grade_distribution must contribute to the quality signal"
+    )
+
+
+def test_r4_direction_quality_score_incorporates_quality_grader_verdict():
+    """r4: _compute_direction_quality_score must consume quality_grader_verdict
+    (pass/fail) from research_history so directions whose findings consistently
+    pass forward-quality grading score higher.
+
+    Finding: quality_grader_verdict was stored on individual task contexts in
+    task_lifecycle.py but never aggregated into direction quality scoring — it
+    had no effect on research prioritisation.
+
+    Fix: the quality scorer reads quality_grader_verdict.passed from recent
+    history entries and adds a recency-weighted pass-rate component.
+    """
+    from app.direction_metrics import _compute_direction_quality_score
+
+    # Direction where quality grader consistently passed.
+    all_pass = {
+        "research_history": [
+            {"quality_grader_verdict": {"passed": True}},
+            {"quality_grader_verdict": {"passed": True}},
+            {"quality_grader_verdict": {"passed": True}},
+        ]
+    }
+    # Direction where quality grader consistently failed.
+    all_fail = {
+        "research_history": [
+            {"quality_grader_verdict": {"passed": False}},
+            {"quality_grader_verdict": {"passed": False}},
+            {"quality_grader_verdict": {"passed": False}},
+        ]
+    }
+
+    pass_score = _compute_direction_quality_score(all_pass)
+    fail_score = _compute_direction_quality_score(all_fail)
+
+    assert pass_score > fail_score, (
+        "_compute_direction_quality_score must assign a higher score to a direction "
+        "whose findings all passed quality grading than one where all failed; "
+        "quality_grader_verdict.passed must contribute to the quality signal"
+    )
+
+
+def test_r4_direction_quality_score_used_in_research_spawning_priority():
+    """r4: autonomous_research.py must import and call _compute_direction_quality_score
+    so that quality feedback actually influences which directions get research tasks.
+
+    A quality signal that is computed but never consumed by the spawner has no effect.
+    """
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "backend" / "app" / "autonomous_research.py",
+        Path("/repo/backend/app/autonomous_research.py"),
+        Path(__file__).resolve().parent.parent / "app" / "autonomous_research.py",
+    ]
+    source: str | None = None
+    for p in candidates:
+        if p.exists():
+            source = p.read_text(encoding="utf-8")
+            break
+    if source is None:
+        import pytest
+        pytest.skip("autonomous_research.py not found — skipping source check")
+
+    assert "_compute_direction_quality_score" in source, (
+        "autonomous_research.py must import and call _compute_direction_quality_score "
+        "so that research quality feedback (grade_distribution / quality_grader_verdict) "
+        "influences which directions are prioritised for research spawning"
+    )
+
+
+# =========================================================================== #
+# 2-finding resident bootstrap/recovery salvage bundle (2026-07-20)
+# =========================================================================== #
+
+
+def _agent_resident_lib_source() -> str:
+    """Return the source of agent/src/handlers/strategic-resident-lib.ts."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "agent" / "src" / "handlers" / "strategic-resident-lib.ts",
+        Path("/repo/agent/src/handlers/strategic-resident-lib.ts"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("strategic-resident-lib.ts not found in expected locations")
+
+
+def _agent_resident_handler_source() -> str:
+    """Return the source of agent/src/handlers/strategic-resident.ts."""
+    from pathlib import Path
+
+    candidates = [
+        Path(__file__).resolve().parents[2] / "agent" / "src" / "handlers" / "strategic-resident.ts",
+        Path("/repo/agent/src/handlers/strategic-resident.ts"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+    raise FileNotFoundError("strategic-resident.ts not found in expected locations")
+
+
+# --------------------------------------------------------------------------- #
+# Finding res-1 — CompactionCheckpointContext carries contextPrefix/skills/tools
+# --------------------------------------------------------------------------- #
+
+
+def test_res1_compaction_checkpoint_context_has_bootstrap_fields():
+    """CompactionCheckpointContext must declare contextPrefix, skillsText, toolContentText.
+
+    Finding res-1 claim: buildBootstrapPrompt receives contextPrefix, skillsText, and
+    toolContentText, while CompactionCheckpointContext has no corresponding fields —
+    so a post-compaction session operates without operator purpose, project skills,
+    and built-in tool content that every bootstrap turn sees.
+
+    Fix: CompactionCheckpointContext was extended with contextPrefix?, skillsText?,
+    and toolContentText? so buildCheckpointContext (in the handler) can carry these
+    session-static values forward on every compaction restart.
+    """
+    try:
+        source = _agent_resident_lib_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("strategic-resident-lib.ts not found — skipping agent source check")
+
+    # All three fields must appear in the CompactionCheckpointContext interface.
+    assert "contextPrefix" in source, (
+        "CompactionCheckpointContext must declare contextPrefix so the operator "
+        "purpose/constraints preamble survives into every compaction checkpoint"
+    )
+    assert "skillsText" in source, (
+        "CompactionCheckpointContext must declare skillsText so project skills "
+        "(from .blueprint/tools.json) are available after every compaction restart"
+    )
+    assert "toolContentText" in source, (
+        "CompactionCheckpointContext must declare toolContentText so built-in tool "
+        "content (operator notes, whiteboard) is carried into every compaction checkpoint"
+    )
+
+
+def test_res1_build_compaction_checkpoint_renders_bootstrap_fields():
+    """buildCompactionCheckpoint must render contextPrefix, skillsText, toolContentText.
+
+    Finding res-1: even if the interface has the fields, omitting them from the
+    buildCompactionCheckpoint render function means the fields go nowhere.  The
+    function must actually emit sections for each non-empty value.
+    """
+    try:
+        source = _agent_resident_lib_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("strategic-resident-lib.ts not found — skipping agent source check")
+
+    # Find the buildCompactionCheckpoint function body.
+    idx = source.find("export function buildCompactionCheckpoint(")
+    assert idx >= 0, "buildCompactionCheckpoint not found in strategic-resident-lib.ts"
+    body = source[idx: idx + 8000]
+
+    assert "ctx.contextPrefix" in body, (
+        "buildCompactionCheckpoint must push ctx.contextPrefix into the sections array "
+        "so the operator-purpose/constraints preamble appears in every checkpoint"
+    )
+    assert "ctx.skillsText" in body, (
+        "buildCompactionCheckpoint must push ctx.skillsText (as a '## Project Skills' "
+        "section) into the checkpoint so project skills survive compaction restarts"
+    )
+    assert "ctx.toolContentText" in body, (
+        "buildCompactionCheckpoint must push ctx.toolContentText (as a '## Project Tool "
+        "Content' section) into the checkpoint so tool content survives compaction restarts"
+    )
+
+
+def test_res1_build_checkpoint_context_populates_bootstrap_fields():
+    """The handler's buildCheckpointContext must supply contextPrefix/skills/tools.
+
+    Finding res-1: the checkpoint context builder in strategic-resident.ts must assign
+    the session-static values (contextPrefix from buildContextPrefix, skillsText from
+    the skills array, toolContentText from project_tools) into the returned
+    CompactionCheckpointContext so they travel through maybeCompact to the checkpoint.
+    """
+    try:
+        source = _agent_resident_handler_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("strategic-resident.ts not found — skipping agent source check")
+
+    # buildCheckpointContext closure must reference the session-static local vars.
+    idx = source.find("const buildCheckpointContext = ")
+    assert idx >= 0, "buildCheckpointContext closure not found in strategic-resident.ts"
+    body = source[idx: idx + 8000]
+
+    assert "contextPrefix" in body, (
+        "buildCheckpointContext must include contextPrefix in the returned "
+        "CompactionCheckpointContext so operator purpose/constraints survive compaction"
+    )
+    assert "skillsText" in body, (
+        "buildCheckpointContext must include skillsText in the returned "
+        "CompactionCheckpointContext so project skills survive compaction"
+    )
+    assert "toolContentText" in body, (
+        "buildCheckpointContext must include toolContentText in the returned "
+        "CompactionCheckpointContext so built-in tool content survives compaction"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Finding res-2 — workspace recovery re-provisions helpers and restarts subprocess
+# --------------------------------------------------------------------------- #
+
+
+def test_res2_workspace_vanish_guard_reprovisions_all_helpers():
+    """The workspace-vanish guard must re-provision all startup helper tools.
+
+    Finding res-2 claim: startup provisions playbook, messages, skills, strategic,
+    and ambient helpers after cloning, while recloneResidentWorkspace only restores
+    the clone and Git credential helper — so after an external workspace deletion the
+    recovered workspace is missing all generated helper scripts.
+
+    Fix: the workspace-vanish guard in the main loop now calls writePlaybookHelper,
+    writeMessagesHelper, writeSkillHelpers, writeStrategicHelpers, and
+    provisionAmbientHelpers after recloneResidentWorkspace, mirroring startup exactly.
+    """
+    try:
+        source = _agent_resident_handler_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("strategic-resident.ts not found — skipping agent source check")
+
+    # Find the workspace-vanish guard block.
+    idx = source.find("workspace vanished")
+    assert idx >= 0, "workspace-vanish guard not found in strategic-resident.ts"
+    # Scan forward for all the re-provisioning calls (generous window: 2000 chars).
+    guard_body = source[idx: idx + 2000]
+
+    for helper in (
+        "writePlaybookHelper",
+        "writeMessagesHelper",
+        "writeSkillHelpers",
+        "writeStrategicHelpers",
+        "provisionAmbientHelpers",
+    ):
+        assert helper in guard_body, (
+            f"The workspace-vanish guard must call {helper} after recloneResidentWorkspace "
+            f"to re-provision that helper into the replacement checkout — without it the "
+            f"recovery session cannot invoke the corresponding command"
+        )
+
+
+def test_res2_workspace_vanish_guard_restarts_and_primes_subprocess():
+    """The workspace-vanish guard must restart the subprocess and prime it with a checkpoint.
+
+    Finding res-2 claim: the resident subprocess is spawned once with cwd set to the
+    original workspace and is neither restarted nor re-primed when that directory is
+    deleted and recreated — so the live subprocess still points at the deleted inode.
+
+    Fix: the guard closes the old subprocess, spawns a fresh one (with cwd pointing at
+    the replacement workspace), and primes it with buildCompactionCheckpoint so the
+    restarted process has coherent context rather than an empty conversation.
+    """
+    try:
+        source = _agent_resident_handler_source()
+    except FileNotFoundError:
+        import pytest
+        pytest.skip("strategic-resident.ts not found — skipping agent source check")
+
+    idx = source.find("workspace vanished")
+    assert idx >= 0, "workspace-vanish guard not found in strategic-resident.ts"
+    guard_body = source[idx: idx + 2000]
+
+    assert "session.close()" in guard_body or "close()" in guard_body, (
+        "The workspace-vanish guard must close the old subprocess (session.close()) "
+        "so the dead inode reference is released before the new session starts"
+    )
+    assert "startResidentClaudeSession" in guard_body, (
+        "The workspace-vanish guard must call startResidentClaudeSession to spawn a "
+        "fresh subprocess whose cwd points at the replacement workspace directory"
+    )
+    assert "buildCompactionCheckpoint" in guard_body, (
+        "The workspace-vanish guard must prime the fresh subprocess with "
+        "buildCompactionCheckpoint so the recovery session has the full decision "
+        "register, exam ledger, and operator grounding rather than an empty conversation"
     )

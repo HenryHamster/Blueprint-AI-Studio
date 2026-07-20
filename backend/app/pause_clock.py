@@ -109,6 +109,41 @@ def active_elapsed(
     return max(0.0, raw - paused_during)
 
 
+def active_elapsed_seconds(
+    state: Optional[DeploymentState],
+    started_at: datetime,
+    baseline_paused: Optional[float] = None,
+) -> float:
+    """Seconds since ``started_at`` excluding pause windows — the reaper-side
+    analogue of :func:`active_elapsed` for wall-clock stall/timeout reapers
+    that penalize a task/cycle for lack of *progress*. A paused pipeline can't
+    make progress, so these must not count pause time toward their deadline.
+
+    Three modes, degrading safely:
+
+    * ``state is None`` → raw elapsed (no pause data available — preserves
+      pre-PauseClock behavior for callers/tests that don't thread state).
+    * ``baseline_paused`` given (the value of :func:`total_paused_seconds` at
+      timer start) → EXACT across every pause window since then.
+    * ``baseline_paused is None`` but ``state`` present → subtract only the
+      currently-OPEN pause window. Safe for the common single-pause case: a
+      still-running timer that predates the open pause has its whole overlap
+      inside that one window, so active time is never over-counted *during* a
+      pause. It cannot retroactively credit already-closed windows for a legacy
+      row that carries no baseline — such rows converge to correct once they
+      rotate (cycles/qualifications are short-lived) and are never falsely
+      reaped while the pipeline is actually paused.
+    """
+    if started_at.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=None)
+    raw = (_utcnow() - started_at).total_seconds()
+    if state is None:
+        return max(0.0, raw)
+    if baseline_paused is not None:
+        return max(0.0, raw - (total_paused_seconds(state) - baseline_paused))
+    return max(0.0, raw - _in_flight_seconds(state))
+
+
 def mark_paused(state: DeploymentState, kind: str) -> None:
     """Record entry into a pause window. Idempotent: if already paused,
     keeps the existing ``paused_at`` and ``paused_kind`` so we don't

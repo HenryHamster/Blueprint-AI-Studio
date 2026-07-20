@@ -108,6 +108,34 @@ _MAX_ERROR_REDRIVE_ATTEMPTS = 5
 # once this many consecutive re-drives still result in infra_failure.
 _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS = 3
 
+# Time-based backoff schedule for infra-failure re-drives keyed on the
+# candidate-agnostic same-(signature, engine_sha) streak.  The streak counts
+# consecutive trailing infra_attempt_history entries that share BOTH the
+# current infra_failure_signature AND the current engine_sha — it does NOT
+# reset when the candidate SHA advances, so a persistent infra condition that
+# survives multiple automain promotions is still gated.
+#
+# Index == streak length (clamped to the last entry):
+#   0 → immediate (first same-signature attempt — no backoff)
+#   1 → 60 s  (second consecutive hit — short cooldown, might self-resolve)
+#   2 → 300 s (third hit — 5 min, wait for infra to stabilise)
+#   3+ → 1800 s (four or more hits — 30 min, clearly structural)
+_INFRA_BACKOFF_SCHEDULE: tuple[int, ...] = (0, 60, 300, 1800)
+
+
+def _infra_backoff_seconds(same_signature_streak: int) -> int:
+    """Minimum wait (seconds) before re-driving the same-(signature, engine_sha) failure.
+
+    Pure helper — no I/O.  ``same_signature_streak`` is the count of trailing
+    infra_attempt_history entries that share BOTH the current failure signature
+    AND the current engine_sha (candidate-agnostic: SHA changes do not reset it).
+    """
+    if same_signature_streak <= 0:
+        return 0
+    idx = min(same_signature_streak, len(_INFRA_BACKOFF_SCHEDULE) - 1)
+    return _INFRA_BACKOFF_SCHEDULE[idx]
+
+
 _RUBRIC_REDRIVE_STATUSES: frozenset[str] = frozenset(
     {"rubric_changed", "rubric_provenance_unknown"}
 )
@@ -445,6 +473,49 @@ async def _redrive_infra_failure_qualification(
                     _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
                 )
             return False
+        # Time-based backoff keyed on candidate-agnostic same-(signature,
+        # engine_sha) streak.  Unlike ``consecutive_infra_errors`` (which resets
+        # when the candidate SHA advances), this streak counts trailing
+        # infra_attempt_history entries that share BOTH the current signature AND
+        # the current engine_sha — so a persistent infra condition that survives
+        # multiple automain promotions is still rate-limited.  Resets naturally
+        # when the signature or engine_sha changes (the trailing run breaks).
+        _cur_sig = qual.get("infra_failure_signature")
+        _cur_eng = qual.get("engine_sha")
+        _attempt_history = [
+            row
+            for row in (qual.get("infra_attempt_history") or [])
+            if isinstance(row, dict)
+        ]
+        _same_sig_streak = 0
+        for _entry in reversed(_attempt_history):
+            if (
+                _entry.get("signature") == _cur_sig
+                and _entry.get("engine_sha") == _cur_eng
+            ):
+                _same_sig_streak += 1
+            else:
+                break
+        _required_wait = _infra_backoff_seconds(_same_sig_streak)
+        if _required_wait > 0:
+            _finalized_at_str = qual.get("finalized_at")
+            if _finalized_at_str:
+                try:
+                    _finalized_at = datetime.fromisoformat(_finalized_at_str)
+                    _elapsed = (_utcnow() - _finalized_at).total_seconds()
+                    if _elapsed < _required_wait:
+                        logger.debug(
+                            "[RELEASE_QUALIFIER] redrive backoff: v%d "
+                            "same-sig/engine streak=%d requires %ds wait, "
+                            "elapsed=%.0fs — skipping this sweep",
+                            version.version_number,
+                            _same_sig_streak,
+                            _required_wait,
+                            _elapsed,
+                        )
+                        return False
+                except (ValueError, TypeError):
+                    pass  # malformed timestamp → do not gate, allow redrive
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,

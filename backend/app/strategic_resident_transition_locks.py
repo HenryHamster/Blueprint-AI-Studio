@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
+from datetime import datetime
 
 from sqlalchemy import and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,6 +41,9 @@ ACTIVE_LEGACY_CYCLE_OUTCOMES = (
     "phase2_running",
 )
 LEGACY_CYCLE_TASK_TYPES = ("design_doc_update", "strategic_review")
+_RECONCILABLE_CYCLE_TASK_STATUSES = frozenset(
+    {TaskStatus.FAILED, TaskStatus.CANCELLED}
+)
 
 
 class ResidentCheckpointBoundaryError(ResidentOwnershipTransitionError):
@@ -69,11 +73,60 @@ def _payload(task: Task) -> dict:
     return task.first_payload if isinstance(task.first_payload, dict) else {}
 
 
+def _active_cycle_phase(
+    cycle: StrategicCycle,
+) -> tuple[str, uuid.UUID | None, str]:
+    if cycle.outcome in {"in_progress", "phase1_running"}:
+        return "phase1", cycle.phase1_task_id, "design_doc_update"
+    if cycle.outcome == "phase2_running":
+        return "phase2", cycle.phase2_task_id, "strategic_review"
+    raise LegacyResidentDrainRequired(
+        f"legacy StrategicCycle {cycle.id} remains active in {cycle.outcome}"
+    )
+
+
+def _reconcile_failed_active_cycle(
+    cycle: StrategicCycle,
+    task: Task,
+    *,
+    phase: str,
+    reconciled_at: datetime,
+) -> None:
+    status = str(getattr(task.status, "value", task.status))
+    terminal_at = task.completed_at or task.updated_at or reconciled_at
+    previous_outcome = cycle.outcome
+    if phase == "phase1":
+        cycle.outcome = "failed_phase1"
+        cycle.phase1_completed_at = cycle.phase1_completed_at or terminal_at
+    else:
+        cycle.outcome = "failed_phase2"
+        cycle.phase2_completed_at = cycle.phase2_completed_at or terminal_at
+    reason = (
+        f"cutover_reconciliation: linked {phase} Task {task.id} reached "
+        f"{status} while StrategicCycle remained {previous_outcome}"
+    )
+    detail = (task.latest_status_message or "").strip()
+    cycle.failure_reason = (f"{reason}: {detail}" if detail else reason)[:2000]
+    cycle.updated_at = reconciled_at
+
+
+def _cycle_lineage_matches(cycle: StrategicCycle, task: Task) -> bool:
+    canonical = task.strategic_cycle_id
+    context = task.context if isinstance(task.context, dict) else {}
+    if canonical is not None:
+        if str(canonical) != cycle.id:
+            return False
+        contextual = context.get("strategic_cycle_id")
+        return contextual is None or str(contextual) == cycle.id
+    return str(context.get("strategic_cycle_id") or "") == cycle.id
+
+
 async def lock_project_resident_tasks(
     session: AsyncSession,
     project_id: uuid.UUID,
     *,
     reject_active_legacy_cycles: bool = False,
+    reconciliation_at: datetime | None = None,
 ) -> tuple[Project, StrategicResident, list[Task]]:
     """Lock the transition root and complete live Resident task inventory."""
     project = (
@@ -113,11 +166,6 @@ async def lock_project_resident_tasks(
         .scalars()
         .all()
     )
-    if active_cycles and reject_active_legacy_cycles:
-        raise LegacyResidentDrainRequired(
-            "legacy StrategicCycle work is still active: "
-            + ", ".join(cycle.id for cycle in active_cycles)
-        )
 
     vision = project.vision if isinstance(project.vision, dict) else {}
     legacy_blob = vision.get(LEGACY_SESSION_KEY)
@@ -129,26 +177,30 @@ async def lock_project_resident_tasks(
             raise ResidentOwnershipStateError(
                 "legacy Resident session references a malformed task id"
             ) from None
-    pointer_ids = sorted(
-        {
-            task_id
-            for task_id in (
-                resident.active_turn_task_id,
-                resident.interactive_successor_task_id,
-                resident.background_successor_task_id,
-                legacy_task_id,
-            )
-            if task_id is not None
-        },
-        key=str,
-    )
+    pointer_ids = {
+        task_id
+        for task_id in (
+            resident.active_turn_task_id,
+            resident.interactive_successor_task_id,
+            resident.background_successor_task_id,
+            legacy_task_id,
+        )
+        if task_id is not None
+    }
+    cycle_task_ids: set[uuid.UUID] = set()
+    if active_cycles and reject_active_legacy_cycles:
+        for cycle in active_cycles:
+            _phase, task_id, _task_type = _active_cycle_phase(cycle)
+            if task_id is not None:
+                cycle_task_ids.add(task_id)
+    locked_task_ids = sorted(pointer_ids | cycle_task_ids, key=str)
     tasks: list[Task] = []
-    if pointer_ids:
+    if locked_task_ids:
         tasks.extend(
             (
                 await session.execute(
                     select(Task)
-                    .where(Task.id.in_(pointer_ids))
+                    .where(Task.id.in_(locked_task_ids))
                     .order_by(Task.id.asc())
                     .with_for_update()
                     .execution_options(populate_existing=True)
@@ -180,8 +232,8 @@ async def lock_project_resident_tasks(
         .with_for_update()
         .execution_options(populate_existing=True)
     )
-    if pointer_ids:
-        query = query.where(Task.id.not_in(pointer_ids))
+    if locked_task_ids:
+        query = query.where(Task.id.not_in(locked_task_ids))
     tasks.extend((await session.execute(query)).scalars().all())
     by_id = {task.id: task for task in tasks}
     for attr in (
@@ -223,6 +275,54 @@ async def lock_project_resident_tasks(
             raise ResidentOwnershipStateError(
                 "legacy Resident session Task lineage is inconsistent"
             )
+    if active_cycles and reject_active_legacy_cycles:
+        if resident.engine_owner != "legacy":
+            raise ResidentOwnershipStateError(
+                "authoritative Resident still has active legacy StrategicCycle work"
+            )
+        blockers: list[str] = []
+        reconciliations: list[tuple[StrategicCycle, Task, str]] = []
+        reconciled_at = reconciliation_at or project.updated_at
+        for cycle in active_cycles:
+            phase, task_id, expected_task_type = _active_cycle_phase(cycle)
+            task = by_id.get(task_id) if task_id is not None else None
+            reason: str | None = None
+            if task_id is None:
+                reason = f"{cycle.id}: missing {phase} Task pointer"
+            elif task is None:
+                reason = f"{cycle.id}: linked Task {task_id} is missing"
+            elif task.project_id != project_id:
+                reason = f"{cycle.id}: linked Task {task_id} is cross-project"
+            elif _payload(task).get("type") != expected_task_type:
+                reason = f"{cycle.id}: linked Task {task_id} has wrong phase type"
+            elif not _cycle_lineage_matches(cycle, task):
+                reason = f"{cycle.id}: linked Task {task_id} has stale cycle lineage"
+            elif task.status not in _RECONCILABLE_CYCLE_TASK_STATUSES:
+                reason = (
+                    f"{cycle.id}: linked Task {task_id} remains "
+                    f"{getattr(task.status, 'value', task.status)}"
+                )
+            elif task.post_commit_pending:
+                reason = (
+                    f"{cycle.id}: linked Task {task_id} has post-commit work pending"
+                )
+            if reason is not None:
+                blockers.append(reason)
+                continue
+            reconciliations.append((cycle, task, phase))
+        if blockers:
+            raise LegacyResidentDrainRequired(
+                "legacy StrategicCycle work is still active: " + "; ".join(blockers)
+            )
+        for cycle, task, phase in reconciliations:
+            _reconcile_failed_active_cycle(
+                cycle,
+                task,
+                phase=phase,
+                reconciled_at=reconciled_at,
+            )
+            session.add(cycle)
+
     return project, resident, tasks
 
 

@@ -328,6 +328,96 @@ def test_runner_health_alert_event_constants_are_registered():
     )
 
 
+# ── Conversation surface routing drift guards ────────────────────────────
+
+
+def test_conversation_event_types_surface_drift_guard():
+    """Every event type in CONVERSATION_EVENT_TYPES must be in the audience registry.
+
+    CONVERSATION_EVENT_TYPES in ``project_message_creation.py`` controls surface
+    routing (CONVERSATION vs ACTIVITY) in ``build_project_message``.  A new
+    conversational event type added to CONVERSATION_EVENT_TYPES without a
+    corresponding ``_EVENT_AUDIENCE_REGISTRY`` entry will fail this test, forcing
+    a conscious audience decision.
+    """
+    from app.project_message_creation import CONVERSATION_EVENT_TYPES
+
+    registered = get_registered_event_types()
+    missing = CONVERSATION_EVENT_TYPES - registered
+    assert not missing, (
+        "Conversation event types missing from the audience registry:\n"
+        + "\n".join(f"  - {et!r}" for et in sorted(missing))
+        + "\n\nAdd each to _EVENT_AUDIENCE_REGISTRY in "
+        "backend/app/message_audience.py."
+    )
+
+
+def test_operator_visible_undotted_event_types_not_conversational_must_be_explicitly_excluded():
+    """Operator-visible undotted event types are either conversational or consciously excluded.
+
+    A new operator-visible (operator-action-needed or operator-fyi) undotted event
+    type added to ``_EVENT_AUDIENCE_REGISTRY`` without a ``CONVERSATION_EVENT_TYPES``
+    entry or explicit exclusion will silently route to the ACTIVITY surface instead
+    of CONVERSATION.  This test ensures every such type is consciously decided.
+
+    Dotted event types (``task.*``, ``runner.*``, etc.) are categorical alert types
+    that go through ``Alert`` pathways, not ``build_project_message`` surface routing,
+    so they are excluded from this check.
+    """
+    from app.project_message_creation import CONVERSATION_EVENT_TYPES
+
+    # Operator-visible undotted event types that are intentionally non-conversational:
+    # lifecycle notices, pipeline alerts, and direct escalations route to ACTIVITY.
+    _NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES: frozenset[str] = frozenset({
+        "handmerge_pr_preserved",
+        "unsafe_branch_configuration",
+        "review_fix_lane_gate_integrity_violation",
+        "repeat_fingerprint_halt",
+        "lane_killed_exhausted",
+        "lane_killed_stranded",
+        "lane_checkpoint_recover",
+        "lane_budget_near_exhausted",
+        "pilot_auto_disabled",
+        "operator_command",
+        "strategic_check_in",
+        "agent_annotation",
+    })
+
+    registered = get_registered_event_types()
+    # Focus on undotted NOTE-type event types.  Dotted types are categorical
+    # alert types that go through Alert pathways, not build_project_message
+    # surface routing.
+    operator_undotted = {
+        et for et in registered
+        if is_operator_visible(route_event(et)) and "." not in et
+    }
+
+    covered = CONVERSATION_EVENT_TYPES | _NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES
+    missing = operator_undotted - covered
+    assert not missing, (
+        "Operator-visible undotted event types not in CONVERSATION_EVENT_TYPES "
+        "or the non-conversational allowlist:\n"
+        + "\n".join(
+            f"  - {et!r} → {route_event(et)}" for et in sorted(missing)
+        )
+        + "\n\nEither add to CONVERSATION_EVENT_TYPES in "
+        "backend/app/project_message_creation.py (conversational) or add to "
+        "_NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES in this test (intentionally "
+        "non-conversational)."
+    )
+
+    # Sanity-check: every allowlist entry is registered and operator-visible.
+    for et in _NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES:
+        assert et in registered, (
+            f"Allowlist entry {et!r} is not in the audience registry. "
+            "Remove it from the allowlist."
+        )
+        assert is_operator_visible(route_event(et)), (
+            f"Allowlist entry {et!r} is not operator-visible. "
+            "Remove it from the allowlist."
+        )
+
+
 # ── Alert read-model audience filter (operator_visible_alert_filter) ─────
 
 
