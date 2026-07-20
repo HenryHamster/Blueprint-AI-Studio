@@ -310,6 +310,7 @@ from app.reaper_sweeps import (
     sweep_metrics_integrity,
     sweep_capability_backing_proofs,
     sweep_auto_clear_moot_pending_confirmations,
+    sweep_decay_stale_pending_confirmations,
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
@@ -3416,6 +3417,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Moot pending-confirmation sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22e-ii: Age-decay stale pending_user_confirmation items —
+                # removes ANY item (all types including intent_change/major_decision)
+                # whose created_at is older than PENDING_CONFIRMATION_STALE_DECAY_DAYS.
+                # Complements Step 22e which is signal-based and credential/access-only.
+                # 6-hourly cadence-gated on an independent timer.
+                _mark_reaper_progress()
+                try:
+                    await sweep_decay_stale_pending_confirmations(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Stale pending-confirmation decay error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

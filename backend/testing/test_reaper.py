@@ -19034,6 +19034,209 @@ async def test_moot_confirmation_sweep_covers_all_projects_beyond_old_limit(reap
         _rs._last_moot_confirm_sweep = _prev
 
 
+# ---------------------------------------------------------------------------
+# test_pending_confirmation_stale_decay
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_stale_decay_removes_old_intent_change(reaper_db):
+    """An intent_change item older than PENDING_CONFIRMATION_STALE_DECAY_DAYS is
+    removed by the decay sweep and the revision log is updated."""
+    from app.problem_model import PENDING_CONFIRMATION_STALE_DECAY_DAYS
+
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        old_ts = (
+            _utcnow() - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS + 1)
+        ).isoformat()
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-intent-old",
+                    "type": "intent_change",
+                    "proposal": "Pivot the project to a new direction.",
+                    "created_at": old_ts,
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert decayed == 1
+
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"] == []
+        log = project.problem_model.get("revision_log") or []
+        assert any(
+            e.get("changes", {}).get("decayed_pending_confirmations") == ["p-intent-old"]
+            for e in log
+        )
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_stale_decay_keeps_fresh_item(reaper_db):
+    """An item younger than PENDING_CONFIRMATION_STALE_DECAY_DAYS is left untouched."""
+    from app.problem_model import PENDING_CONFIRMATION_STALE_DECAY_DAYS
+
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        fresh_ts = (
+            _utcnow() - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS - 1)
+        ).isoformat()
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-fresh",
+                    "type": "major_decision",
+                    "proposal": "Adopt a new framework.",
+                    "created_at": fresh_ts,
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert decayed == 0
+
+        await reaper_db.refresh(project)
+        ids = {p["id"] for p in project.problem_model["pending_user_confirmation"]}
+        assert ids == {"p-fresh"}
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_stale_decay_removes_all_types(reaper_db):
+    """All four confirmation types age out identically when past the decay window."""
+    from app.problem_model import PENDING_CONFIRMATION_STALE_DECAY_DAYS
+
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        old_ts = (
+            _utcnow() - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS + 5)
+        ).isoformat()
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred",
+                    "type": "credentials_needed",
+                    "proposal": "Need an API key.",
+                    "created_at": old_ts,
+                },
+                {
+                    "id": "p-access",
+                    "type": "access_needed",
+                    "proposal": "Need repo access.",
+                    "created_at": old_ts,
+                },
+                {
+                    "id": "p-intent",
+                    "type": "intent_change",
+                    "proposal": "Pivot direction.",
+                    "created_at": old_ts,
+                },
+                {
+                    "id": "p-decision",
+                    "type": "major_decision",
+                    "proposal": "Adopt new infra.",
+                    "created_at": old_ts,
+                },
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert decayed == 4
+
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"] == []
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_stale_decay_cadence_gated(reaper_db):
+    """A just-stamped cadence timer gates the sweep out (returns 0 without work)."""
+    from app.problem_model import PENDING_CONFIRMATION_STALE_DECAY_DAYS
+
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = _utcnow()  # just ran -> not due
+    try:
+        project = await _make_project(reaper_db)
+        old_ts = (
+            _utcnow() - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS + 1)
+        ).isoformat()
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-gated",
+                    "type": "intent_change",
+                    "proposal": "Should be gated.",
+                    "created_at": old_ts,
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert decayed == 0
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-gated"
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
+@pytest.mark.asyncio
+async def test_pending_confirmation_stale_decay_no_created_at(reaper_db):
+    """Items with a missing created_at are conservatively left in place."""
+    _prev = _rs._last_stale_confirm_decay_sweep
+    _rs._last_stale_confirm_decay_sweep = None
+    try:
+        project = await _make_project(reaper_db)
+        project.problem_model = {
+            "pending_user_confirmation": [
+                {
+                    "id": "p-no-ts",
+                    "type": "intent_change",
+                    "proposal": "No timestamp present.",
+                    "created_at": "",
+                }
+            ]
+        }
+        reaper_db.add(project)
+        await reaper_db.commit()
+
+        decayed = await _rs.sweep_decay_stale_pending_confirmations(
+            reaper_db, _utcnow()
+        )
+        assert decayed == 0
+        await reaper_db.refresh(project)
+        assert project.problem_model["pending_user_confirmation"][0]["id"] == "p-no-ts"
+    finally:
+        _rs._last_stale_confirm_decay_sweep = _prev
+
+
 @pytest.mark.asyncio
 async def test_proof_earn_loop_fires_without_demand_when_unproven_caps_exist(reaper_db, mocker):
     """Step 22b fires even with NO demand when unproven working capabilities exist.

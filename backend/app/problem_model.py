@@ -1708,6 +1708,65 @@ def auto_clear_resolved_confirmations(
     return cleared
 
 
+PENDING_CONFIRMATION_STALE_DECAY_DAYS = 30
+"""Age (in days) after which a ``pending_user_confirmation`` item is considered stale
+and eligible for automatic removal by the reaper decay sweep, regardless of type.
+
+Applies to ALL four types: ``intent_change``, ``major_decision``,
+``credentials_needed``, and ``access_needed``.  The moot-confirmation sweep
+(:func:`auto_clear_resolved_confirmations`) remains the fast-path that clears
+credential/access items when the system can positively prove resolution; this
+constant governs the age-based fallback for items the moot sweep can never remove
+(``intent_change`` / ``major_decision``) and for credential/access items whose moot
+signal never fires."""
+
+
+def decay_stale_pending_confirmations(
+    model: ProblemModel,
+    now_iso: str,
+) -> list[str]:
+    """Remove ``pending_user_confirmation`` items older than
+    :data:`PENDING_CONFIRMATION_STALE_DECAY_DAYS`.
+
+    Pure, DB-free counterpart to :func:`auto_clear_resolved_confirmations`: it
+    round-trips the ``ProblemModel`` identically — removes the item(s), bumps
+    ``revision``, stamps ``last_updated`` / ``last_updated_by='user'``, and appends
+    one ``revision_log`` entry.  Mutates ``model`` in place and returns the ids
+    decayed (empty list => no change).
+
+    Applies to ALL four confirmation types.  Items with a missing or unparseable
+    ``created_at`` are conservatively left in place (fail-closed on ambiguous data).
+    Idempotent: removed items are already gone on a second call.
+    """
+    if not model.pending_user_confirmation:
+        return []
+    now = _parse_iso_to_naive_utc(now_iso)
+    if now is None:
+        return []
+    cutoff = now - timedelta(days=PENDING_CONFIRMATION_STALE_DECAY_DAYS)
+    decayed: list[str] = []
+    kept: list[PendingConfirmation] = []
+    for item in model.pending_user_confirmation:
+        created = _parse_iso_to_naive_utc(item.created_at)
+        if created is not None and created < cutoff:
+            decayed.append(item.id)
+        else:
+            kept.append(item)
+    if not decayed:
+        return []
+    model.pending_user_confirmation = kept
+    model.revision += 1
+    model.last_updated = now_iso
+    model.last_updated_by = "user"
+    append_revision_log(
+        model,
+        f"age-decayed {len(decayed)} stale pending confirmation(s) "
+        f"(>{PENDING_CONFIRMATION_STALE_DECAY_DAYS}d old)",
+        {"decayed_pending_confirmations": decayed},
+    )
+    return decayed
+
+
 def append_self_reflection(
     log_raw: list | None,
     entry: SelfReflectionEntry,

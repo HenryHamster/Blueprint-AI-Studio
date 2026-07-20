@@ -1026,6 +1026,115 @@ async def sweep_auto_clear_moot_pending_confirmations(session, now=None) -> int:
     return total_cleared
 
 
+# Cadence gate for the stale-decay pending-confirmation sweep (Step 22e-ii).
+# 6-hourly, independent timer (age-based decay; much cheaper than moot sweep
+# which does credential I/O per project, so longer interval is fine).
+_STALE_CONFIRM_DECAY_INTERVAL_SECONDS = 21600
+_last_stale_confirm_decay_sweep: datetime | None = None
+
+
+async def sweep_decay_stale_pending_confirmations(session, now=None) -> int:
+    """Step 22e-ii: Age-decay stale ``pending_user_confirmation`` items.
+
+    Complements :func:`sweep_auto_clear_moot_pending_confirmations` (which is
+    fast-path / signal-based and only touches ``credentials_needed`` /
+    ``access_needed``).  This sweep removes ANY confirmation item whose
+    ``created_at`` is older than
+    :data:`app.problem_model.PENDING_CONFIRMATION_STALE_DECAY_DAYS`, including
+    ``intent_change`` and ``major_decision`` items that the moot sweep can never
+    remove.
+
+    Items with a missing or unparseable ``created_at`` are conservatively kept.
+    Iterates ALL projects via keyset pagination (batches of 100).  6-hourly
+    cadence-gated on an independent timer.  Wrapped so it can never crash the
+    reaper cycle.  Returns the total number of items decayed.
+    """
+    global _last_stale_confirm_decay_sweep
+    from app.models import Project
+    from app.problem_model import (
+        decay_stale_pending_confirmations,
+        parse_problem_model,
+    )
+    from sqlalchemy.orm import load_only
+    from sqlalchemy.orm.attributes import flag_modified
+
+    _now = now or _utcnow()
+    if not _is_cadence_due(
+        _last_stale_confirm_decay_sweep, _STALE_CONFIRM_DECAY_INTERVAL_SECONDS, _now
+    ):
+        return 0
+    _last_stale_confirm_decay_sweep = _now
+
+    now_iso = _now.isoformat()
+    _BATCH = 100
+    last_id = None
+    total_decayed = 0
+
+    while True:
+        query = (
+            select(Project)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.problem_model,
+                    raiseload=True,
+                )
+            )
+            .where(Project.problem_model.is_not(None))
+            .order_by(Project.id)
+            .limit(_BATCH)
+        )
+        if last_id is not None:
+            query = query.where(Project.id > last_id)
+
+        rows = (await session.execute(query)).scalars().all()
+        if not rows:
+            break
+
+        last_id = rows[-1].id
+
+        for project in rows:
+            try:
+                pm = getattr(project, "problem_model", None)
+                if not isinstance(pm, dict):
+                    continue
+                pending = pm.get("pending_user_confirmation")
+                if not isinstance(pending, list) or not pending:
+                    continue
+
+                try:
+                    model = parse_problem_model(pm)
+                except Exception:  # noqa: BLE001
+                    continue
+
+                decayed = decay_stale_pending_confirmations(model, now_iso)
+                if decayed:
+                    project.problem_model = model.model_dump()
+                    flag_modified(project, "problem_model")
+                    session.add(project)
+                    await session.commit()
+                    total_decayed += len(decayed)
+
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] Stale pending-confirmation decay failed for project %s:",
+                    getattr(project, "id", "?"),
+                    exc_info=True,
+                )
+                with contextlib.suppress(Exception):
+                    await session.rollback()
+
+        if len(rows) < _BATCH:
+            break
+
+    if total_decayed:
+        logger.info(
+            "[REAPER] Step 22e-ii: age-decayed %d stale pending confirmation(s)",
+            total_decayed,
+        )
+    return total_decayed
+
+
 async def sweep_proof_earn_loop(session, now=None) -> dict[str, Any]:
     """Step 22b: Earn proof for demanded unproven working capabilities.
 
@@ -3453,6 +3562,7 @@ __all__ = [
     "sweep_resolve_stale_open_bug_messages",
     "sweep_resolve_linked_messages",
     "sweep_decay_stale_open_messages",
+    "sweep_decay_stale_pending_confirmations",
     "STALE_OPEN_DECAY_DAYS",
     "STALE_OPEN_BUG_CLASS_DECAY_DAYS",
     "STALE_QUESTION_DECAY_DAYS",
