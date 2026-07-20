@@ -209,18 +209,31 @@ function appendCapabilityResult(
 function residentPrompt(
   providerInput: Record<string, unknown>,
   capabilityResults: Record<string, unknown>[],
+  actionRoundsRemaining: number,
+  requestSlotsRemaining: number,
 ): string {
+  const actionsAllowed = actionRoundsRemaining > 0 && requestSlotsRemaining > 0;
+  const actionInstructions = actionsAllowed
+    ? [
+      `You have ${actionRoundsRemaining} capability action round(s) and ${requestSlotsRemaining} request slot(s) remaining. Batch the decisive requests you need; after those rounds you must synthesize the final structured result.`,
+      'Request inspections and mutations in separate rounds.',
+      'You may invoke only catalog entries whose availability is "invoke" by returning:',
+      '{"capability_requests":[{"capability_id":"task.inspect","parameters":{"task_id":"UUID"}}]}',
+      'After inspecting decisive evidence, you may invoke mutation catalog entries whose availability is "invoke" by returning:',
+      '{"mutation_requests":[{"capability_id":"task.reprioritize","parameters":{"task_id":"UUID","priority":50},"operation_id":"stable-id","expected_revisions":{"target_task_updated_at":"ISO timestamp"},"evidence":[]}]}'
+    ]
+    : [
+      'Capability actions are closed for this turn. Do not return capability_requests or mutation_requests.',
+      'Return the exact final structured result now using the evidence and receipts already supplied. Represent any further evidence or operation need honestly in follow_up or required_attention; never claim an unperformed operation.',
+    ];
   const prompt = [
     'Return exactly one JSON object and no prose or markdown.',
-    'You may first invoke only catalog entries whose availability is "invoke" by returning:',
-    '{"capability_requests":[{"capability_id":"task.inspect","parameters":{"task_id":"UUID"}}]}',
-    'After inspecting decisive evidence, you may invoke mutation catalog entries whose availability is "invoke" by returning:',
-    '{"mutation_requests":[{"capability_id":"task.reprioritize","parameters":{"task_id":"UUID","priority":50},"operation_id":"stable-id","expected_revisions":{"target_task_updated_at":"ISO timestamp"},"evidence":[]}]}',
+    ...actionInstructions,
     'The server supplies project, turn, authority, checkpoint, and context revisions. Never include or override those server-owned revisions.',
     'Mutation evidence references must copy kind, project_id, source_id, revision, checksum, and inspected_at from server-validated inspection evidence; never invent evidence. Explicit approvals are durable server-side grants and are never represented in the model request.',
     'Every mutation response contains a server-authored completion_projection. Copy its operation and receipt exactly into final operations and receipts, and copy every projected unknown_effect and required_attention item exactly. An unknown_effect receipt must remain an applying operation and must never be reported as success or retried.',
     'Never claim an operation that lacks a server receipt.',
-    `Request at most ${MAX_CAPABILITY_REQUESTS} inspections and mutations combined. Request inspections and mutations in separate rounds. Never request a propose_only capability; include those only as final operations with status "proposed".`,
+    'Never request a propose_only capability; include those only as final operations with status "proposed".',
     'When reasoning is complete, include every final key even when null or empty:',
     '{"reply":null,"facts":[],"evidence":[],"operations":[],"receipts":[],"unknown_effects":[],"strategic_implications":[],"proposed_memory":[],"follow_up":null,"required_attention":[],"reconciliation":{"accepted_memory_proposal_ids":[],"accepted_implication_ids":[],"accepted_open_loop_ids":[],"resolved_open_loop_ids":[],"evidence_inspections":[]}}',
     'Only accept strategic changes you can support with decisive revisioned evidence you inspected in this turn. Record those inspections exactly in reconciliation.evidence_inspections.',
@@ -284,8 +297,16 @@ export async function handleStrategicResidentTurn(
   let result: Record<string, unknown> | null = null;
   try {
     for (let round = 0; round <= MAX_CAPABILITY_ROUNDS; round += 1) {
+      const actionRoundsRemaining = Math.max(0, MAX_CAPABILITY_ROUNDS - round);
+      const requestSlotsRemaining = Math.max(0, MAX_CAPABILITY_REQUESTS - requestKeys.size);
+      const actionsAllowed = actionRoundsRemaining > 0 && requestSlotsRemaining > 0;
       const run = await runClaudeCode(
-        residentPrompt(providerInput, capabilityResults),
+        residentPrompt(
+          providerInput,
+          capabilityResults,
+          actionRoundsRemaining,
+          requestSlotsRemaining,
+        ),
         ws,
         statusRef,
         model,
@@ -298,13 +319,17 @@ export async function handleStrategicResidentTurn(
         throw new Error(`Resident provider exited with code ${run.exitCode}`);
       }
       const texts = [run.lastResultText, run.allOutput];
+      if (!actionsAllowed) {
+        if (capabilityAction(texts)) {
+          throw new Error('Resident requested a capability after the action phase closed');
+        }
+        result = requireResult(texts);
+        break;
+      }
       const action = capabilityAction(texts);
       if (!action) {
         result = requireResult(texts);
         break;
-      }
-      if (round >= MAX_CAPABILITY_ROUNDS) {
-        throw new Error('Resident capability round limit exceeded');
       }
       if (requestKeys.size + action.requests.length > MAX_CAPABILITY_REQUESTS) {
         throw new Error('Resident capability request budget exceeded');
