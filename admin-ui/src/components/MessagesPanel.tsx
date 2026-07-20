@@ -1,5 +1,7 @@
 /* eslint-disable react-hooks/refs, react-hooks/set-state-in-effect */
 import { memo, useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { ConversationUtilityBar } from './ConversationUtilityBar';
+import { useChatChrome } from '../hooks/useChatChrome';
 import { auth } from '../firebase';
 import { currentUiSurface, reportUiLoadTiming } from '../uiLoadTiming';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker, acceptPendingConfirmation, dismissPendingConfirmation } from '../api';
@@ -564,6 +566,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [loading, setLoading] = useState(true);
   const [expandedConfirmationItemId, setExpandedConfirmationItemId] = useState<string | null>(null);
   const [resolvedConfirmationIds, setResolvedConfirmationIds] = useState<Set<string>>(() => new Set());
+  const [chatChromeExpanded, persistChatChrome] = useChatChrome();
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
   const [newType, setNewType] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.type ?? 'FEEDBACK');
   const [newContent, setNewContent] = useState(() => loadComposerDraft(currentActorUserId, selectedProjectId)?.content ?? '');
@@ -2747,23 +2750,16 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       />
 
       {conversationMode && (
-        <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-2 md:px-4">
-          <div className="mx-auto flex w-full max-w-[940px] items-center gap-2">
-            <input
-              aria-label="Search Resident conversation"
-              type="search"
-              value={searchQuery}
-              onChange={event => setSearchQuery(event.target.value)}
-              placeholder="Search conversation"
-              className="min-h-[36px] min-w-0 flex-1 rounded-md border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-xs text-neutral-100 placeholder:text-neutral-500 focus:border-indigo-500 focus:outline-none"
-            />
-            {residentEngineHealth && <ResidentEngineHealthChip health={residentEngineHealth} />}
-          </div>
-        </div>
+        <ConversationUtilityBar
+          expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
+          searchQuery={searchQuery} onSearchChange={setSearchQuery}
+          needsActionCount={usesStrategicReadModel ? attentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
+          residentHealth={residentEngineHealth ? <ResidentEngineHealthChip health={residentEngineHealth} /> : null}
+        />
       )}
 
-      {/* Inline alerts — replaces the separate AlertsPopover bell-triggered surface */}
-      {alerts && alerts.length > 0 && (
+      {/* Inline alerts — collapsed into the utility bar above by default in conversation mode. */}
+      {(!conversationMode || chatChromeExpanded) && alerts && alerts.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border px-3 py-2 md:px-4" data-testid="alerts-inline-banner">
           <AlertsBanner
             alerts={alerts}
@@ -2920,7 +2916,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       {/* Needs-action strip — derived from the canonical attention model when the
           strategic read model is available. Shows needs_operator items at the top
           with lifecycle.clears_when so the operator sees they will self-clear. */}
-      {usesStrategicReadModel && attentionNeedsActionItems.length > 0 && (
+      {(!conversationMode || chatChromeExpanded) && usesStrategicReadModel && attentionNeedsActionItems.length > 0 && (
         <div className="shrink-0 border-b border-workbench-border bg-amber-950/20 px-3 py-2 md:px-4" data-testid="needs-action-strip">
           <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-col gap-1.5">
             <div className="flex items-center gap-2">
