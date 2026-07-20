@@ -410,9 +410,10 @@ async def test_completion_post_rejects_malformed_nested_result_without_writes(
             headers={"x-agent-token": token},
         )
         assert response.status_code == 409, response.text
-        assert response.json()["detail"] == (
-            "Resident turn result does not match the structured contract"
-        )
+        assert response.json()["error"] == {
+            "code": 409,
+            "message": "Resident turn result does not match the structured contract",
+        }
 
     async with _factory(db_session)() as verify:
         stored_resident = await verify.get(StrategicResident, project.id)
