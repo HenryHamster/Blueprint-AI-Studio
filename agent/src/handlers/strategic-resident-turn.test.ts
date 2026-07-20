@@ -177,6 +177,169 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
   });
 
+  it('forces final structured synthesis after two distinct capability rounds', async () => {
+    const firstTaskId = '33333333-3333-3333-3333-333333333333';
+    const secondTaskId = '44444444-4444-4444-4444-444444444444';
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: firstTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: secondTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Synthesized', facts: [], evidence: [], operations: [], receipts: [],
+          unknown_effects: [], strategic_implications: [], proposed_memory: [],
+          follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string, body: Record<string, unknown>) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return Promise.resolve({
+          capability_id: 'task.inspect',
+          evidence: { source_id: (body.parameters as Record<string, unknown>).task_id },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    expect(String(mocks.runClaudeCode.mock.calls[0][0])).toContain(
+      '2 capability action round(s) and 8 request slot(s) remaining',
+    );
+    expect(String(mocks.runClaudeCode.mock.calls[1][0])).toContain(
+      '1 capability action round(s) and 7 request slot(s) remaining',
+    );
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('Capability actions are closed for this turn');
+    expect(finalPrompt).not.toContain('{"capability_requests"');
+    expect(finalPrompt).not.toContain('{"mutation_requests"');
+    expect(finalPrompt).not.toContain('Request at most');
+    expect(finalPrompt).not.toContain('Request inspections and mutations');
+    expect(finalPrompt).toContain(firstTaskId);
+    expect(finalPrompt).toContain(secondTaskId);
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(2);
+    expect(mocks.apiPost.mock.calls.at(-1)?.[0]).toBe('/api/agent/resident-turn/complete');
+  });
+
+  it('forces final synthesis when all capability request slots are exhausted', async () => {
+    const taskIds = Array.from({ length: 8 }, (_, index) => (
+      `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`
+    ));
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: taskIds.map((taskId) => ({
+            capability_id: 'task.inspect',
+            parameters: { task_id: taskId },
+          })),
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          reply: 'Budget synthesized', facts: [], evidence: [], operations: [], receipts: [],
+          unknown_effects: [], strategic_implications: [], proposed_memory: [],
+          follow_up: null, required_attention: [],
+          reconciliation: {
+            accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+            accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+          },
+        }),
+      });
+    mocks.apiPost.mockImplementation((path: string, body: Record<string, unknown>) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return Promise.resolve({
+          capability_id: 'task.inspect',
+          evidence: { source_id: (body.parameters as Record<string, unknown>).task_id },
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[1][0]);
+    expect(finalPrompt).toContain('Capability actions are closed for this turn');
+    expect(finalPrompt).not.toContain('{"capability_requests"');
+    expect(finalPrompt).not.toContain('{"mutation_requests"');
+    expect(finalPrompt).not.toContain('Request at most');
+    expect(finalPrompt).not.toContain('Request inspections and mutations');
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(8);
+    expect(mocks.apiPost.mock.calls.at(-1)?.[0]).toBe('/api/agent/resident-turn/complete');
+  });
+  it('never executes a capability requested after the action phase closes', async () => {
+    const taskIds = [
+      '33333333-3333-3333-3333-333333333333',
+      '44444444-4444-4444-4444-444444444444',
+      '55555555-5555-5555-5555-555555555555',
+    ];
+    for (const taskId of taskIds) {
+      mocks.runClaudeCode.mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: taskId },
+          }],
+        }),
+      });
+    }
+    mocks.apiPost.mockResolvedValue({ capability_id: 'task.inspect', evidence: {} });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('requested a capability after the action phase closed');
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    expect(String(mocks.runClaudeCode.mock.calls[2][0])).toContain(
+      'Capability actions are closed for this turn',
+    );
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(2);
+    expect(mocks.apiPost.mock.calls.some(([path]) => (
+      path === '/api/agent/resident-turn/complete'
+      || path === '/api/agent/resident-turn/mutate'
+    ))).toBe(false);
+  });
+
   it('posts a mutation with server-owned authority revisions and returns its receipt to the provider', async () => {
     mocks.runClaudeCode
       .mockResolvedValueOnce({
