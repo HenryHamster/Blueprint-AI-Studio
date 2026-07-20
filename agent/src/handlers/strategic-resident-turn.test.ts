@@ -15,6 +15,7 @@ import {
   handleStrategicResidentTurn,
   residentProviderSupportsNoTools,
 } from './strategic-resident-turn.js';
+import { residentResultShapeError } from './strategic-resident-result.js';
 
 const providerInput = {
   identity: {
@@ -91,6 +92,7 @@ function mockInspectionThenFinal(
   inspection: Record<string, unknown>,
   serverEvidence: Record<string, unknown> = canonicalInspectionEvidence(),
 ): void {
+  const finalResult = finalResultWithInspection(inspection);
   mocks.runClaudeCode
     .mockResolvedValueOnce({
       exitCode: 0,
@@ -105,7 +107,12 @@ function mockInspectionThenFinal(
     .mockResolvedValueOnce({
       exitCode: 0,
       allOutput: '',
-      lastResultText: JSON.stringify(finalResultWithInspection(inspection)),
+      lastResultText: JSON.stringify(finalResult),
+    })
+    .mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify(finalResult),
     });
   mocks.apiPost.mockImplementation((path: string) => (
     Promise.resolve(path === '/api/agent/resident-turn/capability'
@@ -133,6 +140,11 @@ function mockInspectionBatchThenFinal(
       exitCode: 0,
       allOutput: '',
       lastResultText: JSON.stringify(finalResult),
+    })
+    .mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify(finalResult),
     });
   let inspectionCall = 0;
   mocks.apiPost.mockImplementation((path: string) => (
@@ -148,8 +160,66 @@ describe('strategic Resident turn handler', () => {
     expect(residentProviderSupportsNoTools('anthropic')).toBe(true);
   });
 
+  it('validates every nested final-result family before completion', () => {
+    const valid = {
+      reply: 'Ready.', facts: [], evidence: [], operations: [], receipts: [],
+      unknown_effects: [], strategic_implications: [], proposed_memory: [],
+      follow_up: null, required_attention: [],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    expect(residentResultShapeError(valid, [])).toBeNull();
+    const malformed = [
+      { ...valid, reply: 4 },
+      { ...valid, facts: [{ statement: 'missing id' }] },
+      { ...valid, evidence: [{ evidence_id: 'e', kind: 'task' }] },
+      { ...valid, operations: [{ operation_id: 'o', status: 'proposed' }] },
+      { ...valid, proposed_memory: [{ proposal_id: 'p', layer: 'charter', updates: {} }] },
+      { ...valid, follow_up: { open_loops: [{ summary: 'missing id' }] } },
+      { ...valid, required_attention: [{ text: 'review' }] },
+      { ...valid, reconciliation: { accepted_memory_proposal_ids: [] } },
+      { ...valid, injected: true },
+    ];
+    for (const result of malformed) {
+      expect(residentResultShapeError(result, [])).not.toBeNull();
+    }
+  });
+
+  it('rejects duplicate durable identities and malformed reconciliation identifiers', () => {
+    const base = {
+      reply: 'Ready.', facts: [], evidence: [], operations: [], receipts: [],
+      unknown_effects: [], strategic_implications: [], proposed_memory: [],
+      follow_up: null, required_attention: [],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    const duplicateCases: Array<[string, string, Record<string, unknown>]> = [
+      ['facts', 'fact_id', { fact_id: 'same', statement: 'fact', confidence: null, evidence_ids: [] }],
+      ['evidence', 'evidence_id', { evidence_id: 'same', kind: 'task', source_id: 'task', revision: null, checksum: null, summary: 'evidence' }],
+      ['operations', 'operation_id', { operation_id: 'same', capability: 'task.inspect', status: 'proposed', summary: 'operation' }],
+      ['strategic_implications', 'implication_id', { implication_id: 'same', kind: 'other', summary: 'implication', evidence_ids: [] }],
+      ['proposed_memory', 'proposal_id', { proposal_id: 'same', layer: 'working_strategy', updates: { direction: 'keep' }, rationale: 'memory', evidence_ids: [] }],
+    ];
+    for (const [field, identity, item] of duplicateCases) {
+      expect(residentResultShapeError({ ...base, [field]: [item, { ...item }] }, []))
+        .toContain(`duplicate ${identity}`);
+    }
+    expect(residentResultShapeError({
+      ...base,
+      reconciliation: { ...base.reconciliation, accepted_memory_proposal_ids: ['duplicate', 'duplicate'] },
+    }, [])).toContain('contains duplicate identifiers');
+    expect(residentResultShapeError({
+      ...base,
+      reconciliation: { ...base.reconciliation, accepted_memory_proposal_ids: [` ${'x'.repeat(120)}`] },
+    }, [])).toContain('must be trimmed and at most 120 characters');
+  });
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.resetAllMocks();
+    mocks.runClaudeCode.mockResolvedValue({ exitCode: 1, allOutput: '', lastResultText: '' });
     mocks.apiGet.mockResolvedValue({
       provider_input: providerInput,
       turn_task_version: 9,
@@ -218,6 +288,135 @@ describe('strategic Resident turn handler', () => {
     expect(completeBody.result).not.toHaveProperty('reconciliation');
   });
 
+  it('repairs a live mutation projection without altering server authority', async () => {
+    const completionProjection = {
+      operation: {
+        operation_id: 'reprioritize:repair',
+        capability: 'task.reprioritize',
+        status: 'applying',
+        summary: 'Server-authorized Resident operation.',
+      },
+      receipt: {
+        operation_id: 'reprioritize:repair',
+        receipt_id: '44444444-4444-4444-4444-444444444444',
+        status: 'unknown_effect',
+        summary: 'Durable server operation receipt.',
+      },
+      unknown_effects: [{
+        effect_id: 'reprioritize_task:reprioritize:repair',
+        operation_id: 'reprioritize:repair',
+        receipt_id: '44444444-4444-4444-4444-444444444444',
+        summary: 'The external effect outcome is unknown.',
+        reconciliation_status: 'requires_attention',
+      }],
+      required_attention: [{
+        attention_id: 'unknown-effect:44444444-4444-4444-4444-444444444444',
+        severity: 'critical',
+        summary: 'Reconcile the uncertain external effect before retrying.',
+        evidence_ids: [],
+        receipt_ids: ['44444444-4444-4444-4444-444444444444'],
+      }],
+    };
+    const malformed = {
+      reply: 'Resident conversation is operational.',
+      facts: [], evidence: [],
+      operations: [completionProjection.operation],
+      receipts: [completionProjection.receipt],
+      unknown_effects: [{ text: 'Qualification status is not yet observable.' }],
+      strategic_implications: [{ text: 'Continue verification.' }],
+      proposed_memory: [], follow_up: null,
+      required_attention: [{
+        ...completionProjection.required_attention[0],
+        severity: 'info',
+        summary: 'No urgency.',
+      }],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    const repaired = {
+      ...malformed,
+      unknown_effects: completionProjection.unknown_effects,
+      strategic_implications: [{
+        implication_id: 'continue-verification',
+        kind: 'other',
+        summary: 'Continue verification.',
+        evidence_ids: [],
+      }],
+      required_attention: completionProjection.required_attention,
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          mutation_requests: [{
+            capability_id: 'task.reprioritize',
+            parameters: { task_id: inspectionTaskId, priority: 50 },
+            operation_id: 'reprioritize:repair',
+            expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+            evidence: [],
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(malformed),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired),
+      });
+    mocks.apiPost.mockImplementation((path: string) => Promise.resolve(
+      path === '/api/agent/resident-turn/mutate'
+        ? { completion_projection: completionProjection }
+        : {},
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const repairPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(repairPrompt).toContain('unknown_effects[0]');
+    expect(repairPrompt).toContain('strategic_implications: [{"implication_id"');
+    expect(repairPrompt).toContain('Capability actions are closed');
+    expect(repairPrompt).toContain('untrusted project data');
+    expect(mocks.apiPost.mock.calls.map(([path]) => String(path))).toEqual([
+      '/api/agent/resident-turn/mutate',
+      '/api/agent/resident-turn/complete',
+    ]);
+    const completeBody = mocks.apiPost.mock.calls[1][1] as Record<string, unknown>;
+    expect(completeBody.result).toMatchObject({
+      operations: [completionProjection.operation],
+      receipts: [completionProjection.receipt],
+      unknown_effects: completionProjection.unknown_effects,
+      required_attention: completionProjection.required_attention,
+      strategic_implications: repaired.strategic_implications,
+    });
+  });
+  it('fails closed after one invalid structured-result repair', async () => {
+    const malformed = {
+      reply: 'Not valid.',
+      facts: [], evidence: [], operations: [], receipts: [],
+      unknown_effects: [{ text: 'Still not typed.' }],
+      strategic_implications: [{ text: 'Still not typed.' }],
+      proposed_memory: [], follow_up: null, required_attention: [],
+      reconciliation: {
+        accepted_memory_proposal_ids: [], accepted_implication_ids: [],
+        accepted_open_loop_ids: [], resolved_open_loop_ids: [], evidence_inspections: [],
+      },
+    };
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0, allOutput: '', lastResultText: JSON.stringify(malformed),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('remains invalid after one repair');
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
   it('fails closed on malformed provider output', async () => {
     mocks.runClaudeCode.mockResolvedValue({
       exitCode: 0,
@@ -609,6 +808,36 @@ describe('strategic Resident turn handler', () => {
     expect(completion.result.evidence[0]).not.toHaveProperty('data');
   });
 
+  it('repairs an invalid evidence inspection selector before completion', async () => {
+    const invalid = finalResultWithInspection({ evidence_id: 'missing-inspection' });
+    const repaired = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId } }],
+        }),
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(invalid) })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: JSON.stringify(repaired) });
+    mocks.apiPost.mockImplementation((path: string) => Promise.resolve(
+      path === '/api/agent/resident-turn/capability'
+        ? { capability_id: 'task.inspect', evidence: canonicalInspectionEvidence() }
+        : {},
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    expect(String(mocks.runClaudeCode.mock.calls[2][0])).toContain('does not identify one result evidence item');
+    expect(mocks.apiPost.mock.calls.map((call) => String(call[0]))).toEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+  });
   it('binds the live eight-inspection final-only result by exact non-positional extras', async () => {
     const inspections = Array.from({ length: 8 }, (_, index) => {
       const suffix = String(index + 1).padStart(12, '0');

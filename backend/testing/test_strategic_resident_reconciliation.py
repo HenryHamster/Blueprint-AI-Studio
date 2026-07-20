@@ -382,6 +382,72 @@ async def _completion_body(session, project, task, checkpoint) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_completion_post_rejects_malformed_nested_result_without_writes(
+    client,
+    db_session,
+):
+    project, _resident, task, checkpoint, _message, _successor = (
+        await _resident_turn_rows(db_session)
+    )
+    body = await _completion_body(db_session, project, task, checkpoint)
+    body["result"] = {
+        **body["result"],
+        "unknown_effects": [{"text": "Qualification status is unknown."}],
+        "strategic_implications": [{"text": "Continue verification."}],
+    }
+    token = create_agent_token(
+        str(task.id),
+        task.vm_instance_id,
+        task_type="strategic_resident_turn",
+        project_id=str(project.id),
+        claim_nonce=str(task.context[RESIDENT_CLAIM_NONCE_CONTEXT_KEY]),
+    )
+
+    for _attempt in range(2):
+        response = await client.post(
+            "/api/agent/resident-turn/complete",
+            json=body,
+            headers={"x-agent-token": token},
+        )
+        assert response.status_code == 409, response.text
+        assert response.json()["error"] == {
+            "code": 409,
+            "message": "Resident turn result does not match the structured contract",
+        }
+
+    async with _factory(db_session)() as verify:
+        stored_resident = await verify.get(StrategicResident, project.id)
+        stored_task = await verify.get(Task, task.id)
+        checkpoints = (
+            (
+                await verify.execute(
+                    select(StrategicResidentCheckpoint).where(
+                        StrategicResidentCheckpoint.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        strategic_messages = (
+            (
+                await verify.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.from_type == "strategic",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+    assert stored_resident.active_turn_task_id == task.id
+    assert stored_resident.current_checkpoint_id == checkpoint.id
+    assert stored_task.status == TaskStatus.IN_PROGRESS
+    assert len(checkpoints) == 1
+    assert strategic_messages == []
+
+@pytest.mark.asyncio
 async def test_completion_post_replays_after_committed_response_is_lost(
     client,
     db_session,

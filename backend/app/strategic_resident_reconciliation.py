@@ -9,6 +9,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -378,7 +379,13 @@ async def reconcile_strategic_resident_turn(
     reconciliation_id = str(request.reconciliation_id).strip()
     if not reconciliation_id or len(reconciliation_id) > 200:
         raise ReconciliationResultInvalid("reconciliation_id is invalid")
-    result = normalize_strategic_resident_turn_result(request.turn_result)
+    # Malformed scalar list fields can raise TypeError before Pydantic runs.
+    try:
+        result = normalize_strategic_resident_turn_result(request.turn_result)
+    except (ValidationError, TypeError) as exc:
+        raise ReconciliationResultInvalid(
+            "Resident turn result does not match the structured contract"
+        ) from exc
     result_projection = result.model_dump(mode="json")
     result_hash = hashlib.sha256(canonical_json_bytes(result_projection)).hexdigest()
     request_hash = reconciliation_request_hash(request, result_hash=result_hash)
