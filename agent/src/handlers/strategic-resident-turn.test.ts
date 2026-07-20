@@ -114,6 +114,33 @@ function mockInspectionThenFinal(
   ));
 }
 
+function mockInspectionBatchThenFinal(
+  serverEvidence: Record<string, unknown>[],
+  finalResult: Record<string, unknown>,
+): void {
+  mocks.runClaudeCode
+    .mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        capability_requests: serverEvidence.map((evidence) => ({
+          capability_id: 'task.inspect',
+          parameters: { task_id: evidence.source_id },
+        })),
+      }),
+    })
+    .mockResolvedValueOnce({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify(finalResult),
+    });
+  let inspectionCall = 0;
+  mocks.apiPost.mockImplementation((path: string) => (
+    Promise.resolve(path === '/api/agent/resident-turn/capability'
+      ? { capability_id: 'task.inspect', evidence: serverEvidence[inspectionCall++] }
+      : {})
+  ));
+}
 describe('strategic Resident turn handler', () => {
   it('fails closed for provider CLIs that cannot enforce the tool denylist', () => {
     expect(residentProviderSupportsNoTools('openai')).toBe(false);
@@ -582,6 +609,145 @@ describe('strategic Resident turn handler', () => {
     expect(completion.result.evidence[0]).not.toHaveProperty('data');
   });
 
+  it('binds the live eight-inspection final-only result by exact non-positional extras', async () => {
+    const inspections = Array.from({ length: 8 }, (_, index) => {
+      const suffix = String(index + 1).padStart(12, '0');
+      const sourceId = `44444444-4444-4444-4444-${suffix}`;
+      return {
+        kind: 'task',
+        project_id: providerInput.identity.project_id,
+        source_id: sourceId,
+        revision: `task:${sourceId}:v${index + 1}`,
+        checksum: String(index + 1).repeat(64),
+        inspected_at: `2026-07-20T06:3${index}:50Z`,
+        data: { position: index, nested: { attempts: index + 1, labels: [`resident-${index}`] } },
+      };
+    });
+    const selected = inspections[5];
+    const finalResult = finalResultWithInspection({ evidence_id: 'selected-evidence' });
+    finalResult.evidence = [
+      ...inspections.slice(0, 3).map((inspection, index) => ({
+        evidence_id: `unselected-${index}`,
+        kind: inspection.kind,
+        source_id: inspection.source_id,
+        revision: inspection.revision,
+        checksum: inspection.checksum,
+        summary: `Unselected inspection ${index}.`,
+      })),
+      {
+        evidence_id: 'selected-evidence',
+        summary: 'Observed the selected authoritative Resident turn.',
+        project_id: selected.project_id,
+        inspected_at: selected.inspected_at,
+        data: {
+          nested: {
+            labels: selected.data.nested.labels,
+            attempts: selected.data.nested.attempts,
+          },
+          position: selected.data.position,
+        },
+      },
+    ];
+    mockInspectionBatchThenFinal(inspections, finalResult);
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode.mock.calls[1][0]).toContain(
+      'Capability actions are closed for this turn.',
+    );
+    expect(mocks.apiPost).toHaveBeenCalledTimes(9);
+    expect(mocks.apiPost.mock.calls[8][0]).toBe('/api/agent/resident-turn/complete');
+    expect(mocks.apiPost.mock.calls[8][1]).toMatchObject({
+      result: {
+        evidence: [
+          {}, {}, {},
+          {
+            evidence_id: 'selected-evidence',
+            kind: selected.kind,
+            source_id: selected.source_id,
+            revision: selected.revision,
+            checksum: selected.checksum,
+            summary: 'Observed the selected authoritative Resident turn.',
+          },
+        ],
+      },
+      evidence_inspections: [{
+        evidence_id: 'selected-evidence',
+        kind: selected.kind,
+        source_id: selected.source_id,
+        revision: selected.revision,
+        checksum: selected.checksum,
+        inspected_at: selected.inspected_at,
+        decisive: true,
+      }],
+    });
+    const completion = mocks.apiPost.mock.calls[8][1] as {
+      result: { evidence: Record<string, unknown>[] };
+    };
+    expect(completion.result.evidence[3]).not.toHaveProperty('project_id');
+    expect(completion.result.evidence[3]).not.toHaveProperty('inspected_at');
+    expect(completion.result.evidence[3]).not.toHaveProperty('data');
+  });
+  it('keeps identical copied extras across different inspections ambiguous', async () => {
+    const sharedData = { status: 'IN_PROGRESS', nested: { attempts: 1 } };
+    const secondTaskId = '55555555-5555-5555-5555-555555555555';
+    const inspections = [
+      canonicalInspectionEvidence({ data: sharedData }),
+      canonicalInspectionEvidence({
+        source_id: secondTaskId,
+        revision: `task:${secondTaskId}:v2`,
+        checksum: 'd'.repeat(64),
+        data: sharedData,
+      }),
+    ];
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      evidence_id: 'engine-owner-observation',
+      summary: 'Observed one Resident turn.',
+      project_id: providerInput.identity.project_id,
+      inspected_at: inspectionTimestamp,
+      data: sharedData,
+    }];
+    mockInspectionBatchThenFinal(inspections, finalResult);
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('is not backed by one server inspection');
+
+    expect(mocks.apiPost).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not combine copied extras from different inspection receipts', async () => {
+    const secondTaskId = '55555555-5555-5555-5555-555555555555';
+    const secondData = { status: 'COMPLETED', nested: { attempts: 2 } };
+    const inspections = [
+      canonicalInspectionEvidence({ data: { status: 'IN_PROGRESS', nested: { attempts: 1 } } }),
+      canonicalInspectionEvidence({
+        source_id: secondTaskId,
+        revision: `task:${secondTaskId}:v2`,
+        checksum: 'd'.repeat(64),
+        inspected_at: '2026-07-20T06:37:50Z',
+        data: secondData,
+      }),
+    ];
+    const finalResult = finalResultWithInspection({ evidence_id: 'engine-owner-observation' });
+    finalResult.evidence = [{
+      evidence_id: 'engine-owner-observation',
+      summary: 'Observed one Resident turn.',
+      project_id: providerInput.identity.project_id,
+      inspected_at: inspectionTimestamp,
+      data: secondData,
+    }];
+    mockInspectionBatchThenFinal(inspections, finalResult);
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('contains an unverified server field');
+
+    expect(mocks.apiPost).toHaveBeenCalledTimes(2);
+  });
   it.each([
     ['project_id', '99999999-9999-9999-9999-999999999999', {}],
     ['inspected_at', '2026-07-20T06:37:50Z', {}],
@@ -611,7 +777,7 @@ describe('strategic Resident turn handler', () => {
 
     await expect(handleStrategicResidentTurn(
       'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
-    )).rejects.toThrow(`unknown field or unverified server field: ${field}`);
+    )).rejects.toThrow(`unverified server field: ${field}`);
 
     expect(mocks.apiPost).toHaveBeenCalledOnce();
     expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
