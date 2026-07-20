@@ -1224,29 +1224,39 @@ describe('strategic Resident turn handler', () => {
     ))).toBe(false);
   });
 
-  it('posts a mutation with server-owned authority revisions and returns its receipt to the provider', async () => {
+  it('canonicalizes decorated current-turn mutation evidence before posting', async () => {
+    const inspectionData = { status: 'IN_PROGRESS', nested: { attempts: 1, labels: ['resident'] } };
     mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect',
+            parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
       .mockResolvedValueOnce({
         exitCode: 0,
         allOutput: '',
         lastResultText: JSON.stringify({
           mutation_requests: [{
             id: 'task.reprioritize',
-            parameters: {
-              task_id: '33333333-3333-3333-3333-333333333333',
-              priority: 50,
-            },
+            parameters: { task_id: inspectionTaskId, priority: 50 },
             operation_id: 'reprioritize:33333333',
-            expected_revisions: {
-              target_task_updated_at: '2026-07-18T00:00:00Z',
-            },
+            expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
             evidence: [{
+              evidence_id: 'evidence-turn-task',
               kind: 'task',
               project_id: providerInput.identity.project_id,
-              source_id: '33333333-3333-3333-3333-333333333333',
-              revision: 'task:v1',
-              checksum: 'c'.repeat(64),
-              inspected_at: '2026-07-18T00:00:00Z',
+              source_id: inspectionTaskId,
+              revision: inspectionRevision,
+              checksum: inspectionChecksum,
+              inspected_at: inspectionTimestamp,
+              summary: 'Observed the authoritative task.',
+              decisive: true,
+              data: { nested: { labels: ['resident'], attempts: 1 }, status: 'IN_PROGRESS' },
             }],
           }],
         }),
@@ -1265,6 +1275,12 @@ describe('strategic Resident turn handler', () => {
         }),
       });
     mocks.apiPost.mockImplementation((path: string) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return Promise.resolve({
+          capability_id: 'task.inspect',
+          evidence: canonicalInspectionEvidence({ data: inspectionData }),
+        });
+      }
       if (path === '/api/agent/resident-turn/mutate') {
         return Promise.resolve({
           capability_id: 'task.reprioritize',
@@ -1280,9 +1296,10 @@ describe('strategic Resident turn handler', () => {
       'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
     );
 
-    const [path, bodyRaw] = mocks.apiPost.mock.calls[0] as unknown[];
+    const [path, bodyRaw] = mocks.apiPost.mock.calls[1] as unknown[];
     expect(path).toBe('/api/agent/resident-turn/mutate');
-    expect(bodyRaw).toMatchObject({
+    const body = bodyRaw as Record<string, unknown>;
+    expect(body).toMatchObject({
       capability_id: 'task.reprioritize',
       project_id: providerInput.identity.project_id,
       turn_task_id: 'task-id',
@@ -1298,12 +1315,110 @@ describe('strategic Resident turn handler', () => {
         target_task_updated_at: '2026-07-18T00:00:00Z',
       },
     });
-    expect(String(mocks.runClaudeCode.mock.calls[1][0])).toContain(
-      'reprioritize:33333333',
-    );
-    expect(mocks.apiPost.mock.calls[1][0]).toBe('/api/agent/resident-turn/complete');
+    expect(body.evidence).toStrictEqual([{
+      kind: 'task',
+      project_id: providerInput.identity.project_id,
+      source_id: inspectionTaskId,
+      revision: inspectionRevision,
+      checksum: inspectionChecksum,
+      inspected_at: inspectionTimestamp,
+    }]);
+    expect(String(mocks.runClaudeCode.mock.calls[2][0])).toContain('reprioritize:33333333');
+    expect(mocks.apiPost.mock.calls[2][0]).toBe('/api/agent/resident-turn/complete');
+  });
+  it('rejects mutation evidence that was not inspected in the current turn', async () => {
+    mocks.runClaudeCode.mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: JSON.stringify({
+        mutation_requests: [{
+          capability_id: 'task.reprioritize',
+          parameters: { task_id: inspectionTaskId, priority: 50 },
+          operation_id: 'reprioritize:uninspected',
+          expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+          evidence: [canonicalInspectionEvidence({ evidence_id: 'local-evidence' })],
+        }],
+      }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('mutation evidence[0] is not backed by one server inspection');
+
+    expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 
+  it('rejects altered server data on mutation evidence', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          mutation_requests: [{
+            capability_id: 'task.reprioritize',
+            parameters: { task_id: inspectionTaskId, priority: 50 },
+            operation_id: 'reprioritize:altered-data',
+            expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+            evidence: [canonicalInspectionEvidence({ data: { status: 'COMPLETED' } })],
+          }],
+        }),
+      });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect',
+      evidence: canonicalInspectionEvidence({ data: { status: 'IN_PROGRESS' } }),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('mutation evidence[0] is not backed by one server inspection');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
+  it('rejects unknown mutation evidence fields instead of stripping them', async () => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          mutation_requests: [{
+            capability_id: 'task.reprioritize',
+            parameters: { task_id: inspectionTaskId, priority: 50 },
+            operation_id: 'reprioritize:unknown-field',
+            expected_revisions: { target_task_updated_at: '2026-07-18T00:00:00Z' },
+            evidence: [canonicalInspectionEvidence({ injected_authority: 99 })],
+          }],
+        }),
+      });
+    mocks.apiPost.mockResolvedValue({
+      capability_id: 'task.inspect', evidence: canonicalInspectionEvidence(),
+    });
+
+    await expect(handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    )).rejects.toThrow('mutation evidence[0] contains an unknown field: injected_authority');
+
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/capability');
+  });
   it('carries a durable unknown-effect projection into an admissible completion', async () => {
     const completionProjection = {
       operation: {
