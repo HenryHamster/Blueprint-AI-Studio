@@ -62,6 +62,38 @@ function requireResult(texts: string[]): Record<string, unknown> {
   throw new Error('Resident provider did not return the exact structured result');
 }
 
+function normalizedCapabilityRequestFields(
+  item: Record<string, unknown>,
+  kind: 'capability' | 'mutation',
+  index: number,
+): ResidentCapabilityRequest {
+  const canonicalId = item.capability_id;
+  const catalogId = item.id;
+  if (canonicalId !== undefined && typeof canonicalId !== 'string') {
+    throw new Error(`Resident ${kind} request[${index}].capability_id must be a string`);
+  }
+  if (catalogId !== undefined && typeof catalogId !== 'string') {
+    throw new Error(`Resident ${kind} request[${index}].id must be a string`);
+  }
+  if (canonicalId !== undefined && catalogId !== undefined && canonicalId !== catalogId) {
+    throw new Error(`Resident ${kind} request[${index}] has conflicting capability identifiers`);
+  }
+  const capabilityId = canonicalId ?? catalogId;
+  if (typeof capabilityId !== 'string' || capabilityId.length === 0) {
+    throw new Error(`Resident ${kind} request[${index}] is missing capability_id`);
+  }
+  const rawParameters = item.parameters;
+  if (
+    rawParameters !== undefined
+    && (!rawParameters || typeof rawParameters !== 'object' || Array.isArray(rawParameters))
+  ) {
+    throw new Error(`Resident ${kind} request[${index}].parameters must be a JSON object`);
+  }
+  return {
+    capability_id: capabilityId,
+    parameters: (rawParameters as Record<string, unknown> | undefined) ?? {},
+  };
+}
 function inspectionRequests(texts: string[]): ResidentCapabilityRequest[] | null {
   for (const text of texts) {
     const parsed = extractJsonObjectDetailed(text, 'capability_requests');
@@ -73,23 +105,15 @@ function inspectionRequests(texts: string[]): ResidentCapabilityRequest[] | null
     if (parsed.value.capability_requests.length > MAX_CAPABILITY_REQUESTS) {
       throw new Error('Resident requested too many capabilities');
     }
-    return parsed.value.capability_requests.map((raw) => {
+    return parsed.value.capability_requests.map((raw, index) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-        throw new Error('Resident capability request must be an object');
+        throw new Error(`Resident capability request[${index}] must be an object`);
       }
-      const item = raw as Record<string, unknown>;
-      if (
-        typeof item.capability_id !== 'string'
-        || !item.parameters
-        || typeof item.parameters !== 'object'
-        || Array.isArray(item.parameters)
-      ) {
-        throw new Error('Resident capability request is malformed');
-      }
-      return {
-        capability_id: item.capability_id,
-        parameters: item.parameters as Record<string, unknown>,
-      };
+      return normalizedCapabilityRequestFields(
+        raw as Record<string, unknown>,
+        'capability',
+        index,
+      );
     });
   }
   return null;
@@ -106,18 +130,15 @@ function mutationRequests(texts: string[]): ResidentMutationRequest[] | null {
     if (parsed.value.mutation_requests.length > MAX_CAPABILITY_REQUESTS) {
       throw new Error('Resident requested too many mutations');
     }
-    return parsed.value.mutation_requests.map((raw) => {
+    return parsed.value.mutation_requests.map((raw, index) => {
       if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-        throw new Error('Resident mutation request must be an object');
+        throw new Error(`Resident mutation request[${index}] must be an object`);
       }
       const item = raw as Record<string, unknown>;
+      const normalized = normalizedCapabilityRequestFields(item, 'mutation', index);
       const revisions = item.expected_revisions;
       if (
-        typeof item.capability_id !== 'string'
-        || !item.parameters
-        || typeof item.parameters !== 'object'
-        || Array.isArray(item.parameters)
-        || typeof item.operation_id !== 'string'
+        typeof item.operation_id !== 'string'
         || item.operation_id.length === 0
         || item.operation_id.length > 128
         || !revisions
@@ -137,8 +158,8 @@ function mutationRequests(texts: string[]): ResidentMutationRequest[] | null {
         }
       }
       return {
-        capability_id: item.capability_id,
-        parameters: item.parameters as Record<string, unknown>,
+        capability_id: normalized.capability_id,
+        parameters: normalized.parameters,
         operation_id: item.operation_id,
         expected_revisions: revisions as Record<string, string | number>,
         evidence: (item.evidence as unknown[] | undefined) ?? [],
@@ -217,6 +238,7 @@ function residentPrompt(
     ? [
       `You have ${actionRoundsRemaining} capability action round(s) and ${requestSlotsRemaining} request slot(s) remaining. Batch the decisive requests you need; after those rounds you must synthesize the final structured result.`,
       'Request inspections and mutations in separate rounds.',
+      'The catalog uses id and lists required parameter names. Copy catalog id into request capability_id. Request parameters must be a JSON object keyed by those names; use {} or omit parameters only when the catalog list is empty. Never copy a catalog entry as the request.',
       'You may invoke only catalog entries whose availability is "invoke" by returning:',
       '{"capability_requests":[{"capability_id":"task.inspect","parameters":{"task_id":"UUID"}}]}',
       'After inspecting decisive evidence, you may invoke mutation catalog entries whose availability is "invoke" by returning:',
