@@ -29,7 +29,7 @@ export function ConversationUtilityBar({
 }) {
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
-      <div className="mx-auto flex w-full max-w-[940px] min-w-0 items-center gap-2">
+      <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-2">
         {expanded ? (
           <input
             aria-label="Search Resident conversation"
@@ -72,10 +72,9 @@ export function ConversationUtilityBar({
                 {alertCount} alert{alertCount === 1 ? '' : 's'}
               </button>
             )}
-            <span className="min-w-0 flex-1" aria-hidden="true" />
           </>
         )}
-        {residentHealth}
+        <div className="ml-auto flex min-w-0 items-center gap-2">{residentHealth}</div>
         {expanded && (
           <button
             type="button"
