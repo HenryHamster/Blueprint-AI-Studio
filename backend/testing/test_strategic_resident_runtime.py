@@ -1055,6 +1055,386 @@ async def test_signal_project_change_is_zero_call_when_cursor_already_handled(db
 
 
 @pytest.mark.asyncio
+async def test_clean_resume_bootstraps_background_once(db_session):
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    resident.background_policy = "paused"
+    resident.scheduling_state = {}
+    db_session.add(resident)
+    await db_session.flush()
+    now = _utcnow()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=now
+    )
+    assert wake is not None
+    assert wake.state == "queued"
+    assert wake.task_id is not None
+    assert resident.scheduling_state["background_activation_sequence"] == 1
+    task = await db_session.get(Task, wake.task_id)
+    assert task is not None
+    assert task.first_payload["project_change_cursor"] == {
+        "resident_activation_sequence": 1
+    }
+
+    # An idempotent active sync must not turn the bootstrap into a polling loop.
+    assert (
+        await sync_resident_background_policy(
+            db_session, project_id=project.id, paused=False, now=now
+        )
+        is None
+    )
+    tasks = (await db_session.execute(_select(Task))).scalars().all()
+    assert [item.id for item in tasks] == [wake.task_id]
+
+
+@pytest.mark.asyncio
+async def test_pre_marker_active_resident_self_bootstraps_on_sync(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    resident.background_policy = "active"
+    resident.scheduling_state = {}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False
+    )
+    assert wake is not None
+    assert wake.state == "queued"
+    assert resident.scheduling_state["background_activation_sequence"] == 1
+
+
+@pytest.mark.asyncio
+async def test_activation_repair_sweep_queues_once_and_skips_ineligible_rows(
+    db_session,
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.strategic_resident_activation_sweep import (
+        sweep_missing_background_activation_wakeups,
+    )
+
+    active_project, active = await _authoritative_project(db_session)
+    paused_project, paused = await _authoritative_project(db_session)
+    legacy_project, legacy = await _authoritative_project(db_session)
+    active.scheduling_state = {}
+    active.next_wakeup_at = None
+    paused.background_policy = "paused"
+    paused.scheduling_state = {}
+    legacy.engine_owner = "legacy"
+    legacy.authority_generation += 1
+    legacy.scheduling_state = {}
+    db_session.add_all([active, paused, legacy])
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    assert await sweep_missing_background_activation_wakeups(
+        session_factory=factory,
+        now=_utcnow(),
+        empty_scan_cooldown=timedelta(0),
+    ) == 1
+    assert await sweep_missing_background_activation_wakeups(
+        session_factory=factory,
+        now=_utcnow(),
+        empty_scan_cooldown=timedelta(0),
+    ) == 0
+
+    async with factory() as verify:
+        repaired = await verify.get(type(active), active_project.id)
+        skipped_paused = await verify.get(type(paused), paused_project.id)
+        skipped_legacy = await verify.get(type(legacy), legacy_project.id)
+        assert repaired is not None
+        assert repaired.scheduling_state["background_activation_sequence"] == 1
+        assert repaired.active_turn_task_id is not None
+        task = await verify.get(Task, repaired.active_turn_task_id)
+        assert task is not None
+        assert task.first_payload["project_change_cursor"] == {
+            "resident_activation_sequence": 1
+        }
+        assert skipped_paused is not None
+        assert (
+            "background_activation_sequence" not in skipped_paused.scheduling_state
+        )
+        assert skipped_legacy is not None
+        assert (
+            "background_activation_sequence" not in skipped_legacy.scheduling_state
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_marker", [False, "1", "invalid", -7, 1.5])
+async def test_activation_repair_sweep_repairs_malformed_markers(
+    db_session,
+    malformed_marker,
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app.strategic_resident_activation_sweep import (
+        sweep_missing_background_activation_wakeups,
+    )
+
+    project, resident = await _authoritative_project(db_session)
+    resident.scheduling_state = {
+        "background_activation_sequence": malformed_marker,
+    }
+    db_session.add(resident)
+    await db_session.commit()
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+
+    assert await sweep_missing_background_activation_wakeups(
+        session_factory=factory,
+        now=_utcnow(),
+        empty_scan_cooldown=timedelta(0),
+    ) == 1
+    async with factory() as verify:
+        repaired = await verify.get(type(resident), project.id)
+        assert repaired is not None
+        assert repaired.scheduling_state["background_activation_sequence"] == 1
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_add_activation_successor_when_active_turn_represents_pending(
+    db_session,
+):
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    cursor = {"qualification_verdict_id": "already-represented"}
+    active = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="background",
+        project_change_cursor=cursor,
+    )
+    assert active.task_id is not None
+    resident.background_policy = "paused"
+    resident.scheduling_state = {"pending_project_change_cursor": cursor}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session,
+        project_id=project.id,
+        paused=False,
+        now=_utcnow(),
+    )
+
+    assert wake is None
+    assert resident.active_turn_task_id == active.task_id
+    assert resident.background_successor_task_id is None
+    assert "pending_project_change_cursor" not in resident.scheduling_state
+    assert resident.scheduling_state["background_activation_sequence"] == 1
+    tasks = (
+        await db_session.execute(_select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert [task.id for task in tasks] == [active.task_id]
+
+
+@pytest.mark.asyncio
+async def test_resume_with_active_background_and_empty_scheduling_queues_nothing(
+    db_session,
+):
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    active = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="background",
+        project_change_cursor={"ordinary_task_terminal": "existing-work"},
+    )
+    resident.background_policy = "paused"
+    resident.scheduling_state = {}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=_utcnow()
+    )
+
+    assert wake is None
+    assert resident.active_turn_task_id == active.task_id
+    assert resident.background_successor_task_id is None
+    assert resident.scheduling_state["background_activation_sequence"] == 1
+    tasks = (
+        await db_session.execute(_select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert [task.id for task in tasks] == [active.task_id]
+
+
+@pytest.mark.asyncio
+async def test_resume_replaces_stale_handled_pending_with_activation(db_session):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    cursor = {"qualification_verdict_id": "already-handled"}
+    resident.background_policy = "paused"
+    resident.handled_project_change_cursor = cursor
+    resident.scheduling_state = {"pending_project_change_cursor": cursor}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=_utcnow()
+    )
+
+    assert wake is not None and wake.task_id is not None
+    task = await db_session.get(Task, wake.task_id)
+    assert task is not None
+    assert (
+        task.first_payload["project_change_cursor"]["resident_activation_sequence"]
+        == 1
+    )
+    assert "pending_project_change_cursor" not in resident.scheduling_state
+
+
+@pytest.mark.asyncio
+async def test_resume_with_interactive_active_adds_background_activation_successor(
+    db_session,
+):
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    interactive = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="interactive",
+        message_sequence=1,
+    )
+    resident.background_policy = "paused"
+    resident.scheduling_state = {}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=_utcnow()
+    )
+
+    assert wake is not None and wake.task_id is not None
+    assert resident.active_turn_task_id == interactive.task_id
+    assert resident.active_turn_lane == "interactive"
+    assert resident.background_successor_task_id == wake.task_id
+    successor = await db_session.get(Task, wake.task_id)
+    assert successor is not None
+    assert successor.first_payload["project_change_cursor"] == {
+        "resident_activation_sequence": 1
+    }
+
+
+@pytest.mark.asyncio
+async def test_resume_with_background_successor_queues_no_extra_activation(db_session):
+    from sqlmodel import select as _select
+
+    from app.strategic_resident_wakeups import sync_resident_background_policy
+
+    project, resident = await _authoritative_project(db_session)
+    interactive = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="interactive",
+        message_sequence=1,
+    )
+    background = await coalesce_authoritative_resident_turn(
+        db_session,
+        project_id=project.id,
+        lane="background",
+        project_change_cursor={"ordinary_task_terminal": "queued-background"},
+    )
+    assert background.task_id is not None
+    resident.background_policy = "paused"
+    resident.scheduling_state = {}
+    db_session.add(resident)
+    await db_session.flush()
+
+    wake = await sync_resident_background_policy(
+        db_session, project_id=project.id, paused=False, now=_utcnow()
+    )
+
+    assert wake is None
+    assert resident.active_turn_task_id == interactive.task_id
+    assert resident.background_successor_task_id == background.task_id
+    tasks = (
+        await db_session.execute(_select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    assert {task.id for task in tasks} == {interactive.task_id, background.task_id}
+
+
+@pytest.mark.asyncio
+async def test_activation_repair_empty_scan_cooldown_and_hot_catchup(
+    db_session,
+    monkeypatch,
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    from app import strategic_resident_activation_sweep as activation_sweep
+
+    monkeypatch.setattr(activation_sweep, "_empty_scan_not_before", None)
+    factory = async_sessionmaker(
+        bind=db_session.bind, expire_on_commit=False, autoflush=False
+    )
+    now = _utcnow()
+
+    _first_project, first = await _authoritative_project(db_session)
+    first.scheduling_state = {}
+    db_session.add(first)
+    await db_session.commit()
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory, now=now, batch_size=1
+    ) == 1
+
+    await db_session.rollback()
+    _second_project, second = await _authoritative_project(db_session)
+    second.scheduling_state = {}
+    db_session.add(second)
+    await db_session.commit()
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory, now=now, batch_size=1
+    ) == 1
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory, now=now, batch_size=1
+    ) == 0
+
+    await db_session.rollback()
+    third_project, third = await _authoritative_project(db_session)
+    third.scheduling_state = {}
+    db_session.add(third)
+    await db_session.commit()
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory, now=now, batch_size=1
+    ) == 0
+    async with factory() as verify:
+        skipped = await verify.get(type(third), third_project.id)
+        assert skipped is not None
+        assert "background_activation_sequence" not in skipped.scheduling_state
+
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory,
+        now=now,
+        batch_size=1,
+        empty_scan_cooldown=timedelta(0),
+    ) == 1
+    assert await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=factory,
+        now=now,
+        batch_size=1,
+        empty_scan_cooldown=timedelta(0),
+    ) == 0
+
+
+@pytest.mark.asyncio
 async def test_paused_project_change_is_preserved_and_queued_on_resume(db_session):
     from app.strategic_resident_wakeups import sync_resident_background_policy
 

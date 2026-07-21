@@ -1239,6 +1239,45 @@ async def test_cutover_with_no_pending_messages_seeds_no_turn(ownership_factory)
 
 
 @pytest.mark.asyncio
+async def test_active_cutover_arms_exactly_one_background_bootstrap(
+    ownership_factory,
+):
+    from app.strategic_resident_wakeups import (
+        sweep_due_authoritative_resident_wakeups,
+    )
+
+    project_id, _ = await _seed_project(ownership_factory)
+    now = datetime(2026, 7, 20, 21, 0, tzinfo=timezone.utc)
+    await cutover_to_strategic_resident(
+        ownership_factory, project_id, now=now
+    )
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        assert resident is not None
+        assert resident.background_policy == "active"
+        assert resident.next_wakeup_at == now.replace(tzinfo=None)
+        assert resident.scheduling_state["background_activation_sequence"] == 1
+        assert resident.active_turn_task_id is None
+
+    assert await sweep_due_authoritative_resident_wakeups(
+        session_factory=ownership_factory,
+        now=now.replace(tzinfo=None),
+    ) == 1
+    assert await sweep_due_authoritative_resident_wakeups(
+        session_factory=ownership_factory,
+        now=now.replace(tzinfo=None),
+    ) == 0
+
+    async with ownership_factory() as session:
+        resident = await session.get(StrategicResident, project_id)
+        assert resident is not None
+        assert resident.active_turn_lane == "background"
+        task = await session.get(Task, resident.active_turn_task_id)
+        assert task is not None
+        assert task.first_payload["trigger_kind"] == "deadline"
+
+@pytest.mark.asyncio
 async def test_cutover_does_not_absorb_activity_or_system_messages(
     ownership_factory,
 ):
