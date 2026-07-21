@@ -18,6 +18,7 @@ from app.strategic_resident_capabilities import (
 from app.routers import agent_resident_capabilities as capability_router
 from app.routers.agent_resident_capabilities import ResidentCapabilityRequest
 from app.strategic_resident_capability_invocation import (
+    CorrectableCapabilityParameterError,
     ResidentCapabilityInvocation,
     validated_capability_parameters,
 )
@@ -121,7 +122,17 @@ def test_compact_catalog_omits_verbose_receipt_and_evidence_metadata():
     catalog = compact_capability_catalog()
     assert len(catalog) == len(RESIDENT_CAPABILITIES)
     assert set(catalog[0]) == {
-        "id", "mode", "risk", "parameters", "approval", "availability"
+        "id", "mode", "risk", "parameter_specs", "approval", "availability"
+    }
+    task = next(item for item in catalog if item["id"] == "task.inspect")
+    pull_request = next(item for item in catalog if item["id"] == "pr.inspect")
+    rollback = next(item for item in catalog if item["id"] == "deployment.rollback")
+    assert task["parameter_specs"] == {"task_id": "uuid"}
+    assert pull_request["parameter_specs"] == {
+        "pr_number": {"type": "integer", "min": 1, "max": 2**31 - 1}
+    }
+    assert rollback["parameter_specs"] == {
+        "revision": {"type": "ref", "min_len": 1, "max_len": 512}
     }
     assert capability_for("task.inspect").service == "resident_task_inspection"
     assert next(item for item in catalog if item["id"] == "task.inspect")["availability"] == "invoke"
@@ -256,6 +267,51 @@ def test_capability_parameter_contracts_reject_type_and_casefold_bypasses():
             capability_for("branch.inspect"),
             {"ref": "main branch"},
         )
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "parameters", "parameter", "issue", "expected", "message"),
+    [
+        ("task.inspect", {"task_id": []}, "task_id", "type", {"kind": "uuid"}, "task_id must be a UUID string"),
+        ("task.inspect", {"task_id": "bad"}, "task_id", "format", {"kind": "uuid"}, "task_id must be a UUID string"),
+        ("pr.inspect", {"pr_number": "7"}, "pr_number", "type", {"kind": "integer", "minimum": 1, "maximum": 2**31 - 1}, "pr_number must be an integer"),
+        ("pr.inspect", {"pr_number": 0}, "pr_number", "minimum", {"kind": "integer", "minimum": 1, "maximum": 2**31 - 1}, "pr_number is below its minimum"),
+        ("pr.inspect", {"pr_number": 2**31}, "pr_number", "maximum", {"kind": "integer", "minimum": 1, "maximum": 2**31 - 1}, "pr_number exceeds its maximum"),
+    ],
+)
+def test_scalar_parameter_errors_expose_narrow_correction_detail(
+    capability_id, parameters, parameter, issue, expected, message
+):
+    with pytest.raises(CorrectableCapabilityParameterError) as invalid:
+        validated_capability_parameters(capability_for(capability_id), parameters)
+    assert invalid.value.detail() == {
+        "code": "resident_capability_parameter_validation",
+        "parameter": parameter,
+        "issue": issue,
+        "expected": expected,
+        "message": message,
+    }
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "parameters", "message"),
+    [
+        ("task.inspect", {}, "missing required"),
+        (
+            "task.inspect",
+            {"task_id": "00000000-0000-0000-0000-000000000001", "extra": 1},
+            "unsupported capability parameters",
+        ),
+        ("task.inspect", {"task_id": {"token": "secret"}}, "credential scope"),
+        ("branch.inspect", {"ref": 123}, "must be a string"),
+    ],
+)
+def test_non_scalar_parameter_errors_are_not_marked_correctable(
+    capability_id, parameters, message
+):
+    with pytest.raises(ValueError, match=message) as invalid:
+        validated_capability_parameters(capability_for(capability_id), parameters)
+    assert not isinstance(invalid.value, CorrectableCapabilityParameterError)
 
 
 def test_capability_rate_limit_identity_is_task_token_scoped_and_hashed():
@@ -626,8 +682,35 @@ async def test_capability_route_enforces_durable_unique_budget_and_retry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability_id", "parameters", "expected_detail"),
+    [
+        (
+            "task.inspect",
+            {"task_id": "not-a-uuid"},
+            {
+                "code": "resident_capability_parameter_validation",
+                "parameter": "task_id",
+                "issue": "format",
+                "expected": {"kind": "uuid"},
+                "message": "task_id must be a UUID string",
+            },
+        ),
+        (
+            "pr.inspect",
+            {"pr_number": "7"},
+            {
+                "code": "resident_capability_parameter_validation",
+                "parameter": "pr_number",
+                "issue": "type",
+                "expected": {"kind": "integer", "minimum": 1, "maximum": 2**31 - 1},
+                "message": "pr_number must be an integer",
+            },
+        ),
+    ],
+)
 async def test_capability_route_rejects_invalid_parameters_before_authority_locks(
-    db_session, monkeypatch
+    db_session, monkeypatch, capability_id, parameters, expected_detail
 ):
     load = AsyncMock()
     monkeypatch.setattr(
@@ -639,8 +722,8 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
         await capability_router.invoke_resident_capability(
             None,
             ResidentCapabilityRequest(
-                capability_id="task.inspect",
-                parameters={"task_id": "not-a-uuid"},
+                capability_id=capability_id,
+                parameters=parameters,
             ),
             db_session,
             {
@@ -652,6 +735,7 @@ async def test_capability_route_rejects_invalid_parameters_before_authority_lock
             },
         )
     assert invalid.value.status_code == 400
+    assert invalid.value.detail == expected_detail
     load.assert_not_awaited()
 
 

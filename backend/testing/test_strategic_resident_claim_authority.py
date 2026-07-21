@@ -249,6 +249,7 @@ async def test_bounded_failure_clears_pointer_and_replays_idempotently(
     await db_session.refresh(resident)
     assert task.status == TaskStatus.FAILED
     assert task.context["_resident_failure"]["failure_id"] == "failure-1"
+    assert "agent_error_report" not in task.context
     assert task.context["_slot_released"] is True
     assert account["active_tasks"] == 0
     assert account["project_state"][str(task.project_id)]["active_tasks"] == 0
@@ -270,6 +271,79 @@ async def test_bounded_failure_clears_pointer_and_replays_idempotently(
     assert replay.json()["idempotent_replay"] is True
     assert account["active_tasks"] == 0
 
+
+@pytest.mark.asyncio
+async def test_failure_sanitizes_report_and_cleans_retry_context(
+    client,
+    db_session,
+):
+    _project, resident, task, bootstrap = await _seed_claimable_turn(db_session)
+
+    claim = await client.post(
+        "/api/agent/claim", headers={"x-agent-token": bootstrap}
+    )
+    report = {
+        "schema": 1,
+        "task_id": str(task.id),
+        "provider": "openai",
+        "auth_mode": "oauth",
+        "exit_code": 1,
+        "exit_signal": None,
+        "duration_ms": 123,
+        "model_output_seen": False,
+        "result_event_seen": False,
+        "provider_errors": [
+            {
+                "source": "codex-turn-failed",
+                "code": "startup_error",
+                "message": f"token=abcdefgh12345678 {'x' * 700}",
+            }
+            for _ in range(8)
+        ],
+        "stderr_tail": (
+            f"{'x' * 3_000} missing optional dependency "
+            "@openai/codex-linux-x64 token=abcdefgh12345678"
+        ),
+        "last_stream_event": "turn.failed",
+        "unexpected": {"nested": "discard me"},
+    }
+    failed = await client.post(
+        "/api/agent/resident-turn/fail",
+        json={
+            "task_id": str(task.id),
+            "project_id": str(task.project_id),
+            "failure_id": "structured-provider-failure",
+            "reason": "Resident provider exited with code 1",
+            "failure_category": "fatal",
+            "error_report": report,
+        },
+        headers={"x-agent-token": claim.json()["agent_token"]},
+    )
+    assert failed.status_code == 200, failed.text
+    await db_session.refresh(task)
+    await db_session.refresh(resident)
+
+    stored = task.context["agent_error_report"]
+    assert stored["exit_code"] == 1
+    assert len(stored["stderr_tail"]) <= 2_000
+    assert "abcdefgh12345678" not in stored["stderr_tail"]
+    assert len(stored["provider_errors"]) == 5
+    assert all(len(row["message"]) <= 500 for row in stored["provider_errors"])
+    assert all(
+        "abcdefgh12345678" not in row["message"]
+        for row in stored["provider_errors"]
+    )
+    assert "unexpected" not in stored
+    marker = task.context["_resident_failure"]
+    assert marker["category"] == "fatal"
+    assert "raw_category" not in marker
+    assert "failure_class" not in marker
+    assert resident.recovery_state["failure_category"] == "fatal"
+    assert "failure_class" not in resident.recovery_state
+
+    retry = await db_session.get(Task, resident.active_turn_task_id)
+    assert retry is not None
+    assert "agent_error_report" not in (retry.context or {})
 
 @pytest.mark.asyncio
 async def test_failure_promotes_interactive_successor_while_background_paused(

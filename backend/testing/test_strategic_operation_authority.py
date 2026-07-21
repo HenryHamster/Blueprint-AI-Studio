@@ -1422,6 +1422,152 @@ async def test_inspection_endpoint_writes_citable_receipt(authority_db, monkeypa
     assert len(receipts) == 1
 
 
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="operation-receipt trigger enforcement requires PostgreSQL",
+)
+@pytest.mark.asyncio
+async def test_postgres_fence_accepts_context_bound_inspection_receipt(db_session):
+    """The DB fence accepts the exact read-only receipt shape emitted in production."""
+
+    from app.strategic_resident_inspection_receipt import build_inspection_receipt
+
+    context_hash = "e" * 64
+    _project, turn_task, _resident = await _authority_rows(db_session)
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: context_hash,
+    }
+    db_session.add(turn_task)
+    await db_session.commit()
+    await db_session.refresh(turn_task)
+
+    receipt = build_inspection_receipt(
+        capability_id="task.inspect",
+        turn_task=turn_task,
+        context_hash=context_hash,
+        request_hash="a" * 64,
+        evidence_json={
+            "kind": "task",
+            "source_id": str(turn_task.id),
+            "revision": "1",
+            "checksum": "b" * 64,
+        },
+    )
+    assert receipt is not None
+    assert receipt.expected_revisions == {"context_hash": context_hash}
+    db_session.add(receipt)
+    await db_session.commit()
+
+    persisted = await db_session.scalar(
+        select(StrategicOperationReceipt).where(
+            StrategicOperationReceipt.id == receipt.id
+        )
+    )
+    assert persisted is not None
+    assert persisted.status == "applied"
+
+    from app.strategic_resident_external_inspection import (
+        ExternalInspectionPlan,
+        _pending_receipt,
+    )
+
+    applying = _pending_receipt(
+        task=turn_task,
+        capability_id="pr.inspect",
+        request_hash="c" * 64,
+        plan=ExternalInspectionPlan(
+            expected_revisions={
+                "context_hash": context_hash,
+                "pr_head_sha": "deadbeef",
+                "_inspection_plan_hash": "f" * 64,
+            },
+            reservation={"owner": "BlueprintAIStudio", "repo": "Blueprint", "pr": 1},
+            external_scope={"owner": "BlueprintAIStudio", "repo": "Blueprint"},
+        ),
+        attempt_id="external-attempt-1",
+    )
+    db_session.add(applying)
+    await db_session.commit()
+    await db_session.refresh(applying)
+    assert applying.status == "applying"
+    assert applying.unknown_effects == []
+
+
+@pytest.mark.skipif(
+    not USE_POSTGRES,
+    reason="operation-receipt trigger enforcement requires PostgreSQL",
+)
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "context_hash",
+        "capability_pair",
+        "risk_level",
+        "status",
+        "unknown_effects",
+        "operation_id",
+        "mutation_shape",
+    ],
+)
+@pytest.mark.asyncio
+async def test_postgres_inspection_fence_rejects_noncanonical_receipts(
+    db_session, tamper
+):
+    """Only the exact server-authored read-only receipt shape bypasses mutation keys."""
+
+    from sqlalchemy.exc import DBAPIError
+
+    from app.strategic_resident_inspection_receipt import build_inspection_receipt
+
+    context_hash = "e" * 64
+    _project, turn_task, _resident = await _authority_rows(db_session)
+    turn_task.context = {
+        **dict(turn_task.context or {}),
+        TURN_CONTEXT_HASH_KEY: context_hash,
+    }
+    db_session.add(turn_task)
+    await db_session.commit()
+    await db_session.refresh(turn_task)
+
+    receipt = build_inspection_receipt(
+        capability_id="task.inspect",
+        turn_task=turn_task,
+        context_hash=context_hash,
+        request_hash="f" * 64,
+        evidence_json={
+            "kind": "task",
+            "source_id": str(turn_task.id),
+            "revision": "1",
+            "checksum": "a" * 64,
+        },
+    )
+    assert receipt is not None
+    if tamper == "context_hash":
+        receipt.expected_revisions = {"context_hash": "d" * 64}
+    elif tamper == "capability_pair":
+        receipt.operation_kind = "inspect_pr"
+    elif tamper == "risk_level":
+        receipt.risk_level = "medium"
+    elif tamper == "status":
+        receipt.status = "pending"
+    elif tamper == "unknown_effects":
+        receipt.unknown_effects = [{"effect": "not-read-only"}]
+    elif tamper == "operation_id":
+        receipt.operation_id = f"not-inspect:{turn_task.id}"
+    elif tamper == "mutation_shape":
+        receipt.capability = "strategy.running_update.set"
+        receipt.operation_kind = "set_running_update"
+    else:
+        raise AssertionError(f"unknown tamper: {tamper}")
+
+    db_session.add(receipt)
+    with pytest.raises(DBAPIError) as exc_info:
+        await db_session.commit()
+    assert getattr(exc_info.value.orig, "sqlstate", None) == "42501"
+    assert "Resident mutation authority is stale or invalid" in str(exc_info.value)
+    await db_session.rollback()
+
 def _github_pr_payload(*, owner: str, repo: str, pr_number: int) -> dict:
     return {
         "id": 991,

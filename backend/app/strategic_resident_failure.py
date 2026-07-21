@@ -10,6 +10,10 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.failure_classification import (
+    AGENT_ERROR_REPORT_CONTEXT_KEY,
+    sanitize_agent_error_report,
+)
 from app.models import Project, StrategicResident, Task, TaskStatus
 from app.strategic_resident_agent_binding import (
     ResidentAgentAuthorityError,
@@ -45,6 +49,7 @@ async def fail_authoritative_resident_turn(
     failure_id: str,
     reason: str,
     failure_category: str,
+    error_report: object | None = None,
 ) -> ResidentTurnFailureOutcome:
     """Fence the live turn, persist one failure, and clear its active pointer."""
 
@@ -151,6 +156,13 @@ async def fail_authoritative_resident_turn(
         turn_task_id=binding.task_id,
         authority_generation=int(resident.authority_generation),
     )
+    sanitized_error_report = sanitize_agent_error_report(error_report)
+    context = dict(task.context or {})
+    if sanitized_error_report is not None:
+        context[AGENT_ERROR_REPORT_CONTEXT_KEY] = sanitized_error_report
+    else:
+        context.pop(AGENT_ERROR_REPORT_CONTEXT_KEY, None)
+    task.context = context
     mutation = await apply_locked_resident_turn_failure(
         session,
         resident=resident,

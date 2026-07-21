@@ -326,6 +326,9 @@ from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
 from app.strategic_resident_project_change_sweep import (
     sweep_durable_project_change_wakeups,
 )
+from app.strategic_resident_activation_sweep import (
+    sweep_missing_background_activation_wakeups,
+)
 from app.strategic_resident_wakeups import (
     sweep_due_authoritative_resident_wakeups,
     sweep_pending_worker_proposal_wakeups,
@@ -2804,6 +2807,17 @@ async def reaper_service():
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                try:
+                    await sweep_missing_background_activation_wakeups(
+                        session_factory=AsyncSessionLocal,
+                        now=now,
+                        batch_size=32,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Resident activation repair sweep error: {e}",
+                        exc_info=True,
+                    )
                 try:
                     await sweep_due_authoritative_resident_wakeups(
                         session_factory=AsyncSessionLocal,

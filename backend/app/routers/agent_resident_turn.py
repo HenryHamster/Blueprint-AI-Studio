@@ -215,6 +215,7 @@ async def fail_resident_turn(
             failure_id=body.failure_id,
             reason=body.reason,
             failure_category=body.failure_category,
+            error_report=body.error_report,
         )
     except ResidentAgentTaskNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

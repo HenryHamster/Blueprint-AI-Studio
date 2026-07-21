@@ -332,15 +332,36 @@ def capability_for(capability_id: str) -> CapabilitySpec:
         raise ValueError(f"unknown Strategic Resident capability: {capability_id}") from exc
 
 
+def _compact_parameter_spec(parameter: CapabilityParameterSpec) -> str | dict[str, Any]:
+    result: dict[str, Any] = {"type": parameter.kind.value}
+    for field, compact_field in (
+        ("min_length", "min_len"),
+        ("max_length", "max_len"),
+        ("minimum", "min"),
+        ("maximum", "max"),
+    ):
+        value = getattr(parameter, field)
+        if value is not None:
+            result[compact_field] = value
+    if parameter.choices:
+        result["choices"] = list(parameter.choices)
+    if len(result) == 1:
+        return parameter.kind.value
+    return result
+
+
 def compact_capability_catalog() -> list[dict[str, Any]]:
-    """Latency-conscious discovery view; full declarations stay server-side."""
+    """Latency-conscious discovery view with compact declared parameter schemas."""
 
     return [
         {
             "id": spec.capability_id,
             "mode": spec.mode.value,
             "risk": spec.risk.value,
-            "parameters": list(spec.required_parameters),
+            "parameter_specs": {
+                parameter.name: _compact_parameter_spec(parameter)
+                for parameter in spec.parameter_specs
+            },
             "approval": spec.approval_policy,
             "availability": (
                 "invoke"

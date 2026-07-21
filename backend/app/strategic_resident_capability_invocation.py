@@ -16,6 +16,7 @@ from app.strategic_operation_authority_validation import (
 from app.strategic_resident_capabilities import (
     CapabilityMode,
     CapabilityParameterKind,
+    CapabilityParameterSpec,
     CapabilitySpec,
     capability_for,
 )
@@ -51,6 +52,35 @@ _FORBIDDEN_PARAMETER_SUFFIXES = (
     "_secret",
     "_api_key",
 )
+
+
+class CorrectableCapabilityParameterError(ValueError):
+    """A narrow scalar schema error that an inspection caller may correct."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        parameter: CapabilityParameterSpec,
+        issue: str,
+    ) -> None:
+        super().__init__(message)
+        self.parameter_name = parameter.name
+        self.issue = issue
+        self.expected: dict[str, Any] = {"kind": parameter.kind.value}
+        if parameter.minimum is not None:
+            self.expected["minimum"] = parameter.minimum
+        if parameter.maximum is not None:
+            self.expected["maximum"] = parameter.maximum
+
+    def detail(self) -> dict[str, Any]:
+        return {
+            "code": "resident_capability_parameter_validation",
+            "parameter": self.parameter_name,
+            "issue": self.issue,
+            "expected": self.expected,
+            "message": str(self),
+        }
 
 
 def _normalized_parameter_key(value: str) -> str:
@@ -109,19 +139,39 @@ def validated_capability_parameters(
         value = validated[parameter.name]
         if parameter.kind is CapabilityParameterKind.uuid:
             if not isinstance(value, str):
-                raise ValueError(f"{parameter.name} must be a UUID string")
+                raise CorrectableCapabilityParameterError(
+                    f"{parameter.name} must be a UUID string",
+                    parameter=parameter,
+                    issue="type",
+                )
             try:
                 result[parameter.name] = str(uuid.UUID(value))
             except ValueError:
-                raise ValueError(f"{parameter.name} must be a UUID string") from None
+                raise CorrectableCapabilityParameterError(
+                    f"{parameter.name} must be a UUID string",
+                    parameter=parameter,
+                    issue="format",
+                ) from None
             continue
         if parameter.kind is CapabilityParameterKind.integer:
             if type(value) is not int:
-                raise ValueError(f"{parameter.name} must be an integer")
+                raise CorrectableCapabilityParameterError(
+                    f"{parameter.name} must be an integer",
+                    parameter=parameter,
+                    issue="type",
+                )
             if parameter.minimum is not None and value < parameter.minimum:
-                raise ValueError(f"{parameter.name} is below its minimum")
+                raise CorrectableCapabilityParameterError(
+                    f"{parameter.name} is below its minimum",
+                    parameter=parameter,
+                    issue="minimum",
+                )
             if parameter.maximum is not None and value > parameter.maximum:
-                raise ValueError(f"{parameter.name} exceeds its maximum")
+                raise CorrectableCapabilityParameterError(
+                    f"{parameter.name} exceeds its maximum",
+                    parameter=parameter,
+                    issue="maximum",
+                )
             result[parameter.name] = value
             continue
         if parameter.kind in {
@@ -217,6 +267,7 @@ class ResidentCapabilityInvocation(BaseModel):
 __all__ = [
     "MAX_CAPABILITY_PARAMETER_BYTES",
     "CapabilityEvidenceRef",
+    "CorrectableCapabilityParameterError",
     "ResidentCapabilityInvocation",
     "validated_capability_parameters",
 ]

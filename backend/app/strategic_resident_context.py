@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -17,6 +18,7 @@ from app.artifact_refs import (
     RESIDENT_ARTIFACT_REF_GRANTS_MAX,
 )
 from app.models import (
+    MessageHandlingState,
     MessageSurface,
     Project,
     ProjectMessage,
@@ -295,23 +297,42 @@ async def _conversation_projection(
             "interactive Resident turn has no frozen conversation range"
         )
     effective_start = max(start, handled_sequence + 1)
+    actionable_filters = (
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.surface == MessageSurface.CONVERSATION,
+        ProjectMessage.from_type == "user",
+        ProjectMessage.handling_state.in_(
+            (MessageHandlingState.PENDING, MessageHandlingState.CLAIMED)
+        ),
+        ProjectMessage.sequence.is_not(None),
+        ProjectMessage.sequence >= effective_start,
+        ProjectMessage.sequence <= end,
+    )
+    actionable_count = int(
+        await session.scalar(
+            select(func.count(ProjectMessage.id)).where(*actionable_filters)
+        )
+        or 0
+    )
     unhandled_rows = (
         (
             await session.execute(
                 select(ProjectMessage)
-                .where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.surface == MessageSurface.CONVERSATION,
-                    ProjectMessage.sequence.is_not(None),
-                    ProjectMessage.sequence >= effective_start,
-                    ProjectMessage.sequence <= end,
-                )
+                .where(*actionable_filters)
                 .order_by(ProjectMessage.sequence.asc())
                 .limit(MAX_CONVERSATION_MESSAGES)
             )
         )
         .scalars()
         .all()
+    )
+    represented_start = (
+        int(unhandled_rows[0].sequence)
+        if unhandled_rows
+        else min(effective_start, end)
+    )
+    prior_before = (
+        int(unhandled_rows[0].sequence) if unhandled_rows else end + 1
     )
     prior_limit = MAX_CONVERSATION_MESSAGES - len(unhandled_rows)
     prior_rows = []
@@ -324,7 +345,7 @@ async def _conversation_projection(
                         ProjectMessage.project_id == project_id,
                         ProjectMessage.surface == MessageSurface.CONVERSATION,
                         ProjectMessage.sequence.is_not(None),
-                        ProjectMessage.sequence < effective_start,
+                        ProjectMessage.sequence < prior_before,
                     )
                     .order_by(ProjectMessage.sequence.desc())
                     .limit(prior_limit)
@@ -335,6 +356,7 @@ async def _conversation_projection(
         )
         prior_rows.reverse()
     rows = [*prior_rows, *unhandled_rows]
+    unhandled_ids = {row.id for row in unhandled_rows}
     reply_ids = {
         row.reply_to_message_id
         for row in rows
@@ -408,7 +430,7 @@ async def _conversation_projection(
                 "created_at": row.created_at.isoformat(),
                 "content": content,
                 "content_truncated": content_truncated,
-                "is_unhandled": int(row.sequence or 0) >= effective_start,
+                "is_unhandled": row.id in unhandled_ids,
                 "reply_to": reply,
                 "references": refs,
                 "operator_intent": _bounded_value(
@@ -419,15 +441,16 @@ async def _conversation_projection(
                 else None,
             }
         )
-    requested_count = max(0, end - effective_start + 1)
     return messages, evidence[:MAX_REFS], {
         "handled_sequence": handled_sequence,
-        "requested_start": effective_start,
+        "requested_start": represented_start,
         "requested_end": end,
         "represented_end": (
-            int(unhandled_rows[-1].sequence) if unhandled_rows else None
+            end
+            if actionable_count <= MAX_CONVERSATION_MESSAGES
+            else int(unhandled_rows[-1].sequence)
         ),
-        "omitted_messages": max(0, requested_count - len(unhandled_rows)),
+        "omitted_messages": max(0, actionable_count - len(unhandled_rows)),
         "omitted_unrevisioned_refs": omitted_refs,
     }
 

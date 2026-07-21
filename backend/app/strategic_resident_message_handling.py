@@ -39,6 +39,12 @@ async def respond_to_represented_user_messages(
                     ProjectMessage.project_id == project_id,
                     ProjectMessage.surface == MessageSurface.CONVERSATION,
                     ProjectMessage.from_type == "user",
+                    ProjectMessage.handling_state.in_(
+                        (
+                            MessageHandlingState.PENDING,
+                            MessageHandlingState.CLAIMED,
+                        )
+                    ),
                     ProjectMessage.sequence >= represented_start,
                     ProjectMessage.sequence <= represented_end,
                 )
