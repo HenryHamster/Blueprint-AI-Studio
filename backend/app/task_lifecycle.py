@@ -2885,6 +2885,63 @@ async def _process_post_commit(
                     )
                     verdict = "REQUEST_CHANGES"
 
+                # Mechanical hedge detector: scan the PR diff for unjustified
+                # default-off/observe/fail-open patterns the reviewer may have
+                # missed (or whose introduction the reviewer approved). Findings
+                # are MAJOR-severity issues that survive the reconciliation logic
+                # as genuine blockers. The detector is pure and synchronous;
+                # only the GitHub API call is async.
+                _hedge_findings: list[dict] = []
+                try:
+                    (
+                        _hd_token,
+                        _hd_owner,
+                        _hd_repo,
+                    ) = await get_github_token_for_task(task.id, session)
+                    if pr_number and _hd_token:
+                        _hd_files = await get_pr_files(
+                            _hd_token,
+                            _hd_owner,
+                            _hd_repo,
+                            pr_number,
+                            project_id=str(task.project_id),
+                            include_patch=True,
+                        )
+                        if _hd_files:
+                            from app.review_heuristics import detect_hedges_in_diff
+
+                            _hedge_findings = detect_hedges_in_diff(_hd_files)
+                except Exception:
+                    logger.warning(
+                        f"[REVIEW PIPELINE] Hedge detection failed for PR "
+                        f"#{pr_number} (task {task.id}) — skipping mechanical "
+                        f"hedge check",
+                        exc_info=True,
+                    )
+
+                if _hedge_findings:
+                    # Merge findings into the issues list, avoiding duplicates
+                    # by exact description match.
+                    _existing_descs = {
+                        i.get("description", "")
+                        for i in issues
+                        if isinstance(i, dict)
+                    }
+                    for hf in _hedge_findings:
+                        if isinstance(hf, dict) and hf.get("description") not in _existing_descs:
+                            issues.append(hf)
+                            _existing_descs.add(hf.get("description", ""))
+                    # If the reviewer approved despite the hedge, override to
+                    # REQUEST_CHANGES so the fix loop addresses it.
+                    if verdict == "APPROVE":
+                        logger.warning(
+                            f"[REVIEW PIPELINE] PR #{pr_number}: hedge detector "
+                            f"found {len(_hedge_findings)} unjustified hedge(s) "
+                            f"in APPROVED diff — overriding verdict to "
+                            f"REQUEST_CHANGES"
+                        )
+                        verdict = "REQUEST_CHANGES"
+
                 # REQUEST_CHANGES unsupported by its own evidence → reconcile to
                 # APPROVE. The decision must follow the reviewer's structured
                 # ``issues``, not the free-text ``verdict`` token taken on faith —

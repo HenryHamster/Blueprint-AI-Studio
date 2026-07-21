@@ -4644,6 +4644,77 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         assert entry.get("startup_failure_cooldown_at") is None
 
 
+@pytest.mark.asyncio
+class TestLoadMaxPlanPoolSecretFetchFailed:
+    """load_max_plan_pool sets secret_fetch_failed=True when Secret Manager raises."""
+
+    async def _load_with_sm_acct(self, secret_ref: str, monkeypatch, side_effect):
+        from app import max_plan_pool as mpp
+
+        acct = _FakeMaxPlanAccount("acct-sm")
+        acct.secret_blob_ref = secret_ref
+
+        async def _fake_get_user_secret(_ref):
+            raise side_effect
+
+        monkeypatch.setattr(
+            "app.secrets_manager.get_user_secret",
+            _fake_get_user_secret,
+        )
+        monkeypatch.setattr(
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession([acct])
+        )
+        await mpp.load_max_plan_pool()
+        return _account_by_id[str(acct.id)]
+
+    async def test_secret_fetch_failure_sets_flag(self, monkeypatch):
+        """When Secret Manager raises, secret_fetch_failed must be True."""
+        entry = await self._load_with_sm_acct(
+            "projects/proj/secrets/mysecret/versions/latest",
+            monkeypatch,
+            RuntimeError("secret unavailable"),
+        )
+        assert entry["secret_fetch_failed"] is True
+
+    async def test_secret_fetch_failure_clears_runtime_secret(self, monkeypatch):
+        """When Secret Manager raises, runtime_secret must be None so the meter is dark."""
+        entry = await self._load_with_sm_acct(
+            "projects/proj/secrets/mysecret/versions/latest",
+            monkeypatch,
+            RuntimeError("secret unavailable"),
+        )
+        assert entry["runtime_secret"] is None
+
+    async def test_secret_fetch_failure_emits_warning(self, monkeypatch, caplog):
+        """When Secret Manager raises, a '[POOL] Usage meter: failed to fetch secret' warning is logged."""
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="app.max_plan_pool"):
+            await self._load_with_sm_acct(
+                "projects/proj/secrets/mysecret/versions/latest",
+                monkeypatch,
+                RuntimeError("secret unavailable"),
+            )
+        assert any(
+            "Usage meter: failed to fetch secret" in r.message
+            and r.levelno == logging.WARNING
+            for r in caplog.records
+        )
+
+    async def test_non_sm_secret_ref_leaves_flag_false(self, monkeypatch):
+        """A plain API-key secret_blob_ref must not set secret_fetch_failed."""
+        from app import max_plan_pool as mpp
+
+        acct = _FakeMaxPlanAccount("acct-plain")
+        acct.secret_blob_ref = "sk-ant-test"
+        monkeypatch.setattr(
+            mpp, "AsyncSessionLocal", lambda: _FakeLoadSession([acct])
+        )
+        await mpp.load_max_plan_pool()
+        entry = _account_by_id[str(acct.id)]
+        assert entry["secret_fetch_failed"] is False
+
+
 class TestGetTaskLlmAccountId:
     """get_task_llm_account_id prefers the promoted Task.llm_account_id column
     when present, falling back to the context JSONB for pre-migration rows or
@@ -4922,6 +4993,21 @@ async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch)
     assert after == before + 1, (
         f"counter should have incremented by 1 (was {before}, now {after})"
     )
+
+
+def test_get_usage_persist_failure_count_reflects_module_counter():
+    """get_usage_persist_failure_count() reads the module-level counter."""
+    import app.max_plan_pool as pool_mod
+
+    from app.max_plan_pool import get_usage_persist_failure_count
+
+    original = pool_mod._usage_persist_failures
+    try:
+        assert get_usage_persist_failure_count() == original
+        pool_mod._usage_persist_failures = original + 7
+        assert get_usage_persist_failure_count() == original + 7
+    finally:
+        pool_mod._usage_persist_failures = original
 
 
 # ── get_project_account_usage / get_user_project_pool_summary ────────────────

@@ -1194,6 +1194,7 @@ async def orchestrator_worker():
     # Late imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
         detect_persistently_dark_meters,
+        get_usage_persist_failure_count,
         load_max_plan_pool,
         refresh_usage_meter_snapshots,
         release_max_plan_account,
@@ -1300,14 +1301,22 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_usage_meter_refresh, 300):
                 await refresh_usage_meter_snapshots()
                 dark = await detect_persistently_dark_meters()
+                persist_failures = get_usage_persist_failure_count()
                 if dark:
                     names = ", ".join(
                         f"{d['name'] or d['id']} ({d['dark_reason']})" for d in dark
                     )
                     logger.warning(
-                        "[POOL] usage meter: %d account(s) persistently dark: %s",
+                        "[POOL] usage meter: %d account(s) persistently dark: %s"
+                        " (persist_failures=%d)",
                         len(dark),
                         names,
+                        persist_failures,
+                    )
+                elif persist_failures:
+                    logger.warning(
+                        "[POOL] usage meter: persist_failures=%d (no dark accounts)",
+                        persist_failures,
                     )
                 _last_usage_meter_refresh = _utcnow()
 

@@ -19,6 +19,7 @@ standalone suite without a database.
 import pytest
 
 from app.direction_metrics import _compute_acceptance_rate
+from app.review_heuristics import detect_hedges_in_diff
 from app.review_policy import (
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     evaluate_auto_approve_small_main,
@@ -259,3 +260,188 @@ class TestReReviewSkipParity:
         d = should_skip_re_review("code_review", False, scan_blocked=False)
         assert d.skip is False
         assert d.rule == "none"
+
+
+# ── Mechanical hedge detection ────────────────────────────────────────────────
+
+
+class TestHedgeDetection:
+    """Behavioral tests for detect_hedges_in_diff in review_heuristics.
+
+    Each test crafts a ``diff_files`` structure mimicking the return value of
+    ``get_pr_files(include_patch=True)``, runs the detector, and asserts on
+    the returned findings. The detector is pure / synchronous.
+    """
+
+    @staticmethod
+    def _diff_file(filename: str, patch: str) -> dict:
+        return {"filename": filename, "status": "modified", "patch": patch}
+
+    def test_detects_observe_default(self):
+        """A new gate defaulting to ``observe`` produces a finding."""
+        diff = [
+            self._diff_file(
+                "backend/app/some_module.py",
+                "@@ -0,0 +1,5 @@\n"
+                "+# New feature gate\n"
+                "+from app.config import FeatureGate\n"
+                "+\n"
+                "+_MY_GATE = \"observe\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1, "observe default should be caught"
+        assert any("observe" in f.get("description", "") for f in findings)
+
+    def test_detects_off_default(self):
+        """A new config entry defaulting to ``off`` produces a finding."""
+        diff = [
+            self._diff_file(
+                "backend/app/config.py",
+                "@@ -10,0 +11,3 @@\n"
+                "+    # Pilot mode\n"
+                "+    mode = \"off\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1, "off default should be caught"
+        assert any("off" in f.get("description", "") for f in findings)
+
+    def test_detects_disabled_default(self):
+        """A new lane defaulting to ``disabled`` produces a finding."""
+        diff = [
+            self._diff_file(
+                "backend/app/lane.py",
+                "@@ -5,0 +6 @@\n"
+                "+_pilot_lane = \"disabled\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1, "disabled default should be caught"
+        assert any("disabled" in f.get("description", "") for f in findings)
+
+    def test_detects_fail_open_default(self):
+        """A mode defaulting to ``fail-open`` produces a finding."""
+        diff = [
+            self._diff_file(
+                "backend/app/mode.py",
+                "@@ -0,0 +1,3 @@\n"
+                "+# Fail-open mode\n"
+                "+default = \"fail-open\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1, "fail-open default should be caught"
+        assert any("fail" in f.get("description", "").lower() for f in findings)
+
+    def test_clean_diff_no_findings(self):
+        """A diff with no hedge patterns returns an empty list."""
+        diff = [
+            self._diff_file(
+                "backend/app/normal.py",
+                "@@ -1,0 +2,5 @@\n"
+                "+def greet(name: str) -> str:\n"
+                "+    return f\"Hello, {name}!\"\n"
+                "+\n"
+                "+MAX_RETRIES = 3\n",
+            ),
+            self._diff_file(
+                "backend/app/other.py",
+                "@@ -5,0 +6 @@\n"
+                "+enabled = True\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert findings == [], f"expected no findings, got {findings}"
+
+    def test_detected_issue_is_major_severity(self):
+        """Finding severity is MAJOR (so it survives reconciliation)."""
+        diff = [
+            self._diff_file(
+                "backend/app/foo.py",
+                "@@ -0,0 +1 @@\n"
+                "+mode = \"observe\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1
+        assert all(f.get("severity") == "MAJOR" for f in findings)
+
+    def test_detected_issue_message_matches_anti_hedge_focus(self):
+        """Description contains ``unjustified hedge`` matching the prose in
+        ANTI_HEDGE_FOCUS and REVIEW_ANTI_HEDGE_CRITERION."""
+        diff = [
+            self._diff_file(
+                "backend/app/bar.py",
+                "@@ -0,0 +1 @@\n"
+                "+flag_default = \"off\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert len(findings) >= 1
+        desc = findings[0].get("description", "")
+        assert "unjustified hedge" in desc.lower(), (
+            f"description should contain 'unjustified hedge', got: {desc}"
+        )
+
+    def test_justified_default_off_not_flagged(self):
+        """A diff that references a default-off flag in a comment or test does
+        NOT produce a false positive — only added lines with the hedge pattern
+        trigger the detector."""
+        diff = [
+            self._diff_file(
+                "backend/app/legacy.py",
+                "@@ -10,0 +11,2 @@\n"
+                "+    # This uses the existing observe-mode flag for monitoring only\n"
+                "+    _check_existing_flag(flag_name)\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        assert findings == [], (
+            f"comment-only reference should not trigger, got: {findings}"
+        )
+
+    def test_removed_lines_skipped(self):
+        """Removed lines (diff prefix ``-``) are not scanned."""
+        diff = [
+            self._diff_file(
+                "backend/app/cleanup.py",
+                "@@ -5,0 +6,2 @@\n"
+                "-_old_mode = \"observe\"\n"
+                "+_new_mode = \"committed\"\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        # The removed line has _old_mode = "observe" but it starts with '-'
+        # so it should be skipped. The added line has "committed" which is
+        # not a hedge value.
+        assert findings == [], (
+            f"removed lines and non-hedge additions should not trigger, "
+            f"got: {findings}"
+        )
+
+    def test_multiple_diff_files(self):
+        """Multiple files with mixed content — only the file with the hedge
+        produces a finding, and the other file is clean."""
+        diff = [
+            self._diff_file(
+                "backend/app/good.py",
+                "@@ -1,0 +2 @@\n"
+                "+THRESHOLD = 100\n",
+            ),
+            self._diff_file(
+                "backend/app/hedge.py",
+                "@@ -10,0 +11 @@\n"
+                "+_feature_gate = \"off\"\n",
+            ),
+            self._diff_file(
+                "backend/app/unchanged.py",
+                "this file has no patch\n",
+            ),
+        ]
+        findings = detect_hedges_in_diff(diff)
+        hedge_files = {f.get("file") for f in findings}
+        assert "backend/app/hedge.py" in hedge_files, (
+            f"should flag hedge.py, got files: {hedge_files}"
+        )
+        assert "backend/app/good.py" not in hedge_files

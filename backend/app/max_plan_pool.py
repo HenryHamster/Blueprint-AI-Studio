@@ -3219,6 +3219,11 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
     return scheduled
 
 
+def get_usage_persist_failure_count() -> int:
+    """Return the number of usage-snapshot DB persist failures since module load."""
+    return _usage_persist_failures
+
+
 async def detect_persistently_dark_meters(
     now: datetime | None = None,
     threshold_seconds: float = _USAGE_METER_DISPLAY_STALE_SECONDS * 2,

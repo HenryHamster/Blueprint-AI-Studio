@@ -88,6 +88,7 @@ from app.review_heuristics import (  # noqa: F401
     compute_drift_signal,
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
+    detect_hedges_in_diff,
     fix_all_occurrences_directive,
 )
 

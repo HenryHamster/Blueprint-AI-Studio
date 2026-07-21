@@ -545,6 +545,79 @@ def _feedback_jaccard(a: str, b: str) -> float:
     return len(tokens_a & tokens_b) / len(tokens_a | tokens_b)
 
 
+# ── Mechanical hedge detection (anti-hedging enforcement) ─────────────────────
+# Anti-hedging principle: new features, gates, and flags must default ON/committed,
+# not observe/off/disabled/fail-open, without documented justification.
+# This regex matches assignments where the variable name (or a keyword like
+# "default", "mode", "flag", "gate", "feature", "pilot", "lane") is followed
+# by one of the hedge string values.
+_HEDGE_DEFAULT_VALUE_RE = re.compile(
+    r"(?:default|mode|flag|gate|feature|pilot|lane)\s*[=:]\s*"
+    r"[\"'](observe|off|disabled|fail-?open)[\"']",
+    re.IGNORECASE,
+)
+
+
+def detect_hedges_in_diff(diff_files: list[dict]) -> list[dict]:
+    """Scan PR diff files for unjustified default-off/observe/fail-open hedges.
+
+    Inspects each file's ``patch`` field (unified diff text available when
+    ``get_pr_files`` is called with ``include_patch=True``) for added lines
+    that introduce a new flag, gate, or mode defaulting to ``observe``,
+    ``off``, ``disabled``, or ``fail-open``. These are the default-off/hedge
+    patterns the anti-hedging principle (ANTI_HEDGE_FOCUS / REVIEW_ANTI_HEDGE_CRITERION)
+    defines as 'guilty until proven innocent'.
+
+    Returns a list of issue dicts with ``severity`` set to ``"MAJOR"`` (so
+    they are treated as genuine blocking issues by the review pipeline's
+    reconciliation logic). Returns an empty list when no hedge patterns are
+    found.
+
+    The caller is responsible for providing ``patch`` fields (via
+    ``include_patch=True``) and for merging returned findings into the review
+    issues list.
+    """
+    findings: list[dict] = []
+    for file_entry in diff_files or []:
+        if not isinstance(file_entry, dict):
+            continue
+        filename = file_entry.get("filename", "")
+        if not isinstance(filename, str):
+            continue
+        patch = file_entry.get("patch")
+        if not isinstance(patch, str) or not patch:
+            continue
+        for raw_line in patch.splitlines():
+            if not raw_line.startswith("+"):
+                continue
+            # Strip the leading '+' to get the added line content.
+            added = raw_line[1:]
+            stripped = added.strip()
+            if not stripped:
+                continue
+            # Skip comments, docstrings, and import lines.
+            if stripped.startswith(("#", '"""', "'''", "//", "*", "/*")):
+                continue
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                continue
+            match = _HEDGE_DEFAULT_VALUE_RE.search(stripped)
+            if match:
+                hedge_value = match.group(1)
+                # Store with a descriptive issue format matching ANTI_HEDGE_FOCUS.
+                findings.append({
+                    "severity": "MAJOR",
+                    "file": filename,
+                    "line": 0,
+                    "description": (
+                        f"Unjustified hedge: new flag/gate defaults to "
+                        f"'{hedge_value}' — anti-hedging principle requires "
+                        f"new features to default ON/committed, not observe/"
+                        f"off/disabled/fail-open, without documented justification."
+                    ),
+                })
+    return findings
+
+
 # ── Per-lane iteration cap accounting ─────────────────────────────────────────
 # Review-fix iteration budget lanes — mechanical churn (conflict resolution,
 # CI fixes, second-opinion arbitration) must not crowd out review-convergence
