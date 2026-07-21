@@ -5906,6 +5906,60 @@ async def _finalize_qualification(
                         "status": "smoketest_infra_respawned",
                         "respawn_count": _smoke_new_count,
                     }
+                # --- Smoketest claude_code_failed (env-death): bounded respawn ---
+                # A bare CLI exit with claude_code_failed is almost always an
+                # environmental/provider death, not a candidate defect. Respawn so
+                # the candidate gets a fair evaluation on a fresh VM.
+                smoke_env_death_respawn_count = qual.get(
+                    "smoketest_env_death_respawn_count", 0
+                )
+                if (
+                    _smoke_task_obj.status == TaskStatus.FAILED
+                    and _smoke_explicit_cat == "claude_code_failed"
+                    and smoke_env_death_respawn_count < _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_new_task = await _spawn_qualifier_smoketest_task(
+                        session,
+                        version.project_id,
+                        version_id=version.id,
+                        candidate_sha=candidate_sha,
+                        qualification_attempt_id=attempt_id,
+                    )
+                    _smoke_new_count = smoke_env_death_respawn_count + 1
+                    _smoke_updated_qual = append_infra_failure_child_event(
+                        qual,
+                        leg="smoketest",
+                        failed_task=_smoke_task_obj,
+                        replacement_task_id=str(_smoke_new_task.id),
+                        label="smoketest_env_death_respawned",
+                        respawn_count=_smoke_new_count,
+                    )
+                    _smoke_updated_qual = {
+                        **_smoke_updated_qual,
+                        "smoketest_task_id": str(_smoke_new_task.id),
+                        "smoketest_env_death_respawn_count": _smoke_new_count,
+                    }
+                    _smoke_updated_qual = _advance_qualification_retry_episode(
+                        version, _smoke_updated_qual, cap=_MAX_AUDIT_RL_RESPAWNS
+                    )
+                    version.last_qualification = _smoke_updated_qual
+                    flag_modified(version, "last_qualification")
+                    session.add(version)
+                    await session.flush()
+                    logger.info(
+                        "[RELEASE_QUALIFIER] v%d smoketest task %s died with "
+                        "claude_code_failed (env death); re-spawned as %s "
+                        "(respawn %d/%d)",
+                        version.version_number,
+                        smoketest_task_id,
+                        _smoke_new_task.id,
+                        _smoke_new_count,
+                        _MAX_AUDIT_RL_RESPAWNS,
+                    )
+                    return {
+                        "status": "smoketest_env_death_respawned",
+                        "respawn_count": _smoke_new_count,
+                    }
                 _smoke_infra_label = _enrich_infra_error(
                     f"smoketest_task_{_smoke_task_obj.status.lower()}",
                     _smoke_task_obj,
@@ -5922,6 +5976,12 @@ async def _finalize_qualification(
                     and smoke_infra_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
                 ):
                     _smoke_infra_label = "smoketest_infra_respawn_cap_exceeded"
+                if (
+                    _smoke_task_obj.status == TaskStatus.FAILED
+                    and _smoke_explicit_cat == "claude_code_failed"
+                    and smoke_env_death_respawn_count >= _MAX_AUDIT_RL_RESPAWNS
+                ):
+                    _smoke_infra_label = "smoketest_env_death_respawn_cap_exceeded"
                 return await _handle_infra_failure(
                     session,
                     version,

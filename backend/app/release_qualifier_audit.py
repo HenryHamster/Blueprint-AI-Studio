@@ -71,6 +71,9 @@ def _task_failure_category(task: Task | None) -> str | None:
     return str(category) if category else None
 
 
+_CHILD_TAIL_MAX_CHARS = 500
+
+
 def _compact_infra_child_event(
     *,
     leg: str,
@@ -86,6 +89,9 @@ def _compact_infra_child_event(
         category = _task_failure_category(failed_task)
         if category:
             event["failure_category"] = category
+        tail = failed_task.latest_status_message
+        if tail:
+            event["child_tail"] = tail[-_CHILD_TAIL_MAX_CHARS:]
     if replacement_task_id:
         event["replacement_task_id"] = replacement_task_id
     if label:

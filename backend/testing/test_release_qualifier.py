@@ -23992,6 +23992,171 @@ class TestFinalizeInfraFailure:
             == "smoketest_infra_respawn_cap_exceeded"
         )
 
+    # --- Smoketest claude_code_failed (env-death) respawn tests --------------
+
+    @pytest.mark.asyncio
+    async def test_smoketest_env_death_claude_code_failed_respawns_new_task(
+        self, db_session
+    ):
+        """FAILED smoketest with claude_code_failed → env-death respawn, not infra_failure."""
+        project, version = await _make_project_and_version(db_session)
+        candidate = "beef" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-envdeath",
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(version.id),
+                "failure_category": "claude_code_failed",
+            },
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        original_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": original_smoke_id,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "smoketest_env_death_respawned"
+        assert result["respawn_count"] == 1
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["smoketest_env_death_respawn_count"] == 1
+        assert new_qual["smoketest_task_id"] != original_smoke_id
+
+        # No QualificationVerdict — verdict not rendered on respawn.
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 0
+
+    @pytest.mark.asyncio
+    async def test_smoketest_env_death_second_respawn_increments_count(
+        self, db_session
+    ):
+        """Second env-death respawn (count=1 → 2) stays below cap, no infra_failure."""
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "bead" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-envdeath2",
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(version.id),
+                "failure_category": "claude_code_failed",
+            },
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        original_smoke_id = str(smoke_task.id)
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": original_smoke_id,
+            "smoketest_env_death_respawn_count": 1,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Only run this assertion when cap > 1 (currently _MAX_AUDIT_RL_RESPAWNS == 2).
+        if _MAX_AUDIT_RL_RESPAWNS <= 1:
+            return
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "smoketest_env_death_respawned"
+        assert result["respawn_count"] == 2
+
+        await db_session.refresh(version)
+        new_qual = version.last_qualification
+        assert new_qual["smoketest_env_death_respawn_count"] == 2
+        assert new_qual["smoketest_task_id"] != original_smoke_id
+
+    @pytest.mark.asyncio
+    async def test_smoketest_env_death_respawn_cap_exceeded_routes_to_infra_failure(
+        self, db_session
+    ):
+        """When smoketest_env_death_respawn_count hits cap, route to infra_failure
+        with label 'smoketest_env_death_respawn_cap_exceeded'."""
+        from app.release_qualifier import _MAX_AUDIT_RL_RESPAWNS
+
+        project, version = await _make_project_and_version(db_session)
+        candidate = "face" * 10
+        smoke_task = Task(
+            project_id=project.id,
+            title="smoke",
+            payloads=[{"type": "smoketest", "base_branch": "automain"}],
+            vm_instance_id="vm-smoke-envdeath-cap",
+            status=TaskStatus.FAILED,
+            context={
+                "release_version_id": str(version.id),
+                "failure_category": "claude_code_failed",
+            },
+        )
+        db_session.add(smoke_task)
+        await db_session.commit()
+        await db_session.refresh(smoke_task)
+
+        version.last_qualification = {
+            "status": "pending",
+            **_EMPTY_RUBRIC_PROJECTION,
+            "candidate_sha": candidate,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-05-19T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": str(smoke_task.id),
+            "smoketest_env_death_respawn_count": _MAX_AUDIT_RL_RESPAWNS,
+            "prior_infra_streak": 0,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["error"] == "smoketest_env_death_respawn_cap_exceeded"
+
+        await db_session.refresh(version)
+        assert version.phase == "stabilize"
+        assert (
+            version.last_qualification["error"]
+            == "smoketest_env_death_respawn_cap_exceeded"
+        )
+
     # --- Merge-grade PROVISION_FAILURE / AGENT_TIMEOUT respawn tests --------
 
     @pytest.mark.asyncio
@@ -42705,6 +42870,95 @@ async def test_collect_terminal_infra_child_events_skips_seen_failed(db_session)
     # The existing entry must be preserved; no duplicate must appear.
     assert len(result) == 1
     assert result[0]["failed_task_id"] == str(task.id)
+
+
+# ===========================================================================
+# _compact_infra_child_event — child_tail from latest_status_message
+# ===========================================================================
+
+
+def test_compact_infra_child_event_includes_child_tail_from_latest_status_message():
+    """child_tail is populated from latest_status_message and truncated to 500 chars."""
+    from app.release_qualifier_audit import _compact_infra_child_event
+
+    task = MagicMock()
+    task.id = uuid.uuid4()
+    task.status = "FAILED"
+    task.context = {"failure_category": "claude_code_failed"}
+    long_msg = "x" * 700
+    task.latest_status_message = long_msg
+
+    event = _compact_infra_child_event(leg="smoketest", failed_task=task)
+
+    assert "child_tail" in event
+    assert len(event["child_tail"]) == 500
+    assert event["child_tail"] == long_msg[-500:]
+
+
+def test_compact_infra_child_event_omits_child_tail_when_status_message_none():
+    """child_tail must be absent when latest_status_message is None."""
+    from app.release_qualifier_audit import _compact_infra_child_event
+
+    task = MagicMock()
+    task.id = uuid.uuid4()
+    task.status = "FAILED"
+    task.context = {}
+    task.latest_status_message = None
+
+    event = _compact_infra_child_event(leg="audit", failed_task=task)
+
+    assert "child_tail" not in event
+
+
+def test_compact_infra_child_event_omits_child_tail_when_failed_task_none():
+    """child_tail must be absent when failed_task is None."""
+    from app.release_qualifier_audit import _compact_infra_child_event
+
+    event = _compact_infra_child_event(leg="audit", failed_task=None)
+
+    assert "child_tail" not in event
+    assert "failed_task_id" not in event
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_infra_child_events_propagates_child_tail(db_session):
+    """Integration: a task with latest_status_message produces an event with child_tail."""
+    from app.release_qualifier_audit import _collect_terminal_infra_child_events
+
+    project = Project(
+        name="Child-tail-test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="Audit with tail",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+        latest_status_message="Error: claude_code_failed — the agent exited with CODE_ERROR",
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    qual = {
+        "audit_task_id": str(audit_task.id),
+        "infra_failure_child_events": [],
+    }
+
+    result = await _collect_terminal_infra_child_events(
+        db_session, qual, infra_error="audit_failed"
+    )
+
+    assert len(result) == 1
+    assert result[0]["leg"] == "audit"
+    assert result[0]["child_tail"] == "Error: claude_code_failed — the agent exited with CODE_ERROR"
 
 
 # ===========================================================================
