@@ -4702,6 +4702,26 @@ async def _record_infra_dimension_unavailable(
             prior = existing.detail.get("consecutive_infra_errors")
             if isinstance(prior, int) and not isinstance(prior, bool):
                 prior_streak = prior
+        elif existing is None:
+            # No row for this candidate SHA yet — carry the streak forward from
+            # the most recent unavailable row for this dimension at ANY SHA so
+            # that the cap still fires on a moving automain (new SHA each cycle).
+            prior_row = (
+                await session.execute(
+                    select(QualificationDimensionResult)
+                    .where(
+                        QualificationDimensionResult.release_version_id == version.id,
+                        QualificationDimensionResult.dimension == dimension,
+                        QualificationDimensionResult.status == "unavailable",
+                    )
+                    .order_by(QualificationDimensionResult.computed_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            if prior_row is not None and isinstance(prior_row.detail, dict):
+                prior = prior_row.detail.get("consecutive_infra_errors")
+                if isinstance(prior, int) and not isinstance(prior, bool):
+                    prior_streak = prior
     except Exception as exc:  # noqa: BLE001 — best-effort read of the prior streak
         logger.warning(
             "[RELEASE_QUALIFIER] failed to read prior infra streak for dimension "
