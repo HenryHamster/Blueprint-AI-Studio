@@ -882,6 +882,32 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
     expect(mocks.apiPost).not.toHaveBeenCalled();
   });
+  it('repairs a transient malformed final result before failing the turn', async () => {
+    const valid = emptyFinalResult('Recovered after format repair.');
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: '{"reply":"narrative only"}',
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(valid),
+      });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(2);
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+    expect(mocks.apiPost.mock.calls[0][0]).toBe('/api/agent/resident-turn/complete');
+    expect(mocks.apiPost.mock.calls[0][1]).toMatchObject({
+      result: { reply: 'Recovered after format repair.' },
+    });
+  });
+
   it('fails closed on malformed provider output', async () => {
     mocks.runClaudeCode.mockResolvedValue({
       exitCode: 0,

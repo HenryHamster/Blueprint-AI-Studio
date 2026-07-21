@@ -28,6 +28,7 @@ import {
   residentResultRepairPrompt,
   residentResultShapeError,
 } from './strategic-resident-result.js';
+import { repairStructuredOutput } from './structured-output-repair.js';
 
 // Claude CLI permission rules define bare `*` as every built-in, MCP, plugin,
 // and future tool. A finite denylist would reopen authority as tools evolve.
@@ -65,14 +66,21 @@ export function residentProviderSupportsNoTools(provider: string): boolean {
   return NO_TOOL_PROVIDERS.has(provider);
 }
 
+const FINAL_RESULT_REQUIRED_KEYS = [
+  'reply', 'facts', 'evidence', 'operations', 'receipts', 'unknown_effects',
+  'strategic_implications', 'proposed_memory', 'follow_up',
+  'required_attention', 'reconciliation',
+];
+
+const FINAL_RESULT_FORMAT_REOPEN_PROMPT = [
+  'Your previous Resident turn response did not include the complete final structured result.',
+  'Return ONLY the complete JSON object — no prose, no markdown.',
+  FINAL_RESULT_SCHEMA_HINT,
+].join('\n\n');
+
 function requireResult(texts: string[]): Record<string, unknown> {
-  const keys = [
-    'reply', 'facts', 'evidence', 'operations', 'receipts', 'unknown_effects',
-    'strategic_implications', 'proposed_memory', 'follow_up',
-    'required_attention', 'reconciliation',
-  ];
   for (const text of texts) {
-    const parsed = extractJsonObjectDetailed(text, ...keys);
+    const parsed = extractJsonObjectDetailed(text, ...FINAL_RESULT_REQUIRED_KEYS);
     if (parsed.ok) return parsed.value;
   }
   throw new Error('Resident provider did not return the exact structured result');
@@ -526,21 +534,59 @@ export async function handleStrategicResidentTurn(
         false,
         boundary.runOptions,
       );
-      if (run.exitCode !== 0) {
-        throw new Error(`Resident provider exited with code ${run.exitCode}`);
-      }
       const texts = [run.lastResultText, run.allOutput];
       if (!actionsAllowed) {
         if (capabilityAction(texts)) {
           throw new Error('Resident requested a capability after the action phase closed');
         }
-        result = requireResult(texts);
+        const repairResult = await repairStructuredOutput<Record<string, unknown>>({
+          mode: 'object',
+          requiredKeys: FINAL_RESULT_REQUIRED_KEYS,
+          first: run,
+          reopenPrompt: FINAL_RESULT_FORMAT_REOPEN_PROMPT,
+          ws,
+          statusRef,
+          model,
+          effort,
+          disallowedTools: ALL_TOOLS,
+          retryStatus: 'Repairing Resident format slip...',
+          runOptions: boundary.runOptions,
+        });
+        if (repairResult.value === null) {
+          if (run.exitCode !== 0) {
+            throw new Error(`Resident provider exited with code ${run.exitCode}`);
+          }
+          throw new Error('Resident provider did not return the exact structured result');
+        }
+        result = repairResult.value;
         break;
       }
       const action = capabilityAction(texts);
       if (!action) {
-        result = requireResult(texts);
+        const repairResult = await repairStructuredOutput<Record<string, unknown>>({
+          mode: 'object',
+          requiredKeys: FINAL_RESULT_REQUIRED_KEYS,
+          first: run,
+          reopenPrompt: FINAL_RESULT_FORMAT_REOPEN_PROMPT,
+          ws,
+          statusRef,
+          model,
+          effort,
+          disallowedTools: ALL_TOOLS,
+          retryStatus: 'Repairing Resident format slip...',
+          runOptions: boundary.runOptions,
+        });
+        if (repairResult.value === null) {
+          if (run.exitCode !== 0) {
+            throw new Error(`Resident provider exited with code ${run.exitCode}`);
+          }
+          throw new Error('Resident provider did not return the exact structured result');
+        }
+        result = repairResult.value;
         break;
+      }
+      if (run.exitCode !== 0) {
+        throw new Error(`Resident provider exited with code ${run.exitCode}`);
       }
       if (requestKeys.size + action.requests.length > MAX_CAPABILITY_REQUESTS) {
         throw new Error('Resident capability request budget exceeded');

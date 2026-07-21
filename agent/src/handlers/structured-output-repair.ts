@@ -1,5 +1,6 @@
 import type WebSocket from 'ws';
 import { sendLog, runClaudeCode } from '../index.js';
+import type { ProviderRunOptions } from '../providers/runners.js';
 import {
   extractJsonObjectDetailed, extractJsonArrayDetailed,
   describeJsonExtractionResult, JsonExtractionError,
@@ -67,6 +68,10 @@ export interface RepairStructuredOutputOptions {
    *  that fails schema validation is treated like a format miss and reopened
    *  once, using the returned miss reason. */
   validateParsedValue?: (value: unknown) => ParsedValueValidationResult;
+  /** Optional provider-level run options forwarded to the reopen runClaudeCode call.
+   *  Required when the original run used a process boundary (e.g. the Resident boundary)
+   *  so the repair call runs inside the same isolated environment. */
+  runOptions?: ProviderRunOptions;
 }
 
 export type ParsedValueValidationResult =
@@ -227,7 +232,7 @@ export async function repairStructuredOutput<T = unknown>(
     const missAwarePrompt = buildMissAwarePrompt(firstAttempt.missReason, requiredKeys, reopenPrompt, priorOutput);
     const tokensBefore = getLlmTelemetry();
     const retryRun = await runClaudeCode(
-      missAwarePrompt, ws, statusRef, model, effort, disallowedTools,
+      missAwarePrompt, ws, statusRef, model, effort, disallowedTools, undefined, opts.runOptions,
     );
     const tokensAfter = getLlmTelemetry();
     recordFormatRepairTokens(
