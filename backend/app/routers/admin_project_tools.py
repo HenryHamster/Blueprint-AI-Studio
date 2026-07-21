@@ -1971,19 +1971,6 @@ async def trigger_project_compute_image_build(
     ``tag``, ``built``, ``already_present``.  Surfaces build failures (ValueError /
     RuntimeError from the pipeline) as a 422 rather than a 500 traceback.
 
-    **Async build contract (200 vs 202).** When the off-orchestrator builder
-    backend is enabled (``COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED``) and a real
-    build is needed, the build is dispatched to a throwaway builder VM and this
-    returns **202 Accepted** with ``{status, build_id, builder_vm_id, dep_hash,
-    async: true, adopted}`` plus the legacy fields as unresolved placeholders
-    (``pinned_ref``/``digest`` null, ``built`` false). The build is finalized
-    asynchronously by the reaper poll sweep; poll
-    ``GET .../compute-image/status`` (which surfaces in-flight builds under
-    ``active_builds``) to observe completion. An already-present image and a
-    ``dry_run`` request still complete inline and return **200** with the
-    persisted fields. When the backend flag is off the whole build runs inline
-    and always returns 200 (the pre-existing behavior).
-
     **Requires OWNER role.** A build runs docker on the orchestrator host and
     pushes to the shared compute-image registry — a privileged, expensive,
     host-affecting operation, not the member-grade read/save that the rest of
@@ -2106,37 +2093,6 @@ async def trigger_project_compute_image_build(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    # ASYNC CONTRACT: when the off-orchestrator builder backend is enabled and a
-    # real build is needed, the build was handed to a throwaway builder VM and is
-    # NOT finished — the reaper poll sweep finalizes the ProjectComputeImage pin.
-    # Return 202 with the tracking id instead of the synchronous build record.
-    # An already-present image or a ``dry_run`` request still completes inline and
-    # returns 200 with the persisted fields below, so existing callers that expect
-    # a synchronous result keep working for those cases; a caller that triggers a
-    # real async build MUST handle 202 (the ``async`` flag marks it).
-    if isinstance(result, _cb.AsyncImageBuildDispatch):
-        return Response(
-            content=_json.dumps(
-                {
-                    "status": result.status,
-                    "build_id": str(result.build_id),
-                    "builder_vm_id": result.builder_vm_id,
-                    "dep_hash": result.dep_hash,
-                    "async": True,
-                    "adopted": result.adopted,
-                    # Backward-compat fields the admin-ui already reads — present
-                    # but unresolved because the build has not completed yet.
-                    "pinned_ref": None,
-                    "digest": None,
-                    "tag": result.dep_hash,
-                    "built": False,
-                    "already_present": False,
-                }
-            ),
-            media_type="application/json",
-            status_code=202,
-        )
 
     result = await _preserve_existing_digest_pin(session, project.id, result)
 

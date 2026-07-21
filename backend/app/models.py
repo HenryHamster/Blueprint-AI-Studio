@@ -4038,6 +4038,12 @@ class DeploymentState(SQLModel, table=True):
     pipeline_events_state: Dict[str, Any] | None = Field(
         default=None, sa_column=Column(JSONB, nullable=True)
     )
+    # Persisted GC-guard sweep state — cumulative totals survive process restarts
+    # so the operator readiness signal (get_compute_image_gc_guard_readiness)
+    # reflects durable observed history rather than resetting to zero on deploy.
+    gc_guard_state: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
     # Previous deploy tracking — populated when a new deploy supersedes the
     # current one. Lets RecentChangesContext builders compute the commit range
     # (prior_deploy_sha..current_sha) without a live git checkout.

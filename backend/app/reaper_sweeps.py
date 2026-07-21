@@ -62,12 +62,10 @@ from app.compute_jobs import (
 from app.database import AsyncSessionLocal
 from app.models import (
     ArtifactRefPromotionIntent,
-    ComputeImageBuildStatus,
     ComputeJob,
     ComputeJobFile,
     ComputeJobStatus,
     LocalRunner,
-    ProjectComputeImageBuild,
     ProjectMessageAttachmentUpload,
     Task,
     TaskStatus,
@@ -466,7 +464,7 @@ async def sweep_stalled_strategic_cycles(
     # Pause-aware: a cycle whose completion handler simply could not run while
     # the pipeline was paused must not be force-terminated as "stalled". Passing
     # the deploy state makes find_stalled's 3h deadline exclude pause time.
-    from app.models import DeploymentState  # noqa: PLC0415
+    from app.models import DeploymentState
 
     _deploy_state = await session.get(DeploymentState, 1)
     stalled = await strategic_cycle.find_stalled(session, deploy_state=_deploy_state)
@@ -2552,6 +2550,57 @@ _gc_guard_first_run_at: datetime | None = None
 _gc_guard_last_run_at: datetime | None = None
 # Per-execution snapshot of the last non-cadence-skipped sweep run.
 _gc_guard_last_result: dict[str, int] | None = None
+# Set to True once the DB-persisted state has been loaded into the module
+# globals above (happens on the first sweep execution per process lifetime).
+_gc_guard_state_loaded_from_db: bool = False
+
+async def _load_gc_guard_state_from_db(session) -> None:
+    """Seed module-global GC-guard counters from the DeploymentState row.
+
+    Called once per process lifetime (lazy, on the first sweep execution) to
+    restore cumulative totals that survived a process restart/redeploy.  A
+    missing DeploymentState row or a NULL ``gc_guard_state`` column is silently
+    ignored — the sweep simply starts from zero for this process.
+    """
+    global _gc_guard_state_loaded_from_db
+    global _gc_guard_total_runs, _gc_guard_total_applied, _gc_guard_total_pruned
+    global _gc_guard_total_apply_failed, _gc_guard_consecutive_healthy_cycles
+    global _gc_guard_first_run_at, _gc_guard_last_run_at, _gc_guard_last_result
+    _gc_guard_state_loaded_from_db = True  # mark loaded even if DB has no data
+    try:
+        from app.models import DeploymentState
+
+        row = (
+            (
+                await session.execute(
+                    select(DeploymentState).where(DeploymentState.id == 1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        state = (row.gc_guard_state or {}) if row is not None else {}
+        if not state:
+            return
+        _gc_guard_total_runs = int(state.get("total_runs", 0))
+        _gc_guard_total_applied = int(state.get("total_applied", 0))
+        _gc_guard_total_pruned = int(state.get("total_pruned", 0))
+        _gc_guard_total_apply_failed = int(state.get("total_apply_failed", 0))
+        _gc_guard_consecutive_healthy_cycles = int(
+            state.get("consecutive_healthy_cycles", 0)
+        )
+        raw_first = state.get("first_run_at")
+        if raw_first:
+            _gc_guard_first_run_at = datetime.fromisoformat(raw_first)
+        raw_last = state.get("last_run_at")
+        if raw_last:
+            _gc_guard_last_run_at = datetime.fromisoformat(raw_last)
+        last_result = state.get("last_result")
+        if isinstance(last_result, dict):
+            _gc_guard_last_result = dict(last_result)
+    except Exception:  # noqa: BLE001 — never crash the sweep on a DB restore failure
+        logger.exception("_load_gc_guard_state_from_db: failed to restore GC-guard state")
+
 
 # Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
 # an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
@@ -2746,6 +2795,7 @@ async def sweep_protect_referenced_compute_image_digests(
     global _last_compute_image_gc_guard_sweep, _gc_guard_total_runs, _gc_guard_total_applied
     global _gc_guard_total_pruned, _gc_guard_total_apply_failed, _gc_guard_consecutive_healthy_cycles
     global _gc_guard_first_run_at, _gc_guard_last_run_at, _gc_guard_last_result
+    global _gc_guard_state_loaded_from_db
     from app.compute_image_build import (
         apply_registry_protection_tag,
         delete_registry_protection_tag,
@@ -2756,6 +2806,11 @@ async def sweep_protect_referenced_compute_image_digests(
     from app.models import Project, ProjectComputeImage
 
     _now = now or _utcnow()
+
+    # Restore durable counters from the DB on the first sweep call per process.
+    if not _gc_guard_state_loaded_from_db:
+        await _load_gc_guard_state_from_db(session)
+
     if not _is_cadence_due(
         _last_compute_image_gc_guard_sweep,
         _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS,
@@ -3003,7 +3058,7 @@ async def sweep_protect_referenced_compute_image_digests(
             await _alert_compute_image_protection_failures(
                 session, failed_projects, apply_failed=apply_failed, now=_now
             )
-        except Exception:  # noqa: BLE001 — alerting must never crash the sweep
+        except Exception:
             logger.exception(
                 "sweep_protect_referenced_compute_image_digests: failed to raise "
                 "protection-failure alert(s)"
@@ -3029,6 +3084,41 @@ async def sweep_protect_referenced_compute_image_digests(
         _gc_guard_consecutive_healthy_cycles += 1
     else:
         _gc_guard_consecutive_healthy_cycles = 0
+
+    # Persist cumulative state to DB so it survives process restarts/redeploys.
+    try:
+        from app.models import DeploymentState
+        from sqlalchemy import update as _sa_update
+
+        await session.execute(
+            _sa_update(DeploymentState)
+            .where(DeploymentState.id == 1)
+            .values(
+                gc_guard_state={
+                    "total_runs": _gc_guard_total_runs,
+                    "total_applied": _gc_guard_total_applied,
+                    "total_pruned": _gc_guard_total_pruned,
+                    "total_apply_failed": _gc_guard_total_apply_failed,
+                    "consecutive_healthy_cycles": _gc_guard_consecutive_healthy_cycles,
+                    "first_run_at": _gc_guard_first_run_at.isoformat()
+                    if _gc_guard_first_run_at
+                    else None,
+                    "last_run_at": _gc_guard_last_run_at.isoformat()
+                    if _gc_guard_last_run_at
+                    else None,
+                    "last_result": dict(_gc_guard_last_result)
+                    if _gc_guard_last_result
+                    else None,
+                }
+            )
+        )
+        await session.commit()
+    except Exception:  # noqa: BLE001 — persistence failure must never crash the sweep
+        logger.exception(
+            "sweep_protect_referenced_compute_image_digests: failed to persist GC-guard state"
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
     return {
         "applied": applied,
@@ -3152,7 +3242,6 @@ async def sweep_refresh_project_compute_images(
         return {
             "projects": 0,
             "rebuilt": 0,
-            "dispatched": 0,
             "unchanged": 0,
             "no_config": 0,
             "deferred": 0,
@@ -3200,7 +3289,6 @@ async def sweep_refresh_project_compute_images(
     summary = {
         "projects": 0,
         "rebuilt": 0,
-        "dispatched": 0,
         "unchanged": 0,
         "no_config": 0,
         "deferred": 0,
@@ -3257,13 +3345,6 @@ async def sweep_refresh_project_compute_images(
                     project_id,
                     exc_info=True,
                 )
-        elif status == "dispatched":
-            # Off-orchestrator async build kicked off; it counts against the
-            # per-cycle build budget. The reaper poll sweep records the pin (and
-            # any drift alert fires once the pinned_ref is known), so nothing to
-            # record here.
-            summary["dispatched"] += 1
-            builds_done += 1
         elif status == "unchanged":
             summary["unchanged"] += 1
         elif status == "no_config":
@@ -3292,204 +3373,18 @@ async def sweep_refresh_project_compute_images(
 
     if (
         summary["rebuilt"]
-        or summary["dispatched"]
         or summary["deferred"]
         or summary["errors"]
     ):
         logger.info(
-            "[REAPER] compute-image auto-refresh: rebuilt=%d dispatched=%d "
+            "[REAPER] compute-image auto-refresh: rebuilt=%d "
             "unchanged=%d deferred=%d no_config=%d errors=%d (of %d project(s))",
             summary["rebuilt"],
-            summary["dispatched"],
             summary["unchanged"],
             summary["deferred"],
             summary["no_config"],
             summary["errors"],
             summary["projects"],
-        )
-    return summary
-
-
-# ── Off-orchestrator image-build poll monitor (Step 22d-ii of the reaper cycle) ──
-#
-# Sibling of the compute-job monitor: it drives BUILDING ProjectComputeImageBuild
-# rows to a terminal state by polling the throwaway builder VM's serial marker /
-# durable terminal.json, then records the pinned image (through the same
-# digest-preservation guard the inline path uses) and reaps the VM. Past its
-# deadline a build's VM is deleted and the row is marked TIMED_OUT.
-#
-# This sweep IS registered in the reaper cycle (reaper.py Step 22d-ii) and runs
-# on every reaper tick. It handles the async ephemeral-VM builder lane; the
-# synchronous Cloud Build lane completes inline at Step 22d.
-_IMAGE_BUILD_POLL_MAX_ROWS = 25
-
-
-async def sweep_poll_image_builds(
-    session,
-    now=None,
-    *,
-    _backend=None,
-    _record_fn=None,
-    _preserve_fn=None,
-    _reap_fn=None,
-    max_builds: int = _IMAGE_BUILD_POLL_MAX_ROWS,
-) -> dict[str, int]:
-    """Poll BUILDING off-orchestrator compute-image builds to a terminal state.
-
-    For each ``BUILDING`` :class:`ProjectComputeImageBuild` row (bounded to
-    ``max_builds``):
-
-    * **Past deadline** — delete the builder VM and mark the row ``TIMED_OUT``
-      (a build that ran past its wall-clock ceiling never completes on its own).
-    * **SUCCEEDED** — reconstruct a ``BuildResult`` from the tool's parsed
-      ``RESULT_JSON``, run it through the digest-preservation guard, UPSERT the
-      ``ProjectComputeImage`` pin, persist ``result_json``, mark ``SUCCEEDED``,
-      and reap the VM.
-    * **FAILED** — persist the reason, mark ``FAILED``, and reap the VM.
-    * **still BUILDING** — leave the row untouched for the next pass.
-
-    All VM/serial/registry calls go through the injected ``_backend`` /
-    ``_record_fn`` / ``_preserve_fn`` / ``_reap_fn`` seams so the state machine is
-    testable with no cloud I/O. A per-row failure is isolated — it never aborts
-    the sweep. Returns a summary dict of per-outcome counts. The reaper (once this
-    is wired) wraps it so a raised error can never crash the cycle.
-    """
-    from app import compute_backends as _cb
-
-    _now = now or _utcnow()
-    backend = _backend if _backend is not None else _cb.get_image_builder_backend()
-    record_fn = _record_fn if _record_fn is not None else _cb.record_project_compute_image_build
-    preserve_fn = (
-        _preserve_fn if _preserve_fn is not None else _cb._preserve_existing_digest_pin_cb
-    )
-
-    async def _default_reap(build: ProjectComputeImageBuild) -> bool:
-        return await backend.abort(build, reason="reap_after_terminal")
-
-    reap_fn = _reap_fn if _reap_fn is not None else _default_reap
-
-    rows = (
-        (
-            await session.execute(
-                select(ProjectComputeImageBuild)
-                .where(
-                    ProjectComputeImageBuild.status == ComputeImageBuildStatus.BUILDING
-                )
-                .order_by(ProjectComputeImageBuild.created_at)
-                .limit(max_builds)
-            )
-        )
-        .scalars()
-        .all()
-    )
-
-    summary = {
-        "polled": 0,
-        "succeeded": 0,
-        "failed": 0,
-        "timed_out": 0,
-        "still_building": 0,
-        "errors": 0,
-    }
-    for build in rows:
-        summary["polled"] += 1
-        try:
-            # Deadline first: a build past its wall-clock ceiling is reaped and
-            # marked TIMED_OUT without trusting a (possibly never-coming) marker.
-            if build.deadline_at is not None and _now >= build.deadline_at:
-                await reap_fn(build)
-                build.status = ComputeImageBuildStatus.TIMED_OUT
-                build.error_reason = "build exceeded its wall-clock deadline"
-                build.updated_at = _now
-                session.add(build)
-                await session.commit()
-                with contextlib.suppress(Exception):
-                    from app.alert_dispatch import (
-                        _maybe_create_compute_image_build_failure_alert,
-                    )
-                    await _maybe_create_compute_image_build_failure_alert(
-                        session, build, failure_kind="timed_out"
-                    )
-                summary["timed_out"] += 1
-                continue
-
-            status = await backend.poll(build)
-            if status.status == ComputeImageBuildStatus.BUILDING:
-                summary["still_building"] += 1
-                continue
-
-            if status.status == ComputeImageBuildStatus.SUCCEEDED:
-                result_payload = status.result or {}
-                build_result = _cb.build_result_from_serial_payload(
-                    result_payload, dep_hash=build.dep_hash
-                )
-                # Never let a digest-less result NULL an already-stored pin.
-                build_result = await preserve_fn(
-                    session, build.project_id, build_result
-                )
-                await record_fn(
-                    session,
-                    build.project_id,
-                    build.registry_repo,
-                    build.image_name,
-                    build_result,
-                )
-                build.status = ComputeImageBuildStatus.SUCCEEDED
-                build.result_json = build_result.to_json()
-                build.error_reason = None
-                build.updated_at = _now
-                build.image_published_at = _now
-                session.add(build)
-                await session.commit()
-                await reap_fn(build)
-                with contextlib.suppress(Exception):
-                    from app.alert_dispatch import _maybe_create_compute_image_drift_alert
-
-                    await _maybe_create_compute_image_drift_alert(
-                        session,
-                        build.project_id,
-                        dep_hash=build.dep_hash,
-                        pinned_ref=getattr(build_result, "pinned_ref", None),
-                    )
-                summary["succeeded"] += 1
-                continue
-
-            # FAILED (or any non-BUILDING/SUCCEEDED terminal state).
-            build.status = ComputeImageBuildStatus.FAILED
-            build.error_reason = status.reason or "image build failed"
-            build.updated_at = _now
-            session.add(build)
-            await session.commit()
-            await reap_fn(build)
-            with contextlib.suppress(Exception):
-                from app.alert_dispatch import (
-                    _maybe_create_compute_image_build_failure_alert,
-                )
-                await _maybe_create_compute_image_build_failure_alert(
-                    session, build, failure_kind="failed"
-                )
-            summary["failed"] += 1
-        except Exception:  # noqa: BLE001 — isolate a per-row failure
-            logger.warning(
-                "[REAPER] image-build poll raised for build %s",
-                getattr(build, "id", "?"),
-                exc_info=True,
-            )
-            with contextlib.suppress(Exception):
-                await session.rollback()
-            summary["errors"] += 1
-            continue
-
-    if summary["succeeded"] or summary["failed"] or summary["timed_out"] or summary["errors"]:
-        logger.info(
-            "[REAPER] image-build poll: succeeded=%d failed=%d timed_out=%d "
-            "still_building=%d errors=%d (of %d row(s))",
-            summary["succeeded"],
-            summary["failed"],
-            summary["timed_out"],
-            summary["still_building"],
-            summary["errors"],
-            summary["polled"],
         )
     return summary
 
@@ -3711,7 +3606,6 @@ __all__ = [
     "sweep_protect_referenced_compute_image_digests",
     "get_compute_image_gc_guard_readiness",
     "sweep_refresh_project_compute_images",
-    "sweep_poll_image_builds",
     "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
     "VIEWABLE_ARTIFACT_RETENTION_DAYS",
