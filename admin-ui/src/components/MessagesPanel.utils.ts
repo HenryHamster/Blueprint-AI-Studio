@@ -12,7 +12,7 @@
 // 3. If escalation, add a badge label to ESCALATION_BADGE_LABELS
 // The invariant test will fail and tell you exactly what's missing.
 
-export { ESCALATION_EVENT_TYPES, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, HIGH_SIGNAL_NOTE_EVENTS, CRITICAL_NOTE_EVENTS, ROUTINE_EVENT_LABELS } from './eventPrefs';
+export { ESCALATION_EVENT_TYPES, ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS, HIGH_SIGNAL_NOTE_EVENTS, CRITICAL_NOTE_EVENTS, ROUTINE_EVENT_LABELS, STRATEGIST_INTERNAL_FALLBACK_BLOCK } from './eventPrefs';
 export { type EventPref, EVENT_PREFS_KEY, eventPrefsKey, loadEventPrefs, saveEventPrefs, classifySignalLevel, effectiveSignal, getToastSeverity, isCriticalSeverity, countHighSignalMessages, countNewSinceLastVisit } from './eventPrefs';
 export { type MuteWindow, muteWindowKey, loadMuteWindow, saveMuteWindow, clearMuteWindow, isMuteWindowActive, formatMuteCountdown } from './muteWindow';
 export { SAVED_VIEWS_CAP, type SavedView, type SavedViewsFile, savedViewsKey, loadSavedViews, saveSavedViews } from './savedViews';

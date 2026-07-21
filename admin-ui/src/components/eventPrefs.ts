@@ -103,6 +103,18 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   'operator_decision.capture_rate_low': 'op-decision capture rate',
 };
 
+// Event types that the server stamps as audience=strategist-internal. All entries
+// in ROUTINE_EVENT_LABELS are strategist-internal per event_type_snapshot.json,
+// so this set is derived from those keys. Used as a fallback block in
+// classifySignalLevel: if a message arrives without an audience stamp (legacy),
+// we must not let HIGH_SIGNAL_NOTE_EVENTS drift accidentally re-promote an event
+// that the server designates strategist-internal.
+// Invariant: STRATEGIST_INTERNAL_FALLBACK_BLOCK ∩ HIGH_SIGNAL_NOTE_EVENTS = ∅
+// Pinned by: MessagesPanel.invariant.test.ts
+export const STRATEGIST_INTERNAL_FALLBACK_BLOCK: ReadonlySet<string> = new Set(
+  Object.keys(ROUTINE_EVENT_LABELS),
+);
+
 export type EventPref = 'mute' | 'routine' | 'surfaced';
 
 export const EVENT_PREFS_KEY = 'messages_panel_event_prefs';
@@ -161,6 +173,9 @@ export function classifySignalLevel(msg: {
   if (['FEEDBACK', 'BLOCKER', 'BUG_REPORT', 'QUESTION'].includes(msg.message_type)) return 'high';
   if (msg.message_type === 'NOTE') {
     const et = msg.context.event_type as string | undefined;
+    // Guard: strategist-internal events must never be re-promoted by the
+    // HIGH_SIGNAL_NOTE_EVENTS fallback, even if they drift into that set.
+    if (et && STRATEGIST_INTERNAL_FALLBACK_BLOCK.has(et)) return 'routine';
     if (et && HIGH_SIGNAL_NOTE_EVENTS.has(et)) return 'high';
   }
   return 'routine';

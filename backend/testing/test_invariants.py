@@ -2246,6 +2246,15 @@ class TestSchemaRevisionSync:
                     c.func.attr in _DATA_ONLY_OP_ATTRS for c in up_calls
                 ):
                     continue
+                # Truly no-op migrations: upgrade has no op.* calls AND
+                # downgrade is also empty/pass-only.  These are legitimate
+                # placeholder migrations (e.g. bump-only revisions with no
+                # schema changes) — a pass downgrade is correct, not an
+                # oversight.
+                if not up_calls and (
+                    not body or all(isinstance(n, ast.Pass) for n in body)
+                ):
+                    continue
 
             # Empty or only `pass`
             if not body or all(isinstance(n, ast.Pass) for n in body):

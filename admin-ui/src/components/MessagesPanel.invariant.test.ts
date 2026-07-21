@@ -5,6 +5,7 @@ import {
   ROUTINE_EVENT_LABELS,
   ESCALATION_EVENT_TYPES,
   ESCALATION_BADGE_LABELS,
+  STRATEGIST_INTERNAL_FALLBACK_BLOCK,
   classifySignalLevel,
 } from './MessagesPanel.utils';
 import eventTypeSnapshot from '../../../backend/testing/event_type_snapshot.json';
@@ -161,6 +162,51 @@ describe('event-type classification invariant', () => {
         default:
           throw new Error(`Unknown classification: ${classification}`);
       }
+    }
+  });
+
+  it('every snapshot strategist-internal event_type is in STRATEGIST_INTERNAL_FALLBACK_BLOCK', () => {
+    // Pins that STRATEGIST_INTERNAL_FALLBACK_BLOCK covers all server-designated
+    // strategist-internal event types — so the fallback guard in classifySignalLevel
+    // can never miss one and re-promote it via HIGH_SIGNAL_NOTE_EVENTS drift.
+    const strategistInternalTypes = snapshotEventTypes
+      .filter(e => e.audience === 'strategist-internal')
+      .map(e => e.name);
+    for (const et of strategistInternalTypes) {
+      expect(
+        STRATEGIST_INTERNAL_FALLBACK_BLOCK.has(et),
+        `snapshot strategist-internal event_type "${et}" is missing from STRATEGIST_INTERNAL_FALLBACK_BLOCK`,
+      ).toBe(true);
+    }
+  });
+
+  it('HIGH_SIGNAL_NOTE_EVENTS and STRATEGIST_INTERNAL_FALLBACK_BLOCK are disjoint', () => {
+    // If any event_type drifts into both sets, the guard in classifySignalLevel
+    // would silence a legitimate high-signal event. This invariant prevents that.
+    const overlap = Array.from(HIGH_SIGNAL_NOTE_EVENTS).filter(et =>
+      STRATEGIST_INTERNAL_FALLBACK_BLOCK.has(et),
+    );
+    expect(
+      overlap,
+      `event_types in both HIGH_SIGNAL_NOTE_EVENTS and STRATEGIST_INTERNAL_FALLBACK_BLOCK: ${overlap.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('classifySignalLevel returns routine for strategist-internal event_types under NULL audience', () => {
+    // Exercises the STRATEGIST_INTERNAL_FALLBACK_BLOCK guard path in classifySignalLevel.
+    // A NULL-audience NOTE message must classify as routine even for event_types that
+    // could drift into HIGH_SIGNAL_NOTE_EVENTS, because the server designates them
+    // strategist-internal.
+    const strategistInternalTypes = snapshotEventTypes
+      .filter(e => e.audience === 'strategist-internal')
+      .map(e => e.name);
+    for (const et of strategistInternalTypes) {
+      const result = classifySignalLevel({
+        from_type: 'system',
+        message_type: 'NOTE',
+        context: { event_type: et },  // no audience field — legacy NULL-audience path
+      });
+      expect(result, `classifySignalLevel returned "${result}" for strategist-internal "${et}" without audience`).toBe('routine');
     }
   });
 });
