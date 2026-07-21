@@ -121,6 +121,14 @@ Findings covered here (1-finding baked-image authoring-prompt salvage bundle, 20
           research-plan.ts injects baked_image_ref preference into the local-runner note;
           strategic.ts buildLocalRunnerSection emits baked-image guidance when baked_image_ref present
 
+Findings covered here (1-finding baked-image authoring-prompt salvage bundle, task db1e30ca, 2026-07-21):
+  db-1 — same as bi-1; all three prompt files (thinker.ts, research-plan.ts, strategic.ts) already
+          instruct agents to OMIT container_image when a project-baked image is listed and the
+          backend strategic_spawning.py already injects baked_image_ref into local_runner_status.
+          Already pinned by test_thinker_prefers_baked_image_over_always_set_explicitly,
+          test_research_plan_injects_baked_image_ref_into_local_runner_note, and
+          test_strategic_local_runner_section_includes_baked_image_guidance.
+
 Findings covered here (1-finding greenfield onboarding invariant bundle, task c1160063, 2026-07-21):
   c1-1 — end-to-end: repo_bootstrap.spawn_bootstrap_task suppresses the clone_failed loop via
           _self_heal_undetermined_emptiness + repo_is_empty guard; knowledge_completion wires
@@ -6678,4 +6686,47 @@ def test_c1_greenfield_unit_test_files_cover_both_seams():
     assert "_design_web_only_grounding_miss" in web_url_src, (
         "test_design_web_url_reachability.py must import and exercise "
         "_design_web_only_grounding_miss directly"
+    )
+
+
+# ── 1-finding baked-image authoring-prompt salvage bundle (task db1e30ca, 2026-07-21) ── #
+# Finding db-1 is identical to bi-1; all three prompt files and the backend
+# strategic_spawning.py already carry the project-baked image preference.
+# Full coverage in the bi-1 test suite below.
+# --------------------------------------------------------------------------- #
+
+
+def test_db_1_baked_image_authoring_preference_already_wired():
+    """Authoring agents must prefer project-baked images; backend must inject baked_image_ref.
+
+    Finding db-1 (same as bi-1): thinker.ts, research-plan.ts, and strategic.ts must all
+    instruct agents to OMIT container_image when a project-baked image is listed, and the
+    backend must inject baked_image_ref into local_runner_status so the prompt channel
+    carries the digest-pinned image reference.
+
+    Full coverage already provided by test_thinker_prefers_baked_image_over_always_set_explicitly,
+    test_research_plan_injects_baked_image_ref_into_local_runner_note, and
+    test_strategic_local_runner_section_includes_baked_image_guidance. This function
+    cross-references those invariants under the db prefix.
+    """
+    thinker_src = _find_repo_file("agent/src/prompts/thinker.ts").read_text()
+    research_src = _find_repo_file("agent/src/handlers/research-plan.ts").read_text()
+    strategic_src = _find_repo_file("agent/src/handlers/strategic.ts").read_text()
+    spawning_src = _find_repo_file("backend/app/strategic_spawning.py").read_text()
+
+    assert "Prefer the project-baked image" in thinker_src, (
+        "thinker.ts must guide agents to prefer the project-baked image over always "
+        "setting container_image explicitly"
+    )
+    assert "baked_image_ref" in research_src, (
+        "research-plan.ts must read baked_image_ref from local_runner_status to surface "
+        "the project-baked image to authoring agents"
+    )
+    assert "baked_image_ref" in strategic_src, (
+        "strategic.ts buildLocalRunnerSection must handle baked_image_ref to emit baked-image "
+        "guidance in the self-hosted compute section"
+    )
+    assert "baked_image_ref" in spawning_src, (
+        "backend strategic_spawning.py must inject baked_image_ref into local_runner_status "
+        "so the prompt channel carries the digest-pinned image reference"
     )
