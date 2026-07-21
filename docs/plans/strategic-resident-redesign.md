@@ -434,7 +434,7 @@ ambient shell access, unrestricted credentials, or broader mutation authority.
 - Additional specialized reads: pipeline, qualification, PR
   reviews/comments/mergeability, branch state, CI runs/streamed logs, and
   deployment inspection.
-- Native managed `panel_review` and repeated CI-repair contracts with exact-head
+- Native managed repeated CI-repair contracts with exact-head
   CAS, correlated evidence, and return-to-Resident completion.
 - Revision-linked deployment outcome wakeups and any direct operational action
   justified by real pilot usage rather than catalog completeness.

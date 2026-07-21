@@ -751,7 +751,6 @@ AGENT_DOCKER_TYPES: frozenset[str] = frozenset(
         "self_audit",
         "security_audit",
         "review",
-        "panel_review",
         "release_audit",
         "release_audit_challenge",
         "release_merge_grade",

@@ -239,25 +239,6 @@ Update dependencies and manage versions.
 
 ## Review Task Types
 
-### `panel_review`
-
-Run a fixed multi-agent review workflow over a PR and persist a structured verdict. Spawns multiple review passes from distinct lenses (correctness, security, performance, etc.) and emits a structured `PANEL_REVIEW` artifact.
-
-**Payload:** Extends `review` payload fields.
-
-```json
-{
-  "pr_number": number,                   // PR to review (required)
-  "focus_areas": "string[]",             // Lenses to activate (optional)
-  "effort": "low|medium|high"            // Review depth (default: "medium")
-}
-```
-
-**Output artifacts:**
-- `PANEL_REVIEW` — Structured multi-lens verdict
-
----
-
 ### `review`
 
 Review a PR and leave detailed comments.

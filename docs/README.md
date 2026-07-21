@@ -241,7 +241,7 @@ QUEUED → PROVISIONING → IN_PROGRESS → EVALUATING? → COMPLETED/FAILED/CAN
 See [TASK_LIFECYCLE.md](TASK_LIFECYCLE.md) for complete lifecycle details, [DATA_MODELS.md — TaskStatus](DATA_MODELS.md#taskstatus) for enum definition, and [BACKEND_MODULES.md — task_lifecycle.py](BACKEND_MODULES.md#task_lifecyclepy) for implementation.
 
 ### Task Types
-27 bespoke agent task types: create, review, panel_review, fix, verify_tests, plan, research, strategic_review, design_doc_update, security_audit, qa, deps, docs, smoketest, migrate, debug, perf, investigate, self_audit, release_audit, release_audit_challenge, memo, compute_experiment, web_research, design, refactor, repo_bootstrap.
+26 bespoke agent task types: create, review, fix, verify_tests, plan, research, strategic_review, design_doc_update, security_audit, qa, deps, docs, smoketest, migrate, debug, perf, investigate, self_audit, release_audit, release_audit_challenge, memo, compute_experiment, web_research, design, refactor, repo_bootstrap.
 
 See [PAYLOADS_AND_SCHEMAS.md](PAYLOADS_AND_SCHEMAS.md) for payload configuration, [AGENT_HANDLERS.md](AGENT_HANDLERS.md) for handler implementation, and `agent/src/taskCapabilities.ts` for the canonical agent-side dispatch list.
 

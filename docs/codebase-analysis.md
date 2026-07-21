@@ -201,7 +201,7 @@ QUEUED
 | Category | Handlers |
 |---|---|
 | Core | `create`, `refactor`, `docs`, `qa`, `deps`, `migrate`, `debug`, `perf`, `investigate` |
-| Review/Fix | `review`, `panel_review`, `fix`, `release_audit`, `release_audit_challenge`, `release_merge_grade` |
+| Review/Fix | `review`, `fix`, `release_audit`, `release_audit_challenge`, `release_merge_grade` |
 | Planning & Research | `plan`, `research`, `web_research`, `strategic_review`, `design_doc_update` |
 | Auditing & Testing | `security_audit`, `smoketest`, `verify_tests`, `self_audit` |
 | Structured Output | `memo`, `compute_experiment`, `repo_bootstrap`, `design` |

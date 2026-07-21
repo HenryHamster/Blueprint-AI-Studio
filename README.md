@@ -147,7 +147,6 @@ Blueprint's agent currently has bespoke handlers for 27 task types. The canonica
 | `create` | Implement a new feature from a prompt |
 | `refactor` | Refactor existing code |
 | `review` | Review a PR and leave comments |
-| `panel_review` | Run a fixed multi-agent review workflow over a PR and persist a structured verdict |
 | `fix` | Fix issues identified in a review |
 | `verify_tests` | Clone a PR head, run the detected test suite, and post a pass/fail verdict |
 | `plan` | Generate an implementation plan |
