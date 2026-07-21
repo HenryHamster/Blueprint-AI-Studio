@@ -1,4 +1,5 @@
 import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
 
 // ── Hoisted setup ─────────────────────────────────────────────────────────────
 const { mockRecordToolUse, mockRecordCheckOutcome, mockIsCheckInvocation, mockSendLog } =
@@ -73,6 +74,8 @@ vi.mock('../processTracking.js', () => ({
 vi.mock('../prompt.js', () => ({
   writePlaybookHelper: vi.fn(),
   writeMessagesHelper: vi.fn(),
+  writeSymbolsHelper: vi.fn(),
+  retryPostShellFn: vi.fn(() => ''),
   writeSkillHelpers: vi.fn(),
   formatSkills: vi.fn(() => ''),
   formatProjectTools: vi.fn(() => ''),
@@ -87,6 +90,7 @@ import {
   _setLastProviderRunErrorReportForTesting,
   __setCommandExistsOverrideForSmoke,
   refreshRuntimeState,
+  provisionAmbientHelpers,
 } from './runners.js';
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
@@ -671,5 +675,17 @@ describe('text-mode stdout handler (Gemini) — recordToolUse on progress', () =
     emitStream(['   ']);
     await runProviderAgent('prompt', null, { value: '' });
     expect(mockRecordToolUse).not.toHaveBeenCalled();
+  });
+});
+
+describe('provisionAmbientHelpers note script', () => {
+  it('writes ./note with _json_str instead of sed escaping', () => {
+    provisionAmbientHelpers('t-test', '/tmp/ws');
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls;
+    const noteCall = writeCalls.find(c => (c[0] as string).includes('/note'));
+    expect(noteCall).toBeDefined();
+    const content = (noteCall as Array<unknown>)[1] as string;
+    expect(content).toContain('_json_str');
+    expect(content).not.toContain('sed');
   });
 });

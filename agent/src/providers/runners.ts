@@ -18,7 +18,7 @@ import {
   recordLlmTokens, recordProviderReportedUsage, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
-import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
+import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn, jsonStrShellFn } from '../token-file.js';
 import { normalizeProviderTokenUsage } from './usage.js';
 import { applyDeepSeekModelEnv, pinDeepSeekModel } from './deepseek-env.js';
 import { maybeConsumeCodexWeeklyReset } from './codex-rate-limit-reset.js';
@@ -1109,11 +1109,13 @@ TASK="\${TASK_ID:?TASK_ID not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 ${retryPostShellFn()}
+${jsonStrShellFn()}
 
-# Build JSON with printf to avoid shell expansion issues
-JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\":\\"$(echo "$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
-[ -n "$PAGE" ] && JSON="\${JSON},\\"target_page\\":\\"$PAGE\\""
-[ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"$SEVERITY\\""
+# Build JSON with _json_str to avoid shell escaping issues
+JSON=$(printf '{"task_id":%s,"annotation_type":%s,"content":%s' \\
+  "$(_json_str "$TASK")" "$(_json_str "$TYPE")" "$(_json_str "$CONTENT")")
+[ -n "$PAGE" ] && JSON="\${JSON},\\"target_page\\":$(_json_str "$PAGE")"
+[ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":$(_json_str "$SEVERITY")"
 JSON="\${JSON}}"
 
 printf '%s' "$JSON" | _post_with_retry "$API/api/agent/annotate" "note $TYPE"
