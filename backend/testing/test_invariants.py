@@ -5573,6 +5573,28 @@ class TestDirectionLifecycleInvariants:
             "this controls direction sprawl and must not change without approval."
         )
 
+    def test_blind_multi_reviewer_gate_enabled_default(self):
+        """blind_multi_reviewer_gate_enabled must remain True — default-on blind
+        multi-reviewer gate for judgment-shaped acceptance decisions."""
+        from app.shared_state import runtime_config
+
+        assert runtime_config["blind_multi_reviewer_gate_enabled"] is True, (
+            f"blind_multi_reviewer_gate_enabled changed to "
+            f"{runtime_config['blind_multi_reviewer_gate_enabled']} — "
+            "this controls whether high-stakes decisions spawn blind multi-reviewer panels."
+        )
+
+    def test_max_parallel_research_per_project_default(self):
+        """max_parallel_research_per_project must remain at 6 — controls
+        simultaneous research task parallelism per project."""
+        from app.shared_state import runtime_config
+
+        assert runtime_config["max_parallel_research_per_project"] == 6, (
+            f"max_parallel_research_per_project changed to "
+            f"{runtime_config['max_parallel_research_per_project']} — "
+            "this limits parallel research tasks per project."
+        )
+
     def test_direction_text_limits(self):
         """DIRECTION_TEXT_MAX and COMPLETION_CRITERIA_MAX must match spec."""
         from app.routers.directions import DIRECTION_TEXT_MAX, COMPLETION_CRITERIA_MAX

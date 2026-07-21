@@ -1399,7 +1399,7 @@ async def _spawn_research_task_inner(
             return
 
         max_parallel = project_parallelism_cap(
-            project, "max_parallel_research", "max_parallel_research_per_project", 3
+            project, "max_parallel_research", "max_parallel_research_per_project", 6
         )
         for d in sorted_eligible:
             did = d.get("id")
@@ -1981,7 +1981,7 @@ async def _spawn_research_task_inner(
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.
     max_parallel = project_parallelism_cap(
-        project, "max_parallel_research", "max_parallel_research_per_project", 3
+        project, "max_parallel_research", "max_parallel_research_per_project", 6
     )
     active_research_count = (
         await session.execute(

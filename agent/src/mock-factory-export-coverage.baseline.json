@@ -2024,6 +2024,7 @@
     ],
     "../prompt.js": [
       "AGENT_HELPER_NAMES",
+      "ANTI_HEDGING_GUIDANCE",
       "BEYOND_SCOPE_REPORTING",
       "CODE_CHANGE_HELPER_GUIDANCE",
       "CREATE_TASK_FOCUS",
@@ -2721,6 +2722,7 @@
     ],
     "../prompt.js": [
       "AGENT_HELPER_NAMES",
+      "ANTI_HEDGING_GUIDANCE",
       "BEYOND_SCOPE_REPORTING",
       "CODE_CHANGE_HELPER_GUIDANCE",
       "CREATE_TASK_FOCUS",
@@ -3884,6 +3886,7 @@
     ],
     "../prompt.js": [
       "AGENT_HELPER_NAMES",
+      "ANTI_HEDGING_GUIDANCE",
       "BEYOND_SCOPE_REPORTING",
       "CODE_CHANGE_HELPER_GUIDANCE",
       "CREATE_TASK_FOCUS",

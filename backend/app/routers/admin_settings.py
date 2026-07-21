@@ -719,7 +719,7 @@ async def get_settings(
             * 2,
         ),
         "max_parallel_research_per_project": _runtime_config.get(
-            "max_parallel_research_per_project", 3
+            "max_parallel_research_per_project", 6
         ),
         "max_total_research_per_project": _runtime_config.get(
             "max_total_research_per_project", 5
@@ -3434,7 +3434,7 @@ async def _apply_settings(
                         "max_active_directions", 10
                     ),
                     "max_parallel_research_per_project": _runtime_config.get(
-                        "max_parallel_research_per_project", 3
+                        "max_parallel_research_per_project", 6
                     ),
                     "auto_debug_enabled": _runtime_config.get(
                         "auto_debug_enabled", True

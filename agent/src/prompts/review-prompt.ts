@@ -184,7 +184,8 @@ ${REVIEW_ANTI_HEDGE_CRITERION}`,
 - Is the code readable and following existing patterns in the codebase?
 - Are there obvious performance issues (unnecessary loops, redundant DB calls)?
 - Does the change break any existing interfaces or contracts?
-- Are type annotations correct (TypeScript/Python)?`,
+- Are type annotations correct (TypeScript/Python)?
+- **Anti-hedging**: Does this diff introduce a new default-off flag, observe mode, or fail-open behavior WITHOUT an explicit written justification (a code comment, PR description note, or inline rationale)? If yes, flag as MAJOR — new features must ship enabled by default; unjustified observe/off/fail-open patterns are forbidden.`,
   test_coverage: `**Test Coverage:**
 - Are there tests for the new/changed behavior? (A genuinely missing test for new behavior is a blockable defect.)
 - Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)`,

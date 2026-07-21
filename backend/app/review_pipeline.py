@@ -89,6 +89,7 @@ from app.review_heuristics import (  # noqa: F401
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
     detect_hedges_in_diff,
+    detect_unjustified_hedge,
     fix_all_occurrences_directive,
 )
 
@@ -1541,7 +1542,7 @@ async def _check_fix_mid_retry_defer(
                 ):
                     continue
             return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.debug(
             "[PIPELINE] _check_fix_mid_retry_defer lookup failed for "
             f"PR #{pr_number} — allowing review spawn",
@@ -1588,9 +1589,7 @@ def task_counts_toward_review_cap(task: Task) -> bool:
         fc = (task.context or {}).get("failure_category")
         if fc in INFRA_CLASSES:
             return False
-    if (task.context or {}).get("_review_stale_head"):
-        return False
-    return True
+    return not (task.context or {}).get("_review_stale_head")
 
 
 def _recent_consecutive_lane_count(
@@ -2086,7 +2085,7 @@ async def _spawn_pipeline_task(
     # supersessions do.
     _source_noop_fix = False
     _source_is_fix = source_task.first_payload.get("type") == "fix"
-    if source_task.status in (
+    if source_task.status in (  # noqa: SIM102
         TaskStatus.COMPLETED,
         TaskStatus.FAILED,
         TaskStatus.CANCELLED,
@@ -3702,7 +3701,7 @@ async def _spawn_pipeline_task(
     if new_review_history:
         _issue_ledger = build_issue_ledger(new_review_history)
         _contested = _issue_ledger.get("contested") or []
-        if _contested:
+        if _contested:  # noqa: SIM102
             if task_type == "fix":
                 contested_fix_prefix = format_contested_regions_for_fix(
                     _contested, base_branch

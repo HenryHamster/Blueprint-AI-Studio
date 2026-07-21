@@ -5628,10 +5628,6 @@ async def _process_post_commit(
                     await session.commit()
 
                 fix_reason = review_loop.get("fix_reason", "code_review")
-                # First-pass minor-only fix: the initial review flagged only
-                # minor nits, so this fix carries skip_rereview_minor_only (set
-                # at spawn time in _spawn_pipeline_task). It skips the re-review
-                # the same way ci_failure/merge_conflict fixes do.
                 skip_rereview_minor_only = bool(
                     review_loop.get("skip_rereview_minor_only")
                 )
@@ -5689,17 +5685,11 @@ async def _process_post_commit(
                         label = "migration-guard fix"
                     else:
                         label = "minor-nit fix"
-                    skip_detail = (
-                        fix_reason
-                        if fix_reason
-                        in ("ci_failure", "merge_conflict", "migration_guard")
-                        else "minor_only"
-                    )
-                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {skip_detail})"
+                    task.latest_status_message = f"{label} applied for PR #{pr_number} — waiting for CI (review skipped: {_rr_decision.reason})"
                     session.add(task)
                     await session.commit()
                     logger.info(
-                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (skip reason={skip_detail}) — skipping re-review, waiting for CI"
+                        f"[REVIEW PIPELINE] {label} for PR #{pr_number} (skip reason={_rr_decision.reason}) — skipping re-review, waiting for CI"
                     )
                 else:
                     # Not blocked and no skip reason: spawn a fresh re-review.

@@ -2997,18 +2997,8 @@ async def _persist_rate_limit_usage_to_db(
     """
     if not snapshot.known:
         return
-    usage_dict: dict[str, Any] = {
-        "updated_at": _utcnow().isoformat(),
-        "source": "oauth_usage_probe",
-    }
-    for window in ("five_hour", "seven_day"):
-        util = snapshot.window_utilizations.get(window)
-        if util is not None:
-            entry = {"utilization": float(util)}
-            reset = snapshot.resets_at.get(window)
-            if reset:
-                entry["resets_at"] = reset
-            usage_dict[window] = entry
+    usage_dict = snapshot.to_dict()
+    usage_dict["updated_at"] = _utcnow().isoformat()
     from app.models import MaxPlanAccount
 
     for attempt in range(2):
@@ -3023,7 +3013,7 @@ async def _persist_rate_limit_usage_to_db(
                     persist_session.add(row)
                     await persist_session.commit()
                 return  # success
-        except Exception:
+        except Exception:  # noqa: PERF203 - bounded persist-retry, not a hot loop
             if attempt == 0:
                 global _usage_persist_failures
                 _usage_persist_failures += 1
@@ -3096,38 +3086,31 @@ def _snapshot_from_persisted_usage(
         updated_at = datetime.fromisoformat(raw.get("updated_at"))
     except (TypeError, ValueError):
         return None
-    utils: dict[str, float] = {}
-    resets: dict[str, str | None] = {}
-    if source == "oauth_usage_probe":
-        for window in ("five_hour", "seven_day"):
-            entry = raw.get(window)
-            if not isinstance(entry, Mapping):
-                continue
-            util = entry.get("utilization")
-            if isinstance(util, bool) or not isinstance(util, (int, float)):
-                continue
-            utils[window] = float(util)
-            reset = entry.get("resets_at")
-            if isinstance(reset, str):
-                resets[window] = reset
-    elif source == "messages_api_header":
+    # oauth_usage_probe blobs round-trip through UsageSnapshot.to_dict/from_dict.
+    snapshot = UsageSnapshot.from_dict(raw)
+    if snapshot is not None and snapshot.known:
+        return snapshot, updated_at
+    # from_dict only understands the oauth_usage_probe schema. The Messages API
+    # persists a ``messages_api_header`` blob (unified_5h utilization, 0..100
+    # scale) that non-leader instances must still read — map it to the five_hour
+    # window so per-response header data is not silently discarded.
+    if source == "messages_api_header":
         entry = raw.get("unified_5h")
         if isinstance(entry, Mapping):
             util = entry.get("utilization")
             if not isinstance(util, bool) and isinstance(util, (int, float)):
-                utils["five_hour"] = float(util)
+                resets: dict[str, str | None] = {}
                 reset = entry.get("resets_at")
                 if isinstance(reset, str):
                     resets["five_hour"] = reset
-    if not utils:
-        return None
-    snapshot = UsageSnapshot(
-        known=True,
-        window_utilizations=utils,
-        resets_at=resets,
-        probed_at=updated_at.isoformat(),
-    )
-    return snapshot, updated_at
+                snapshot = UsageSnapshot(
+                    known=True,
+                    window_utilizations={"five_hour": float(util)},
+                    resets_at=resets,
+                    probed_at=updated_at.isoformat(),
+                )
+                return snapshot, updated_at
+    return None
 
 
 def _restore_usage_state(
@@ -3194,6 +3177,23 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
     async with _max_plan_pool_lock:
         for acct in _account_by_id.values():
             if not _account_meter_eligible(acct):
+                # Warn when an Anthropic OAuth account is dark due to a missing
+                # secret — operators cannot distinguish this from a probe failure
+                # without an explicit log.
+                provider = _normalize_provider_name(acct.get("provider"))
+                auth_mode = _normalize_auth_mode(acct.get("auth_mode"))
+                if (
+                    provider == LLMProviderName.ANTHROPIC.value
+                    and auth_mode == LLMAuthMode.OAUTH.value
+                    and bool(acct.get("enabled", True))
+                    and not bool(acct.get("oauth_token") or acct.get("runtime_secret"))
+                ):
+                    logger.warning(
+                        "[POOL] usage meter dark for account %s: OAuth secret unavailable "
+                        "(Secret Manager fetch failed or secret not set); meter will stay "
+                        "unknown until the secret is restored",
+                        acct.get("id", "<unknown>"),
+                    )
                 continue
             snap = acct.get("usage_snapshot")
             at = acct.get("usage_snapshot_at")

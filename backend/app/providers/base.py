@@ -134,6 +134,65 @@ class UsageSnapshot:
                 out.append(float(val))
         return tuple(out)
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict for DB persistence.
+
+        Callers that persist to DB should also set an ``updated_at`` key with
+        the write timestamp so freshness comparisons work across restarts.
+        Readable by :meth:`from_dict`.
+        """
+        d: dict[str, Any] = {
+            "source": "oauth_usage_probe",
+            "known": self.known,
+        }
+        if self.probed_at is not None:
+            d["probed_at"] = self.probed_at
+        if self.known:
+            for window, util in self.window_utilizations.items():
+                entry: dict[str, Any] = {"utilization": float(util)}
+                reset = self.resets_at.get(window)
+                if reset:
+                    entry["resets_at"] = reset
+                d[window] = entry
+        return d
+
+    @classmethod
+    def from_dict(cls, raw: Any) -> UsageSnapshot | None:
+        """Reconstruct from a dict written by :meth:`to_dict`.
+
+        Returns ``None`` on any structural mismatch so callers can treat a
+        bad/foreign blob as "no snapshot". Backwards-compatible with old blobs
+        that lack the ``known`` or ``probed_at`` fields.
+        """
+        if not isinstance(raw, Mapping) or raw.get("source") != "oauth_usage_probe":
+            return None
+        known = raw.get("known", True)
+        # Prefer explicit probed_at; fall back to updated_at for old blobs.
+        probed_at: str | None = raw.get("probed_at") or raw.get("updated_at")
+        if not known:
+            return cls.unknown(probed_at)
+        _reserved = frozenset({"source", "known", "probed_at", "updated_at"})
+        utils: dict[str, float] = {}
+        resets: dict[str, str | None] = {}
+        for key, entry in raw.items():
+            if key in _reserved or not isinstance(entry, Mapping):
+                continue
+            util = entry.get("utilization")
+            if isinstance(util, bool) or not isinstance(util, (int, float)):
+                continue
+            utils[key] = float(util)
+            reset = entry.get("resets_at")
+            if isinstance(reset, str):
+                resets[key] = reset
+        if not utils:
+            return None
+        return cls(
+            known=True,
+            window_utilizations=utils,
+            resets_at=resets,
+            probed_at=probed_at,
+        )
+
 
 @dataclass(frozen=True)
 class FileMaterial:

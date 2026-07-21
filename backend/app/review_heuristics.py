@@ -651,6 +651,60 @@ LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
 PERSISTENT_CONFLICT_ESCALATION_THRESHOLD = 2
 
 
+# ── Anti-hedging: detect unjustified default-off / observe / fail-open ─────────
+# A "hedge" is a newly-introduced default-off flag, observe-mode lane, or
+# fail-open behavior with no explicit written justification. The review checklist
+# instructs reviewers to flag these as MAJOR. This detector confirms the finding
+# programmatically by scanning CRITICAL/MAJOR issue descriptions for hedge-cue
+# patterns. A matching issue that also contains a justification keyword is allowed
+# through — the reviewer saw the hedge and confirmed it has a rationale.
+_HEDGE_CUE_RES = [
+    re.compile(r"default(?:s)?\s+(?:to\s+)?(?:off|false|disabled)", re.IGNORECASE),
+    re.compile(r"observe[_-]?mode", re.IGNORECASE),
+    re.compile(r"fail[_-]?open", re.IGNORECASE),
+    re.compile(r"feature\s+flag\s+.*(?:off|disabled|false)", re.IGNORECASE),
+    re.compile(r"disabled\s+by\s+default", re.IGNORECASE),
+    re.compile(r"\bunjustified\s+(?:hedge|default|flag|observe|mode)\b", re.IGNORECASE),
+    re.compile(r"no\s+(?:written\s+)?justification", re.IGNORECASE),
+    re.compile(r"without\s+(?:an?\s+)?(?:written\s+)?justification", re.IGNORECASE),
+]
+
+_HEDGE_JUSTIFIED_RE = re.compile(
+    r"\b(?:justified\s+by|justification\s+in|intentional(?:ly)?|documented\s+(?:in|reason)"
+    r"|by\s+design|staged\s+rollout|rationale\s*:)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_unjustified_hedge(issues: list) -> tuple[bool, str]:
+    """Scan reviewer issues for unjustified-hedge findings.
+
+    Returns ``(True, reason)`` when a CRITICAL or MAJOR issue description
+    matches a hedge-cue pattern (default-off, observe mode, fail-open, …) and
+    does NOT contain a justification keyword indicating the hedge was accepted
+    as intentional. Returns ``(False, "")`` otherwise.
+
+    Intended use: the review pipeline calls this after the model reviewer
+    produces its issue list to confirm the anti-hedge checklist rule fired and
+    to prevent auto-approval of PRs that introduce unjustified hedges.
+    """
+    for issue in issues or []:
+        if not isinstance(issue, dict):
+            continue
+        severity = (issue.get("severity") or "").lower()
+        if severity not in ("critical", "major"):
+            continue
+        desc = (issue.get("description") or "").strip()
+        if not desc:
+            continue
+        if _HEDGE_JUSTIFIED_RE.search(desc):
+            continue
+        for cue_re in _HEDGE_CUE_RES:
+            if cue_re.search(desc):
+                return (True, f"anti-hedge rule: {desc[:120]}")
+    return (False, "")
+
+
 def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821
     """Classify a completed/failed pipeline task into its review-fix lane.
 
