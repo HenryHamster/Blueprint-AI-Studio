@@ -92,6 +92,8 @@ from app.review_heuristics import (  # noqa: F401
     fix_all_occurrences_directive,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
+    should_skip_initial_review,
+    should_skip_rereview,
 )
 
 # Review<->fix outer-loop convergence machinery (scope-pressure / narrow-focus

@@ -66,6 +66,8 @@ from app.review_pipeline import (
     maybe_spawn_cross_cutting_safeguard,
     post_merge_summary_comment,
     should_auto_approve_diff,
+    should_skip_initial_review,
+    should_skip_rereview,
     REVIEW_FIX_GOAL_PREAMBLE,
 )
 from testing.factories import make_project, make_task
@@ -18999,3 +19001,69 @@ async def test_reviewer_that_completes_inside_supersede_window_keeps_its_verdict
     )
     assert (landed.context or {}).get("failure_detail") is None
     delete_vm.assert_not_awaited()
+
+
+# ── should_skip_initial_review ─────────────────────────────────────────────
+
+
+class TestShouldSkipInitialReview:
+    def test_non_intermediate_always_skips(self):
+        skip, reason = should_skip_initial_review(False, "large")
+        assert skip is True
+        assert "non-intermediate" in reason
+
+    def test_non_intermediate_small_scope_skips(self):
+        skip, _ = should_skip_initial_review(False, "small")
+        assert skip is True
+
+    def test_intermediate_small_scope_skips(self):
+        skip, reason = should_skip_initial_review(True, "small")
+        assert skip is True
+        assert "rollup" in reason
+
+    def test_intermediate_medium_scope_skips(self):
+        skip, _ = should_skip_initial_review(True, "medium")
+        assert skip is True
+
+    def test_intermediate_large_scope_requires_review(self):
+        skip, reason = should_skip_initial_review(True, "large")
+        assert skip is False
+        assert "full review" in reason
+
+    def test_intermediate_unknown_scope_skips(self):
+        # Any scope that is not 'large' is treated as not requiring review.
+        skip, _ = should_skip_initial_review(True, "unknown")
+        assert skip is True
+
+
+# ── should_skip_rereview ────────────────────────────────────────────────────
+
+
+class TestShouldSkipRereview:
+    def test_minor_only_first_pass_skips(self):
+        skip, reason = should_skip_rereview("code_review", True)
+        assert skip is True
+        assert "minor-only" in reason
+
+    def test_ci_failure_skips(self):
+        skip, reason = should_skip_rereview("ci_failure", False)
+        assert skip is True
+        assert "ci_failure" in reason
+
+    def test_merge_conflict_skips(self):
+        skip, _ = should_skip_rereview("merge_conflict", False)
+        assert skip is True
+
+    def test_migration_guard_skips(self):
+        skip, _ = should_skip_rereview("migration_guard", False)
+        assert skip is True
+
+    def test_code_review_requires_rereview(self):
+        skip, reason = should_skip_rereview("code_review", False)
+        assert skip is False
+        assert "re-review required" in reason
+
+    def test_minor_only_overrides_code_review(self):
+        # skip_rereview_minor_only takes priority over fix_reason
+        skip, _ = should_skip_rereview("code_review", True)
+        assert skip is True

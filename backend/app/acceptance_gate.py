@@ -883,7 +883,7 @@ def acceptance_blocks_success(recorded: Any) -> bool:
     Absence of the key (``None``) — the case for every task that declared no
     acceptance evidence, plus all legacy rows — returns ``False`` so those tasks
     keep their current bare-merge success. Additive and backward-compatible,
-    mirroring :func:`app.reproduction_scoring.reproduction_blocks_success`.
+    mirroring the additive/backward-compatible pattern in app.reproduction_scoring.
     """
     if not isinstance(recorded, dict):
         return False

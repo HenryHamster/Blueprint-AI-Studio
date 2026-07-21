@@ -7,11 +7,9 @@ reproduce-on-HEAD verdict for that defect at ingestion
 the single place that:
 
   * names the additive context key the verdict travels under
-    (:data:`TARGET_DEFECT_REPRODUCTION_KEY`),
+    (:data:`TARGET_DEFECT_REPRODUCTION_KEY`), and
   * stamps a recognized verdict onto a spawn-context dict
-    (:func:`record_target_defect_reproduction`), and
-  * decides, from a recorded verdict, whether a merged fix may still be
-    credited as a verified success (:func:`reproduction_blocks_success`).
+    (:func:`record_target_defect_reproduction`).
 
 The contract is deliberately additive and backward-compatible: a task with no
 recorded key (feature creates, legacy rows, anything spawned before this lands)
@@ -49,15 +47,3 @@ def record_target_defect_reproduction(context: dict, verdict: str | None) -> Non
         context[TARGET_DEFECT_REPRODUCTION_KEY] = verdict
 
 
-def reproduction_blocks_success(verdict: str | None) -> bool:
-    """Whether a recorded verdict blocks crediting a merged fix as success.
-
-    ``True`` only when a verdict was recorded AND it is not
-    :data:`CITATION_STATE_PRESENT` — i.e. the target defect was never positively
-    established to reproduce on HEAD (it was ``absent`` or ``indeterminate``).
-    ``None`` (no key recorded) returns ``False`` so legacy/feature tasks keep
-    their current bare-merge success.
-    """
-    if verdict is None:
-        return False
-    return verdict != CITATION_STATE_PRESENT

@@ -29,7 +29,6 @@ from app.compute_verification import (
     _has_compute_verification,
     _is_verification_disabled_via_env,
     _parse_verification_verdict,
-    _resolve_compute_verification_mode,
 )
 from app.models import Task, TaskStatus
 
@@ -258,46 +257,6 @@ class TestHasComputeVerification:
 # ---------------------------------------------------------------------------
 # Mode resolver tests
 # ---------------------------------------------------------------------------
-
-
-class TestResolveComputeVerificationMode:
-    """Cover _resolve_compute_verification_mode."""
-
-    def test_defaults_to_advisory(self):
-        """When config is absent or invalid, default to advisory."""
-        with patch(
-            "app.compute_verification._runtime_config",
-            {},
-        ):
-            assert _resolve_compute_verification_mode() == "advisory"
-
-    def test_advisory_from_config(self):
-        with patch(
-            "app.compute_verification._runtime_config",
-            {"compute_verification_mode": "advisory"},
-        ):
-            assert _resolve_compute_verification_mode() == "advisory"
-
-    def test_soft_gate_from_config(self):
-        with patch(
-            "app.compute_verification._runtime_config",
-            {"compute_verification_mode": "soft_gate"},
-        ):
-            assert _resolve_compute_verification_mode() == "soft_gate"
-
-    def test_hard_gate_from_config(self):
-        with patch(
-            "app.compute_verification._runtime_config",
-            {"compute_verification_mode": "hard_gate"},
-        ):
-            assert _resolve_compute_verification_mode() == "hard_gate"
-
-    def test_invalid_mode_falls_back(self):
-        with patch(
-            "app.compute_verification._runtime_config",
-            {"compute_verification_mode": "invalid"},
-        ):
-            assert _resolve_compute_verification_mode() == "advisory"
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Standalone unit tests for the reproduce-on-HEAD scoring leaf module.
 
-Covers the additive context-key recorder and the success-blocking predicate.
+Covers the additive context-key recorder.
 Pure in-memory — runs under ``bash scripts/test-backend.sh --standalone``.
 """
 
@@ -9,7 +9,6 @@ import pytest
 from app.reproduction_scoring import (
     TARGET_DEFECT_REPRODUCTION_KEY,
     record_target_defect_reproduction,
-    reproduction_blocks_success,
 )
 from app.source_ref_validation import (
     CITATION_STATE_ABSENT,
@@ -41,11 +40,3 @@ def test_record_does_not_clobber_other_keys():
     assert ctx == {"other": 1, TARGET_DEFECT_REPRODUCTION_KEY: CITATION_STATE_PRESENT}
 
 
-def test_blocks_success_truth_table():
-    # No verdict recorded -> does not block (legacy/feature tasks).
-    assert reproduction_blocks_success(None) is False
-    # Positively reproduced -> does not block.
-    assert reproduction_blocks_success(CITATION_STATE_PRESENT) is False
-    # Never positively established -> blocks.
-    assert reproduction_blocks_success(CITATION_STATE_ABSENT) is True
-    assert reproduction_blocks_success(CITATION_STATE_INDETERMINATE) is True

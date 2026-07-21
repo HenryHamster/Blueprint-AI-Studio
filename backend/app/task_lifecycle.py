@@ -65,6 +65,8 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     reconciled_approve_markers,
     should_auto_approve_diff,
+    should_skip_initial_review,
+    should_skip_rereview,
 )
 from app.failure_classification import (
     classify_failure,
@@ -2075,21 +2077,14 @@ async def _process_post_commit(
                             f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review"
                         )
 
-                if (
-                    is_intermediate and scope in ("small", "medium")
-                ) or auto_approve_small or not is_intermediate:
+                _skip_initial, _skip_initial_reason = should_skip_initial_review(
+                    is_intermediate, scope
+                )
+                if _skip_initial or auto_approve_small:
                     # Security scan then auto-merge, skip model review.
-                    #
-                    # Two cases route here:
-                    #   1) Small/medium scope on an intermediate staging branch
-                    #      (rollup child). The rollup PR to main gets the full
-                    #      review — staging-branch merges don't need it.
-                    #   2) Non-rollup single task landing directly into automain
-                    #      (any scope, not intermediate). CI + the promotion gate
-                    #      already backstop these, so the expensive model review
-                    #      is redundant and the cut matches the v24 cost plan
-                    #      (P2: Reduce duplicate agent work). Rollup PRs where
-                    #      changes aggregate keep full review.
+                    # Policy is encapsulated in should_skip_initial_review
+                    # (review_heuristics). auto_approve_small is an independent
+                    # main-branch gate that also routes here.
                     try:
                         gh_token, owner, repo = await get_github_token_for_task(
                             task.id, session
@@ -5750,9 +5745,8 @@ async def _process_post_commit(
                 #   - minor-only first-pass verdict → the fix only addressed
                 #                   minor nits; a re-review would near-certainly
                 #                   approve, so spend CI as the only gate.
-                skip_rereview = (
-                    fix_reason in ("ci_failure", "merge_conflict", "migration_guard")
-                    or skip_rereview_minor_only
+                skip_rereview, _skip_rereview_reason = should_skip_rereview(
+                    fix_reason, skip_rereview_minor_only
                 )
                 if not scan_blocked and skip_rereview:
                     from app import pause_clock

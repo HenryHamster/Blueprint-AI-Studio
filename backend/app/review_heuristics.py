@@ -674,6 +674,43 @@ LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
 PERSISTENT_CONFLICT_ESCALATION_THRESHOLD = 2
 
 
+_REVIEW_REQUIRED_SCOPES = frozenset({"large"})
+
+
+def should_skip_initial_review(is_intermediate: bool, scope: str) -> tuple[bool, str]:
+    """Whether to skip the automated code review for a newly opened PR.
+
+    Non-intermediate (single-task-to-automain) PRs always skip — the promotion
+    gate and CI are the only required backstop, matching v24 cost plan P2.
+    Intermediate (staging/rollup sub-PR) tasks skip for small/medium scope;
+    the rollup PR to main gets the full review instead.
+    Large-scope intermediate PRs always get a full review.
+
+    Returns (skip, reason).
+    """
+    if not is_intermediate:
+        return (True, "non-intermediate branch: CI and promotion gate backstop review")
+    if scope not in _REVIEW_REQUIRED_SCOPES:
+        return (True, f"{scope} scope on intermediate branch: rollup PR gets full review")
+    return (False, f"{scope} scope on intermediate branch: full review required")
+
+
+def should_skip_rereview(fix_reason: str, skip_rereview_minor_only: bool) -> tuple[bool, str]:
+    """Whether to skip re-review after a fix task completes.
+
+    Skips when the fix addresses mechanical issues that don't change the
+    review decision (CI failures, merge conflicts, migration repairs), or
+    when the initial review flagged only minor-severity issues.
+
+    Returns (skip, reason).
+    """
+    if skip_rereview_minor_only:
+        return (True, "first-pass minor-only verdict: CI gates the merge")
+    if fix_reason in ("ci_failure", "merge_conflict", "migration_guard"):
+        return (True, f"{fix_reason}: original review already approved; CI gates merge")
+    return (False, f"{fix_reason}: re-review required")
+
+
 def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821
     """Classify a completed/failed pipeline task into its review-fix lane.
 

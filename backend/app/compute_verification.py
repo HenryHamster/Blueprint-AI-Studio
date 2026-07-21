@@ -76,22 +76,6 @@ def _has_compute_verification(task: Task) -> bool:
     )
 
 
-def _resolve_compute_verification_mode() -> str:
-    """Return the current verification mode from runtime config.
-
-    Modes (mirroring the strategic_retirement_challenge_gate_mode pattern):
-      ``"advisory"`` — (default) record the verdict + notify, never block.
-      ``"soft_gate"`` — record + notify, but warn prominently on reject.
-      ``"hard_gate"`` — (future) block SUCCESS when the grader rejects.
-    Falls back to ``"advisory"`` when the runtime config value is unset or
-    invalid.
-    """
-    raw = _runtime_config.get("compute_verification_mode", "advisory")
-    if isinstance(raw, str) and raw in ("advisory", "soft_gate", "hard_gate"):
-        return raw
-    return "advisory"
-
-
 def _build_compute_verification_rubric(
     task: Task,
     criterion: Optional[dict],
