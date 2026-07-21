@@ -1912,6 +1912,45 @@ async def get_knowledge_document(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/admin/operator-inbox-liveness
+# ---------------------------------------------------------------------------
+
+
+@router.get("/operator-inbox-liveness")
+async def get_operator_inbox_liveness(
+    force_run: bool = Query(default=False),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Return a snapshot of the operator-inbox liveness signal.
+
+    Always returns the process-local observability ring (``total_ticks``,
+    ``total_forward_leaked``, ``total_badge_invisible``,
+    ``total_info_alert_noise``, ``recent_ticks``).
+
+    When ``?force_run=true`` is passed, also triggers a live DB scan via
+    ``run_operator_inbox_liveness_check`` (bypasses the cadence gate) and
+    returns the per-project results under ``run_results``.
+    """
+    from app.operator_inbox_liveness import (  # noqa: PLC0415
+        get_operator_inbox_liveness_observability,
+        run_operator_inbox_liveness_check,
+    )
+    from app.models import _utcnow as _ts  # noqa: PLC0415
+
+    snapshot = get_operator_inbox_liveness_observability()
+
+    if force_run:
+        run_results = await run_operator_inbox_liveness_check(
+            session, _ts(), _force=True
+        )
+        snapshot = get_operator_inbox_liveness_observability()
+        snapshot["run_results"] = [r._asdict() for r in (run_results or [])]
+
+    return snapshot
+
+
+# ---------------------------------------------------------------------------
 # Adversarial spawn-gate canary endpoints
 # ---------------------------------------------------------------------------
 
