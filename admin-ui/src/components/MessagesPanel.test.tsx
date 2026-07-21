@@ -9642,3 +9642,197 @@ describe('MessagesPanel needs-action filter', () => {
     expect(text).toContain('Operator action required');
   });
 });
+
+// ── Finding m-3: operator inbox consumes attention lifecycle fields ──────────
+// Verifies that lifecycle.operator_action, lifecycle.acknowledgeable, and
+// lifecycle.acknowledge_effect are consumed by the needs-action strip UI, not
+// silently ignored. Finding claim: only clears_when was rendered; the others
+// were typed but unused.
+describe('MessagesPanel attention model lifecycle field consumption', () => {
+  beforeEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); localStorage.setItem('bp.chatChromeExpanded', 'true'); });
+  afterEach(() => { localStorage.clear(); sessionStorage.clear(); vi.clearAllMocks(); });
+
+  function setupConvMock(): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-conversation(?:\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+        }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+    });
+  }
+
+  test('operator_action hint renders in needs-action chip when lifecycle.operator_action is set', async () => {
+    setupConvMock();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const state = makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 item needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1, watch: 0, unread: 0, questions: 1,
+          blockers: 0, approvals: 0, manual_directions: 0,
+          failed_tasks: 0, blocked_tasks: 0, parked_tasks: 0,
+        },
+        items: [
+          {
+            id: 'message:msg-lc-1',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'question',
+            label: 'Lifecycle question',
+            ref: { kind: 'message', id: 'msg-lc-1', project_id: 'proj-1' },
+            lifecycle: {
+              clears_when: 'answered',
+              operator_action: 'answer',
+              acknowledgeable: false,
+              acknowledge_effect: null,
+            },
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={state}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-strip"]')).toBeTruthy();
+    });
+    // operator_action hint must be rendered (data-testid="operator-action-hint")
+    await waitFor(() => {
+      const hint = container.querySelector('[data-testid="operator-action-hint"]');
+      expect(hint).toBeTruthy();
+    });
+  });
+
+  test('Ack button renders when lifecycle.acknowledgeable=true and clicking it hides the item', async () => {
+    setupConvMock();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const state = makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 item needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1, watch: 0, unread: 0, questions: 0,
+          blockers: 1, approvals: 0, manual_directions: 0,
+          failed_tasks: 0, blocked_tasks: 0, parked_tasks: 0,
+        },
+        items: [
+          {
+            id: 'message:msg-ack-1',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'blocker',
+            label: 'Ack-able blocker',
+            ref: { kind: 'message', id: 'msg-ack-1', project_id: 'proj-1' },
+            lifecycle: {
+              clears_when: 'task_unblocked',
+              operator_action: null,
+              acknowledgeable: true,
+              acknowledge_effect: 'hides_until_change',
+            },
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={state}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-strip"]')).toBeTruthy();
+    });
+    // Ack button must be rendered when acknowledgeable=true
+    const ackBtn = await waitFor(() => {
+      const btn = container.querySelector('[data-testid="attention-ack-btn"]');
+      expect(btn).toBeTruthy();
+      return btn as HTMLButtonElement;
+    });
+    // Clicking Ack must remove the item from the strip (client-side hide)
+    fireEvent.click(ackBtn);
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="attention-ack-btn"]')).toBeNull();
+    });
+    // The strip itself may disappear when all items are acked
+    const strip = container.querySelector('[data-testid="needs-action-strip"]');
+    if (strip) {
+      const chipText = strip.textContent ?? '';
+      expect(chipText).not.toContain('Ack-able blocker');
+    }
+  });
+
+  test('no Ack button when lifecycle.acknowledgeable is false or absent', async () => {
+    setupConvMock();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const state = makeStrategicState({
+      attention: {
+        level: 'needs_operator',
+        summary: '1 item needs action',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 1, watch: 0, unread: 0, questions: 1,
+          blockers: 0, approvals: 0, manual_directions: 0,
+          failed_tasks: 0, blocked_tasks: 0, parked_tasks: 0,
+        },
+        items: [
+          {
+            id: 'message:msg-noack-1',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'question',
+            label: 'Non-ackable question',
+            ref: { kind: 'message', id: 'msg-noack-1', project_id: 'proj-1' },
+            lifecycle: {
+              clears_when: 'answered',
+              operator_action: 'answer',
+              acknowledgeable: false,
+              acknowledge_effect: null,
+            },
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-1"
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        filterChrome="minimal"
+        strategicState={state}
+      />,
+    );
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="needs-action-strip"]')).toBeTruthy();
+    });
+    // When acknowledgeable=false, no Ack button should appear
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 30)); });
+    expect(container.querySelector('[data-testid="attention-ack-btn"]')).toBeNull();
+  });
+});

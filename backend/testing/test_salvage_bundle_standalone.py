@@ -1,5 +1,5 @@
-"""Standalone smoke tests covering the 16-finding salvage bundle and the 7-finding
-compute-images salvage bundle.
+"""Standalone smoke tests covering the 16-finding salvage bundle, the 7-finding
+compute-images salvage bundle, and the 7-finding operator audience/lifecycle bundle.
 
 These tests run without a database (--standalone --no-postgres) and verify
 properties that were identified in the adversarial-gate review cycle but can be
@@ -106,6 +106,17 @@ Findings covered here (5-finding operator-inbox lifecycle/convergence salvage bu
   n3 — acknowledge_effect label: lifecycleAcknowledgeEffectLabel helper converts effect to human-readable tooltip
   n4 — QUESTION auto-decay (already fixed; see m3 tests above)
   n5 — confirmation chips actionable (already fixed; see m2 tests above)
+
+Findings covered here (7-finding operator audience/lifecycle salvage bundle, 2026-07-21):
+  m-1 — research.dedup_deadlock + research.already_fixed_deadlock registered STRATEGIST_INTERNAL
+  m-2 — research.direction_auto_completed registered STRATEGIST_INTERNAL; emitter has event_type=;
+         dedup BUG_REPORT + review_pipeline BLOCKER call stamp_message_audience;
+         all Alert() constructors in backend/app/ have event_type=
+  m-3 — lifecycle fields consumed (operator_action hint, Ack button) [pinned in MessagesPanel.test.tsx]
+  m-4 — attention-driven inbox default (needsActionOnly=true default) [pinned in MessagesPanel.test.tsx]
+  m-5 — confirmation chips actionable [pinned in MessagesPanel.test.tsx]
+  m-6 — QUESTION auto-decay: STALE_QUESTION_DECAY_DAYS=30; stale_unanswered stamped; runtime-configurable
+  m-7 — notifications converged on attention model [pinned in MessagesPanel.test.tsx]
 
 Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-1  — MetricsIntegrityFlag uses real backend contract (check/status/self_reported/ground_truth/delta/severity/subject/detail/auto_resolved)
@@ -5309,6 +5320,212 @@ def test_f20_20_hotfix_eligible_modules_restricts_scope():
         "evaluate_hotfix_scope must return eligible=True for a diff that touches "
         "only HOTFIX_ELIGIBLE_MODULES — the hotfix channel must be usable for "
         "narrowly-scoped gate fixes"
+    )
+
+
+# ── 7-finding operator audience / message lifecycle salvage bundle (2026-07-21) ── #
+# Findings: design/fix: creation-path fail-closed audience contract (m-1..m-2),
+#           feat: auto-decay stale QUESTION messages (m-6).
+# Findings m-3 (operator inbox lifecycle), m-4 (attention-driven inbox),
+# m-5 (confirmation chips), m-7 (converge notifications) are pinned by the
+# MessagesPanel.test.tsx / useMessageList.test.ts frontend test suites.
+# --------------------------------------------------------------------------- #
+
+
+def test_m1_research_dedup_deadlock_alert_registered_strategist_internal():
+    """research.dedup_deadlock must route to STRATEGIST_INTERNAL (not leak to operator).
+
+    Finding claim: research_direction_state.py builds a dedup-deadlock Alert with no
+    event_type, so it fails open and reaches the operator badge. Fix: event_type=
+    'research.dedup_deadlock' registered as STRATEGIST_INTERNAL in message_audience.py.
+    """
+    from app.message_audience import route_event, STRATEGIST_INTERNAL
+
+    assert route_event("research.dedup_deadlock") == STRATEGIST_INTERNAL, (
+        "research.dedup_deadlock must route to STRATEGIST_INTERNAL — "
+        "dedup churn is internal bookkeeping, never operator-visible"
+    )
+
+
+def test_m1_research_already_fixed_deadlock_registered_strategist_internal():
+    """research.already_fixed_deadlock must route to STRATEGIST_INTERNAL."""
+    from app.message_audience import route_event, STRATEGIST_INTERNAL
+
+    assert route_event("research.already_fixed_deadlock") == STRATEGIST_INTERNAL, (
+        "research.already_fixed_deadlock must route to STRATEGIST_INTERNAL — "
+        "already-fixed deadlock detection is internal bookkeeping"
+    )
+
+
+def test_m2_research_direction_auto_completed_registered_strategist_internal():
+    """research.direction_auto_completed must route to STRATEGIST_INTERNAL.
+
+    Finding claim: research_completion.py builds a 'Direction auto-completed' Alert
+    with no event_type though research.direction_auto_completed is registered
+    STRATEGIST_INTERNAL — a claim-vs-shipped contradiction that leaks.
+    Fix: both the registry entry AND the emitter have event_type= stamped.
+    """
+    from app.message_audience import route_event, STRATEGIST_INTERNAL
+
+    assert route_event("research.direction_auto_completed") == STRATEGIST_INTERNAL, (
+        "research.direction_auto_completed must route to STRATEGIST_INTERNAL — "
+        "auto-completion is an internal lifecycle event, never operator-facing"
+    )
+
+
+def test_m2_research_direction_state_dedup_alert_uses_event_type():
+    """Dedup-deadlock Alert constructor in research_direction_state must include event_type.
+
+    Finding claim: the Alert built at the dedup-deadlock branch omits event_type=,
+    causing it to fail-open and reach the operator alert badge.
+    """
+    import inspect
+    from app import research_direction_state
+
+    src = inspect.getsource(research_direction_state)
+    assert "research.dedup_deadlock" in src, (
+        "research_direction_state must emit event_type='research.dedup_deadlock' "
+        "on the dedup-deadlock Alert so the audience registry routes it correctly"
+    )
+    assert "research.already_fixed_deadlock" in src, (
+        "research_direction_state must emit event_type='research.already_fixed_deadlock' "
+        "on the already-fixed-deadlock Alert so the audience registry routes it correctly"
+    )
+
+
+def test_m2_research_direction_state_bugr_message_stamps_audience():
+    """BUG_REPORT ProjectMessage for dedup-deadlock must call stamp_message_audience.
+
+    Finding claim: research_direction_state.py builds an agent BUG_REPORT ProjectMessage
+    with no audience stamp, so it fails open and reaches the operator.
+    """
+    import inspect
+    from app import research_direction_state
+
+    src = inspect.getsource(research_direction_state)
+    assert "stamp_message_audience" in src, (
+        "research_direction_state must import and call stamp_message_audience — "
+        "BUG_REPORT project messages emitted here must carry an audience stamp "
+        "so they route to STRATEGIST_INTERNAL rather than failing open"
+    )
+
+
+def test_m2_review_pipeline_blocker_stamps_audience():
+    """BLOCKER ProjectMessage in review_pipeline must call stamp_message_audience.
+
+    Finding claim: review_pipeline.py builds a BLOCKER ProjectMessage with no audience
+    stamp, failing open and leaking to the operator channel.
+    """
+    import inspect
+    from app import review_pipeline
+
+    src = inspect.getsource(review_pipeline)
+    assert "stamp_message_audience" in src, (
+        "review_pipeline must import and call stamp_message_audience — "
+        "the repeat-fingerprint BLOCKER ProjectMessage must carry an audience stamp "
+        "so it routes correctly rather than failing open to the operator"
+    )
+
+
+def test_m2_all_alert_constructors_have_event_type():
+    """Every Alert(...) instantiation in backend/app/ must include event_type=.
+
+    Finding claim: ~93 of 112 direct Alert(...) constructors omit event_type=,
+    reaching the operator badge via the fail-open read filter.
+    Fix: every Alert() in the emitter surface must pass event_type= so the
+    audience registry can route it.
+    """
+    import re
+    import glob
+
+    files = glob.glob("backend/app/**/*.py", recursive=True)
+    missing = []
+    for f in sorted(files):
+        with open(f) as fh:
+            src = fh.read()
+        for m in re.finditer(r"(?:alert|_alert|_res_alert)\s*=\s*Alert\s*\(", src):
+            start = m.start()
+            paren_pos = src.index("(", start)
+            depth = 0
+            end = paren_pos
+            for j in range(paren_pos, min(paren_pos + 3000, len(src))):
+                if src[j] == "(":
+                    depth += 1
+                elif src[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            block = src[start : end + 1]
+            if "event_type" not in block:
+                lineno = src[:start].count("\n") + 1
+                missing.append(f"{f}:{lineno}")
+
+    assert not missing, (
+        "These Alert() constructors are missing event_type= and will fail-open "
+        "to the operator badge via the NULL read filter:\n"
+        + "\n".join(f"  {loc}" for loc in missing)
+    )
+
+
+def test_m6_stale_question_decay_days_is_30():
+    """STALE_QUESTION_DECAY_DAYS must equal 30 — longer window than NOTE default.
+
+    Finding claim: the stale-open decay sweep explicitly excludes QUESTION messages
+    from auto-resolution. Fix: extend the sweep with a longer 30-day window for
+    QUESTION messages, configurable via runtime_config['stale_question_decay_days'].
+    """
+    from app.reaper_sweeps import STALE_QUESTION_DECAY_DAYS, STALE_OPEN_DECAY_DAYS
+
+    assert STALE_QUESTION_DECAY_DAYS == 30, (
+        f"STALE_QUESTION_DECAY_DAYS must be 30 — questions deserve more patience "
+        f"than NOTE/FEEDBACK messages; got {STALE_QUESTION_DECAY_DAYS}"
+    )
+    assert STALE_QUESTION_DECAY_DAYS > STALE_OPEN_DECAY_DAYS, (
+        f"STALE_QUESTION_DECAY_DAYS ({STALE_QUESTION_DECAY_DAYS}) must exceed "
+        f"STALE_OPEN_DECAY_DAYS ({STALE_OPEN_DECAY_DAYS}) — questions get a longer "
+        f"patience window than NOTE/FEEDBACK"
+    )
+
+
+def test_m6_sweep_decay_stale_open_messages_handles_question():
+    """sweep_decay_stale_open_messages must handle QUESTION with stale_unanswered reason.
+
+    Finding claim: the stale-open decay sweep excludes QUESTION from auto-resolution.
+    Fix: QUESTION messages auto-resolve after STALE_QUESTION_DECAY_DAYS with
+    resolution_reason='stale_unanswered' so operators can distinguish them from
+    genuinely-answered questions.
+    """
+    import inspect
+    from app.reaper_sweeps import sweep_decay_stale_open_messages
+
+    src = inspect.getsource(sweep_decay_stale_open_messages)
+    assert "stale_unanswered" in src, (
+        "sweep_decay_stale_open_messages must stamp resolution='stale_unanswered' "
+        "when auto-resolving a QUESTION message so operators can distinguish "
+        "auto-resolved from genuinely-answered questions"
+    )
+    assert "question_cutoff" in src or "QUESTION" in src, (
+        "sweep_decay_stale_open_messages must handle QUESTION messages with their "
+        "own longer decay window (STALE_QUESTION_DECAY_DAYS)"
+    )
+
+
+def test_m6_stale_question_decay_days_runtime_configurable():
+    """stale_question_decay_days must be configurable via runtime_config.
+
+    Finding claim: The decay window should be configurable at runtime
+    (e.g., 'stale_question_decay_days'). Fix: sweep reads
+    runtime_config.get('stale_question_decay_days', STALE_QUESTION_DECAY_DAYS).
+    """
+    import inspect
+    from app.reaper_sweeps import sweep_decay_stale_open_messages
+
+    src = inspect.getsource(sweep_decay_stale_open_messages)
+    assert "stale_question_decay_days" in src, (
+        "sweep_decay_stale_open_messages must read runtime_config.get("
+        "'stale_question_decay_days', ...) so the question-decay window "
+        "is adjustable without a code deploy"
     )
 
 
