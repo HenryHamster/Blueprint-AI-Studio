@@ -64,6 +64,7 @@ def test_route_event_high_signal_maps_to_operator_fyi():
     assert route_event("release_calcifying") == OPERATOR_FYI
     assert route_event("promotion_readiness_reached") == OPERATOR_FYI
     assert route_event("strategic_steering_deferred") == OPERATOR_FYI
+    assert route_event("resident_reply") == OPERATOR_FYI
 
 
 def test_route_event_criterion_mutations_maps_to_operator_action_needed():
@@ -1184,9 +1185,13 @@ def test_scan_skips_defaulted_user_from_type():
 
 
 # Modules with directly-authored operator-reaching ProjectMessage/build_project_message
-# sites.  notification_dispatch.py is the original choke-point; the other three
-# construct their escalation/attention rows via ``build_project_message`` and used
-# to land them with a NULL audience (fail-OPEN) — they now stamp at the emitter.
+# sites.  notification_dispatch.py is the original choke-point; the other modules
+# construct their escalation/attention rows via ``build_project_message`` and stamp
+# at the emitter so they carry a fail-closed audience.
+#
+# NOTE: This list is no longer used by test_no_operator_visible_emitter_bypasses_audience_gate,
+# which now scans all modules under backend/app/ exhaustively (no allowlist).  We keep
+# the variable for reference / legacy test isolation if needed.
 _MODULES_WITH_OPERATOR_MESSAGES = [
     "notification_dispatch.py",
     "review_loop_convergence.py",
@@ -1250,31 +1255,91 @@ def test_scan_accepts_stamped_build_project_message():
 
 def test_no_operator_visible_emitter_bypasses_audience_gate():
     """Whole-file invariant: every operator-reaching ProjectMessage /
-    build_project_message construction in the message-authoring modules routes its
-    audience through the shared gate.
+    build_project_message construction under backend/app/ routes its audience
+    through the shared gate.
 
-    Exercises the production stamping seam: reverting any escalation/attention
-    poster stamp (or adding a new operator-reaching row via the raw model
-    constructor OR the canonical ``build_project_message`` builder) makes this
-    scan flag the offending site and fail CI.
+    The test globs the entire app tree so any new module with an unstamped
+    operator-reaching ProjectMessage/build_project_message call fails CI
+    automatically — no allowlist update required.
+
+    This is the structural ratchet that prevents the operator-visible audience
+    leak from silently reoccurring: a freshly added emitter that forgets to call
+    ``stamp_message_audience`` (or ``route_event``) in its enclosing function is
+    caught by this scan. Fix by stamping the context dict with the appropriate
+    event_type before passing it to ``build_project_message`` or the
+    ``ProjectMessage`` constructor.
     """
+    import glob
+
     app_dir = os.path.normpath(
         os.path.join(os.path.dirname(__file__), "..", "app")
     )
     all_offenders: list[str] = []
-    for module_name in _MODULES_WITH_OPERATOR_MESSAGES:
-        fpath = os.path.join(app_dir, module_name)
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
         with open(fpath, encoding="utf-8") as f:
             source = f.read()
-        all_offenders.extend(
-            _collect_ungated_emitters(source, filename=fpath, rel=module_name)
+        offenders = _collect_ungated_emitters(
+            source, filename=fpath, rel=rel
         )
+        all_offenders.extend(offenders)
+
     assert not all_offenders, (
         "Found operator-reaching ProjectMessage/build_project_message site(s) that "
         "do NOT route their audience through the shared gate "
         "(stamp_message_audience/route_event). Every operator-reaching emitter must "
         "be stamped so a fail-closed audience classification is guaranteed:\n"
         + "\n".join(all_offenders)
+    )
+
+
+def test_no_operator_reaching_emitter_outside_scan_leaks():
+    """Exhaustive-glob scan catches every operator-reaching emitter, including
+    any module outside the old allowlist.
+
+    The previous allowlist-based scan only checked 11 known modules, so a 12th
+    operator-reaching emitter (e.g. strategic_resident_reconciliation.py) could
+    silently land rows with a NULL audience that the read filter fails OPEN on.
+    This test verifies that:
+
+    1. The exhaustive glob scan covers ``strategic_resident_reconciliation.py``
+       (which previously bypassed the gate).
+    2. ``"resident_reply"`` is registered in the audience registry as OPERATOR_FYI.
+    3. The stamped context in ``_create_resident_reply`` passes the gate scan.
+    """
+    import glob
+
+    # (1) Verify the event_type is registered in the audience registry.
+    assert route_event("resident_reply") == OPERATOR_FYI, (
+        "resident_reply must be registered as OPERATOR_FYI"
+    )
+    non_operator = get_non_operator_event_types()
+    assert "resident_reply" not in non_operator, (
+        "resident_reply is operator-visible, must not be in the non-operator filter"
+    )
+
+    # (2) Verify the glob scan includes strategic_resident_reconciliation.py.
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    all_files = sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True))
+    reconciliation_file = os.path.join(app_dir, "strategic_resident_reconciliation.py")
+    assert reconciliation_file in all_files, (
+        "strategic_resident_reconciliation.py must be in the glob scan set"
+    )
+
+    # (3) Scan that file and confirm no offenders — the stamp closes the hole.
+    with open(reconciliation_file, encoding="utf-8") as f:
+        source = f.read()
+    offenders = _collect_ungated_emitters(
+        source,
+        filename=reconciliation_file,
+        rel="strategic_resident_reconciliation.py",
+    )
+    assert not offenders, (
+        "strategic_resident_reconciliation.py must route its operator-reaching "
+        "build_project_message call through the audience gate. "
+        "Offenders found:\n" + "\n".join(offenders)
     )
 
 
@@ -1563,6 +1628,75 @@ def test_alert_scan_mixed_gated_and_ungated():
     )
     assert len(offenders) == 1
     assert "emit_ungated()" in offenders[0]
+
+
+# ── Structural guard: every Alert event_type must be registered ──────────
+
+
+def _collect_alert_constructors_with_unregistered_event_type(
+    source: str, *, filename: str, rel: str, registered: frozenset[str]
+) -> list[str]:
+    """Return offender strings for Alert(...) calls whose event_type= literal is
+    not present in the audience registry."""
+    tree = ast.parse(source, filename=filename)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or _ast_called_name(node) != "Alert":
+            continue
+        for kw in node.keywords:
+            if kw.arg != "event_type":
+                continue
+            if not isinstance(kw.value, ast.Constant) or not isinstance(kw.value.value, str):
+                continue
+            event_type = kw.value.value
+            if event_type not in registered:
+                offenders.append(
+                    f"  {rel}:{node.lineno} — Alert(event_type={event_type!r}) "
+                    "is not registered in _EVENT_AUDIENCE_REGISTRY; "
+                    "add it to backend/app/message_audience.py with its intended audience"
+                )
+    return offenders
+
+
+def test_no_alert_constructor_uses_unregistered_event_type():
+    """Whole-app invariant: every Alert(event_type=...) literal must be present
+    in the audience registry.
+
+    operator_visible_alert_filter() is fail-OPEN for unregistered event_types
+    (NULL/unknown rows are retained as operator-visible for legacy compat), so
+    an Alert whose event_type is not in _EVENT_AUDIENCE_REGISTRY silently
+    inflates the operator badge / preview as if it were operator-visible.
+
+    This ratchet catches the gap structurally: adding a new Alert() with an
+    unregistered event_type now fails CI immediately rather than only leaking
+    at runtime.  Fix by adding the event_type to _EVENT_AUDIENCE_REGISTRY in
+    backend/app/message_audience.py with the correct audience.
+    """
+    import glob
+
+    app_dir = os.path.normpath(
+        os.path.join(os.path.dirname(__file__), "..", "app")
+    )
+    registered = get_registered_event_types()
+    all_offenders: list[str] = []
+    for fpath in sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True)):
+        rel = os.path.relpath(fpath, app_dir)
+        with open(fpath, encoding="utf-8") as f:
+            source = f.read()
+        all_offenders.extend(
+            _collect_alert_constructors_with_unregistered_event_type(
+                source, filename=fpath, rel=rel, registered=registered
+            )
+        )
+
+    assert not all_offenders, (
+        "Found Alert() constructor(s) under backend/app/ with an event_type= that "
+        "is NOT registered in _EVENT_AUDIENCE_REGISTRY (message_audience.py).\n"
+        "operator_visible_alert_filter() FAILS OPEN for unregistered event types, "
+        "so these alerts leak into the operator badge/preview as if operator-visible.\n"
+        "Fix: add each event_type to _EVENT_AUDIENCE_REGISTRY with its intended audience:\n"
+        + "\n".join(all_offenders)
+    )
 
 
 # ── Whole-file invariant: zero ungated Alert constructors across all app modules ──

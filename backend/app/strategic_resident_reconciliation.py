@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.message_audience import stamp_message_audience
 from app.models import (
     MessageHandlingState,
     MessageSurface,
@@ -388,18 +389,8 @@ async def _create_resident_reply(
     identity = hashlib.sha256(
         f"{request.turn_task_id}:{request.reconciliation_id}".encode()
     ).hexdigest()
-    return await build_project_message(
-        session,
-        project_id=request.project_id,
-        surface=MessageSurface.CONVERSATION,
-        handling_state=MessageHandlingState.RESPONDED,
-        handled_by_task_id=request.turn_task_id,
-        reply_to_message_id=reply_target_id,
-        message_type=MessageType.NOTE,
-        from_type="strategic",
-        from_task_id=request.turn_task_id,
-        content=(result.reply or "Resident operation outcome recorded.").strip(),
-        context={
+    ctx = stamp_message_audience(
+        {
             "event_type": "resident_reply",
             "resident_turn_result_version": 1,
             "reconciliation_id": str(request.reconciliation_id).strip(),
@@ -414,6 +405,20 @@ async def _create_resident_reply(
                 ],
             },
         },
+        "resident_reply",
+    )
+    return await build_project_message(
+        session,
+        project_id=request.project_id,
+        surface=MessageSurface.CONVERSATION,
+        handling_state=MessageHandlingState.RESPONDED,
+        handled_by_task_id=request.turn_task_id,
+        reply_to_message_id=reply_target_id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        from_task_id=request.turn_task_id,
+        content=(result.reply or "Resident operation outcome recorded.").strip(),
+        context=ctx,
         status="resolved",
         resolved_at=_utcnow(),
         updated_at=_utcnow(),

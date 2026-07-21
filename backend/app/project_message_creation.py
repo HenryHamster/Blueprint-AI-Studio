@@ -78,6 +78,7 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "capability_verdict_decided",
         "capability_trial_ambiguous_lift_escalation",
         "question_answer",
+        "resident_reply",
         "feedback_reply",
         "capability_proof_gate_graduated_observe",
         "capability_proof_gate_graduated_enforce",

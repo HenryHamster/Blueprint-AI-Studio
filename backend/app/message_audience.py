@@ -80,6 +80,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "capability_verdict_decided": OPERATOR_FYI,
     "capability_trial_ambiguous_lift_escalation": OPERATOR_FYI,
     "question_answer": OPERATOR_FYI,
+    # resident_reply: Resident strategist's conversational outcome notification
+    # — the Resident produced a reply (e.g. operation outcome or
+    # user-facing message). Informational, operator-visible.
+    "resident_reply": OPERATOR_FYI,
     # feedback_reply: user replied to a feedback/notification — informational,
     # operator-visible. The strategist is armed (via maybe_arm_operator_refresh)
     # to process the answer, same as question_answer.
@@ -245,6 +249,13 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # Compute job terminated by the no-progress watchdog.
     "compute.job_stalled": OPERATOR_FYI,
     # === Runner-specific alerts =============================================
+    # Runner self-update bookkeeping: INFO (succeeded) and WARNING (failed)
+    # variants both record internal pipeline housekeeping — the operator
+    # does not need to act on a successful update, and a failed update
+    # surfaces via runner.degraded / post_update_silent, which ARE operator-
+    # visible.  Registering here ensures operator_visible_alert_filter drops
+    # these rows when they leak through direct Alert() construction.
+    "runner.self_update": STRATEGIST_INTERNAL,
     # Task with require_local_runner fell back to cloud after threshold.
     "runner.local_fallback": OPERATOR_FYI,
     # Runner repeatedly declined a task (repeated no-bid signals).
@@ -256,6 +267,9 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "runner.container_runner_unavailable": OPERATOR_ACTION_NEEDED,
     # Task pinned to local runner skipped because LLM credentials cannot be resolved.
     "runner.credential_skip": OPERATOR_ACTION_NEEDED,
+    # === Billing / budget alerts ============================================
+    # Monthly budget threshold alert — operator should review spend and act.
+    "MONTHLY_BUDGET_ALERT": OPERATOR_ACTION_NEEDED,
     # === SR quality metrics (strategist-internal, acted on autonomously) ====
     "sr.precision_recall_degraded": STRATEGIST_INTERNAL,
     "sr.engagement_thinning": STRATEGIST_INTERNAL,

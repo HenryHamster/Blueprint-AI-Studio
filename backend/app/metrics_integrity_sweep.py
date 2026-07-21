@@ -84,11 +84,12 @@ configured thresholds; disabled by default — operators must opt in via
 stamp shows ALL recent outcomes were non-green — could_not_run / red / skipped;
 flags stalled (project, cap) pairs, distinguishing infrastructure failure
 (could_not_run) from definitive failure (red), without altering any gate decision),
-and ``operator_inbox_needs_action_liveness`` (per-project check that every open
-operator-visible ProjectMessage is genuinely needs-action per derive_needs_action();
-flags projects where internal-only chatter is leaking into the operator inbox —
-measuring the direction's headline success criterion that zero non-actionable notices
-reach the operator).
+and ``operator_inbox_needs_action_liveness`` (two-directional per-project audit:
+forward — non-fyi operator-visible ProjectMessages that fail derive_needs_action()
+are flagged as leaks into the operator inbox; reverse — linked BLOCKER/QUESTION
+messages that pass derive_needs_action() but are invisible to badge SQL (status=
+'open' only) are flagged as missed items; also covers the alert channel by counting
+undismissed INFO-severity operator-visible Alerts as non-actionable noise).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -5634,31 +5635,50 @@ async def check_research_quality_grader_pass_rate(ctx: SweepContext) -> List[Che
 
 @register_check(
     "operator_inbox_needs_action_liveness",
-    "Sample open operator-visible ProjectMessage rows per project and flag any "
-    "project where the open operator-visible set contains messages that "
-    "derive_needs_action() marks non-actionable — internal chatter leaking into "
-    "the operator inbox.",
+    "Sample open+linked operator-visible ProjectMessage rows and undismissed "
+    "operator-visible INFO Alerts per project; flag (a) non-fyi messages that "
+    "fail derive_needs_action() (forward leak), (b) linked messages that pass "
+    "derive_needs_action() but are invisible to badge SQL using status='open' "
+    "(reverse drift), and (c) INFO-severity alerts in the operator-visible "
+    "alert channel (non-actionable alert noise). operator-fyi audience rows "
+    "are legitimate informational notices and are never counted as leaked chatter.",
 )
 async def check_operator_inbox_needs_action_liveness(
     ctx: SweepContext,
 ) -> List[CheckResult]:
-    """Ground truth: every open, operator-visible ProjectMessage should have
-    ``derive_needs_action() == True``.  A message that is open and operator-visible
-    but not genuinely needs-action is internal chatter reaching the operator
-    inbox — the ``size-cap / salvage / dedup / lifecycle`` notices the direction's
-    success evidence says must reach zero.
+    """Two-directional operator inbox liveness audit covering messages and alerts.
 
-    self_reported = total open operator-visible count per project.
-    ground_truth  = subset where ``derive_needs_action()`` is True.
-    delta         = non-actionable messages leaking into the operator inbox.
+    **Forward drift (leak in):** open/linked operator-visible messages that fail
+    ``derive_needs_action()`` AND whose audience is NOT ``operator-fyi``.
+    ``operator-fyi`` is a legitimate informational channel, not leaked chatter;
+    only non-fyi non-actionable messages are real leaks (e.g. NULL-audience
+    legacy rows with non-BLOCKER/QUESTION types).
+
+    **Reverse drift (miss out):** messages with ``status='linked'`` that pass
+    ``derive_needs_action()`` — genuinely actionable items whose badge SQL (which
+    reads ``status='open'`` only) silently drops them.  A linked BLOCKER is
+    ``needs_action=True`` per ``derive_needs_action`` but invisible to the badge.
+
+    **Alert channel:** undismissed INFO-severity alerts that pass
+    ``operator_visible_alert_filter()`` — bookkeeping notices inflating the
+    operator alert badge with non-actionable entries.
+
+    self_reported = total sampled (open+linked) operator-visible message count.
+    ground_truth  = messages correctly needs-action AND badge-visible (status=open).
+    delta         = forward_leaked + badge_invisible + info_alert_count.
 
     Bounded to ``max_projects`` projects; within each, at most ``sample_limit``
-    open operator-visible rows.  Returns SKIPPED when a project has no open
-    operator-visible messages.  Pure recompute — never writes to ProjectMessage.
+    open+linked operator-visible rows.  Returns SKIPPED when a project has no
+    open/linked operator-visible messages and no INFO alerts.  Pure recompute —
+    never writes to ProjectMessage or Alert.
     """
-    from app.message_audience import operator_visible_audience_filter
-    from app.message_convergence import OPEN_STATUS, derive_needs_action
-    from app.models import Project, ProjectMessage
+    from app.message_audience import (
+        OPERATOR_FYI,
+        operator_visible_alert_filter,
+        operator_visible_audience_filter,
+    )
+    from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
+    from app.models import Alert, AlertSeverity, Project, ProjectMessage
 
     project_ids = (
         await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
@@ -5676,12 +5696,15 @@ async def check_operator_inbox_needs_action_liveness(
     results: List[CheckResult] = []
     for (project_id,) in project_ids:
         pid = str(project_id)
+        # Widened from status='open' to status IN ('open', 'linked') so that
+        # linked BLOCKER/QUESTION messages (genuinely needs-action, in-flight fix)
+        # are included in the sample and visible to the reverse-drift check.
         messages = (
             await ctx.session.execute(
                 select(ProjectMessage)
                 .where(
                     ProjectMessage.project_id == project_id,
-                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
                     ProjectMessage.from_type != "user",
                     operator_visible_audience_filter(ProjectMessage.context),
                 )
@@ -5690,36 +5713,95 @@ async def check_operator_inbox_needs_action_liveness(
             )
         ).scalars().all()
 
-        if not messages:
+        # Alert channel liveness: undismissed INFO-severity, operator-visible alerts
+        # are non-actionable bookkeeping notices inflating the operator alert badge.
+        info_alert_count = int(
+            (
+                await ctx.session.execute(
+                    select(func.count())
+                    .select_from(Alert)
+                    .where(
+                        Alert.project_id == project_id,
+                        Alert.dismissed_at.is_(None),
+                        Alert.severity == AlertSeverity.INFO,
+                        operator_visible_alert_filter(Alert.event_type),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+        if not messages and info_alert_count == 0:
             results.append(
                 CheckResult(
                     check="operator_inbox_needs_action_liveness",
                     status=CheckStatus.SKIPPED,
                     subject=pid,
-                    detail="no open operator-visible messages",
+                    detail="no open/linked operator-visible messages or INFO alerts",
                 )
             )
             continue
 
         total = len(messages)
-        actionable = sum(1 for m in messages if derive_needs_action(m))
-        non_actionable = total - actionable
 
-        if non_actionable > 0:
+        def _audience_str(m: ProjectMessage) -> str | None:
+            return (m.context or {}).get("audience")
+
+        def _status_str(m: ProjectMessage) -> str:
+            s = m.status
+            return s.value if hasattr(s, "value") else str(s)
+
+        # Forward: non-actionable messages NOT from the operator-fyi channel.
+        # operator-fyi is a legitimate informational audience (not a leak). Only
+        # NULL-audience or non-fyi operator-visible messages that fail
+        # derive_needs_action() are real forward leaks.
+        forward_leaked = [
+            m for m in messages
+            if not derive_needs_action(m) and _audience_str(m) != OPERATOR_FYI
+        ]
+
+        # Reverse: needs-action messages with linked status that badge SQL misses.
+        # derive_needs_action() returns True for BLOCKER/QUESTION at any non-resolved
+        # status, but the badge reads status='open' only — linked items are invisible.
+        badge_invisible = [
+            m for m in messages
+            if derive_needs_action(m) and _status_str(m) == LINKED_STATUS
+        ]
+
+        actionable_badge_visible = sum(
+            1 for m in messages
+            if derive_needs_action(m) and _status_str(m) == OPEN_STATUS
+        )
+        delta = len(forward_leaked) + len(badge_invisible) + info_alert_count
+
+        if delta > 0:
+            parts: List[str] = []
+            if forward_leaked:
+                parts.append(
+                    f"{len(forward_leaked)}/{total} non-fyi operator-visible "
+                    "message(s) not genuinely needs-action (forward leak into "
+                    "operator inbox)"
+                )
+            if badge_invisible:
+                parts.append(
+                    f"{len(badge_invisible)} needs-action message(s) with "
+                    "linked status invisible to badge SQL (reverse drift)"
+                )
+            if info_alert_count:
+                parts.append(
+                    f"{info_alert_count} INFO alert(s) in operator-visible "
+                    "alert channel (non-actionable alert noise)"
+                )
             results.append(
                 CheckResult(
                     check="operator_inbox_needs_action_liveness",
                     status=CheckStatus.FLAGGED,
                     self_reported=total,
-                    ground_truth=actionable,
-                    delta=non_actionable,
+                    ground_truth=actionable_badge_visible,
+                    delta=delta,
                     severity="warn",
                     subject=pid,
-                    detail=(
-                        f"{non_actionable}/{total} open operator-visible "
-                        "message(s) are not genuinely needs-action "
-                        "(internal chatter in operator inbox)"
-                    ),
+                    detail="; ".join(parts),
                 )
             )
         else:
@@ -5732,8 +5814,9 @@ async def check_operator_inbox_needs_action_liveness(
                     delta=0,
                     subject=pid,
                     detail=(
-                        f"all {total} open operator-visible message(s) are "
-                        "genuinely needs-action"
+                        f"all {total} open/linked operator-visible message(s) are "
+                        "correctly handled (no forward leaks, no badge-invisible "
+                        "items, no INFO alert noise)"
                     ),
                 )
             )

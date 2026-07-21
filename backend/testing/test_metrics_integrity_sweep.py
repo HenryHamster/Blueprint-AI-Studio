@@ -32,6 +32,8 @@ from app.metrics_integrity_sweep import (
     get_metrics_integrity_observability,
 )
 from app.models import (
+    Alert,
+    AlertSeverity,
     Artifact,
     ArtifactType,
     CriterionEvidence,
@@ -7599,10 +7601,11 @@ async def test_operator_inbox_needs_action_liveness_ok_when_all_actionable(db):
 
 @pytest.mark.asyncio
 async def test_operator_inbox_needs_action_liveness_flags_nonactionable_notice(db):
-    """An open NOTE (non-actionable) in the operator inbox triggers FLAGGED with delta=1."""
+    """An open NULL-audience NOTE (non-actionable, non-fyi) triggers FLAGGED with delta=1."""
     project = await _project(db)
-    # NOTE is non-actionable (not in NEEDS_ACTION_MESSAGE_TYPES, audience != operator-action-needed)
-    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    # NOTE with no audience (NULL) is operator-visible (legacy fallthrough) but not
+    # needs-action and not operator-fyi — should be flagged as a forward leak.
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
     await db.commit()
 
     ctx = SweepContext(session=db, now=_utcnow(), mode="observe",
@@ -7668,10 +7671,12 @@ async def test_operator_inbox_needs_action_liveness_ignores_user_messages(db):
 
 @pytest.mark.asyncio
 async def test_operator_inbox_needs_action_liveness_enforce_enrolls_finding(db):
-    """In enforce mode, a non-actionable open message enrolls an EvergreenBacklogItem."""
+    """In enforce mode, a non-actionable NULL-audience open message enrolls an EvergreenBacklogItem."""
     _rc["metrics_integrity_sweep_mode"] = "enforce"
     project = await _project(db)
-    _inbox_message(db, project, message_type=MessageType.NOTE, audience="operator-fyi")
+    # NULL-audience NOTE: operator-visible (legacy fallthrough) but not needs-action
+    # and not operator-fyi → forward leak → FLAGGED → enrolled in enforce mode.
+    _inbox_message(db, project, message_type=MessageType.NOTE, audience=None)
     await db.commit()
 
     now = _utcnow()
@@ -7698,3 +7703,79 @@ def test_registry_contains_operator_inbox_check():
     """operator_inbox_needs_action_liveness is registered in the check registry."""
     names = {c.name for c in registered_checks()}
     assert "operator_inbox_needs_action_liveness" in names
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db):
+    """Verify the check exercises both drift directions and the alert channel.
+
+    Forward drift: operator-fyi NOTEs are legitimate informational notices and
+    are NOT counted as leaked chatter. Only non-fyi messages that fail
+    derive_needs_action() are forward leaks.
+
+    Reverse drift: a linked BLOCKER (needs-action=True per derive_needs_action,
+    status='linked') is now included in the sample and flagged as badge-invisible
+    — the badge SQL reads status='open' only and would miss it.
+
+    Alert coverage: an undismissed INFO-severity, operator-visible Alert is
+    flagged as non-actionable alert noise, demonstrating the check covers the
+    alert channel in addition to the message ledger.
+    """
+    project = await _project(db)
+
+    # Linked BLOCKER: needs-action=True (derive_needs_action), but status='linked'
+    # → badge SQL (status='open') misses it → reverse drift.
+    _inbox_message(
+        db, project,
+        message_type=MessageType.BLOCKER,
+        audience="operator-action-needed",
+        status="linked",
+    )
+
+    # operator-fyi NOTE: legitimate informational notice — NOT a forward leak.
+    _inbox_message(
+        db, project,
+        message_type=MessageType.NOTE,
+        audience="operator-fyi",
+    )
+
+    # INFO-severity alert with NULL event_type: operator-visible (fails open on NULL)
+    # but non-actionable → alert channel noise detected by the check.
+    db.add(Alert(
+        project_id=project.id,
+        severity=AlertSeverity.INFO,
+        title="Build completed",
+        message="Image build finished successfully",
+        event_type=None,
+    ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_operator_inbox_needs_action_liveness(ctx)
+
+    pid = str(project.id)
+    project_results = [r for r in results if r.subject == pid]
+    assert len(project_results) == 1
+    r = project_results[0]
+
+    # FLAGGED because of reverse drift (1 badge-invisible linked BLOCKER)
+    # and alert channel noise (1 INFO alert).
+    # The operator-fyi NOTE is NOT counted as a forward leak.
+    assert r.status == CheckStatus.FLAGGED, (
+        f"expected FLAGGED, got {r.status}: {r.detail}"
+    )
+    # delta = 0 forward_leaked + 1 badge_invisible + 1 info_alert = 2
+    assert r.delta == 2, (
+        f"expected delta=2 (1 badge-invisible + 1 INFO alert), got {r.delta}: {r.detail}"
+    )
+    # Reverse drift detail mentions badge-invisible / linked status
+    assert "linked" in r.detail or "badge" in r.detail or "invisible" in r.detail, (
+        f"expected reverse-drift mention in detail: {r.detail}"
+    )
+    # Alert channel detail mentions INFO alerts
+    assert "INFO" in r.detail or "alert" in r.detail.lower(), (
+        f"expected alert-channel mention in detail: {r.detail}"
+    )
