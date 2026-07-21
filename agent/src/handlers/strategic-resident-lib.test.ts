@@ -44,7 +44,7 @@ describe('residentConfig', () => {
     expect(c.maxOpsPerTurn).toBe(3);
     expect(c.compactionThresholdTokens).toBeUndefined(); // model-derived by default
     expect(c.compactionCooldownMs).toBe(300_000); // 5 min default
-    expect(c.operatorAckThresholdMs).toBe(10_000); // 10s default
+    expect(c.operatorAckThresholdMs).toBe(0); // disabled by default; chip provides visual feedback
   });
 
   it('reads the payload knobs (seconds → ms)', () => {

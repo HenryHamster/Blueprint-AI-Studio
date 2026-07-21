@@ -110,9 +110,9 @@ describe('RailMiniCanvas — state 2: no canvas, strategist active', () => {
     expect(screen.getByTestId('rail-mini-canvas-working')).toBeInTheDocument();
   });
 
-  it('shows the generic "Working…" label when no task or direction label is provided', () => {
+  it('shows the chip label when no task or direction label is provided', () => {
     render(<RailMiniCanvas canvas={null} strategistActive={true} />);
-    expect(screen.getByText('Working…')).toBeInTheDocument();
+    expect(screen.getByText('Strategist working…')).toBeInTheDocument();
   });
 
   it('shows the active task label when provided', () => {
@@ -124,7 +124,6 @@ describe('RailMiniCanvas — state 2: no canvas, strategist active', () => {
       />,
     );
     expect(screen.getByText('Implementing feature X')).toBeInTheDocument();
-    expect(screen.queryByText('Working…')).toBeNull();
   });
 
   it('shows the active direction label when provided', () => {

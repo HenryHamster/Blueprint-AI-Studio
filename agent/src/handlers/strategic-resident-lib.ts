@@ -281,7 +281,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     ? num(payload.strategic_session_compaction_threshold_tokens, 0)
     : undefined;
   const compactionCooldownSec = num(payload.strategic_session_compaction_cooldown_seconds, 300);
-  const ackThresholdSec = num(payload.strategic_session_operator_ack_threshold_seconds, 10);
+  const ackThresholdSec = num(payload.strategic_session_operator_ack_threshold_seconds, 0);
   // 0 or negative disables the early ack; positive values clamp to a 1s floor.
   const operatorAckThresholdMs = ackThresholdSec <= 0 ? 0 : Math.max(1000, Math.round(ackThresholdSec * 1000));
   return {

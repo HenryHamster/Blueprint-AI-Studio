@@ -38,6 +38,8 @@ import { useConversationSend } from '../hooks/useConversationSend';
 import { compareResidentMessages, useResidentConversation } from '../hooks/useResidentConversation';
 import { useResidentEngineHealth } from '../hooks/useResidentEngineHealth';
 import { ResidentEngineHealthChip } from './ResidentEngineHealthChip';
+import { useStrategistStatus } from '../hooks/useStrategistStatus';
+import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
@@ -891,6 +893,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
   const optimisticStrategicRefreshRef = useRef<StrategicRefreshMarker | null>(null);
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
+  const strategistStatus = useStrategistStatus({
+    strategistActive,
+    cycleProgress,
+    lastCycleCompletion: undefined, // chip in MessagesPanel only covers active+pending; completion uses its own banner below
+    pendingRefreshAt: strategicRefresh?.requested_at ?? null,
+    lastFiredAt: !strategicRefresh?.requested_at ? (strategicRefresh?.last_fired_at ?? null) : null,
+  });
+  const showStrategistChip = !conversationMode && (strategistActive || Boolean(strategicRefresh));
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
   const openMessageCommandSurface = useCallback(() => {
@@ -2803,35 +2813,13 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         </div>
       )}
 
-      {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
-          a receipt showing when a prior steer was picked up and acted upon. Hidden
-          once the cycle starts (strategistActive), at which point "Strategist working…"
-          takes over. Displays the queued directive excerpt and coalesce count. */}
-      {strategicRefresh && !strategistActive && !conversationMode && (
-        <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
-          <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
-          <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
-            {strategicRefresh.requested_at ? (
-              <>
-                Strategic cycle pending{strategicRefresh.origin ? ` · ${strategicRefresh.origin}` : ''}
-                {strategicRefresh.excerpt && (
-                  <>
-                    {' · '}
-                    <span className="italic">{strategicRefresh.excerpt.slice(0, 120)}{strategicRefresh.excerpt.length > 120 ? '…' : ''}</span>
-                  </>
-                )}
-                {strategicRefresh.operator_count && strategicRefresh.operator_count > 1 && (
-                  <> · +{strategicRefresh.operator_count - 1} {strategicRefresh.operator_count - 1 === 1 ? 'steer' : 'steers'} coalesced</>
-                )}
-                {` · armed ${timeAgo(strategicRefresh.requested_at)}`}
-              </>
-            ) : (
-              <>
-                Steer picked up{strategicRefresh.last_fired_at ? ` · strategic cycle ran ${timeAgo(strategicRefresh.last_fired_at)}` : ''}
-              </>
-            )}
-          </span>
-          {strategicRefresh.requested_at && (
+      {/* Unified strategist status chip: covers active cycle (indigo), pending steer (indigo),
+          and steer-received receipt (emerald). The cycle-completion banner below is kept
+          separate because it carries rich detail (direction counts, etc.). */}
+      {showStrategistChip && (
+        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 flex items-center gap-2 shrink-0">
+          <StrategistStatusChip status={strategistStatus} />
+          {strategicRefresh?.requested_at && (
             <button
               type="button"
               onClick={() => { void handleCancelStrategicRefresh(); }}
@@ -2842,23 +2830,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
               {cancellingRefresh ? 'Cancelling…' : 'Cancel'}
             </button>
           )}
-        </div>
-      )}
-
-      {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
-          WS events. Shows phase label and steering excerpt when the enriched event payload
-          is available, otherwise falls back to the minimal "working" text. */}
-      {strategistActive && !conversationMode && (
-        <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
-          <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
-          <span className="text-xs text-indigo-300 font-medium min-w-0">
-            {cycleProgress?.phase_label ? `Strategist: ${cycleProgress.phase_label}…` : 'Strategist working…'}
-            {cycleProgress?.steering_excerpt && (
-              <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
-                "{cycleProgress.steering_excerpt.slice(0, 100)}{cycleProgress.steering_excerpt.length > 100 ? '…' : ''}"
-              </span>
-            )}
-          </span>
         </div>
       )}
 

@@ -1712,7 +1712,7 @@ describe('handleStrategicResident — early operator-turn acknowledgment', () =>
     vi.useRealTimers();
   });
 
-  it('posts an early acknowledgment when the operator turn exceeds the configured threshold', async () => {
+  it('posts an early acknowledgment when the operator turn exceeds an explicitly configured threshold', async () => {
     vi.useFakeTimers();
 
     const OPERATOR_MSG = {

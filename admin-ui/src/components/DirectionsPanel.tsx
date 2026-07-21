@@ -1,5 +1,7 @@
 import { useState, useMemo, useCallback } from 'react';
 import { ChevronDown, Plus, X } from 'lucide-react';
+import { useStrategistStatus } from '../hooks/useStrategistStatus';
+import { StrategistStatusChip } from './StrategistStatusChip';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
 import RunningUpdatePanel from './RunningUpdatePanel';
@@ -287,6 +289,9 @@ export function DirectionsPanel({
     [grouped]
   );
 
+  const strategistStatus = useStrategistStatus({ strategistActive, cycleProgress, lastCycleCompletion });
+  const showStrategistChip = strategistStatus.phase !== 'idle' && (strategistActive || lastCycleCompletion);
+
   return (
       <div className="flex-1 min-h-0 overflow-hidden flex flex-col bg-neutral-950">
         <DirectionsPanelHeader
@@ -304,41 +309,9 @@ export function DirectionsPanel({
           showCycleControls={showCycleControls}
           showTabs={showInternalTabs}
         />
-        {strategistActive && (
-          <div className="px-5 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
-            <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
-            <span className="text-xs text-indigo-300 font-medium min-w-0">
-              {cycleProgress?.phase_label ? `Strategist: ${cycleProgress.phase_label}…` : 'Strategist working…'}
-              {cycleProgress?.steering_excerpt && (
-                <span className="ml-1.5 text-indigo-400/80 italic font-normal truncate block">
-                  "{cycleProgress.steering_excerpt.slice(0, 80)}{cycleProgress.steering_excerpt.length > 80 ? '…' : ''}"
-                </span>
-              )}
-            </span>
-          </div>
-        )}
-        {lastCycleCompletion && !strategistActive && activeTab === 'directions' && (
-          <div className="px-5 py-2 border-b border-neutral-800 bg-emerald-950/30 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
-            <span className="w-2 h-2 rounded-full bg-emerald-400 mt-0.5 shrink-0" aria-hidden="true" />
-            <span className="text-xs text-emerald-300 min-w-0">
-              <span className="font-medium">Cycle complete</span>
-              {(lastCycleCompletion.created_count ?? 0) > 0 && (
-                <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
-              )}
-              {(lastCycleCompletion.retired_count ?? 0) > 0 && (
-                <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
-              )}
-              {(lastCycleCompletion.staged_count ?? 0) > 0 && (
-                <span className="ml-1.5">· {lastCycleCompletion.staged_count} staged</span>
-              )}
-              {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
-                <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
-              )}
-              {lastCycleCompletion.problem_model_changed && <span className="ml-1.5">· problem model updated</span>}
-              {lastCycleCompletion.status_message && (
-                <span className="ml-1.5 text-emerald-400/80 italic">{lastCycleCompletion.status_message.slice(0, 80)}</span>
-              )}
-            </span>
+        {showStrategistChip && (
+          <div className="px-5 py-2 border-b border-neutral-800 shrink-0">
+            <StrategistStatusChip status={strategistStatus} />
           </div>
         )}
         <div className="flex-1 min-h-0 overflow-hidden flex flex-col">
