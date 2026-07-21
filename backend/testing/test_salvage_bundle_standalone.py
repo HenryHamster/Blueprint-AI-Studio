@@ -132,6 +132,20 @@ Findings covered here (7-finding operator audience/lifecycle salvage bundle, 202
   m-6 — QUESTION auto-decay: STALE_QUESTION_DECAY_DAYS=30; stale_unanswered stamped; runtime-configurable
   m-7 — notifications converged on attention model [pinned in MessagesPanel.test.tsx]
 
+Findings covered here (7-finding creation-path fail-closed/attention/lifecycle salvage bundle, task fb81a82f, 2026-07-21):
+  fb-1 — design: creation-path fail-closed audience contract → already pinned by test_m1_* + test_m2_* (m-1/m-2)
+  fb-2 — fix: fail-closed audience at Alert/message creation → already pinned by test_m1_*, test_m2_* (m-1/m-2)
+  fb-3 — feat: operator inbox consumes server attention/lifecycle model (operator_action hint, Ack button)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel attention model lifecycle field consumption (m-3)
+  fb-4 — feat(ui): make operator inbox attention-driven, retire dual effectiveSignal classification
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel needs-action filter (m-4)
+  fb-5 — fix(chat): make confirmation chips actionable (accept/dismiss affordance in needs-action strip)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel confirmation chip actionability (m-5)
+  fb-6 — feat(messages): auto-decay stale open QUESTION messages → already pinned by test_m6_* (m-6)
+  fb-7 — feat(ui): converge operator notifications on attention model (toast uses attention, not effectiveSignal)
+         → already pinned by MessagesPanel.test.tsx::fires toast for needs_operator message even when
+           event_type is muted (m-7)
+
 Findings covered here (15-finding capability-proof salvage bundle, 2026-07-17):
   cp-1  — MetricsIntegrityFlag uses real backend contract (check/status/self_reported/ground_truth/delta/severity/subject/detail/auto_resolved)
   cp-2  — capability_proof_trial_stall is registered as a health check
