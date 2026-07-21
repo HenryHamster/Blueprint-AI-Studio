@@ -61,17 +61,17 @@ class TestGetAlertsAudienceFilter:
         assert "Internal Payoff Alert" not in titles
 
     @pytest.mark.asyncio
-    async def test_get_alerts_retains_null_event_type(
+    async def test_get_alerts_excludes_null_event_type(
         self, client: AsyncClient, db_session
     ):
-        """Legacy alerts with no event_type must still be returned (fail-open for unknown)."""
+        """Alerts with no event_type must NOT be returned — fail-closed for NULL/unregistered."""
         project = await _make_project(db_session)
 
         db_session.add(
             Alert(
                 project_id=project.id,
                 severity="ERROR",
-                title="Legacy Alert",
+                title="Untagged Alert",
                 message="no event type",
             )
         )
@@ -80,4 +80,6 @@ class TestGetAlertsAudienceFilter:
         resp = await client.get("/api/admin/alerts")
         assert resp.status_code == 200
         titles = [a["title"] for a in resp.json()]
-        assert "Legacy Alert" in titles
+        assert "Untagged Alert" not in titles, (
+            "NULL event_type alerts must be excluded (fail-closed)"
+        )

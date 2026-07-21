@@ -332,15 +332,23 @@ _NON_OPERATOR_AUDIENCES: frozenset[str] = frozenset(
 )
 
 # Registry event_types that resolve to a non-operator audience.  Precomputed
-# from the single-source-of-truth registry so the Alert read-model filter never
-# duplicates an event-type list.  A row whose ``event_type`` is one of these is
-# strategist-internal / pipeline-log and must never reach an operator badge,
-# count, or preview.  Untagged (NULL) or unregistered ``event_type`` rows are
-# retained by the filter — the conservative, legacy-preserving choice.
+# from the single-source-of-truth registry.  Used by get_non_operator_event_types()
+# (a testing hook); the Alert read-model filter now uses _OPERATOR_EVENT_TYPES
+# (explicit allowlist, fail-closed) rather than this denylist.
 _NON_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
     event_type
     for event_type, audience in _EVENT_AUDIENCE_REGISTRY.items()
     if audience in _NON_OPERATOR_AUDIENCES
+)
+
+# Registry event_types that resolve to an operator-visible audience.  Precomputed
+# for use by operator_visible_alert_filter: the Alert read-model uses an explicit
+# IN-allowlist (fail-closed) so NULL and unregistered event_types never reach an
+# operator badge, count, or preview.
+_OPERATOR_EVENT_TYPES: frozenset[str] = frozenset(
+    event_type
+    for event_type, audience in _EVENT_AUDIENCE_REGISTRY.items()
+    if audience in _AUDIENCES_THAT_REACH_OPERATOR
 )
 
 
@@ -416,22 +424,25 @@ def operator_visible_alert_filter(event_type_column: Any) -> Any:
 
     ``Alert`` carries no ``context``/``audience`` column — its audience is keyed
     on ``event_type`` through the same registry that :func:`route_event`
-    consults at creation.  This is the alert analogue of
-    :func:`operator_visible_audience_filter`: it retains untagged (``NULL``) and
-    unregistered ``event_type`` rows (conservative, legacy-preserving) while
-    dropping rows whose ``event_type`` is explicitly registered
-    strategist-internal or pipeline-log so they never contribute to an
-    operator-facing badge count, severity aggregate, or preview.
+    consults at creation.  This filter is fail-closed: only rows whose
+    ``event_type`` is explicitly registered as operator-visible
+    (``operator-action-needed`` or ``operator-fyi``) pass through.
+    NULL and unregistered ``event_type`` rows are excluded — they must never
+    contribute to an operator-facing badge count, severity aggregate, or preview.
+    Register the event_type in :data:`_EVENT_AUDIENCE_REGISTRY` with the correct
+    operator audience to make an Alert visible.
     """
-    return or_(
-        event_type_column.is_(None),
-        event_type_column.notin_(_NON_OPERATOR_EVENT_TYPES),
-    )
+    return event_type_column.in_(list(_OPERATOR_EVENT_TYPES))
 
 
 def get_non_operator_event_types() -> frozenset[str]:
     """Return every event_type that resolves to a non-operator audience (testing hook)."""
     return _NON_OPERATOR_EVENT_TYPES
+
+
+def get_operator_event_types() -> frozenset[str]:
+    """Return every event_type that resolves to an operator-visible audience (testing hook)."""
+    return _OPERATOR_EVENT_TYPES
 
 
 def stamp_message_audience(

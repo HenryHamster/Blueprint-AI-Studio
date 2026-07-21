@@ -3638,10 +3638,9 @@ def test_research_direction_state_direction_auto_completed_alert_stamps_event_ty
     """research_direction_state Alert for 'Direction auto-completed' must stamp event_type.
 
     Finding p2: research.direction_auto_completed is registered STRATEGIST_INTERNAL in
-    the audience registry. Without event_type= the Alert has a NULL event_type and the
-    operator_visible_alert_filter retains it (fail-open for NULLs), leaking an internal
-    bookkeeping notice to the operator badge. Stamping event_type= ensures the filter
-    routes it correctly.
+    the audience registry. operator_visible_alert_filter is fail-closed (IN-allowlist),
+    so without event_type= the Alert has a NULL event_type and is excluded entirely from
+    the operator UI. Stamping event_type= ensures the filter routes it correctly.
     """
     import inspect
     import app.research_direction_state as rds_mod
@@ -3650,8 +3649,8 @@ def test_research_direction_state_direction_auto_completed_alert_stamps_event_ty
     assert 'event_type="research.direction_auto_completed"' in source, (
         "research_direction_state must pass "
         'event_type="research.direction_auto_completed" to the Alert constructor so '
-        "operator_visible_alert_filter routes it STRATEGIST_INTERNAL; without it the "
-        "NULL event_type falls through the fail-open read filter and leaks to the operator"
+        "operator_visible_alert_filter routes it STRATEGIST_INTERNAL (fail-closed: a "
+        "NULL event_type is excluded from the operator view by the IN-allowlist filter)"
     )
 
 
@@ -3659,8 +3658,8 @@ def test_research_direction_state_dedup_deadlock_alert_stamps_event_type():
     """research_direction_state Alert for 'Dedup deadlock detected' must stamp event_type.
 
     Finding p2: research.dedup_deadlock is registered STRATEGIST_INTERNAL. Without
-    event_type= the Alert has NULL and leaks to the operator badge via the fail-open
-    filter for NULLs.
+    event_type= the Alert has NULL and is excluded from the operator UI entirely via
+    the fail-closed IN-allowlist filter.
     """
     import inspect
     import app.research_direction_state as rds_mod
@@ -3677,7 +3676,7 @@ def test_research_direction_state_already_fixed_deadlock_alert_stamps_event_type
     """research_direction_state Alert for 'Already-fixed deadlock detected' must stamp event_type.
 
     Finding p2: research.already_fixed_deadlock is registered STRATEGIST_INTERNAL. Without
-    event_type= the Alert has NULL and leaks to the operator badge.
+    event_type= the Alert has NULL and is silently excluded from operator UI by fail-closed filter.
     """
     import inspect
     import app.research_direction_state as rds_mod
@@ -3694,9 +3693,10 @@ def test_research_completion_direction_auto_completed_alert_stamps_event_type():
     """research_completion Alert for 'Direction auto-completed' must stamp event_type.
 
     Finding p2: research_completion.py builds a 'Direction auto-completed' Alert without
-    event_type, so it has a NULL event_type and leaks through operator_visible_alert_filter.
+    event_type, so it has a NULL event_type. operator_visible_alert_filter is fail-closed
+    (IN-allowlist), so a NULL event_type is silently excluded from the operator UI entirely.
     Stamping event_type='research.direction_auto_completed' (STRATEGIST_INTERNAL) ensures
-    the filter gates it out.
+    the filter routes it correctly.
     """
     import inspect
     import app.research_completion as rc_mod
@@ -3710,8 +3710,8 @@ def test_research_completion_direction_auto_completed_alert_stamps_event_type():
     assert count >= 1, (
         "research_completion.py must pass event_type='research.direction_auto_completed' "
         "to its 'Direction auto-completed' Alert constructor; found 0 occurrences — "
-        "without this stamp the NULL event_type falls through the fail-open read filter "
-        "and surfaces the internal bookkeeping notice in the operator badge"
+        "without this stamp the NULL event_type is silently excluded by the fail-closed "
+        "IN-allowlist filter and the alert never appears in the operator UI"
     )
 
 
@@ -3736,8 +3736,8 @@ def test_strategist_internal_alert_event_types_are_registered():
     for event_type, expected_audience in expected.items():
         assert event_type in _EVENT_AUDIENCE_REGISTRY, (
             f"_EVENT_AUDIENCE_REGISTRY must include '{event_type}' so "
-            "operator_visible_alert_filter can gate it; missing entries fall through "
-            "to the fail-open NULL branch and leak internal bookkeeping to the operator"
+            "operator_visible_alert_filter can gate it correctly; missing entries are "
+            "silently excluded by the fail-closed IN-allowlist filter (NULL treated as non-operator)"
         )
         actual = _EVENT_AUDIENCE_REGISTRY[event_type]
         assert actual == expected_audience, (

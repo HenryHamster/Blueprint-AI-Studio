@@ -24,6 +24,7 @@ from app.message_audience import (
     PIPELINE_LOG,
     get_logical_event_pairs,
     get_non_operator_event_types,
+    get_operator_event_types,
     get_operator_visible_webhook_events,
     get_registered_event_types,
     is_external_webhook_operator_visible,
@@ -497,19 +498,51 @@ def _compile_alert_filter(event_types_to_probe=("warm_pool.payoff",)):
     )
 
 
-def test_operator_visible_alert_filter_retains_null_and_excludes_internal():
-    """The Alert filter keeps NULL/unregistered event_types and drops registered
-    strategist-internal ones — expressed as an ``IS NULL OR NOT IN (...)`` clause."""
+def test_operator_visible_alert_filter_is_fail_closed():
+    """The Alert filter is fail-closed: only explicitly registered operator-visible
+    event_types pass through.  NULL and unregistered event_types are excluded —
+    expressed as an ``IN (...)`` allowlist clause with no IS NULL pass-through."""
     sql = _compile_alert_filter()
-    # NULL rows are retained.
-    assert "event_type IS NULL" in sql
-    # Strategist-internal event types are enumerated in the NOT IN list.
-    assert "NOT IN" in sql
-    assert "warm_pool.payoff" in sql
-    assert "hotfix_backmerge.size_violation" in sql
-    # Operator-visible alert event types are NOT in the exclusion list.
-    assert "task.failed" not in sql
-    assert "approval.needed" not in sql
+    # NULL rows are NOT retained — no IS NULL pass-through.
+    assert "IS NULL" not in sql
+    # Uses an explicit IN allowlist, not a NOT IN denylist.
+    assert "NOT IN" not in sql
+    assert "IN" in sql
+    # Operator-visible alert event types are in the allowlist.
+    assert "task.failed" in sql
+    assert "approval.needed" in sql
+    # Strategist-internal event types are NOT in the allowlist.
+    assert "warm_pool.payoff" not in sql
+    assert "hotfix_backmerge.size_violation" not in sql
+
+
+def test_operator_event_types_registry_is_consistent():
+    """Operator and non-operator event_type sets are disjoint and cover the full registry."""
+    operator_types = get_operator_event_types()
+    non_operator_types = get_non_operator_event_types()
+    registered = get_registered_event_types()
+
+    # Every registered event_type appears in exactly one set.
+    assert operator_types.isdisjoint(non_operator_types), (
+        "Operator and non-operator sets must not overlap"
+    )
+    assert operator_types | non_operator_types == registered, (
+        "Every registered event_type must be in exactly one of the two sets"
+    )
+
+    # Spot-check: known operator-visible events are in the operator set.
+    assert "task.failed" in operator_types
+    assert "approval.needed" in operator_types
+    assert "runner.deactivated" in operator_types
+
+    # Spot-check: known non-operator events are NOT in the operator set.
+    assert "warm_pool.payoff" not in operator_types
+    assert "hotfix_backmerge.size_violation" not in operator_types
+    assert "migration.slot_contention" not in operator_types
+
+    # Every member genuinely resolves to an operator-visible audience.
+    for event_type in operator_types:
+        assert is_operator_visible(route_event(event_type)), event_type
 
 
 # ── External-webhook audience gate ──────────────────────────────────────
@@ -1448,13 +1481,13 @@ async def test_question_answer_stamps_audience_default_from_type(monkeypatch):
 
 # ── Structural AST scan: Alert(...) constructors must carry event_type ───
 #
-# operator_visible_alert_filter(Alert.event_type) in operator_attention.py
-# FAILS OPEN on NULL event_type, so a directly-constructed Alert(...) without
-# an event_type= keyword silently inflates the operator badge/preview.
+# operator_visible_alert_filter(Alert.event_type) is fail-closed (IN-allowlist).
+# A directly-constructed Alert(...) without an event_type= keyword has a NULL
+# event_type and is silently EXCLUDED from operator-facing surfaces.
 # The correct pattern is either:
 #   (a) Alert(..., event_type="registered.event") in the constructor call, OR
 #   (b) routing through create_project_alert_if_allowed (which stamps it).
-# This ratchet prevents either pattern from silently regressing.
+# This ratchet prevents ungated Alert constructors from silently regressing.
 
 _ALERT_GATE_CALL = "create_project_alert_if_allowed"
 
@@ -1667,15 +1700,14 @@ def test_no_alert_constructor_uses_unregistered_event_type():
     """Whole-app invariant: every Alert(event_type=...) literal must be present
     in the audience registry.
 
-    operator_visible_alert_filter() is fail-OPEN for unregistered event_types
-    (NULL/unknown rows are retained as operator-visible for legacy compat), so
-    an Alert whose event_type is not in _EVENT_AUDIENCE_REGISTRY silently
-    inflates the operator badge / preview as if it were operator-visible.
+    operator_visible_alert_filter() is fail-closed (IN-allowlist): an Alert whose
+    event_type is not in _EVENT_AUDIENCE_REGISTRY is silently EXCLUDED from the
+    operator badge / preview — it will never be visible to the operator.
 
     This ratchet catches the gap structurally: adding a new Alert() with an
-    unregistered event_type now fails CI immediately rather than only leaking
-    at runtime.  Fix by adding the event_type to _EVENT_AUDIENCE_REGISTRY in
-    backend/app/message_audience.py with the correct audience.
+    unregistered event_type now fails CI immediately rather than silently
+    disappearing at runtime.  Fix by adding the event_type to _EVENT_AUDIENCE_REGISTRY
+    in backend/app/message_audience.py with the correct audience.
     """
     import glob
 
@@ -1697,8 +1729,9 @@ def test_no_alert_constructor_uses_unregistered_event_type():
     assert not all_offenders, (
         "Found Alert() constructor(s) under backend/app/ with an event_type= that "
         "is NOT registered in _EVENT_AUDIENCE_REGISTRY (message_audience.py).\n"
-        "operator_visible_alert_filter() FAILS OPEN for unregistered event types, "
-        "so these alerts leak into the operator badge/preview as if operator-visible.\n"
+        "operator_visible_alert_filter() is fail-closed (IN-allowlist), so an "
+        "unregistered event_type will be EXCLUDED from the operator badge/preview — "
+        "the alert will silently disappear from the operator UI.\n"
         "Fix: add each event_type to _EVENT_AUDIENCE_REGISTRY with its intended audience:\n"
         + "\n".join(all_offenders)
     )
@@ -1716,8 +1749,9 @@ def test_no_alert_constructor_bypasses_event_type_gate():
     constructor fails CI automatically — no allowlist update required.
 
     This is the structural ratchet that prevents the operator-badge leak from
-    silently reoccurring: operator_visible_alert_filter(Alert.event_type) fails
-    OPEN on NULL, so any ungated Alert(...) inflates the operator badge/preview.
+    silently reoccurring: operator_visible_alert_filter(Alert.event_type) is now
+    fail-closed (IN-allowlist), so any Alert(...) without an event_type= keyword
+    will be silently excluded from the operator badge/preview.
     Fix by adding event_type=<registered_key> to the Alert(...) call (register the
     key in message_audience.py if needed).
     """
@@ -1739,10 +1773,10 @@ def test_no_alert_constructor_bypasses_event_type_gate():
     assert not all_offenders, (
         "Found Alert() constructor(s) under backend/app/ that do NOT supply an "
         "event_type= keyword or route through create_project_alert_if_allowed. "
-        "A NULL event_type causes operator_visible_alert_filter to FAIL OPEN, "
-        "leaking the alert into the operator badge/preview. Fix by adding "
-        "event_type=<registered_key> to the Alert(...) call (register the key in "
-        "message_audience.py if needed):\n" + "\n".join(all_offenders)
+        "operator_visible_alert_filter is fail-closed (IN-allowlist), so an Alert "
+        "without an event_type will be silently excluded from the operator badge/preview. "
+        "Fix by adding event_type=<registered_key> to the Alert(...) call (register the "
+        "key in message_audience.py if needed):\n" + "\n".join(all_offenders)
     )
 
 

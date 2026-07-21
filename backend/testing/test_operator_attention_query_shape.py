@@ -82,17 +82,19 @@ def _add_alert(db_session, project_id, *, severity, event_type, title):
 
 
 @pytest.mark.asyncio
-async def test_strategist_internal_alerts_excluded_from_operator_attention(db_session):
-    """Alert rows whose event_type is registered strategist-internal must not
-    reach the operator badge count, severity aggregate, or ERROR/WARNING preview.
+async def test_strategist_internal_and_null_alerts_excluded_from_operator_attention(db_session):
+    """Alert rows whose event_type is NULL, unregistered, or registered
+    strategist-internal must not reach the operator badge count, severity
+    aggregate, or ERROR/WARNING preview.
 
-    Untagged (NULL event_type) legacy alerts and operator-visible alerts are
-    retained. Exercises all three Alert query paths in operator_attention.py that
-    now apply operator_visible_alert_filter(Alert.event_type).
+    operator_visible_alert_filter is fail-closed: only rows whose event_type is
+    explicitly registered as operator-visible pass through.  NULL and unregistered
+    event_types are excluded — they are not legacy-retained.
+    Exercises all three Alert query paths in operator_attention.py.
     """
     project = await _seed_alert_project(db_session)
 
-    # Operator-visible + legacy-NULL alerts are retained.
+    # Operator-visible alert: must be retained.
     _add_alert(
         db_session,
         project.id,
@@ -100,12 +102,13 @@ async def test_strategist_internal_alerts_excluded_from_operator_attention(db_se
         event_type="task.failed",
         title="Operator-visible error",
     )
+    # NULL event_type: must be EXCLUDED (fail-closed, not legacy-retained).
     _add_alert(
         db_session,
         project.id,
         severity=AlertSeverity.WARNING,
         event_type=None,
-        title="Legacy untagged warning",
+        title="Untagged null warning",
     )
     # Strategist-internal alerts must be filtered out of every operator surface.
     _add_alert(
@@ -128,21 +131,25 @@ async def test_strategist_internal_alerts_excluded_from_operator_attention(db_se
     attention = await build_operator_attention(db_session, project, TEST_USER_ID)
     counts = attention["counts"]
     assert counts["error_alerts"] == 1, "only the operator-visible ERROR alert counts"
-    assert counts["warning_alerts"] == 1, "only the legacy-NULL WARNING alert counts"
-    assert counts["alerts"] == 2
+    assert counts["warning_alerts"] == 0, (
+        "NULL event_type alerts must be excluded (fail-closed), not retained"
+    )
+    assert counts["alerts"] == 1
 
     alert_titles = {
         item["label"] for item in attention["items"] if item["kind"] == "alert"
     }
     assert "Operator-visible error" in alert_titles
-    assert "Legacy untagged warning" in alert_titles
+    assert "Untagged null warning" not in alert_titles, (
+        "NULL event_type alert must not reach the operator preview (fail-closed)"
+    )
     assert "Internal payoff error" not in alert_titles
     assert "Internal size-violation warning" not in alert_titles
 
     # (a) cross-tab badge count via get_operator_message_counts.
     message_counts = await get_operator_message_counts(db_session, project.id)
-    assert message_counts["active_alerts"] == 2, (
-        "badge count excludes both strategist-internal alerts"
+    assert message_counts["active_alerts"] == 1, (
+        "badge count must exclude NULL and strategist-internal alerts (fail-closed)"
     )
 
 
