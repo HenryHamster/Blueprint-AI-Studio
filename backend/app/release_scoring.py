@@ -740,7 +740,15 @@ def _score_env_preflight(
         else None
     )
     if not isinstance(required, list):
-        # No usable manifest — nothing to judge (None sub_score, never a block).
+        # No parseable required_env list in the artifact — return None so the
+        # caller (compute_composite) can distinguish "evidence absent / malformed"
+        # from "evidence present but prerequisites missing".  When
+        # env_preflight_enabled is True, compute_composite maps None → the
+        # boot_prereq_evidence_missing hard blocker.  External repos that have
+        # no required_runtime_env.py at all are handled upstream:
+        # build_env_preflight_from_source returns {required_env: []} (empty list,
+        # vacuously satisfied → 1.0) so score never reaches None for a genuinely
+        # manifest-free tree.
         return None, [], deploy_target_scope
 
     missing: set[str] = set()

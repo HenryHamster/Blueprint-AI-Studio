@@ -463,6 +463,27 @@ Findings covered here (7-finding creation-path fail-closed/attention/lifecycle s
   b78-6 — feat(messages): auto-decay stale open QUESTION messages → already pinned by test_m6_* (m-6; fb-6; d-6)
   b78-7 — feat(ui): converge operator notifications on attention model (toast uses attention, not effectiveSignal)
            → already pinned by MessagesPanel.test.tsx::fires toast for needs_operator message (m-7; fb-7; d-7)
+
+Findings covered here (18-finding release-qualification salvage bundle, task 8d2616a1, 2026-07-21):
+  8d-1  — env-preflight fail-closed wedges promotion for repos with no manifest → already pinned by test_f20_10_*
+           (env_preflight_evidence.py returns empty required_env for absent manifest, scoring 1.0 / vacuously satisfied)
+  8d-2  — classify serving-only-import ImportError as degrade, not hard block → already pinned by test_f20_1_*
+  8d-3  — design: prove data-dependent migrations safely → already pinned by test_f20_2_*
+  8d-4  — feat(security): verify encryption-key continuity → already pinned by test_f20_3_* + e1/e2/e3
+  8d-5  — research: define safe Fernet key rotation → already pinned by test_f20_4_*
+  8d-6  — fix(encrypt): fail closed on keyless/malformed encryption backfill → already pinned by test_f20_5_*
+  8d-7  — fix(release): make scratch-DB URL degraded, not boot-fatal → already pinned by test_f20_6_*
+  8d-8  — fix(release): isolate gate-defer signature from unrelated child failures → already pinned by test_f20_7_*
+  8d-9  — fix(release): contain timed-out qualifier children → already pinned by test_f20_8_*
+  8d-10 — fix(release): block deterministic migration defects → already pinned by test_f20_9_*
+  8d-11 — feat(release): enforce independent boot preflight → already pinned by test_f20_10_*
+  8d-12 — refactor(release): unify trigger truth and retries → already pinned by test_f20_11_*
+  8d-13 — fix(release): contain orphan promotion actors → already pinned by test_f20_12_*
+  8d-14 — feat(release): gate data-migration proof → already pinned by test_f20_13_*
+  8d-15 — feat(ui): guide narrow release remediation → already pinned by test_f20_14_*
+  8d-16 — feat(release): declare + diagnose migration-apply scratch prereq → already pinned by test_f20_15_*
+  8d-17 — fix(release): stabilize infra-failure signature for gate defers → already pinned by test_f20_16_*
+  8d-18 — fix(release): add hotfix_policy.py to hotfix-eligible modules → already pinned by test_f20_17_*
 """
 
 from __future__ import annotations
@@ -7541,4 +7562,77 @@ def test_db_1_baked_image_authoring_preference_already_wired():
     assert "baked_image_ref" in spawning_src, (
         "backend strategic_spawning.py must inject baked_image_ref into local_runner_status "
         "so the prompt channel carries the digest-pinned image reference"
+    )
+
+
+# ── 18-finding release-qualification salvage bundle (task 8d2616a1, 2026-07-21) ── #
+# All 18 findings are already addressed and pinned by the f20-* test suite above.
+# This function cross-references them under the 8d prefix.
+# --------------------------------------------------------------------------- #
+
+
+def test_8d_release_qualification_findings_all_pinned():
+    """Cross-reference check: all 18 findings from task 8d2616a1 are already pinned.
+
+    8d-1  (env-preflight no-manifest wedge) → test_f20_10_env_preflight_enabled_flag_independent_of_smoketest
+           Key invariant: build_env_preflight_from_source returns {required_env: []} (not None) when the
+           candidate has no required_runtime_env.py, so _score_env_preflight returns 1.0 (vacuously satisfied)
+           and boot_prereq_evidence_missing is NOT fired for external/greenfield repos.
+    8d-2  (serving-only-import degrade) → test_f20_1_serving_only_import_classifies_as_degrade
+    8d-3  (data-dependent migration proof design) → test_f20_2_scratch_replay_compares_schema_not_row_data
+    8d-4  (encryption-key continuity) → test_f20_3_encryption_key_continuity_functions_present
+    8d-5  (safe Fernet key rotation) → test_f20_4_multifernet_rotate_method_exists
+    8d-6  (keyless/malformed backfill fail-closed) → test_f20_5_require_encryption_active_raises_*
+    8d-7  (scratch-DB URL degraded not boot-fatal) → test_f20_6_scratch_db_url_in_qualification_env_not_required_env
+    8d-8  (gate-defer signature isolation) → test_f20_7_infra_failure_signature_derived_from_error_code_only
+    8d-9  (timed-out qualifier children containment) → test_f20_8_force_finalize_cancels_children_before_rewriting_state
+    8d-10 (deterministic migration defects block) → test_f20_9_deterministic_migration_defect_returns_block_verdict
+    8d-11 (independent boot preflight) → test_f20_10_env_preflight_enabled_flag_independent_of_smoketest
+    8d-12 (trigger truth/retries) → test_f20_11_infra_failure_maps_to_dedicated_redrive_trigger
+    8d-13 (orphan promotion actors) → test_f20_12_promotion_timeout_applies_to_bare_claims
+    8d-14 (data-migration proof gate) → test_f20_13_data_migration_proof_gate_defers_dml
+    8d-15 (narrow release remediation UI) → test_f20_14_hotfix_remediation_api_client_present
+    8d-16 (scratch prereq qualification) → test_f20_15_missing_qualification_env_surfaces_scratch_db_url
+    8d-17 (infra-failure signature stable) → test_f20_16_infra_failure_signature_stable_across_candidate_rotations
+    8d-18 (hotfix_policy.py in eligible modules) → test_f20_17_hotfix_policy_and_router_self_eligible
+    """
+    from app.env_preflight_evidence import build_env_preflight_from_source
+
+    # 8d-1: repos with no manifest must not be blocked by boot_prereq_evidence_missing.
+    # When required_runtime_env_py_source is None, the function must return a dict
+    # with required_env=[] (not None), so the scoring layer sees a vacuously-satisfied
+    # manifest (1.0) and does not fire the evidence-missing hard blocker.
+    artifact = build_env_preflight_from_source(
+        required_runtime_env_py_source=None,
+        smoketest_yaml_source=None,
+    )
+    assert isinstance(artifact, dict), (
+        "build_env_preflight_from_source must return a dict (not None) when "
+        "required_runtime_env_py_source is None — a missing manifest is vacuously "
+        "satisfied, not a hard block"
+    )
+    required_env = artifact.get("required_env")
+    assert isinstance(required_env, list) and required_env == [], (
+        "build_env_preflight_from_source must return required_env=[] when the candidate "
+        "has no manifest file — the empty list scores as 1.0 (vacuously satisfied) and "
+        "does NOT trigger boot_prereq_evidence_missing"
+    )
+
+    # 8d-17 / 8d-7 / 8d-8: cross-check that the key invariants from f20-16/f20-7/f20-6
+    # are still in force (tested in detail by their respective test_f20_* functions).
+    from app.release_qualifier_audit import _infra_failure_signature
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+    sig = _infra_failure_signature(
+        "migration_apply_check_unavailable",
+        child_failures=[{"leg": "audit", "code": "whatever"}],
+    )
+    assert "migration_apply_check_unavailable" in sig, (
+        "_infra_failure_signature must embed the stable error code, not child failures"
+    )
+
+    boot_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" not in boot_names, (
+        "MIGRATION_APPLY_SCRATCH_DATABASE_URL must not be a boot requirement — "
+        "its absence must degrade qualification, not block Cloud Run boot"
     )
