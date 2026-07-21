@@ -3271,6 +3271,140 @@ async def detect_persistently_dark_meters(
     return stale
 
 
+async def _load_persisted_usage_blobs() -> Dict[str, Any]:
+    """Fetch every account's persisted ``rate_limit_usage`` blob keyed by id str.
+
+    Best-effort and read-only: on any DB error returns an empty map so the
+    caller degrades to in-memory-only classification rather than raising. The
+    fleet-wide reliability summary must never break the settings load.
+    """
+    from sqlmodel import select as sql_select
+
+    from app.models import MaxPlanAccount
+
+    blobs: Dict[str, Any] = {}
+    try:
+        async with AsyncSessionLocal() as session:
+            rows = (
+                await session.execute(
+                    sql_select(MaxPlanAccount.id, MaxPlanAccount.rate_limit_usage)
+                )
+            ).all()
+        for acct_id, raw in rows:
+            if raw is not None:
+                blobs[str(acct_id)] = raw
+    except Exception:
+        logger.warning(
+            "[POOL] failed to load persisted usage blobs for reliability stats",
+            exc_info=True,
+        )
+    return blobs
+
+
+def _fresher_usage_stamp(
+    acct: Dict[str, Any], persisted_raw: Any
+) -> datetime | None:
+    """Return the wall-clock stamp of the fresher KNOWN usage snapshot across
+    the in-memory probe result and the DB-persisted blob, or None if neither
+    source has a known snapshot. Mirrors ``usage_snapshot_summary_with_fallback``
+    so non-leader instances see the leader's persisted meters.
+    """
+    stamps: list[datetime] = []
+    snap = acct.get("usage_snapshot")
+    at = acct.get("usage_snapshot_at")
+    if isinstance(snap, UsageSnapshot) and snap.known and at is not None:
+        stamps.append(at)
+    parsed = _snapshot_from_persisted_usage(persisted_raw)
+    if parsed is not None:
+        stamps.append(parsed[1])
+    return max(stamps) if stamps else None
+
+
+async def get_meter_reliability_stats(
+    now: datetime | None = None,
+    min_coverage_pct: int = 80,
+) -> Dict[str, Any]:
+    """Return a fleet-wide usage-meter reliability summary.
+
+    Walks the account pool under ``_max_plan_pool_lock`` and classifies every
+    account as ineligible / known-fresh / known-stale / dark.  The returned
+    dict is JSON-safe and side-effect-free.
+
+    Keys returned:
+    - ``meters_eligible``    — accounts that can produce a usage snapshot
+    - ``meters_known``       — eligible accounts with a fresh known snapshot
+    - ``meters_stale``       — eligible accounts with a stale but known snapshot
+    - ``meters_dark``        — eligible accounts with no known snapshot
+    - ``meters_ineligible``  — accounts skipped (non-OAuth / disabled / no secret)
+    - ``dark_by_reason``     — dict mapping dark-reason string → count
+    - ``coverage_ratio``     — meters_known / meters_eligible (None if eligible=0)
+    - ``persist_failure_count`` — module-level DB persist failure counter
+    - ``armable``            — True iff coverage_ratio >= min_coverage_pct/100
+                               and persist_failure_count == 0
+
+    Cross-instance correctness: probes are scheduled only from the leader
+    orchestrator loop, so the in-memory ``usage_snapshot`` is absent on
+    non-leader Cloud Run instances. Classifying purely off memory would report
+    every account dark (coverage_ratio=0, armable=False) on non-leaders even
+    when meters are healthy per the shared DB — the exact blindness
+    ``usage_snapshot_summary_with_fallback`` exists to fix. So we fetch the
+    DB-persisted ``MaxPlanAccount.rate_limit_usage`` blobs and classify each
+    account off the fresher of the in-memory and persisted snapshots.
+    """
+    now = now or _utcnow()
+    meters_known = 0
+    meters_stale = 0
+    meters_dark = 0
+    meters_ineligible = 0
+    dark_by_reason: Dict[str, int] = {}
+
+    persisted_by_id = await _load_persisted_usage_blobs()
+
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                meters_ineligible += 1
+                continue
+            # Prefer the fresher of the in-memory probe result and the
+            # DB-persisted blob (mirrors usage_snapshot_summary_with_fallback),
+            # so non-leader instances read the leader's persisted meters.
+            best_at = _fresher_usage_stamp(
+                acct, persisted_by_id.get(str(acct.get("id")))
+            )
+            if best_at is not None:
+                stale = (now - best_at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
+                if stale:
+                    meters_stale += 1
+                else:
+                    meters_known += 1
+            else:
+                meters_dark += 1
+                reason = _usage_dark_reason(acct) or "unknown"
+                dark_by_reason[reason] = dark_by_reason.get(reason, 0) + 1
+
+    meters_eligible = meters_known + meters_stale + meters_dark
+    persist_failures = get_usage_persist_failure_count()
+    coverage_ratio: float | None = (
+        meters_known / meters_eligible if meters_eligible > 0 else None
+    )
+    armable = (
+        coverage_ratio is not None
+        and coverage_ratio >= min_coverage_pct / 100.0
+        and persist_failures == 0
+    )
+    return {
+        "meters_eligible": meters_eligible,
+        "meters_known": meters_known,
+        "meters_stale": meters_stale,
+        "meters_dark": meters_dark,
+        "meters_ineligible": meters_ineligible,
+        "dark_by_reason": dark_by_reason,
+        "coverage_ratio": coverage_ratio,
+        "persist_failure_count": persist_failures,
+        "armable": armable,
+    }
+
+
 def _apply_usage_gate(
     candidates: List[Any],
     *,

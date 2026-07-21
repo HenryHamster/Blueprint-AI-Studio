@@ -39,6 +39,7 @@ from app.task_locking import deployment_state_lock
 from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
 from app.max_plan_pool import (
+    get_meter_reliability_stats as _get_meter_reliability_stats,
     provider_selection_mode as _provider_selection_mode_from_config,
 )
 from app.providers.registry import get_provider, list_providers
@@ -210,6 +211,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         # Proactive account-usage headroom (advisory; ships dark by default).
         "usage_headroom_gate_enabled",
         "usage_headroom_long_running_task_types",
+        "usage_headroom_min_coverage_pct",
         "usage_headroom_threshold_pct",
         # Side-effect-only key: fires a test webhook, never stored.
         "test_notification",
@@ -511,6 +513,30 @@ async def get_settings(
             exc_info=True,
         )
 
+    # Fleet-wide usage-meter reliability summary. Best-effort: a failure here
+    # must never break the settings load.
+    _min_coverage_pct = int(_runtime_config.get("usage_headroom_min_coverage_pct", 80))
+    meter_reliability: dict = {
+        "meters_eligible": 0,
+        "meters_known": 0,
+        "meters_stale": 0,
+        "meters_dark": 0,
+        "meters_ineligible": 0,
+        "dark_by_reason": {},
+        "coverage_ratio": None,
+        "persist_failure_count": 0,
+        "armable": False,
+    }
+    try:
+        meter_reliability = await _get_meter_reliability_stats(
+            min_coverage_pct=_min_coverage_pct
+        )
+    except Exception:
+        logger.warning(
+            "failed to compute meter reliability stats for settings",
+            exc_info=True,
+        )
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -662,12 +688,14 @@ async def get_settings(
         "usage_headroom_gate_enabled": bool(
             _runtime_config.get("usage_headroom_gate_enabled", False)
         ),
+        "usage_headroom_min_coverage_pct": _min_coverage_pct,
         "usage_headroom_threshold_pct": _runtime_config.get(
             "usage_headroom_threshold_pct", 90
         ),
         "usage_headroom_long_running_task_types": _runtime_config.get(
             "usage_headroom_long_running_task_types", []
         ),
+        "meter_reliability": meter_reliability,
         "agent_prompt_suffixes": _runtime_config.get("agent_prompt_suffixes", {}),
         "autonomous_periodic_tasks": _runtime_config.get(
             "autonomous_periodic_tasks", {}
@@ -1422,6 +1450,20 @@ async def _apply_settings(
                 detail="usage_headroom_threshold_pct must be between 1 and 100",
             )
         _runtime_config["usage_headroom_threshold_pct"] = val
+    if "usage_headroom_min_coverage_pct" in payload:
+        try:
+            val = int(payload["usage_headroom_min_coverage_pct"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_min_coverage_pct must be a number",
+            )
+        if not (0 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_min_coverage_pct must be between 0 and 100",
+            )
+        _runtime_config["usage_headroom_min_coverage_pct"] = val
     if "usage_headroom_long_running_task_types" in payload:
         raw = payload["usage_headroom_long_running_task_types"]
         if not isinstance(raw, list) or not all(isinstance(t, str) for t in raw):

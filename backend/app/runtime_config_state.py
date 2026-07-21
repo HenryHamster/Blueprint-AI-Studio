@@ -1203,6 +1203,12 @@ runtime_config: Dict = {
     # Utilization percentage (5h OR 7d) at/above which an account is skipped for
     # long-running task types when the gate is enabled. 0..100.
     "usage_headroom_threshold_pct": 90,
+    # Minimum fraction of meter-eligible accounts that must have a fresh known
+    # snapshot before usage_headroom_gate_enabled is considered safe to arm.
+    # Expressed as an integer percentage (0..100). Default 80 is conservative:
+    # at least 4 out of 5 eligible accounts must report fresh data. An operator
+    # can lower this to 0 to arm regardless of coverage (not recommended).
+    "usage_headroom_min_coverage_pct": 80,
     # Task types the claim-time gate applies to (long-running work that burns a
     # large share of an account's budget if it dies mid-run and restarts). The
     # headroom RANKING preference applies to all task types when enabled; only

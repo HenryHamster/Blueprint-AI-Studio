@@ -72,6 +72,7 @@ from app.max_plan_pool import (
     _usage_headroom_rank,
     _usage_headroom_settings,
     detect_persistently_dark_meters,
+    get_meter_reliability_stats,
     _usage_dark_reason,
     _usage_snapshot_summary,
     usage_snapshot_summary_with_fallback,
@@ -5831,3 +5832,140 @@ class TestSelectLLMRuntimeFiltersByRunnerCLIs:
             assert mock_select.called
         finally:
             self._reset_pools()
+
+
+# ── get_meter_reliability_stats ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+class TestGetMeterReliabilityStats:
+    """Fleet-wide meter reliability aggregation."""
+
+    def _reg(self, acct):
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_empty_pool_returns_zero_counts(self):
+        result = await get_meter_reliability_stats()
+        assert result["meters_eligible"] == 0
+        assert result["meters_known"] == 0
+        assert result["meters_stale"] == 0
+        assert result["meters_dark"] == 0
+        assert result["coverage_ratio"] is None
+        assert result["armable"] is False
+
+    async def test_all_fresh_known_reports_full_coverage(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        acct = self._reg(_acct(id="ok", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
+        original_failures = pool_mod._usage_persist_failures
+        try:
+            pool_mod._usage_persist_failures = 0
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["meters_eligible"] == 1
+            assert result["meters_known"] == 1
+            assert result["meters_dark"] == 0
+            assert result["coverage_ratio"] == 1.0
+            assert result["armable"] is True
+        finally:
+            pool_mod._usage_persist_failures = original_failures
+
+    async def test_dark_account_reported_with_reason(self):
+        now = _utcnow()
+        acct = self._reg(
+            _acct(id="dark", provider="anthropic", auth_mode="oauth")
+        )
+        acct["usage_probe_failed_at"] = now
+        result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+        assert result["meters_eligible"] == 1
+        assert result["meters_dark"] == 1
+        assert result["meters_known"] == 0
+        assert result["dark_by_reason"].get("endpoint_error", 0) == 1
+        assert result["coverage_ratio"] == 0.0
+        assert result["armable"] is False
+
+    async def test_ineligible_account_not_counted_in_eligible(self):
+        now = _utcnow()
+        # API key account is ineligible
+        self._reg(_acct(id="apikey", provider="anthropic", auth_mode="api_key", oauth_token=None))
+        result = await get_meter_reliability_stats(now=now)
+        assert result["meters_ineligible"] == 1
+        assert result["meters_eligible"] == 0
+
+    async def test_stale_known_counted_separately(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        stale_seconds = pool_mod._USAGE_METER_DISPLAY_STALE_SECONDS
+        acct = self._reg(_acct(id="stale", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now - timedelta(seconds=stale_seconds + 1))
+        result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+        assert result["meters_stale"] == 1
+        assert result["meters_known"] == 0
+        assert result["meters_eligible"] == 1
+        assert result["coverage_ratio"] == 0.0
+        assert result["armable"] is False
+
+    async def test_per_reason_dark_breakdown(self):
+        now = _utcnow()
+        acct_ep = self._reg(_acct(id="ep", provider="anthropic", auth_mode="oauth"))
+        acct_ep["usage_probe_failed_at"] = now
+        self._reg(_acct(id="np", provider="anthropic", auth_mode="oauth"))
+        # never_probed: no stamps, no snapshot
+        result = await get_meter_reliability_stats(now=now)
+        assert result["dark_by_reason"].get("endpoint_error", 0) == 1
+        assert result["dark_by_reason"].get("never_probed", 0) == 1
+        assert result["meters_dark"] == 2
+
+    async def test_persist_failure_count_reflected(self):
+        import app.max_plan_pool as pool_mod
+        now = _utcnow()
+        acct = self._reg(_acct(id="ok2", provider="anthropic", auth_mode="oauth"))
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
+        original = pool_mod._usage_persist_failures
+        try:
+            pool_mod._usage_persist_failures = original + 3
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["persist_failure_count"] == original + 3
+            # armable requires zero persist failures
+            assert result["armable"] is False
+        finally:
+            pool_mod._usage_persist_failures = original
+
+    async def test_coverage_ratio_zero_eligible_returns_none(self):
+        result = await get_meter_reliability_stats(min_coverage_pct=0)
+        assert result["coverage_ratio"] is None
+        assert result["armable"] is False
+
+    async def test_db_persisted_blob_covers_dark_in_memory_account(self, monkeypatch):
+        """Non-leader instances have no in-memory snapshot, but the leader's
+        probe is persisted to MaxPlanAccount.rate_limit_usage. The fresher-of-two
+        fallback must classify such an account as known, not dark."""
+        import app.max_plan_pool as pool_mod
+
+        now = _utcnow()
+        acct = self._reg(_acct(id="nonleader", provider="anthropic", auth_mode="oauth"))
+        # in-memory is dark (never probed on this non-leader instance)
+        assert acct.get("usage_snapshot") is None
+
+        async def _fake_blobs():
+            return {
+                "nonleader": {
+                    "source": "oauth_usage_probe",
+                    "updated_at": now.isoformat(),
+                    "five_hour": {"utilization": 12.0},
+                    "seven_day": {"utilization": 8.0},
+                }
+            }
+
+        monkeypatch.setattr(pool_mod, "_load_persisted_usage_blobs", _fake_blobs)
+        original = pool_mod._usage_persist_failures
+        try:
+            pool_mod._usage_persist_failures = 0
+            result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
+            assert result["meters_known"] == 1
+            assert result["meters_dark"] == 0
+            assert result["coverage_ratio"] == 1.0
+            assert result["armable"] is True
+        finally:
+            pool_mod._usage_persist_failures = original
