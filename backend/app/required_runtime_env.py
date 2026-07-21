@@ -1,4 +1,4 @@
-"""Declarative manifests of environment variables the app requires.
+"""Declarative manifest of environment variables the app requires to boot.
 
 BOOT contract (:data:`REQUIRED_RUNTIME_ENV`)
     Hard requirements for the app to start.  :func:`_verify_required_env` walks

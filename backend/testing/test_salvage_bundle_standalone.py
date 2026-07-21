@@ -225,7 +225,7 @@ Findings covered here (20-finding release-qualification salvage bundle, 2026-07-
   f20-3  — verify encryption-key continuity; probe_key_continuity / assert_plaintext_or_raise present
   f20-4  — research: define safe Fernet key rotation; MultiFernet.rotate() exists
   f20-5  — fail closed on keyless/malformed backfill; require_encryption_active raises on malformed key
-  f20-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (boot-safe absence)
+  f20-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (QUALIFICATION_ENV cut as dead manifest)
   f20-7  — gate-defer signature derived from error code only (no child failures)
   f20-8  — timed-out qualifier children cancelled via _cancel_qualifier_children before state rewrite
   f20-9  — _DeterministicMigrationDefect returns 'block' verdict (not 'defer')
@@ -234,7 +234,7 @@ Findings covered here (20-finding release-qualification salvage bundle, 2026-07-
   f20-12 — release_reconciliation.py references 'claiming' field for orphan containment
   f20-13 — migration_apply_gate.py references DML/data-migration detection
   f20-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview / triggerHotfixPromote
-  f20-15 — migration-apply gate defers gracefully when scratch-DB URL absent
+  f20-15 — QUALIFICATION_ENV + missing_qualification_env() cut as dead code; scratch-URL absence not boot-fatal
   f20-16 — _infra_failure_signature stable across candidate rotations (same error → same sig)
   f20-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES
   f20-18 — acceptance-evidence minting in release_qualifier_sweep.py (deployed-side), not subprocess
@@ -346,7 +346,7 @@ def test_infra_failure_signature_is_deterministic():
 
 
 def test_scratch_db_url_is_qualification_prereq_not_boot_req():
-    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV.
+    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must not appear in REQUIRED_RUNTIME_ENV.
 
     Finding #11: absent scratch URL must degrade qualification (gate defers with an
     actionable verdict) but MUST NOT block the app from booting on Cloud Run.
@@ -397,8 +397,8 @@ def test_scratch_db_url_absence_does_not_raise_on_cloud_run(monkeypatch):
     """Absent scratch-DB URL must not raise at boot, even on Cloud Run.
 
     Finding #2: the scratch-DB URL was previously declared with scope='cloud_run'
-    in REQUIRED_RUNTIME_ENV, making its absence boot-fatal.  It must now be in
-    QUALIFICATION_ENV only so _verify_required_env() passes without it.
+    in REQUIRED_RUNTIME_ENV, making its absence boot-fatal.  It must not be in
+    REQUIRED_RUNTIME_ENV so _verify_required_env() passes without it.
     """
     from app.required_runtime_env import _verify_required_env
     from app.field_encryption import ENCRYPTION_KEY_ENV
@@ -4887,10 +4887,10 @@ def test_f20_5_require_encryption_active_raises_for_missing_key_without_opt_in(m
 
 
 def test_f20_6_scratch_db_url_in_qualification_env_not_required_env():
-    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV.
+    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must not be in REQUIRED_RUNTIME_ENV.
 
     Finding f20-6: the scratch URL was boot-fatal (scope='cloud_run' in REQUIRED_RUNTIME_ENV).
-    The fix removes it from REQUIRED_RUNTIME_ENV so its absence degrades the gate to a
+    The fix moves it out of REQUIRED_RUNTIME_ENV so its absence degrades the gate to a
     'defer' hold instead of crashing the Cloud Run service at startup.
     Full coverage in test_scratch_db_url_is_qualification_prereq_not_boot_req.
     """
