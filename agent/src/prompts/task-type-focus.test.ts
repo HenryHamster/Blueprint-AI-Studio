@@ -352,6 +352,46 @@ describe('anti-hedge catch — simulate detecting a reintroduced hedge', () => {
   });
 });
 
+describe('ANTI_HEDGE_FOCUS ↔ REVIEW_ANTI_HEDGE_CRITERION cross-consistency', () => {
+  it('both name observe as a prohibited default', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('observe');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('observe');
+  });
+
+  it('both name fail-open as a prohibited default', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('fail-open');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('fail-open');
+  });
+
+  it('ANTI_HEDGE_FOCUS names off; REVIEW_ANTI_HEDGE_CRITERION names disabled — intentional wording difference', async () => {
+    // The agent self-review prompt uses "off" (matching typical flag value syntax).
+    // The reviewer checklist uses "disabled" (plain-English description). Both refer
+    // to the same prohibited pattern — this test documents the intentional divergence.
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('off');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('disabled');
+  });
+
+  it('both route hedge findings to correctness', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('correctness');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('correctness');
+  });
+
+  it('ANTI_HEDGE_FOCUS requires passed: false; REVIEW_ANTI_HEDGE_CRITERION uses correctness issue', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('passed: false');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('correctness issue');
+  });
+});
+
 describe('SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC — shared constant usage', () => {
   it('is used consistently in create, fix, refactor, and docs task focuses', async () => {
     const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS, DOCS_TASK_FOCUS } = await import('./task-type-focus.js');
