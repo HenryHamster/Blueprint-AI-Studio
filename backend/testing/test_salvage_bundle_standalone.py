@@ -220,6 +220,14 @@ Findings covered here (20-finding release-qualification salvage bundle, 2026-07-
   f20-18 — acceptance-evidence minting in release_qualifier_sweep.py (deployed-side), not subprocess
   f20-19 — hotfix_promote_current_version + check_hotfix_scope_preview importable from release_qualifier
   f20-20 — evaluate_hotfix_scope rejects out-of-scope files; accepts eligible module-only diffs
+
+Findings covered here (2-finding dispatch-eligibility / heartbeat-docker-cache salvage bundle, 2026-07-21):
+  d1  — dispatch reads ProjectComputeImage via resolve_project_baked_image_strict; fails closed on
+        unresolvable baked image; stores pinned ref in polling_metadata['container_image'] via
+        create_compute_job (previously dispatch forwarded container_image verbatim without resolution)
+  d2  — runner heartbeat reports docker image-cache size via image_cache_by_project alongside
+        disk_free_bytes; routers/runner.py sanitizes and stores the field in runner caps
+        (previously only total disk_free_bytes was reported with no per-project cache attribution)
 """
 
 from __future__ import annotations
@@ -5301,4 +5309,160 @@ def test_f20_20_hotfix_eligible_modules_restricts_scope():
         "evaluate_hotfix_scope must return eligible=True for a diff that touches "
         "only HOTFIX_ELIGIBLE_MODULES — the hotfix channel must be usable for "
         "narrowly-scoped gate fixes"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# d1 — dispatch reads ProjectComputeImage for eligibility via
+#      resolve_project_baked_image_strict; fails closed on unresolvable image
+# --------------------------------------------------------------------------- #
+
+
+def test_dispatch_uses_baked_image_strict_not_verbatim_forward():
+    """_dispatch_compute_experiment_directly calls resolve_project_baked_image_strict.
+
+    Finding d1: the dispatch path forwarded container_image from the task payload
+    verbatim to create_compute_job without ever consulting ProjectComputeImage.
+    The fix wires in resolve_project_baked_image_strict so image-less payloads get
+    a digest-pinned default and fail CLOSED when the project declares a baked image
+    but no built record exists.
+    """
+    import inspect
+    from app.orchestrator_runner_dispatch import _dispatch_compute_experiment_directly
+
+    source = inspect.getsource(_dispatch_compute_experiment_directly)
+
+    assert "resolve_project_baked_image_strict" in source, (
+        "_dispatch_compute_experiment_directly must call resolve_project_baked_image_strict "
+        "to resolve a project's declared baked image at dispatch time. Without this call "
+        "image-less payloads run unreproducibly on the host toolchain."
+    )
+    assert "baked_image_unresolvable" in source, (
+        "_dispatch_compute_experiment_directly must use the 'baked_image_unresolvable' error "
+        "code when the project declares a baked image but no built ProjectComputeImage record "
+        "can be found — dispatching image-less when a baked image is expected is a silent "
+        "reproducibility failure that must surface to the operator."
+    )
+
+
+def test_dispatch_stores_resolved_image_in_polling_metadata():
+    """create_compute_job stores container_image in polling_metadata['container_image'].
+
+    Finding d1 claim (2): the pinned ref must be stored in polling_metadata so the
+    runner subprocess knows exactly which digest to pull and the orchestrator can
+    audit what image each job ran.
+    """
+    import inspect
+    from app.compute_jobs import create_compute_job
+
+    source = inspect.getsource(create_compute_job)
+
+    assert 'polling_metadata["container_image"]' in source or (
+        '"container_image"' in source and "polling_metadata" in source
+    ), (
+        "create_compute_job must store container_image in polling_metadata so the "
+        "resolved digest-pinned ref is durable alongside the job record"
+    )
+
+
+def test_projectcomputeimage_docstring_reflects_dispatch_reads_it():
+    """ProjectComputeImage docstring must say dispatch reads it (not 'nothing in dispatch reads it').
+
+    Finding d1 claim: the docstring at models.py:2111 said 'nothing in dispatch reads it yet'.
+    After the fix, dispatch consults ProjectComputeImage via resolve_project_baked_image_strict,
+    and the docstring was updated to reflect that.
+    """
+    import inspect
+    from app.models import ProjectComputeImage
+
+    doc = inspect.getdoc(ProjectComputeImage) or ""
+
+    assert "nothing in dispatch reads it" not in doc, (
+        "ProjectComputeImage docstring must NOT say 'nothing in dispatch reads it yet' — "
+        "dispatch now reads ProjectComputeImage via resolve_project_baked_image_strict; "
+        "the stale docstring misled future readers about the table's role"
+    )
+    assert "dispatch" in doc.lower(), (
+        "ProjectComputeImage docstring must mention dispatch to document that the table "
+        "is actively used at task-dispatch time, not just at build-record time"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# d2 — runner heartbeat reports docker image-cache size via image_cache_by_project
+# --------------------------------------------------------------------------- #
+
+
+def test_heartbeat_image_cache_stored_in_runner_caps():
+    """routers/runner.py stores image_cache_by_project in runner caps during heartbeat.
+
+    Finding d2: disk_free_bytes reported total filesystem free space with no
+    attribution of how much the docker data-root / image layers consumed. The fix
+    adds image_cache_by_project (per-project docker cache accounting) to both the
+    heartbeat payload (local_runner.py) and the backend caps store (routers/runner.py),
+    enabling fleet-level cache-pressure monitoring.
+    """
+    import inspect
+    from app.routers.runner import heartbeat
+
+    source = inspect.getsource(heartbeat)
+
+    assert "image_cache_by_project" in source, (
+        "routers/runner.py heartbeat handler must reference image_cache_by_project "
+        "to accept the per-project docker image-cache accounting from the runner heartbeat"
+    )
+    assert "_sanitize_image_cache_by_project" in source, (
+        "routers/runner.py heartbeat must call _sanitize_image_cache_by_project "
+        "to normalize and validate the per-project cache dict before storing it in caps"
+    )
+
+
+def test_runner_router_sanitizes_image_cache_by_project():
+    """_sanitize_image_cache_by_project must exist in routers/runner.py.
+
+    Finding d2: no docker-cache-size field existed in the heartbeat inventory —
+    routers/runner.py only stored disk_free_bytes as display-only telemetry. The fix
+    adds _sanitize_image_cache_by_project to validate/normalize the per-project cache
+    dict before storing it in runner caps.
+    """
+    from app.routers import runner as runner_router
+
+    assert hasattr(runner_router, "_sanitize_image_cache_by_project"), (
+        "app.routers.runner must define _sanitize_image_cache_by_project — the function "
+        "that normalizes the per-project docker image-cache dict before storing it in "
+        "runner caps alongside disk_free_bytes"
+    )
+    fn = getattr(runner_router, "_sanitize_image_cache_by_project")
+    assert callable(fn), "_sanitize_image_cache_by_project must be callable"
+
+
+def test_image_cache_by_project_structure():
+    """_sanitize_image_cache_by_project returns None for invalid input, dict for valid.
+
+    Finding d2: ensures the sanitizer is defensive — malformed runner payloads must
+    not crash the heartbeat endpoint or corrupt the caps store.
+    """
+    from app.routers.runner import _sanitize_image_cache_by_project
+
+    assert _sanitize_image_cache_by_project(None) is None, (
+        "_sanitize_image_cache_by_project(None) must return None — "
+        "docker-less runners omit the field; the backend must tolerate absence"
+    )
+    assert _sanitize_image_cache_by_project("not-a-dict") is None, (
+        "_sanitize_image_cache_by_project must return None for non-dict input — "
+        "a malformed runner payload must not propagate garbage into runner caps"
+    )
+    valid = {
+        "total_bytes": 1024,
+        "image_count": 2,
+        "by_project": {"proj-id": {"bytes": 512, "image_count": 1}},
+        "unattributed_bytes": 512,
+        "unattributed_image_count": 1,
+    }
+    result = _sanitize_image_cache_by_project(valid)
+    assert isinstance(result, dict), (
+        "_sanitize_image_cache_by_project must return a dict for valid input"
+    )
+    assert "total_bytes" in result, (
+        "_sanitize_image_cache_by_project must preserve total_bytes from valid input"
     )
