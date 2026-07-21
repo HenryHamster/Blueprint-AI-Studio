@@ -23223,15 +23223,16 @@ class TestFinalizeInfraFailure:
         assert result["same_signature_streak"] == 1
 
     @pytest.mark.asyncio
-    async def test_generic_infra_failure_not_classified_as_permanent(
+    async def test_audit_leg_permanent_incapacity_after_streak(
         self, db_session
     ):
-        """A non-migration-apply error at streak 3+ does NOT get permanent
-        gate-incapacity classification."""
+        """An audit-leg error at streak 3+ now triggers permanent gate-incapacity
+        classification (previously only migration_apply legs were eligible)."""
         from app import release_qualifier_audit as rqa
 
         project, version = await _make_project_and_version(db_session)
-        sig = "audit:PROVISION_FAILURE:audit_task_failed_provision_failure"
+        # Signature is "{leg}:unknown:{stable_error_code}" per _infra_failure_signature
+        sig = "audit:unknown:audit_task_failed_provision_failure"
         same_entry = {
             "finalized_at": "2026-07-10T00:00:00",
             "error": "audit_task_failed_provision_failure",
@@ -23267,9 +23268,146 @@ class TestFinalizeInfraFailure:
         await db_session.commit()
 
         assert result["status"] == "infra_failure"
-        assert result["is_permanent_gate_incapacity"] is False
-        assert result["same_signature_streak"] == 0
+        # Audit leg now also triggers permanent incapacity after _MIN_INFRA_ERROR_STREAK
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
         assert result["consecutive_infra_errors"] == 3
+        # No hotfix_preview for non-migration-apply legs
+        assert result["hotfix_preview"] is None
+
+    @pytest.mark.asyncio
+    async def test_smoketest_leg_permanent_incapacity_after_streak(
+        self, db_session, mocker
+    ):
+        """Smoketest errors repeating with the same signature across
+        _MIN_INFRA_ERROR_STREAK attempts trigger permanent gate-incapacity.
+        Alert message names the 'smoketest' gate, not 'migration-apply gate'."""
+        from app import release_qualifier_audit as rqa
+
+        notify_mock = mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
+        project, version = await _make_project_and_version(db_session)
+        # Signature is "{leg}:unknown:{stable_error_code}" per _infra_failure_signature
+        sig = "smoketest:unknown:smoketest_task_failed"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "smoketest_task_failed",
+            "signature": sig,
+            "candidate_sha": "cafe" * 10,
+            "failing_leg": "smoketest",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "cafe" * 10,
+            "ci_green": True,
+            "smoketest_enabled": True,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "smoketest_task_failed",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+        # No hotfix_preview for smoketest leg
+        assert result["hotfix_preview"] is None
+
+        # The alert message must name the 'smoketest' gate, not 'migration-apply gate'
+        alerts = (
+            (await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project.id,
+                    Alert.severity == "WARNING",
+                )
+            ))
+            .scalars()
+            .all()
+        )
+        assert len(alerts) >= 1
+        latest = alerts[-1]
+        assert "smoketest gate" in latest.message
+        assert "persistently incapable" in latest.message
+        assert "migration-apply gate" not in latest.message
+
+        # Operator notify also names the smoketest leg
+        notify_mock.assert_awaited()
+        notify_message = notify_mock.await_args.args[3]
+        assert "smoketest gate" in notify_message
+        assert "persistently incapable" in notify_message.lower() or "persistently" in notify_message
+
+    @pytest.mark.asyncio
+    async def test_migration_apply_permanent_incapacity_still_detected(
+        self, db_session, mocker
+    ):
+        """Regression guard: migration_apply legs still trigger permanent
+        gate-incapacity detection after the guard was generalized."""
+        from app import release_qualifier_audit as rqa
+
+        mocker.patch(
+            "app.release_qualifier.check_hotfix_scope_preview",
+            new=AsyncMock(return_value={"eligible": False, "status": "ineligible"}),
+        )
+        mocker.patch(
+            "app.release_qualifier._notify_operator", new=AsyncMock()
+        )
+        project, version = await _make_project_and_version(db_session)
+        sig = "migration_apply:unknown:migration_apply_check_unavailable"
+        same_entry = {
+            "finalized_at": "2026-07-10T00:00:00",
+            "error": "migration_apply_check_unavailable",
+            "signature": sig,
+            "candidate_sha": "beef" * 10,
+            "failing_leg": "migration_apply",
+            "child_failures": [],
+        }
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "beef" * 10,
+            "ci_green": True,
+            "smoketest_enabled": False,
+            "started_at": "2026-07-10T00:00:00",
+            "audit_task_id": None,
+            "smoketest_task_id": None,
+            "prior_infra_streak": 2,
+            "infra_attempt_history": [
+                dict(same_entry, finalized_at="2026-07-10T00:00:00"),
+                dict(same_entry, finalized_at="2026-07-10T00:01:00"),
+            ],
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        result = await rqa._handle_infra_failure(
+            db_session,
+            version,
+            dict(version.last_qualification),
+            "migration_apply_check_unavailable",
+        )
+        await db_session.commit()
+
+        assert result["status"] == "infra_failure"
+        assert result["is_permanent_gate_incapacity"] is True
+        assert result["same_signature_streak"] == 3
+        assert result["failing_dimension"] == "migration_apply"
 
     @pytest.mark.asyncio
     async def test_audit_admin_cancel_respawns_new_task(self, db_session):

@@ -945,22 +945,22 @@ async def _handle_infra_failure(
     attempt_history = [*prior_history, attempt_entry][-_INFRA_ATTEMPT_HISTORY_LIMIT:]
 
     # Permanent gate-incapacity detection: count trailing same-signature entries
-    # in attempt_history.  When a migration_apply_check_unavailable error repeats
-    # with the exact same signature across _MIN_INFRA_ERROR_STREAK or more
-    # consecutive attempts, the condition is structural and will not self-resolve
-    # by retry — escalate with a different operator message.
+    # in attempt_history.  When ANY qualifier gate (smoketest, audit, challenge,
+    # merge_grade, migration_apply) repeats with the exact same signature across
+    # _MIN_INFRA_ERROR_STREAK or more consecutive attempts, the condition is
+    # structural and will not self-resolve by retry — escalate with a different
+    # operator message.
     is_permanent_gate_incapacity = False
     same_signature_streak = 0
-    if infra_error.startswith("migration_apply"):
-        cur_sig = signature
-        for entry in reversed(attempt_history):
-            if entry.get("signature") == cur_sig:
-                same_signature_streak += 1
-            else:
-                break
-        is_permanent_gate_incapacity = (
-            same_signature_streak >= _MIN_INFRA_ERROR_STREAK
-        )
+    cur_sig = signature
+    for entry in reversed(attempt_history):
+        if entry.get("signature") == cur_sig:
+            same_signature_streak += 1
+        else:
+            break
+    is_permanent_gate_incapacity = (
+        same_signature_streak >= _MIN_INFRA_ERROR_STREAK
+    )
 
 
     infra_evidence = {
@@ -1046,11 +1046,14 @@ async def _handle_infra_failure(
         else None
     )
 
+    failing_leg = _infer_infra_leg(infra_error)
     hotfix_preview: dict[str, Any] | None = None
-    if is_permanent_gate_incapacity:
+    if is_permanent_gate_incapacity and infra_error.startswith("migration_apply"):
         # Make the sanctioned remediation concrete at the point incapacity is
         # declared.  This is read-only and deliberately best-effort: inability
         # to preview must not turn a held release into a promotion.
+        # Only migration_apply has a meaningful hotfix-scope preview; other legs
+        # (smoketest, audit, challenge) have no narrowed hotfix path.
         try:
             hotfix_preview = await _release_qualifier_module().check_hotfix_scope_preview(
                 session, version.project_id, candidate_sha=qual.get("candidate_sha")
@@ -1107,7 +1110,7 @@ async def _handle_infra_failure(
                 else "Hotfix scope preview unavailable or ineligible; inspect it before acting. "
             )
             alert_message = (
-                f"The migration-apply gate for v{version.version_number} is "
+                f"The {failing_leg} gate for v{version.version_number} is "
                 f"persistently incapable across {same_signature_streak} "
                 f"same-signature attempts ({infra_error!r}) — the underlying "
                 f"condition will not self-resolve by retry. "
@@ -1157,7 +1160,7 @@ async def _handle_infra_failure(
             else " Hotfix scope preview is unavailable or ineligible; do not force-promote."
         )
         notify_message = (
-            f"v{version.version_number} migration-apply gate is persistently "
+            f"v{version.version_number} {failing_leg} gate is persistently "
             f"incapable across {same_signature_streak} same-signature attempts "
             f"({infra_error.replace('_', ' ')}) — the underlying condition "
             f"will not self-resolve by retry. "
