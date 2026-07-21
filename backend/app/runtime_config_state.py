@@ -104,19 +104,6 @@ runtime_config: Dict = {
     # Uses deterministic task-ID-based sampling so operators can safely dial down
     # challenger frequency without randomness between restarts.
     "review_second_opinion_sample_rate": 1.0,
-    # Rollout mode for binding agent-authored direction retirement to the
-    # strategic judgment challenge's per-direction second opinion.
-    #   observe  — compute/record verdict, never block
-    #   advisory — compute/record a prominent warning, never block
-    #   enforce  — unsupported/missing/invalid challenge defers fail-closed
-    # Ships observe by default so operators can inspect challenge quality before
-    # selecting enforce via runtime config.
-    "strategic_retirement_challenge_gate_mode": os.getenv(
-        "STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe"
-    ).lower()
-    if os.getenv("STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE", "observe").lower()
-    in ("observe", "advisory", "enforce")
-    else "observe",
     "queued_age_alert_hours": int(os.getenv("QUEUED_AGE_ALERT_HOURS", "2")),
     "retry_after_reset_alert_threshold": int(
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
@@ -378,47 +365,13 @@ runtime_config: Dict = {
         "SECURITY_AUDIT_QUALITY_GRADER_ENABLED", "false"
     ).lower()
     in ("1", "true", "yes"),
-    # Independent adversarial verification for compute experiment results.
-    # Checkpoint 1 from the v18 Verified Delivery design.  When enabled, a
-    # compute-experiment task whose criterion is self-declared as met is
-    # independently graded by an adversarial grader BEFORE it completes, to
-    # catch common failure modes (measurable=False reported as SUCCESS, score
-    # inflation, infra-vs-capability confusion).
-    # DARK by default (False) — must be explicitly enabled per project.
-    "compute_verification_enabled": os.getenv(
-        "COMPUTE_VERIFICATION_ENABLED", "false"
-    ).lower()
-    in ("1", "true", "yes"),
-    # Verification mode for compute experiment grading.
-    #   "advisory"  — (default) record the verdict + notifiy, never block.
-    #   "soft_gate" — record + notify, warn prominently on reject.
-    #   "hard_gate" — block SUCCESS when the grader rejects (future use).
-    "compute_verification_mode": os.getenv(
-        "COMPUTE_VERIFICATION_MODE", "advisory"
-    ).lower()
-    if os.getenv("COMPUTE_VERIFICATION_MODE", "advisory").lower()
-    in ("advisory", "soft_gate", "hard_gate")
-    else "advisory",
     # Graduated rollout mode for the safeguard merge-gate challenge.
-    # Mirrors strategic_retirement_challenge_gate_mode.
     #   "off"     — no challenge; gate held unconditionally on any
     #               critical/high finding. Preserves pre-v9 behavior exactly.
     #   "observe" — (default) shadow/observe mode: the challenge is spawned and its verdict
     #               is recorded on the safeguard task as
     #               ``safeguard_observe_verdict``, but the gate is NEVER released
     #               by the verdict. Lets operators measure the false-positive rate
-    #               before flipping to enforce. Any challenge error/timeout records
-    #               ``{"outcome": "unavailable"}`` and never blocks.
-    #   "enforce" — full binding mode: a challenger verdict of "rejected" or
-    #               "downgraded" releases the gate with an auditable record.
-    #               Fail-closed: if the challenge errors or times out the gate
-    #               stays closed.
-    "safeguard_challenge_gate_mode": os.getenv(
-        "SAFEGUARD_CHALLENGE_GATE_MODE", "observe"
-    ).lower()
-    if os.getenv("SAFEGUARD_CHALLENGE_GATE_MODE", "observe").lower()
-    in ("off", "observe", "enforce")
-    else "observe",
     # Per-finding second-opinion challenge for high-stakes research-finding
     # verdicts. When True, a single borderline/absent verdict (a reproduce-on-HEAD
     # 'absent' hard-drop or a low-actionability decay) is independently re-examined
@@ -1383,9 +1336,6 @@ _DORMANT_MODE_KNOBS = {
     "evergreen_fill_mode": (
         "Evergreen auto-fill capability enabled but not enforcing (off/observe)"
     ),
-    "strategic_retirement_challenge_gate_mode": (
-        "Adversarial retirement challenge running in observe-only watch"
-    ),
     "structural_health_audit_mode": (
         "Structural-health audit measuring but not enrolling findings"
     ),
@@ -1394,9 +1344,6 @@ _DORMANT_MODE_KNOBS = {
     ),
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"
-    ),
-    "safeguard_challenge_gate_mode": (
-        "Safeguard challenge gate in observe-only shadow mode"
     ),
     "direction_gap_respawn_block_mode": (
         "Direction-gap respawn block in observe-only mode"
@@ -2155,25 +2102,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         _set("review_second_opinion_sample_rate", _rate)
                     except (TypeError, ValueError):
                         pass
-                if "strategic_retirement_challenge_gate_mode" in config_json:
-                    raw_mode = (
-                        str(
-                            config_json["strategic_retirement_challenge_gate_mode"]
-                            or ""
-                        )
-                        .strip()
-                        .lower()
-                    )
-                    if raw_mode in ("observe", "advisory", "enforce"):
-                        _set("strategic_retirement_challenge_gate_mode", raw_mode)
-                if "safeguard_challenge_gate_mode" in config_json:
-                    raw_mode = (
-                        str(config_json["safeguard_challenge_gate_mode"] or "")
-                        .strip()
-                        .lower()
-                    )
-                    if raw_mode in ("off", "observe", "enforce"):
-                        _set("safeguard_challenge_gate_mode", raw_mode)
                 if "evergreen_fill_deferred_memo_enrollment" in config_json:
                     _set(
                         "evergreen_fill_deferred_memo_enrollment",

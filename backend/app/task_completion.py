@@ -1764,12 +1764,6 @@ async def _maybe_release_safeguard_gate(
     """
     from sqlalchemy.orm.attributes import flag_modified  # noqa: PLC0415
 
-    from app.task_evaluators import (
-        SAFEGUARD_CHALLENGE_VERDICT_KEY,
-        SAFEGUARD_OBSERVE_VERDICT_KEY,
-        spawn_safeguard_challenge,
-    )
-
     safeguard_for_id = (safeguard_task.context or {}).get("safeguard_for_task_id")
     if not safeguard_for_id:
         return
@@ -1786,101 +1780,13 @@ async def _maybe_release_safeguard_gate(
         )
         return
 
-    _gate_mode = str(
-        _runtime_config.get("safeguard_challenge_gate_mode", "observe") or "observe"
-    ).lower()
-
+    # No challenge lane: critical/high findings conservatively hold the gate.
     if has_blocker:
-        _challenge_verdict = (safeguard_task.context or {}).get(
-            SAFEGUARD_CHALLENGE_VERDICT_KEY
+        logger.info(
+            "[SAFEGUARD] Gate maintained on %s — critical/high findings",
+            safeguard_for_id[:8],
         )
-
-        if _gate_mode == "observe":
-            if _challenge_verdict is not None:
-                # Re-entry after challenge resolved in observe mode: record shadow
-                # verdict and clear the binding key so a later upgrade to enforce
-                # does not replay a stale shadow verdict.
-                from sqlalchemy.orm.attributes import flag_modified as _flag_modified  # noqa: PLC0415
-
-                outcome = (_challenge_verdict.get("outcome") or "unavailable").lower()
-                logger.info(
-                    "[SAFEGUARD] Observe mode — shadow verdict '%s' recorded on %s (gate unchanged)",
-                    outcome,
-                    safeguard_for_id[:8],
-                )
-                _sg_ctx = dict(safeguard_task.context or {})
-                _sg_ctx[SAFEGUARD_OBSERVE_VERDICT_KEY] = dict(_challenge_verdict)
-                del _sg_ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY]
-                safeguard_task.context = _sg_ctx
-                _flag_modified(safeguard_task, "context")
-                session.add(safeguard_task)
-                await session.commit()
-                # Gate is NEVER released in observe mode.
-                logger.info(
-                    "[SAFEGUARD] Gate maintained on %s — observe mode, shadow verdict recorded",
-                    safeguard_for_id[:8],
-                )
-                return
-            else:
-                # First pass: spawn challenge identically to enforce, but it will
-                # be recorded as shadow on re-entry.
-                challenge = await spawn_safeguard_challenge(
-                    safeguard_task, json.dumps(findings), session
-                )
-                if challenge is not None:
-                    logger.info(
-                        "[SAFEGUARD] Observe mode — shadow challenge %s spawned for %s; gate held",
-                        challenge.id,
-                        safeguard_for_id[:8],
-                    )
-                    return
-                logger.info(
-                    "[SAFEGUARD] Gate maintained on %s — observe mode, critical/high findings "
-                    "(challenge already in flight)",
-                    safeguard_for_id[:8],
-                )
-                return
-
-        if _challenge_verdict is not None:
-            outcome = (_challenge_verdict.get("outcome") or "confirmed").lower()
-            if outcome in ("rejected", "downgraded"):
-                # Challenge overrides the blocker — fall through to gate release.
-                logger.info(
-                    "[SAFEGUARD] Gate released on %s — challenge %s the finding: %s",
-                    safeguard_for_id[:8],
-                    outcome,
-                    _challenge_verdict.get("reasoning", ""),
-                )
-            else:
-                logger.info(
-                    "[SAFEGUARD] Gate maintained on %s — challenge confirmed critical/high finding",
-                    safeguard_for_id[:8],
-                )
-                return
-        elif _gate_mode == "enforce":
-            challenge = await spawn_safeguard_challenge(
-                safeguard_task, json.dumps(findings), session
-            )
-            if challenge is not None:
-                logger.info(
-                    "[SAFEGUARD] Gate decision parked for %s — challenge %s spawned",
-                    safeguard_for_id[:8],
-                    challenge.id,
-                )
-                return
-            # spawn returned None (already in flight) — maintain gate
-            logger.info(
-                "[SAFEGUARD] Gate maintained on %s — critical/high findings "
-                "(challenge already in flight)",
-                safeguard_for_id[:8],
-            )
-            return
-        else:
-            logger.info(
-                "[SAFEGUARD] Gate maintained on %s — critical/high findings",
-                safeguard_for_id[:8],
-            )
-            return
+        return
     orig.requires_approval = False
     pr_num = (safeguard_task.context or {}).get("safeguard_pr_number")
     orig_ctx = dict(orig.context or {})
@@ -4071,55 +3977,6 @@ async def _handle_compute_experiment_completion(
     verdict = evaluate_terminal_output(task, logs)
     sweep_id = (task.first_payload or {}).get("sweep_id") or None
 
-    # === Re-entry from compute verification grader ===
-    # When the independent verification grader completes and the verdict is
-    # returned via QUALITY_GRADER_VERDICT_KEY, we process it here and
-    # short-circuit without re-running the full gate logic (since the
-    # resume-logs from _resolve_quality_grader_completion do not contain
-    # the original terminal output).
-    _cv_verdict_key: str | None = None
-    _cv_verdict_val = (task.context or {}).get("compute_verification")
-    _grader_verdict_val = (task.context or {}).get(
-        "quality_grader"
-    )  # QUALITY_GRADER_VERDICT_KEY
-    _cv_spawned = (task.context or {}).get("compute_verification_spawned")
-
-    if _grader_verdict_val is not None and _cv_verdict_val is None and _cv_spawned:
-        # Re-entry: the independent verification grader returned its verdict.
-        # The task is already COMPLETED (set by _resolve_quality_grader_completion).
-        # Stamp the verdict on context and commit — no need to re-run the gate
-        # or persist knowledge (already done on the first pass).
-        _passed = bool(_grader_verdict_val.get("passed", True))
-        _reason = str(_grader_verdict_val.get("reason", ""))
-        _mode = "advisory"
-        ctx = dict(task.context or {})
-        ctx["compute_verification"] = {
-            "verdict": "confirmed" if _passed else "rejected",
-            "reasoning": _reason,
-            "mode": _mode,
-        }
-        task.context = ctx
-        flag_modified(task, "context")
-        _cv_final_status = TaskStatus.COMPLETED
-        if not _passed and _mode == "hard_gate":
-            _cv_final_status = TaskStatus.FAILED
-            task.status = _cv_final_status
-        session.add(task)
-        await session.commit()
-        logger.info(
-            "[COMPUTE] Verification re-entry for task %s: "
-            "verdict=%s, reason=%.200s, mode=%s",
-            task.id,
-            "passed" if _passed else "failed",
-            _reason,
-            _mode,
-        )
-        return
-
-    if _cv_verdict_val is not None:
-        # Already processed — defensive guard; should not reach here.
-        return
-
     # Record the declared success-criterion verdict DURABLY on the task so the
     # operator and strategic consumers can read whether the experiment's goal
     # was actually met — metric/operator/threshold, observed value, met/unmet,
@@ -4494,21 +4351,6 @@ async def _handle_compute_experiment_completion(
                 f"follow-on {child.id}"
             )[:500]
 
-    # === Compute experiment independent verification (Checkpoint 1) ===
-    # When enabled and no grader has been spawned yet, spawn an independent
-    # adversarial grader to verify the self-reported result BEFORE the task
-    # completes.  Advisory mode records the verdict without blocking.
-    if final_status is not TaskStatus.EVALUATING:
-        await _maybe_spawn_compute_verification(
-            task,
-            criterion,
-            logs,
-            session,
-        )
-        # _maybe_spawn_compute_verification may set task.context markers
-        # and update final_status via the task object if a grader was spawned.
-        if (task.context or {}).get("compute_verification_spawned"):
-            final_status = TaskStatus.EVALUATING
     task.status = final_status
     logger.info(
         "[COMPUTE] Task %s delivered a compute artifact (status=%s)",
@@ -4766,55 +4608,6 @@ def reconcile_review_second_opinion(
         "surviving_issues": surviving,
         "challenge_summary": str(panel.get("summary") or "")[:2000],
     }
-
-
-async def _maybe_spawn_compute_verification(
-    task: Task,
-    criterion: Optional[dict],
-    logs: str,
-    session: AsyncSession,
-) -> None:
-    """Spawn an independent verification grader for a compute experiment result.
-
-    Checks the runtime config and single-shot guard before spawning.  If a
-    grader is spawned, this function sets ``task.context["compute_verification_spawned"]``
-    so the caller can detect the EVALUATING transition.  The caller is
-    responsible for setting ``final_status = EVALUATING``.
-
-    Operates in advisory mode only (current implementation): the verdict is
-    recorded but never blocks the task outcome.
-    """
-    from app.compute_verification import (
-        _build_compute_verification_rubric,
-        _compute_verification_enabled,
-        _has_compute_verification,
-    )
-    from app.task_evaluators import spawn_forward_quality_grader
-
-    if not _compute_verification_enabled():
-        return
-    if criterion is None:
-        return
-    if _has_compute_verification(task):
-        return
-
-    rubric = _build_compute_verification_rubric(task, criterion, logs)
-    ctx = dict(task.context or {})
-    ctx["compute_verification_spawned"] = True
-    task.context = ctx
-
-    grader = await spawn_forward_quality_grader(
-        task,
-        logs,
-        session,
-        rubric=rubric,
-    )
-    if grader is not None:
-        logger.info(
-            "[COMPUTE] Spawned verification grader %s for task %s (advisory mode)",
-            grader.id,
-            task.id,
-        )
 
 
 async def _handle_panel_review_completion(task: Task, logs: str, session: AsyncSession):

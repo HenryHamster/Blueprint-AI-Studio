@@ -3669,112 +3669,6 @@ class TestReproduceOnHeadGate:
         assert (task.context or {}).get("research_surviving_findings") == 1
 
     @_pytest.mark.asyncio
-    async def test_spawned_child_carries_present_reproduction_verdict(
-        self, db_session, mocker
-    ):
-        """A grounded finding's spawned fix carries target_defect_reproduction=present
-        so its outcome scoring can credit a merge as a verified fix."""
-        from test_autonomous_research import _make_finding
-
-        finding = _make_finding(
-            title="Grounded reproducible finding", direction_id="d-repro-verd01"
-        )
-        finding["sources"] = [{"type": "file", "ref": "backend/app/present.py"}]
-
-        async def _validate(sources, **kw):
-            return list(sources)
-
-        task = await self._run_and_get_child_ctx(
-            db_session,
-            mocker,
-            direction_id="d-repro-verd01",
-            parsed_findings=[finding],
-            validate=_validate,
-        )
-        assert task.get("target_defect_reproduction") == "present"
-
-    @_pytest.mark.asyncio
-    async def test_spawned_child_carries_indeterminate_reproduction_verdict(
-        self, db_session, mocker
-    ):
-        """No backend → spawned fix carries an indeterminate verdict, which blocks
-        bare-merge success scoring downstream."""
-        from test_autonomous_research import _make_finding
-
-        finding = _make_finding(
-            title="Indeterminate verdict finding", direction_id="d-repro-verd02"
-        )
-        finding["sources"] = [{"type": "file", "ref": "backend/app/whatever.py"}]
-
-        async def _validate(sources, **kw):
-            return list(sources)
-
-        ctx = await self._run_and_get_child_ctx(
-            db_session,
-            mocker,
-            direction_id="d-repro-verd02",
-            parsed_findings=[finding],
-            has_backend=False,
-            validate=_validate,
-        )
-        assert ctx.get("target_defect_reproduction") == "indeterminate"
-
-    async def _run_and_get_child_ctx(self, db_session, mocker, **kw):
-        """Run a research completion and return the single spawned child's context."""
-        from test_autonomous_research import _patch_research_externals
-
-        direction_id = kw.pop("direction_id")
-        parsed_findings = kw.pop("parsed_findings")
-        has_backend = kw.pop("has_backend", True)
-        validate = kw.pop("validate", None)
-
-        _project, _direction, task = await _grader_project_and_task(
-            db_session, direction_id
-        )
-        _patch_research_externals(mocker)
-        mocker.patch(
-            "app.research_completion._parse_research_findings",
-            return_value=parsed_findings,
-        )
-        mocker.patch(
-            "app.research_completion._assess_project_spawn_health",
-            return_value=(False, None),
-        )
-        mocker.patch(
-            "app.research_completion.resolve_branch_verification_context",
-            new=AsyncMock(return_value={}),
-        )
-        mocker.patch(
-            "app.research_completion.resolve_head_commit",
-            new=AsyncMock(return_value=None),
-        )
-        mocker.patch(
-            "app.research_completion.cited_paths_changed_since",
-            new=AsyncMock(return_value=None),
-        )
-        mocker.patch(
-            "app.research_completion._has_validation_backend",
-            return_value=has_backend,
-        )
-        if validate is not None:
-            mocker.patch("app.research_completion.validate_source_refs", new=validate)
-        mocker.patch(
-            "app.research_completion._summarize_ungrounded_claims_grounded",
-            new=AsyncMock(return_value=None),
-        )
-        await _handle_research_completion(task, "", db_session)
-        child = (
-            (
-                await db_session.execute(
-                    _select(_Task).where(_Task.parent_task_id == task.id)
-                )
-            )
-            .scalars()
-            .first()
-        )
-        return child.context or {}
-
-    @_pytest.mark.asyncio
     async def test_indeterminate_context_never_rejects(self, db_session, mocker):
         """No validation backend → all-broken citations still pass through."""
         from test_autonomous_research import _make_finding
@@ -4065,7 +3959,6 @@ class TestReproduceOnHeadGate:
         assert record["second_opinion_verdict"] == "present"
         assert record["agreement"] == "disagrees"
         assert "renamed" in record["reason"]
-        assert (spawned[0].context or {}).get("target_defect_reproduction") == "present"
         assert (task.context or {})["finding_challenge_records"][0]["agreement"] == (
             "disagrees"
         )

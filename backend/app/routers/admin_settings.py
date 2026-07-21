@@ -190,7 +190,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "review_second_opinion_sample_rate",
         "smoketest_enabled",
         "spend_approval_timeout_hours",
-        "strategic_retirement_challenge_gate_mode",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
         # Resident strategic session (dead-man's-switch safety + resident agent).
@@ -770,10 +769,6 @@ async def get_settings(
         ),
         "review_second_opinion_sample_rate": float(
             _runtime_config.get("review_second_opinion_sample_rate", 1.0)
-        ),
-        "strategic_retirement_challenge_gate_mode": str(
-            _runtime_config.get("strategic_retirement_challenge_gate_mode", "observe")
-            or "observe"
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
@@ -1754,25 +1749,6 @@ async def _apply_settings(
                 detail="review_second_opinion_sample_rate must be between 0.0 and 1.0",
             )
         _runtime_config["review_second_opinion_sample_rate"] = round(fval, 4)
-    if "strategic_retirement_challenge_gate_mode" in payload:
-        val = (
-            str(payload["strategic_retirement_challenge_gate_mode"] or "")
-            .strip()
-            .lower()
-        )
-        if val not in ("observe", "advisory", "enforce"):
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "strategic_retirement_challenge_gate_mode must be one of: "
-                    "observe, advisory, enforce"
-                ),
-            )
-        _runtime_config["strategic_retirement_challenge_gate_mode"] = val
-        if val == "enforce":
-            _debt_keys_to_resolve.append(
-                "dormant_knob:strategic_retirement_challenge_gate_mode"
-            )
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -3490,12 +3466,6 @@ async def _apply_settings(
                     ),
                     "review_second_opinion_sample_rate": float(
                         _runtime_config.get("review_second_opinion_sample_rate", 1.0)
-                    ),
-                    "strategic_retirement_challenge_gate_mode": str(
-                        _runtime_config.get(
-                            "strategic_retirement_challenge_gate_mode", "observe"
-                        )
-                        or "observe"
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)

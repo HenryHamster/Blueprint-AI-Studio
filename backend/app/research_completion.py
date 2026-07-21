@@ -144,7 +144,6 @@ from app.source_ref_validation import (
     CITATION_STATE_PRESENT,
     CITATION_STATE_INDETERMINATE,
 )
-from app.reproduction_scoring import record_target_defect_reproduction
 from app.shared_state import (
     runtime_config as _runtime_config,
     DEFAULT_TASK_SCOPE,
@@ -5400,15 +5399,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _spawn_gate_challenged
             else None,
         }
-        # Record the defect's reproduce-on-HEAD verdict on the spawned fix so its
-        # outcome scoring can refuse bare-merge success when the target defect
-        # was never established to reproduce. Absent findings are already gated
-        # out above (not spawned), so this carries present/indeterminate only;
-        # the helper no-ops for a missing/unrecognized verdict, preserving the
-        # legacy bare-merge behavior for findings without a recorded verdict.
-        record_target_defect_reproduction(
-            new_task.context, finding.get("_reproduce_on_head")
-        )
         session.add(new_task)
         if (
             task_type == "compute_experiment"

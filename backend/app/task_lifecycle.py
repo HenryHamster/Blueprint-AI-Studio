@@ -833,123 +833,6 @@ async def _resolve_quality_grader_completion(
         logger.debug("[GRADER] broadcast after grade failed", exc_info=True)
 
 
-async def _resolve_safeguard_challenge_completion(
-    challenge: Task, payload: AgentStatusPayload, session: AsyncSession
-) -> None:
-    """Route a safeguard-challenge verdict back to the parked safeguard task.
-
-    The challenge (spawned by ``task_evaluators.spawn_safeguard_challenge``)
-    assessed a safeguard audit's critical/high finding.  Here we parse the
-    outcome ("confirmed" | "rejected" | "downgraded"), write it onto the
-    safeguard task's context as ``SAFEGUARD_CHALLENGE_VERDICT_KEY``, restore
-    the safeguard to COMPLETED, and re-invoke ``_maybe_release_safeguard_gate``
-    so the gate decision reflects the challenger's verdict.
-
-    Resolves BOTH a COMPLETED and a FAILED challenger (a failed challenge
-    fails closed: outcome="confirmed") so the safeguard never strands EVALUATING.
-    """
-    from app.task_evaluators import (
-        SAFEGUARD_CHALLENGE_SOURCE_KEY,
-        SAFEGUARD_CHALLENGE_VERDICT_KEY,
-        parse_safeguard_challenge_outcome,
-    )
-    from app.task_completion import _maybe_release_safeguard_gate
-
-    source_id = (challenge.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY)
-    try:
-        source_uuid = uuid.UUID(str(source_id))
-    except (ValueError, TypeError):
-        await session.commit()
-        return
-
-    safeguard = (
-        (
-            await session.execute(
-                select(Task).where(Task.id == source_uuid).with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if safeguard is None:
-        await session.commit()
-        logger.warning(
-            "[SAFEGUARD] Safeguard task %s for challenge %s is gone; verdict dropped",
-            source_id,
-            challenge.id,
-        )
-        return
-
-    ctx = dict(safeguard.context or {})
-    lane = "safeguard_challenge"
-    pending_application = _sidecar_application_pending(
-        ctx, lane=lane, sidecar_id=challenge.id
-    )
-    if not pending_application and (
-        SAFEGUARD_CHALLENGE_VERDICT_KEY in ctx
-        or "awaiting_safeguard_challenge" not in ctx
-    ):
-        await session.commit()
-        logger.info(
-            "[SAFEGUARD] Challenge %s for safeguard %s already resolved; ignoring replayed terminal status",
-            challenge.id,
-            safeguard.id,
-        )
-        return
-
-    if not pending_application:
-        completed = payload.status == TaskStatus.COMPLETED
-        challenge_logs = payload.logs or challenge.latest_status_message or ""
-        verdict = parse_safeguard_challenge_outcome(challenge_logs, completed=completed)
-        challenge.latest_status_message = (
-            f"Safeguard challenge: {verdict['outcome']} — {verdict['reasoning']}"
-        )[:500]
-        session.add(challenge)
-        ctx[SAFEGUARD_CHALLENGE_VERDICT_KEY] = {
-            "outcome": verdict["outcome"],
-            "reasoning": verdict["reasoning"],
-            "challenge_task_id": str(challenge.id),
-        }
-        ctx.pop("awaiting_safeguard_challenge", None)
-        _set_sidecar_application_pending(
-            ctx,
-            lane=lane,
-            sidecar_id=challenge.id,
-            verdict_key=SAFEGUARD_CHALLENGE_VERDICT_KEY,
-        )
-    safeguard.context = ctx
-    flag_modified(safeguard, "context")
-    # Restore terminal status so _maybe_release_safeguard_gate sees a resolved task.
-    safeguard.status = TaskStatus.COMPLETED
-    session.add(safeguard)
-    await session.commit()
-
-    # Re-read findings from the stored plan_output and re-invoke the gate function.
-    _plan_output = safeguard.plan_output
-    if isinstance(_plan_output, dict) and isinstance(
-        _plan_output.get("findings"), list
-    ):
-        findings = _plan_output["findings"]
-    elif isinstance(_plan_output, list):
-        findings = _plan_output
-    else:
-        findings = None
-
-    await _maybe_release_safeguard_gate(safeguard, findings, session)
-    await session.refresh(safeguard)
-    _clear_sidecar_application_pending(safeguard, lane=lane, sidecar_id=challenge.id)
-    session.add(safeguard)
-    await session.commit()
-
-    logger.info(
-        "[SAFEGUARD] Challenge %s resolved safeguard %s with outcome=%s",
-        challenge.id,
-        safeguard.id,
-        ((safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY) or {}).get(
-            "outcome", "applied"
-        ),
-    )
-
 
 async def _resolve_review_second_opinion(
     challenger: Task, payload: AgentStatusPayload, session: AsyncSession
@@ -1428,12 +1311,11 @@ async def trigger_stranded_sidecar_resolution(
     last message, then dispatches to the resolver for the sidecar's lane
     (identified by which SOURCE_KEY the sidecar carries in its context).
 
-    All four resolver functions already handle a FAILED payload fail-closed, so
+    All three resolver functions already handle a FAILED payload fail-closed, so
     no additional logic is needed here — this is purely a routing shim.
     """
     from app.task_evaluators import (
         QUALITY_GRADER_SOURCE_KEY,
-        SAFEGUARD_CHALLENGE_SOURCE_KEY,
         FINDING_CHALLENGE_SOURCE_KEY,
         REVIEW_SECOND_OPINION_SOURCE_KEY,
     )
@@ -1444,9 +1326,7 @@ async def trigger_stranded_sidecar_resolution(
         logs=sidecar.latest_status_message or "",
     )
     ctx = sidecar.context or {}
-    if ctx.get(SAFEGUARD_CHALLENGE_SOURCE_KEY):
-        await _resolve_safeguard_challenge_completion(sidecar, synthetic, session)
-    elif ctx.get(QUALITY_GRADER_SOURCE_KEY):
+    if ctx.get(QUALITY_GRADER_SOURCE_KEY):
         await _resolve_quality_grader_completion(sidecar, synthetic, session)
     elif ctx.get(FINDING_CHALLENGE_SOURCE_KEY):
         await _resolve_finding_challenge_completion(sidecar, synthetic, session)
@@ -1720,19 +1600,6 @@ async def _process_post_commit(
             task.context = ctx
             flag_modified(task, "context")
             session.add(task)
-
-        # Safeguard-challenge side-car: an independent challenger spawned by
-        # ``_maybe_release_safeguard_gate`` carries SAFEGUARD_CHALLENGE_SOURCE_KEY
-        # pointing at the safeguard task whose gate decision it challenges.
-        # Handled BEFORE the quality-grader check so a challenge task is never
-        # mis-routed as a quality-grader completion, and before the
-        # COMPLETED-gated pipeline so even a FAILED challenger resolves
-        # fail-closed rather than stranding the safeguard EVALUATING forever.
-        from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-
-        if (task.context or {}).get(SAFEGUARD_CHALLENGE_SOURCE_KEY):
-            await _resolve_safeguard_challenge_completion(task, payload, session)
-            return {"status": "accepted"}
 
         # Forward-quality grader side-car: an independent grader spawned by the
         # forward-quality escalation carries QUALITY_GRADER_SOURCE_KEY pointing

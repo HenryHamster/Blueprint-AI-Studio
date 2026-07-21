@@ -42,9 +42,7 @@ from app.migration_apply_gate import (
     run_migration_apply_gate,
 )
 from app.required_runtime_env import (
-    QUALIFICATION_ENV,
     _verify_required_env,
-    missing_qualification_env,
 )
 
 # Same Postgres-vs-SQLite selection conftest uses. The scratch-DB cases need a
@@ -73,16 +71,7 @@ def test_scratch_prereq_is_typed_optional_and_boot_safe(monkeypatch):
     # 'defer', it does NOT prevent the app from starting.
     assert _verify_required_env() is None
 
-    # The qualification env manifest declares it as a cloud_run-scoped
-    # qualification prerequisite and surfaces it as missing when absent.
-    assert any(
-        req.name == "MIGRATION_APPLY_SCRATCH_DATABASE_URL" for req in QUALIFICATION_ENV
-    )
-    missing = missing_qualification_env()
-    assert any(
-        req.name == "MIGRATION_APPLY_SCRATCH_DATABASE_URL" for req in missing
-    ), "MIGRATION_APPLY_SCRATCH_DATABASE_URL must appear in missing_qualification_env() when absent in Cloud Run"
-
+    # The gate defers with an actionable verdict when the env var is absent.
     result = preflight_migration_apply_scratch(None)
     assert isinstance(result, MigrationApplyScratchPreflight)
     assert result.status == "absent"

@@ -22497,84 +22497,56 @@ async def test_strategic_decide_churn_retirement_retire(
 
 
 @pytest.mark.asyncio
-async def test_retire_direction_deferral_does_not_record_retired_memory(
+async def test_retire_direction_challenge_gate_removed_proceeds(
     client: AsyncClient, db_session, mocker
 ):
-    """The challenge-gate DEFERRAL branch must NOT record retired memory.
+    """The retirement-challenge deferral gate has been removed.
 
-    In enforce mode with a rejected retirement challenge the retire is deferred
-    (direction stays active), so no _recently_retired_directions entry is written.
+    Formerly, enforce mode with a rejected retirement challenge deferred the
+    retire (direction stayed active, no memory recorded). That gate is gone, so
+    the retire now proceeds regardless of any (now-ignored) challenge record or
+    the inert ``strategic_retirement_challenge_gate_mode`` config: the direction
+    is retired and a _recently_retired_directions memory entry is written.
     """
     from app.auth import create_agent_token
-    from app.shared_state import runtime_config
-    from app.strategic_completion import (
-        STRATEGIC_CHALLENGE_CONTEXT_KEY,
-        STRATEGIC_CHALLENGE_RECORD_VERSION,
-        sanitize_strategic_challenge_record,
-    )
 
     mocker.patch(
         "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
     )
-    rejected_challenge = sanitize_strategic_challenge_record(
-        {
-            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
-            "status": "ok",
-            "portfolio_operations": [
-                {
-                    "op": "retire_direction",
-                    "direction_id": "d-defer-mem",
-                    "verdict": "approved",
-                }
-            ],
-            "retirement_approvals": [
-                {
-                    "direction_id": "d-defer-mem",
-                    "verdict": "rejected",
-                    "rationale": "shallow and unsupported",
-                }
-            ],
-        }
-    )
     project, task = await _make_strategic_retire_task(
         db_session,
-        name="RetireDeferNoMemory",
+        name="RetireChallengeGateRemoved",
         vm="vm-defer-mem",
         direction_id="d-defer-mem",
-        context={STRATEGIC_CHALLENGE_CONTEXT_KEY: rejected_challenge},
+        gap_id="g-model-gc",
     )
     token = create_agent_token(
         str(task.id), "vm-defer-mem", task_type="strategic_review"
     )
-    _prev_mode = runtime_config.get("strategic_retirement_challenge_gate_mode")
-    try:
-        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
-        resp = await client.post(
-            "/api/agent/strategic",
-            json={
-                "task_id": str(task.id),
-                "op": "retire_direction",
-                "data": {"direction_id": "d-defer-mem", "rationale": "kill it"},
-            },
-            headers={"x-agent-token": token},
-        )
-    finally:
-        if _prev_mode is None:
-            runtime_config.pop("strategic_retirement_challenge_gate_mode", None)
-        else:
-            runtime_config["strategic_retirement_challenge_gate_mode"] = _prev_mode
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "retire_direction",
+            "data": {"direction_id": "d-defer-mem", "rationale": "kill it"},
+        },
+        headers={"x-agent-token": token},
+    )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "deferred"
+    # No longer deferred — the retire completes.
+    assert resp.json()["status"] == "ok"
     await db_session.refresh(project)
     target = next(
         d for d in (project.directions or []) if d.get("id") == "d-defer-mem"
     )
-    assert target["status"] == "active"
+    assert target["status"] != "active"
     mem = (project.vision or {}).get("_recently_retired_directions") or []
-    assert not any(m.get("id") == "d-defer-mem" for m in mem), (
-        f"deferral branch must NOT record retired memory; got {mem}"
+    entry = next((m for m in mem if m.get("id") == "d-defer-mem"), None)
+    assert entry is not None, (
+        f"retire must record retired memory now the gate is gone; got {mem}"
     )
+    assert entry["reason"] == "strategic_retire"
 
 
 @pytest.mark.asyncio

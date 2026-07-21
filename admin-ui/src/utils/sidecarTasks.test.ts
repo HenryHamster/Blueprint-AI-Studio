@@ -177,23 +177,6 @@ describe('deriveSidecarBadge — grader', () => {
   });
 });
 
-describe('deriveSidecarBadge — safeguard-challenge', () => {
-  const sidecar = makeTask({
-    id: 'challenge-1',
-    status: 'COMPLETED',
-    context: { safeguard_challenge_for_task_id: 'safeguard-1' },
-  });
-
-  it.each([
-    ['confirmed', 'negative'],
-    ['rejected', 'positive'],
-    ['downgraded', 'mixed'],
-  ])('maps outcome %s', (outcome, tone) => {
-    const primary = makeTask({ id: 'safeguard-1', context: { safeguard_challenge_verdict: { outcome } } });
-    expect(deriveSidecarBadge(sidecar, primary)).toMatchObject({ kind: 'safeguard-challenge', tone });
-  });
-});
-
 describe('deriveSidecarBadge — finding-challenge', () => {
   const sidecar = makeTask({
     id: 'challenge-1',

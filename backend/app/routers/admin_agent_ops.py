@@ -93,11 +93,9 @@ from app.strategic_completion import (
     _spawn_retirement_memos,
     record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
-    challenge_approves_retirement,
     find_gap_respawn_match,
     spawn_budget_status,
     spawn_title_is_redundant,
-    strategic_retirement_challenge_gate_mode,
 )
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
@@ -1964,55 +1962,6 @@ async def strategic_operation(
         )
         now_iso = _utcnow().isoformat()
         ctx = task.context or {}
-        challenge_record = ctx.get(STRATEGIC_CHALLENGE_CONTEXT_KEY)
-        gate_mode = strategic_retirement_challenge_gate_mode()
-        challenge_approved = challenge_approves_retirement(challenge_record, dir_id)
-
-        challenge_status = "missing"
-        challenge_verdict = "missing"
-        challenge_rationale = ""
-        if isinstance(challenge_record, dict):
-            challenge_status = (
-                str(challenge_record.get("status", "invalid") or "invalid")
-                .strip()
-                .lower()
-            )
-            challenge_verdict = "missing_approval"
-            for item in challenge_record.get("retirement_approvals") or []:
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get("direction_id", "")).strip() != str(dir_id).strip():
-                    continue
-                challenge_verdict = (
-                    str(item.get("verdict", "missing") or "missing").strip().lower()
-                )
-                challenge_rationale = str(item.get("rationale", "")).strip()[
-                    :STRATEGIC_RATIONALE_MAX
-                ]
-                break
-
-        if challenge_approved:
-            gate_reason = "retirement second opinion approved"
-        elif challenge_status != "ok":
-            gate_reason = (
-                f"retirement second opinion unavailable or non-ok "
-                f"(challenge_status={challenge_status})"
-            )
-        else:
-            gate_reason = (
-                f"retirement second opinion did not approve "
-                f"(verdict={challenge_verdict})"
-            )
-        gate_audit = {
-            "direction_id": str(dir_id),
-            "mode": gate_mode,
-            "approved": challenge_approved,
-            "challenge_status": challenge_status,
-            "verdict": challenge_verdict,
-            "rationale": challenge_rationale,
-            "reason": gate_reason[:STRATEGIC_RATIONALE_MAX],
-            "recorded_at": now_iso,
-        }
         directions = list(project.directions or [])
         matched_direction = None
         for d in directions:
@@ -2025,101 +1974,6 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
 
-        if not challenge_approved and gate_mode == "enforce":
-            notes = matched_direction.get("notes", [])
-            notes.append(
-                {
-                    "text": f"Strategic retirement deferred: {gate_reason}",
-                    "added_at": now_iso,
-                }
-            )
-            matched_direction["notes"] = _cap_list(
-                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
-            )
-            _captured_deferred_dir = dict(matched_direction)
-            _captured_deferred_id = str(dir_id)
-            def _apply_deferred(fresh: list) -> list:
-                return [
-                    _captured_deferred_dir if d.get("id") == _captured_deferred_id else d
-                    for d in fresh
-                ]
-            await _with_directions_locked(session, project.id, _apply_deferred)
-            verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
-            verdicts.append(gate_audit)
-            deferrals = list(ctx.get("_strategic_retirement_deferrals", []))
-            deferrals.append(gate_audit)
-            task.context = {
-                **ctx,
-                "_strategic_api_called": True,
-                "_strategic_retirement_gate_verdicts": _cap_list(
-                    verdicts,
-                    STRATEGIC_NOTES_HISTORY_MAX,
-                    "_strategic_retirement_gate_verdicts",
-                    warnings,
-                ),
-                "_strategic_retirement_deferrals": _cap_list(
-                    deferrals,
-                    STRATEGIC_NOTES_HISTORY_MAX,
-                    "_strategic_retirement_deferrals",
-                    warnings,
-                ),
-            }
-            flag_modified(task, "context")
-            session.add(task)
-            await session.commit()
-            # Completion-debt ledger: a deferred retirement is a residual
-            # obligation (the retire is owed once the gate clears). Best-effort,
-            # deduped per (project, direction) so repeated deferrals keep a
-            # single open row and never break the strategic operation.
-            try:
-                from app.completion_debt import (
-                    arecord_completion_debt,
-                    KIND_RETIREMENT_RESIDUAL,
-                )
-
-                await arecord_completion_debt(
-                    session,
-                    dedupe_key=f"retirement_residual:{project.id}:{dir_id}:deferred",
-                    kind=KIND_RETIREMENT_RESIDUAL,
-                    title=f"Retirement deferred for direction {dir_id}: {gate_reason}",
-                    project_id=project.id,
-                    source="admin_agent_ops",
-                    detail={"direction_id": str(dir_id), "kind": "deferred"},
-                )
-                await session.commit()
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "[STRATEGIC API] completion-debt record failed for deferred "
-                    "retirement of direction %s (non-fatal)",
-                    dir_id,
-                )
-            await _emit_updated(
-                STRATEGIC_KIND_DIRECTIONS,
-                changed_direction_ids=[dir_id],
-                changed_count=1,
-            )
-            logger.info(
-                "[STRATEGIC API] Deferred retirement for direction %s: %s",
-                dir_id,
-                gate_reason,
-            )
-            return _resp(
-                {
-                    "status": "deferred",
-                    "op": "retire_direction",
-                    "direction_id": dir_id,
-                    "reason": gate_reason,
-                    "gate_mode": gate_mode,
-                    "challenge_status": challenge_status,
-                    "challenge_verdict": challenge_verdict,
-                }
-            )
-
-        if not challenge_approved and gate_mode == "advisory":
-            warnings.append(
-                f"Retirement challenge did not support direction {dir_id}; "
-                "advisory mode committed the retirement anyway"
-            )
         matched_direction["status"] = "expired"
         notes = matched_direction.get("notes", [])
         note_text = f"Retired by strategic review: {rationale}"
@@ -2169,8 +2023,6 @@ async def strategic_operation(
         # Record retired-direction memory in the SAME committed transaction so a
         # strategist-retired direction blocks a same-gap / text-overlap re-spawn
         # next cycle (mirrors the fallback retire path's deferred vision write).
-        # Only reached on a real commit — the challenge-gate deferral branch
-        # returns above without ever getting here.
         _retire_snapshot = dict(matched_direction)
         _retire_outcome = rationale or None
 
@@ -2183,20 +2035,12 @@ async def strategic_operation(
             )
 
         await _with_vision_locked(session, project.id, _record_retire_memory)
-        verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
-        verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
         retired_ids.append(dir_id)
         task.context = {
             **ctx,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
             "_strategic_retired_ids": retired_ids,
-            "_strategic_retirement_gate_verdicts": _cap_list(
-                verdicts,
-                STRATEGIC_NOTES_HISTORY_MAX,
-                "_strategic_retirement_gate_verdicts",
-                warnings,
-            ),
         }
         flag_modified(task, "context")
         session.add(task)
@@ -2207,11 +2051,6 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
-        # Resolve the gate-DEFERRED retirement residual now that the retire has
-        # committed. Best-effort/non-fatal and idempotent w.r.t. the same
-        # resolution done inside ``_spawn_retirement_memos`` below (the second
-        # call is a no-op on an already-resolved row). Only touches the
-        # ``:deferred`` key — the memo handoff debt is a separate obligation.
         try:
             from app.completion_debt import aresolve_deferred_retirement_debt
 

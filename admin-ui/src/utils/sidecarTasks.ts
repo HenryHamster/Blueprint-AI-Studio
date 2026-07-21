@@ -13,7 +13,6 @@ import type { Task } from '../types/task';
 export type SidecarKind =
   | 'second-opinion'
   | 'grader'
-  | 'safeguard-challenge'
   | 'finding-challenge';
 
 /** Back-reference context keys written ON THE SIDE-CAR (backend task_evaluators.py). */
@@ -24,8 +23,6 @@ export const SIDECAR_BACKREF_KEYS: Record<string, SidecarKind> = {
   // (the adversarial side-car reuses the same back-reference key and is
   // distinguished by context.adversarial_grader on the side-car itself)
   quality_grader_for_task_id: 'grader',
-  // SAFEGUARD_CHALLENGE_SOURCE_KEY — challenge of a safeguard audit's merge-gate hold
-  safeguard_challenge_for_task_id: 'safeguard-challenge',
   // FINDING_CHALLENGE_SOURCE_KEY — per-finding second opinion on a research verdict
   finding_challenge_for_task_id: 'finding-challenge',
 };
@@ -133,21 +130,6 @@ export function deriveSidecarBadge(sidecar: Task, primary: Task): SidecarBadge |
           : badge(backref.kind, 'grade ✗', 'negative', `Forward-quality grade failed${reason}`);
       }
       return unresolved(backref.kind, 'grade', sidecar);
-    }
-    case 'safeguard-challenge': {
-      // SAFEGUARD_CHALLENGE_VERDICT_KEY: {outcome: confirmed|rejected|downgraded, reasoning}
-      const verdict = pctx['safeguard_challenge_verdict'] as { outcome?: unknown } | undefined;
-      const outcome = typeof verdict?.outcome === 'string' ? verdict.outcome : null;
-      if (outcome === 'confirmed') {
-        return badge(backref.kind, 'safeguard ✗ confirmed', 'negative', 'Independent challenge confirmed the safeguard finding — merge gate held');
-      }
-      if (outcome === 'rejected') {
-        return badge(backref.kind, 'safeguard ✓ rejected', 'positive', 'Independent challenge rejected the safeguard finding as a false positive');
-      }
-      if (outcome === 'downgraded') {
-        return badge(backref.kind, 'safeguard ~ downgraded', 'mixed', 'Independent challenge downgraded the safeguard finding below critical/high severity');
-      }
-      return unresolved(backref.kind, 'safeguard challenge', sidecar);
     }
     case 'finding-challenge': {
       // FINDING_CHALLENGE_VERDICT_KEY: FindingChallengeRecord {agreement, ...}

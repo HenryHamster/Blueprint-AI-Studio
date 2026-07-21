@@ -91,25 +91,6 @@ ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES = frozenset(
     }
 )
 
-# Context key written on a spawned safeguard-challenge task, pointing at the
-# safeguard audit task whose merge-gate decision it challenges.
-# ``task_lifecycle._process_post_commit`` watches for this key to route the
-# challenge's completion back to the parked safeguard task.
-SAFEGUARD_CHALLENGE_SOURCE_KEY = "safeguard_challenge_for_task_id"
-
-# Context key written on the SAFEGUARD task once its challenge returns.  The
-# value is a dict with keys ``outcome`` ("confirmed" | "rejected" | "downgraded")
-# and ``reasoning``.  ``_maybe_release_safeguard_gate`` reads it on re-entry to
-# decide whether the merge gate is released or held.
-SAFEGUARD_CHALLENGE_VERDICT_KEY = "safeguard_challenge_verdict"
-
-# Context key written on the SAFEGUARD task when it operates in observe/shadow
-# mode. The value mirrors SAFEGUARD_CHALLENGE_VERDICT_KEY (same dict shape) but
-# the gate is NEVER released based on this key — it is a bounded, auditable
-# record of what the challenge WOULD have decided. Consumed by digest_metrics
-# to compute the false-positive-block rate without changing merge behavior.
-SAFEGUARD_OBSERVE_VERDICT_KEY = "safeguard_observe_verdict"
-
 
 # ---------------------------------------------------------------------------
 # Per-finding second-opinion CHALLENGE seam.
@@ -1633,103 +1614,7 @@ async def spawn_forward_quality_grader(
     return grader
 
 
-async def spawn_safeguard_challenge(
-    safeguard_task: Task,
-    findings_text: str,
-    session: AsyncSession,
-) -> Task | None:
-    """Spawn an independent challenge task for a safeguard security-audit finding.
-
-    Returns the spawned challenge ``Task``, or ``None`` when a challenge is
-    already in flight or already resolved (single-shot guard).
-
-    The safeguard task is moved to EVALUATING and will NOT finalize the
-    merge-gate decision until the challenger's verdict returns via
-    ``task_lifecycle._resolve_safeguard_challenge_completion``.
-    """
-    ctx = dict(safeguard_task.context or {})
-    if ctx.get(SAFEGUARD_CHALLENGE_VERDICT_KEY) is not None or ctx.get(
-        "awaiting_safeguard_challenge"
-    ):
-        return None
-
-    base_branch = (safeguard_task.first_payload or {}).get("base_branch", "main")
-    prompt = (
-        "You are an independent security reviewer. A security audit has flagged "
-        "the following finding(s) as critical or high severity, and the project's "
-        "merge gate is held pending your independent assessment.\n\n"
-        "Your task: read each finding carefully and determine whether it "
-        "constitutes a genuine critical or high severity vulnerability in the "
-        "codebase, or whether it is a false positive / over-stated severity.\n\n"
-        "-----8<----- FINDING(S) START -----8<-----\n"
-        f"{findings_text[:20000]}\n"
-        "-----8<----- FINDING(S) END -----8<-----\n\n"
-        "End your response with EXACTLY ONE JSON object on its own line, and "
-        "nothing after it:\n"
-        '{"outcome": "confirmed" | "rejected" | "downgraded", '
-        '"reasoning": "<one-sentence justification>"}\n'
-        "Where:\n"
-        "  confirmed  — the finding is a genuine critical/high severity issue\n"
-        "  rejected   — the finding is a false positive\n"
-        "  downgraded — the finding is real but severity is below critical/high\n"
-    )
-
-    challenge = Task(
-        project_id=safeguard_task.project_id,
-        title=(f"[CHALLENGE] safeguard gate for {str(safeguard_task.id)[:8]}"),
-        description=(
-            "Independent challenge of a safeguard security-audit finding before "
-            "the merge gate is maintained."
-        ),
-        parent_task_id=None,
-        payloads=[
-            {
-                "type": "investigate",
-                "prompt": prompt,
-                "base_branch": base_branch,
-                "scope": "small",
-                # Deliberate cost-efficiency tier: mid-pipeline second opinion,
-                # not the final merge gate. Accepted finding; pinned by
-                # test_spawn_safeguard_challenge_sets_sonnet_quality_tier.
-                "quality_tier": "sonnet",
-            }
-        ],
-        context={
-            SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard_task.id),
-            "scope": "small",
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        priority=safeguard_task.priority,
-    )
-    session.add(challenge)
-
-    safeguard_task.status = TaskStatus.EVALUATING
-    safeguard_task.latest_status_message = (
-        "Awaiting independent challenge verdict before finalizing merge gate decision"
-    )[:500]
-    ctx["awaiting_safeguard_challenge"] = True
-    safeguard_task.context = ctx
-    flag_modified(safeguard_task, "context")
-    session.add(safeguard_task)
-    await session.commit()
-    await session.refresh(challenge)
-
-    ctx2 = dict(safeguard_task.context or {})
-    ctx2["awaiting_safeguard_challenge"] = str(challenge.id)
-    safeguard_task.context = ctx2
-    flag_modified(safeguard_task, "context")
-    session.add(safeguard_task)
-    await session.commit()
-
-    logger.info(
-        "[SAFEGUARD] Spawned challenge %s for safeguard %s; gate decision "
-        "parked EVALUATING awaiting verdict",
-        challenge.id,
-        safeguard_task.id,
-    )
-    return challenge
+# (safeguard_challenge lane removed — observe-only, no measured lift)
 
 
 def parse_grader_verdict(logs: str | None, completed: bool = True) -> EvaluationVerdict:
@@ -1783,42 +1668,6 @@ def parse_grader_verdict(logs: str | None, completed: bool = True) -> Evaluation
     return EvaluationVerdict(
         False, "grader verdict unparseable; failing closed", "forward-quality"
     )
-
-
-def parse_safeguard_challenge_outcome(logs: str | None, completed: bool = True) -> dict:
-    """Parse an independent safeguard-challenge outcome from its output.
-
-    Returns a dict with keys ``outcome`` and ``reasoning``.  FAIL-CLOSED on
-    every ambiguous case: a challenger that did not complete, emitted nothing,
-    or produced unparseable output yields ``outcome="confirmed"`` so the gate
-    is maintained rather than accidentally released on a bad response.
-    """
-    _fail_closed = {
-        "outcome": "confirmed",
-        "reasoning": "challenge did not resolve; gate maintained",
-    }
-
-    if not completed:
-        return _fail_closed
-
-    text = (logs or "").strip()
-    if not text:
-        return _fail_closed
-
-    obj = scan_balanced_json_objects(text, required_key="outcome")
-    if obj is not None:
-        outcome = str(obj.get("outcome", "")).strip().lower()
-        reasoning = str(obj.get("reasoning") or "")[:480]
-        if outcome in ("confirmed", "rejected", "downgraded"):
-            return {"outcome": outcome, "reasoning": reasoning}
-
-    # Fallback: anchored keyword scan.
-    low = text.lower()
-    for keyword in ("rejected", "downgraded", "confirmed"):
-        if f'"outcome": "{keyword}"' in low or f'"outcome":"{keyword}"' in low:
-            return {"outcome": keyword, "reasoning": "outcome keyword found (anchored)"}
-
-    return _fail_closed
 
 
 # ---------------------------------------------------------------------------

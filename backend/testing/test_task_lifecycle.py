@@ -8849,275 +8849,6 @@ async def test_park_task_catches_up_already_terminal_compute_job(tl_db):
     assert reg_other.fired_at is None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# _resolve_safeguard_challenge_completion
-# ══════════════════════════════════════════════════════════════════════════════
-
-
-async def _make_safeguard_triplet(
-    session,
-    project_id,
-    *,
-    plan_output=None,
-):
-    """Return (orig, safeguard, challenge) set up for _resolve_safeguard_challenge_completion tests.
-
-    orig — EVALUATING, requires_approval=True (simulates review approved, safeguard pending).
-    safeguard — EVALUATING (parked awaiting challenge), with safeguard_for_task_id → orig.
-    challenge — COMPLETED, with SAFEGUARD_CHALLENGE_SOURCE_KEY → safeguard.
-    """
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-
-    orig = await _make_task(
-        session,
-        project_id,
-        task_type="create",
-        status=TaskStatus.EVALUATING,
-        context={"review_loop": {"review_approved": True}},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    orig.requires_approval = True
-    session.add(orig)
-    await session.commit()
-
-    safeguard = await _make_task(
-        session,
-        project_id,
-        task_type="security_audit",
-        status=TaskStatus.EVALUATING,
-        context={
-            "safeguard_for_task_id": str(orig.id),
-            "safeguard_pr_number": "88",
-            "awaiting_safeguard_challenge": str(uuid.uuid4()),
-        },
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    if plan_output is not None:
-        safeguard.plan_output = plan_output
-        session.add(safeguard)
-        await session.commit()
-
-    challenge = Task(
-        project_id=project_id,
-        payloads=[{"type": "investigate", "prompt": "assess finding"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard.id)},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-    return orig, safeguard, challenge
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_writes_verdict_and_releases_gate(tl_db):
-    """A COMPLETED challenger with 'rejected' outcome:
-    (a) writes the verdict under SAFEGUARD_CHALLENGE_VERDICT_KEY,
-    (b) restores safeguard to COMPLETED,
-    (c) pops awaiting_safeguard_challenge,
-    (d) re-invokes the gate function, which releases the gate."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    high_finding = {
-        "severity": "high",
-        "title": "Missing auth",
-        "description": "desc",
-        "fix_prompt": "fix it",
-        "file_path": "app/x.py",
-        "line_number": 1,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [high_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "false positive confirmed"}',
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    assert safeguard.status == TaskStatus.COMPLETED, (
-        "Safeguard must be restored to COMPLETED"
-    )
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict is not None, "Verdict must be written to safeguard context"
-    assert verdict["outcome"] == "rejected"
-    assert verdict["reasoning"] == "false positive confirmed"
-    assert verdict["challenge_task_id"] == str(challenge.id)
-    assert "awaiting_safeguard_challenge" not in (safeguard.context or {}), (
-        "awaiting_safeguard_challenge must be popped after resolution"
-    )
-
-    await session.refresh(orig)
-    assert orig.requires_approval is False, (
-        "Gate must be released on 'rejected' verdict"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_confirmed_maintains_gate(tl_db):
-    """A COMPLETED challenger with 'confirmed' outcome writes the verdict and
-    maintains the merge gate (orig.requires_approval stays True)."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    critical_finding = {
-        "severity": "critical",
-        "title": "SQL injection",
-        "description": "Raw query.",
-        "fix_prompt": "Parameterize.",
-        "file_path": "app/db.py",
-        "line_number": 5,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [critical_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "confirmed", "reasoning": "genuine SQL injection"}',
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    assert safeguard.status == TaskStatus.COMPLETED
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict["outcome"] == "confirmed"
-
-    await session.refresh(orig)
-    assert orig.requires_approval is True, (
-        "Gate must remain closed on 'confirmed' verdict"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_failed_challenger_fails_closed(tl_db):
-    """A FAILED challenger (payload.status != COMPLETED) produces outcome='confirmed'
-    so the merge gate is maintained rather than accidentally released."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_VERDICT_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-    high_finding = {
-        "severity": "high",
-        "title": "Auth bypass",
-        "description": "desc",
-        "fix_prompt": "fix it",
-        "file_path": "app/y.py",
-        "line_number": 2,
-    }
-    orig, safeguard, challenge = await _make_safeguard_triplet(
-        session, project.id, plan_output={"findings": [high_finding]}
-    )
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.FAILED,
-        logs=None,
-    )
-
-    import app.shared_state as shared_state
-
-    shared_state.runtime_config["safeguard_challenge_gate_mode"] = "enforce"
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-    await session.refresh(safeguard)
-    verdict = (safeguard.context or {}).get(SAFEGUARD_CHALLENGE_VERDICT_KEY)
-    assert verdict is not None
-    assert verdict["outcome"] == "confirmed", (
-        "A failed challenger must produce 'confirmed' outcome (fail-closed)"
-    )
-    assert safeguard.status == TaskStatus.COMPLETED
-
-    await session.refresh(orig)
-    assert orig.requires_approval is True, (
-        "Gate must remain closed when challenger failed"
-    )
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_invalid_uuid_source_early_return(tl_db):
-    """When SAFEGUARD_CHALLENGE_SOURCE_KEY holds a non-UUID value, the function
-    commits the challenge status message and returns without error."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: "not-a-valid-uuid"},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "fp"}',
-    )
-
-    # Must not raise even with an invalid source UUID.
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
-
-@pytest.mark.asyncio
-async def test_resolve_challenge_source_gone_early_return(tl_db):
-    """When the safeguard task UUID is valid but not in the DB, the function
-    commits the challenge status message, logs a warning, and returns without error."""
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-    from app.task_lifecycle import _resolve_safeguard_challenge_completion
-
-    session, _ = tl_db
-    project = await _make_project(session)
-
-    phantom_safeguard_id = uuid.uuid4()  # valid UUID but not in DB
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess"}],
-        status=TaskStatus.COMPLETED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(phantom_safeguard_id)},
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    payload = AgentStatusPayload(
-        task_id=challenge.id,
-        status=TaskStatus.COMPLETED,
-        logs='{"outcome": "rejected", "reasoning": "fp"}',
-    )
-
-    # Must not raise even when the source safeguard is missing from the DB.
-    await _resolve_safeguard_challenge_completion(challenge, payload, session)
-
 
 # Default-on second-opinion gate for ordinary review verdicts
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10302,62 +10033,6 @@ async def test_resolver_uses_grader_hashes_when_source_hashes_are_missing(
     assert "awaiting_adversarial_grader" not in (source.context or {})
 
 
-@pytest.mark.asyncio
-async def test_sweep_stranded_safeguard_challenge_cancelled(tl_db, mocker):
-    """A CANCELLED safeguard challenge with no status POST must resolve the parked safeguard."""
-    from app.services import _sweep_stranded_sidecar_sources
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
-
-    session, Session = tl_db
-    mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
-    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
-    mocker.patch(
-        "app.task_completion._maybe_release_safeguard_gate",
-        new=AsyncMock(return_value=None),
-    )
-    mocker.patch(
-        "app.task_completion.broadcast_to_project", new=AsyncMock(return_value=None)
-    )
-
-    project = await _make_project(session)
-
-    safeguard = Task(
-        project_id=project.id,
-        payloads=[{"type": "security_audit", "base_branch": "main"}],
-        status=TaskStatus.EVALUATING,
-        created_by="ORCHESTRATOR",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(safeguard)
-    await session.commit()
-    await session.refresh(safeguard)
-
-    challenge = Task(
-        project_id=project.id,
-        payloads=[{"type": "investigate", "prompt": "assess", "base_branch": "main"}],
-        status=TaskStatus.CANCELLED,
-        created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(safeguard.id)},
-        latest_status_message="VM cancelled",
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-    )
-    session.add(challenge)
-    await session.commit()
-    await session.refresh(challenge)
-
-    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
-
-    safeguard.context = {"awaiting_safeguard_challenge": str(challenge.id)}
-    _flag_modified(safeguard, "context")
-    session.add(safeguard)
-    await session.commit()
-
-    await _sweep_stranded_sidecar_sources()
-
-    await session.refresh(safeguard)
-    assert safeguard.status != TaskStatus.EVALUATING, (
-        "safeguard must not remain EVALUATING after sweep resolves the cancelled challenge"
-    )
 
 
 @pytest.mark.asyncio
@@ -10489,7 +10164,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     so sidecars_by_id.get() returned None and the source stayed EVALUATING forever.
     """
     from app.services import _sweep_stranded_sidecar_sources
-    from app.task_evaluators import SAFEGUARD_CHALLENGE_SOURCE_KEY
+    from app.task_evaluators import FINDING_CHALLENGE_SOURCE_KEY
 
     session, Session = tl_db
     mocker.patch("app.recovery_sweeps.services.AsyncSessionLocal", Session)
@@ -10530,13 +10205,13 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
     await session.commit()
     await session.refresh(source)
 
-    # Create a FAILED sidecar for the SECOND awaiting key (safeguard_challenge).
+    # Create a FAILED sidecar for the SECOND awaiting key (finding_challenge).
     dead_challenge = Task(
         project_id=project.id,
         payloads=[{"type": "investigate", "prompt": "assess", "base_branch": "main"}],
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        context={FINDING_CHALLENGE_SOURCE_KEY: str(source.id)},
         latest_status_message="Reaper killed",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
@@ -10549,7 +10224,7 @@ async def test_sweep_stranded_multi_lane_non_first_sidecar(tl_db, mocker):
 
     source.context = {
         "awaiting_quality_grader": str(live_grader.id),
-        "awaiting_safeguard_challenge": str(dead_challenge.id),
+        "awaiting_finding_challenge": str(dead_challenge.id),
     }
     _flag_modified(source, "context")
     session.add(source)
@@ -10570,15 +10245,15 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     The stranded-sidecar recovery sweep must fire lane resolution once per terminal
     awaiting_* key. This test verifies the invariant: when a source carries two
     terminal sidecars in two different lanes (e.g., quality_grader and
-    safeguard_challenge), the sweep resolves both, and both lane verdicts are
+    finding_challenge), the sweep resolves both, and both lane verdicts are
     recorded in the source's context exactly once.
     """
     from app.services import _sweep_stranded_sidecar_sources
     from app.task_evaluators import (
         QUALITY_GRADER_SOURCE_KEY,
         QUALITY_GRADER_VERDICT_KEY,
-        SAFEGUARD_CHALLENGE_SOURCE_KEY,
-        SAFEGUARD_CHALLENGE_VERDICT_KEY,
+        FINDING_CHALLENGE_SOURCE_KEY,
+        FINDING_CHALLENGE_VERDICT_KEY,
     )
 
     session, Session = tl_db
@@ -10624,7 +10299,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     await session.commit()
     await session.refresh(grader)
 
-    # Create second terminal sidecar for safeguard_challenge lane.
+    # Create second terminal sidecar for finding_challenge lane.
     challenge = Task(
         project_id=project.id,
         payloads=[
@@ -10632,7 +10307,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
         ],
         status=TaskStatus.FAILED,
         created_by="ORCHESTRATOR",
-        context={SAFEGUARD_CHALLENGE_SOURCE_KEY: str(source.id)},
+        context={FINDING_CHALLENGE_SOURCE_KEY: str(source.id)},
         latest_status_message="Challenge timed out",
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
     )
@@ -10645,7 +10320,7 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
 
     source.context = {
         "awaiting_quality_grader": str(grader.id),
-        "awaiting_safeguard_challenge": str(challenge.id),
+        "awaiting_finding_challenge": str(challenge.id),
     }
     _flag_modified(source, "context")
     session.add(source)
@@ -10665,16 +10340,16 @@ async def test_sweep_stranded_multi_terminal_lanes_both_verdicts_applied(tl_db, 
     assert QUALITY_GRADER_VERDICT_KEY in ctx, (
         "quality_grader verdict must be written on the source after resolution"
     )
-    assert SAFEGUARD_CHALLENGE_VERDICT_KEY in ctx, (
-        "safeguard_challenge verdict must be written on the source after resolution"
+    assert FINDING_CHALLENGE_VERDICT_KEY in ctx, (
+        "finding_challenge verdict must be written on the source after resolution"
     )
 
     # Verify both awaiting keys have been cleared.
     assert "awaiting_quality_grader" not in ctx, (
         "awaiting_quality_grader must be cleared after resolution"
     )
-    assert "awaiting_safeguard_challenge" not in ctx, (
-        "awaiting_safeguard_challenge must be cleared after resolution"
+    assert "awaiting_finding_challenge" not in ctx, (
+        "awaiting_finding_challenge must be cleared after resolution"
     )
 
 

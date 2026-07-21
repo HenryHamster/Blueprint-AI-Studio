@@ -1058,18 +1058,18 @@ async def test_dormant_knob_reconciliation_recovers_env_graduation_and_demotion(
     """Startup-style reconciliation must resolve stale rows and reopen them."""
     from app.completion_debt import areconcile_dormant_knob_debts
 
-    key = "dormant_knob:safeguard_challenge_gate_mode"
+    key = "dormant_knob:direction_gap_respawn_block_mode"
     seeded = await cd.arecord_completion_debt(
         db_session,
         dedupe_key=key,
         kind=cd.KIND_DORMANT_KNOB,
-        title="Safeguard challenge gate is observe-only",
+        title="Direction-gap respawn block is observe-only",
         project_id=None,
     )
     await db_session.commit()
     assert seeded is True
 
-    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "enforce")
+    monkeypatch.setitem(runtime_config, "direction_gap_respawn_block_mode", "enforce")
     stats = await areconcile_dormant_knob_debts(db_session)
     await db_session.commit()
     db_session.expire_all()
@@ -1082,7 +1082,7 @@ async def test_dormant_knob_reconciliation_recovers_env_graduation_and_demotion(
     assert resolved_row.status == cd.STATUS_RESOLVED
     assert stats["resolved"] >= 1
 
-    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "observe")
+    monkeypatch.setitem(runtime_config, "direction_gap_respawn_block_mode", "observe")
     stats = await areconcile_dormant_knob_debts(db_session)
     await db_session.commit()
     db_session.expire_all()

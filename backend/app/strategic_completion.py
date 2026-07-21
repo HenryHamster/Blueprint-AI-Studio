@@ -512,14 +512,6 @@ _HARD_BLOCK_PORTFOLIO_OPS = frozenset(
         "activate_direction",
     }
 )
-STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY = (
-    "strategic_retirement_challenge_gate_mode"
-)
-STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES = frozenset(
-    {"observe", "advisory", "enforce"}
-)
-
-
 def _sanitize_challenge_verdict_block(
     raw: object,
     *,
@@ -816,47 +808,6 @@ def challenge_approves_evidence_progress(
         ):
             return True
     return False
-
-
-def challenge_approves_retirement(record: object, direction_id: str) -> bool:
-    """True iff the challenge record APPROVED retiring this direction_id.
-
-    Mirrors :func:`challenge_approves_evidence_progress` in fail-closed shape:
-    non-dict records, non-ok statuses, blank direction ids, rejected/uncertain
-    entries, and missing entries all return False. No caller should treat an
-    unavailable retirement second opinion as approval.
-    """
-    if not isinstance(record, dict):
-        return False
-    if record.get("status") != "ok":
-        return False
-    target_id = (direction_id or "").strip()
-    if not target_id:
-        return False
-    for item in record.get(_RETIREMENT_APPROVALS_KEY) or []:
-        if not isinstance(item, dict):
-            continue
-        if (
-            str(item.get("direction_id", "")).strip() == target_id
-            and str(item.get("verdict", "")).strip().lower() == "approved"
-        ):
-            return True
-    return False
-
-
-def strategic_retirement_challenge_gate_mode() -> str:
-    """Return the current retirement challenge rollout mode."""
-    raw = (
-        str(
-            _runtime_config.get(STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY, "observe")
-            or "observe"
-        )
-        .strip()
-        .lower()
-    )
-    if raw not in STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODES:
-        return "observe"
-    return raw
 
 
 def strategic_challenge_summary(record: object) -> dict | None:
@@ -4240,12 +4191,6 @@ async def _handle_strategic_completion(
             _retirement_critiques = (task.context or {}).get(
                 "_strategic_retirement_critiques"
             )
-            _retirement_gate_verdicts = (task.context or {}).get(
-                "_strategic_retirement_gate_verdicts"
-            )
-            _retirement_deferrals = (task.context or {}).get(
-                "_strategic_retirement_deferrals"
-            )
             _extra: dict = {
                 "created_direction_ids": created_ids,
                 "retired_direction_ids": retired_ids,
@@ -4293,10 +4238,6 @@ async def _handle_strategic_completion(
                 )
             if _retirement_critiques is not None:
                 _extra["retirement_critiques"] = _retirement_critiques
-            if _retirement_gate_verdicts is not None:
-                _extra["retirement_gate_verdicts"] = _retirement_gate_verdicts
-            if _retirement_deferrals is not None:
-                _extra["retirement_deferrals"] = _retirement_deferrals
             # Copy the bounded, versioned strategic judgment challenge record
             # (evidence_progress / retirement / portfolio-shape second opinion)
             # verbatim into cycle_metadata so the challenge pass is durably

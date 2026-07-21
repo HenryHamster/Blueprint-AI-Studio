@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 _AWAITING_SIDECAR_KEYS = (
     "awaiting_quality_grader",
     "awaiting_adversarial_grader",
-    "awaiting_safeguard_challenge",
     "awaiting_finding_challenge",
     "awaiting_review_second_opinion",
 )

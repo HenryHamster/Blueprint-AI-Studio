@@ -225,7 +225,7 @@ Findings covered here (20-finding release-qualification salvage bundle, 2026-07-
   f20-3  — verify encryption-key continuity; probe_key_continuity / assert_plaintext_or_raise present
   f20-4  — research: define safe Fernet key rotation; MultiFernet.rotate() exists
   f20-5  — fail closed on keyless/malformed backfill; require_encryption_active raises on malformed key
-  f20-6  — scratch-DB URL in QUALIFICATION_ENV not REQUIRED_RUNTIME_ENV
+  f20-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (boot-safe absence)
   f20-7  — gate-defer signature derived from error code only (no child failures)
   f20-8  — timed-out qualifier children cancelled via _cancel_qualifier_children before state rewrite
   f20-9  — _DeterministicMigrationDefect returns 'block' verdict (not 'defer')
@@ -234,7 +234,7 @@ Findings covered here (20-finding release-qualification salvage bundle, 2026-07-
   f20-12 — release_reconciliation.py references 'claiming' field for orphan containment
   f20-13 — migration_apply_gate.py references DML/data-migration detection
   f20-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview / triggerHotfixPromote
-  f20-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL in QUALIFICATION_ENV; missing_qualification_env() works
+  f20-15 — migration-apply gate defers gracefully when scratch-DB URL absent
   f20-16 — _infra_failure_signature stable across candidate rotations (same error → same sig)
   f20-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES
   f20-18 — acceptance-evidence minting in release_qualifier_sweep.py (deployed-side), not subprocess
@@ -346,25 +346,20 @@ def test_infra_failure_signature_is_deterministic():
 
 
 def test_scratch_db_url_is_qualification_prereq_not_boot_req():
-    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must be in QUALIFICATION_ENV, not REQUIRED_RUNTIME_ENV.
+    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV.
 
     Finding #11: absent scratch URL must degrade qualification (gate defers with an
     actionable verdict) but MUST NOT block the app from booting on Cloud Run.
     """
-    from app.required_runtime_env import QUALIFICATION_ENV, REQUIRED_RUNTIME_ENV
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
 
     _SCRATCH_VAR = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
 
     boot_names = {r.name for r in REQUIRED_RUNTIME_ENV}
-    qual_names = {r.name for r in QUALIFICATION_ENV}
 
     assert _SCRATCH_VAR not in boot_names, (
         f"{_SCRATCH_VAR} must NOT be in REQUIRED_RUNTIME_ENV — "
         "its absence must degrade qualification, never block Cloud Run boot"
-    )
-    assert _SCRATCH_VAR in qual_names, (
-        f"{_SCRATCH_VAR} must be in QUALIFICATION_ENV so diagnostic tooling "
-        "can surface missing vars before repeated opaque deferrals accumulate"
     )
 
 
@@ -4892,26 +4887,20 @@ def test_f20_5_require_encryption_active_raises_for_missing_key_without_opt_in(m
 
 
 def test_f20_6_scratch_db_url_in_qualification_env_not_required_env():
-    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must be in QUALIFICATION_ENV, not REQUIRED_RUNTIME_ENV.
+    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV.
 
     Finding f20-6: the scratch URL was boot-fatal (scope='cloud_run' in REQUIRED_RUNTIME_ENV).
-    The fix moves it to QUALIFICATION_ENV so its absence degrades the gate to a
+    The fix removes it from REQUIRED_RUNTIME_ENV so its absence degrades the gate to a
     'defer' hold instead of crashing the Cloud Run service at startup.
     Full coverage in test_scratch_db_url_is_qualification_prereq_not_boot_req.
     """
-    from app.required_runtime_env import REQUIRED_RUNTIME_ENV, QUALIFICATION_ENV
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
 
     req_names = {r.name for r in REQUIRED_RUNTIME_ENV}
-    qual_names = {r.name for r in QUALIFICATION_ENV}
 
     assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" not in req_names, (
         "MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV — "
         "its absence must degrade the gate, not crash Cloud Run at boot"
-    )
-    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in qual_names, (
-        "MIGRATION_APPLY_SCRATCH_DATABASE_URL must be in QUALIFICATION_ENV — "
-        "absence is reported via missing_qualification_env() as a degraded hold, "
-        "not a RuntimeError at startup"
     )
 
 
@@ -5167,25 +5156,26 @@ def test_f20_14_hotfix_remediation_api_client_present():
 
 
 def test_f20_15_missing_qualification_env_surfaces_scratch_db_url():
-    """missing_qualification_env() must list MIGRATION_APPLY_SCRATCH_DATABASE_URL when absent.
+    """migration-apply gate must defer gracefully when MIGRATION_APPLY_SCRATCH_DATABASE_URL is absent.
 
     Finding f20-15 claim: MIGRATION_APPLY_SCRATCH_DATABASE_URL appeared nowhere in
-    required_runtime_env.py. The fix adds it to QUALIFICATION_ENV so it surfaces as a
-    degraded hold via missing_qualification_env() rather than causing an opaque infinite
-    defer with no operator-visible explanation.
+    required_runtime_env.py. The fix ensures it is not in REQUIRED_RUNTIME_ENV so its
+    absence causes a graceful 'absent' defer rather than a boot-time RuntimeError.
+    The gate's own preflight surfaces the missing var with an actionable message.
     """
-    from app.required_runtime_env import missing_qualification_env, QUALIFICATION_ENV
+    from app.migration_apply_gate import MigrationApplyScratchPreflight, preflight_migration_apply_scratch
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
 
-    qual_names = {r.name for r in QUALIFICATION_ENV}
-    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in qual_names, (
-        "MIGRATION_APPLY_SCRATCH_DATABASE_URL must be in QUALIFICATION_ENV so "
-        "missing_qualification_env() can surface it when the var is absent"
+    req_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" not in req_names, (
+        "MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV — "
+        "its absence must degrade the gate, not crash Cloud Run at boot"
     )
-    # missing_qualification_env() is callable and returns a list.
-    result = missing_qualification_env()
-    assert isinstance(result, list), (
-        "missing_qualification_env() must return a list of EnvRequirement entries"
-    )
+    # The gate's preflight surfaces the missing var with an actionable message.
+    result = preflight_migration_apply_scratch(None)
+    assert isinstance(result, MigrationApplyScratchPreflight)
+    assert result.status == "absent"
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (result.detail or "")
 
 
 # f20-16 — fix(release): stabilize infra-failure signature for gate defers
