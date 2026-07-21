@@ -48,6 +48,26 @@ logger = logging.getLogger(__name__)
 
 DESIGN_DOC_MAX_BYTES = 500_000
 
+
+class DesignDocSizeLimitExceeded(Exception):
+    """Raised by with_design_doc_locked when a write would grow the agent-owned
+    portion of design_doc past DESIGN_DOC_MAX_BYTES and raise_on_size_limit=True.
+
+    Callers that need to surface the failure to the strategist (e.g. HTTP
+    handlers) should pass raise_on_size_limit=True and catch this exception
+    to return a visible error rather than a silent False.
+    """
+
+    def __init__(self, project_id, old_size: int, new_size: int, ceiling: int):
+        self.project_id = project_id
+        self.old_size = old_size
+        self.new_size = new_size
+        self.ceiling = ceiling
+        super().__init__(
+            f"design_doc size limit exceeded for project {project_id}: "
+            f"would grow from {old_size} to {new_size} bytes (ceiling {ceiling})"
+        )
+
 # Keys in project.design_doc that are owned by internal orchestration (code-side
 # writers) and are excluded from the agent-write size cap. These keys have their
 # own internal retention caps and must not consume the agent-write budget.
@@ -567,6 +587,7 @@ async def with_design_doc_locked(
     mutate_fn: Callable[[dict], None],
     *,
     skip_locked: bool = False,
+    raise_on_size_limit: bool = False,
 ) -> bool:
     """Atomic read-modify-write of project.design_doc under a project row lock.
 
@@ -581,10 +602,18 @@ async def with_design_doc_locked(
             by another session — preserves best-effort / non-blocking
             semantics for hot dispatch paths where lock contention should
             degrade gracefully rather than block.
+        raise_on_size_limit: When True, raise DesignDocSizeLimitExceeded
+            instead of silently returning False when the agent-owned portion
+            of design_doc would exceed DESIGN_DOC_MAX_BYTES. Use this on
+            agent-facing paths so the caller can return a visible error
+            rather than letting the strategist believe the write persisted.
+            Defaults to False for backward compatibility.
 
     Returns:
         True if mutate_fn was applied, False if the row was held and
-        skip_locked=True caused an immediate skip.
+        skip_locked=True caused an immediate skip (or raise_on_size_limit is
+        False and the size cap was hit — use raise_on_size_limit=True to
+        distinguish cap failures from lock-skip failures).
 
     This is the canonical helper for all design_doc mutations. Using it
     consistently prevents concurrent writers from clobbering each other's
@@ -618,6 +647,10 @@ async def with_design_doc_locked(
                 new_agent_size,
                 DESIGN_DOC_MAX_BYTES,
             )
+            if raise_on_size_limit:
+                raise DesignDocSizeLimitExceeded(
+                    project_id, old_agent_size, new_agent_size, DESIGN_DOC_MAX_BYTES
+                )
             return False
         project.design_doc = doc
         flag_modified(project, "design_doc")

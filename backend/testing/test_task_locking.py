@@ -20,6 +20,7 @@ from sqlmodel import select
 from app.models import Project, ProjectMember, Task, TaskStatus
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
+    DesignDocSizeLimitExceeded,
     acquire_pr_spawn_lock,
     lock_project_or_429,
     project_lock,
@@ -1628,3 +1629,103 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
     }
     missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
     assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"
+
+
+# ── raise_on_size_limit: opt-in exception path ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_raises_on_size_limit_when_opted_in(db_session):
+    """When raise_on_size_limit=True, a growth-over-ceiling write must raise
+    DesignDocSizeLimitExceeded instead of silently returning False.
+
+    This lets agent-facing callers surface the failure rather than returning
+    an implicit success that leaves the strategist believing the write persisted.
+    """
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
+    project = Project(name="raise-on-limit-test", user_id="user")
+    project.design_doc = {"pad": padding}
+    db_session.add(project)
+    await db_session.commit()
+
+    def _grow(doc: dict) -> None:
+        doc["new_key"] = "y" * 100
+
+    with pytest.raises(DesignDocSizeLimitExceeded) as exc_info:
+        await with_design_doc_locked(
+            db_session, project.id, _grow, raise_on_size_limit=True
+        )
+
+    exc = exc_info.value
+    assert exc.project_id == project.id, "exception must carry the project id"
+    assert exc.new_size > exc.old_size, "new_size must be larger than old_size"
+    assert exc.ceiling == DESIGN_DOC_MAX_BYTES, "ceiling must match DESIGN_DOC_MAX_BYTES"
+
+    # Doc must not have been mutated.
+    await db_session.refresh(project)
+    assert "new_key" not in project.design_doc, (
+        "doc must be unchanged after raise_on_size_limit exception"
+    )
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_silent_on_size_limit_by_default(db_session):
+    """Default raise_on_size_limit=False preserves backward-compatible behavior:
+    a growth-over-ceiling write returns False without raising.
+
+    Existing callers that check the boolean return value must continue to work.
+    """
+    padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
+    project = Project(name="silent-limit-test", user_id="user")
+    project.design_doc = {"pad": padding}
+    db_session.add(project)
+    await db_session.commit()
+
+    def _grow(doc: dict) -> None:
+        doc["new_key"] = "y" * 100
+
+    # Default: no raise_on_size_limit kwarg — must return False, not raise.
+    result = await with_design_doc_locked(db_session, project.id, _grow)
+    assert result is False, (
+        "growth over ceiling with default raise_on_size_limit=False must return False"
+    )
+
+    # Explicit False — same expectation.
+    result2 = await with_design_doc_locked(
+        db_session, project.id, _grow, raise_on_size_limit=False
+    )
+    assert result2 is False, (
+        "growth over ceiling with raise_on_size_limit=False must return False"
+    )
+
+    await db_session.refresh(project)
+    assert "new_key" not in project.design_doc, "write must not be persisted"
+
+
+@pytest.mark.asyncio
+async def test_raise_on_size_limit_does_not_fire_for_shrinking_write(db_session):
+    """raise_on_size_limit=True must NOT raise when the write shrinks the
+    agent-owned portion — the shrink path is the recovery path and must always
+    succeed even when the doc is already over the ceiling.
+    """
+    bloated = "x" * (DESIGN_DOC_MAX_BYTES + 100)
+    project = Project(name="shrink-no-raise", user_id="user")
+    project.design_doc = {"pad": bloated}
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+
+    _flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+
+    def _shrink(doc: dict) -> None:
+        doc["pad"] = "small"
+
+    # Must not raise — shrinking from over-ceiling is the self-healing path.
+    result = await with_design_doc_locked(
+        db_session, project.id, _shrink, raise_on_size_limit=True
+    )
+    await db_session.commit()
+    assert result is True, "shrinking write must succeed even with raise_on_size_limit=True"
+
+    await db_session.refresh(project)
+    assert project.design_doc.get("pad") == "small", "shrink must be persisted"

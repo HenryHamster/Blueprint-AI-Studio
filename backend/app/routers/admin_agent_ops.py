@@ -119,6 +119,7 @@ from app.task_capabilities import (
 from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
+    DesignDocSizeLimitExceeded,
     _RESERVED_DESIGN_DOC_KEYS,
     lock_project_or_429 as _lock_project_or_429,
     task_lock,
@@ -367,7 +368,16 @@ async def backfill_file_to_system_index(session: AsyncSession) -> int:
             doc["_file_to_system"] = rebuilt
             _was_updated = True
 
-        await _with_design_doc_locked(session, project_id, _mutate)
+        try:
+            await _with_design_doc_locked(
+                session, project_id, _mutate, raise_on_size_limit=True
+            )
+        except DesignDocSizeLimitExceeded as exc:
+            logger.warning(
+                "[backfill_file_to_system_index] skipped project %s: %s",
+                project_id,
+                exc,
+            )
         if _was_updated:
             updated_count += 1
     return updated_count
