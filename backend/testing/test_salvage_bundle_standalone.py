@@ -229,6 +229,12 @@ Findings covered here (4-finding operator-walkthrough / runner-config / project-
        and is disabled while the PATCH is outstanding; the auto-uniquified slug assigned by
        the backend is surfaced to the operator as a created-slug notice after tool creation
 
+Findings covered here (note-shim / runner-config / project-tools / walkthrough salvage bundle, 2026-07-21):
+  n1 — note shim uses _json_str (not sed) for JSON encoding: provisionAmbientHelpers in
+       runners.ts imports jsonStrShellFn and declares _json_str in the ./note script body;
+       CONTENT, PAGE, and SEVERITY are encoded via $(_json_str ...) so newlines, tabs,
+       backslashes, and control characters are transmitted correctly
+
 Findings covered here (4-finding compute/research salvage bundle, 2026-07-19):
   r1 — clone-form preservation: buildCloneForm reads input_artifact_job_id / setup_step /
        no_progress_timeout_seconds from launch_params; backend launch_params builder includes
@@ -7635,4 +7641,95 @@ def test_8d_release_qualification_findings_all_pinned():
     assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" not in boot_names, (
         "MIGRATION_APPLY_SCRATCH_DATABASE_URL must not be a boot requirement — "
         "its absence must degrade qualification, not block Cloud Run boot"
+    )
+
+
+# =========================================================================== #
+# note-shim / runner-config / project-tools / walkthrough salvage bundle      #
+# =========================================================================== #
+
+
+# --------------------------------------------------------------------------- #
+# Finding n1 — ./note shim uses _json_str (not sed) for JSON encoding         #
+# --------------------------------------------------------------------------- #
+
+
+def _runners_ts_source() -> str:
+    """Return the source of agent/src/providers/runners.ts."""
+    from pathlib import Path
+
+    for candidate in (
+        Path(__file__).resolve().parents[2] / "agent" / "src" / "providers" / "runners.ts",
+        Path("/repo/agent/src/providers/runners.ts"),
+    ):
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8")
+    raise FileNotFoundError("runners.ts not found in expected locations")
+
+
+def test_n1_note_shim_imports_json_str_shell_fn():
+    """runners.ts must import jsonStrShellFn from token-file so the ./note
+    script can use _json_str for safe JSON encoding.
+
+    Finding n1: provisionAmbientHelpers used sed for JSON escaping, which
+    drops newlines and control characters. The fix imports jsonStrShellFn
+    alongside agentTokenShellFn and injects _json_str into the note script.
+    """
+    import pytest
+
+    try:
+        source = _runners_ts_source()
+    except FileNotFoundError:
+        pytest.skip("runners.ts not found — agent not present in this shard")
+
+    assert "jsonStrShellFn" in source, (
+        "runners.ts must import jsonStrShellFn from '../token-file.js' so "
+        "provisionAmbientHelpers can inject _json_str into the ./note script"
+    )
+    assert "agentTokenShellFn" in source and "jsonStrShellFn" in source, (
+        "runners.ts must import both agentTokenShellFn and jsonStrShellFn "
+        "from '../token-file.js'"
+    )
+
+
+def test_n1_note_shim_uses_json_str_not_sed():
+    """The ./note script body must encode CONTENT via _json_str, not sed.
+
+    Finding n1: the original note script used
+      sed 's/\\\\/\\\\\\\\/g; s/\"/\\\\\"/'
+    which loses newlines and control characters. The fix uses _json_str
+    (backed by python3 json.dumps) for CONTENT, PAGE, and SEVERITY.
+    """
+    import pytest
+    import re
+
+    try:
+        source = _runners_ts_source()
+    except FileNotFoundError:
+        pytest.skip("runners.ts not found — agent not present in this shard")
+
+    # The note script section is between provisionAmbientHelpers and the
+    # writePlaybookHelper call. Locate the note script template.
+    note_start = source.find("provisionAmbientHelpers")
+    note_end = source.find("writePlaybookHelper", note_start)
+    assert note_start != -1, "provisionAmbientHelpers not found in runners.ts"
+    note_section = source[note_start:note_end] if note_end != -1 else source[note_start:]
+
+    # _json_str must be injected into the note script (via jsonStrShellFn()).
+    assert "_json_str" in note_section, (
+        "The ./note script in provisionAmbientHelpers must declare _json_str "
+        "(injected via jsonStrShellFn()) so content encoding does not lose newlines"
+    )
+
+    # CONTENT must be encoded via _json_str, not raw string interpolation.
+    assert '_json_str "$CONTENT"' in note_section or "_json_str \\\"$CONTENT\\\"" in note_section, (
+        "The ./note script must encode CONTENT via $(_json_str \"$CONTENT\") "
+        "so newlines and control characters are not silently dropped"
+    )
+
+    # The broken sed escaping must not appear in the note script.
+    sed_pattern = re.compile(r'sed\s+[\'"]s/\\\\\\\\/')
+    assert not sed_pattern.search(note_section), (
+        "The ./note script must NOT use sed for JSON escaping — sed loses newlines "
+        "and control characters; use _json_str (python3 json.dumps) instead"
     )
