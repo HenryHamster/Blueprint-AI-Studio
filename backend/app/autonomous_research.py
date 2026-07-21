@@ -1401,6 +1401,9 @@ async def _spawn_research_task_inner(
         max_parallel = project_parallelism_cap(
             project, "max_parallel_research", "max_parallel_research_per_project", 6
         )
+        directed_cooldown_minutes = _runtime_config.get(
+            "directed_research_cooldown_minutes", 120
+        )
         for d in sorted_eligible:
             did = d.get("id")
             if is_pause_mode(d):
@@ -1417,6 +1420,25 @@ async def _spawn_research_task_inner(
                 continue
             if d.get("recommended_mode") == "pause":
                 continue  # strategic agent flagged this system as externally blocked
+            if directed_cooldown_minutes > 0:
+                last_researched = d.get("last_researched_at")
+                if last_researched:
+                    try:
+                        last_dt = datetime.fromisoformat(last_researched).replace(
+                            tzinfo=None
+                        )
+                        age_minutes = (now - last_dt).total_seconds() / 60.0
+                        if age_minutes < directed_cooldown_minutes:
+                            logger.info(
+                                "[AUTONOMOUS] skipped direction %s: last research "
+                                "%.1f min ago (cooldown %d min)",
+                                did,
+                                age_minutes,
+                                directed_cooldown_minutes,
+                            )
+                            continue
+                    except (ValueError, TypeError):
+                        pass
             chosen_directions.append(d)
             # Block this direction and its conflicts
             blocked_ids.add(did)

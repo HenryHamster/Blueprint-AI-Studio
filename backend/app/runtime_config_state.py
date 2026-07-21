@@ -696,6 +696,7 @@ runtime_config: Dict = {
     },
     "autonomous_direction_cooldown_minutes": 240,
     "productive_direction_cooldown_minutes": 45,
+    "directed_research_cooldown_minutes": 120,
     "direction_auto_recovery_hours": 48,
     # Non-merge churn guardrail (Rule 5 in _check_direction_health).
     # window_cycles: how many recent research cycles to evaluate (rolling window).
