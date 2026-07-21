@@ -288,6 +288,70 @@ describe('DEPS_TASK_FOCUS — content invariants', () => {
   });
 });
 
+describe('ANTI_HEDGE_FOCUS — anti-hedging self-review check', () => {
+  it('is a non-empty exported constant naming observe/off/fail-open as unjustified defaults', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    expect(ANTI_HEDGE_FOCUS).not.toBe('');
+    expect(ANTI_HEDGE_FOCUS).toContain('observe');
+    expect(ANTI_HEDGE_FOCUS).toContain('fail-open');
+    expect(ANTI_HEDGE_FOCUS).toContain('off');
+  });
+
+  it('instructs recording unjustified hedge under correctness with passed: false', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('correctness');
+    expect(ANTI_HEDGE_FOCUS).toContain('passed: false');
+    expect(ANTI_HEDGE_FOCUS).toContain('unjustified hedge');
+  });
+
+  it('requires a concrete documented reason to justify an off/observe/fail-open default', async () => {
+    const { ANTI_HEDGE_FOCUS } = await import('./task-type-focus.js');
+    expect(ANTI_HEDGE_FOCUS).toContain('documented');
+  });
+
+  it('appears verbatim in CREATE, FIX, and REFACTOR focus blocks', async () => {
+    const { ANTI_HEDGE_FOCUS, CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(CREATE_TASK_FOCUS).toContain(ANTI_HEDGE_FOCUS);
+    expect(FIX_TASK_FOCUS).toContain(ANTI_HEDGE_FOCUS);
+    expect(REFACTOR_TASK_FOCUS).toContain(ANTI_HEDGE_FOCUS);
+  });
+
+  it('does not appear in QA, DOCS, DEPS, or MIGRATE focus blocks', async () => {
+    const { ANTI_HEDGE_FOCUS, QA_TASK_FOCUS, DOCS_TASK_FOCUS, DEPS_TASK_FOCUS, MIGRATE_TASK_FOCUS } = await import('./task-type-focus.js');
+    expect(QA_TASK_FOCUS).not.toContain(ANTI_HEDGE_FOCUS);
+    expect(DOCS_TASK_FOCUS).not.toContain(ANTI_HEDGE_FOCUS);
+    expect(DEPS_TASK_FOCUS).not.toContain(ANTI_HEDGE_FOCUS);
+    expect(MIGRATE_TASK_FOCUS).not.toContain(ANTI_HEDGE_FOCUS);
+  });
+});
+
+describe('anti-hedge catch — simulate detecting a reintroduced hedge', () => {
+  it('a self-review following CREATE_TASK_FOCUS would flag a newly-introduced observe default', async () => {
+    // Simulate: an agent re-introduces `const mode = 'observe'` as a new gate default.
+    // CREATE_TASK_FOCUS must name 'observe' as a prohibited pattern and require a
+    // correctness failure, so following the checklist catches the reintroduced hedge.
+    const { CREATE_TASK_FOCUS } = await import('./task-type-focus.js');
+    const reintroducedHedge = "const mode = 'observe'; // default — review but do not act";
+    // The focus block names the exact pattern the reintroduced hedge uses
+    expect(CREATE_TASK_FOCUS).toContain('observe');
+    // Requires recording a correctness failure, not just noting it
+    expect(CREATE_TASK_FOCUS).toContain('passed: false');
+    // The issue message template matches the hedge in the sample diff
+    expect(CREATE_TASK_FOCUS).toContain('unjustified hedge');
+    // Sanity: the sample hedge is a genuine observe default
+    expect(reintroducedHedge).toMatch(/observe/);
+  });
+
+  it('REVIEW_ANTI_HEDGE_CRITERION names observe/fail-open so reviewers flag the same patterns', async () => {
+    // Verifies reviewer checklist and agent self-review focus agree on which patterns to catch.
+    const { REVIEW_ANTI_HEDGE_CRITERION } = await import('./review-prompt.js');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('observe');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('fail-open');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('disabled');
+    expect(REVIEW_ANTI_HEDGE_CRITERION).toContain('correctness');
+  });
+});
+
 describe('SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC — shared constant usage', () => {
   it('is used consistently in create, fix, refactor, and docs task focuses', async () => {
     const { CREATE_TASK_FOCUS, FIX_TASK_FOCUS, REFACTOR_TASK_FOCUS, DOCS_TASK_FOCUS } = await import('./task-type-focus.js');

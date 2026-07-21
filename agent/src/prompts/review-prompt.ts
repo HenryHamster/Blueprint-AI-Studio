@@ -157,6 +157,14 @@ ${checks.join('\n')}
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
 }
 
+// Reviewer criterion for catching unjustified default-off/observe/fail-open hedges.
+// Exported so the self-review test file can assert the reviewer checks the same patterns
+// the agent self-review focus blocks name.
+export const REVIEW_ANTI_HEDGE_CRITERION =
+  '- Does the diff introduce a new flag, gate, or mode that defaults to `observe`, ' +
+  'disabled, or `fail-open` without documented rationale? ' +
+  'New behavior must default ON/committed — flag unjustified hedges as a correctness issue.';
+
 // Per-lens checklist text used by buildLensScopedChecklistSection.
 // Each panel_review lens agent receives only its own section so it does not
 // re-read the full four-section list it was explicitly told to ignore.
@@ -165,7 +173,8 @@ const LENS_CHECKLIST_ITEMS: Record<string, string> = {
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
-- Do any database queries have N+1 problems or missing indexes?`,
+- Do any database queries have N+1 problems or missing indexes?
+${REVIEW_ANTI_HEDGE_CRITERION}`,
   security: `**Security:**
 - Are user inputs validated and sanitized before use?
 - Are there SQL injection, XSS, path traversal, or command injection risks?

@@ -8,6 +8,17 @@
 const SCOPE_DRIFT_INCIDENTAL_ALLOWLIST_DESC =
   'lockfiles (`package-lock.json`, `poetry.lock`, `Cargo.lock`, `go.sum`), generated outputs, `.gitignore`, sibling test files (`.test.*`/`.spec.*`)';
 
+// Shared anti-hedge check used in create/fix/refactor task focuses.
+// New features/gates/flags must default ON/committed; unjustified observe/off/fail-open
+// defaults are a correctness finding, not just style.
+export const ANTI_HEDGE_FOCUS =
+  '**Anti-hedge check** — new features, gates, and flags must default ON/committed, ' +
+  'not `observe`, `off`, or `fail-open`, unless a concrete reason is documented ' +
+  '(measured lift, genuine per-project variance, emergency kill-switch). ' +
+  'If you introduced any new flag, gate, or mode whose default is `observe`, disabled, ' +
+  'or fail-open without that justification, record under `correctness` with `passed: false` ' +
+  'and the issue: "unjustified hedge: <flag/gate> defaults to <observe|off|fail-open>".';
+
 // Shared cross-file consistency check instruction used in create and fix task focuses.
 // Extracted to a single source of truth so examples and recording format stay consistent
 // without drift between the two copies.
@@ -71,6 +82,7 @@ is accidental scope-drift or subtle behavioral changes that bypass tests.
    Verify each call site is updated and behavior-preserving.
 3. **Test delta** — a pure refactor should need no new tests; if you added tests,
    explain why in \`blind_spots\`.
+4. ${ANTI_HEDGE_FOCUS}
 `;
 
 export const QA_TASK_FOCUS = `
@@ -107,6 +119,7 @@ the declared scope. Apply these additional checks before \`./done\`:
 3. ${CROSS_FILE_CONSISTENCY_FOCUS}
 4. **Caller compatibility** — grep for callers of any function or export you
    added or modified; confirm their call sites still compile and behave correctly.
+5. ${ANTI_HEDGE_FOCUS}
 `;
 
 export const FIX_TASK_FOCUS = `
@@ -179,6 +192,7 @@ failing, and scope creep into unrelated files. Apply these additional checks:
    delivery — push it and let CI verify. \`./blocked\` is only for cases where
    no code edit can fix the problem (e.g. a missing upstream dependency or a
    repo-wide gate failure on files you did not touch).
+7. ${ANTI_HEDGE_FOCUS}
 `;
 
 export const DOCS_TASK_FOCUS = `
