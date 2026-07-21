@@ -20,6 +20,7 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Column,
+    JSON,
     String,
     Integer,
     Float,
@@ -5605,6 +5606,50 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
         Index(
             "ix_evergreenfilldecisionlog_project_ts",
             "project_id",
+            "ts",
+        ),
+    )
+
+
+class AuditLaneDecisionLog(SQLModel, table=True):
+    """Durable per-cycle audit-lane decision log for structural_health_audit and
+    metrics_integrity_sweep observe-mode evidence.
+
+    One row per audit cycle (structural_health_audit) or sweep tick
+    (metrics_integrity_sweep), written regardless of mode (observe/enforce) and
+    regardless of whether any findings tripped. This makes the observe-window
+    evidence durable across process restarts and deploys, so the 'observe phase
+    validated it' argument is backed by a queryable cross-deploy record rather
+    than an in-memory ring that resets on every restart.
+
+    Lane discriminator: 'structural_health' | 'metrics_integrity'.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    ts: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False, index=True),
+    )
+
+    lane: str = Field(sa_column=Column(String(32), nullable=False))
+    mode: str = Field(sa_column=Column(String(16), nullable=False))
+
+    # True when at least one check/axis tripped (would-have-fired signal).
+    tripped: bool = Field(sa_column=Column(Boolean, nullable=False))
+
+    # Count of checks/findings enrolled in this cycle (0 in observe mode).
+    enrolled: int = Field(default=0, sa_column=Column(Integer, nullable=False))
+
+    # Bounded summary payload (check counts, flag names, etc.) for diagnostics.
+    payload: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSON, nullable=False),
+    )
+
+    __table_args__ = (
+        Index(
+            "ix_auditlanedecisionlog_lane_ts",
+            "lane",
             "ts",
         ),
     )

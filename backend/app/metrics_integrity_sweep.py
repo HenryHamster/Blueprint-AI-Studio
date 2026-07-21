@@ -367,6 +367,98 @@ def _reset_observability_for_tests() -> None:
     _last_sweep_scan = None
 
 
+# --- Durable DB writer + reader (survive process restarts) -------------------
+
+_SWEEP_LANE = "metrics_integrity"
+
+
+async def log_sweep_tick_to_db(
+    session,
+    *,
+    ts: datetime,
+    mode: str,
+    tripped: bool,
+    enrolled: int,
+    payload: Dict[str, Any],
+) -> None:
+    """Write one durable row per sweep tick into AuditLaneDecisionLog.
+
+    Best-effort: any DB error is logged and swallowed so it can never crash the
+    reaper cycle or cause a rollback that would undo legitimately enrolled findings.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+
+        row = AuditLaneDecisionLog(
+            ts=ts,
+            lane=_SWEEP_LANE,
+            mode=mode,
+            tripped=tripped,
+            enrolled=enrolled,
+            payload=payload,
+        )
+        session.add(row)
+        await session.flush()
+    except Exception:
+        logger.warning(
+            "[METRICS_INTEGRITY] log_sweep_tick_to_db failed — in-memory signal preserved",
+            exc_info=True,
+        )
+
+
+async def get_metrics_integrity_observability_from_db(
+    session, *, window_hours: int = 24
+) -> Dict[str, Any]:
+    """Return aggregate observe-window stats from the durable AuditLaneDecisionLog.
+
+    Queries rows within the trailing ``window_hours`` for the metrics_integrity
+    lane and returns: total ticks, tripped count (would-have-fired), and enrolled
+    count.  Falls back to an empty result rather than raising.
+    """
+    try:
+        from app.models import AuditLaneDecisionLog
+        from sqlmodel import select as _select
+
+        cutoff = _utcnow() - timedelta(hours=window_hours)
+        rows = (
+            await session.execute(
+                _select(AuditLaneDecisionLog)
+                .where(
+                    AuditLaneDecisionLog.lane == _SWEEP_LANE,
+                    AuditLaneDecisionLog.ts >= cutoff,
+                )
+                .order_by(AuditLaneDecisionLog.ts.desc())
+                .limit(500)
+            )
+        ).scalars().all()
+
+        total = len(rows)
+        tripped_count = sum(1 for r in rows if r.tripped)
+        enrolled_total = sum(r.enrolled for r in rows)
+        last_ts = rows[0].ts.isoformat() if rows else None
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "ticks": total,
+            "tripped_count": tripped_count,
+            "enrolled_total": enrolled_total,
+            "last_tick_at": last_ts,
+        }
+    except Exception:
+        logger.warning(
+            "[METRICS_INTEGRITY] get_metrics_integrity_observability_from_db failed",
+            exc_info=True,
+        )
+        return {
+            "source": "db",
+            "window_hours": window_hours,
+            "ticks": 0,
+            "tripped_count": 0,
+            "enrolled_total": 0,
+            "last_tick_at": None,
+        }
+
+
 # --- Config resolution -------------------------------------------------------
 
 
@@ -730,6 +822,23 @@ async def run_metrics_integrity_sweep(
                 for f in tick["flags"]
             ),
         )
+
+    tripped = tick["flagged"] > 0
+    payload = {
+        "results": tick["results"],
+        "flagged": tick["flagged"],
+        "errors": tick["errors"],
+        "enrolled": enrolled,
+    }
+    await log_sweep_tick_to_db(
+        session,
+        ts=_now,
+        mode=cfg["mode"],
+        tripped=tripped,
+        enrolled=enrolled,
+        payload=payload,
+    )
+
     return tick
 
 

@@ -7838,3 +7838,125 @@ async def test_operator_inbox_leak_signal_counts_null_audience_noise(db, _clean_
     assert "forward leak" in r.detail or "not genuinely needs-action" in r.detail, (
         f"expected forward-leak mention in detail: {r.detail}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Durable DB writer + reader (AuditLaneDecisionLog).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_log_sweep_tick_to_db_writes_row(db):
+    """log_sweep_tick_to_db writes one AuditLaneDecisionLog row per call."""
+    from app.models import AuditLaneDecisionLog
+    from app.metrics_integrity_sweep import log_sweep_tick_to_db
+    from app.time_utils import _utcnow
+    from sqlmodel import select as _select
+
+    now = _utcnow()
+    await log_sweep_tick_to_db(
+        db,
+        ts=now,
+        mode="observe",
+        tripped=True,
+        enrolled=0,
+        payload={"flagged": 2, "results": 5},
+    )
+    await db.flush()
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].tripped is True
+    assert rows[0].enrolled == 0
+    assert rows[0].payload["flagged"] == 2
+
+
+@pytest.mark.asyncio
+async def test_get_metrics_integrity_observability_from_db_aggregates(db):
+    """get_metrics_integrity_observability_from_db counts tripped vs total ticks."""
+    from app.metrics_integrity_sweep import (
+        get_metrics_integrity_observability_from_db,
+        log_sweep_tick_to_db,
+    )
+    from app.time_utils import _utcnow
+
+    now = _utcnow()
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="observe", tripped=True, enrolled=0, payload={}
+    )
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="observe", tripped=False, enrolled=0, payload={}
+    )
+    await log_sweep_tick_to_db(
+        db, ts=now, mode="enforce", tripped=True, enrolled=1, payload={}
+    )
+    await db.flush()
+
+    result = await get_metrics_integrity_observability_from_db(db, window_hours=24)
+    assert result["ticks"] == 3
+    assert result["tripped_count"] == 2
+    assert result["enrolled_total"] == 1
+    assert result["source"] == "db"
+
+
+@pytest.mark.asyncio
+async def test_run_metrics_integrity_sweep_writes_db_row(db):
+    """run_metrics_integrity_sweep writes a durable AuditLaneDecisionLog row."""
+    from app.models import AuditLaneDecisionLog
+    from sqlmodel import select as _select
+
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    await run_metrics_integrity_sweep(db)
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    assert rows[0].enrolled == 0
+
+
+@pytest.mark.asyncio
+async def test_observe_mode_tick_is_logged_with_correct_tripped_signal(db):
+    """In observe mode the DB row's tripped field matches whether any flags fired."""
+    from app.models import AuditLaneDecisionLog
+    from sqlmodel import select as _select
+
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    tick = await run_metrics_integrity_sweep(db)
+
+    rows = list(
+        (
+            await db.execute(
+                _select(AuditLaneDecisionLog).where(
+                    AuditLaneDecisionLog.lane == "metrics_integrity"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].mode == "observe"
+    # tripped must match whether the in-memory tick actually flagged anything.
+    expected_tripped = tick["flagged"] > 0
+    assert rows[0].tripped is expected_tripped
