@@ -7707,15 +7707,15 @@ def test_registry_contains_operator_inbox_check():
 
 @pytest.mark.asyncio
 async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db):
-    """Verify the check exercises both drift directions and the alert channel.
+    """Verify the check exercises forward drift and the alert channel.
 
     Forward drift: operator-fyi NOTEs are legitimate informational notices and
     are NOT counted as leaked chatter. Only non-fyi messages that fail
     derive_needs_action() are forward leaks.
 
-    Reverse drift: a linked BLOCKER (needs-action=True per derive_needs_action,
-    status='linked') is now included in the sample and flagged as badge-invisible
-    — the badge SQL reads status='open' only and would miss it.
+    Reverse drift: the badge SQL now uses status IN ('open', 'linked') for
+    needs-action queries, so a linked BLOCKER is correctly counted in the badge.
+    badge_invisible is always 0 in the check; delta comes only from the INFO alert.
 
     Alert coverage: an undismissed INFO-severity, operator-visible Alert is
     flagged as non-actionable alert noise, demonstrating the check covers the
@@ -7723,8 +7723,8 @@ async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db)
     """
     project = await _project(db)
 
-    # Linked BLOCKER: needs-action=True (derive_needs_action), but status='linked'
-    # → badge SQL (status='open') misses it → reverse drift.
+    # Linked BLOCKER: needs-action=True (derive_needs_action), status='linked'.
+    # The badge SQL now includes linked status, so this is NOT badge-invisible.
     _inbox_message(
         db, project,
         message_type=MessageType.BLOCKER,
@@ -7761,19 +7761,15 @@ async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db)
     assert len(project_results) == 1
     r = project_results[0]
 
-    # FLAGGED because of reverse drift (1 badge-invisible linked BLOCKER)
-    # and alert channel noise (1 INFO alert).
+    # FLAGGED because of alert channel noise (1 INFO alert).
     # The operator-fyi NOTE is NOT counted as a forward leak.
+    # badge_invisible is 0 because the badge SQL now includes linked status.
     assert r.status == CheckStatus.FLAGGED, (
         f"expected FLAGGED, got {r.status}: {r.detail}"
     )
-    # delta = 0 forward_leaked + 1 badge_invisible + 1 info_alert = 2
-    assert r.delta == 2, (
-        f"expected delta=2 (1 badge-invisible + 1 INFO alert), got {r.delta}: {r.detail}"
-    )
-    # Reverse drift detail mentions badge-invisible / linked status
-    assert "linked" in r.detail or "badge" in r.detail or "invisible" in r.detail, (
-        f"expected reverse-drift mention in detail: {r.detail}"
+    # delta = 0 forward_leaked + 0 badge_invisible + 1 info_alert = 1
+    assert r.delta == 1, (
+        f"expected delta=1 (only 1 INFO alert), got {r.delta}: {r.detail}"
     )
     # Alert channel detail mentions INFO alerts
     assert "INFO" in r.detail or "alert" in r.detail.lower(), (

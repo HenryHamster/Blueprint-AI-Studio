@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
 from sqlmodel import select
 
-from app.message_convergence import OPEN_STATUS, derive_needs_action
+from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
 from app.acceptance_criteria import (
     UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
     get_criteria_for_version,
@@ -1846,23 +1846,45 @@ async def get_operator_message_counts(
                 }
 
     _hs_types = list(_HIGH_SIGNAL_MESSAGE_TYPES)
-    _operator_visible_message_filters = [
+    _base_message_filters = [
         ProjectMessage.project_id == project_id,
-        ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
         operator_visible_audience_filter(ProjectMessage.context),
     ]
-    count_rows = (
+    # Needs-action types (BLOCKER, QUESTION) include LINKED: a linked BLOCKER/QUESTION
+    # remains actionable until resolved, so the badge must count it.
+    _actionable_status = ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS])
+    # Watch/informational types keep OPEN only; a linked BUG_REPORT or FEEDBACK
+    # has been acknowledged and is no longer surfaced to the operator.
+    _watch_status = ProjectMessage.status == OPEN_STATUS
+
+    actionable_types = [MessageType.BLOCKER, MessageType.QUESTION]
+    watch_types = [MessageType.BUG_REPORT, MessageType.FEEDBACK]
+    actionable_count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())
             .where(
-                *_operator_visible_message_filters,
-                ProjectMessage.message_type.in_(_hs_types),
+                *_base_message_filters,
+                _actionable_status,
+                ProjectMessage.message_type.in_(actionable_types),
             )
             .group_by(ProjectMessage.message_type)
         )
     ).all()
-    counts = {mt: int(cnt or 0) for mt, cnt in count_rows}
+    watch_count_rows = (
+        await session.execute(
+            select(ProjectMessage.message_type, func.count())
+            .where(
+                *_base_message_filters,
+                _watch_status,
+                ProjectMessage.message_type.in_(watch_types),
+            )
+            .group_by(ProjectMessage.message_type)
+        )
+    ).all()
+    counts = {mt: int(cnt or 0) for mt, cnt in [*actionable_count_rows, *watch_count_rows]}
+    # Retained for note_count and unread queries that use OPEN only.
+    _operator_visible_message_filters = [*_base_message_filters, _watch_status]
 
     # Count high-signal NOTE escalations, excluding muted event types.
     # NOTE queries use operator_visible_nonactionable_message_filter (strict, no NULL
@@ -1925,7 +1947,7 @@ async def get_operator_message_counts(
             ).scalar()
             or 0
         )
-    # needs_operator here is the message-based component: open questions + blockers.
+    # needs_operator here is the message-based component: open/linked questions + blockers.
     # The audience-routed action rows are included too, so the lightweight badge
     # endpoint and the full attention projection share the same authority.
     action_message_count = int(
@@ -1934,7 +1956,8 @@ async def get_operator_message_counts(
                 select(func.count())
                 .select_from(ProjectMessage)
                 .where(
-                    *_operator_visible_message_filters,
+                    *_base_message_filters,
+                    _actionable_status,
                     ProjectMessage.context["audience"].as_string()
                     == OPERATOR_ACTION_NEEDED,
                     ProjectMessage.message_type.notin_(
@@ -2002,24 +2025,31 @@ async def build_operator_attention(
         )
     ).scalar_one_or_none()
 
-    _common_message_filters = [
+    _base_filters = [
         ProjectMessage.project_id == project.id,
-        ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
         operator_visible_audience_filter(ProjectMessage.context),
     ]
+    # Needs-action types (BLOCKER, QUESTION, operator-action-needed) include LINKED:
+    # a linked BLOCKER/QUESTION remains actionable until resolved.
+    _attn_actionable_status = ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS])
+    # Watch/informational types (BUG_REPORT, FEEDBACK) and unread keep OPEN only.
+    _attn_watch_status = ProjectMessage.status == OPEN_STATUS
+    _common_actionable_filters = [*_base_filters, _attn_actionable_status]
+    _common_watch_filters = [*_base_filters, _attn_watch_status]
+
     # UNION ALL with per-type LIMITs: one round-trip while preserving independent
     # per-priority caps so a burst of BUG_REPORT/FEEDBACK can't crowd out BLOCKERs.
     _blocker_q = (
         select(ProjectMessage)
-        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.BLOCKER)
+        .where(*_common_actionable_filters, ProjectMessage.message_type == MessageType.BLOCKER)
         .order_by(ProjectMessage.created_at.desc())
         .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
     )
     _question_q = (
         select(ProjectMessage)
         .where(
-            *_common_message_filters,
+            *_common_actionable_filters,
             or_(
                 ProjectMessage.message_type == MessageType.QUESTION,
                 and_(
@@ -2037,7 +2067,7 @@ async def build_operator_attention(
     _watch_q = (
         select(ProjectMessage)
         .where(
-            *_common_message_filters,
+            *_common_watch_filters,
             ProjectMessage.message_type.in_([MessageType.BUG_REPORT, MessageType.FEEDBACK]),
         )
         .order_by(ProjectMessage.created_at.desc())
@@ -2054,17 +2084,30 @@ async def build_operator_attention(
         .scalars()
         .all()
     )
-    message_count_rows = (
+    # Count BLOCKER+QUESTION with LINKED included, BUG_REPORT+FEEDBACK OPEN-only.
+    actionable_count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())
             .where(
-                *_common_message_filters,
-                ProjectMessage.message_type.in_(list(_HIGH_SIGNAL_MESSAGE_TYPES)),
+                *_common_actionable_filters,
+                ProjectMessage.message_type.in_([MessageType.BLOCKER, MessageType.QUESTION]),
             )
             .group_by(ProjectMessage.message_type)
         )
     ).all()
-    message_counts = {message_type: int(count or 0) for message_type, count in message_count_rows}
+    watch_count_rows = (
+        await session.execute(
+            select(ProjectMessage.message_type, func.count())
+            .where(
+                *_common_watch_filters,
+                ProjectMessage.message_type.in_([MessageType.BUG_REPORT, MessageType.FEEDBACK]),
+            )
+            .group_by(ProjectMessage.message_type)
+        )
+    ).all()
+    message_counts = {
+        mt: int(cnt or 0) for mt, cnt in [*actionable_count_rows, *watch_count_rows]
+    }
     open_question_count = message_counts.get(MessageType.QUESTION, 0)
     open_blocker_count = message_counts.get(MessageType.BLOCKER, 0)
     bug_report_count = message_counts.get(MessageType.BUG_REPORT, 0)
@@ -2075,7 +2118,7 @@ async def build_operator_attention(
                 select(func.count())
                 .select_from(ProjectMessage)
                 .where(
-                    *_common_message_filters,
+                    *_common_actionable_filters,
                     ProjectMessage.context["audience"].as_string()
                     == OPERATOR_ACTION_NEEDED,
                     ProjectMessage.message_type.notin_(
@@ -2093,7 +2136,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(func.count()).select_from(ProjectMessage).where(
-                    *_common_message_filters,
+                    *_common_watch_filters,
                     ProjectMessage.message_type.in_(list(_HIGH_SIGNAL_MESSAGE_TYPES)),
                     *unread_count_filters,
                 )

@@ -16,9 +16,10 @@ Registered as a standing reaper step (``sweep_operator_inbox_liveness`` in
 * ``forward_leaked`` — open/linked non-fyi operator-visible messages that fail
   ``derive_needs_action()``.  These are NULL-audience legacy rows or mis-routed
   messages inflating the operator inbox with non-actionable chatter.
-* ``badge_invisible`` — messages with ``status='linked'`` that pass
-  ``derive_needs_action()`` but are invisible to the badge SQL that reads only
-  ``status='open'``.  Genuinely actionable items silently missed by the badge.
+* ``badge_invisible`` — always 0.  The badge SQL in ``operator_attention.py``
+  now uses ``status IN ('open', 'linked')`` for needs-action queries, so linked
+  BLOCKER/QUESTION messages are correctly counted.  Field retained for API
+  stability.
 * ``info_alert_noise`` — undismissed INFO-severity, operator-visible Alerts in
   the alert channel.  Bookkeeping notices inflating the operator alert badge.
 
@@ -155,10 +156,6 @@ async def run_operator_inbox_liveness_check(
         def _audience_str(m: ProjectMessage) -> str | None:
             return (m.context or {}).get("audience")
 
-        def _status_str(m: ProjectMessage) -> str:
-            s = m.status
-            return s.value if hasattr(s, "value") else str(s)
-
         # Forward: non-fyi operator-visible messages that fail derive_needs_action.
         # operator-fyi is a legitimate informational audience — not a leak.
         forward_leaked_msgs = [
@@ -166,14 +163,11 @@ async def run_operator_inbox_liveness_check(
             if not derive_needs_action(m) and _audience_str(m) != OPERATOR_FYI
         ]
 
-        # Reverse: needs-action messages with linked status invisible to badge SQL.
-        badge_invisible_msgs = [
-            m for m in messages
-            if derive_needs_action(m) and _status_str(m) == LINKED_STATUS
-        ]
-
+        # badge_invisible is always 0: the badge SQL now uses
+        # status IN ('open', 'linked') for needs-action queries, so linked
+        # BLOCKER/QUESTION messages are correctly included in the count.
         n_forward = len(forward_leaked_msgs)
-        n_badge = len(badge_invisible_msgs)
+        n_badge = 0
         delta = n_forward + n_badge + info_alert_count
 
         parts: List[str] = []
@@ -181,11 +175,6 @@ async def run_operator_inbox_liveness_check(
             parts.append(
                 f"{n_forward}/{len(messages)} non-fyi operator-visible "
                 "message(s) not genuinely needs-action (forward leak)"
-            )
-        if n_badge:
-            parts.append(
-                f"{n_badge} needs-action message(s) with linked status "
-                "invisible to badge SQL (reverse drift)"
             )
         if info_alert_count:
             parts.append(
@@ -199,8 +188,7 @@ async def run_operator_inbox_liveness_check(
             if parts
             else (
                 f"all {len(messages)} open/linked operator-visible message(s) "
-                "correctly handled (no forward leaks, no badge-invisible "
-                "items, no INFO alert noise)"
+                "correctly handled (no forward leaks, no INFO alert noise)"
             )
         )
         results.append(

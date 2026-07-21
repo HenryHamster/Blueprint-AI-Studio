@@ -5654,17 +5654,18 @@ async def check_operator_inbox_needs_action_liveness(
     only non-fyi non-actionable messages are real leaks (e.g. NULL-audience
     legacy rows with non-BLOCKER/QUESTION types).
 
-    **Reverse drift (miss out):** messages with ``status='linked'`` that pass
-    ``derive_needs_action()`` — genuinely actionable items whose badge SQL (which
-    reads ``status='open'`` only) silently drops them.  A linked BLOCKER is
-    ``needs_action=True`` per ``derive_needs_action`` but invisible to the badge.
+    **Reverse drift (miss out):** always 0.  The badge SQL in
+    ``operator_attention.py`` now uses ``status IN ('open', 'linked')`` for
+    needs-action queries, so linked BLOCKER/QUESTION messages are correctly
+    counted.  ``badge_invisible`` is retained in the delta formula for API
+    stability but will never be non-zero under correct operation.
 
     **Alert channel:** undismissed INFO-severity alerts that pass
     ``operator_visible_alert_filter()`` — bookkeeping notices inflating the
     operator alert badge with non-actionable entries.
 
     self_reported = total sampled (open+linked) operator-visible message count.
-    ground_truth  = messages correctly needs-action AND badge-visible (status=open).
+    ground_truth  = messages correctly needs-action AND badge-visible (status in open/linked).
     delta         = forward_leaked + badge_invisible + info_alert_count.
 
     Bounded to ``max_projects`` projects; within each, at most ``sample_limit``
@@ -5760,17 +5761,13 @@ async def check_operator_inbox_needs_action_liveness(
             if not derive_needs_action(m) and _audience_str(m) != OPERATOR_FYI
         ]
 
-        # Reverse: needs-action messages with linked status that badge SQL misses.
-        # derive_needs_action() returns True for BLOCKER/QUESTION at any non-resolved
-        # status, but the badge reads status='open' only — linked items are invisible.
-        badge_invisible = [
-            m for m in messages
-            if derive_needs_action(m) and _status_str(m) == LINKED_STATUS
-        ]
+        # badge_invisible is always 0: the badge SQL now uses
+        # status IN ('open', 'linked') for needs-action queries.
+        badge_invisible: List[Any] = []
 
         actionable_badge_visible = sum(
             1 for m in messages
-            if derive_needs_action(m) and _status_str(m) == OPEN_STATUS
+            if derive_needs_action(m) and _status_str(m) in (OPEN_STATUS, LINKED_STATUS)
         )
         delta = len(forward_leaked) + len(badge_invisible) + info_alert_count
 
@@ -5781,11 +5778,6 @@ async def check_operator_inbox_needs_action_liveness(
                     f"{len(forward_leaked)}/{total} non-fyi operator-visible "
                     "message(s) not genuinely needs-action (forward leak into "
                     "operator inbox)"
-                )
-            if badge_invisible:
-                parts.append(
-                    f"{len(badge_invisible)} needs-action message(s) with "
-                    "linked status invisible to badge SQL (reverse drift)"
                 )
             if info_alert_count:
                 parts.append(

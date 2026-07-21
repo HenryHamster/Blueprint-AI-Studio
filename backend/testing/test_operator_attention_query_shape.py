@@ -8,7 +8,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from app.message_audience import OPERATOR_ACTION_NEEDED
-from app.message_convergence import RESOLVED_STATUS, derive_needs_action
+from app.message_convergence import LINKED_STATUS, RESOLVED_STATUS, derive_needs_action
 from app.models import (
     Alert,
     AlertSeverity,
@@ -183,3 +183,67 @@ def test_derive_needs_action_single_source_of_truth():
     assert derive_needs_action(
         _pm(message_type=MessageType.NOTE, status=RESOLVED_STATUS, context={"audience": OPERATOR_ACTION_NEEDED})
     ) is False
+
+
+@pytest.mark.asyncio
+async def test_linked_blocker_counted_in_badge_and_attention(db_session):
+    """A BLOCKER with status='linked' must appear in the operator badge count
+    and the build_operator_attention preview.
+
+    derive_needs_action() returns True for BLOCKER at any non-resolved status,
+    so a linked BLOCKER remains actionable.  The badge SQL must use
+    status IN ('open', 'linked') to reflect this, not status='open' only.
+    """
+    project = Project(name="Linked blocker test", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner")
+    )
+
+    # Linked BLOCKER: still needs-action per derive_needs_action, status='linked'.
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.BLOCKER,
+            status=LINKED_STATUS,
+            body="Linked blocker body",
+            context={"audience": "operator-action-needed"},
+        )
+    )
+    # Open QUESTION: control — must also appear.
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.QUESTION,
+            status="open",
+            body="Open question body",
+            context={"audience": "operator-action-needed"},
+        )
+    )
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    counts = await get_operator_message_counts(db_session, project.id)
+
+    assert counts["blocker"] == 1, (
+        f"linked BLOCKER must appear in badge count, got blocker={counts['blocker']}"
+    )
+    assert counts["question"] == 1, "open QUESTION must appear in badge count"
+    assert counts["needs_operator"] == 2, (
+        f"needs_operator must include both linked BLOCKER and open QUESTION, "
+        f"got {counts['needs_operator']}"
+    )
+
+    attention = await build_operator_attention(db_session, project, TEST_USER_ID)
+    item_labels = [item["label"] for item in attention.get("items", [])]
+    blocker_items = [
+        item for item in attention.get("items", [])
+        if item.get("reason") == "blocker"
+    ]
+    assert len(blocker_items) >= 1, (
+        f"linked BLOCKER must appear in build_operator_attention preview, "
+        f"items={item_labels}"
+    )
