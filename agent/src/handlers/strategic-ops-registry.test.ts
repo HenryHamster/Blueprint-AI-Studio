@@ -7,12 +7,10 @@ import { describe, expect, it } from 'vitest';
 import {
   STRATEGIC_OPS_REGISTRY,
   cliOps,
-  promptOps,
   allBackendOps,
   strategicOpsManifest,
 } from './strategic-ops-registry.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
-import { buildBootstrapPrompt } from './strategic-resident-lib.js';
 
 // The single canonical registry (strategic-ops-registry.ts) is the source of
 // truth for the strategist mutating-op surface. These drift-guards fail if the
@@ -35,22 +33,6 @@ function renderStrategicScript(): string {
   } finally {
     try { fs.rmSync(ws, { recursive: true }); } catch { /* ignore */ }
   }
-}
-
-function renderBootstrap(): string {
-  return buildBootstrapPrompt({
-    contextPrefix: '',
-    projectName: 'Drift',
-    problemModelJson: '{}',
-    runningUpdate: '',
-    directionsText: '',
-    stagedDirectionsText: '',
-    retiredDirectionsText: '',
-    previousDecisionOutcomesText: '',
-    visionJson: '',
-    openMessagesText: '',
-    sessionId: 'ss-drift',
-  });
 }
 
 describe('strategic ops registry — internal consistency', () => {
@@ -119,25 +101,6 @@ describe('generated ./strategic CLI derives from the registry', () => {
   it('the count of _call dispatch arms matches the CLI-flagged op count', () => {
     const calls = [...script.matchAll(/_call "([a-z_]+)"/g)].map(m => m[1]);
     expect(new Set(calls)).toEqual(new Set(cliOps().map(e => e.op)));
-  });
-});
-
-describe('resident bootstrap prompt derives from the registry', () => {
-  const prompt = renderBootstrap();
-
-  it('lists exactly the prompt-flagged aliases and drops the misleading ellipsis', () => {
-    const expectedList = promptOps().map(e => e.alias).join(', ');
-    expect(prompt).toContain(`apply strategic operations (${expectedList})`);
-    // The old hand-typed list ended in an ellipsis implying "and more" — gone.
-    expect(prompt).not.toContain('pending-confirm, …');
-    expect(prompt).not.toContain('…');
-  });
-
-  it('does not advertise any internal-only op alias', () => {
-    for (const e of STRATEGIC_OPS_REGISTRY.filter(x => !x.prompt)) {
-      const alias = e.op.replace(/_/g, '-');
-      expect(prompt, `internal op ${e.op} leaked into the prompt`).not.toContain(alias);
-    }
   });
 });
 

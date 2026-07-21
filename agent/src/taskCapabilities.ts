@@ -46,7 +46,6 @@ export const AGENT_TASK_TYPE_IDS = [
   'repo_bootstrap',
   'salvage_bundle',
   'capability_proof_trial',
-  'strategic_resident_turn',
 ] as const;
 
 export type AgentTaskType = (typeof AGENT_TASK_TYPE_IDS)[number];

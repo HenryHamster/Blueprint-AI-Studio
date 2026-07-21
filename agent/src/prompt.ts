@@ -276,7 +276,6 @@ export const TASK_TYPES_WITHOUT_HINT: ReadonlySet<string> = new Set([
   'repo_bootstrap',          // Uses specialized.ts bespoke prompt assembly (external-repo first-cycle bootstrap)
   'salvage_bundle',          // Uses standard.ts handleSalvageBundle bespoke prompt assembly (consolidated fix batch)
   'capability_proof_trial',  // Uses capability-proof-trial.ts; runs the targeted covering tests directly, no Claude prompt
-  'strategic_resident_turn', // Uses strategic-resident-turn.ts bespoke prompt assembly (no-clone resident loop)
 ]);
 
 // ── Dynamic Task Type Hints (based on project build configuration) ───────────

@@ -246,11 +246,7 @@
     "providers/runners.ts": 2250,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
-    "providers/resident-session.ts": 800,
-    "handlers/research-plan-sections.ts": 1800,
-    "handlers/strategic-resident-lib.ts": 2950,
-    "handlers/strategic-resident.ts": 1800,
-    "handlers/strategic-resident-turn.ts": 1000
+    "handlers/research-plan-sections.ts": 1800
   },
   "frontend": {
     "useAppState.ts": 3000,
