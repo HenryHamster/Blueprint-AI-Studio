@@ -373,16 +373,24 @@ describe('handleSmoketest — URL health checks', () => {
     expect(stored.env_preflight_error).toBeTruthy();
   });
 
-  it('reports FAILED when smoketestResult.passed is false', async () => {
+  it('reports COMPLETED with SMOKETEST_RESULT even when smoketestResult.passed is false (genuine test failure, not agent crash)', async () => {
+    // A genuine smoketest failure (tests ran but failed) must post COMPLETED so the
+    // qualifier reads the SMOKETEST_RESULT artifact and calls _score_smoketest to
+    // produce a quality verdict.  Posting FAILED here causes the qualifier to route
+    // through _handle_infra_failure and stall promotion forever.
     const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
     vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('FAILED');
+    expect(call.status).toBe('COMPLETED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
+    expect(call.failure_category).toBeUndefined();
+    const stored = JSON.parse(call.logs as string) as { passed: boolean };
+    expect(stored.passed).toBe(false);
   });
+
 
   it('appends passing URL health check results and keeps passed=true', async () => {
     const smoketestResult = { passed: true, tests: [] as Array<{ name: string; status: string; message: string }> };

@@ -21320,6 +21320,74 @@ class TestFinalizeInfraFailure:
         assert verdicts[0].terminal_status == "infra_failure"
 
     @pytest.mark.asyncio
+    async def test_smoketest_completed_with_failed_tests_produces_quality_verdict(
+        self, db_session
+    ):
+        """A COMPLETED smoketest child whose SMOKETEST_RESULT artifact has
+        passed=False is scored as a quality verdict (low sub-score), NOT routed
+        through infra_failure.
+
+        This is the end-to-end proof of the agent-side fix: the smoketest agent
+        now always posts status=COMPLETED when Claude ran and produced a parseable
+        result, letting the qualifier read _score_smoketest and produce a real
+        quality verdict instead of stalling promotion forever via _handle_infra_failure.
+        """
+        project, version = await _make_project_and_version(db_session)
+        # Audit passes cleanly; smoketest COMPLETED but tests failed (passed=False,
+        # non-startup suite failure so score > 0 but < 1, not a hard blocker).
+        await _seed_qualification_children(
+            db_session,
+            project,
+            version,
+            audit_logs={
+                "audit_score": 1.0,
+                "test_erosion": {"deleted_test_files": []},
+            },
+            smoke_logs={
+                "passed": False,
+                "tests": [
+                    {"name": "test_startup_ok", "status": "pass"},
+                    {"name": "test_regression_a", "status": "fail", "message": "AssertionError"},
+                    {"name": "test_regression_b", "status": "fail", "message": "AssertionError"},
+                ],
+                "suites": {
+                    "startup": {"passed": True},
+                    "regression": {"passed": False},
+                },
+            },
+        )
+
+        result = await rq._finalize_qualification(db_session, version)
+        await db_session.commit()
+
+        # Must NOT be infra_failure — a COMPLETED smoketest with parsed artifact
+        # produces a quality verdict regardless of passed=True/False.
+        assert result["status"] != "infra_failure", (
+            f"Expected quality verdict, got infra_failure: {result}"
+        )
+        # A low smoketest score drives composite below threshold → not_promoted.
+        # The key invariant is that we reached the scoring path, not infra_failure.
+        assert result["status"] in ("not_promoted", "dry_run"), (
+            f"Expected a quality verdict (not_promoted or dry_run), got: {result['status']}"
+        )
+        await db_session.refresh(version)
+        sub_scores = (version.last_qualification or {}).get("sub_scores") or {}
+        assert "smoketest" in sub_scores, f"smoketest sub_score missing in last_qualification: {version.last_qualification}"
+        # 1 pass out of 3 tests → approx 0.33 score, well below threshold.
+        assert sub_scores["smoketest"] < 1.0, (
+            f"Expected smoketest sub_score < 1.0 for failed tests, got {sub_scores['smoketest']}"
+        )
+
+        # Confirm a quality verdict row was written (not an infra_failure row).
+        verdicts = await _infra_verdicts_for_version(db_session, version)
+        assert len(verdicts) == 1, (
+            f"Expected 1 quality verdict row, got {len(verdicts)}"
+        )
+        assert verdicts[0].terminal_status != "infra_failure", (
+            f"Expected a quality verdict (not infra_failure), got terminal_status={verdicts[0].terminal_status}"
+        )
+
+    @pytest.mark.asyncio
     async def test_consecutive_infra_errors_backstop_fires_alert(self, db_session):
         """After _MIN_INFRA_ERROR_STREAK consecutive infra failures, an Alert is
         raised — the calcification guard is silent for infra failures, so this

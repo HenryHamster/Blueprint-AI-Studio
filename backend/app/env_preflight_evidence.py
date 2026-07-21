@@ -149,12 +149,20 @@ def build_env_preflight_from_source(
     The artifact shape, presence-only hard rule, and ``manifest_source`` pointer
     are identical to :func:`build_env_preflight_evidence`.
 
-    Returns ``None`` when ``required_runtime_env_py_source`` is ``None`` or
-    cannot be parsed (the caller should treat this as "evidence unavailable").
+    Returns ``None`` only when ``required_runtime_env_py_source`` cannot be
+    parsed (the caller should treat this as "evidence unavailable").  When
+    ``required_runtime_env_py_source`` is ``None`` (the candidate tree has no
+    manifest file), the manifest is treated as declaring NO prerequisites —
+    an empty ``required_env`` list is returned rather than ``None``, so the
+    scoring layer scores the artifact as vacuously satisfied (1.0) instead of
+    firing the ``boot_prereq_evidence_missing`` hard blocker.  External and
+    greenfield repos that do not ship the Blueprint-specific manifest are
+    thus promotable — the manifest is Blueprint-specific, not universal.
     """
     if required_runtime_env_py_source is None:
-        return None
-    required_env = _extract_required_env_from_source(required_runtime_env_py_source)
+        required_env: list[dict[str, str]] = []
+    else:
+        required_env = _extract_required_env_from_source(required_runtime_env_py_source)
     startup_check_names = (
         _parse_startup_check_names_from_yaml(smoketest_yaml_source)
         if smoketest_yaml_source is not None

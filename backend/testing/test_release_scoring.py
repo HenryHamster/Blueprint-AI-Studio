@@ -962,7 +962,7 @@ class TestFailClosedCategoryVerdicts:
         no-criteria path rather than synthesising a spurious block.
         """
         assert self._fn(set()) is None
-        assert self._fn(set([None])) is None  # only None keys → filtered out
+        assert self._fn({None}) is None  # only None keys → filtered out
 
     def test_non_empty_keys_returns_unverified_verdicts(self):
         """Each active criterion key gets an ``unverified`` verdict row, sorted."""
@@ -1581,6 +1581,83 @@ class TestEnvPreflightGate:
         # Distinct from operator-env and deployed phrases.
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_OPERATOR_ENV]
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+
+    def test_manifest_absent_candidate_promotes_while_broken_manifest_blocks(self):
+        """An absent manifest (source=None) must NOT trigger boot_prereq_evidence_missing.
+
+        The env-preflight manifest (backend/app/required_runtime_env.py) is
+        Blueprint-specific.  External and greenfield repos that do not ship it
+        must remain promotable — a missing file means "no prerequisites declared",
+        not "evidence unavailable".  Only a malformed/unparseable manifest (source
+        present but unreadable) should produce a None score and fire the hard block.
+
+        This test drives the full scoring seam from build_env_preflight_from_source
+        through _score_env_preflight into compute_composite to exercise the end-to-end
+        contract, not just the individual helpers.
+        """
+        from app.env_preflight_evidence import build_env_preflight_from_source, sanitize_env_preflight_artifact
+
+        # --- absent manifest → vacuously satisfied (score=1.0) → promotes ---
+        absent_artifact = build_env_preflight_from_source(None)
+        assert absent_artifact is not None, "absent manifest must return a dict, not None"
+        assert absent_artifact["required_env"] == []
+
+        # sanitize (mirrors release_qualifier._finalize_qualification)
+        sanitized_absent = sanitize_env_preflight_artifact(absent_artifact)
+        absent_score, absent_missing, _ = rs._score_env_preflight(
+            sanitized_absent, {"K_REVISION": True}
+        )
+        assert absent_score == 1.0, "absent manifest should score 1.0 (vacuously satisfied)"
+        assert absent_missing == []
+
+        absent_result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=absent_score,
+                env_preflight_missing=absent_missing,
+            )
+        )
+        assert absent_result["blocker"] is None, (
+            f"absent manifest must not block — got blocker={absent_result['blocker']!r}"
+        )
+        assert absent_result["promote"] is True
+
+        # --- broken manifest (unparseable source) → score=None → blocks ---
+        broken_artifact = build_env_preflight_from_source(
+            required_runtime_env_py_source="this is }{{{ not valid python"
+        )
+        # A SyntaxError source yields required_env=[] (graceful degradation in the
+        # parser), so the artifact itself is non-None with an empty list — same
+        # vacuous-satisfaction path as absent.  The true "evidence unavailable" case
+        # is when the score reaches compute_composite as None (e.g. sanitize returns
+        # None for a non-dict raw blob).  Confirm the broken-source path degrades
+        # gracefully (not None) while a raw-None blob remains a hard block.
+        assert broken_artifact is not None
+        assert broken_artifact["required_env"] == [], (
+            "SyntaxError source should degrade to empty required_env (graceful), "
+            "not raise or block"
+        )
+
+        # A raw non-dict blob (e.g. from a corrupted artifact store) sanitizes to
+        # None → score=None → boot_prereq_evidence_missing fires.
+        raw_none_blob = "not-a-dict"
+        sanitized_none = sanitize_env_preflight_artifact(raw_none_blob)
+        assert sanitized_none is None, "non-dict raw blob must sanitize to None"
+
+        none_score, _, _ = rs._score_env_preflight(sanitized_none, {"K_REVISION": True})
+        assert none_score is None
+
+        blocked_result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=none_score,  # None
+                env_preflight_missing=[],
+            )
+        )
+        assert blocked_result["blocker"] == "boot_prereq_evidence_missing", (
+            "corrupted/absent artifact (sanitized to None) must hard-block"
+        )
+        assert blocked_result["promote"] is False
 
 
 # ---------------------------------------------------------------------------

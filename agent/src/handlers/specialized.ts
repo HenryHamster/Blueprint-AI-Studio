@@ -572,13 +572,17 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     const passCount = smoketestResult.tests.filter(t => t.status === 'pass').length;
     const summary = `Smoke tests ${passed ? 'PASSED' : 'FAILED'}: ${passCount}/${smoketestResult.tests.length} passed`;
     sendLog(ws, `\n${summary}\n`);
+    // Always post COMPLETED when Claude ran and produced a parseable result —
+    // the quality verdict lives in the SMOKETEST_RESULT artifact (passed: true/false),
+    // not in the task status.  Posting FAILED here caused the qualifier to route
+    // genuine test failures through _handle_infra_failure instead of _score_smoketest,
+    // which silently stalled promotion forever instead of producing a quality verdict.
     await persistAndPostStatus(taskId, {
       task_id: taskId,
-      status: passed ? 'COMPLETED' : 'FAILED',
+      status: 'COMPLETED',
       artifact_type: 'SMOKETEST_RESULT',
       logs: JSON.stringify(smoketestResult),
       repo_url: `https://github.com/${owner}/${repo}`,
-      ...(!passed ? { failure_category: 'claude_code_failed' } : {}),
     });
   } else {
     const smoketestUnparseable = exitCode === 0;
