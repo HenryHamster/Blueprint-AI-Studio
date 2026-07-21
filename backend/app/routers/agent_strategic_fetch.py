@@ -1366,6 +1366,9 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "resident_exam_leads": None,    # exempt (never dropped); session-scoped, no fetch path
     # Low — dedicated fetch verb; tiny persisted trend across recent cycles
     "integrity_conflict_trend": "integrity-conflict-trend",
+    # Medium — dedicated fetch verbs; operator-facing tools/skills readable by strategist
+    "skills": "skills",
+    "project_tools": "tools",
 }
 
 _SECTIONS_NEEDING_CYCLE_HISTORY: frozenset[str] = frozenset({

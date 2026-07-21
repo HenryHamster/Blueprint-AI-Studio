@@ -6489,3 +6489,22 @@ async def test_agent_fetch_ui_load_timing_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+def test_section_fetch_inventory_covers_tools_and_skills():
+    """SECTION_FETCH_INVENTORY must register both 'skills' and 'project_tools'
+    with their dedicated fetch verbs ('skills' and 'tools' respectively).
+
+    The ./fetch tools and ./fetch skills shell verbs already exist in the agent
+    and hit /api/agent/projects/{id}/tools and /api/agent/projects/{id}/skills,
+    but without inventory entries the completeness tests (and the strategist's
+    recovery path) cannot discover them.
+    """
+    from app.routers.agent_strategic_fetch import SECTION_FETCH_INVENTORY
+
+    assert SECTION_FETCH_INVENTORY.get("skills") == "skills", (
+        "'skills' must be registered in SECTION_FETCH_INVENTORY with verb 'skills'"
+    )
+    assert SECTION_FETCH_INVENTORY.get("project_tools") == "tools", (
+        "'project_tools' must be registered in SECTION_FETCH_INVENTORY with verb 'tools'"
+    )

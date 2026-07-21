@@ -939,13 +939,13 @@ export function writeDesignDocHelper(
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
+  printf '{"task_id":%s,"op":"set","key":%s,"value":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" "$VALUE" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc set"
 elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
+  printf '{"task_id":%s,"op":"delete","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc delete"`;
   const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
   const helperScript = `#!/bin/bash
@@ -959,6 +959,7 @@ KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
+${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
 
@@ -973,12 +974,12 @@ _post_once() {
 }
 ${retryFn}
 if [ "$OP" = "list" ]; then
-  printf '{"task_id":"%s","op":"list"}' "$TASK" | _post_once
+  printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once
 elif [ "$OP" = "get" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: get requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":"%s","op":"get","key":"%s"}' "$TASK" "$KEY" | _post_once
+  printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once
 ${writeBranches}
 else
   echo "Unknown op: $OP. ${unknownUsage}" >&2; exit 1

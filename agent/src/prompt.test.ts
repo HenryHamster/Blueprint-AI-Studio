@@ -4826,8 +4826,10 @@ describe('writeDesignDocHelper', () => {
     expect(script).toContain('design-doc get|set|delete|list');
     expect(script).toContain('TASK="task-xyz"');
     // POST body shape the backend op handler parses must be unchanged.
-    expect(script).toContain('"op":"set","key":"%s","value":%s');
-    expect(script).toContain('"op":"delete","key":"%s"');
+    // KEY and TASK are encoded via _json_str (not bare %s) to survive quotes/newlines.
+    expect(script).toContain('"op":"set","key":%s,"value":%s');
+    expect(script).toContain('"op":"delete","key":%s}');
+    expect(script).toContain('$(_json_str "$KEY")');
   });
 
   it('makes set/delete durable: a retry loop honoring Retry-After on 429/5xx', () => {
@@ -4861,13 +4863,28 @@ describe('writeDesignDocHelper', () => {
     expect(script).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
   });
 
+  it('design-doc escapes adversarial key/value: _json_str routes KEY and TASK through JSON encoder', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    // _json_str function must be injected so quotes/backslashes/newlines in KEY do not break JSON.
+    expect(script).toContain('_json_str()');
+    // Every operation (set, delete, get, list) routes KEY and TASK through the encoder.
+    expect(script).toContain('$(_json_str "$KEY")');
+    expect(script).toContain('$(_json_str "$TASK")');
+    // VALUE in set is raw JSON from the caller — must NOT be re-encoded as a string.
+    expect(script).not.toContain('$(_json_str "$VALUE")');
+    // Old bare-%s encoding must be gone for key and task_id fields.
+    expect(script).not.toContain('"task_id":"%s"');
+    expect(script).not.toContain('"key":"%s"');
+  });
+
   it('keeps read ops (list/get) fail-fast with no retry', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];
     expect(script).toContain('_post_once()');
     // list and get route through the single-shot helper, not the retry loop.
-    expect(script).toMatch(/"op":"list"\}' "\$TASK" \| _post_once/);
-    expect(script).toMatch(/"op":"get","key":"%s"\}' "\$TASK" "\$KEY" \| _post_once/);
+    expect(script).toContain(`printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once`);
+    expect(script).toContain(`printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once`);
   });
 
   it('generated design-doc script passes `bash -n` syntax check', async () => {
@@ -4914,8 +4931,8 @@ describe('writeDesignDocHelper', () => {
       expect(script).toContain('TASK="task-xyz"');
       // get and list still route through the fail-fast single-shot helper.
       expect(script).toContain('_post_once()');
-      expect(script).toMatch(/"op":"list"\}' "\$TASK" \| _post_once/);
-      expect(script).toMatch(/"op":"get","key":"%s"\}' "\$TASK" "\$KEY" \| _post_once/);
+      expect(script).toContain(`printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once`);
+      expect(script).toContain(`printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once`);
     });
 
     it('rejects set/delete (no write path, no retry loop) in read-only workspaces', () => {
