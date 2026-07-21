@@ -385,6 +385,25 @@ Findings covered here (17-finding release-qualification salvage bundle, task c39
   c39-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (03-15)
   c39-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (03-16)
   c39-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (03-17)
+
+Findings covered here (17-finding release-qualification salvage bundle, task 927eea0b, 2026-07-21):
+  92-1  — serving-only-import ImportError degrades gate (not hard-block) → already pinned by test_f20_1_* (03-1)
+  92-2  — data-dependent migration proof design; scratch replay uses schema not row data → already pinned by test_f20_2_* (03-2)
+  92-3  — encryption-key continuity: probe_key_continuity / assert_plaintext_or_raise present → already pinned by test_f20_3_* + e1/e2/e3 (03-3)
+  92-4  — MultiFernet.rotate() for staged key rotation → already pinned by test_f20_4_* (03-4)
+  92-5  — fail closed on keyless/malformed encryption backfill; require_encryption_active raises → already pinned by test_f20_5_* (03-5)
+  92-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (degraded, not boot-fatal) → already pinned by test_f20_6_* (03-6)
+  92-7  — gate-defer signature derived from error code only (no child failures) → already pinned by test_f20_7_* (03-7)
+  92-8  — timed-out qualifier children cancelled via _cancel_qualifier_children before state rewrite → already pinned by test_f20_8_* (03-8)
+  92-9  — _DeterministicMigrationDefect returns 'block' verdict (not 'defer') → already pinned by test_f20_9_* (03-9)
+  92-10 — env_preflight_enabled independent gate flag; absent evidence is a hard blocker → already pinned by test_f20_10_* (03-10)
+  92-11 — trigger resolver returns infra_failure_redrive for infra_failure (bespoke loops gated separately) → already pinned by test_f20_11_* (03-11)
+  92-12 — release_reconciliation references 'claiming' field for orphan containment → already pinned by test_f20_12_* (03-12)
+  92-13 — migration_apply_gate data-migration proof gate defers DML without proof declaration → already pinned by test_f20_13_* (03-13)
+  92-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview + triggerHotfixPromote → already pinned by test_f20_14_* (03-14)
+  92-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (03-15)
+  92-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (03-16)
+  92-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (03-17)
 """
 
 from __future__ import annotations
