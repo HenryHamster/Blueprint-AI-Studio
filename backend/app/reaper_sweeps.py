@@ -2539,6 +2539,20 @@ _COMPUTE_IMAGE_GC_GUARD_INTERVAL_SECONDS = 3600
 _COMPUTE_IMAGE_PROTECT_WINDOW_SECONDS = 30 * 24 * 3600
 _last_compute_image_gc_guard_sweep: datetime | None = None
 
+# Observability state for the operator GC-guard readiness signal.
+# Populated after every actual sweep execution (not cadence-skipped).
+# Reset on process restart — the operator needs a multi-cycle observation
+# window before flipping cleanup_policy_dry_run=false.
+_gc_guard_total_runs: int = 0
+_gc_guard_total_applied: int = 0
+_gc_guard_total_pruned: int = 0
+_gc_guard_total_apply_failed: int = 0
+_gc_guard_consecutive_healthy_cycles: int = 0
+_gc_guard_first_run_at: datetime | None = None
+_gc_guard_last_run_at: datetime | None = None
+# Per-execution snapshot of the last non-cadence-skipped sweep run.
+_gc_guard_last_result: dict[str, int] | None = None
+
 # Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
 # an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
 # gcloud binary / Artifact Registry API error / non-zero exit), so a failed apply
@@ -2729,7 +2743,9 @@ async def sweep_protect_referenced_compute_image_digests(
     (``applied``/``pruned``/``skipped_cadence``). The caller wraps this so it can
     never crash the reaper cycle; the registry helpers fail open individually.
     """
-    global _last_compute_image_gc_guard_sweep
+    global _last_compute_image_gc_guard_sweep, _gc_guard_total_runs, _gc_guard_total_applied
+    global _gc_guard_total_pruned, _gc_guard_total_apply_failed, _gc_guard_consecutive_healthy_cycles
+    global _gc_guard_first_run_at, _gc_guard_last_run_at, _gc_guard_last_result
     from app.compute_image_build import (
         apply_registry_protection_tag,
         delete_registry_protection_tag,
@@ -2995,11 +3011,75 @@ async def sweep_protect_referenced_compute_image_digests(
             with contextlib.suppress(Exception):
                 await session.rollback()
 
+    # --- Update cumulative GC-guard state for operator readiness signal ---
+    _gc_guard_total_runs += 1
+    _gc_guard_total_applied += applied
+    _gc_guard_total_pruned += pruned
+    _gc_guard_total_apply_failed += apply_failed
+    if _gc_guard_first_run_at is None:
+        _gc_guard_first_run_at = _now
+    _gc_guard_last_run_at = _now
+    _gc_guard_last_result = {
+        "applied": applied,
+        "pruned": pruned,
+        "apply_failed": apply_failed,
+        "skipped_cadence": 0,
+    }
+    if apply_failed == 0:
+        _gc_guard_consecutive_healthy_cycles += 1
+    else:
+        _gc_guard_consecutive_healthy_cycles = 0
+
     return {
         "applied": applied,
         "pruned": pruned,
         "apply_failed": apply_failed,
         "skipped_cadence": 0,
+    }
+
+
+def get_compute_image_gc_guard_readiness() -> dict[str, Any]:
+    """Return observed GC-guard sweep state for operator readiness assessment.
+
+    The ``cleanup_policy_dry_run=true`` flag on the compute-image Artifact
+    Registry means image storage grows unbounded until an operator confirms
+    the ``inuse-`` protection-tag sweep is working reliably and flips
+    ``dry_run=false``.  This function surfaces the cumulative and per-run
+    observability accumulated since process start so the operator can make
+    that call from a machine-readable signal rather than log inspection.
+
+    Returns a dict with:
+      - **ready** — ``True`` when the sweep has run at least once, has
+        protected at least one digest, and had zero apply failures on the
+        last run.
+      - **total_runs** — number of actual sweep executions since start.
+      - **consecutive_healthy_cycles** — number of consecutive executions
+        with ``apply_failed == 0``.
+      - **first_run_at** / **last_run_at** — ISO-format timestamps.
+      - **last_sweep** — per-run snapshot ``{applied, pruned, apply_failed}``.
+      - **cumulative** — running totals ``{applied, pruned, apply_failed}``.
+    """
+    is_healthy = (
+        _gc_guard_last_result is not None
+        and _gc_guard_last_result["applied"] > 0
+        and _gc_guard_consecutive_healthy_cycles >= 1
+    )
+    return {
+        "ready": _gc_guard_total_runs >= 1 and is_healthy,
+        "total_runs": _gc_guard_total_runs,
+        "consecutive_healthy_cycles": _gc_guard_consecutive_healthy_cycles,
+        "first_run_at": _gc_guard_first_run_at.isoformat()
+        if _gc_guard_first_run_at
+        else None,
+        "last_run_at": _gc_guard_last_run_at.isoformat()
+        if _gc_guard_last_run_at
+        else None,
+        "last_sweep": dict(_gc_guard_last_result) if _gc_guard_last_result else None,
+        "cumulative": {
+            "applied": _gc_guard_total_applied,
+            "pruned": _gc_guard_total_pruned,
+            "apply_failed": _gc_guard_total_apply_failed,
+        },
     }
 
 
@@ -3213,7 +3293,7 @@ async def sweep_refresh_project_compute_images(
     return summary
 
 
-# ── Off-orchestrator image-build poll monitor (DARK — not wired into the loop) ──
+# ── Off-orchestrator image-build poll monitor (Step 22d-ii of the reaper cycle) ──
 #
 # Sibling of the compute-job monitor: it drives BUILDING ProjectComputeImageBuild
 # rows to a terminal state by polling the throwaway builder VM's serial marker /
@@ -3221,9 +3301,9 @@ async def sweep_refresh_project_compute_images(
 # digest-preservation guard the inline path uses) and reaps the VM. Past its
 # deadline a build's VM is deleted and the row is marked TIMED_OUT.
 #
-# This sweep is NOT registered in the reaper cycle and NOT called by the trigger
-# endpoint — the whole builder lane ships dark, selectable by config. It exists
-# so the machinery is testable and ready to wire up once proven.
+# This sweep IS registered in the reaper cycle (reaper.py Step 22d-ii) and runs
+# on every reaper tick. It handles the async ephemeral-VM builder lane; the
+# synchronous Cloud Build lane completes inline at Step 22d.
 _IMAGE_BUILD_POLL_MAX_ROWS = 25
 
 
@@ -3612,6 +3692,7 @@ __all__ = [
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
+    "get_compute_image_gc_guard_readiness",
     "sweep_refresh_project_compute_images",
     "sweep_poll_image_builds",
     "sweep_silent_runner_compute_jobs",

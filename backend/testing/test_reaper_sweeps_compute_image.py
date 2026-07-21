@@ -27,11 +27,14 @@ from sqlmodel import SQLModel
 
 from sqlmodel import select
 
+import base64
+
 from app import compute_backends as _cb
 from app.compute_image_build import BuildResult
 from app.models import ComputeJob, ComputeJobStatus, Project, ProjectComputeImage
 from app.reaper_sweeps import (
     _split_pinned_ref,
+    get_compute_image_gc_guard_readiness,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
 )
@@ -3600,4 +3603,255 @@ async def test_async_image_build_lane_end_to_end(db, monkeypatch):
     assert pin_rows[0].digest == _DIGEST_A
     assert pin_rows[0].dep_hash == dep_hash
     assert pin_rows[0].built is True
+
+
+# ── Security: builder startup script embeds orchestrator's scanner ────────────
+
+
+def test_builder_startup_script_embeds_orchestrator_scanner_not_repo_copy():
+    """The builder VM's startup script must deliver the ORCHESTRATOR'S OWN
+    compute_image_build.py, not any copy that may exist inside the cloned repo.
+
+    This is the regression guard for the security invariant: the credential
+    scanner and --network=none confinement live inside compute_image_build.py.
+    If the script ever referenced the repo's copy, a malicious repo could ship
+    a no-op scanner and bypass the layer-credential check.
+    """
+    import uuid
+
+    request = _cb.ImageBuildRequest(
+        build_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        dep_hash="abc123",
+        registry_repo="us-central1-docker.pkg.dev/proj/compute",
+        image_name="base",
+        repo_clone={"owner": "org", "repo": "myrepo", "ref": "main"},
+        repo_token="ghp_test",
+    )
+    script = _cb._build_image_builder_startup_script(
+        request, terminal_upload_url="https://storage.googleapis.com/bucket/terminal.json"
+    )
+
+    # 1. The script must contain the orchestrator's own base64 blob verbatim.
+    assert _cb._BUILD_TOOL_B64 in script, (
+        "startup script does not embed _BUILD_TOOL_B64 — "
+        "the orchestrator's trusted scanner is absent"
+    )
+
+    # 2. The blob must decode to content that came from the orchestrator's own
+    #    module, not some other file (checked by the presence of the scanner anchor).
+    decoded = base64.b64decode(_cb._BUILD_TOOL_B64)
+    assert b"_CREDENTIAL_PATTERNS" in decoded, (
+        "_BUILD_TOOL_B64 does not contain _CREDENTIAL_PATTERNS — "
+        "wrong file is embedded as the build tool"
+    )
+
+    # 3. The source path of the embedded tool must be inside the orchestrator's
+    #    app directory, not the repo clone directory on the builder VM.
+    source = _cb._BUILD_TOOL_SOURCE_PATH
+    assert source.is_file(), f"_BUILD_TOOL_SOURCE_PATH {source} must exist"
+    assert _cb._BUILDER_REPO_DIR not in str(source), (
+        f"Build tool sourced from repo clone dir {_cb._BUILDER_REPO_DIR} — "
+        "must come from the orchestrator's own app directory"
+    )
+
+    # 4. The script must not reference compute_image_build.py anywhere inside
+    #    the repo clone directory (the untrusted source).
+    repo_scanner_path = f"{_cb._BUILDER_REPO_DIR}/compute_image_build.py"
+    assert repo_scanner_path not in script, (
+        f"startup script references {repo_scanner_path!r} — "
+        "the repo's copy of the scanner must never be invoked"
+    )
+
+
+# ── GC-guard readiness observability state ───────────────────────────
+
+
+class TestComputeImageGcGuardReadiness:
+    """Tests for the GC-guard sweep observability state and readiness signal.
+
+    Each test resets the module-level ``_gc_guard_*`` globals so assertions
+    against cumulative/total state are deterministic regardless of test order.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_gc_guard_state(self):
+        """Reset module-level GC guard state before each test."""
+        import app.reaper_sweeps as _rs  # noqa: PLC0415 — local to fixture
+
+        _rs._gc_guard_total_runs = 0
+        _rs._gc_guard_total_applied = 0
+        _rs._gc_guard_total_pruned = 0
+        _rs._gc_guard_total_apply_failed = 0
+        _rs._gc_guard_consecutive_healthy_cycles = 0
+        _rs._gc_guard_first_run_at = None
+        _rs._gc_guard_last_run_at = None
+        _rs._gc_guard_last_result = None
+        yield
+
+    @pytest.mark.asyncio
+    async def test_readiness_before_first_run(self, db):
+        """Accessor returns defaults (ready=False, no run data)."""
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is False
+        assert state["total_runs"] == 0
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["first_run_at"] is None
+        assert state["last_run_at"] is None
+        assert state["last_sweep"] is None
+        assert state["cumulative"]["applied"] == 0
+        assert state["cumulative"]["pruned"] == 0
+        assert state["cumulative"]["apply_failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_readiness_after_successful_sweep(self, db):
+        """State reflects one successful sweep: ready=True, counts match."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            result = await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert result["applied"] == 1  # sanity: sweep actually ran
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is True
+        assert state["total_runs"] == 1
+        assert state["consecutive_healthy_cycles"] == 1
+        assert state["first_run_at"] is not None
+        assert state["last_run_at"] == state["first_run_at"]
+        assert state["last_sweep"] is not None
+        assert state["last_sweep"]["applied"] == 1
+        assert state["last_sweep"]["pruned"] == 0
+        assert state["last_sweep"]["apply_failed"] == 0
+        assert state["cumulative"]["applied"] == 1
+        assert state["cumulative"]["pruned"] == 0
+        assert state["cumulative"]["apply_failed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_readiness_after_sweep_with_failures(self, db):
+        """Apply failures set apply_failed and keep ready=False."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            result = await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: None,  # every apply fails
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert result["apply_failed"] == 1
+        assert result["applied"] == 0
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["ready"] is False
+        assert state["total_runs"] == 1
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["last_sweep"]["applied"] == 0
+        assert state["last_sweep"]["apply_failed"] == 1
+        assert state["cumulative"]["applied"] == 0
+        assert state["cumulative"]["apply_failed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_consecutive_healthy_cycles_accumulate(self, db):
+        """Two clean runs increment consecutive_healthy_cycles."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        # First execution (cadence open at 2-hours-ago snapshot)
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert get_compute_image_gc_guard_readiness()["consecutive_healthy_cycles"] == 1
+
+        # Second execution — the patched cadence gate is still 2-hours-ago,
+        # so the sweep runs again without waiting for the real hourly interval.
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["consecutive_healthy_cycles"] == 2
+        assert state["total_runs"] == 2
+        assert state["cumulative"]["applied"] == 2
+        assert state["ready"] is True
+
+    @pytest.mark.asyncio
+    async def test_failure_resets_consecutive_healthy_cycles(self, db):
+        """A failed run after a healthy run resets consecutive_healthy_cycles to 0."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        # First run: healthy
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: "inuse-tag",
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        assert get_compute_image_gc_guard_readiness()["consecutive_healthy_cycles"] == 1
+
+        # Second run: all applies fail
+        with patch(
+            "app.reaper_sweeps._last_compute_image_gc_guard_sweep",
+            _PAST_NOW,
+        ):
+            await sweep_protect_referenced_compute_image_digests(
+                db,
+                now=_NOW,
+                _apply_tag=lambda repo, digest: None,  # all fail
+                _list_tags=lambda repo: [],
+                _delete_tag=lambda repo, tag: False,
+            )
+
+        state = get_compute_image_gc_guard_readiness()
+
+        assert state["consecutive_healthy_cycles"] == 0
+        assert state["total_runs"] == 2
+        assert state["cumulative"]["apply_failed"] == 1
+        assert state["ready"] is False
+        # Cumulative applied still includes the first run's count.
+        assert state["cumulative"]["applied"] == 1
 

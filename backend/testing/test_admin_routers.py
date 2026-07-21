@@ -33113,3 +33113,147 @@ class TestComputeImageStatus:
         body = resp.json()
         assert body["status"] == "never_built"
         assert "drift" not in body
+
+    @pytest.mark.asyncio
+    async def test_status_build_metrics_populated(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """build_metrics aggregates terminal build rows: success_rate, cache_hit_rate, avg_build_seconds."""
+        from datetime import timedelta
+        from app.models import ComputeImageBuildStatus, ProjectComputeImage, ProjectComputeImageBuild, _utcnow
+        import json
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": {"dockerfile": ".blueprint/Dockerfile.compute"},
+            },
+        )
+        project = await _make_project(db_session, name="MetricsProject")
+
+        now = _utcnow()
+        # 2 SUCCEEDED builds: one cache hit, one fresh
+        b1 = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="aaa",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            started_at=now - timedelta(hours=2),
+            image_published_at=now - timedelta(hours=1, minutes=50),
+            result_json=json.dumps({"already_present": True}),
+        )
+        b2 = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="bbb",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            started_at=now - timedelta(hours=4),
+            image_published_at=now - timedelta(hours=3, minutes=30),
+            result_json=json.dumps({"already_present": False}),
+        )
+        # 1 FAILED build
+        b3 = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="ccc",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            status=ComputeImageBuildStatus.FAILED,
+        )
+        # 1 TIMED_OUT build
+        b4 = ProjectComputeImageBuild(
+            project_id=project.id,
+            dep_hash="ddd",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            image_name="proj",
+            status=ComputeImageBuildStatus.TIMED_OUT,
+        )
+        for b in (b1, b2, b3, b4):
+            db_session.add(b)
+
+        # ProjectComputeImage row so the endpoint returns "built"
+        img_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="bbb",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:" + "e" * 64,
+            digest="sha256:" + "e" * 64,
+            built=True,
+        )
+        db_session.add(img_row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+
+        m = body["build_metrics"]
+        assert m["total_builds"] == 4
+        assert m["succeeded"] == 2
+        assert m["failed"] == 1
+        assert m["timed_out"] == 1
+        # 2 of 4 succeeded → 0.5
+        assert abs(m["success_rate"] - 0.5) < 1e-6
+        # 1 of 2 succeeded had already_present=True → 0.5
+        assert abs(m["cache_hit_rate"] - 0.5) < 1e-6
+        # b1: 10 min = 600s, b2: 30 min = 1800s → avg = 1200s
+        assert m["avg_build_seconds"] is not None
+        assert abs(m["avg_build_seconds"] - 1200.0) < 5.0
+        assert m["in_flight_count"] == 0
+
+        # build_age_hours is present and non-negative
+        assert body["build_age_hours"] is not None
+        assert body["build_age_hours"] >= 0.0
+
+    @pytest.mark.asyncio
+    async def test_status_build_metrics_empty_when_no_builds(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        """build_metrics.total_builds == 0 and rates are null when no terminal builds exist."""
+        from app.models import ProjectComputeImage
+
+        self._patch_manifest(
+            monkeypatch,
+            compute_image={
+                "name": "us-docker.pkg.dev/p/compute-images/proj:latest",
+                "build": None,
+            },
+        )
+        project = await _make_project(db_session, name="EmptyMetrics Project")
+
+        img_row = ProjectComputeImage(
+            project_id=project.id,
+            image_name="proj",
+            registry_repo="us-docker.pkg.dev/p/compute-images",
+            dep_hash="zerohash",
+            tag="latest",
+            pinned_ref="us-docker.pkg.dev/p/compute-images/proj@sha256:" + "f" * 64,
+            digest="sha256:" + "f" * 64,
+            built=True,
+        )
+        db_session.add(img_row)
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/compute-image/status"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "built"
+
+        m = body["build_metrics"]
+        assert m["total_builds"] == 0
+        assert m["succeeded"] == 0
+        assert m["success_rate"] is None
+        assert m["cache_hit_rate"] is None
+        assert m["avg_build_seconds"] is None
+        assert m["in_flight_count"] == 0

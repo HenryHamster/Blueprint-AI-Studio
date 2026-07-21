@@ -64,6 +64,7 @@ from app.models import (
 )
 from app.auth import (
     get_current_user,
+    require_admin,
     AGENT_JWT_SECRET,
     AGENT_JWT_ALGORITHM,
     TOOL_ASSET_TOKEN_SCOPE,
@@ -72,6 +73,7 @@ from app.admin_helpers import _get_user_project_with_role
 from app.task_locking import lock_project_or_429
 from app import compute_backends as _cb
 from app import compute_image_build as _cib
+from app import reaper_sweeps as _rs
 
 logger = logging.getLogger(__name__)
 
@@ -2168,6 +2170,102 @@ async def trigger_project_compute_image_build(
 # (identical to the build path's hash computation) to detect staleness.
 
 
+async def _compute_image_build_metrics(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    registry_repo: str,
+    image_name: str,
+    *,
+    lookback_days: int = 30,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    """Aggregate operational metrics over terminal compute-image build rows.
+
+    Queries up to ``limit`` terminal (SUCCEEDED/FAILED/TIMED_OUT)
+    ``ProjectComputeImageBuild`` rows for this project/image within
+    ``lookback_days``, newest first, and computes:
+
+    - ``total_builds``, ``succeeded``, ``failed``, ``timed_out``
+    - ``success_rate``: succeeded / total (null when no builds)
+    - ``cache_hit_rate``: fraction of SUCCEEDED rows whose ``result_json``
+      records ``already_present=true`` (null when no succeeded builds)
+    - ``avg_build_seconds``: mean of ``image_published_at - started_at`` for
+      SUCCEEDED rows that have both timestamps (null when none qualify)
+    - ``in_flight_count``: PENDING + BUILDING rows (cross-checks active_builds)
+    """
+    cutoff = _utcnow() - timedelta(days=lookback_days)
+
+    terminal_rows = (
+        (
+            await session.execute(
+                select(ProjectComputeImageBuild)
+                .where(
+                    ProjectComputeImageBuild.project_id == project_id,
+                    ProjectComputeImageBuild.registry_repo == registry_repo,
+                    ProjectComputeImageBuild.image_name == image_name,
+                    ProjectComputeImageBuild.status.in_(
+                        [
+                            ComputeImageBuildStatus.SUCCEEDED,
+                            ComputeImageBuildStatus.FAILED,
+                            ComputeImageBuildStatus.TIMED_OUT,
+                        ]
+                    ),
+                    ProjectComputeImageBuild.created_at >= cutoff,
+                )
+                .order_by(ProjectComputeImageBuild.created_at.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    succeeded = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.SUCCEEDED]
+    failed = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.FAILED]
+    timed_out = [r for r in terminal_rows if r.status == ComputeImageBuildStatus.TIMED_OUT]
+    total = len(terminal_rows)
+
+    success_rate: float | None = (len(succeeded) / total) if total > 0 else None
+
+    cache_hits = sum(
+        1
+        for r in succeeded
+        if r.result_json and _json.loads(r.result_json).get("already_present")
+    )
+    cache_hit_rate: float | None = (cache_hits / len(succeeded)) if succeeded else None
+
+    durations = [
+        (r.image_published_at - r.started_at).total_seconds()
+        for r in succeeded
+        if r.started_at and r.image_published_at
+    ]
+    avg_build_seconds: float | None = (sum(durations) / len(durations)) if durations else None
+
+    in_flight_count_result = await session.execute(
+        select(func.count(ProjectComputeImageBuild.id)).where(
+            ProjectComputeImageBuild.project_id == project_id,
+            ProjectComputeImageBuild.registry_repo == registry_repo,
+            ProjectComputeImageBuild.image_name == image_name,
+            ProjectComputeImageBuild.status.in_(
+                [ComputeImageBuildStatus.PENDING, ComputeImageBuildStatus.BUILDING]
+            ),
+        )
+    )
+    in_flight_count = in_flight_count_result.scalar() or 0
+
+    return {
+        "lookback_days": lookback_days,
+        "total_builds": total,
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "timed_out": len(timed_out),
+        "success_rate": success_rate,
+        "cache_hit_rate": cache_hit_rate,
+        "avg_build_seconds": avg_build_seconds,
+        "in_flight_count": in_flight_count,
+    }
+
+
 async def _list_active_image_builds(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -2293,6 +2391,14 @@ async def get_project_compute_image_status(
     if row is None:
         return {"status": "never_built", "active_builds": active_builds}
 
+    build_metrics = await _compute_image_build_metrics(
+        session, project_id, registry_repo, image_name
+    )
+
+    build_age_hours: float | None = None
+    if row.updated_at:
+        build_age_hours = (_utcnow() - row.updated_at).total_seconds() / 3600.0
+
     result: Dict[str, Any] = {
         "status": "built",
         "pinned_ref": row.pinned_ref,
@@ -2304,6 +2410,8 @@ async def get_project_compute_image_status(
         "updated_at": row.updated_at.isoformat() if row.updated_at else None,
         "is_digest_pinned": row.digest is not None,
         "active_builds": active_builds,
+        "build_metrics": build_metrics,
+        "build_age_hours": build_age_hours,
     }
 
     if check_drift:
@@ -2408,3 +2516,30 @@ async def _compute_build_drift(
         "current_dep_hash": current_hash,
         "stored_dep_hash": stored_row.dep_hash,
     }
+
+
+@router.get("/compute-image-registry/readiness")
+async def get_compute_image_registry_readiness(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Return the GC-guard sweep's readiness signal for the compute-image registry.
+
+    The compute-image Artifact Registry has ``cleanup_policy_dry_run=true``,
+    meaning image storage grows unbounded until the operator can confirm the
+    ``inuse-`` protection-tag guard sweep is working reliably.  This endpoint
+    surfaces the machine-readable evidence accumulated since process start so
+    the operator can make the ``dry_run=false`` flip with confidence, without
+    resorting to log inspection.
+
+    Response fields mirror ``reaper_sweeps.get_compute_image_gc_guard_readiness``:
+      - **ready** (bool) — ``True`` when at least one sweep run completed with
+        protected digests and zero apply failures on the last execution.
+      - **total_runs** (int) — number of actual sweep executions since start.
+      - **consecutive_healthy_cycles** (int) — consecutive runs with zero failures.
+      - **first_run_at** / **last_run_at** — ISO-format timestamps (null before
+        first run).
+      - **last_sweep** — per-run snapshot ``{applied, pruned, apply_failed}``
+        from the most recent execution (null before first run).
+      - **cumulative** — running totals ``{applied, pruned, apply_failed}``.
+    """
+    return _rs.get_compute_image_gc_guard_readiness()

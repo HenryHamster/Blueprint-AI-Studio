@@ -125,9 +125,14 @@ _VIEWABLE_WATCH_B64 = base64.b64encode(
 # layout — unlike the repo-root ``scripts/`` dir, which is NOT copied into the
 # backend image. Loaded at import time so a missing file fails fast at startup,
 # not during live provisioning. See CLAUDE.md's base64-blob cross-language rule.
-_BUILD_TOOL_B64 = base64.b64encode(
-    (Path(__file__).parent / "compute_image_build.py").read_bytes()
-).decode("ascii")
+_BUILD_TOOL_SOURCE_PATH: Path = Path(__file__).parent / "compute_image_build.py"
+_BUILD_TOOL_B64 = base64.b64encode(_BUILD_TOOL_SOURCE_PATH.read_bytes()).decode("ascii")
+# Security invariant: the blob must contain the credential-scanner anchor string so
+# a truncated or wrong file is caught at import time, not during a live build.
+assert b"_CREDENTIAL_PATTERNS" in base64.b64decode(_BUILD_TOOL_B64), (
+    "compute_image_build.py is missing _CREDENTIAL_PATTERNS — "
+    "the orchestrator's trusted scanner is not embedded"
+)
 
 logger = logging.getLogger(__name__)
 
