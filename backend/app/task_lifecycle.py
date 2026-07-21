@@ -5669,7 +5669,7 @@ async def _process_post_commit(
                     ci_loop[
                         "ci_wait_pause_baseline"
                     ] = await pause_clock.current_baseline(session)
-                    ci_loop["ci_poll_interval"] = 10
+                    ci_loop["ci_poll_interval"] = 30
                     task.status = TaskStatus.EVALUATING
                     task.context = {**(task.context or {}), "review_loop": ci_loop}
                     if fix_reason == "ci_failure":
