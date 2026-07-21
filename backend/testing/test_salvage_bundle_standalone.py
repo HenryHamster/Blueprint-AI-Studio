@@ -248,6 +248,27 @@ Findings covered here (2-finding dispatch-eligibility / heartbeat-docker-cache s
   d2  — runner heartbeat reports docker image-cache size via image_cache_by_project alongside
         disk_free_bytes; routers/runner.py sanitizes and stores the field in runner caps
         (previously only total disk_free_bytes was reported with no per-project cache attribution)
+
+Findings covered here (19-finding release-qualification salvage bundle, 2026-07-21):
+  s19-1  — serving-only-import ImportError degrades gate (not hard-block) → already pinned by test_f20_1_*
+  s19-2  — data-dependent migration proof design; scratch replay uses schema not row data → already pinned by test_f20_2_*
+  s19-3  — encryption-key continuity: probe_key_continuity / assert_plaintext_or_raise present → already pinned by test_f20_3_* + e1/e2/e3
+  s19-4  — MultiFernet.rotate() for staged key rotation → already pinned by test_f20_4_*
+  s19-5  — fail closed on keyless/malformed encryption backfill; require_encryption_active raises → already pinned by test_f20_5_*
+  s19-6  — scratch-DB URL in QUALIFICATION_ENV, not REQUIRED_RUNTIME_ENV → already pinned by test_f20_6_*
+  s19-7  — gate-defer infra signature derived from error code only (no child failures) → already pinned by test_f20_7_*
+  s19-8  — timed-out qualifier children cancelled before state rewrite → already pinned by test_f20_8_*
+  s19-9  — _DeterministicMigrationDefect returns 'block' verdict (not defer) → already pinned by test_f20_9_*
+  s19-10 — env_preflight_enabled is an independent gate flag; absent evidence is a hard blocker → already pinned by test_f20_10_*
+  s19-11 — trigger resolver returns infra_failure_redrive for infra_failure (bespoke loops gated separately) → already pinned by test_f20_11_*
+  s19-12 — release_reconciliation references 'claiming' field for orphan containment across all paths → already pinned by test_f20_12_*
+  s19-13 — migration_apply_gate data-migration proof gate defers DML without proof declaration → already pinned by test_f20_13_*
+  s19-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview + triggerHotfixPromote → already pinned by test_f20_14_*
+  s19-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_*
+  s19-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_*
+  s19-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_*
+  s19-18 — acceptance-evidence minting runs deployed-side in release_qualifier_sweep.py → already pinned by test_f20_18_*
+  s19-19 — hotfix_promote_current_version + evaluate_hotfix_scope are operator-gated (separate from force promote) → already pinned by test_f20_19_* + test_f20_20_*
 """
 
 from __future__ import annotations
