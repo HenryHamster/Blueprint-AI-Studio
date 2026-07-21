@@ -10,6 +10,7 @@ Covers:
 """
 
 import types
+import uuid as _uuid
 
 import pytest
 
@@ -426,3 +427,420 @@ def test_is_operator_visible_correct_for_all_four_audiences():
     assert is_operator_visible(STRATEGIST_INTERNAL) is False
     assert is_operator_visible(PIPELINE_LOG) is False
     assert is_operator_visible("unknown-audience") is False
+
+
+# ---------------------------------------------------------------------------
+# DB-backed durable persistence + escalation tests
+# ---------------------------------------------------------------------------
+
+
+async def _create_test_project(session, name: str = "liveness-test") -> str:
+    """Create a minimal project row and return its string id."""
+    from app.models import Project
+
+    project = Project(name=name, user_id="liveness-test-user")
+    session.add(project)
+    await session.flush()
+    return str(project.id)
+
+
+async def _create_forward_leaked_message(
+    session,
+    project_id: str,
+    *,
+    status: str = "open",
+    audience: str | None = None,
+    message_type: str = "NOTE",
+    from_type: str = "system",
+) -> str:
+    """Create a ProjectMessage that will be detected as a forward leak.
+
+    The message has operator-visible audience filter pass-through (NULL or
+    operator-action-needed/fyi) but does NOT satisfy derive_needs_action()
+    (a NOTE with operator-action-needed audience passes derive_needs_action
+    — so we use NULL audience to fail the filter or operator-fyi which is
+    excluded by the != OPERATOR_FYI guard).
+
+    Actually, to create a forward-leaked message the liveness check will
+    detect: we need operator_visible_audience_filter to PASS (so the message
+    appears in the query) AND derive_needs_action to FAIL AND the audience
+    guard != OPERATOR_FYI to PASS.
+
+    A NOTE with audience=None passes operator_visible_audience_filter (NULL
+    is retained), fails derive_needs_action (NOTE is never needs-action),
+    and audience is not OPERATOR_FYI, so it's a forward leak.
+    """
+    from app.models import ProjectMessage
+
+    ctx = {"audience": audience} if audience else {}
+    msg = ProjectMessage(
+        project_id=_uuid.UUID(project_id),
+        from_type=from_type,
+        message_type=message_type,
+        status=status,
+        content="Test forward-leaked message",
+        context=ctx,
+    )
+    session.add(msg)
+    await session.flush()
+    return str(msg.id)
+
+
+async def _count_observations(session, project_id: str) -> int:
+    """Return the number of durable observation rows for *project_id*."""
+    from app.models import OperatorInboxLivenessObservation as OLO
+    from sqlalchemy import func as sqlfunc
+    from sqlmodel import select
+
+    result = await session.execute(
+        select(sqlfunc.count()).where(OLO.project_id == project_id)
+    )
+    return result.scalar() or 0
+
+
+async def _get_escalation_messages(session, project_id: str) -> list:
+    """Return open ProjectMessages with the persistent-leak dedupe_key."""
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    dedupe_key = f"operator_inbox_leak:{project_id}"
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == _uuid.UUID(project_id),
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+        )
+    )
+    return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_persistent_leak_escalates_once_to_strategist(db_session):
+    """Drive liveness check across >=3 flagged ticks; assert exactly ONE
+    strategist-internal escalation is created, durable observations are
+    written, and a clean tick resolves the episode.
+
+    This is the named acceptance test for the durable-persistence +
+    strategist-escalation feature (d-7c851b3f success evidence).
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+    from sqlmodel import select
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "persistent-leak-test")
+    # Create a forward-leaked message: NULL-audience NOTE that passes
+    # operator_visible_audience_filter (NULL is retained) but fails
+    # derive_needs_action (NOTE is never needs-action).
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Tick 1 — first flagged tick (not yet persistent, < 3)
+    results_1 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_1 is not None
+    flagged_1 = [r for r in results_1 if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged_1) == 1, f"Expected 1 flagged, got {flagged_1}"
+
+    # One durable observation written
+    assert await _count_observations(db_session, project_id) == 1
+
+    # No escalation yet (only 1 tick)
+    escalations_1 = await _get_escalation_messages(db_session, project_id)
+    assert len(escalations_1) == 0, "Should not escalate before persistence threshold"
+
+    # Tick 2 — second flagged tick (still not persistent)
+    results_2 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_2 is not None
+    flagged_2 = [r for r in results_2 if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged_2) == 1
+
+    assert await _count_observations(db_session, project_id) == 2
+    escalations_2 = await _get_escalation_messages(db_session, project_id)
+    assert len(escalations_2) == 0, "Should not escalate at only 2 ticks"
+
+    # Tick 3 — third flagged tick (NOW persistent: >= 3 consecutive)
+    results_3 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_3 is not None
+    flagged_3 = [r for r in results_3 if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged_3) == 1
+
+    # Three durable observations
+    assert await _count_observations(db_session, project_id) == 3
+
+    # EXACTLY ONE escalation message created
+    escalations_3 = await _get_escalation_messages(db_session, project_id)
+    assert len(escalations_3) == 1, (
+        f"Expected exactly 1 escalation at tick 3, got {len(escalations_3)}"
+    )
+    escalation = escalations_3[0]
+    assert escalation.status == "open"
+
+    # Audience is STRATEGIST_INTERNAL — never operator-visible
+    audience = (escalation.context or {}).get("audience")
+    assert audience == STRATEGIST_INTERNAL, (
+        f"Escalation audience must be strategist-internal, got {audience!r}"
+    )
+
+    # Verify the escalation content references the leak
+    assert "persistent" in (escalation.content or "").lower()
+
+    # Tick 4 — fourth flagged tick (already escalated, should be idempotent)
+    results_4 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_4 is not None
+    flagged_4 = [r for r in results_4 if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged_4) == 1
+
+    assert await _count_observations(db_session, project_id) == 4
+
+    # STILL exactly ONE escalation — no duplicates
+    escalations_4 = await _get_escalation_messages(db_session, project_id)
+    open_4 = [e for e in escalations_4 if e.status == "open"]
+    assert len(open_4) == 1, (
+        f"Expected exactly 1 OPEN escalation after tick 4, got {len(open_4)} "
+        f"(total messages with dedupe_key: {len(escalations_4)})"
+    )
+
+    # Now clean up: remove the forward-leaked message so the project is clean.
+    # Tick 5 — clean tick (no forward-leaked messages → status "ok")
+    from app.models import ProjectMessage
+    leak_msgs = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == _uuid.UUID(project_id),
+                ProjectMessage.message_type == "NOTE",
+                ProjectMessage.from_type == "system",
+            )
+        )
+    ).scalars().all()
+    for m in leak_msgs:
+        if (m.context or {}).get("audience") is None and m.status == "open":
+            m.status = "resolved"
+            m.resolution = "test-cleanup"
+            db_session.add(m)
+    await db_session.flush()
+
+    # Tick 5 — should now be "ok" (no forward leaks)
+    results_5 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results_5 is not None
+    proj_5 = [r for r in results_5 if r.project_id == project_id]
+    # After resolving the leak message, we expect status "ok"
+    if proj_5:
+        assert proj_5[0].status in ("ok", "skipped"), (
+            f"Expected ok/skipped after cleanup, got {proj_5[0].status}"
+        )
+
+    # The escalation should now be resolved
+    await db_session.refresh(escalation)
+    assert escalation.status == "resolved", (
+        f"Escalation should be resolved after clean tick, got status={escalation.status!r}"
+    )
+    assert escalation.resolution == "auto-resolved (clean tick)"
+
+    # Now re-introduce a leak and verify a NEW escalation is created
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Tick 6 — start of new episode (1st flagged tick after clean break)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    # No open escalation after just 1 tick of a new episode
+    escalations_6 = await _get_escalation_messages(db_session, project_id)
+    open_6 = [e for e in escalations_6 if e.status == "open"]
+    assert len(open_6) == 0, (
+        f"Expected no open escalation after 1 tick of new episode, "
+        f"got {len(open_6)} open (would mean episode boundary was missed)"
+    )
+
+    # Tick 7 — 2nd flagged tick (still below persistence threshold of 3)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    escalations_7 = await _get_escalation_messages(db_session, project_id)
+    open_7 = [e for e in escalations_7 if e.status == "open"]
+    assert len(open_7) == 0, (
+        f"Expected no open escalation after 2 ticks of new episode, "
+        f"got {len(open_7)} open (would mean episode boundary was missed)"
+    )
+
+    # Tick 8 — 3rd flagged tick, persistence threshold reached again
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+
+    # A NEW escalation should exist (the old one is resolved, so a fresh open one)
+    all_escalations = await _get_escalation_messages(db_session, project_id)
+    open_escalations = [e for e in all_escalations if e.status == "open"]
+    assert len(open_escalations) == 1, (
+        f"Expected exactly 1 OPEN escalation for new episode, "
+        f"got {len(open_escalations)} open, {len(all_escalations)} total"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_durable_observation_written_for_flagged_project(db_session):
+    """A single flagged tick writes one durable observation row."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "durable-obs-test")
+    await _create_forward_leaked_message(db_session, project_id)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+    flagged = [r for r in results if r.project_id == project_id and r.status == "flagged"]
+    assert len(flagged) == 1
+
+    count = await _count_observations(db_session, project_id)
+    assert count == 1, f"Expected 1 durable observation, got {count}"
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_no_escalation_below_persistence_threshold(db_session):
+    """No escalation message is created when a project has fewer than 3
+    consecutive flagged ticks."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "below-threshold-test")
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Two ticks — below the threshold of 3
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+
+    escalations = await _get_escalation_messages(db_session, project_id)
+    assert len(escalations) == 0, (
+        f"No escalation expected below threshold, got {len(escalations)}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_clean_tick_resolves_open_escalation(db_session):
+    """A clean tick (no forward leaks) resolves an existing open escalation."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "clean-resolve-test")
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Three ticks to trigger persistence and escalation
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+
+    # Escalation should exist and be open
+    escalations = await _get_escalation_messages(db_session, project_id)
+    assert len(escalations) == 1
+    assert escalations[0].status == "open"
+
+    # Resolve the forward-leaked message to make the project clean
+    leak_msgs = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == _uuid.UUID(project_id),
+                ProjectMessage.message_type == "NOTE",
+                ProjectMessage.from_type == "system",
+            )
+        )
+    ).scalars().all()
+    for m in leak_msgs:
+        if (m.context or {}).get("audience") is None and m.status == "open":
+            m.status = "resolved"
+            m.resolution = "test-cleanup"
+            db_session.add(m)
+    await db_session.flush()
+
+    # Clean tick — should resolve the escalation
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+    proj = [r for r in results if r.project_id == project_id]
+    if proj:
+        assert proj[0].status in ("ok", "skipped")
+
+    # Re-fetch — escalation should be resolved
+    await db_session.refresh(escalations[0])
+    assert escalations[0].status == "resolved"
+    assert escalations[0].resolution == "auto-resolved (clean tick)"
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_escalation_event_type_is_strategist_internal(db_session):
+    """The 'operator_inbox_leak_persistent' event type resolves to
+    STRATEGIST_INTERNAL and never reaches the operator channel."""
+    from app.message_audience import STRATEGIST_INTERNAL, OPERATOR_ACTION_NEEDED, route_event
+    from app.message_audience import is_operator_visible
+
+    # Verify the event type is registered as STRATEGIST_INTERNAL
+    audience = route_event("operator_inbox_leak_persistent")
+    assert audience == STRATEGIST_INTERNAL, (
+        f"Expected STRATEGIST_INTERNAL, got {audience!r}"
+    )
+    assert not is_operator_visible(audience), (
+        "operator_inbox_leak_persistent must NOT be operator-visible"
+    )
+    # Also verify it's not accidentally operator-action-needed
+    assert audience != OPERATOR_ACTION_NEEDED, (
+        "Escalation must not create operator-facing noise"
+    )
+
+
+@pytest.mark.asyncio
+async def test_observability_endpoint_includes_durable_data(
+    client: AsyncClient, db_session
+):
+    """The liveness endpoint returns durable_observations and open_episodes keys
+    alongside the existing in-memory snapshot keys."""
+    import app.operator_inbox_liveness as _liveness_mod
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "endpoint-durable-test")
+    await _create_forward_leaked_message(db_session, project_id)
+
+    # Run enough ticks to trigger escalation so there's an open episode
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+
+    response = await client.get("/api/admin/operator-inbox-liveness")
+    assert response.status_code == 200
+    data = response.json()
+
+    # Backward-compatible keys still present
+    assert "total_ticks" in data
+    assert "total_forward_leaked" in data
+    assert "recent_ticks" in data
+
+    # New durable keys present
+    assert "durable_observations" in data, "Missing durable_observations key"
+    assert isinstance(data["durable_observations"], list)
+    assert "open_episodes" in data, "Missing open_episodes key"
+    assert isinstance(data["open_episodes"], list)
+
+    # At least one durable observation for our project
+    assert any(
+        obs["project_id"] == project_id for obs in data["durable_observations"]
+    ), f"No durable observation found for {project_id}"
+
+    # Open episode for our project should exist (persistence threshold reached)
+    assert any(
+        ep.get("project_id") == project_id for ep in data["open_episodes"]
+    ), f"No open episode found for {project_id}"
+
+    _liveness_mod._reset_liveness_for_tests()

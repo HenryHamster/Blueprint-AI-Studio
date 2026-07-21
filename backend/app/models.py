@@ -5990,3 +5990,57 @@ class NotificationDeadLetter(SQLModel, table=True):
             text("created_at desc"),
         ),
     )
+
+
+class OperatorInboxLivenessObservation(SQLModel, table=True):
+    """Durable record of one operator-inbox liveness tick for a measured project.
+
+    Written once per tick for EVERY measured project (all statuses:
+    ``"flagged"``, ``"ok"``, ``"skipped"``) so non-flagged rows break the
+    consecutive flagged chain and episode boundaries are detected correctly.
+    When a project goes [flagged×3, clean, flagged], the clean-tick row
+    separates the two episodes and escalation only fires after >= 3 NEW
+    consecutive flagged ticks.  Without clean-tick rows the DB sees an
+    unbroken flagged sequence and escalates on the first flagged tick of the
+    new episode.
+
+    Modeled on :class:`NotificationDeadLetter` (durable record of an ephemeral
+    in-memory signal) so the liveness signal survives restart.
+    """
+
+    __tablename__ = "operator_inbox_liveness_observation"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    status: str = Field(
+        sa_column=Column(String(16), nullable=False, server_default=text("'flagged'"))
+    )
+    forward_leaked: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    badge_invisible: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    info_alert_noise: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    detail: str = Field(default="", sa_column=Column(Text, nullable=False))
+    tick_number: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Composite index for the common query pattern:
+    #   SELECT ... WHERE project_id = ? ORDER BY created_at DESC LIMIT ?
+    # Used by persistence-detection to read the last N ticks for a project.
+    __table_args__ = (
+        Index(
+            "ix_olo_project_id_created_at_desc",
+            "project_id",
+            text("created_at desc"),
+        ),
+    )
+

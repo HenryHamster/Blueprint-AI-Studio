@@ -23,11 +23,14 @@ Registered as a standing reaper step (``sweep_operator_inbox_liveness`` in
 * ``info_alert_noise`` — undismissed INFO-severity, operator-visible Alerts in
   the alert channel.  Bookkeeping notices inflating the operator alert badge.
 
-Pure read-only: this module never writes to ``ProjectMessage`` or ``Alert``.
+Writes durable observation rows for every flagged project so the signal
+survives restart, and escalates persistent leaks (>= 3 consecutive flagged
+hourly ticks) to the strategist surface exactly once per episode.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections import deque
 from datetime import datetime
@@ -50,6 +53,17 @@ _total_forward_leaked: int = 0
 _total_badge_invisible: int = 0
 _total_info_alert_noise: int = 0
 
+# ── Persistence / escalation constants ────────────────────────────────────
+
+_PERSISTENCE_THRESHOLD = 3
+"""Number of consecutive hourly flagged ticks required to treat a leak as persistent."""
+
+_DEDUPE_KEY_PREFIX = "operator_inbox_leak:"
+"""Stable dedupe-key prefix for once-per-episode strategist escalation."""
+
+_ESCALATION_EVENT_TYPE = "operator_inbox_leak_persistent"
+"""Event type registered as STRATEGIST_INTERNAL — never reaches the operator channel."""
+
 
 class LivenessResult(NamedTuple):
     """One per-project result from a liveness check run."""
@@ -60,6 +74,221 @@ class LivenessResult(NamedTuple):
     badge_invisible: int
     info_alert_noise: int
     detail: str
+
+
+# ── Durable persistence helpers ────────────────────────────────────────────
+
+
+async def _persist_observation(
+    session: Any,
+    result: LivenessResult,
+    tick_number: int,
+    now: datetime,
+) -> None:
+    """Write one durable observation row for a measured project.
+
+    Written for EVERY measured project — not only flagged ones — so that
+    non-flagged rows (status ``"ok"`` / ``"skipped"``) break the consecutive
+    flagged chain in ``_count_consecutive_flagged`` and correctly detect
+    episode boundaries when a project goes [flagged×3, clean, flagged].
+    Without clean-tick rows the DB sees an unbroken sequence of flagged rows
+    and escalates on the *first* flagged tick of a new episode instead of
+    waiting for >= 3 NEW consecutive flagged ticks.
+
+    Error-isolated: a persistence failure is caught and logged but never
+    propagated — this is a best-effort durable write; the in-memory signal
+    and the warning log line are the fallback channel.
+    """
+    try:
+        from app.models import OperatorInboxLivenessObservation
+
+        row = OperatorInboxLivenessObservation(
+            project_id=result.project_id,
+            status=result.status,
+            forward_leaked=result.forward_leaked,
+            badge_invisible=result.badge_invisible,
+            info_alert_noise=result.info_alert_noise,
+            detail=result.detail,
+            tick_number=tick_number,
+            created_at=now,
+        )
+        session.add(row)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to persist observation for %s",
+            result.project_id,
+            exc_info=True,
+        )
+
+
+async def _count_consecutive_flagged(
+    session: Any,
+    project_id: str,
+) -> int:
+    """Return the number of consecutive most-recent 'flagged' observation rows.
+
+    Queries the durable table for the last N rows ordered by created_at DESC
+    and counts from the top until a non-flagged row is found.  The result
+    tells us how many consecutive ticks this project has been leaking.
+
+    Error-isolated: returns 0 on any query failure so the reaper cycle
+    continues uninterrupted.
+    """
+    try:
+        from app.models import OperatorInboxLivenessObservation as OLO
+
+        rows = (
+            await session.execute(
+                select(OLO.status)
+                .where(OLO.project_id == project_id)
+                .order_by(OLO.created_at.desc())
+                .limit(_PERSISTENCE_THRESHOLD + 2)
+            )
+        ).scalars().all()
+
+        consecutive = 0
+        for status in rows:
+            if status == "flagged":
+                consecutive += 1
+            else:
+                break
+        return consecutive
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to count consecutive flagged for %s",
+            project_id,
+            exc_info=True,
+        )
+        return 0
+
+
+async def _find_open_escalation(
+    session: Any,
+    project_id: str,
+) -> Any:
+    """Return an open escalation message for *project_id*, or None.
+
+    Matches on ``context['dedupe_key']`` — the stable key stamped at
+    creation time.  Any open message (any type, any surface) that still
+    carries the key is treated as the live episode marker.
+    """
+    try:
+        from app.models import ProjectMessage
+
+        dedupe_key = f"{_DEDUPE_KEY_PREFIX}{project_id}"
+        result = await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == "open",
+                # JSONB path accessor — NULL context never matches.
+                ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Dedup lookup failed for %s",
+            project_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _escalate_persistent_leak(
+    session: Any,
+    result: LivenessResult,
+) -> None:
+    """Escalate a persistent leak to the strategist surface.
+
+    Called when a project has >= _PERSISTENCE_THRESHOLD consecutive flagged
+    observations.  Creates exactly ONE strategist-internal ProjectMessage per
+    episode via a stable dedupe_key; subsequent persistent ticks for the same
+    episode are no-ops.
+
+    Error-isolated: a failure here is caught and logged — the reaper cycle
+    must never crash on a failed escalation.
+    """
+    try:
+        existing = await _find_open_escalation(session, result.project_id)
+        if existing is not None:
+            # Already escalated — update the detail on the still-open message.
+            ctx = dict(existing.context or {})
+            ctx["forward_leaked"] = result.forward_leaked
+            ctx["info_alert_noise"] = result.info_alert_noise
+            ctx["tick_number"] = _total_ticks
+            existing.content = (
+                f"[OPERATOR_INBOX_LIVENESS] Persistent operator-inbox leak "
+                f"detected for project {result.project_id} "
+                f"(forward_leaked={result.forward_leaked}, "
+                f"info_alert_noise={result.info_alert_noise}). "
+                f"Consecutive flagged ticks >= {_PERSISTENCE_THRESHOLD}. "
+                f"Detail: {result.detail[:500]}"
+            )
+            existing.context = ctx
+            session.add(existing)
+            return
+
+        # First time this episode — create the strategist-internal escalation.
+        from app.notification_dispatch import post_event_message
+        import uuid as _uuid
+
+        dedupe_key = f"{_DEDUPE_KEY_PREFIX}{result.project_id}"
+        summary = (
+            f"Persistent operator-inbox leak detected for project {result.project_id}: "
+            f"{result.forward_leaked} forward-leaked message(s), "
+            f"{result.info_alert_noise} INFO alert noise. "
+            f"Consecutive flagged ticks >= {_PERSISTENCE_THRESHOLD} — "
+            f"the chat/messages redesign's success criterion may be violated. "
+            f"Detail: {result.detail[:500]}"
+        )
+        ctx = {
+            "forward_leaked": result.forward_leaked,
+            "info_alert_noise": result.info_alert_noise,
+            "tick_number": _total_ticks,
+            "dedupe_key": dedupe_key,
+        }
+        await post_event_message(
+            session,
+            project_id=_uuid.UUID(result.project_id),
+            event_type=_ESCALATION_EVENT_TYPE,
+            summary=summary,
+            context=ctx,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to escalate persistent leak for %s",
+            result.project_id,
+            exc_info=True,
+        )
+
+
+async def _resolve_open_escalation(
+    session: Any,
+    project_id: str,
+) -> None:
+    """Resolve any open persistent-leak escalation for *project_id*.
+
+    Called when a tick shows the project is clean (no leak detected), so the
+    episode closes and a genuinely NEW future leak can escalate again.
+    """
+    try:
+        existing = await _find_open_escalation(session, project_id)
+        if existing is None:
+            return
+        existing.status = "resolved"
+        existing.resolution = "auto-resolved (clean tick)"
+        session.add(existing)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to resolve escalation for %s",
+            project_id,
+            exc_info=True,
+        )
+
+
+# ── Main liveness check ────────────────────────────────────────────────────
 
 
 async def run_operator_inbox_liveness_check(
@@ -77,6 +306,11 @@ async def run_operator_inbox_liveness_check(
 
     Never mode-gated — fires regardless of ``metrics_integrity_sweep_mode``.
     Pass ``_force=True`` in tests to bypass the cadence gate.
+
+    Persists durable observation rows for every flagged project and escalates
+    persistent leaks (>= 3 consecutive flagged hourly ticks) exactly once per
+    episode to the strategist surface.  A clean tick auto-resolves the episode
+    so a genuinely new leak can escalate again.
     """
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise
@@ -232,6 +466,44 @@ async def run_operator_inbox_liveness_check(
             _total_ticks,
             len(results),
         )
+
+    # ── Durable persistence + escalation (post-measurement) ────────────────
+
+    flagged_project_ids = {r.project_id for r in flagged}
+
+    # Persist rows for ALL measured projects so non-flagged ("ok"/"skipped")
+    # rows break the consecutive flagged chain in _count_consecutive_flagged.
+    for result in results:
+        with contextlib.suppress(Exception):
+            await _persist_observation(session, result, _total_ticks, now)
+
+    for result in flagged:
+        with contextlib.suppress(Exception):
+            consecutive = await _count_consecutive_flagged(session, result.project_id)
+            if consecutive >= _PERSISTENCE_THRESHOLD:
+                await _escalate_persistent_leak(session, result)
+
+    # For projects that were NOT flagged this tick: resolve any open escalation.
+    # A project not present at all (skipped/empty) is NOT automatically resolved
+    # — only projects we measured as clean (status == "ok" or "skipped") close
+    # the episode.  "skipped" means no open/linked operator-visible messages at
+    # all — the leak has been fully eliminated for this project.
+    for result in results:
+        if result.status in ("ok", "skipped") and result.project_id not in flagged_project_ids:
+            with contextlib.suppress(Exception):
+                await _resolve_open_escalation(session, result.project_id)
+
+    # Commit all durable writes from this tick.  The reaper wraps this call in
+    # try/except+rollback and does NOT commit for us; we own our writes.
+    try:
+        await session.commit()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to commit durable writes",
+            exc_info=True,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
     return results
 

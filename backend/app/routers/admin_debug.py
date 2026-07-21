@@ -1931,12 +1931,19 @@ async def get_operator_inbox_liveness(
     When ``?force_run=true`` is passed, also triggers a live DB scan via
     ``run_operator_inbox_liveness_check`` (bypasses the cadence gate) and
     returns the per-project results under ``run_results``.
+
+    Adds durable observation history (``durable_observations``) and open
+    persistent-leak episodes (``open_episodes``) from the durable table.
     """
-    from app.operator_inbox_liveness import (  # noqa: PLC0415
+    from app.operator_inbox_liveness import (
         get_operator_inbox_liveness_observability,
         run_operator_inbox_liveness_check,
     )
-    from app.models import _utcnow as _ts  # noqa: PLC0415
+    from app.models import (
+        OperatorInboxLivenessObservation,
+        ProjectMessage,
+        _utcnow as _ts,
+    )
 
     snapshot = get_operator_inbox_liveness_observability()
 
@@ -1946,6 +1953,61 @@ async def get_operator_inbox_liveness(
         )
         snapshot = get_operator_inbox_liveness_observability()
         snapshot["run_results"] = [r._asdict() for r in (run_results or [])]
+
+    # ── Durable observation history (most recent N rows across all projects) ─
+    try:
+        durable_rows = (
+            await session.execute(
+                select(OperatorInboxLivenessObservation)
+                .order_by(OperatorInboxLivenessObservation.created_at.desc())
+                .limit(100)
+            )
+        ).scalars().all()
+        snapshot["durable_observations"] = [
+            {
+                "id": str(r.id),
+                "project_id": r.project_id,
+                "status": r.status,
+                "forward_leaked": r.forward_leaked,
+                "badge_invisible": r.badge_invisible,
+                "info_alert_noise": r.info_alert_noise,
+                "detail": r.detail,
+                "tick_number": r.tick_number,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in durable_rows
+        ]
+    except Exception:  # noqa: BLE001
+        snapshot["durable_observations"] = []
+
+    # ── Open persistent-leak escalation episodes ───────────────────────────
+    try:
+        dedupe_prefix = "operator_inbox_leak:"
+        open_episodes = (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.status == "open",
+                    ProjectMessage.context["dedupe_key"].as_string().like(
+                        f"{dedupe_prefix}%"
+                    ),
+                )
+                .order_by(ProjectMessage.created_at.desc())
+                .limit(50)
+            )
+        ).scalars().all()
+        snapshot["open_episodes"] = [
+            {
+                "id": str(m.id),
+                "project_id": str(m.project_id),
+                "content": m.content[:500] if m.content else "",
+                "context": m.context or {},
+                "created_at": m.created_at.isoformat() if m.created_at else None,
+            }
+            for m in open_episodes
+        ]
+    except Exception:  # noqa: BLE001
+        snapshot["open_episodes"] = []
 
     return snapshot
 

@@ -327,6 +327,11 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # strategist acts on it (re-emit the marker) but it must NEVER reach the
     # operator chat or the alert channel.
     "operator_decision.capture_rate_low": STRATEGIST_INTERNAL,
+    # operator_inbox_leak_persistent: durable persistent-leak escalation from the
+    # operator-inbox liveness audit.  Strategist-internal so a persistent
+    # forward-leak / alert-noise signal reaches the strategist surface without
+    # creating new operator-facing noise (the very bug this signal detects).
+    "operator_inbox_leak_persistent": STRATEGIST_INTERNAL,
 }
 
 # Set of audiences that reach the operator through normal channels.
