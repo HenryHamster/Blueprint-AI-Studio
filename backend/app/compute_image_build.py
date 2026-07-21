@@ -187,6 +187,31 @@ _BARE_MANIFEST_FALLBACKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = 
         ("composer.lock",),
         ("composer.json",),
     ),
+    # Elixir: hash mix.exs when mix.lock absent
+    (
+        ("mix.lock",),
+        ("mix.exs",),
+    ),
+    # Dart/Flutter: hash pubspec.yaml when pubspec.lock absent
+    (
+        ("pubspec.lock",),
+        ("pubspec.yaml",),
+    ),
+    # Swift PM: hash Package.swift when Package.resolved absent
+    (
+        ("Package.resolved",),
+        ("Package.swift",),
+    ),
+    # Julia: hash Project.toml when Manifest.toml absent
+    (
+        ("Manifest.toml",),
+        ("Project.toml",),
+    ),
+    # Haskell Stack: hash stack.yaml when stack.yaml.lock absent
+    (
+        ("stack.yaml.lock",),
+        ("stack.yaml",),
+    ),
 )
 
 

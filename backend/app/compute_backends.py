@@ -4009,6 +4009,21 @@ _DEFAULT_DEP_FILES = (
     "build.gradle.kts",
     # PHP
     "composer.lock",
+    # Elixir
+    "mix.lock",
+    # Dart/Flutter
+    "pubspec.lock",
+    # .NET/NuGet
+    "packages.lock.json",
+    # Swift PM
+    "Package.resolved",
+    # Julia
+    "Manifest.toml",
+    # Scala sbt (no universal lockfile; hash the manifest directly)
+    "build.sbt",
+    # Haskell Stack / Cabal
+    "stack.yaml.lock",
+    "cabal.project.freeze",
 )
 
 

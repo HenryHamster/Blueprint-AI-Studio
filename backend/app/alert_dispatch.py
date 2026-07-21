@@ -2110,6 +2110,69 @@ async def _maybe_create_compute_image_drift_deferred_alert(
     return True
 
 
+# ── Live Cloud Build lane failure alert ───────────────────────────────────────
+
+# Stable title for the per-project live-lane refresh failure alert.
+# Keyed to project_id so repeated failures in the same sweep cycle
+# deduplicate to exactly ONE open alert per project.
+_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX = (
+    "Compute image refresh failed: "
+)
+
+
+async def _maybe_create_compute_image_refresh_failure_alert(
+    session: AsyncSession,
+    project_id: "object",
+    *,
+    error_reason: str,
+) -> bool:
+    """Create a deduplicated ERROR alert when the live Cloud Build refresh
+    lane returns a failure status for a project's compute image.
+
+    Deduplicated on a STABLE title keyed to ``project_id`` so a project
+    whose refresh consistently errors raises exactly ONE open alert until
+    an operator dismisses it. Returns ``True`` when a NEW alert was
+    created, ``False`` when dedup short-circuited.
+    """
+    title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project_id)[:64]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    reason_label = (error_reason or "(unknown)")[:256]
+    message = (
+        f"The compute-image auto-refresh for project {project_id} failed. "
+        f"Reason: {reason_label}. "
+        f"Authoring agents and compute jobs may use a stale or missing image "
+        f"until the build is retried."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="compute.image_refresh_failure",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 # Stable title for the per-project compute-image build failure alert.
 # Kept CONSTANT per (project_id, image_name) so a build that fails and
 # is retried deduplicates to exactly ONE open alert; the dep_hash and

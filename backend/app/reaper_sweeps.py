@@ -2602,6 +2602,9 @@ async def _load_gc_guard_state_from_db(session) -> None:
         logger.exception("_load_gc_guard_state_from_db: failed to restore GC-guard state")
 
 
+# Result of the last DB-pin reconciliation sweep (None until first run).
+_gc_guard_last_reconciliation: dict[str, Any] | None = None
+
 # Deduped operator-alert title raised when the GC-protection sweep FAILS to apply
 # an ``inuse-`` tag. The registry helper is fail-open (returns None on a missing
 # gcloud binary / Artifact Registry API error / non-zero exit), so a failed apply
@@ -3128,6 +3131,76 @@ async def sweep_protect_referenced_compute_image_digests(
     }
 
 
+async def sweep_reconcile_gc_guard_db_pins(
+    session,
+    *,
+    _list_tags=None,
+) -> dict[str, Any]:
+    """Reconcile DB-pinned compute-image digests against inuse- registry tags.
+
+    For each built ``ProjectComputeImage`` row with a digest, verify that its
+    deterministic ``inuse-<shorthash>`` protection tag is present in the
+    Artifact Registry.  Any pinned digest whose tag is absent belongs to the
+    would-delete set and is returned as a blocking risk finding.
+
+    Returns a dict with:
+      - **risk_findings** — list of ``{project_id, repo, digest, missing_tag}``
+        for every DB-pinned digest unprotected in the registry.
+      - **clean** — ``True`` iff the would-delete set is disjoint from
+        DB-pinned digests (no risk findings).
+
+    Stores the result in ``_gc_guard_last_reconciliation`` so
+    :func:`get_compute_image_gc_guard_readiness` can surface it.
+    """
+    global _gc_guard_last_reconciliation
+    from app.compute_image_build import (
+        list_registry_protection_tags,
+        protection_tag_for_digest,
+    )
+    from app.models import ProjectComputeImage
+
+    list_tags_fn = _list_tags or list_registry_protection_tags
+
+    rows = (
+        await session.execute(
+            select(ProjectComputeImage).where(
+                ProjectComputeImage.built.is_(True),
+                ProjectComputeImage.digest.is_not(None),
+            )
+        )
+    ).scalars().all()
+
+    by_repo: dict[str, list[tuple[str | None, str, str]]] = {}
+    for img in rows:
+        if not img.digest or not img.registry_repo or not img.image_name:
+            continue
+        repo = f"{img.registry_repo}/{img.image_name}"
+        by_repo.setdefault(repo, []).append(
+            (str(img.project_id) if img.project_id else None, img.digest, protection_tag_for_digest(img.digest))
+        )
+
+    risk_findings: list[dict[str, str | None]] = []
+    for repo, entries in sorted(by_repo.items()):
+        try:
+            existing = set(await asyncio.to_thread(list_tags_fn, repo))
+        except Exception:  # noqa: BLE001 — fail open: skip this repo on error
+            continue
+        for project_id, digest, expected_tag in entries:
+            if expected_tag not in existing:
+                risk_findings.append(
+                    {
+                        "project_id": project_id,
+                        "repo": repo,
+                        "digest": digest,
+                        "missing_tag": expected_tag,
+                    }
+                )
+
+    result: dict[str, Any] = {"risk_findings": risk_findings, "clean": not risk_findings}
+    _gc_guard_last_reconciliation = result
+    return result
+
+
 def get_compute_image_gc_guard_readiness() -> dict[str, Any]:
     """Return observed GC-guard sweep state for operator readiness assessment.
 
@@ -3148,6 +3221,12 @@ def get_compute_image_gc_guard_readiness() -> dict[str, Any]:
       - **first_run_at** / **last_run_at** — ISO-format timestamps.
       - **last_sweep** — per-run snapshot ``{applied, pruned, apply_failed}``.
       - **cumulative** — running totals ``{applied, pruned, apply_failed}``.
+      - **reconciliation** — result of the last
+        :func:`sweep_reconcile_gc_guard_db_pins` run, or ``None`` if that
+        sweep has never executed.  ``reconciliation["clean"]`` is ``True``
+        when the would-delete set is disjoint from DB-pinned digests, making
+        it the machine signal the operator should check before flipping
+        ``cleanup_policy_dry_run=false``.
     """
     is_healthy = (
         _gc_guard_last_result is not None
@@ -3170,6 +3249,9 @@ def get_compute_image_gc_guard_readiness() -> dict[str, Any]:
             "pruned": _gc_guard_total_pruned,
             "apply_failed": _gc_guard_total_apply_failed,
         },
+        "reconciliation": dict(_gc_guard_last_reconciliation)
+        if _gc_guard_last_reconciliation is not None
+        else None,
     }
 
 
@@ -3370,6 +3452,22 @@ async def sweep_refresh_project_compute_images(
                 )
         else:  # "error" or an unrecognized status
             summary["errors"] += 1
+            try:
+                from app.alert_dispatch import (
+                    _maybe_create_compute_image_refresh_failure_alert,
+                )
+
+                await _maybe_create_compute_image_refresh_failure_alert(
+                    session,
+                    project_id,
+                    error_reason=(result or {}).get("error", "unknown"),
+                )
+            except Exception:  # noqa: BLE001 — alert is best-effort
+                logger.warning(
+                    "[REAPER] compute-image refresh-failure alert failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
 
     if (
         summary["rebuilt"]
@@ -3604,6 +3702,7 @@ __all__ = [
     "sweep_wake_delivery_stall_alerts",
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
+    "sweep_reconcile_gc_guard_db_pins",
     "get_compute_image_gc_guard_readiness",
     "sweep_refresh_project_compute_images",
     "sweep_silent_runner_compute_jobs",

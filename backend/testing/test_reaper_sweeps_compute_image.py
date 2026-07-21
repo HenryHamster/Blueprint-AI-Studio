@@ -36,6 +36,7 @@ from app.reaper_sweeps import (
     _split_pinned_ref,
     get_compute_image_gc_guard_readiness,
     sweep_protect_referenced_compute_image_digests,
+    sweep_reconcile_gc_guard_db_pins,
     sweep_refresh_project_compute_images,
 )
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -2203,6 +2204,84 @@ async def test_deferred_alert_deduped_on_second_sweep(db):
     assert len(alerts) == 1, "open deferred-drift alert must be deduped, not duplicated"
 
 
+# ── Live-lane refresh-failure alert tests ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_error_status_creates_refresh_failure_alert(db):
+    """An 'error' sweep result fires a deduplicated ERROR alert for the operator."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+    error_msg = "Remote compute-image build is not configured"
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "error", "error": error_msg}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["errors"] == 1
+    expected_title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project.id)[:64]}"
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == expected_title,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one refresh-failure alert expected on error status"
+    assert alerts[0].severity == AlertSeverity.ERROR
+    assert error_msg in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_error_status_refresh_failure_alert_deduped(db):
+    """A second error sweep while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "error", "error": "build misconfigured"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    expected_title = f"{_COMPUTE_IMAGE_REFRESH_FAILURE_ALERT_TITLE_PREFIX}{str(project.id)[:64]}"
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == expected_title,
+                Alert.dismissed_at.is_(None),
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "open refresh-failure alert must be deduped, not duplicated"
+
+
 @pytest.mark.asyncio
 async def test_deferred_no_alert_when_dep_hash_missing(db):
     """A 'deferred' result missing dep_hash still works (belt-and-suspenders)."""
@@ -2443,6 +2522,7 @@ class TestComputeImageGcGuardReadiness:
         # trigger an unexpected DB query.  Tests that exercise the load path
         # explicitly flip this back to False.
         _rs._gc_guard_state_loaded_from_db = True
+        _rs._gc_guard_last_reconciliation = None
         yield
 
     @pytest.mark.asyncio
@@ -2459,6 +2539,7 @@ class TestComputeImageGcGuardReadiness:
         assert state["cumulative"]["applied"] == 0
         assert state["cumulative"]["pruned"] == 0
         assert state["cumulative"]["apply_failed"] == 0
+        assert state["reconciliation"] is None
 
     @pytest.mark.asyncio
     async def test_readiness_after_successful_sweep(self, db):
@@ -2679,4 +2760,90 @@ class TestComputeImageGcGuardReadiness:
         assert readiness["total_runs"] == 2
         assert readiness["consecutive_healthy_cycles"] == 2
         assert readiness["ready"] is True
+
+
+# ── DB-pin reconciliation ─────────────────────────────────────────────────────
+
+
+class TestGcGuardDbPinReconciliation:
+    """Tests for sweep_reconcile_gc_guard_db_pins.
+
+    Verifies that every DB-pinned, still-referenced compute-image digest that
+    lacks an inuse- protection tag is surfaced as a blocking risk finding, and
+    that the clean signal is only True when the would-delete set is disjoint
+    from DB-pinned digests.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_reconciliation_state(self):
+        import app.reaper_sweeps as _rs
+
+        _rs._gc_guard_last_reconciliation = None
+        yield
+
+    @pytest.mark.asyncio
+    async def test_all_pinned_digests_protected_is_clean(self, db):
+        """clean=True when every DB-pinned digest has its inuse- tag in the registry."""
+        from app.compute_image_build import protection_tag_for_digest
+
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [protection_tag_for_digest(_DIGEST_A)],
+        )
+
+        assert result["clean"] is True
+        assert result["risk_findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_unprotected_pin_is_risk_finding(self, db):
+        """A DB-pinned digest missing its inuse- tag appears as a blocking risk finding."""
+        from app.compute_image_build import protection_tag_for_digest
+
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],  # no protection tags in registry
+        )
+
+        assert result["clean"] is False
+        assert len(result["risk_findings"]) == 1
+        finding = result["risk_findings"][0]
+        assert finding["digest"] == _DIGEST_A
+        assert finding["missing_tag"] == protection_tag_for_digest(_DIGEST_A)
+        assert finding["project_id"] == str(project.id)
+        assert _FULL_REPO in finding["repo"]
+
+    @pytest.mark.asyncio
+    async def test_no_built_images_is_clean(self, db):
+        """An empty ProjectComputeImage table yields clean=True with no risk findings."""
+        result = await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],
+        )
+
+        assert result["clean"] is True
+        assert result["risk_findings"] == []
+
+    @pytest.mark.asyncio
+    async def test_reconciliation_stored_in_readiness_getter(self, db):
+        """get_compute_image_gc_guard_readiness surfaces the last reconciliation result."""
+        project = await _make_project(db)
+        await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+        assert get_compute_image_gc_guard_readiness()["reconciliation"] is None
+
+        await sweep_reconcile_gc_guard_db_pins(
+            db,
+            _list_tags=lambda repo: [],  # unprotected
+        )
+
+        state = get_compute_image_gc_guard_readiness()
+        assert state["reconciliation"] is not None
+        assert state["reconciliation"]["clean"] is False
+        assert len(state["reconciliation"]["risk_findings"]) == 1
 

@@ -18733,6 +18733,11 @@ def test_bare_manifest_fallback_files_all_lockfiles_present_returns_nothing():
         "Gemfile.lock",
         "gradle.lockfile",
         "composer.lock",
+        "mix.lock",
+        "pubspec.lock",
+        "Package.resolved",
+        "Manifest.toml",
+        "stack.yaml.lock",
     ])
     result = _bci.bare_manifest_fallback_files(all_lockfiles)
     assert result == []
@@ -18814,6 +18819,52 @@ def test_default_dep_files_includes_rust_go_ruby_jvm_php():
     assert "build.gradle" in _DEFAULT_DEP_FILES
     assert "build.gradle.kts" in _DEFAULT_DEP_FILES
     assert "composer.lock" in _DEFAULT_DEP_FILES
+
+
+def test_default_dep_files_includes_long_tail_ecosystems():
+    """_DEFAULT_DEP_FILES covers long-tail ecosystem lockfiles (Elixir/Dart/Swift/.NET/Julia/Scala/Haskell)."""
+    from app.compute_backends import _DEFAULT_DEP_FILES
+
+    assert "mix.lock" in _DEFAULT_DEP_FILES
+    assert "pubspec.lock" in _DEFAULT_DEP_FILES
+    assert "packages.lock.json" in _DEFAULT_DEP_FILES
+    assert "Package.resolved" in _DEFAULT_DEP_FILES
+    assert "Manifest.toml" in _DEFAULT_DEP_FILES
+    assert "build.sbt" in _DEFAULT_DEP_FILES
+    assert "stack.yaml.lock" in _DEFAULT_DEP_FILES
+    assert "cabal.project.freeze" in _DEFAULT_DEP_FILES
+
+
+def test_long_tail_lockfile_changes_hash(tmp_path):
+    """mix.lock/pubspec.lock/packages.lock.json/Package.resolved/Manifest.toml trigger a rebuild.
+
+    Acceptance: changing one of these lockfiles in a project with no other lockfile
+    yields a different compute_dependency_hash; an unrelated file change does not.
+    """
+    from app.compute_backends import _discover_dep_files
+
+    lockfiles = [
+        ("mix.lock", b"# mix lock v1\n", b"# mix lock v2\n"),
+        ("pubspec.lock", b"# pubspec lock v1\n", b"# pubspec lock v2\n"),
+        ("packages.lock.json", b'{"v1": 1}\n', b'{"v2": 2}\n'),
+        ("Package.resolved", b'{"v1": 1}\n', b'{"v2": 2}\n'),
+        ("Manifest.toml", b"# manifest v1\n", b"# manifest v2\n"),
+    ]
+    for filename, content_a, content_b in lockfiles:
+        p = tmp_path / filename
+        p.write_bytes(content_a)
+        files_a = _discover_dep_files(str(tmp_path))
+        assert filename in files_a, f"_discover_dep_files missed {filename}"
+
+        h_a = _bci.compute_dependency_hash(
+            _bci.assemble_fingerprint_inputs(b"FROM x\n", {filename: content_a})
+        )
+        h_b = _bci.compute_dependency_hash(
+            _bci.assemble_fingerprint_inputs(b"FROM x\n", {filename: content_b})
+        )
+        assert h_a != h_b, f"hash did not change when {filename} changed"
+
+        p.unlink()
 
 
 def test_discover_dep_files_rust_project(tmp_path):
