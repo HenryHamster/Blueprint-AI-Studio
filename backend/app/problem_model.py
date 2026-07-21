@@ -2877,12 +2877,38 @@ def apply_agent_update(
     # agent sees. They are not part of the durable model (extra="forbid" would
     # reject them), so lift them out before validation. ``_agent_view_floor_applied``
     # drives floor-aware field preservation below; ``_gap_memory_trimmed`` is
-    # purely informational and discarded.
+    # purely informational and discarded. ``truncated`` is injected by the
+    # byte-budget packer when a value is truncated — strip it here so an agent
+    # that echoes back a truncated view does not produce a permanent 400.
     floor_applied = proposed_raw.pop("_agent_view_floor_applied", None)
     proposed_raw.pop("_gap_memory_trimmed", None)
+    proposed_raw.pop("truncated", None)
 
     proposed = ProblemModel.model_validate(proposed_raw)
-    current = parse_problem_model(current_raw)
+    # Sanitize current_raw before validation: strip any extra top-level key that
+    # ProblemModel (extra="forbid") would reject. A poisoned stored row — e.g.
+    # one that carries a stale "truncated": true packer marker — otherwise wedges
+    # every subsequent agent write permanently with 400. Stripping unknown keys
+    # is safe: model_dump() never emits them, so they were never durable state.
+    # Known underscore-prefixed directives (_deletions, _compactions, …) are
+    # already lifted above from proposed_raw; current_raw should never carry
+    # them, but strip them here too as a belt-and-suspenders guard.
+    _known_model_keys = set(ProblemModel.model_fields)
+    _current_sanitized: dict = {}
+    _stripped_keys: list[str] = []
+    for _k, _v in (current_raw or {}).items():
+        if _k in _known_model_keys:
+            _current_sanitized[_k] = _v
+        else:
+            _stripped_keys.append(_k)
+    if _stripped_keys:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "apply_agent_update: stripped unknown top-level keys from stored "
+            "problem_model before parse (self-heal): %s",
+            sorted(_stripped_keys),
+        )
+    current = parse_problem_model(_current_sanitized if _stripped_keys else current_raw)
 
     # user_purpose is a durable operator-owned copy of the purpose; agents must
     # never change it (it is set exclusively by apply_user_intent_patch). Restore
