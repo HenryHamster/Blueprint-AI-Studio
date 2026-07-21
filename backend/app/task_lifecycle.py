@@ -3304,7 +3304,7 @@ async def _process_post_commit(
                         else:
                             _use_blind = bool(
                                 _runtime_config.get(
-                                    "blind_multi_reviewer_gate_enabled", False
+                                    "blind_multi_reviewer_gate_enabled", True
                                 )
                             )
                             if _use_blind:

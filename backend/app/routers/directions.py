@@ -439,7 +439,7 @@ async def add_direction(
 
     from app.shared_state import runtime_config as _runtime_config
 
-    max_active = _runtime_config.get("max_active_directions", 5)
+    max_active = _runtime_config.get("max_active_directions", 10)
 
     # Normalize idempotency key: strip whitespace, treat empty as None
     idem_key = (payload.idempotency_key or "").strip() or None
@@ -1010,7 +1010,7 @@ async def update_direction(
         if payload.get("status") == "active":
             from app.shared_state import runtime_config as _runtime_config
 
-            max_active = _runtime_config.get("max_active_directions", 5)
+            max_active = _runtime_config.get("max_active_directions", 10)
             active_count = sum(
                 1
                 for d in directions
@@ -1303,7 +1303,7 @@ async def resurrect_direction_endpoint(
 
     from app.shared_state import runtime_config as _runtime_config
 
-    max_active = _runtime_config.get("max_active_directions", 5)
+    max_active = _runtime_config.get("max_active_directions", 10)
     now_iso = _utcnow().isoformat()
 
     resurrected_holder: list[dict] = []

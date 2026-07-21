@@ -1355,7 +1355,7 @@ async def strategic_operation(
         # consume a slot (mirrors the user PATCH / add_direction staged paths).
         if not staged_create:
             active_count = sum(1 for d in directions if d.get("status") == "active")
-            max_active = _runtime_config.get("max_active_directions", 5)
+            max_active = _runtime_config.get("max_active_directions", 10)
             if active_count >= max_active:
                 ctx = task.context or {}
                 task.context = {**ctx, "_strategic_api_called": True}
@@ -2531,7 +2531,7 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
         active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
+        max_active = _runtime_config.get("max_active_directions", 10)
         if active_count >= max_active:
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}
@@ -2784,7 +2784,7 @@ async def strategic_operation(
         if _blk is not None:
             return _blk
         active_count = sum(1 for d in directions if d.get("status") == "active")
-        max_active = _runtime_config.get("max_active_directions", 5)
+        max_active = _runtime_config.get("max_active_directions", 10)
         if active_count >= max_active:
             ctx = task.context or {}
             task.context = {**ctx, "_strategic_api_called": True}

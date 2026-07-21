@@ -5647,6 +5647,58 @@ class TestDirectionLifecycleInvariants:
             "Direction cap enforcement was lost in PR #832 and must not be removed again."
         )
 
+    def test_max_active_directions_read_site_defaults_match_registry(self):
+        """All read-sites for max_active_directions must use default 10 (matching registry).
+
+        A mismatch means unconfigured deployments silently get a different cap than declared.
+        """
+        import re
+
+        files_to_check = [
+            os.path.join(os.path.dirname(__file__), "..", "app", "directions_repo.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "strategic_completion.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "routers", "directions.py"),
+            os.path.join(os.path.dirname(__file__), "..", "app", "routers", "admin_agent_ops.py"),
+        ]
+        bad = []
+        for path in files_to_check:
+            with open(path) as f:
+                content = f.read()
+            for m in re.finditer(r'get\s*\(\s*["\']max_active_directions["\']\s*,\s*(\d+)\s*\)', content):
+                if m.group(1) != "10":
+                    lineno = content[: m.start()].count("\n") + 1
+                    bad.append(f"{os.path.basename(path)}:{lineno} uses default {m.group(1)!r} (want 10)")
+        assert not bad, (
+            "max_active_directions read-sites have wrong fallback defaults "
+            f"(registry declares 10): {bad}"
+        )
+
+    def test_blind_multi_reviewer_gate_enabled_read_site_default_matches_registry(self):
+        """The task_lifecycle.py read-site for blind_multi_reviewer_gate_enabled must default to
+        True, matching the runtime_config_state registry declaration.
+        """
+        import re
+
+        path = os.path.join(
+            os.path.dirname(__file__), "..", "app", "task_lifecycle.py"
+        )
+        with open(path) as f:
+            content = f.read()
+        bad = []
+        for m in re.finditer(
+            r'get\s*\(\s*["\']blind_multi_reviewer_gate_enabled["\']\s*,\s*(False|True)\s*\)',
+            content,
+        ):
+            if m.group(1) != "True":
+                lineno = content[: m.start()].count("\n") + 1
+                bad.append(
+                    f"task_lifecycle.py:{lineno} uses default {m.group(1)!r} (registry declares True)"
+                )
+        assert not bad, (
+            "blind_multi_reviewer_gate_enabled read-site in task_lifecycle.py uses wrong "
+            f"fallback default: {bad}"
+        )
+
 # ── Module Size Guardrails ─────────────────────────────────────────────────
 # These are loose upper bounds to catch runaway growth, not tight ceilings.
 # If a file hits the limit, consider a refactor — but do NOT "ratchet down"

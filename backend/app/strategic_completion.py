@@ -5358,7 +5358,7 @@ async def _handle_strategic_completion(
                 current_active = sum(
                     1 for d in directions if d.get("status") == "active"
                 )
-                if current_active >= _runtime_config.get("max_active_directions", 5):
+                if current_active >= _runtime_config.get("max_active_directions", 10):
                     logger.warning(
                         f"[STRATEGIC] Skipping direction create: active count {current_active} >= cap"
                     )
@@ -5875,7 +5875,7 @@ async def _handle_strategic_completion(
                     )
                     continue
                 active_count = sum(1 for d in directions if d.get("status") == "active")
-                max_active = _runtime_config.get("max_active_directions", 5)
+                max_active = _runtime_config.get("max_active_directions", 10)
                 if active_count >= max_active:
                     logger.info(
                         "[STRATEGIC] Task %s: fallback approve_direction skipped for %s because active count %s/%s reached cap",
@@ -6074,7 +6074,7 @@ async def _handle_strategic_completion(
                     )
                     continue
                 active_count = sum(1 for d in directions if d.get("status") == "active")
-                max_active = _runtime_config.get("max_active_directions", 5)
+                max_active = _runtime_config.get("max_active_directions", 10)
                 if active_count >= max_active:
                     logger.info(
                         "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because active count %s/%s reached cap",
