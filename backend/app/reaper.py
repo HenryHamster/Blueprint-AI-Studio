@@ -2816,8 +2816,6 @@ async def reaper_service():
                         f"[REAPER] Resident activation repair sweep error: {e}",
                         exc_info=True,
                     )
-                    with contextlib.suppress(Exception):
-                        await session.rollback()
                 try:
                     await sweep_due_authoritative_resident_wakeups(
                         session_factory=AsyncSessionLocal,

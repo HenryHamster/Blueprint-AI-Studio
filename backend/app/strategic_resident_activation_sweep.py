@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, func, not_, or_
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import StrategicResident
 from app.strategic_resident_wakeups import sync_resident_background_policy
 from app.time_utils import _utcnow
@@ -15,6 +17,109 @@ from app.time_utils import _utcnow
 
 _DEFAULT_EMPTY_SCAN_COOLDOWN = timedelta(hours=6)
 _empty_scan_not_before: datetime | None = None
+
+
+def _has_valid_activation_sequence(scheduling_state: object) -> bool:
+    if not isinstance(scheduling_state, dict):
+        return False
+    raw_sequence = scheduling_state.get("background_activation_sequence")
+    return (
+        isinstance(raw_sequence, int)
+        and not isinstance(raw_sequence, bool)
+        and raw_sequence > 0
+    )
+
+
+async def _candidate_project_ids(
+    scan: AsyncSession,
+    *,
+    bounded_batch: int,
+) -> list[uuid.UUID]:
+    authoritative_active = (
+        StrategicResident.engine_owner == "strategic_resident",
+        StrategicResident.background_policy == "active",
+    )
+    dialect_name = resolve_dialect_name(scan)
+    if dialect_name == "postgresql":
+        marker = StrategicResident.scheduling_state[
+            "background_activation_sequence"
+        ]
+        marker_type = func.jsonb_typeof(marker)
+        marker_text = marker.as_string()
+        valid_marker = and_(
+            marker_type == "number",
+            marker_text.op("~")(r"^[1-9][0-9]*$"),
+        )
+        return list(
+            (
+                await scan.execute(
+                    select(StrategicResident.project_id)
+                    .where(
+                        *authoritative_active,
+                        or_(marker_type.is_(None), not_(valid_marker)),
+                    )
+                    .order_by(StrategicResident.project_id.asc())
+                    .limit(bounded_batch)
+                )
+            ).scalars()
+        )
+
+    if dialect_name == "sqlite":
+        marker_path = "$.background_activation_sequence"
+        marker_type = func.json_type(
+            StrategicResident.scheduling_state,
+            marker_path,
+        )
+        marker_value = func.json_extract(
+            StrategicResident.scheduling_state,
+            marker_path,
+        )
+        valid_marker = and_(marker_type == "integer", marker_value > 0)
+        return list(
+            (
+                await scan.execute(
+                    select(StrategicResident.project_id)
+                    .where(
+                        *authoritative_active,
+                        or_(marker_type.is_(None), not_(valid_marker)),
+                    )
+                    .order_by(StrategicResident.project_id.asc())
+                    .limit(bounded_batch)
+                )
+            ).scalars()
+        )
+
+    # Unknown dialects get a portable fallback. Page through all authoritative
+    # active rows and validate in Python; limiting before validation would let
+    # an early run of valid rows permanently hide later repair candidates.
+    project_ids: list[uuid.UUID] = []
+    after_project_id: uuid.UUID | None = None
+    page_size = max(32, bounded_batch)
+    while len(project_ids) < bounded_batch:
+        statement = select(
+            StrategicResident.project_id,
+            StrategicResident.scheduling_state,
+        ).where(*authoritative_active)
+        if after_project_id is not None:
+            statement = statement.where(
+                StrategicResident.project_id > after_project_id
+            )
+        rows = (
+            await scan.execute(
+                statement.order_by(StrategicResident.project_id.asc()).limit(page_size)
+            )
+        ).all()
+        if not rows:
+            break
+        for project_id, scheduling_state in rows:
+            if not _has_valid_activation_sequence(scheduling_state):
+                project_ids.append(project_id)
+                if len(project_ids) == bounded_batch:
+                    break
+        after_project_id = rows[-1][0]
+        if len(rows) < page_size:
+            break
+    return project_ids
 
 
 async def sweep_missing_background_activation_wakeups(
@@ -26,10 +131,10 @@ async def sweep_missing_background_activation_wakeups(
 ) -> int:
     """Repair active authoritative Residents created before activation bootstraps.
 
-    The JSON marker is inspected as text only after checking its JSONB type, so
-    malformed legacy values cannot fail the whole reaper query. Every invalid or
-    missing marker remains eligible until its row is repaired, while the bounded
-    batch prevents a deploy catch-up from monopolizing a reaper cycle.
+    PostgreSQL and SQLite filter invalid markers in their native JSON dialect;
+    unknown dialects page through active rows and validate markers in Python.
+    Every invalid or missing marker remains eligible until its row is repaired,
+    while the bounded batch prevents deploy catch-up from monopolizing a cycle.
 
     Discovery is deliberately separate from mutation. Each candidate is locked
     and revalidated before the policy helper runs, so concurrent reapers can
@@ -49,29 +154,10 @@ async def sweep_missing_background_activation_wakeups(
     ):
         return 0
 
-    marker = StrategicResident.scheduling_state[
-        "background_activation_sequence"
-    ]
-    marker_type = func.jsonb_typeof(marker)
-    marker_text = marker.as_string()
-    valid_marker = and_(
-        marker_type == "number",
-        marker_text.op("~")(r"^[1-9][0-9]*$"),
-    )
     async with session_factory() as scan:
-        project_ids = list(
-            (
-                await scan.execute(
-                    select(StrategicResident.project_id)
-                    .where(
-                        StrategicResident.engine_owner == "strategic_resident",
-                        StrategicResident.background_policy == "active",
-                        or_(marker_type.is_(None), not_(valid_marker)),
-                    )
-                    .order_by(StrategicResident.project_id.asc())
-                    .limit(bounded_batch)
-                )
-            ).scalars()
+        project_ids = await _candidate_project_ids(
+            scan,
+            bounded_batch=bounded_batch,
         )
     if not project_ids:
         _empty_scan_not_before = observed_at + cooldown if cooldown else None
@@ -96,14 +182,7 @@ async def sweep_missing_background_activation_wakeups(
                 or resident.background_policy != "active"
             ):
                 continue
-            raw_sequence = dict(resident.scheduling_state or {}).get(
-                "background_activation_sequence"
-            )
-            if (
-                isinstance(raw_sequence, int)
-                and not isinstance(raw_sequence, bool)
-                and raw_sequence > 0
-            ):
+            if _has_valid_activation_sequence(resident.scheduling_state):
                 continue
             wake = await sync_resident_background_policy(
                 session,
