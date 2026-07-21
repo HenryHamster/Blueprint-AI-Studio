@@ -5,8 +5,6 @@ const MUTATION_EVIDENCE_KEYS = [
 const MUTATION_EVIDENCE_INPUT_KEYS = new Set([
   ...MUTATION_EVIDENCE_KEYS, 'evidence_id', 'summary', 'decisive', 'data',
 ]);
-const INSPECTION_RECEIPT_UNAVAILABLE =
-  'canonical inspection receipt is unavailable or inconsistent';
 const MAX_CAPABILITY_RESULTS_BYTES = 48_000;
 
 export class ResidentMutationEvidenceUnavailableError extends Error {
@@ -48,14 +46,14 @@ export function catalogAvailability(
   const catalog = capabilities && typeof capabilities === 'object'
     ? (capabilities as Record<string, unknown>).catalog
     : null;
-  if (!Array.isArray(catalog)) return null;
+  if (!Array.isArray(catalog)) return 'not_in_catalog';
   const entries: unknown[] = catalog;
   const entry: unknown = entries.find((candidate) => (
     candidate
     && typeof candidate === 'object'
     && (candidate as Record<string, unknown>).id === capabilityId
   ));
-  if (!entry || typeof entry !== 'object') return null;
+  if (!entry || typeof entry !== 'object') return 'not_in_catalog';
   const item = entry as Record<string, unknown>;
   return item.mode === mode && typeof item.availability === 'string'
     ? item.availability
@@ -176,7 +174,10 @@ export function correctableInspectionValidationOutcome(
 }
 
 export function canonicalInspectionReceiptUnavailable(error: unknown): boolean {
-  return capabilityApiErrorDetail(error, 409) === INSPECTION_RECEIPT_UNAVAILABLE;
+  return (
+    error instanceof Error
+    && error.message.startsWith('POST /api/agent/resident-turn/capability failed (409): ')
+  );
 }
 export function canonicalMutationEvidence(
   items: unknown[],

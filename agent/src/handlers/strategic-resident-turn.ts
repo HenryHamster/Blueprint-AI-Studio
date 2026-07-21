@@ -598,7 +598,7 @@ export async function handleStrategicResidentTurn(
         : 'Applying fenced Resident operations...';
       for (const request of action.requests) {
         const availability = catalogAvailability(providerInput, request.capability_id, action.kind);
-        if (availability === 'propose_only') {
+        if (availability === 'propose_only' || availability === 'not_in_catalog') {
           const key = stableJson({ kind: action.kind, request });
           if (requestKeys.has(key)) continue;
           requestKeys.add(key);

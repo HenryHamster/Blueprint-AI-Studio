@@ -1044,18 +1044,69 @@ describe('strategic Resident turn handler', () => {
     expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 
-  it('keeps an aliased unknown capability behind the catalog availability fence', async () => {
-    mocks.runClaudeCode.mockResolvedValue({
-      exitCode: 0,
-      allOutput: '',
-      lastResultText: JSON.stringify({ capability_requests: [{ id: 'unknown.inspect' }] }),
-    });
+  it('gracefully skips an unknown capability ID not in the catalog (hallucinated by LLM)', async () => {
+    const finalResult = emptyFinalResult();
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'pip', parameters: {} }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'pip', parameters: {} }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(finalResult),
+      });
+    mocks.apiPost.mockResolvedValue({});
 
-    await expect(handleStrategicResidentTurn(
+    await handleStrategicResidentTurn(
       'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
-    )).rejects.toThrow('non-invokable inspect capability');
+    );
 
-    expect(mocks.apiPost).not.toHaveBeenCalled();
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const secondPrompt = String(mocks.runClaudeCode.mock.calls[1][0]);
+    expect(secondPrompt).toContain('Capability availability is propose_only');
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(0);
+  });
+  it('keeps an aliased unknown capability behind the catalog availability fence', async () => {
+    const finalResult = emptyFinalResult();
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({ capability_requests: [{ id: 'unknown.inspect' }] }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({ capability_requests: [{ id: 'unknown.inspect' }] }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify(finalResult),
+      });
+    mocks.apiPost.mockResolvedValue({});
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    expect(mocks.apiPost.mock.calls.filter(([path]) => (
+      path === '/api/agent/resident-turn/capability'
+    ))).toHaveLength(0);
   });
   it('fails closed when a catalog capability is requested through the wrong mode', async () => {
     mocks.runClaudeCode.mockResolvedValue({
@@ -2403,6 +2454,66 @@ describe('strategic Resident turn handler', () => {
 
   it.each([
     [
+      'context-not-frozen',
+      'POST /api/agent/resident-turn/capability failed (409): '
+      + '{"detail":"Resident turn context is not frozen for inspection"}',
+    ],
+    [
+      'ledger-invalid',
+      'POST /api/agent/resident-turn/capability failed (409): '
+      + '{"detail":"capability request ledger is invalid"}',
+    ],
+    [
+      'stale-authority',
+      'POST /api/agent/resident-turn/capability failed (409): '
+      + '{"detail":"stale authority — resident agent authority generation mismatch"}',
+    ],
+    [
+      'empty-body',
+      'POST /api/agent/resident-turn/capability failed (409): {}',
+    ],
+  ])('recovers from a non-canonical 409 detail string: %s', async (_label, errorMessage) => {
+    const inspectionRequest = {
+      capability_requests: [{
+        capability_id: 'task.inspect', parameters: { task_id: inspectionTaskId },
+      }],
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult()),
+      });
+    mocks.apiPost.mockImplementation((path: string) => {
+      if (path === '/api/agent/resident-turn/capability') {
+        return Promise.reject(new Error(errorMessage));
+      }
+      return Promise.resolve({});
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('canonical_inspection_replay_unavailable');
+    expect(mocks.apiPost.mock.calls.map((call) => String(call[0]))).toStrictEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+    expect(mocks.sendLog).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining('reason=canonical_inspection_replay_unavailable'),
+    );
+  });
+
+  it.each([
+    [
       'unstructured validation failure',
       new Error(
         'POST /api/agent/resident-turn/capability failed (400): '
@@ -2425,13 +2536,6 @@ describe('strategic Resident turn handler', () => {
     ],
     ['server failure', new Error('POST /api/agent/resident-turn/capability failed (500): boom')],
     ['network failure', new TypeError('fetch failed')],
-    [
-      'different conflict',
-      new Error(
-        'POST /api/agent/resident-turn/capability failed (409): '
-        + '{"detail":"Resident turn context is not frozen"}',
-      ),
-    ],
   ])('fails closed for a non-recoverable inspection %s', async (_label, failure) => {
     mocks.runClaudeCode.mockResolvedValueOnce({
       exitCode: 0,

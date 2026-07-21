@@ -896,6 +896,31 @@ class TestStaleEmptySignalSelfHeal:
         assert project.build_config["repo_is_empty"] is False
         session.commit.assert_not_awaited()
 
+    @pytest.mark.asyncio
+    async def test_transient_token_failure_does_not_consume_cooldown(self):
+        # A transient get_repo_installation_token failure (returns None) must NOT
+        # stamp the 6-hour cooldown — the next task should be allowed to retry.
+        from app.build_config_detection import (
+            _redetect_stale_empty_cooldown,
+            maybe_correct_stale_repo_empty_signal,
+        )
+
+        _redetect_stale_empty_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value=None,  # transient failure — no token
+        ):
+            healed = await maybe_correct_stale_repo_empty_signal(project, session)
+
+        assert healed is False
+        # Cooldown must NOT be stamped — a transient failure should not lock the
+        # project out of self-healing for 6 hours.
+        assert str(getattr(project, "id", "")) not in _redetect_stale_empty_cooldown
+
 
 # ── Plan no-op guard on greenfield repos ─────────────────────────────────────
 # A plan agent that emits {"subtasks": [], "no_op_reason": "..."} on a project
@@ -1257,6 +1282,33 @@ class TestStaleCommitlessSelfHeal:
         assert healed is False
         assert project.build_config["repo_is_empty"] is False
         session.rollback.assert_awaited_once()
+        # A thrown exception must also not consume the cooldown — next task retries.
+        assert str(getattr(project, "id", "")) not in _redetect_stale_commitless_cooldown
+
+    @pytest.mark.asyncio
+    async def test_transient_token_failure_does_not_consume_cooldown(self):
+        # A transient get_repo_installation_token failure (returns None) must NOT
+        # stamp the 6-hour cooldown — the next task should be allowed to retry.
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value=None,  # transient failure — no token
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        # Cooldown must NOT be stamped — a transient failure should not lock the
+        # project out of self-healing for 6 hours.
+        assert str(getattr(project, "id", "")) not in _redetect_stale_commitless_cooldown
 
     @pytest.mark.asyncio
     async def test_preserves_operator_overrides(self):

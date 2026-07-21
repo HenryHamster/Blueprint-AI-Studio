@@ -1416,6 +1416,50 @@ async def test_refresh_build_error_is_isolated(db):
     assert "docker build failed" in result["error"]
 
 
+@pytest.mark.asyncio
+async def test_refresh_build_error_fires_alert(db):
+    """A build failure fires the build-failure alert, not just a log line."""
+    project = await _make_repo_project(db)
+    project_id = project.id  # capture BEFORE session.rollback() expires project
+
+    async def _build(*a, **k):
+        raise RuntimeError("docker build failed (exit 1)")
+
+    alert_called = {"called": False, "failure_kind": None, "project_id": None}
+
+    async def _alert_side_effect(session, build, *, failure_kind):
+        alert_called["called"] = True
+        alert_called["failure_kind"] = failure_kind
+        alert_called["project_id"] = build.project_id
+        alert_called["image_name"] = getattr(build, "image_name", None)
+        alert_called["dep_hash"] = getattr(build, "dep_hash", None)
+        return True
+
+    alert_mock = AsyncMock(side_effect=_alert_side_effect)
+    with patch("app.alert_dispatch._maybe_create_compute_image_build_failure_alert", alert_mock):
+        result = await _cb.refresh_project_compute_image(
+            db,
+            project,
+            _manifest_fn=lambda _p: _async(_BUILD_MANIFEST),
+            _token_fn=lambda o, r: _async("tok"),
+            _default_branch_fn=lambda t, o, r: _async("main"),
+            _fetch_bytes_fn=_fetch_bytes_stub(
+                {".blueprint/Dockerfile.compute": b"FROM python:3.11-slim\n"}
+            ),
+            _tag_exists_fn=lambda full_repo, dep_hash: False,
+            _build_fn=_build,
+            _record_fn=_record_row,
+        )
+
+    assert result["status"] == "error"
+    assert "docker build failed" in result["error"]
+    assert alert_called["called"], "build-failure alert must be fired on build error"
+    assert alert_called["project_id"] == project_id
+    assert alert_called["failure_kind"] == "failed"
+    assert alert_called["image_name"] is not None
+    assert alert_called["dep_hash"] is not None
+
+
 # ── Driver: identical manifest bytes => identical hash => same fast path ───────
 
 

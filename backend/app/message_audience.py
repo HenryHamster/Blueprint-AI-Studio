@@ -227,6 +227,9 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # agents and compute jobs may use a stale or missing image until retried.
     # Operator-visible so the build failure appears in the alert surface.
     "compute.image_build_failure": OPERATOR_FYI,
+    # compute.image_refresh_failure: live Cloud Build refresh lane returned a
+    # failure status for a project's compute image — stale images until retried.
+    "compute.image_refresh_failure": OPERATOR_FYI,
     # === Research / direction drift =======================================
     # research.direction_drift: direction claim vs. shipped-code drift
     # detected — operator should review the flagged directions.

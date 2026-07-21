@@ -1268,13 +1268,40 @@ class TestScoreEnvPreflight:
 
 
 # ---------------------------------------------------------------------------
-# compute_composite — the boot_prereq_missing hard gate (Slice 3, DARK)
+# compute_composite — the boot_prereq_missing hard gate (Slice 3)
+# runtime_config default: env_preflight_enabled=True (Armed)
 # ---------------------------------------------------------------------------
 
 
 class TestEnvPreflightGate:
-    def test_disabled_by_default_is_byte_for_byte_unchanged(self):
-        # The judge defaults OFF: even with missing names supplied, no block, no
+    def test_production_default_is_armed_in_promotion_policy_yaml(self):
+        # The production default for env_preflight_enabled comes from
+        # promotion_policy.yaml (not the module-level dict, which the conftest
+        # overrides to False for test isolation).  This pin asserts the YAML
+        # carries the Armed (True) value so the gate is active in production.
+        from app.runtime_config_state import _read_promotion_policy_file
+
+        policy = _read_promotion_policy_file()
+        assert policy is not None, "promotion_policy.yaml must be readable"
+        assert policy.get("env_preflight_enabled") is True, (
+            "env_preflight_enabled must be True in promotion_policy.yaml "
+            "(Armed by default); update that file if the gate should be disabled fleet-wide"
+        )
+
+        # With the production default (True) and missing prerequisites, the gate
+        # must block — proving the Armed default has real enforcement effect.
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=0.0,
+                env_preflight_missing=["GITHUB_PAT_ENCRYPTION_KEY"],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_missing"
+        assert result["promote"] is False
+
+    def test_flag_off_is_byte_for_byte_unchanged(self):
+        # When explicitly disabled (env_preflight_enabled=False), no block, no
         # sub_score, and the composite is identical to the no-env-preflight call.
         baseline = rs.compute_composite(**_perfect_kwargs())
         with_flag_off = rs.compute_composite(

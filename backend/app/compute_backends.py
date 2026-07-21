@@ -4815,6 +4815,39 @@ async def refresh_project_compute_image(
             await session.rollback()
         except Exception:  # noqa: BLE001
             pass
+        # ── Best-effort build-failure alert ──────────────────────────────────
+        # Fire only when dep_hash was computed (indicating we got past the hash
+        # stage and actually attempted a build).  Pre-hash config/fetch errors
+        # are not build failures.
+        try:
+            _image_name = image_name
+        except NameError:
+            _image_name = None
+        try:
+            _dep_hash = dep_hash
+        except NameError:
+            _dep_hash = None
+        if _dep_hash is not None and _image_name is not None:
+            try:
+                from app.alert_dispatch import _maybe_create_compute_image_build_failure_alert
+                from types import SimpleNamespace
+
+                build = SimpleNamespace(
+                    project_id=project_id,
+                    image_name=_image_name,
+                    dep_hash=_dep_hash,
+                    error_reason=str(e),
+                )
+                await _maybe_create_compute_image_build_failure_alert(
+                    session, build,
+                    failure_kind="timed_out" if isinstance(e, asyncio.TimeoutError) else "failed",
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "[COMPUTE-IMAGE] build-failure alert skipped for project=%s",
+                    project_id,
+                    exc_info=True,
+                )
         return {"status": "error", "error": str(e)}
 
 

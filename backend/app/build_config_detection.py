@@ -374,10 +374,6 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
         _last_attempt = _redetect_stale_empty_cooldown.get(_proj_id_key)
         if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
             return False
-        # Stamp before any API call so concurrent callers in the same window skip
-        # rather than duplicate the expensive walk.
-        if _proj_id_key:
-            _redetect_stale_empty_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -401,6 +397,10 @@ async def maybe_correct_stale_repo_empty_signal(project, session, *, ref=None) -
             project.github_repo,
             ref=integration_branch,
         )
+        # Stamp cooldown after the API call completes so a transient failure
+        # (no token, GitHub 502) does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_stale_empty_cooldown[_proj_id_key] = _now_mono
         if not detected:
             # Transient GitHub failure (detector returned {}). Leave the durable
             # signal untouched — fail-loud is preserved for the clone shortfall.
@@ -493,8 +493,6 @@ async def maybe_correct_stale_commitless_repo_signal(
             and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S
         ):
             return False
-        if _proj_id_key:
-            _redetect_stale_commitless_cooldown[_proj_id_key] = _now_mono
 
         from datetime import datetime, timezone
 
@@ -512,6 +510,10 @@ async def maybe_correct_stale_commitless_repo_signal(
         has_commits = await repo_has_commits(
             token, project.github_owner, project.github_repo
         )
+        # Stamp cooldown after the API call completes so a transient failure
+        # (no token, GitHub 502) does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_stale_commitless_cooldown[_proj_id_key] = _now_mono
         if has_commits:
             # Repo is NOT commitless — something else caused the REPO_UNINITIALIZED
             # signature. Leave the durable signal untouched.

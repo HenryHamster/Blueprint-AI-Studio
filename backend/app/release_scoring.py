@@ -876,11 +876,15 @@ def compute_composite(
         prerequisite ABSENT from the deploy-target env (``"boot_prereq_missing"``).
         Presence-only: ``env_preflight_missing`` carries NAMES, never values.
         ``sub_scores["env_preflight_missing"]`` records the names for operators.
-        This entire dimension is DARK by default: when ``env_preflight_enabled``
-        is False the block is skipped, ``sub_scores["env_preflight"]`` is not
-        recorded, and the composite is byte-for-byte identical to the pre-Slice-3
-        behaviour (the judge contributes NO weight to the audit + test_erosion +
-        smoketest sum — it is a pure hard gate, like the migration gates).
+        When ``env_preflight_enabled`` is False the block is skipped,
+        ``sub_scores["env_preflight"]`` is not recorded, and the composite is
+        byte-for-byte identical to the pre-Slice-3 behaviour (the judge
+        contributes NO weight to the audit + test_erosion + smoketest sum — it
+        is a pure hard gate, like the migration gates).  Note: the
+        ``runtime_config`` default is ``True`` (Armed), so at runtime the gate
+        is active unless the operator explicitly disables it.  The function
+        parameter default is ``False`` for backward-compatibility with callers
+        that do not pass the flag.
         ``env_preflight_ack_override`` (Slice 4) is the OWNER-only escape valve:
         when True it suppresses ONLY this ``boot_prereq_missing`` block (for the
         same-deploy-binding case where the deployed environ does not yet reflect
@@ -993,8 +997,8 @@ def compute_composite(
         # certify the boot gate at all — individual prerequisite presence is moot.
         blocker = "boot_prereq_evidence_missing"
     elif env_preflight_enabled and env_preflight_missing and not env_preflight_ack_override:
-        # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4), DARK by
-        # default (env_preflight_enabled defaults False).  A candidate-declared,
+        # DEPLOYED-side env-preflight judge (Slice 3, design 245212a4).
+        # runtime_config default: True (Armed).  A candidate-declared,
         # in-scope boot prerequisite is ABSENT from the deploy-target env — the
         # v25 class where a new startup gate crashes prod because its secret is
         # unbound.  Presence-only: env_preflight_missing carries NAMES, never
@@ -1064,7 +1068,7 @@ def compute_composite(
     if debt_pressure_score is not None:
         sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
-    # Env-preflight sub-score + missing names (Slice 3, DARK by default).  Only
+    # Env-preflight sub-score + missing names (Slice 3).  Only
     # recorded when the judge is enabled, so a disabled subsystem leaves the
     # sub_scores dict byte-for-byte unchanged.  env_preflight is a pure hard gate
     # (block on any missing) — it never contributes a weight to the composite sum,
