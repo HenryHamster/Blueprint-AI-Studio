@@ -3852,6 +3852,7 @@ class ProjectMessage(SQLModel, table=True):
         # the model/migration coverage invariant can track their names.
         Index("ix_projectmessage_context_event_type", "context"),
         Index("ix_projectmessage_context_dedupe_key", "context"),
+        Index("ix_projectmessage_context_audience", "context"),
         # Accelerates high-signal message fetches filtered by (project_id, message_type)
         # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
         Index(

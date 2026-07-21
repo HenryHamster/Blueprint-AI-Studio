@@ -39,6 +39,7 @@ from fastapi import HTTPException
 from sqlalchemy import select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import resolve_dialect_name
@@ -229,6 +230,8 @@ async def deployment_state_lock(
 async def lock_project_or_429(
     session: AsyncSession,
     project_id: uuid.UUID,
+    *,
+    load_columns: list | None = None,
 ) -> Project:
     """Acquire a row lock on a Project for atomic read-modify-write (handler path).
 
@@ -243,8 +246,14 @@ async def lock_project_or_429(
     Use this from request handlers where the user can retry on 429. For
     background loops or post-commit chains that should not bubble up an
     HTTPException, use ``project_lock`` instead.
+
+    ``load_columns``: when provided, only those columns are loaded from the
+    Project row (``raiseload=True`` guards against accidental access of other
+    columns). Pass only the columns the caller actually reads or mutates to
+    avoid deserializing the 500KB+ design_doc on paths that don't need it.
+    Default ``None`` loads all columns (safe for callers with varied needs).
     """
-    result = await session.execute(
+    stmt = (
         select(Project)
         .where(Project.id == project_id)
         # FOR NO KEY UPDATE — see project_lock: serializes project-row writers
@@ -252,6 +261,9 @@ async def lock_project_or_429(
         .with_for_update(skip_locked=True, key_share=True)
         .execution_options(populate_existing=True)
     )
+    if load_columns is not None:
+        stmt = stmt.options(load_only(*load_columns, raiseload=True))
+    result = await session.execute(stmt)
     project = result.scalars().first()
     if project is not None:
         return project
@@ -343,6 +355,7 @@ async def project_lock(
     *,
     skip_locked: bool = True,
     timeout: float = 30.0,
+    load_columns: list | None = None,
 ) -> AsyncIterator[Project | None]:
     """Acquire SELECT FOR UPDATE on a project row, yield freshly-loaded Project or None.
 
@@ -363,6 +376,11 @@ async def project_lock(
         skip_locked: If True (default), yield ``None`` when the row is
             held; if False, wait up to ``timeout`` and raise on timeout.
         timeout: Max seconds to wait when ``skip_locked=False``.
+        load_columns: When provided, only those columns are fetched from
+            the Project row (``raiseload=True`` guards accidental access).
+            Pass only the columns the caller actually reads or mutates to
+            avoid deserializing the 500KB+ design_doc unnecessarily.
+            Default ``None`` loads all columns (safe for generic callers).
 
     Yields:
         The freshly-loaded Project object, or None if held under skip_locked.
@@ -382,6 +400,8 @@ async def project_lock(
         .with_for_update(skip_locked=skip_locked, key_share=True)
         .execution_options(populate_existing=True)
     )
+    if load_columns is not None:
+        stmt = stmt.options(load_only(*load_columns, raiseload=True))
     try:
         result = await asyncio.wait_for(session.execute(stmt), timeout=timeout)
     except asyncio.TimeoutError as e:
@@ -551,7 +571,12 @@ async def _with_project_locked_list_mutation(
     *,
     skip_locked: bool,
 ) -> bool:
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        load_columns=[Project.id, Project.directions],
+    ) as project:
         if project is None:
             return False
         directions = list(project.directions or [])
@@ -619,7 +644,12 @@ async def with_design_doc_locked(
     consistently prevents concurrent writers from clobbering each other's
     keys via stale read-modify-write races.
     """
-    async with project_lock(session, project_id, skip_locked=skip_locked) as project:
+    async with project_lock(
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        load_columns=[Project.id, Project.design_doc],
+    ) as project:
         if project is None:
             return False
         doc = dict(project.design_doc or {})
@@ -687,7 +717,11 @@ async def with_vision_locked(
     ``directions``.
     """
     async with project_lock(
-        session, project_id, skip_locked=skip_locked, timeout=timeout
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+        load_columns=[Project.id, Project.vision],
     ) as project:
         if project is None:
             return False
@@ -786,7 +820,11 @@ async def with_problem_model_locked(
     lost-update class already eliminated for ``vision`` and ``directions``.
     """
     async with project_lock(
-        session, project_id, skip_locked=skip_locked, timeout=timeout
+        session,
+        project_id,
+        skip_locked=skip_locked,
+        timeout=timeout,
+        load_columns=[Project.id, Project.problem_model],
     ) as project:
         if project is None:
             return False

@@ -337,51 +337,80 @@ async def backfill_file_to_system_index(session: AsyncSession) -> int:
     :func:`_get_file_list_from_system_page`) to every existing systems page,
     bringing the index in sync without waiting for each page to be re-set.
 
+    Uses cursor-based pagination (50 projects per batch) to avoid loading all
+    project IDs into memory and to release per-project locks promptly between
+    batches rather than accumulating them in a single long-running transaction.
+
     Returns the number of projects whose index was actually updated.
     """
-    project_ids = (
-        (
-            await session.execute(
-                select(Project.id).where(
-                    Project.design_doc.isnot(None),
-                    Project.design_doc != {},
+    import uuid as _uuid
+
+    updated_count = 0
+    last_cursor: _uuid.UUID = _uuid.UUID("00000000-0000-0000-0000-000000000000")
+    batch_size = 50
+
+    while True:
+        batch_ids = (
+            (
+                await session.execute(
+                    select(Project.id)
+                    .where(
+                        Project.design_doc.isnot(None),
+                        Project.design_doc != {},
+                        Project.id > last_cursor,
+                    )
+                    .order_by(Project.id)
+                    .limit(batch_size)
                 )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    updated_count = 0
-    for project_id in project_ids:
-        _was_updated = False
+        if not batch_ids:
+            break
 
-        def _mutate(doc: dict) -> None:
-            nonlocal _was_updated
-            rebuilt: dict[str, str] = {}
-            for doc_key, doc_val in doc.items():
-                if doc_key.startswith("systems/") and isinstance(doc_val, dict):
-                    sys_id = doc_key[len("systems/") :]
-                    for fpath in _get_file_list_from_system_page(doc_val):
-                        rebuilt[fpath] = sys_id
-            current = doc.get("_file_to_system")
-            if isinstance(current, dict) and current == rebuilt:
-                return  # already correct
-            doc["_file_to_system"] = rebuilt
-            _was_updated = True
+        for project_id in batch_ids:
+            did_update = await _backfill_one_project(session, project_id)
+            await session.commit()
+            if did_update:
+                updated_count += 1
 
-        try:
-            await _with_design_doc_locked(
-                session, project_id, _mutate, raise_on_size_limit=True
-            )
-        except DesignDocSizeLimitExceeded as exc:
-            logger.warning(
-                "[backfill_file_to_system_index] skipped project %s: %s",
-                project_id,
-                exc,
-            )
-        if _was_updated:
-            updated_count += 1
+        last_cursor = batch_ids[-1]
+
     return updated_count
+
+
+async def _backfill_one_project(session: AsyncSession, project_id: uuid.UUID) -> bool:
+    """Recompute ``_file_to_system`` for a single project under a design_doc lock.
+
+    Returns True if the index was updated, False if it was already correct or
+    the project had no systems pages.
+    """
+    updated = False
+
+    def _mutate(doc: dict) -> None:
+        nonlocal updated
+        rebuilt: dict[str, str] = {}
+        for doc_key, doc_val in doc.items():
+            if doc_key.startswith("systems/") and isinstance(doc_val, dict):
+                sys_id = doc_key[len("systems/") :]
+                for fpath in _get_file_list_from_system_page(doc_val):
+                    rebuilt[fpath] = sys_id
+        current = doc.get("_file_to_system")
+        if isinstance(current, dict) and current == rebuilt:
+            return  # already correct
+        doc["_file_to_system"] = rebuilt
+        updated = True
+
+    try:
+        await _with_design_doc_locked(session, project_id, _mutate, raise_on_size_limit=True)
+    except DesignDocSizeLimitExceeded as exc:
+        logger.warning(
+            "[backfill_file_to_system_index] skipped project %s: %s",
+            project_id,
+            exc,
+        )
+    return updated
 
 
 @router.post("/api/agent/design-doc")

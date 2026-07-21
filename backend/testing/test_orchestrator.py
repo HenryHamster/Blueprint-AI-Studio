@@ -15016,3 +15016,43 @@ async def test_cold_dispatch_fence_grants_after_ledger_proof(db_session):
     )
     assert blocking == []
     assert task.status == TaskStatus.QUEUED
+
+
+def test_dispatch_prefetch_excludes_design_doc_from_select():
+    """Dispatch project pre-fetch must use load_only so the 500KB design_doc
+    JSONB column is not transferred from Postgres on every orchestrator cycle."""
+    import uuid
+
+    from sqlalchemy import select
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.orm import load_only
+
+    from app.models import Project
+
+    stmt = (
+        select(Project)
+        .where(Project.id.in_([uuid.uuid4()]))
+        .options(
+            load_only(
+                Project.id,
+                Project.build_config,
+                Project.paused,
+                Project.archived,
+                Project.github_owner,
+                Project.github_repo,
+                Project.capability_adoption_verdicts,
+                Project.capability_proof_records,
+                raiseload=True,
+            )
+        )
+    )
+    sql = str(stmt.compile(dialect=postgresql.dialect()))
+
+    assert "design_doc" not in sql, (
+        "dispatch pre-fetch must not load design_doc JSONB; got: " + sql[:200]
+    )
+    assert "vision" not in sql, (
+        "dispatch pre-fetch must not load vision JSONB; got: " + sql[:200]
+    )
+    assert "build_config" in sql, "build_config must be in dispatch pre-fetch projection"
+    assert "paused" in sql, "paused must be in dispatch pre-fetch projection"

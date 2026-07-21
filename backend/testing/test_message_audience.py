@@ -1986,5 +1986,47 @@ async def test_resolve_usage_meter_dark_alert_no_op_when_none_open():
     mock_session.execute = AsyncMock(side_effect=[project_result, alert_result])
 
     await _resolve_usage_meter_dark_alert(mock_session)
-
     mock_session.add.assert_not_called()
+
+
+def test_operator_visible_audience_filter_uses_jsonb_scalar_expression():
+    """operator_visible_audience_filter must use context->>'audience' so the
+    expression index ix_projectmessage_context_audience is picked up by the
+    query planner in 10+ hot operator-inbox paths."""
+    from sqlalchemy.dialects import postgresql
+
+    from app.message_audience import operator_visible_audience_filter
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+
+    assert "context" in sql, "filter must reference the context column"
+    assert "audience" in sql and "->>" in sql, (
+        "filter must use the ->> scalar extraction operator on audience "
+        "so the ix_projectmessage_context_audience expression index is used; "
+        f"got: {sql}"
+    )
+
+
+def test_projectmessage_table_args_include_audience_index():
+    """ProjectMessage.__table_args__ must declare ix_projectmessage_context_audience
+    for the model/migration coverage invariant."""
+    from app.models import ProjectMessage
+
+    index_names = {
+        idx.name
+        for idx in ProjectMessage.__table_args__
+        if hasattr(idx, "name")
+    }
+    assert "ix_projectmessage_context_audience" in index_names, (
+        "ProjectMessage.__table_args__ must include ix_projectmessage_context_audience; "
+        f"found: {sorted(index_names)}"
+    )

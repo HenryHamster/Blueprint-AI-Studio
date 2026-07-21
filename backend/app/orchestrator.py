@@ -835,7 +835,24 @@ async def _project_resource_dispatch_defer_message(
                 # Healthy cache hits remain query-free (no expired attributes).
                 await session.refresh(project)
     else:
-        project = await session.get(Project, task.project_id)
+        _proj_row = await session.execute(
+            select(Project)
+            .where(Project.id == task.project_id)
+            .options(
+                load_only(
+                    Project.id,
+                    Project.build_config,
+                    Project.paused,
+                    Project.archived,
+                    Project.github_owner,
+                    Project.github_repo,
+                    Project.capability_adoption_verdicts,
+                    Project.capability_proof_records,
+                    raiseload=True,
+                )
+            )
+        )
+        project = _proj_row.scalar_one_or_none()
         if project_cache is not None:
             project_cache[task.project_id] = project
     if project is None:
@@ -3233,8 +3250,20 @@ async def orchestrator_worker():
                     _dispatch_projects = (
                         (
                             await session.execute(
-                                select(Project).where(
-                                    Project.id.in_(_all_candidate_pids)
+                                select(Project)
+                                .where(Project.id.in_(_all_candidate_pids))
+                                .options(
+                                    load_only(
+                                        Project.id,
+                                        Project.build_config,
+                                        Project.paused,
+                                        Project.archived,
+                                        Project.github_owner,
+                                        Project.github_repo,
+                                        Project.capability_adoption_verdicts,
+                                        Project.capability_proof_records,
+                                        raiseload=True,
+                                    )
                                 )
                             )
                         )

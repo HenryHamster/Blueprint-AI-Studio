@@ -1594,6 +1594,204 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     )
 
 
+# ── load_columns projection (perf finding 1) ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_load_columns_generates_projected_sql(
+    db_session, mocker
+):
+    """lock_project_or_429 with load_columns issues a SELECT that includes only
+    the specified columns (verified by inspecting the SQL statement)."""
+    from app.task_locking import lock_project_or_429
+
+    project = Project(
+        name="load-columns-test",
+        user_id="user-lc",
+        design_doc={"key": "value"},
+        directions=[{"id": "d1"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    executed_stmts: list[str] = []
+    original_execute = db_session.execute
+
+    async def _capture(stmt, *args, **kwargs):
+        try:
+            compiled = str(stmt.compile(compile_kwargs={"literal_binds": False}))
+        except Exception:
+            compiled = str(stmt)
+        executed_stmts.append(compiled)
+        return await original_execute(stmt, *args, **kwargs)
+
+    mocker.patch.object(db_session, "execute", new=AsyncMock(side_effect=_capture))
+
+    locked = await lock_project_or_429(
+        db_session, project.id, load_columns=[Project.id, Project.design_doc]
+    )
+    assert str(locked.id) == str(project.id)
+
+    locking_stmts = [s for s in executed_stmts if "FOR UPDATE" in s.upper()]
+    assert locking_stmts, "expected at least one FOR UPDATE statement"
+    locking_sql = locking_stmts[0]
+    assert "design_doc" in locking_sql.lower(), (
+        "projected SELECT must include design_doc"
+    )
+    assert "directions" not in locking_sql.lower(), (
+        "projected SELECT must NOT include directions (excluded by load_columns)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lock_project_or_429_default_loads_all_columns(db_session):
+    """lock_project_or_429 without load_columns loads all columns (backward compat)."""
+    from app.task_locking import lock_project_or_429
+
+    project = Project(
+        name="load-all-test",
+        user_id="user-all",
+        design_doc={"x": 1},
+        directions=[{"id": "d2"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+
+    locked = await lock_project_or_429(db_session, project.id)
+    # All columns must be accessible without error
+    assert str(locked.id) == str(project.id)
+    assert locked.design_doc == {"x": 1}
+    assert locked.directions == [{"id": "d2"}]
+
+
+@pytest.mark.asyncio
+async def test_with_design_doc_locked_does_not_load_directions(db_session, mocker):
+    """with_design_doc_locked must issue a projected SELECT that loads only
+    id and design_doc — directions and other bulky columns are excluded.
+
+    This verifies the load_columns=[Project.id, Project.design_doc] projection
+    passes through to project_lock correctly.
+    """
+    executed_stmts: list[str] = []
+    original_execute = db_session.execute
+
+    async def _capture(stmt, *args, **kwargs):
+        try:
+            compiled = str(stmt.compile(compile_kwargs={"literal_binds": False}))
+        except Exception:
+            compiled = str(stmt)
+        executed_stmts.append(compiled)
+        return await original_execute(stmt, *args, **kwargs)
+
+    mocker.patch.object(db_session, "execute", new=AsyncMock(side_effect=_capture))
+
+    project = Project(
+        name="dsl-projection-test",
+        user_id="user-proj",
+        design_doc={"z": 99},
+        directions=[{"id": "d3"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    executed_stmts.clear()
+
+    def _touch(doc: dict) -> None:
+        doc["touched"] = True
+
+    await with_design_doc_locked(db_session, project.id, _touch)
+
+    # The FOR UPDATE SELECT must mention design_doc but NOT directions.
+    locking_stmts = [s for s in executed_stmts if "FOR UPDATE" in s.upper()]
+    assert locking_stmts, "expected at least one FOR UPDATE statement"
+    locking_sql = locking_stmts[0]
+    assert "design_doc" in locking_sql.lower(), (
+        "projected SELECT must include design_doc column"
+    )
+    assert "directions" not in locking_sql.lower(), (
+        "projected SELECT must NOT include directions (load_columns projection)"
+    )
+
+
+# ── backfill_file_to_system_index (perf findings 2 & 3) ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_paginates_in_batches(db_session, mocker):
+    """backfill_file_to_system_index must process all projects via cursor
+    pagination (no single unbounded query that loads all IDs at once).
+
+    We seed 3 projects and verify all are processed and the returned count
+    reflects actual updates.
+    """
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    projects = []
+    for i in range(3):
+        p = Project(
+            name=f"backfill-batch-{i}",
+            user_id="user-bf",
+            design_doc={
+                f"systems/sys-{i}": {
+                    "key_paths": [f"src/file_{i}.py"],
+                }
+            },
+        )
+        db_session.add(p)
+        projects.append(p)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 3, f"expected 3 updates, got {count}"
+
+    for p in projects:
+        await db_session.refresh(p)
+        fts = p.design_doc.get("_file_to_system")
+        assert fts is not None, f"_file_to_system missing on project {p.id}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_skips_unchanged(db_session):
+    """Projects whose _file_to_system index is already correct must NOT count
+    as updated — the idempotency guard (current == rebuilt) must fire.
+    """
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    p = Project(
+        name="backfill-idempotent",
+        user_id="user-bi",
+        design_doc={
+            "systems/comp": {"key_paths": ["a/b.py"]},
+            "_file_to_system": {"a/b.py": "comp"},
+        },
+    )
+    db_session.add(p)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 0, (
+        f"expected 0 updates for already-correct index, got {count}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_backfill_file_to_system_index_empty_design_doc_skipped(db_session):
+    """Projects with an empty or null design_doc must be skipped entirely."""
+    from app.routers.admin_agent_ops import backfill_file_to_system_index
+
+    p_null = Project(name="backfill-null", user_id="user-bn", design_doc={})
+    db_session.add(p_null)
+    await db_session.commit()
+
+    count = await backfill_file_to_system_index(db_session)
+    await db_session.commit()
+
+    assert count == 0, f"expected 0 for empty design_doc, got {count}"
+
+
 def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
     """Regression: cochange_index and cochange_applied_prs (written by
     direction_outcomes.py, ~38KB each) must be reserved so they don't
