@@ -6339,3 +6339,151 @@ async def test_kguard_distinct_topics_same_direction_not_deduplicated(db_session
         db_session, project_a.id, "d-006", "topic-beta"
     )
     assert doc_result is False, "Recent doc for topic-alpha must not block commission for topic-beta"
+
+
+# ── greenfield web-only design citation gate (end-to-end) ────────────────────
+#
+# A "greenfield" design document cites ONLY web URLs (no file-path citations)
+# because the target repo is empty or has no relevant codebase to reference.
+# The backend runs ``_design_web_only_grounding_miss`` which probes each URL for
+# reachability so a doc grounded entirely in dead/fabricated links cannot pass.
+# The gate errs toward acceptance — any reachable URL or all-transient errors
+# accept; ALL definitively dead URLs reject.
+
+
+@pytest.mark.asyncio
+async def test_greenfield_web_only_design_live_urls_pass_gate_to_completed(
+    db_session, _quiet_broadcast, mocker
+):
+    """A greenfield design doc that cites ONLY web URLs, all reachable, clears the
+    web-only URL reachability gate and persists exactly one KnowledgeDocument with
+    source_kind=='design' and the web URLs as source_citations."""
+    mocker.patch(
+        "app.knowledge_completion._probe_url_reachability",
+        new=AsyncMock(return_value="reachable"),
+    )
+    project, task = await _make_design_task(db_session, project_name="DSGNgreenfield")
+
+    document = {
+        "title": "Design for the new payments API",
+        "summary": "A greenfield payments API design grounded in web standards.",
+        "body": "# Payments API\n\nThis design references the OpenAPI specification and REST best practices for a new payments service.",
+        "citations": [
+            "https://spec.openapis.org/oas/v3.1.0",
+            "https://restfulapi.net/rest-api-design-tutorial/",
+        ],
+        "tags": ["design", "api"],
+        "topic": "payments API design",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    doc = docs[0]
+    assert doc.source_kind == "design"
+    assert "https://spec.openapis.org/oas/v3.1.0" in doc.source_citations
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_greenfield_web_only_design_all_dead_urls_fail_gate(
+    db_session, _quiet_broadcast, mocker
+):
+    """A greenfield design doc whose EVERY cited URL is definitively dead fails the
+    web-only URL reachability gate: the task is marked FAILED with a reason
+    containing 'unreachable', and no KnowledgeDocument is persisted."""
+    mocker.patch(
+        "app.knowledge_completion._probe_url_reachability",
+        new=AsyncMock(return_value="dead"),
+    )
+    project, task = await _make_design_task(db_session, project_name="DSGNdeadurls")
+
+    document = {
+        "title": "Design for the new payments API",
+        "summary": "A greenfield design referencing only dead links.",
+        "body": "# Payments API\n\nThis design cites URLs that no longer resolve to real resources.",
+        "citations": [
+            "https://fabricated.example.invalid/api-spec",
+            "https://also-fabricated.example.invalid/guide",
+        ],
+        "tags": ["design"],
+        "topic": "payments API",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    assert await _docs_for(db_session, task.id) == []
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    reason = task.context["evaluation_gate"]["reason"]
+    assert "unreachable" in reason
+    assert "not grounded in the codebase" not in reason
+    assert "no usable source citation" not in reason
+
+
+@pytest.mark.asyncio
+async def test_greenfield_web_only_design_transient_errors_err_toward_acceptance(
+    db_session, _quiet_broadcast, mocker
+):
+    """When ALL URL probes return 'transient' (network timeouts, 5xx errors), the
+    gate errs toward acceptance — a flaky network must not block a valid greenfield
+    design. The task is marked COMPLETED and exactly one document persists."""
+    mocker.patch(
+        "app.knowledge_completion._probe_url_reachability",
+        new=AsyncMock(return_value="transient"),
+    )
+    project, task = await _make_design_task(db_session, project_name="DSGNtransient")
+
+    document = {
+        "title": "Design for the new payments API",
+        "summary": "A greenfield design whose URL probes all return transient errors.",
+        "body": "# Payments API\n\nThis design references the OpenAPI spec via web citations.",
+        "citations": [
+            "https://spec.openapis.org/oas/v3.1.0",
+        ],
+        "tags": ["design"],
+        "topic": "payments API",
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_greenfield_web_only_design_with_file_citation_bypasses_url_probe(
+    db_session, _quiet_broadcast, mocker
+):
+    """When a design document has BOTH a web URL AND a file-path citation, the
+    web-only URL reachability probe is skipped entirely — ``_design_web_only_grounding_miss``
+    exits early when non-web citations are present. The task completes without calling
+    ``_probe_url_reachability`` at all."""
+    probe = mocker.patch(
+        "app.knowledge_completion._probe_url_reachability",
+        new=AsyncMock(return_value="dead"),
+    )
+    project, task = await _make_design_task(db_session, project_name="DSGNmixcite")
+
+    document = {
+        "title": "Design for the X subsystem",
+        "summary": "Design referencing both real codebase files and external specs.",
+        "body": "# X\n\nExtends existing modules as described in the referenced external specification.",
+        "citations": [
+            "backend/app/reaper.py",
+            "https://spec.openapis.org/oas/v3.1.0",
+        ],
+        "tags": ["design"],
+        "topic": "X",
+        # Agent-stamped grounding: the file citation resolves to a real path.
+        "_citation_grounding": {"file_citations": 1, "grounded": 1, "checked": True},
+    }
+    await _handle_design_completion(task, json.dumps(document), db_session)
+
+    docs = await _docs_for(db_session, task.id)
+    assert len(docs) == 1
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    # Non-web citation short-circuits the web-only probe — never called.
+    probe.assert_not_called()

@@ -100,6 +100,7 @@ from app.review_policy import (  # noqa: F401
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     ReviewSkipDecision,
     evaluate_auto_approve_small_main,
+    is_first_pass_minor_only,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
     should_skip_initial_review,

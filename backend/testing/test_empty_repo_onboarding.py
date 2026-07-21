@@ -1034,3 +1034,296 @@ class TestGreenfieldPlanNoOpRejection:
             "Undetermined (absent) repo_is_empty must not trigger the greenfield guard — "
             "only repo_is_empty is True fires it"
         )
+
+
+# ── is_repo_uninitialized (public failure_classification helper) ──────────────
+
+
+class TestIsRepoUninitialized:
+    """The public is_repo_uninitialized helper matches the commitless signatures
+    and is safe on edge-case inputs."""
+
+    def test_matches_each_uninitialized_pattern(self):
+        from app.failure_classification import (
+            _REPO_UNINITIALIZED_PATTERNS,
+            is_repo_uninitialized,
+        )
+
+        for pattern in _REPO_UNINITIALIZED_PATTERNS:
+            assert is_repo_uninitialized(pattern), f"should match: {pattern!r}"
+
+    def test_case_insensitive(self):
+        from app.failure_classification import is_repo_uninitialized
+
+        assert is_repo_uninitialized("REPOSITORY HAS NO COMMITS")
+        assert is_repo_uninitialized("This Repository Is Empty.")
+
+    def test_does_not_match_delivery_disagreement(self):
+        from app.failure_classification import (
+            _CLONE_DELIVERY_DISAGREEMENT_PATTERNS,
+            is_repo_uninitialized,
+        )
+
+        for pattern in _CLONE_DELIVERY_DISAGREEMENT_PATTERNS:
+            assert not is_repo_uninitialized(pattern), (
+                f"delivery-disagreement text must NOT match: {pattern!r}"
+            )
+
+    def test_safe_on_empty_and_none(self):
+        from app.failure_classification import is_repo_uninitialized
+
+        assert is_repo_uninitialized("") is False
+        assert is_repo_uninitialized(None) is False
+
+
+# ── Commitless self-heal: maybe_correct_stale_commitless_repo_signal ──────────
+# A project whose durable repo_is_empty=False is stale on a genuinely commitless
+# repo (no branches at all) loops clone_failed with a REPO_UNINITIALIZED
+# signature forever because git clone --branch <trunk> dies before
+# verifyCloneDelivered can run.  maybe_correct_stale_commitless_repo_signal
+# re-verifies via repo_has_commits() and flips the signal when confirmed.
+
+
+class TestStaleCommitlessSelfHeal:
+    """maybe_correct_stale_commitless_repo_signal flips repo_is_empty=True on a
+    confirmed commitless repo and is a no-op for non-stale / non-commitless cases."""
+
+    def _stale_project(self):
+        return Project(
+            name="commitless-external",
+            github_owner="HenryHamster",
+            github_repo="commitless-external",
+            build_config={"repo_is_empty": False, "source_file_count": 5},
+        )
+
+    @pytest.mark.asyncio
+    async def test_flips_when_repo_has_no_commits(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github_refs.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified"),
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is True
+        assert project.build_config["repo_is_empty"] is True
+        assert project.build_config["source_file_count"] == 0
+        assert project.build_config["has_ci"] is False
+        session.commit.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_repo_is_already_true(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = Project(
+            name="already-empty",
+            github_owner="HenryHamster",
+            github_repo="already-empty",
+            build_config={"repo_is_empty": True, "source_file_count": 0},
+        )
+        session = AsyncMock()
+        token_mock = AsyncMock(return_value="tok")
+
+        with patch("app.github.get_repo_installation_token", token_mock):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        token_mock.assert_not_awaited()
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_repo_has_commits(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github_refs.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        assert project.build_config["repo_is_empty"] is False
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_respects_cooldown(self):
+        import time
+
+        from app.build_config_detection import (
+            _REDETECT_COOLDOWN_S,
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        project.id = uuid.uuid4()
+        _redetect_stale_commitless_cooldown[str(project.id)] = (
+            time.monotonic() - _REDETECT_COOLDOWN_S / 2
+        )
+        session = AsyncMock()
+        token_mock = AsyncMock(return_value="tok")
+
+        with patch("app.github.get_repo_installation_token", token_mock):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        token_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_best_effort_on_token_failure(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with patch(
+            "app.github.get_repo_installation_token",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        assert project.build_config["repo_is_empty"] is False
+        session.commit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_best_effort_on_github_error(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = self._stale_project()
+        session = AsyncMock()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github_refs.repo_has_commits",
+                new_callable=AsyncMock,
+                side_effect=RuntimeError("GitHub 502"),
+            ),
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is False
+        assert project.build_config["repo_is_empty"] is False
+        session.rollback.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_preserves_operator_overrides(self):
+        from app.build_config_detection import (
+            _redetect_stale_commitless_cooldown,
+            maybe_correct_stale_commitless_repo_signal,
+        )
+
+        _redetect_stale_commitless_cooldown.clear()
+        project = Project(
+            name="overrides-preserved",
+            github_owner="HenryHamster",
+            github_repo="overrides-preserved",
+            build_config={
+                "repo_is_empty": False,
+                "source_file_count": 3,
+                "git_user_email": "bot@example.com",
+                "git_user_name": "Blueprint Bot",
+                "env_vars": {"FOO": "bar"},
+            },
+        )
+        session = AsyncMock()
+
+        with (
+            patch(
+                "app.github.get_repo_installation_token",
+                new_callable=AsyncMock,
+                return_value="tok",
+            ),
+            patch(
+                "app.github_refs.repo_has_commits",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch("sqlalchemy.orm.attributes.flag_modified"),
+        ):
+            healed = await maybe_correct_stale_commitless_repo_signal(project, session)
+
+        assert healed is True
+        assert project.build_config["repo_is_empty"] is True
+        assert project.build_config["git_user_email"] == "bot@example.com"
+        assert project.build_config["git_user_name"] == "Blueprint Bot"
+        assert project.build_config["env_vars"] == {"FOO": "bar"}
+
+
+# ── agent_status wire-in: REPO_UNINITIALIZED clone_failed → self-heal ─────────
+
+
+class TestAgentStatusRepoUninitializedSelfHeal:
+    """The agent_status clone_failed block routes the REPO_UNINITIALIZED
+    failure signature to maybe_correct_stale_commitless_repo_signal."""
+
+    def test_is_repo_uninitialized_matches_clone_failed_text(self):
+        from app.failure_classification import is_repo_uninitialized
+
+        # Typical text emitted by the agent when ls-remote confirms no commits.
+        assert is_repo_uninitialized("fatal: repository has no commits")
+        assert is_repo_uninitialized("error: this repository is empty")
+        assert is_repo_uninitialized("git repository is empty, cannot clone")
+
+    def test_is_clone_delivery_disagreement_does_not_match_uninitialized_text(self):
+        from app.failure_classification import is_clone_delivery_disagreement
+
+        for text in [
+            "repository has no commits",
+            "this repository is empty",
+            "git repository is empty",
+        ]:
+            assert not is_clone_delivery_disagreement(text), (
+                f"delivery-disagreement must NOT match uninitialized text: {text!r}"
+            )

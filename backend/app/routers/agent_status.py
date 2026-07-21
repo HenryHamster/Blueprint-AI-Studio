@@ -1603,7 +1603,10 @@ async def update_agent_status(
         # confirms the repo is empty. Best-effort: never raises, and preserves
         # fail-loud for a real clone shortfall (a repo with content leaves the
         # stored signal untouched, so the next task still fails loud).
-        from app.failure_classification import is_clone_delivery_disagreement
+        from app.failure_classification import (
+            is_clone_delivery_disagreement,
+            is_repo_uninitialized,
+        )
 
         _raw_fc = payload.failure_category.strip().lower()
         _disagreement_text = "\n".join(
@@ -1619,6 +1622,22 @@ async def update_agent_status(
             _heal_project = await session.get(Project, task.project_id)
             if _heal_project is not None:
                 await maybe_correct_stale_repo_empty_signal(_heal_project, session)
+        elif _raw_fc == "clone_failed" and is_repo_uninitialized(_disagreement_text):
+            # Second self-heal shape: a genuinely commitless repo whose stored
+            # repo_is_empty=False is stale.  git clone --branch <trunk> dies
+            # before verifyCloneDelivered runs, so the failure text matches the
+            # REPO_UNINITIALIZED patterns (not the clone-delivery-disagreement
+            # string).  Re-verify against GitHub and flip the durable signal when
+            # repo_has_commits() confirms the repo is truly commitless.
+            from app.build_config_detection import (
+                maybe_correct_stale_commitless_repo_signal,
+            )
+
+            _heal_project = await session.get(Project, task.project_id)
+            if _heal_project is not None:
+                await maybe_correct_stale_commitless_repo_signal(
+                    _heal_project, session
+                )
     if payload.scope_gate_triggered:
         ctx = dict(task.context or {})
         ctx["scope_gate_triggered"] = payload.scope_gate_triggered

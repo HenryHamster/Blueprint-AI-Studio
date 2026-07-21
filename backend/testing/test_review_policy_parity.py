@@ -23,6 +23,7 @@ from app.review_heuristics import detect_hedges_in_diff
 from app.review_policy import (
     AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     evaluate_auto_approve_small_main,
+    is_first_pass_minor_only,
     should_auto_approve_diff,
     should_skip_initial_review,
     should_skip_re_review,
@@ -260,6 +261,108 @@ class TestReReviewSkipParity:
         d = should_skip_re_review("code_review", False, scan_blocked=False)
         assert d.skip is False
         assert d.rule == "none"
+
+
+# ── is_first_pass_minor_only — documented, testable predicate ──────────────────
+
+
+class TestIsFirstPassMinorOnly:
+    """Tests for the ``is_first_pass_minor_only`` predicate.
+
+    The predicate returns True only when: it is the first review iteration
+    (iteration==1), there is a non-empty list of issues, and every issue that
+    has a ``description`` has a ``severity`` that is (case-insensitively)
+    "minor" — missing/None severity also counts as minor.
+    """
+
+    def test_all_minor_issues_returns_true(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+                {"severity": "minor", "description": "nit: naming"},
+            ],
+            iteration=1,
+        ) is True
+
+    def test_any_major_returns_false(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+                {"severity": "MAJOR", "description": "missing null check"},
+            ],
+            iteration=1,
+        ) is False
+
+    def test_any_critical_returns_false(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+                {"severity": "CRITICAL", "description": "security vulnerability"},
+            ],
+            iteration=1,
+        ) is False
+
+    def test_empty_issues_returns_false(self):
+        assert is_first_pass_minor_only([], iteration=1) is False
+
+    def test_none_issues_returns_false(self):
+        assert is_first_pass_minor_only(None, iteration=1) is False
+
+    def test_missing_description_filtered_not_false_positive(self):
+        """Issues without a description are filtered out and do not cause a
+        false negative — as long as all other (described) issues are minor."""
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+                {"severity": "MAJOR"},  # no description → skipped
+            ],
+            iteration=1,
+        ) is True
+
+    def test_none_severity_treated_as_minor(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": None, "description": "something"},
+                {"severity": "minor", "description": "another nit"},
+            ],
+            iteration=1,
+        ) is True
+
+    def test_missing_severity_key_treated_as_minor(self):
+        assert is_first_pass_minor_only(
+            [
+                {"description": "something without severity key"},
+            ],
+            iteration=1,
+        ) is True
+
+    def test_second_iteration_returns_false(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+            ],
+            iteration=2,
+        ) is False
+
+    def test_iteration_zero_returns_false(self):
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit"},
+            ],
+            iteration=0,
+        ) is False
+
+    def test_mixed_minor_and_missing_description_returns_true(self):
+        """All described issues are minor → True, even with blank entries."""
+        assert is_first_pass_minor_only(
+            [
+                {"severity": "minor", "description": "nit: spacing"},
+                {"severity": "minor", "description": "nit: naming"},
+                {"severity": "MAJOR"},  # no description → filtered
+                {},
+            ],
+            iteration=1,
+        ) is True
 
 
 # ── Mechanical hedge detection ────────────────────────────────────────────────

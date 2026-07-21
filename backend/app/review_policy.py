@@ -170,6 +170,30 @@ def should_skip_initial_review(is_intermediate: bool, scope: str) -> tuple[bool,
     return (False, f"{scope} scope on intermediate branch: full review required")
 
 
+def is_first_pass_minor_only(issues: list | None, iteration: int = 1) -> bool:
+    """Whether every blocking finding from the initial review is minor-severity.
+
+    When this is True the spawned fix only addresses nits, so its completion
+    handler can skip the follow-up re-review (CI gates the merge instead),
+    saving one review iteration + one review-phase LLM call.
+
+    The predicate mirrors the inline computation that previously lived in
+    ``task_lifecycle.py`` (first pass, non-empty issues, every described issue
+    is minor severity — missing/None severity also counts as minor).
+
+    Pure / side-effect-free — unit-testable without a database.
+    """
+    if iteration != 1:
+        return False
+    if not issues:
+        return False
+    return all(
+        (i.get("severity", "minor") or "minor").lower() == "minor"
+        for i in issues
+        if i.get("description")
+    )
+
+
 def should_skip_rereview(
     fix_reason: str, skip_rereview_minor_only: bool
 ) -> tuple[bool, str]:

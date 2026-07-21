@@ -703,6 +703,18 @@ def _is_repo_uninitialized(combined: str) -> bool:
     return any(kw in combined for kw in _REPO_UNINITIALIZED_PATTERNS)
 
 
+def is_repo_uninitialized(combined: str) -> bool:
+    """True when the failure text shows the remote repo has zero commits.
+
+    Public alias for :func:`_is_repo_uninitialized`.  Used by
+    ``agent_status.py`` to route the commitless-repo clone-failure signature to
+    the self-heal path.  Case-insensitive; safe on empty/None.
+    """
+    if not combined:
+        return False
+    return _is_repo_uninitialized(combined.lower())
+
+
 def _is_branch_gone(combined: str) -> bool:
     """True when the failure text shows the target branch/ref no longer exists.
 

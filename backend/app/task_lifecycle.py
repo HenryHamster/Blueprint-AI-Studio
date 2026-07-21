@@ -65,6 +65,7 @@ from app.review_pipeline import (
     fix_all_occurrences_directive,
     reconciled_approve_markers,
     evaluate_auto_approve_small_main,
+    is_first_pass_minor_only,
     should_skip_initial_review,
     should_skip_re_review,
 )
@@ -5309,14 +5310,8 @@ async def _process_post_commit(
                     # skips the follow-up re-review (CI gates the merge instead),
                     # saving one review iteration + one review-phase LLM call.
                     review_iteration = review_loop.get("iteration", 1)
-                    first_attempt_minor_only = (
-                        review_iteration == 1
-                        and bool(issues)
-                        and all(
-                            (i.get("severity", "minor") or "minor").lower() == "minor"
-                            for i in issues
-                            if i.get("description")
-                        )
+                    first_attempt_minor_only = is_first_pass_minor_only(
+                        issues, review_iteration
                     )
                     fix_task, _ = await _spawn_pipeline_task(
                         task,
