@@ -5,6 +5,7 @@ import {
   composerHintCopy,
   predictArming,
   parseArmingOutcome,
+  residentAcceptanceToastCopy,
   workbenchArmingToastCopy,
 } from './messageArming';
 
@@ -33,6 +34,23 @@ describe('armingToastCopy — post-send toast grounded in the real outcome', () 
     expect(armingToastCopy(undefined)).toBe('Message sent');
   });
 });
+describe('residentAcceptanceToastCopy — canonical conversation receipt wins', () => {
+  test('queued overrides a contradictory legacy not_armed outcome', () => {
+    const receipt = residentAcceptanceToastCopy('queued', 'not_armed');
+    expect(receipt).toEqual({
+      message: 'Message accepted — Resident queued',
+      severity: 'success',
+    });
+    expect(receipt.message).not.toContain('wasn’t woken');
+  });
+
+  test('capacity and paused receipts stay truthful', () => {
+    expect(residentAcceptanceToastCopy('waiting_for_capacity', 'steering').message)
+      .toContain('waiting to start');
+    expect(residentAcceptanceToastCopy('paused', 'steering').severity).toBe('info');
+  });
+});
+
 
 describe('armingHintCopy — composer hint per outcome', () => {
   test('steering hint reaches the strategist', () => {

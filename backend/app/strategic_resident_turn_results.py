@@ -16,6 +16,8 @@ EvidenceKind = Literal[
     "task_log",
     "runner",
     "runner_capacity",
+    "pipeline",
+    "qualification_state",
     "pr",
     "pr_diff",
     "pr_check",

@@ -23,6 +23,8 @@ EVIDENCE_KINDS = frozenset(
         "task_log",
         "runner",
         "runner_capacity",
+        "pipeline",
+        "qualification_state",
         "pr",
         "pr_diff",
         "pr_check",
@@ -55,11 +57,9 @@ INSPECTION_CAPABILITY_KINDS = {
 SUCCESSFUL_INSPECTION_STATUSES = frozenset({"applied", "reconciled"})
 
 # Maps a ``ResidentTaskEvidence.kind`` (the inspection taxonomy) to the trust
-# ``EVIDENCE_KINDS`` taxonomy used by ``evidence_key``/``build_trusted_evidence_index``.
-# All task-derived inspections collapse to ``task`` except logs -> ``task_log``;
-# source_id + revision + checksum still distinguish the specific evidence (e.g. a
-# failure vs a provider inspection of the same task differ by checksum), so the
-# collapse never conflates distinct evidence.
+# ``EVIDENCE_KINDS`` used by ``evidence_key``/``build_trusted_evidence_index``.
+# Task inspections collapse to ``task`` except logs -> ``task_log``; source_id,
+# revision, and checksum distinguish evidence without conflation.
 INSPECTION_EVIDENCE_KIND_MAP = {
     "task": "task",
     "lineage": "task",
@@ -68,6 +68,8 @@ INSPECTION_EVIDENCE_KIND_MAP = {
     "provider": "task",
     "runner": "runner",
     "runner_capacity": "runner_capacity",
+    "pipeline": "pipeline",
+    "qualification": "qualification_state",
     "pr": "pr",
     "pr_diff": "pr_diff",
     "pr_check": "pr_check",

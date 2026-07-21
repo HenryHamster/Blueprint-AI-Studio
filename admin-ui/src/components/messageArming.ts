@@ -61,6 +61,30 @@ export function armingToastCopy(outcome: ArmingOutcome | null | undefined): stri
   return outcome ? ARMING_TOAST[outcome] : 'Message sent';
 }
 
+export type ResidentWakeupState = 'queued' | 'coalesced' | 'paused' | 'waiting_for_capacity';
+
+/** Conversation acceptance is authoritative; legacy arming cannot override it. */
+export function residentAcceptanceToastCopy(
+  wakeup: ResidentWakeupState | null | undefined,
+  arming: ArmingOutcome | null | undefined,
+): { message: string; severity: 'success' | 'info' } {
+  switch (wakeup) {
+    case 'queued':
+      return { message: 'Message accepted — Resident queued', severity: 'success' };
+    case 'coalesced':
+      return { message: 'Message accepted — included in the next Resident turn', severity: 'success' };
+    case 'paused':
+      return { message: 'Message accepted — background autonomy is paused', severity: 'info' };
+    case 'waiting_for_capacity':
+      return { message: 'Message accepted — Resident is waiting to start', severity: 'info' };
+    default:
+      return {
+        message: armingToastCopy(arming),
+        severity: arming === 'not_armed' ? 'info' : 'success',
+      };
+  }
+}
+
 /** Toast copy for Strategic workbench mode changes that wake or tried to wake Strategic. */
 export function workbenchArmingToastCopy(outcome: ArmingOutcome | null | undefined): string | null {
   return outcome === 'steering' || outcome === 'not_armed' ? WORKBENCH_ARMING_TOAST[outcome] : null;

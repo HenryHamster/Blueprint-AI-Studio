@@ -387,7 +387,7 @@ function residentPrompt(
     'Mutation evidence references must be shaped exactly as {"kind":"<server kind>","project_id":"<server project_id>","source_id":"<server source_id>","revision":"<server revision>","checksum":"<server checksum>","inspected_at":"<server inspected_at>"}. Copy every field from one server-validated inspection; do not include evidence_id, summary, decisive, data, or any other field. Explicit approvals are durable server-side grants and are never represented in the model request.',
     'Every mutation response contains a server-authored completion_projection. Copy its operation and receipt exactly into final operations and receipts, and copy every projected unknown_effect and required_attention item exactly. An unknown_effect receipt must remain an applying operation and must never be reported as success or retried.',
     'Never claim an operation that lacks a server receipt.',
-    'Never request a propose_only capability; include those only as final operations with status "proposed".',
+    'Never request a propose_only capability; include those only as final operations with status "proposed". Use pipeline.inspect for broad project status; use qualification.inspect only for focused qualification follow-up. Continue obvious read-only diagnostic chains without asking the operator for permission.',
     residentReplyContract(isRecord(providerInput.identity) ? providerInput.identity.lane : null),
     FINAL_RESULT_SCHEMA_HINT,
     'Only accept strategic changes you can support with decisive revisioned evidence you inspected in this turn. Record those inspections exactly in reconciliation.evidence_inspections.',

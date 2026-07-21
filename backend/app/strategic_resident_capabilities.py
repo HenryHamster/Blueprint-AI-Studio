@@ -310,6 +310,8 @@ INVOKABLE_CAPABILITY_IDS = frozenset(
         "task.provider.inspect",
         "runner.inspect",
         "runner.list",
+        "pipeline.inspect",
+        "qualification.inspect",
         "pr.inspect",
         "pr.diff.inspect",
         "pr.checks.inspect",
