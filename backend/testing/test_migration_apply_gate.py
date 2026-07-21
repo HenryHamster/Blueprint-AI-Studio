@@ -2578,3 +2578,323 @@ async def test_provision_seed_uses_replay_timeout_code(monkeypatch):
         "The de-duplicated _provision_seed_and_detect_drift must forward the "
         "replay-specific timeout_code to _apply_candidate_migrations."
     )
+
+
+# --- Subprocess structured verdict: classifier -------------------------------
+#
+# The isolated migration-apply subprocess classifies its OWN exception (the only
+# place the typed exception is observable) and emits a machine-readable verdict.
+# `_classify_apply_failure` is that classifier; the tests below pin each branch.
+
+
+def test_classify_apply_failure_syntax_error_is_deterministic_defect():
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        SyntaxError("invalid syntax", ("<migration_0001>", 3, 1, "def upgrade(\n"))
+    )
+    assert verdict["kind"] == "deterministic_defect"
+    assert verdict["exc_type"] == "SyntaxError"
+    assert "SyntaxError" in verdict["detail"]
+
+
+def test_classify_apply_failure_third_party_import_is_deterministic_defect():
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        ImportError("No module named 'nonexistent_dep_xyz'")
+    )
+    assert verdict["kind"] == "deterministic_defect"
+    assert verdict["exc_type"] == "ImportError"
+
+
+def test_classify_apply_failure_app_import_is_serving_only():
+    import app.migration_apply_gate as gate_mod
+
+    exc = ImportError(
+        "cannot import name 'require_encryption_active' from 'app.field_encryption'"
+    )
+    verdict = gate_mod._classify_apply_failure(exc)
+    assert verdict["kind"] == "serving_only_import"
+    assert "app.field_encryption" in verdict["detail"]
+
+
+def test_classify_apply_failure_class42_sql_error_is_deterministic_defect():
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeOrig(Exception):
+        pgcode = "42P01"  # undefined_table
+
+    exc = sa.exc.ProgrammingError(
+        "relation \"nope\" does not exist", {}, _FakeOrig("undefined table")
+    )
+    verdict = gate_mod._classify_apply_failure(exc)
+    assert verdict["kind"] == "deterministic_defect"
+    assert verdict["pgcode"] == "42P01"
+    assert "42P01" in verdict["detail"]
+
+
+def test_classify_apply_failure_non_class42_sql_error_is_apply_error():
+    import app.migration_apply_gate as gate_mod
+
+    class _FakeOrig(Exception):
+        pgcode = "40P01"  # deadlock_detected — transient, must DEFER
+
+    exc = sa.exc.ProgrammingError("deadlock detected", {}, _FakeOrig("deadlock"))
+    verdict = gate_mod._classify_apply_failure(exc)
+    assert verdict["kind"] == "apply_error"
+    assert verdict["pgcode"] == "40P01"
+
+
+def test_classify_apply_failure_keyless_encryption_runtime_error():
+    import app.migration_apply_gate as gate_mod
+
+    exc = RuntimeError(
+        f"{gate_mod._ENCRYPTION_KEY_ENV_VAR} is required to activate encryption"
+    )
+    verdict = gate_mod._classify_apply_failure(exc)
+    assert verdict["kind"] == "keyless_encryption"
+
+
+def test_classify_apply_failure_generic_exception_is_apply_error():
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        OSError("connection refused: scratch-db:5432")
+    )
+    assert verdict["kind"] == "apply_error"
+    assert verdict["exc_type"] == "OSError"
+
+
+# --- Subprocess structured verdict: parent parsing/re-raising -----------------
+
+
+def _fake_apply_proc(stdout_bytes, *, returncode=0):
+    class _FakeProc:
+        pass
+
+    proc = _FakeProc()
+    proc.returncode = returncode
+    proc.pid = 999
+
+    async def _communicate(input=None):
+        del input
+        return stdout_bytes, b""
+
+    proc.communicate = _communicate
+    return proc
+
+
+class _FakeApplyEngine:
+    url = make_url(
+        "postgresql+asyncpg://scratch_user:scratch-secret@scratch-db:5432/scratch"
+    )
+
+
+def _verdict_stdout(gate_mod, verdict):
+    import json as _json
+
+    # Prepend incidental migration stdout to prove the sentinel scan is robust.
+    return (
+        "some migration printed this\n"
+        + gate_mod._MIGRATION_APPLY_VERDICT_SENTINEL
+        + _json.dumps(verdict)
+        + "\n"
+    ).encode()
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_deterministic_verdict_reraises_defect(monkeypatch):
+    """A deterministic_defect verdict on the child's stdout must re-raise
+    ``_DeterministicMigrationDefect`` in the parent (BLOCK, not defer)."""
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        SyntaxError("invalid syntax", ("<m>", 3, 1, "def upgrade(\n"))
+    )
+    stdout = _verdict_stdout(gate_mod, verdict)
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout)),
+    )
+
+    with pytest.raises(gate_mod._DeterministicMigrationDefect) as exc_info:
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+    assert "SyntaxError" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_serving_only_verdict_reraises(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        ImportError("cannot import name 'x' from 'app.field_encryption'")
+    )
+    stdout = _verdict_stdout(gate_mod, verdict)
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout)),
+    )
+
+    with pytest.raises(gate_mod._ServingOnlyImportError):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_keyless_verdict_reraises(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(
+        RuntimeError(f"{gate_mod._ENCRYPTION_KEY_ENV_VAR} required")
+    )
+    stdout = _verdict_stdout(gate_mod, verdict)
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout)),
+    )
+
+    with pytest.raises(gate_mod._KeylessEncryptionArtifact):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_apply_error_verdict_defers(monkeypatch):
+    """An ``apply_error`` verdict must re-raise ``_MigrationApplyError`` (defer)."""
+    import app.migration_apply_gate as gate_mod
+
+    verdict = gate_mod._classify_apply_failure(OSError("connection refused"))
+    stdout = _verdict_stdout(gate_mod, verdict)
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout)),
+    )
+
+    with pytest.raises(gate_mod._MigrationApplyError):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_ok_verdict_returns(monkeypatch):
+    import app.migration_apply_gate as gate_mod
+
+    stdout = _verdict_stdout(gate_mod, {"kind": "ok"})
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout, returncode=0)),
+    )
+
+    # No exception — a clean apply.
+    await gate_mod._run_migration_apply_subprocess(
+        _FakeApplyEngine(),
+        "candidate-versions",
+        timeout_code="migration_apply_replay_apply_timeout",
+    )
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_crash_without_verdict_defers(monkeypatch):
+    """A child that dies WITHOUT emitting a parseable verdict (crash / OOM /
+    SIGKILL) must fall back to the conservative generic ``_MigrationApplyError``
+    (defer) — an infra hiccup must NOT be mis-classified as a hard block."""
+    import app.migration_apply_gate as gate_mod
+
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(b"Killed\n", returncode=-9)),
+    )
+
+    with pytest.raises(gate_mod._MigrationApplyError) as exc_info:
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+    # Must NOT be a deterministic defect / serving-only / keyless — those are the
+    # classified branches; a verdict-less crash is only ever a defer.
+    assert not isinstance(exc_info.value, gate_mod._DeterministicMigrationDefect)
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_crash_keyless_stderr_scan_preserved(monkeypatch):
+    """When no verdict is emitted, the historic keyless-encryption stderr scan
+    still classifies the deliberate fail-closed artifact — the fallback path is
+    not regressed by the new structured-verdict primary path."""
+    import app.migration_apply_gate as gate_mod
+
+    stderr = (
+        f"RuntimeError: {gate_mod._ENCRYPTION_KEY_ENV_VAR} is required "
+        "to activate encryption\n"
+    ).encode()
+
+    proc = _fake_apply_proc(b"", returncode=1)
+
+    async def _communicate(input=None):
+        del input
+        return b"", stderr
+
+    proc.communicate = _communicate
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=proc),
+    )
+
+    with pytest.raises(gate_mod._KeylessEncryptionArtifact):
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+
+
+@pytest.mark.asyncio
+async def test_apply_subprocess_verdict_detail_scrubs_scratch_password(monkeypatch):
+    """The scratch DB password must never leak into the surfaced verdict detail,
+    even when the child echoes a connection string into its exception message."""
+    import app.migration_apply_gate as gate_mod
+
+    leaky = {
+        "kind": "apply_error",
+        "exc_type": "OperationalError",
+        "detail": (
+            "could not connect: postgresql+asyncpg://scratch_user:scratch-secret@"
+            "scratch-db:5432/scratch"
+        ),
+    }
+    stdout = _verdict_stdout(gate_mod, leaky)
+    monkeypatch.setattr(
+        gate_mod.asyncio,
+        "create_subprocess_exec",
+        AsyncMock(return_value=_fake_apply_proc(stdout)),
+    )
+
+    with pytest.raises(gate_mod._MigrationApplyError) as exc_info:
+        await gate_mod._run_migration_apply_subprocess(
+            _FakeApplyEngine(),
+            "candidate-versions",
+            timeout_code="migration_apply_replay_apply_timeout",
+        )
+    assert "scratch-secret" not in str(exc_info.value)
+    assert "<redacted>" in str(exc_info.value)

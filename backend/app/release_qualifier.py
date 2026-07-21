@@ -3129,6 +3129,86 @@ async def run_qualification(
         [row for dim, row in prior_dim_results.items() if dim in resolved_dims],
         attempt_id,
     )
+    # Pre-spawn deterministic migration-identity collision gate: cheap file-list
+    # comparison identical to the finalize-time gate, but run BEFORE incrementing
+    # qualification_attempts and BEFORE spawning the expensive audit/smoketest/
+    # merge-grade children.  A duplicate-revision or dual-head alembic chain is
+    # DETERMINISTIC: re-running the full pipeline cannot change the verdict, so
+    # burning an expensive attempt first is pure waste.  Skipped when the
+    # migration_identity dimension is already resolved for this candidate_sha from
+    # a prior finalize (the dimension was verified clean or blocked then; either
+    # way the live fetch is redundant).  Under the FOR UPDATE lock — safe to write.
+    if "migration_identity" not in resolved_dims:
+        try:
+            _pre_mi_verdict, _pre_mi_detail = (
+                await check_qualification_migration_identity(
+                    token,
+                    owner,
+                    repo,
+                    candidate_sha,
+                    promotion_target,
+                    project_id=str(project_id),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            _pre_mi_verdict = "defer"
+            _pre_mi_detail = f"migration-identity pre-spawn check error: {exc}"
+        if _pre_mi_verdict == "block":
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s blocked "
+                "pre-spawn by migration-identity collision — NOT incrementing "
+                "qualification_attempts: %s",
+                version.version_number,
+                candidate_sha[:8],
+                _pre_mi_detail,
+            )
+            await _upsert_dimension_result(
+                session,
+                version,
+                candidate_sha,
+                "migration_identity",
+                status="blocked",
+                sub_score=None,
+                blocker="migration_identity_collision",
+                detail={
+                    "verdict": "block",
+                    "detail": _pre_mi_detail,
+                    "execution_site": "pre_spawn",
+                },
+                origin_attempt_id=attempt_id,
+            )
+            version.last_qualification = {
+                "status": "not_promoted",
+                "blocker": "migration_identity_collision",
+                "candidate_sha": candidate_sha,
+                "qualification_attempt_id": str(attempt_id),
+                "retry_episode": retry_episode,
+                "retry_episode_cap": retry_episode_cap,
+                "detail": _pre_mi_detail,
+                "started_at": started_at,
+            }
+            flag_modified(version, "last_qualification")
+            session.add(version)
+            return {
+                "status": "migration_identity_collision",
+                "blocker": "migration_identity_collision",
+                "detail": _pre_mi_detail,
+                "qualification_attempt_id": str(attempt_id),
+            }
+        if _pre_mi_verdict == "defer":
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d candidate %s "
+                "migration-identity pre-spawn check deferred — NOT incrementing "
+                "qualification_attempts: %s",
+                version.version_number,
+                candidate_sha[:8],
+                _pre_mi_detail,
+            )
+            return {
+                "status": "migration_identity_deferred",
+                "detail": _pre_mi_detail,
+                "qualification_attempt_id": str(attempt_id),
+            }
     # A child task is needed only when NOT ALL of its produced dimensions are
     # already resolved.  audit task → {audit, test_erosion}; smoketest task →
     # {smoketest}; merge_grade task → {merge_grade}.

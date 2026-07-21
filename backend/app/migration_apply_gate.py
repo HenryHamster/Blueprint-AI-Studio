@@ -268,6 +268,7 @@ _CANDIDATE_METADATA_SCRIPT = textwrap.dedent(
 _MIGRATION_APPLY_SCRIPT = textwrap.dedent(
     """
     import asyncio
+    import json
     import os
 
     from sqlalchemy.engine import make_url
@@ -275,6 +276,8 @@ _MIGRATION_APPLY_SCRIPT = textwrap.dedent(
     from sqlalchemy.pool import NullPool
 
     from app.migration_apply_gate import (
+        _MIGRATION_APPLY_VERDICT_SENTINEL,
+        _classify_apply_failure,
         _reconcile_then_upgrade,
         _scratch_connect_args,
     )
@@ -298,7 +301,21 @@ _MIGRATION_APPLY_SCRIPT = textwrap.dedent(
         finally:
             await engine.dispose()
 
-    asyncio.run(_main())
+    def _emit(verdict):
+        # Single-line, sentinel-prefixed JSON so the parent can recover the
+        # child's own exception classification across the process boundary.
+        print(_MIGRATION_APPLY_VERDICT_SENTINEL + json.dumps(verdict), flush=True)
+
+    try:
+        asyncio.run(_main())
+    except Exception as exc:  # noqa: BLE001 - folded into a structured verdict
+        # Classify HERE (the only place the typed exception is observable) and
+        # exit 0: presence of a verdict, not the exit code, tells the parent the
+        # failure was classified.  A crash/OOM/timeout-kill emits no verdict and
+        # the parent conservatively defers.
+        _emit(_classify_apply_failure(exc))
+    else:
+        _emit({"kind": "ok"})
     """
 )
 
@@ -348,6 +365,15 @@ _SUBPROCESS_ENV_ALLOWLIST = (
 # identifies a deliberate fail-closed artifact (not deploy-fatal) rather than a
 # genuine migration defect.
 _ENCRYPTION_KEY_ENV_VAR = "GITHUB_PAT_ENCRYPTION_KEY"
+
+# Sentinel prefix the isolated migration-apply subprocess writes ahead of its
+# single-line JSON verdict on stdout. The parent scans for this line to recover
+# the child's own exception classification (SyntaxError / ImportError /
+# ProgrammingError / keyless artifact) — which is invisible across the process
+# boundary otherwise, since the typed exception is raised INSIDE the child.
+# A distinctive, collision-proof marker so incidental migration stdout never
+# masquerades as a verdict.
+_MIGRATION_APPLY_VERDICT_SENTINEL = "__BLUEPRINT_MIGRATION_APPLY_VERDICT__:"
 
 _T = TypeVar("_T")
 
@@ -484,6 +510,103 @@ def _looks_like_keyless_encryption_artifact(detail: str) -> bool:
     return False
 
 
+def _classify_apply_failure(exc: BaseException) -> dict[str, object]:
+    """Classify an exception raised while applying the candidate chain.
+
+    Runs INSIDE the isolated migration-apply subprocess — the only place the
+    typed exception is directly observable — and returns a JSON-serializable
+    verdict the parent replays into the SAME typed exceptions it used to raise
+    in-process (before the apply moved into a child).  Mirrors the historic
+    parent-side ``except`` ladder exactly so classification is unchanged:
+
+      * ``SyntaxError`` / non-``app.*`` ``ImportError``  → ``deterministic_defect``
+        (guaranteed to reproduce every retry — must hard-BLOCK, never defer).
+      * ``app.*`` ``ImportError``                        → ``serving_only_import``
+        (candidate-only symbol absent from the serving engine; not deploy-fatal).
+      * class-42 ``ProgrammingError``                    → ``deterministic_defect``
+        (SQL syntax / undefined table / invalid schema — deterministic).
+      * keyless-encryption ``RuntimeError``              → ``keyless_encryption``
+        (deliberate fail-closed of the secret-free replay; not deploy-fatal).
+      * everything else (connection loss, deadlock, non-42 SQL error, …)
+                                                          → ``apply_error``
+        (indeterminate — safety UNKNOWN, so the release DEFERS and retries).
+
+    The ``detail`` carries a human-readable message; ``exc_type`` the offending
+    exception's class name; and (for ProgrammingError) ``pgcode`` the SQLSTATE.
+    Secret scrubbing of ``detail`` happens in the parent — this only classifies.
+    """
+    exc_type = type(exc).__name__
+    if isinstance(exc, sa.exc.ProgrammingError):
+        pgcode = getattr(exc.orig, "pgcode", None) or getattr(
+            exc.orig, "sqlstate", None
+        )
+        pgcode_str = str(pgcode) if pgcode else None
+        if pgcode_str and pgcode_str.startswith("42"):
+            return {
+                "kind": "deterministic_defect",
+                "exc_type": exc_type,
+                "pgcode": pgcode_str,
+                "detail": (
+                    f"candidate migration has a deterministic SQL defect "
+                    f"(SQLSTATE {pgcode_str}): {exc}"
+                ),
+            }
+        return {
+            "kind": "apply_error",
+            "exc_type": exc_type,
+            "pgcode": pgcode_str,
+            "detail": (
+                f"candidate migration chain failed to apply against production's "
+                f"recorded state: {exc_type}: {exc}"
+            ),
+        }
+    if isinstance(exc, ImportError):
+        if _looks_like_serving_only_import(exc):
+            return {
+                "kind": "serving_only_import",
+                "exc_type": exc_type,
+                "detail": (
+                    f"candidate migration imports a candidate-only app symbol "
+                    f"(serving-engine artifact, not deploy-fatal): {exc}"
+                ),
+            }
+        return {
+            "kind": "deterministic_defect",
+            "exc_type": exc_type,
+            "detail": (
+                f"candidate migration has a deterministic Python defect "
+                f"({exc_type}): {exc}"
+            ),
+        }
+    if isinstance(exc, SyntaxError):
+        return {
+            "kind": "deterministic_defect",
+            "exc_type": exc_type,
+            "detail": (
+                f"candidate migration has a deterministic Python defect "
+                f"({exc_type}): {exc}"
+            ),
+        }
+    if _looks_like_keyless_encryption_artifact(f"{exc_type}: {exc}"):
+        return {
+            "kind": "keyless_encryption",
+            "exc_type": exc_type,
+            "detail": (
+                "candidate encryption migration fail-closed because "
+                f"{_ENCRYPTION_KEY_ENV_VAR} is deliberately withheld from "
+                "the secret-free scratch replay subprocess (not deploy-fatal)"
+            ),
+        }
+    return {
+        "kind": "apply_error",
+        "exc_type": exc_type,
+        "detail": (
+            f"candidate migration chain failed to apply against production's "
+            f"recorded state: {exc_type}: {exc}"
+        ),
+    }
+
+
 class _ScratchDatabaseUnavailable(Exception):
     """The dedicated scratch server could not be reached or provision a DB."""
 
@@ -537,6 +660,36 @@ def _subprocess_base_env() -> dict[str, str]:
     }
 
 
+def _scrub_secret_text(
+    text: str, *, sensitive_values: tuple[str, ...] = ()
+) -> str:
+    """Redact credentials, URL userinfo, secret assignments and GitHub tokens.
+
+    Shared by :func:`_bounded_subprocess_detail` (raw child stderr) and the
+    structured-verdict path (child-classified ``detail``) so BOTH surfaces are
+    scrubbed identically — the scratch DB password must never leak regardless of
+    which path surfaces it.
+    """
+    for value in sorted(filter(None, sensitive_values), key=len, reverse=True):
+        text = text.replace(value, "<redacted>")
+    text = re.sub(
+        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+(?::[^/@\s]*)?@",
+        r"\1<redacted>@",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(password|token|secret|api[_-]?key)\s*([=:])\s*[^\s,;]+",
+        r"\1\2<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
+        "<redacted-token>",
+        text,
+    )
+    return text
+
+
 def _bounded_subprocess_detail(
     stderr: bytes,
     stdout: bytes,
@@ -553,21 +706,7 @@ def _bounded_subprocess_detail(
     text = raw[-_SUBPROCESS_DIAGNOSTIC_MAX_BYTES :].decode(
         errors="replace"
     ).strip()
-    text = re.sub(
-        r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s]+(?::[^/@\s]*)?@",
-        r"\1<redacted>@",
-        text,
-    )
-    text = re.sub(
-        r"(?i)\b(password|token|secret|api[_-]?key)\s*([=:])\s*[^\s,;]+",
-        r"\1\2<redacted>",
-        text,
-    )
-    text = re.sub(
-        r"\b(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,})\b",
-        "<redacted-token>",
-        text,
-    )
+    text = _scrub_secret_text(text)
     if truncated:
         text = f"[truncated to last {_SUBPROCESS_DIAGNOSTIC_MAX_BYTES} bytes] {text}"
     return text or f"exit {returncode}"
@@ -999,6 +1138,22 @@ async def _run_migration_apply_subprocess(
         timeout_seconds=_MIGRATION_APPLY_SUBPROCESS_TIMEOUT_SECONDS,
         timeout_code=timeout_code,
     )
+
+    password = scratch_engine.url.password or ""
+
+    # Primary path: the child classified its own outcome and emitted a
+    # structured verdict.  Replay it into the SAME typed exceptions the parent
+    # used to raise in-process, so a deterministic defect hard-BLOCKS instead of
+    # deferring as a transient infra failure and burning retry attempts.
+    verdict = _parse_apply_verdict(stdout)
+    if verdict is not None:
+        _raise_for_apply_verdict(verdict, password=password)
+        return
+
+    # Fail-SAFE fallback: no parseable verdict means the child died before it
+    # could classify (segfault / OOM-kill / SIGKILL on timeout).  An infra
+    # hiccup must NOT be mis-blocked — preserve the historic conservative
+    # behavior: honor the keyless-encryption stderr scan, else defer.
     if proc.returncode != 0:
         if _looks_like_keyless_encryption_artifact(
             stderr.decode(errors="replace")
@@ -1013,13 +1168,81 @@ async def _run_migration_apply_subprocess(
             stderr,
             stdout,
             proc.returncode,
-            sensitive_values=(scratch_engine.url.password or "",),
+            sensitive_values=(password,),
         )
 
         raise _MigrationApplyError(
             "candidate migration subprocess failed to apply against the "
             f"recorded state: {detail}"
         )
+    # rc == 0 with no verdict — nothing failed; treat as a successful apply.
+
+
+def _parse_apply_verdict(stdout: bytes) -> dict[str, object] | None:
+    """Recover the child's structured verdict from its captured stdout.
+
+    Scans for the sentinel-prefixed JSON line the apply subprocess emits and
+    returns the LAST valid one (defensive against incidental migration stdout
+    printed before it).  Returns ``None`` when no parseable verdict is present —
+    the caller then falls back to the conservative returncode/stderr path.
+    """
+    verdict: dict[str, object] | None = None
+    for line in stdout.decode(errors="replace").splitlines():
+        marker = line.find(_MIGRATION_APPLY_VERDICT_SENTINEL)
+        if marker == -1:
+            continue
+        payload = line[marker + len(_MIGRATION_APPLY_VERDICT_SENTINEL) :]
+        try:
+            parsed = json.loads(payload)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict) and isinstance(parsed.get("kind"), str):
+            verdict = parsed  # last valid verdict wins
+    return verdict
+
+
+def _raise_for_apply_verdict(
+    verdict: dict[str, object], *, password: str
+) -> None:
+    """Replay a child verdict into the parent's typed exception contract.
+
+    ``ok`` returns cleanly; every failure kind re-raises the exact exception the
+    in-process ``except`` ladder used to raise, so the downstream verdict mapping
+    (block / defer / ok) in :func:`run_migration_apply_gate` is unchanged.  The
+    ``detail`` is scrubbed of the scratch DB password before it is surfaced.
+    """
+    kind = verdict.get("kind")
+    if kind == "ok":
+        return
+    raw_detail = verdict.get("detail")
+    detail = _scrub_secret_text(
+        str(raw_detail) if raw_detail else "",
+        sensitive_values=(password,),
+    )[:_SUBPROCESS_DIAGNOSTIC_MAX_BYTES]
+    if kind == "deterministic_defect":
+        raise _DeterministicMigrationDefect(
+            detail or "candidate migration has a deterministic defect"
+        )
+    if kind == "serving_only_import":
+        raise _ServingOnlyImportError(
+            detail
+            or "candidate migration imports a candidate-only app symbol "
+            "(serving-engine artifact, not deploy-fatal)"
+        )
+    if kind == "keyless_encryption":
+        raise _KeylessEncryptionArtifact(
+            detail
+            or (
+                "candidate encryption migration fail-closed because "
+                f"{_ENCRYPTION_KEY_ENV_VAR} is deliberately withheld from "
+                "the secret-free scratch replay subprocess (not deploy-fatal)"
+            )
+        )
+    # ``apply_error`` or any unrecognized kind — indeterminate, so DEFER.
+    raise _MigrationApplyError(
+        "candidate migration subprocess failed to apply against the "
+        f"recorded state: {detail or 'generic apply error'}"
+    )
 
 
 async def _apply_candidate_migrations(
@@ -1077,7 +1300,10 @@ async def _apply_candidate_migrations(
             f"candidate migration chain failed to apply against production's "
             f"recorded state: {type(exc).__name__}: {exc}"
         ) from exc
-    except _MigrationApplyTimeout:
+    except _MigrationApplyError:
+        # Already a (defer-mapped) apply error — from the subprocess verdict
+        # path or an in-process seed step.  Propagate without re-wrapping so the
+        # scrubbed detail survives intact.  Covers _MigrationApplyTimeout too.
         raise
     except Exception as exc:
         raise _MigrationApplyError(

@@ -7849,6 +7849,237 @@ async def test_run_qualification_no_credentials(db_session, mocker):
 
 
 # ===========================================================================
+# run_qualification — pre-spawn migration-identity collision gate
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_dual_head_collision_blocks_before_attempt_spend(db_session, mocker):
+    """A candidate whose migration file list contains a duplicate revision /
+    dual alembic head is BLOCKED at run_qualification time BEFORE any child is
+    spawned and BEFORE qualification_attempts is incremented.
+
+    The pre-spawn migration-identity gate short-circuits with
+    status='migration_identity_collision' without touching qualification_attempts
+    (so a deterministic structural defect does not consume an expensive attempt
+    slot) and without creating any release_audit / qualifier_smoketest /
+    release_merge_grade Task rows.
+    """
+    from unittest.mock import AsyncMock
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+
+    # Simulate a duplicate-revision collision: patch the migration-identity
+    # check so both the candidate and the promotion target list report a
+    # shared revision '0143' that maps to DIFFERENT files (content diverges).
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        new=AsyncMock(
+            return_value=(
+                "block",
+                "revision '0143' maps to different filenames on candidate vs main",
+            )
+        ),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Status must indicate a pre-spawn block, not "spawned".
+    assert result["status"] == "migration_identity_collision", result
+    assert result["blocker"] == "migration_identity_collision"
+    assert "0143" in (result.get("detail") or "")
+
+    # qualification_attempts MUST NOT be incremented.
+    await db_session.refresh(version)
+    assert (version.qualification_attempts or 0) == 0, (
+        "qualification_attempts should remain 0 — a structural collision "
+        "must not consume an attempt slot"
+    )
+
+    # last_qualification should record the block.
+    lq = version.last_qualification
+    assert lq is not None
+    assert lq["status"] == "not_promoted"
+    assert lq["blocker"] == "migration_identity_collision"
+
+    # NO child tasks should be created.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task_types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "release_audit" not in task_types, (
+        "release_audit child must NOT be spawned on a pre-spawn collision"
+    )
+    assert "qualifier_smoketest" not in task_types, (
+        "qualifier_smoketest child must NOT be spawned on a pre-spawn collision"
+    )
+    assert "release_merge_grade" not in task_types, (
+        "release_merge_grade child must NOT be spawned on a pre-spawn collision"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_migration_identity_block_stamps_dimension_result(
+    db_session, mocker
+):
+    """A pre-spawn migration-identity block upserts the migration_identity
+    dimension as 'blocked' with blocker='migration_identity_collision' so
+    the operator badge and downstream scoring see a consistent verdict
+    regardless of whether the block was caught pre-spawn or at finalize."""
+    from unittest.mock import AsyncMock
+
+    from sqlmodel import select
+
+    from app.models import QualificationDimensionResult
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+
+    collision_detail = "revision '0200' maps to different files on candidate vs main"
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        new=AsyncMock(return_value=("block", collision_detail)),
+    )
+
+    await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Verify the migration_identity dimension row was written.
+    rows = (
+        await db_session.execute(
+            select(QualificationDimensionResult).where(
+                QualificationDimensionResult.release_version_id == version.id,
+                QualificationDimensionResult.dimension == "migration_identity",
+            )
+        )
+    ).scalars().all()
+
+    assert len(rows) == 1, "expected exactly one migration_identity dimension row"
+    row = rows[0]
+    assert row.status == "blocked"
+    assert row.blocker == "migration_identity_collision"
+    assert (row.detail or {}).get("execution_site") == "pre_spawn"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_migration_identity_deferred_no_attempt_increment(
+    db_session, mocker
+):
+    """When the migration-identity pre-spawn check cannot fetch the migration
+    list (defer), run_qualification returns early WITHOUT incrementing
+    qualification_attempts and WITHOUT spawning any children."""
+    from unittest.mock import AsyncMock
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        new=AsyncMock(return_value=("defer", "GitHub API returned 503")),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "migration_identity_deferred", result
+
+    # qualification_attempts MUST NOT be incremented.
+    await db_session.refresh(version)
+    assert (version.qualification_attempts or 0) == 0, (
+        "a deferred migration-identity check must not increment attempt count"
+    )
+
+    # No child tasks should be created.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 0, "no children should spawn when migration-identity defers"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_migration_identity_ok_proceeds_normally(
+    db_session, mocker
+):
+    """When the migration-identity pre-spawn check returns 'ok' (no collision),
+    run_qualification continues to the normal spawn path — qualification_attempts
+    is incremented and the audit child is spawned (happy-path regression guard)."""
+    from unittest.mock import AsyncMock
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"clean candidate must proceed to spawn; got {result['status']!r}"
+    )
+
+    await db_session.refresh(version)
+    assert (version.qualification_attempts or 0) == 1, (
+        "qualification_attempts should be 1 after a successful spawn"
+    )
+
+    # At least the audit child must be spawned.
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    task_types = [(t.first_payload or {}).get("type") for t in tasks]
+    assert "release_audit" in task_types, (
+        "release_audit child must be spawned for a clean candidate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_authorized_renumber_not_blocked_pre_spawn(
+    db_session, mocker
+):
+    """An authorized renumber exemption must NOT be falsely treated as a
+    collision: when check_qualification_migration_identity returns 'ok' (the
+    authorized-divergence path), run_qualification proceeds normally and does
+    not short-circuit with a collision block."""
+    from unittest.mock import AsyncMock
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+
+    # check_qualification_migration_identity returns 'ok' for authorized
+    # renumbers — mirror that here so we confirm the pre-spawn gate honours it.
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned", (
+        f"authorized renumber must not be blocked pre-spawn; got {result!r}"
+    )
+    await db_session.refresh(version)
+    assert (version.qualification_attempts or 0) == 1
+
+
+# ===========================================================================
 # run_qualification — qualify-on-synced gate (LTS split)
 # ===========================================================================
 
@@ -24416,6 +24647,163 @@ async def _seed_pending_qualification(
     await db_session.commit()
     await db_session.refresh(version)
     return audit_task, smoke_task
+
+
+async def _seed_merge_grade_child(
+    db_session,
+    project,
+    version,
+    *,
+    status: TaskStatus,
+) -> Task:
+    """Attach a blind merge-grade child task in ``status`` to the pending
+    qualification and stamp its id into ``version.last_qualification``.
+
+    Mirrors the real run_qualification spawn: the merge-grade child carries the
+    active attempt id and ``release_version_id`` so the finalize gate and the
+    in-flight guards recognise it as a required qualifier child.
+    """
+    qual = dict(version.last_qualification or {})
+    attempt_text = qual.get("qualification_attempt_id") or str(uuid.uuid4())
+    merge_grade_task = Task(
+        project_id=project.id,
+        title="merge-grade-child",
+        payloads=[{
+            "type": "release_merge_grade",
+            "base_branch": "main",
+            "qualification_attempt_id": attempt_text,
+        }],
+        vm_instance_id="vm-merge-grade-child",
+        status=status,
+        context={
+            "release_version_id": str(version.id),
+            "qualification_attempt_id": attempt_text,
+        },
+    )
+    db_session.add(merge_grade_task)
+    await db_session.commit()
+    await db_session.refresh(merge_grade_task)
+
+    qual["merge_grade_task_id"] = str(merge_grade_task.id)
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return merge_grade_task
+
+
+@pytest.mark.asyncio
+async def test_in_flight_attempt_not_superseded_when_automain_advances(
+    db_session, mocker
+):
+    """An in-flight qualification attempt whose children are still non-terminal
+    must RUN TO A VERDICT on its pinned candidate_sha — it must NOT be superseded
+    merely because automain advanced beneath the pin.
+
+    Root cause (parent task): the superseded reconciler's in-flight guard only
+    checked the audit + smoketest children, diverging from the canonical
+    ``_qualification_in_flight`` definition (which also covers the blind
+    merge-grade and audit-challenge children).  So an attempt whose audit/smoke
+    had finished but whose merge-grade child was still running could be falsely
+    superseded — cancelling a legitimately in-flight attempt — when automain
+    moved out from under the pinned candidate.
+
+    This test pins a candidate, makes the merge-grade child non-terminal while
+    audit + smoke are terminal, advances automain to a NEW head, and asserts:
+      (a) the reconciler does NOT supersede (children survive; still pending);
+      (b) candidate_sha stays the pinned snapshot even though automain moved;
+      (c) the branch-movement path does NOT burn the retry-episode counter or
+          the consecutive-infra-errors streak (so the cap is not falsely tripped);
+      (d) once the merge-grade child reaches a terminal state a genuine
+          out-of-band supersession (candidate already on the promotion target)
+          still fires — no regression to the legitimate cancellation path.
+    """
+    from app import release_reconciliation
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    pinned_candidate = "feed" * 10  # the exact commit the children scored
+    audit_task, _smoke_task = await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        candidate_sha=pinned_candidate,
+    )
+    # A blind merge-grade child is STILL RUNNING — the attempt is genuinely
+    # in flight even though audit + smoke have finished.
+    merge_grade_task = await _seed_merge_grade_child(
+        db_session, project, version, status=TaskStatus.IN_PROGRESS
+    )
+
+    # Baseline the attempt-accounting so we can prove branch movement never
+    # advances it.
+    version.qualification_retry_episode = 2
+    qual = dict(version.last_qualification)
+    qual["retry_episode"] = 2
+    qual["consecutive_infra_errors"] = 1
+    version.last_qualification = qual
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # automain HEAD has advanced far past the pinned candidate, and the
+    # candidate now *appears* reachable from the promotion target — the exact
+    # conditions under which the old audit+smoke-only guard would have
+    # superseded an attempt whose merge-grade child was still running.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain="advanced0" * 5, main="mainhead" * 5),
+    )
+    is_ancestor = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+
+    reconciled = await release_reconciliation._reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # (a) NOT superseded while the merge-grade child is in flight.
+    assert reconciled is False
+    # The in-flight guard short-circuits BEFORE any ancestry probe.
+    is_ancestor.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.last_qualification["status"] == "pending"
+    # The children survive (nothing cancelled the in-flight attempt).
+    await db_session.refresh(merge_grade_task)
+    await db_session.refresh(audit_task)
+    assert merge_grade_task.status == TaskStatus.IN_PROGRESS
+    assert audit_task.status == TaskStatus.COMPLETED
+    # (b) The pin is unchanged even though automain moved.
+    assert version.last_qualification["candidate_sha"] == pinned_candidate
+    # (c) No episode / infra-streak burn from pure branch movement.
+    assert version.qualification_retry_episode == 2
+    assert version.last_qualification.get("retry_episode") == 2
+    assert version.last_qualification.get("consecutive_infra_errors") == 1
+
+    # (d) Once the merge-grade child terminates, a genuine out-of-band
+    # supersession (candidate already reachable from the promotion target)
+    # still fires — the legitimate cancellation path is preserved.
+    merge_grade_task.status = TaskStatus.COMPLETED
+    db_session.add(merge_grade_task)
+    await db_session.commit()
+
+    reconciled_after = await release_reconciliation._reconcile_if_pending_qualification_superseded(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert reconciled_after is True
+    is_ancestor.assert_awaited()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["blocker"] == "qualification_superseded"
+    # The superseded verdict is recorded against the PINNED candidate, and even
+    # a legitimate supersession never advances the episode / infra counters.
+    assert version.last_qualification["candidate_sha"] == pinned_candidate
+    assert version.qualification_retry_episode == 2
+    assert version.last_qualification.get("retry_episode") == 2
+    assert version.last_qualification.get("consecutive_infra_errors") == 1
 
 
 @pytest.mark.asyncio
@@ -44425,3 +44813,115 @@ class TestAttemptContractFreeze:
             )
         finally:
             shared_state.runtime_config.pop("capability_proof_gate_mode", None)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_deterministic_defect_surfaces_as_block(monkeypatch):
+    """End-to-end seam: a deterministic migration defect raised INSIDE the
+    isolated migration-apply subprocess surfaces to the release-qualifier gate
+    as a hard BLOCK — not a defer / infra_failure retry that burns attempts.
+
+    This pins the regression this task fixes: the SyntaxError/ImportError/
+    class-42 ProgrammingError classifiers went dead when migration apply moved
+    into a child process (the parent only saw returncode + stderr text and
+    wrapped everything as a deferrable ``_MigrationApplyError``).  The fix has
+    the child emit a structured verdict that the parent replays into the SAME
+    typed exceptions.
+
+    The test drives the REAL production chain that
+    ``release_qualifier._resolve_migration_apply_at_finalize`` invokes:
+    ``run_migration_apply_gate`` -> ``_provision_seed_and_detect_drift`` ->
+    ``_apply_candidate_migrations`` -> ``_run_migration_apply_subprocess``.
+    Only the OS-level subprocess spawn is faked — its stdout carries a verdict
+    built by the real ``_classify_apply_failure`` for a genuine ``SyntaxError``,
+    so the classifier, the sentinel emission format, ``_parse_apply_verdict``,
+    ``_raise_for_apply_verdict`` and the ``('block', ...)`` mapping are all
+    exercised together.
+    """
+    import sqlalchemy as sa
+    import app.migration_apply_gate as gate_mod
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    # No real retry backoff in the (unreachable-here) transient path.
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_BASE_DELAY", 0.001)
+    monkeypatch.setattr(gate_mod, "_TRANSIENT_RETRY_MAX_DELAY", 0.01)
+
+    prod_meta = sa.MetaData()
+    sa.Table("widget", prod_meta, sa.Column("id", sa.Integer, primary_key=True))
+    monkeypatch.setattr(
+        gate_mod,
+        "_read_prod_state",
+        AsyncMock(return_value=gate_mod._ProdState(revision="a01", metadata=prod_meta)),
+    )
+
+    class _FakeScratchEngine:
+        url = make_url(
+            "postgresql+asyncpg://scratch_user:scratch-secret@scratch-db:5432/scratch_ephemeral"
+        )
+
+        async def dispose(self):
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _fake_ephemeral(_base_url, db_name=None):
+        # Yield a distinct db name so the ISOLATION GUARD does not trip.
+        yield _FakeScratchEngine(), "scratch-gate-ephemeral"
+
+    monkeypatch.setattr(gate_mod, "ephemeral_postgres_database", _fake_ephemeral)
+    monkeypatch.setattr(gate_mod, "_seed_scratch", AsyncMock())
+
+    # Build the child's verdict with the REAL classifier for a genuine
+    # SyntaxError — the exact machine-readable line the child prints on stdout.
+    child_verdict = gate_mod._classify_apply_failure(
+        SyntaxError("invalid syntax", ("<migration_0001>", 3, 1, "def upgrade(\n"))
+    )
+    assert child_verdict["kind"] == "deterministic_defect"
+    stdout_bytes = (
+        gate_mod._MIGRATION_APPLY_VERDICT_SENTINEL + json.dumps(child_verdict) + "\n"
+    ).encode()
+
+    spawn_calls = 0
+
+    class _FakeProc:
+        returncode = 0
+        pid = 4242
+
+        async def communicate(self, input=None):
+            del input
+            return stdout_bytes, b""
+
+    async def _fake_spawn(*args, **kwargs):
+        nonlocal spawn_calls
+        spawn_calls += 1
+        return _FakeProc()
+
+    monkeypatch.setattr(gate_mod.asyncio, "create_subprocess_exec", _fake_spawn)
+
+    engine = create_async_engine("postgresql+asyncpg://u:p@localhost:5432/nope")
+    try:
+        verdict, detail = await gate_mod.run_migration_apply_gate(
+            prod_engine=engine,
+            candidate_sources={"0001_bad.py": "revision='0001'\ndown_revision=None\n"},
+            required_metadata=sa.MetaData(),
+            scratch_db_url=(
+                "postgresql+asyncpg://scratch_user:scratch-secret@"
+                "scratch-db:5432/control"
+            ),
+        )
+    finally:
+        await engine.dispose()
+
+    assert verdict == "block", (
+        f"deterministic subprocess defect must BLOCK, not {verdict!r}: {detail}"
+    )
+    assert detail is not None and "SyntaxError" in detail, (
+        f"block detail should name the offending exception type: {detail!r}"
+    )
+    # Deterministic defect blocks on the FIRST apply — no infra-failure retry.
+    assert spawn_calls == 1, (
+        f"deterministic defect spawned the apply subprocess {spawn_calls} times; "
+        "must block on first attempt without a retry"
+    )
+    # The scratch DB password must never leak into the surfaced verdict.
+    assert "scratch-secret" not in (detail or "")

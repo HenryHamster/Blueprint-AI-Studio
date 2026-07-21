@@ -78,6 +78,15 @@ def _default_green_ci(mocker):
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
+    # Patch the SHA map so the pre-spawn migration-identity check (which uses
+    # list_version_shas_at_ref) sees identical lists on both refs and returns
+    # "ok" — mirrors the test_release_qualifier autouse fixture.
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=AsyncMock(
+            return_value={"0001_init.py": "sha1", "0002_feature.py": "sha2"}
+        ),
+    )
     mocker.patch(
         "app.release_qualifier._resolve_migration_identity_at_finalize",
         new=AsyncMock(return_value=("ok", None)),
