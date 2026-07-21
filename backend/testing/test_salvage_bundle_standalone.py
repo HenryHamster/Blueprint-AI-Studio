@@ -121,6 +121,14 @@ Findings covered here (1-finding baked-image authoring-prompt salvage bundle, 20
           research-plan.ts injects baked_image_ref preference into the local-runner note;
           strategic.ts buildLocalRunnerSection emits baked-image guidance when baked_image_ref present
 
+Findings covered here (1-finding greenfield onboarding invariant bundle, task c1160063, 2026-07-21):
+  c1-1 — end-to-end: repo_bootstrap.spawn_bootstrap_task suppresses the clone_failed loop via
+          _self_heal_undetermined_emptiness + repo_is_empty guard; knowledge_completion wires
+          _design_web_only_grounding_miss into the acceptance gate so a web-only greenfield design
+          document passes when its URLs are reachable. Both seams covered by separate unit tests
+          (test_empty_repo_onboarding.py, test_design_web_url_reachability.py); this section adds
+          a cross-seam structural invariant asserting both guards co-exist in the onboarding flow.
+
 Findings covered here (7-finding operator audience/lifecycle salvage bundle, 2026-07-21):
   m-1 — research.dedup_deadlock + research.already_fixed_deadlock registered STRATEGIST_INTERNAL
   m-2 — research.direction_auto_completed registered STRATEGIST_INTERNAL; emitter has event_type=;
@@ -6098,4 +6106,132 @@ def test_strategic_local_runner_section_includes_baked_image_guidance():
     assert "PREFER to omit" in src, (
         "strategic.ts must include 'PREFER to omit' guidance in the baked-image note "
         "so the strategist knows to omit container_image for experiments"
+    )
+
+
+# ── c1-1: end-to-end greenfield onboarding cross-seam invariant ───────────────
+
+
+def test_c1_bootstrap_self_heal_and_repo_is_empty_guard_coexist():
+    """spawn_bootstrap_task must contain both self-heal and the repo_is_empty guard.
+
+    Finding c1-1: the clone_failed loop suppression depends on TWO cooperating
+    guards in spawn_bootstrap_task: (1) _self_heal_undetermined_emptiness resolves
+    an absent durable signal against the live repo, and (2) the repo_is_empty guard
+    returns not_eligible so the doomed bootstrap is never spawned.  If either guard
+    is removed independently the loop re-opens, so both must co-exist in the same
+    function body.
+    """
+    src = _find_repo_file("backend/app/repo_bootstrap.py").read_text()
+
+    assert "_self_heal_undetermined_emptiness" in src, (
+        "repo_bootstrap.py must contain _self_heal_undetermined_emptiness — "
+        "the legacy-undetermined self-heal that resolves an absent repo_is_empty "
+        "signal against the live GitHub repo before the bootstrap guard fires"
+    )
+    assert 'reason="repo_is_empty"' in src, (
+        "repo_bootstrap.spawn_bootstrap_task must return reason='repo_is_empty' "
+        "so the clone_failed loop is suppressed for empty/greenfield projects"
+    )
+    # Both guards must appear inside spawn_bootstrap_task, not in a helper that
+    # could be accidentally decoupled from the spawn path.
+    fn_start = src.find("async def spawn_bootstrap_task(")
+    assert fn_start != -1, "spawn_bootstrap_task not found in repo_bootstrap.py"
+    # Extract the full function body up to the next top-level function definition.
+    tail = src[fn_start:]
+    next_fn_offset = tail.find("\nasync def ", 1)
+    if next_fn_offset == -1:
+        next_fn_offset = tail.find("\ndef ", 1)
+    fn_body = tail[:next_fn_offset] if next_fn_offset != -1 else tail
+    assert "_self_heal_undetermined_emptiness" in fn_body, (
+        "spawn_bootstrap_task must call _self_heal_undetermined_emptiness inline — "
+        "the guard must be on the critical spawn path, not only in a decoupled helper"
+    )
+    assert 'reason="repo_is_empty"' in fn_body, (
+        "spawn_bootstrap_task must return reason='repo_is_empty' on the same code path "
+        "so suppression fires after self-heal resolves the empty signal"
+    )
+
+
+def test_c1_web_only_grounding_gate_wired_into_knowledge_completion():
+    """_design_web_only_grounding_miss must be called inside the knowledge completion gate.
+
+    Finding c1-1: greenfield design documents cannot cite repository files that do
+    not exist yet — their only grounding evidence is reachable web URLs.
+    _design_web_only_grounding_miss probes those URLs; it must be wired into the
+    completion gate (not dead code) so a document grounded entirely in dead links
+    cannot pass acceptance.
+    """
+    src = _find_repo_file("backend/app/knowledge_completion.py").read_text()
+
+    assert "_design_web_only_grounding_miss" in src, (
+        "knowledge_completion.py must define _design_web_only_grounding_miss — "
+        "the URL reachability gate for web-only greenfield design documents"
+    )
+    # The function must be both defined AND called (wired into the gate).
+    define_idx = src.find("async def _design_web_only_grounding_miss(")
+    assert define_idx != -1, (
+        "_design_web_only_grounding_miss must be defined as an async function in "
+        "knowledge_completion.py"
+    )
+    call_idx = src.find("await _design_web_only_grounding_miss(")
+    assert call_idx != -1, (
+        "knowledge_completion.py must AWAIT _design_web_only_grounding_miss — "
+        "the gate must be active on the completion path, not merely defined"
+    )
+    # The call-site must appear AFTER the function definition (normal call order),
+    # and must not be inside the function body itself (which would be a recursive
+    # self-call, not a wired gate).
+    assert call_idx > define_idx, (
+        "_design_web_only_grounding_miss must be awaited at a call-site that follows "
+        "its definition — the gate is wired via a downstream caller, not recursively"
+    )
+    # The call must not be inside the helper's own body.  The helper body ends
+    # before any subsequent top-level `async def` or `def`.  Check that the call
+    # site is outside the helper by confirming it does not fall inside [define_idx,
+    # next_fn_idx) where next_fn_idx is the next top-level function after define_idx.
+    tail = src[define_idx:]
+    next_fn_offset = tail.find("\nasync def ", 1)
+    if next_fn_offset == -1:
+        next_fn_offset = tail.find("\ndef ", 1)
+    if next_fn_offset != -1:
+        helper_end = define_idx + next_fn_offset
+        assert call_idx > helper_end, (
+            "The await of _design_web_only_grounding_miss must be outside its own body — "
+            "a call inside the helper would be a recursive self-call, not a wired gate"
+        )
+
+
+def test_c1_greenfield_unit_test_files_cover_both_seams():
+    """Both half-tests must exist with their core invariant functions.
+
+    Finding c1-1: the two seams ship separate unit-test files.  This structural
+    check confirms those files are present and name the key test functions so a
+    later refactor that deletes or renames them surfaces here before CI.
+    """
+    empty_repo_src = _find_repo_file(
+        "backend/testing/test_empty_repo_onboarding.py"
+    ).read_text()
+    web_url_src = _find_repo_file(
+        "backend/testing/test_design_web_url_reachability.py"
+    ).read_text()
+
+    # Half-1: clone_failed suppression.
+    assert "TestBootstrapGuardIsReachable" in empty_repo_src, (
+        "test_empty_repo_onboarding.py must contain TestBootstrapGuardIsReachable "
+        "— the class that verifies spawn_bootstrap_task suppresses empty repos"
+    )
+    assert "TestLegacyUndeterminedEmptinessSelfHeal" in empty_repo_src, (
+        "test_empty_repo_onboarding.py must contain TestLegacyUndeterminedEmptinessSelfHeal "
+        "— the class that exercises _self_heal_undetermined_emptiness end-to-end"
+    )
+
+    # Half-2: web-URL reachability gate.
+    assert "TestDesignWebOnlyGroundingMiss" in web_url_src, (
+        "test_design_web_url_reachability.py must contain TestDesignWebOnlyGroundingMiss "
+        "— the class that verifies _design_web_only_grounding_miss accepts/rejects docs"
+    )
+    assert "_design_web_only_grounding_miss" in web_url_src, (
+        "test_design_web_url_reachability.py must import and exercise "
+        "_design_web_only_grounding_miss directly"
     )
