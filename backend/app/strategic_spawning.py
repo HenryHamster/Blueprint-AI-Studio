@@ -5765,7 +5765,7 @@ async def _spawn_strategic_review(
                 _runtime_config.get("strategic_session_turn_timeout_seconds", 120)
             ),
             "strategic_session_message_poll_seconds": float(
-                _runtime_config.get("strategic_session_message_poll_seconds", 1.5)
+                _runtime_config.get("strategic_session_message_poll_seconds", 10)
             ),
             "strategic_session_min_tick_seconds": int(
                 _runtime_config.get("strategic_session_min_tick_seconds", 600)
