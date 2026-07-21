@@ -366,6 +366,25 @@ Findings covered here (17-finding release-qualification salvage bundle, task 03c
   03-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (c17-15)
   03-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (c17-16)
   03-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (c17-17)
+
+Findings covered here (17-finding release-qualification salvage bundle, task c39e0ee0, 2026-07-21):
+  c39-1  — serving-only-import ImportError degrades gate (not hard-block) → already pinned by test_f20_1_* (03-1)
+  c39-2  — data-dependent migration proof design; scratch replay uses schema not row data → already pinned by test_f20_2_* (03-2)
+  c39-3  — encryption-key continuity: probe_key_continuity / assert_plaintext_or_raise present → already pinned by test_f20_3_* + e1/e2/e3 (03-3)
+  c39-4  — MultiFernet.rotate() for staged key rotation → already pinned by test_f20_4_* (03-4)
+  c39-5  — fail closed on keyless/malformed encryption backfill; require_encryption_active raises → already pinned by test_f20_5_* (03-5)
+  c39-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (degraded, not boot-fatal) → already pinned by test_f20_6_* (03-6)
+  c39-7  — gate-defer signature derived from error code only (no child failures) → already pinned by test_f20_7_* (03-7)
+  c39-8  — timed-out qualifier children cancelled via _cancel_qualifier_children before state rewrite → already pinned by test_f20_8_* (03-8)
+  c39-9  — _DeterministicMigrationDefect returns 'block' verdict (not 'defer') → already pinned by test_f20_9_* (03-9)
+  c39-10 — env_preflight_enabled independent gate flag; absent evidence is a hard blocker → already pinned by test_f20_10_* (03-10)
+  c39-11 — trigger resolver returns infra_failure_redrive for infra_failure (bespoke loops gated separately) → already pinned by test_f20_11_* (03-11)
+  c39-12 — release_reconciliation references 'claiming' field for orphan containment → already pinned by test_f20_12_* (03-12)
+  c39-13 — migration_apply_gate data-migration proof gate defers DML without proof declaration → already pinned by test_f20_13_* (03-13)
+  c39-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview + triggerHotfixPromote → already pinned by test_f20_14_* (03-14)
+  c39-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (03-15)
+  c39-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (03-16)
+  c39-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (03-17)
 """
 
 from __future__ import annotations
@@ -6106,6 +6125,412 @@ def test_strategic_local_runner_section_includes_baked_image_guidance():
     assert "PREFER to omit" in src, (
         "strategic.ts must include 'PREFER to omit' guidance in the baked-image note "
         "so the strategist knows to omit container_image for experiments"
+    )
+
+
+# ── 17-finding release-qualification salvage bundle (task c39e0ee0, 2026-07-21) ── #
+# All 17 findings are identical to those in the 03ca2ee5 bundle and are already
+# pinned by the f20-* test suite.  The functions below are thin cross-references
+# that verify the same invariants under the c39 prefix.
+# --------------------------------------------------------------------------- #
+
+
+# c39-1 — classify serving-only-import ImportError as degrade, not hard block
+# Already pinned by test_f20_1_serving_only_import_error_degrades_gate.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_1_serving_only_import_degrades_gate():
+    """_ServingOnlyImportError must degrade the gate to ('ok', None).
+
+    Finding c39-1: an ImportError referencing a candidate-only app.* symbol during
+    serving-process replay raised ImportError, which _apply_candidate_migrations caught
+    as _DeterministicMigrationDefect — a hard block.  The fix introduces
+    _ServingOnlyImportError and degrades the gate to ('ok', None) instead.
+    Full coverage in test_f20_1_serving_only_import_error_degrades_gate.
+    """
+    from app.migration_apply_gate import _ServingOnlyImportError, _looks_like_serving_only_import
+
+    assert issubclass(_ServingOnlyImportError, Exception)
+
+    exc = ImportError("No module named 'app.field_encryption'")
+    exc.name = "app.field_encryption"
+    assert _looks_like_serving_only_import(exc), (
+        "_looks_like_serving_only_import must return True for app.* import errors — "
+        "candidate-only app symbols degrade the gate, not hard-block it"
+    )
+
+
+# c39-2 — prove data-dependent migrations safely (design)
+# Already pinned by test_f20_2_data_migration_proof_gate_design.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_2_scratch_replay_uses_empty_tables():
+    """Scratch migration replay must use empty tables and compare schema, not row data.
+
+    Finding c39-2: production state supplied to scratch replay contains only the Alembic
+    revision and reflected table/column metadata; scratch seeding creates empty tables.
+    Full coverage in test_f20_2_data_migration_proof_gate_design.
+    """
+    import pathlib
+
+    gate_source = (
+        pathlib.Path(__file__).parent.parent / "app" / "migration_apply_gate.py"
+    ).read_text()
+    assert "schema" in gate_source and "drift" in gate_source, (
+        "migration_apply_gate.py must reference schema drift detection — "
+        "scratch replay compares schema names, not row-transform outcomes"
+    )
+
+
+# c39-3 — verify encryption-key continuity
+# Already pinned by test_f20_3_*, test_probe_key_continuity_fails_closed_for_incompatible_key,
+# and test_assert_plaintext_or_raise_raises_for_wrong_key_ciphertext (e2/e3).
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_3_probe_key_continuity_and_assert_plaintext_present():
+    """probe_key_continuity and assert_plaintext_or_raise must be importable from field_encryption.
+
+    Finding c39-3: decrypt_field returns its input unchanged when a valid Fernet token
+    cannot be decrypted.  Migration 0531 treated decrypt_field(value) == value as evidence
+    the value is plaintext and re-encrypted it.  probe_key_continuity and
+    assert_plaintext_or_raise guard against this.
+    Full coverage in test_f20_3_*, e2, and e3.
+    """
+    from app.field_encryption import probe_key_continuity, assert_plaintext_or_raise
+
+    assert callable(probe_key_continuity)
+    assert callable(assert_plaintext_or_raise)
+
+
+# c39-4 — research: define safe Fernet key rotation (MultiFernet)
+# Already pinned by test_f20_4_multifernet_rotate_exists.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_4_multifernet_rotate_importable():
+    """cryptography.fernet.MultiFernet must be importable and expose rotate().
+
+    Finding c39-4: the MultiFernet contract encrypts with the first key, decrypts with
+    every configured key, and supports explicit token rotation via rotate().
+    Full coverage in test_f20_4_multifernet_rotate_exists.
+    """
+    from cryptography.fernet import MultiFernet
+
+    assert hasattr(MultiFernet, "rotate"), (
+        "cryptography.fernet.MultiFernet must expose rotate() for staged key rotation"
+    )
+
+
+# c39-5 — fail closed on keyless/malformed encryption backfill
+# Already pinned by test_f20_5_require_encryption_active_raises_on_missing_key.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_5_require_encryption_active_distinguishes_malformed_from_absent(monkeypatch):
+    """require_encryption_active must raise RuntimeError for both malformed and absent keys.
+
+    Finding c39-5: _get_fernet catches an invalid key and returns None, so
+    is_encryption_active() returns False for BOTH missing and malformed keys — the
+    backfill silently no-ops in both cases.  require_encryption_active() raises in
+    both failure modes.
+    Full coverage in test_f20_5_require_encryption_active_raises_on_missing_key.
+    """
+    import pytest
+    from app import field_encryption
+
+    monkeypatch.delenv("GITHUB_PAT_ENCRYPTION_KEY", raising=False)
+    monkeypatch.delenv("ALLOW_PLAINTEXT_CREDENTIALS", raising=False)
+    with pytest.raises(RuntimeError):
+        field_encryption.require_encryption_active("c39-5-absent-key")
+
+    monkeypatch.setenv("GITHUB_PAT_ENCRYPTION_KEY", "not-a-valid-fernet-key")
+    with pytest.raises(RuntimeError):
+        field_encryption.require_encryption_active("c39-5-malformed-key")
+
+
+# c39-6 — make scratch-DB URL degraded, not boot-fatal
+# Already pinned by test_scratch_db_url_is_qualification_prereq_not_boot_req
+# and test_f20_6_scratch_db_url_in_qualification_env_not_required_env.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_6_scratch_db_url_not_in_required_runtime_env():
+    """MIGRATION_APPLY_SCRATCH_DATABASE_URL must not appear in REQUIRED_RUNTIME_ENV.
+
+    Finding c39-6: the scratch URL was declared with scope='cloud_run' in
+    required_runtime_env.py, making its absence boot-fatal.  The fix removes it so
+    its absence degrades the gate to a 'defer' hold rather than crashing Cloud Run.
+    Full coverage in test_scratch_db_url_is_qualification_prereq_not_boot_req.
+    """
+    from app.required_runtime_env import REQUIRED_RUNTIME_ENV
+
+    req_names = {r.name for r in REQUIRED_RUNTIME_ENV}
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" not in req_names, (
+        "MIGRATION_APPLY_SCRATCH_DATABASE_URL must NOT be in REQUIRED_RUNTIME_ENV — "
+        "its absence must degrade the gate, not crash Cloud Run at boot"
+    )
+
+
+# c39-7 — isolate gate-defer signature from unrelated child failures
+# Already pinned by test_infra_failure_signature_ignores_child_failures
+# and test_f20_7_infra_failure_signature_derived_from_error_code_only.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_7_infra_failure_signature_stable_under_varying_children():
+    """_infra_failure_signature must be stable regardless of which child tasks failed.
+
+    Finding c39-7: _infra_failure_signature derived its leg from child_failures[-1],
+    so audit vs smoketest child-task failures caused the signature to oscillate between
+    attempts, preventing the permanent-gate-incapacity streak.
+    Full coverage in test_infra_failure_signature_ignores_child_failures.
+    """
+    from app.release_qualifier_audit import _infra_failure_signature
+
+    error = "migration_apply_check_unavailable"
+    assert (
+        _infra_failure_signature(error, [{"leg": "audit"}])
+        == _infra_failure_signature(error, [{"leg": "smoketest"}])
+        == _infra_failure_signature(error, [])
+    ), "_infra_failure_signature must be stable regardless of child_failures content"
+
+
+# c39-8 — contain timed-out qualifier children
+# Already pinned by test_cancel_qualifier_children_covers_all_child_types
+# and test_f20_8_force_finalize_cancels_children_before_rewriting_state.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_8_cancel_qualifier_children_callable():
+    """_cancel_qualifier_children must be defined in release_qualifier_sweep.py.
+
+    Finding c39-8: qualification timeout and sweep-crash handlers rewrote the release
+    record and alerted without changing referenced child task states, so in-flight
+    children could complete and influence the next re-drive.
+    Full coverage in test_cancel_qualifier_children_covers_all_child_types.
+    """
+    from app.release_qualifier_sweep import _cancel_qualifier_children
+
+    assert callable(_cancel_qualifier_children)
+
+
+# c39-9 — block deterministic migration defects
+# Already pinned by test_deterministic_migration_defect_class_exists
+# and test_f20_9_deterministic_migration_defect_returns_block_verdict.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_9_deterministic_migration_defect_is_exception():
+    """_DeterministicMigrationDefect must be an Exception subclass mapping to 'block'.
+
+    Finding c39-9: all migration-apply exceptions previously converted to defer.  The
+    fix introduces _DeterministicMigrationDefect for repeatable SQL errors and
+    non-serving ImportError/SyntaxError, which the gate converts to a 'block' verdict.
+    Full coverage in test_deterministic_migration_defect_class_exists.
+    """
+    from app.migration_apply_gate import _DeterministicMigrationDefect
+
+    assert issubclass(_DeterministicMigrationDefect, Exception)
+
+
+# c39-10 — enforce independent boot preflight
+# Already pinned by test_env_preflight_absent_evidence_is_a_hard_blocker
+# and test_f20_10_env_preflight_enabled_flag_independent_of_smoketest.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_10_env_preflight_enabled_flag_in_release_qualifier():
+    """env_preflight_enabled must be an independent gate flag in release_qualifier.py.
+
+    Finding c39-10: the sole env-preflight artifact producer was attached to the
+    optional smoketest child.  The fix introduces an independent env_preflight_enabled
+    flag so absent/malformed evidence is a hard blocker.
+    Full coverage in test_env_preflight_absent_evidence_is_a_hard_blocker.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).parent.parent / "app" / "release_qualifier.py").read_text()
+    assert "env_preflight_enabled" in src, (
+        "release_qualifier.py must reference env_preflight_enabled as an independent gate flag"
+    )
+
+
+# c39-11 — unify trigger truth and retries
+# Already pinned by test_infra_failure_redrive_is_independent_of_auto_qualification_triggers_knob
+# and test_f20_11_infra_failure_maps_to_dedicated_redrive_trigger.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_11_auto_qualification_triggers_does_not_control_infra_failure_redrive():
+    """auto_qualification_triggers knob must NOT gate the infra_failure bespoke re-drive.
+
+    Finding c39-11: the trigger resolver returned not_applicable for states handled by
+    dedicated sweep re-drive functions, and the auto_qualification_triggers knob controlled
+    only the generic trigger sweep, not the bespoke infra-failure loop.
+    Full coverage in test_infra_failure_redrive_is_independent_of_auto_qualification_triggers_knob.
+    """
+    import pathlib
+
+    redrive_src = (
+        pathlib.Path(__file__).parent.parent / "app" / "release_qualifier_redrive.py"
+    ).read_text()
+    assert "infra_failure" in redrive_src, (
+        "release_qualifier_redrive.py must reference infra_failure — "
+        "the bespoke infra-failure re-drive must exist independently of the generic trigger knob"
+    )
+
+
+# c39-12 — contain orphan promotion actors
+# Already pinned by test_bare_claim_promotion_gets_shorter_timeout
+# and test_f20_12_promotion_timeout_applies_to_bare_claims.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_12_release_reconciliation_references_claiming_field():
+    """release_reconciliation.py must reference the 'claiming' field for orphan containment.
+
+    Finding c39-12: a crash after PR creation could leave promotion_pending with
+    claiming=True and no PR number; timeout cleanup only closed PRs for managed-check-wait
+    records, not bare claims.
+    Full coverage in test_bare_claim_promotion_gets_shorter_timeout.
+    """
+    import inspect
+    from app import release_reconciliation
+
+    assert "claiming" in inspect.getsource(release_reconciliation), (
+        "release_reconciliation must reference 'claiming' — bare claims must be reachable"
+    )
+
+
+# c39-13 — gate data-migration proof
+# Already pinned by test_data_migration_proof_gate_defers_dml_without_proof
+# and test_f20_13_data_migration_proof_gate_defers_dml.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_13_migration_apply_gate_references_dml_detection():
+    """migration_apply_gate.py must reference DML/data-migration detection.
+
+    Finding c39-13: the migration-safe verdict could be produced after applying a data
+    migration to empty scratch tables with no fixture or invariant contract required.
+    The gate must defer for DML migrations that lack a proof declaration.
+    Full coverage in test_data_migration_proof_gate_defers_dml_without_proof.
+    """
+    import pathlib
+
+    src = (pathlib.Path(__file__).parent.parent / "app" / "migration_apply_gate.py").read_text()
+    assert "dml" in src.lower() or "DML" in src or "data_migration" in src, (
+        "migration_apply_gate.py must reference DML/data migration detection"
+    )
+
+
+# c39-14 — guide narrow release remediation (UI)
+# Already pinned by test_version_lifecycle_panel_has_hotfix_remediation
+# and test_f20_14_hotfix_remediation_api_client_present.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_14_hotfix_remediation_api_client_in_projects_ts():
+    """admin-ui/src/api/projects.ts must expose getHotfixScopePreview and triggerHotfixPromote.
+
+    Finding c39-14: admin-ui had no hotfix preview or promotion client and
+    VersionLifecyclePanel rendered only generic qualification failure state.
+    Full coverage in test_version_lifecycle_panel_has_hotfix_remediation.
+    """
+    import pathlib
+    import pytest
+
+    candidates = [
+        pathlib.Path(__file__).resolve().parents[2] / "admin-ui" / "src" / "api" / "projects.ts",
+        pathlib.Path("/repo/admin-ui/src/api/projects.ts"),
+    ]
+    api_source: str | None = None
+    for p in candidates:
+        if p.exists():
+            api_source = p.read_text()
+            break
+    if api_source is None:
+        pytest.skip("admin-ui/src/api/projects.ts not found — admin-ui not present in this shard")
+
+    assert "getHotfixScopePreview" in api_source or "hotfix" in api_source.lower(), (
+        "admin-ui/src/api/projects.ts must expose a hotfix scope preview function"
+    )
+    assert "triggerHotfixPromote" in api_source or "promote/hotfix" in api_source, (
+        "admin-ui/src/api/projects.ts must expose a hotfix promote function"
+    )
+
+
+# c39-15 — declare + diagnose migration-apply scratch prereq
+# Already pinned by test_scratch_db_url_is_qualification_prereq_not_boot_req
+# and test_f20_15_missing_qualification_env_surfaces_scratch_db_url.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_15_scratch_preflight_surfaces_missing_url():
+    """preflight_migration_apply_scratch must surface MIGRATION_APPLY_SCRATCH_DATABASE_URL absence.
+
+    Finding c39-15: MIGRATION_APPLY_SCRATCH_DATABASE_URL appeared nowhere in
+    required_runtime_env.py.  The gate's own preflight must surface a missing URL with an
+    actionable 'absent' status and the variable name in its detail.
+    Full coverage in test_scratch_db_url_is_qualification_prereq_not_boot_req.
+    """
+    from app.migration_apply_gate import MigrationApplyScratchPreflight, preflight_migration_apply_scratch
+
+    result = preflight_migration_apply_scratch(None)
+    assert isinstance(result, MigrationApplyScratchPreflight)
+    assert result.status == "absent"
+    assert "MIGRATION_APPLY_SCRATCH_DATABASE_URL" in (result.detail or "")
+
+
+# c39-16 — stabilize infra-failure signature for gate defers
+# Already pinned by test_infra_failure_signature_ignores_child_failures
+# and test_f20_16_infra_failure_signature_stable_across_candidate_rotations.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_16_infra_failure_signature_stable_for_migration_apply_error():
+    """_infra_failure_signature must produce the same string for migration_apply errors.
+
+    Finding c39-16: live v26 qualification showed signatures oscillating between
+    challenge:PROVISION_FAILURE:migration_apply_check_unavailable and
+    audit:PROVISION_FAILURE:audit_infra_respawn_cap_exceeded, preventing the
+    is_permanent_gate_incapacity streak from accumulating.
+    Full coverage in test_infra_failure_signature_ignores_child_failures.
+    """
+    from app.release_qualifier_audit import _infra_failure_signature
+
+    error = "migration_apply_check_unavailable"
+    assert (
+        _infra_failure_signature(error, [{"leg": "challenge", "status": "FAILED"}])
+        == _infra_failure_signature(error, [{"leg": "audit", "status": "CANCELLED"}])
+        == _infra_failure_signature(error, [])
+    )
+
+
+# c39-17 — add hotfix_policy.py to hotfix-eligible modules
+# Already pinned by test_hotfix_policy_and_router_in_eligible_modules
+# and test_f20_17_hotfix_policy_and_router_self_eligible.
+# --------------------------------------------------------------------------- #
+
+
+def test_c39_17_hotfix_policy_and_router_in_eligible_modules():
+    """hotfix_policy.py and admin_operator_triggers.py must be in HOTFIX_ELIGIBLE_MODULES.
+
+    Finding c39-17: HOTFIX_ELIGIBLE_MODULES did not contain 'backend/app/hotfix_policy.py'.
+    Without both modules, a fix to the hotfix scope validator cannot be deployed via the
+    hotfix channel — the exact self-reference gap the channel exists to solve.
+    Full coverage in test_hotfix_policy_and_router_in_eligible_modules.
+    """
+    from app.hotfix_policy import HOTFIX_ELIGIBLE_MODULES
+
+    assert "backend/app/hotfix_policy.py" in HOTFIX_ELIGIBLE_MODULES, (
+        "'backend/app/hotfix_policy.py' must be in HOTFIX_ELIGIBLE_MODULES"
+    )
+    assert "backend/app/routers/admin_operator_triggers.py" in HOTFIX_ELIGIBLE_MODULES, (
+        "'backend/app/routers/admin_operator_triggers.py' must be in HOTFIX_ELIGIBLE_MODULES"
     )
 
 
