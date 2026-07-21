@@ -725,13 +725,13 @@ async def post_event_message(
             event_type,
         )
         return None
-    ctx: dict[str, Any] = {"event_type": event_type}
-    if context:
-        ctx.update(context)
-    # Stamp the resolved audience so operator-facing surfaces can exclude
-    # non-operator (strategist-internal) rows. Canonical value wins over any
-    # audience the caller may have placed in ``context``.
-    ctx["audience"] = audience
+    # Stamp the resolved audience via the shared helper so the message carries
+    # a fail-closed audience classification consistent with every other
+    # operator-reaching emitter. ``stamp_message_audience`` sets event_type
+    # (preserving any existing value via setdefault) and always overwrites
+    # audience with the canonical registry resolution — a caller-supplied
+    # audience in ``context`` never wins over the registry.
+    ctx = stamp_message_audience(context, event_type, message_type=MessageType.NOTE.value)
     msg = await build_project_message(
         session,
         project_id=project_id,
