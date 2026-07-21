@@ -899,10 +899,11 @@ def compute_composite(
         audit report itself was present.
 
     ``smoketest_enabled`` (audit H3): the qualifier-smoketest subsystem is
-    gated by ``runtime_config["smoketest_enabled"]``, which defaults False.
-    When the qualifying run had it disabled it spawned NO qualifier-smoketest
-    child and there is no SMOKETEST_RESULT artifact — so ``smoketest_score``
-    is unconditionally None.  Treating that None as the
+    gated by ``runtime_config["smoketest_enabled"]``, which defaults True
+    (armed).  A per-project build_config override can disable it for projects
+    that have no smoke suite.  When the qualifying run had it disabled it spawned
+    NO qualifier-smoketest child and there is no SMOKETEST_RESULT artifact — so
+    ``smoketest_score`` is unconditionally None.  Treating that None as the
     ``smoketest_startup_failed`` hard blocker would make EVERY candidate fail
     while the subsystem is off.  Therefore, when ``smoketest_enabled`` is
     False this function: (a) skips the smoketest hard blocker, (b) drops the

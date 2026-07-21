@@ -1581,3 +1581,126 @@ class TestEnvPreflightGate:
         # Distinct from operator-env and deployed phrases.
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_OPERATOR_ENV]
         assert label != rs.EXECUTION_SITE_LABELS[rs.EXECUTION_SITE_DEPLOYED]
+
+
+# ---------------------------------------------------------------------------
+# env_preflight_enabled armed-by-default: source literal + behavior contract
+# ---------------------------------------------------------------------------
+
+
+class TestEnvPreflightArmedDefault:
+    """Guards the armed-by-default state for env_preflight_enabled.
+
+    The conftest resets env_preflight_enabled to False for test isolation
+    (individual gate tests set it explicitly), so the live runtime_config value
+    during tests is always False.  These tests read the source literal directly
+    via AST to verify the literal default is True — the invariant that survives
+    despite the test-isolation override.
+    """
+
+    def test_env_preflight_literal_default_is_true(self):
+        """runtime_config_state.py dict literal must have env_preflight_enabled=True."""
+        import ast
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).parent.parent / "app" / "runtime_config_state.py"
+        ).read_text()
+        tree = ast.parse(src)
+        found = None
+        for node in ast.walk(tree):
+            # runtime_config is an annotated assignment (runtime_config: Dict[...] = {...})
+            value = None
+            if isinstance(node, (ast.AnnAssign, ast.Assign)) and isinstance(node.value, ast.Dict):
+                value = node.value
+            if value is None:
+                continue
+            for k, v in zip(value.keys, value.values):
+                if isinstance(k, ast.Constant) and k.value == "env_preflight_enabled":
+                    found = v.value if isinstance(v, ast.Constant) else None
+                    break
+            if found is not None:
+                break
+        assert found is True, (
+            f"runtime_config literal env_preflight_enabled must be True (armed), "
+            f"got {found!r}. The gate was built to prevent the v25 prod boot-crash — "
+            "re-arming it must be explicit."
+        )
+
+    def test_armed_env_preflight_blocks_without_evidence(self):
+        """With env_preflight_enabled=True, missing evidence is a hard block."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(
+                env_preflight_enabled=True,
+                env_preflight_score=None,
+                env_preflight_missing=[],
+            )
+        )
+        assert result["blocker"] == "boot_prereq_evidence_missing"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+
+
+class TestSmoketestArmedDefault:
+    """Guards the armed-by-default state for smoketest_enabled.
+
+    The qualifier records the per-run smoketest_enabled flag at spawn time.
+    Tests that exercise specific smoketest scenarios set it explicitly on the
+    record.  These tests read the source literal directly via AST to verify the
+    literal default is True, and confirm the active-gate behaviour.
+    """
+
+    def test_smoketest_literal_default_is_true(self):
+        """runtime_config_state.py dict literal must have smoketest_enabled=True."""
+        import ast
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).parent.parent / "app" / "runtime_config_state.py"
+        ).read_text()
+        tree = ast.parse(src)
+        found = None
+        for node in ast.walk(tree):
+            value = None
+            if isinstance(node, (ast.AnnAssign, ast.Assign)) and isinstance(node.value, ast.Dict):
+                value = node.value
+            if value is None:
+                continue
+            for k, v in zip(value.keys, value.values):
+                if isinstance(k, ast.Constant) and k.value == "smoketest_enabled":
+                    found = v.value if isinstance(v, ast.Constant) else None
+                    break
+            if found is not None:
+                break
+        assert found is True, (
+            f"runtime_config literal smoketest_enabled must be True (armed), "
+            f"got {found!r}. Change the literal intentionally — do not flip to False."
+        )
+
+    def test_armed_smoketest_blocks_on_missing_score(self):
+        """With smoketest_enabled=True, a None smoketest_score is a hard block."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=None)
+        )
+        assert result["blocker"] == "smoketest_startup_failed"
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+
+    def test_armed_smoketest_passes_with_full_score(self):
+        """With smoketest_enabled=True and a passing score, no smoketest blocker fires."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=True, smoketest_score=1.0)
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+        assert result["sub_scores"]["smoketest"] == 1.0
+
+    def test_disabled_smoketest_drops_dimension(self):
+        """With smoketest_enabled=False, a None score does NOT block; weights renormalize."""
+        result = rs.compute_composite(
+            **_perfect_kwargs(smoketest_enabled=False, smoketest_score=None)
+        )
+        assert result["blocker"] is None
+        assert result["promote"] is True
+        # smoketest dimension contributes 0 when disabled; audit+test_erosion renormalize
+        assert result["sub_scores"]["smoketest"] == 0.0

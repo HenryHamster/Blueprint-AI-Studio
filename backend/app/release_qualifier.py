@@ -2884,11 +2884,11 @@ async def run_qualification(
     # changeset than was qualified.
     diff_range = f"{promotion_target}...{candidate_sha}"
     # Audit H3: the qualifier-smoketest child is spawned only when the
-    # smoketest subsystem is enabled.  smoketest_enabled defaults False (the
-    # subsystem is deferred), in which case no qualifier-smoketest task is
-    # spawned and compute_composite drops the smoketest dimension entirely —
-    # see _finalize_qualification / compute_composite.  When True, behave as
-    # the design doc specifies (audit + test-erosion + smoketest).
+    # smoketest subsystem is enabled.  smoketest_enabled defaults True (armed);
+    # a qualifying run spawns a qualifier-smoketest child and compute_composite
+    # scores the smoketest dimension — see _finalize_qualification /
+    # compute_composite.  A per-project build_config override can hold a specific
+    # project out of the smoketest; absent that, the fleet default applies.
     # Per-project override on the build_config seam (a project may or may not
     # have a smoke suite), falling back to the fleet-global runtime_config flag.
     smoketest_enabled = bool(

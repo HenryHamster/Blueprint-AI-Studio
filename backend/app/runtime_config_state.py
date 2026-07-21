@@ -1157,7 +1157,12 @@ runtime_config: Dict = {
     # smoketest_enabled gates smoketest task spawns. Operator-tunable via
     # runtime_config_json; persisted across restarts.
     "promotion_enabled": False,
-    "smoketest_enabled": False,
+    "smoketest_enabled": True,
+    # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
+    # Armed True: a new candidate must declare its required boot-time env vars;
+    # missing or absent declarations block promotion.  This gate was built to
+    # prevent the v25 GITHUB_PAT_ENCRYPTION_KEY prod boot-crash.
+    "env_preflight_enabled": True,
     # Per-project live-promotion enablement overrides ({project_id: bool}).
     # An EMPTY map (the default) means every project falls back to the
     # fleet-wide ``promotion_enabled`` above. A per-project entry arms or holds
