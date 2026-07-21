@@ -19,6 +19,7 @@ from app.max_plan_pool import (
     _persist_rate_limit_usage_to_db,
     _snapshot_from_persisted_usage,
     get_usage_persist_failure_count,
+    get_usage_persist_failing_accounts,
     get_usage_headroom_armable_since,
     reconcile_usage_headroom_arming,
     refresh_usage_meter_snapshots,
@@ -383,91 +384,176 @@ class TestSnapshotFromPersistedUsageWithNewBlobs:
 
 
 class TestPersistFailureCounterRecovery:
-    """_usage_persist_failures must decrement on a successful persist so a
-    transient DB hiccup does not permanently block usage_headroom arming.
+    """_usage_persist_failing_accounts must clear for an account on a successful
+    persist so a transient DB hiccup does not permanently block usage_headroom arming.
     """
 
     @pytest.mark.asyncio
     async def test_persist_failure_counter_recovers_after_success(self, monkeypatch):
         import app.max_plan_pool as mpp
 
-        # Seed the module-level counter to simulate a prior failure.
-        monkeypatch.setattr(mpp, "_usage_persist_failures", 1)
+        # Seed the per-account set to simulate a prior failure.
+        original = mpp._usage_persist_failing_accounts.copy()
+        mpp._usage_persist_failing_accounts.clear()
+        mpp._usage_persist_failing_accounts.add("test-id")
+        try:
+            snap = UsageSnapshot(
+                known=True,
+                window_utilizations={"five_hour": 30.0, "seven_day": 45.0},
+                resets_at={},
+                probed_at="2026-07-09T12:00:00",
+            )
 
-        snap = UsageSnapshot(
-            known=True,
-            window_utilizations={"five_hour": 30.0, "seven_day": 45.0},
-            resets_at={},
-            probed_at="2026-07-09T12:00:00",
-        )
+            class FakeRow:
+                rate_limit_usage = None
+                updated_at = None
 
-        class FakeRow:
-            rate_limit_usage = None
-            updated_at = None
+            class FakeSession:
+                async def __aenter__(self):
+                    return self
 
-        class FakeSession:
-            async def __aenter__(self):
-                return self
+                async def __aexit__(self, *a, **k):
+                    pass
 
-            async def __aexit__(self, *a, **k):
-                pass
+                async def get(self, model, acct_id):
+                    return FakeRow()
 
-            async def get(self, model, acct_id):
-                return FakeRow()
+                def add(self, obj):
+                    pass
 
-            def add(self, obj):
-                pass
+                async def commit(self):
+                    pass
 
-            async def commit(self):
-                pass
+            monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+            monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
 
-        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
-        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
-
-        assert get_usage_persist_failure_count() == 1, "counter must be seeded"
-        await _persist_rate_limit_usage_to_db("test-id", snap)
-        assert get_usage_persist_failure_count() == 0, (
-            "counter must decrement to 0 after a successful persist so armable can recover"
-        )
+            assert get_usage_persist_failure_count() == 1, "failing set must be seeded"
+            await _persist_rate_limit_usage_to_db("test-id", snap)
+            assert get_usage_persist_failure_count() == 0, (
+                "account must be cleared from failing set after a successful persist so armable can recover"
+            )
+        finally:
+            mpp._usage_persist_failing_accounts.clear()
+            mpp._usage_persist_failing_accounts.update(original)
 
     @pytest.mark.asyncio
     async def test_counter_does_not_go_below_zero(self, monkeypatch):
         import app.max_plan_pool as mpp
 
-        monkeypatch.setattr(mpp, "_usage_persist_failures", 0)
+        original = mpp._usage_persist_failing_accounts.copy()
+        mpp._usage_persist_failing_accounts.clear()
+        try:
+            snap = UsageSnapshot(
+                known=True,
+                window_utilizations={"five_hour": 10.0},
+                resets_at={},
+                probed_at="2026-07-09T12:00:00",
+            )
 
-        snap = UsageSnapshot(
-            known=True,
-            window_utilizations={"five_hour": 10.0},
-            resets_at={},
-            probed_at="2026-07-09T12:00:00",
-        )
+            class FakeRow:
+                rate_limit_usage = None
+                updated_at = None
 
-        class FakeRow:
-            rate_limit_usage = None
-            updated_at = None
+            class FakeSession:
+                async def __aenter__(self):
+                    return self
 
-        class FakeSession:
-            async def __aenter__(self):
-                return self
+                async def __aexit__(self, *a, **k):
+                    pass
 
-            async def __aexit__(self, *a, **k):
-                pass
+                async def get(self, model, acct_id):
+                    return FakeRow()
 
-            async def get(self, model, acct_id):
-                return FakeRow()
+                def add(self, obj):
+                    pass
 
-            def add(self, obj):
-                pass
+                async def commit(self):
+                    pass
 
-            async def commit(self):
-                pass
+            monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+            monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
 
-        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
-        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+            await _persist_rate_limit_usage_to_db("test-id", snap)
+            assert get_usage_persist_failure_count() == 0, (
+                "count must stay at 0 when account was not in failing set (no negative)"
+            )
+        finally:
+            mpp._usage_persist_failing_accounts.clear()
+            mpp._usage_persist_failing_accounts.update(original)
 
-        await _persist_rate_limit_usage_to_db("test-id", snap)
-        assert get_usage_persist_failure_count() == 0, "counter must stay at 0, not go negative"
+    @pytest.mark.asyncio
+    async def test_persist_failure_attributed_per_account(self, monkeypatch):
+        """One account's successful persist must NOT clear another account's failure.
+
+        Account A persistently fails; Account B succeeds on every attempt.
+        After B's success, A must still appear in the failing set — the count
+        stays >= 1 and get_usage_persist_failing_accounts() names A.
+        Once A itself succeeds, the count drops to 0.
+        """
+        import app.max_plan_pool as mpp
+
+        original = mpp._usage_persist_failing_accounts.copy()
+        mpp._usage_persist_failing_accounts.clear()
+        try:
+            snap = UsageSnapshot(
+                known=True,
+                window_utilizations={"five_hour": 20.0},
+                resets_at={},
+                probed_at="2026-07-09T12:00:00",
+            )
+
+            class FakeRow:
+                rate_limit_usage = None
+                updated_at = None
+
+            # Fake session that always succeeds (controls success for B)
+            class SuccessSession:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *a, **k):
+                    pass
+
+                async def get(self, model, acct_id):
+                    return FakeRow()
+
+                def add(self, obj):
+                    pass
+
+                async def commit(self):
+                    pass
+
+            # Simulate A having previously failed — seed it manually
+            mpp._usage_persist_failing_accounts.add("account-a")
+
+            monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: SuccessSession())
+            monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+            # B succeeds — must not clear A's failure
+            await _persist_rate_limit_usage_to_db("account-b", snap)
+            assert get_usage_persist_failure_count() >= 1, (
+                "A's failure must persist after B's success"
+            )
+            failing_ids = {a["id"] for a in get_usage_persist_failing_accounts()}
+            assert "account-a" in failing_ids, (
+                "get_usage_persist_failing_accounts() must name account-a as failing"
+            )
+            assert "account-b" not in failing_ids, (
+                "account-b succeeded and must not appear in the failing set"
+            )
+
+            # Now A itself succeeds — count must drop to 0
+            await _persist_rate_limit_usage_to_db("account-a", snap)
+            assert get_usage_persist_failure_count() == 0, (
+                "count must reach 0 once account-a itself persists successfully"
+            )
+            failing_ids_after = {a["id"] for a in get_usage_persist_failing_accounts()}
+            assert "account-a" not in failing_ids_after, (
+                "account-a must be cleared from failing set after its own success"
+            )
+        finally:
+            mpp._usage_persist_failing_accounts.clear()
+            mpp._usage_persist_failing_accounts.update(original)
 
 
 # ── Dark-meter warning for OAuth accounts with missing secrets ────────────────

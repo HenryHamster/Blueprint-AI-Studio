@@ -827,7 +827,9 @@ _pending_rl_persists: List[
 _pending_cap_persists: set = (
     set()
 )  # Account IDs with dirty daily_task_count / disabled_reason to flush
-_usage_persist_failures: int = 0  # Count of usage-snapshot DB persist failures since module load
+_usage_persist_failing_accounts: set[str] = (
+    set()
+)  # Account IDs whose last usage-snapshot DB persist failed (after retry)
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
 # Claude rate-limit (vs GitHub 429, GCP quota, Anthropic 529 overload, etc).
@@ -2991,11 +2993,12 @@ async def _persist_rate_limit_usage_to_db(
     """Write the usage snapshot into MaxPlanAccount.rate_limit_usage.
 
     Best-effort advisory: failures are logged but never raised.
-    On failure, increments the ``_usage_persist_failures`` counter and retries
-    once so a transient DB hiccup does not leave the meter dark on non-leader
-    instances (which rely on the persisted ``rate_limit_usage`` column).
+    On failure, adds the account id to ``_usage_persist_failing_accounts`` and
+    retries once so a transient DB hiccup does not leave the meter dark on
+    non-leader instances (which rely on the persisted ``rate_limit_usage``
+    column).  On success, removes ONLY this account from the failing set so one
+    account's recovery never clears another account's failure attribution.
     """
-    global _usage_persist_failures
     if not snapshot.known:
         return
     usage_dict = snapshot.to_dict()
@@ -3013,12 +3016,11 @@ async def _persist_rate_limit_usage_to_db(
                     row.updated_at = _utcnow()
                     persist_session.add(row)
                     await persist_session.commit()
-                if _usage_persist_failures > 0:
-                    _usage_persist_failures -= 1
+                _usage_persist_failing_accounts.discard(acct_id)
                 return  # success
         except Exception:  # noqa: PERF203 - bounded persist-retry, not a hot loop
             if attempt == 0:
-                _usage_persist_failures += 1
+                _usage_persist_failing_accounts.add(acct_id)
                 logger.warning(
                     "[POOL] failed to persist rate_limit_usage for account %s; retrying...",
                     acct_id,
@@ -3222,8 +3224,23 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
 
 
 def get_usage_persist_failure_count() -> int:
-    """Return the number of usage-snapshot DB persist failures since module load."""
-    return _usage_persist_failures
+    """Return the number of accounts currently failing to persist their usage snapshot."""
+    return len(_usage_persist_failing_accounts)
+
+
+def get_usage_persist_failing_accounts() -> list[dict[str, str]]:
+    """Return accounts currently failing to persist usage snapshots.
+
+    Each entry has 'id' and 'name' (name resolved from the in-memory pool where
+    available, otherwise the id string).
+    """
+    result = []
+    for acct_id in _usage_persist_failing_accounts:
+        acct = _account_by_id.get(acct_id)
+        result.append(
+            {"id": acct_id, "name": acct["name"] if acct else acct_id}
+        )
+    return result
 
 
 async def detect_persistently_dark_meters(

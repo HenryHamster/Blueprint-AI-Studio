@@ -4939,7 +4939,7 @@ async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch):
-    """On DB failure, retries once and increments _usage_persist_failures."""
+    """On DB failure, retries once and adds account to _usage_persist_failing_accounts."""
     import app.max_plan_pool as pool_mod
 
     from app.max_plan_pool import _persist_rate_limit_usage_to_db
@@ -4982,37 +4982,40 @@ async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch)
     )
     monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
 
-    before = pool_mod._usage_persist_failures
+    before = len(pool_mod._usage_persist_failing_accounts)
     await _persist_rate_limit_usage_to_db("test-id", snap)
-    after = pool_mod._usage_persist_failures
+    after = len(pool_mod._usage_persist_failing_accounts)
 
     # Retry fired: commit was called twice (first fails, second succeeds).
     assert commit_call_count == 2, (
         f"expected 2 commit calls (1 fail + 1 retry), got {commit_call_count}"
     )
-    # The attempt-0 failure increments the counter, but the attempt-1 retry
-    # succeeds and decrements it back down (see the decrement-on-success fix),
-    # so a transient hiccup that recovers nets zero — this is exactly what lets
-    # `armable` recover instead of being permanently pinned False.
+    # The attempt-0 failure adds test-id to the failing set, but the attempt-1
+    # retry succeeds and removes it — a transient hiccup that recovers nets zero,
+    # which lets `armable` recover instead of being permanently pinned False.
     assert after == before, (
-        f"counter should net zero after a transient fail+retry-success "
+        f"failing-account set should net zero after a transient fail+retry-success "
         f"(was {before}, now {after})"
     )
 
 
 def test_get_usage_persist_failure_count_reflects_module_counter():
-    """get_usage_persist_failure_count() reads the module-level counter."""
+    """get_usage_persist_failure_count() returns len of the per-account failing set."""
     import app.max_plan_pool as pool_mod
 
     from app.max_plan_pool import get_usage_persist_failure_count
 
-    original = pool_mod._usage_persist_failures
+    original = pool_mod._usage_persist_failing_accounts.copy()
     try:
-        assert get_usage_persist_failure_count() == original
-        pool_mod._usage_persist_failures = original + 7
-        assert get_usage_persist_failure_count() == original + 7
+        pool_mod._usage_persist_failing_accounts.clear()
+        assert get_usage_persist_failure_count() == 0
+        pool_mod._usage_persist_failing_accounts.update(
+            {f"fake-acct-{i}" for i in range(7)}
+        )
+        assert get_usage_persist_failure_count() == 7
     finally:
-        pool_mod._usage_persist_failures = original
+        pool_mod._usage_persist_failing_accounts.clear()
+        pool_mod._usage_persist_failing_accounts.update(original)
 
 
 # ── get_project_account_usage / get_user_project_pool_summary ────────────────
@@ -5863,9 +5866,9 @@ class TestGetMeterReliabilityStats:
         now = _utcnow()
         acct = self._reg(_acct(id="ok", provider="anthropic", auth_mode="oauth"))
         _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
-        original_failures = pool_mod._usage_persist_failures
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
         try:
-            pool_mod._usage_persist_failures = 0
+            pool_mod._usage_persist_failing_accounts.clear()
             result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
             assert result["meters_eligible"] == 1
             assert result["meters_known"] == 1
@@ -5873,7 +5876,8 @@ class TestGetMeterReliabilityStats:
             assert result["coverage_ratio"] == 1.0
             assert result["armable"] is True
         finally:
-            pool_mod._usage_persist_failures = original_failures
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)
 
     async def test_dark_account_reported_with_reason(self):
         now = _utcnow()
@@ -5926,15 +5930,18 @@ class TestGetMeterReliabilityStats:
         now = _utcnow()
         acct = self._reg(_acct(id="ok2", provider="anthropic", auth_mode="oauth"))
         _acct_usage(acct, _known_snap(5.0, 5.0), at=now)
-        original = pool_mod._usage_persist_failures
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
         try:
-            pool_mod._usage_persist_failures = original + 3
+            pool_mod._usage_persist_failing_accounts.update(
+                {"fake-fail-1", "fake-fail-2", "fake-fail-3"}
+            )
             result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
-            assert result["persist_failure_count"] == original + 3
+            assert result["persist_failure_count"] >= 3
             # armable requires zero persist failures
             assert result["armable"] is False
         finally:
-            pool_mod._usage_persist_failures = original
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)
 
     async def test_coverage_ratio_zero_eligible_returns_none(self):
         result = await get_meter_reliability_stats(min_coverage_pct=0)
@@ -5963,13 +5970,14 @@ class TestGetMeterReliabilityStats:
             }
 
         monkeypatch.setattr(pool_mod, "_load_persisted_usage_blobs", _fake_blobs)
-        original = pool_mod._usage_persist_failures
+        original_failing = pool_mod._usage_persist_failing_accounts.copy()
         try:
-            pool_mod._usage_persist_failures = 0
+            pool_mod._usage_persist_failing_accounts.clear()
             result = await get_meter_reliability_stats(now=now, min_coverage_pct=80)
             assert result["meters_known"] == 1
             assert result["meters_dark"] == 0
             assert result["coverage_ratio"] == 1.0
             assert result["armable"] is True
         finally:
-            pool_mod._usage_persist_failures = original
+            pool_mod._usage_persist_failing_accounts.clear()
+            pool_mod._usage_persist_failing_accounts.update(original_failing)

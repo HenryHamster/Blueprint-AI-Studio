@@ -2367,6 +2367,7 @@ async def _maybe_create_usage_meter_dark_alert(
     session: AsyncSession,
     dark_count: int,
     persist_failures: int,
+    persist_failing_account_names: list[str] | None = None,
 ) -> None:
     """Fleet-broadcast WARNING when usage meters are persistently dark or persist-failing.
 
@@ -2381,8 +2382,14 @@ async def _maybe_create_usage_meter_dark_alert(
         else ""
     )
     if persist_failures:
+        names_part = ""
+        if persist_failing_account_names:
+            _MAX_NAMES = 5
+            shown = persist_failing_account_names[:_MAX_NAMES]
+            extra = len(persist_failing_account_names) - len(shown)
+            names_part = f" ({', '.join(shown)}{f' +{extra} more' if extra else ''})"
         suffix = (
-            f"{persist_failures} DB persist failure(s) in the usage-meter pipeline"
+            f"{persist_failures} DB persist failure(s) in the usage-meter pipeline{names_part}"
         )
         msg = f"{msg}; {suffix}" if msg else suffix
     msg = (msg or "Usage meter is dark — check logs for details.") + (

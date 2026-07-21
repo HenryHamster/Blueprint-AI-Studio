@@ -1195,6 +1195,7 @@ async def orchestrator_worker():
     from app.max_plan_pool import (
         detect_persistently_dark_meters,
         get_usage_persist_failure_count,
+        get_usage_persist_failing_accounts,
         load_max_plan_pool,
         reconcile_usage_headroom_arming,
         refresh_usage_meter_snapshots,
@@ -1305,6 +1306,7 @@ async def orchestrator_worker():
                 await refresh_usage_meter_snapshots()
                 dark = await detect_persistently_dark_meters()
                 persist_failures = get_usage_persist_failure_count()
+                failing_accts = get_usage_persist_failing_accounts() if persist_failures else []
                 if dark:
                     names = ", ".join(
                         f"{d['name'] or d['id']} ({d['dark_reason']})" for d in dark
@@ -1317,9 +1319,13 @@ async def orchestrator_worker():
                         persist_failures,
                     )
                 elif persist_failures:
+                    failing_names = ", ".join(
+                        a["name"] for a in failing_accts
+                    )
                     logger.warning(
-                        "[POOL] usage meter: persist_failures=%d (no dark accounts)",
+                        "[POOL] usage meter: persist_failures=%d accounts=[%s] (no dark accounts)",
                         persist_failures,
+                        failing_names,
                     )
                 try:
                     async with AsyncSessionLocal() as _meter_alert_session:
@@ -1328,6 +1334,9 @@ async def orchestrator_worker():
                                 _meter_alert_session,
                                 dark_count=len(dark),
                                 persist_failures=persist_failures,
+                                persist_failing_account_names=[
+                                    a["name"] for a in failing_accts
+                                ],
                             )
                         else:
                             await _resolve_usage_meter_dark_alert(_meter_alert_session)
