@@ -15,7 +15,11 @@ import {
   handleStrategicResidentTurn,
   residentProviderSupportsNoTools,
 } from './strategic-resident-turn.js';
-import { residentResultShapeError } from './strategic-resident-result.js';
+import {
+  FINAL_RESULT_SCHEMA_HINT,
+  residentReplyContract,
+  residentResultShapeError,
+} from './strategic-resident-result.js';
 
 const providerInput = {
   identity: {
@@ -198,6 +202,32 @@ describe('strategic Resident turn handler', () => {
     expect(residentProviderSupportsNoTools('anthropic')).toBe(true);
   });
 
+  it('states persistence, owner, and lane-specific reply contracts', () => {
+    const background = residentReplyContract('background');
+    const interactive = residentReplyContract('interactive');
+    for (const contract of [background, interactive]) {
+      expect(contract).toContain(
+        'follow_up.open_loops persist only when their loop_id values are included in reconciliation.accepted_open_loop_ids',
+      );
+      expect(contract).toContain(
+        'Resolve existing open loops only through reconciliation.resolved_open_loop_ids',
+      );
+    }
+    expect(FINAL_RESULT_SCHEMA_HINT).toContain(
+      'use "resident" for Resident-runnable commitments',
+    );
+    expect(FINAL_RESULT_SCHEMA_HINT).toContain(
+      '"operator" for human-blocked commitments',
+    );
+    expect(FINAL_RESULT_SCHEMA_HINT).toContain('null only when genuinely unassigned');
+    expect(FINAL_RESULT_SCHEMA_HINT).toContain('actual actor identity in context or summary');
+    expect(background).toContain('Routine or unchanged background turns must keep reply:null');
+    expect(background).toContain(
+      'non-null background reply only for meaningful decisions, required attention, catch-up, or operation outcomes',
+    );
+    expect(interactive).not.toContain('Routine or unchanged background turns');
+  });
+
   it('validates every nested final-result family before completion', () => {
     const valid = {
       reply: 'Ready.', facts: [], evidence: [], operations: [], receipts: [],
@@ -237,6 +267,32 @@ describe('strategic Resident turn handler', () => {
         implication_id: 'other-observation', kind: 'other', summary: 'Observation.', evidence_ids: [],
       }],
     }, [])).toBeNull();
+
+    const scheduled = {
+      ...valid,
+      follow_up: {
+        summary: 'Useful work remains.',
+        open_loops: [{
+          loop_id: 'scheduled-work', summary: 'Continue the work.', owner: null,
+          due_at: '2026-07-21T08:30:00-07:00', evidence_ids: [],
+        }],
+        next_wakeup_at: '2026-07-21T15:30:00.123456Z',
+      },
+    };
+    expect(residentResultShapeError(scheduled, [])).toBeNull();
+    for (const invalid of ['tomorrow-ish', '2026-02-30T12:00:00Z', '2026-07-21T25:00:00Z']) {
+      expect(residentResultShapeError({
+        ...scheduled,
+        follow_up: { ...scheduled.follow_up, next_wakeup_at: invalid },
+      }, [])).toContain('next_wakeup_at must be a parseable ISO-8601 timestamp');
+      expect(residentResultShapeError({
+        ...scheduled,
+        follow_up: {
+          ...scheduled.follow_up,
+          open_loops: [{ ...scheduled.follow_up.open_loops[0], due_at: invalid }],
+        },
+      }, [])).toContain('due_at must be a parseable ISO-8601 timestamp');
+    }
   });
 
   it('preflights high-impact evidence references and accepted inspections', () => {

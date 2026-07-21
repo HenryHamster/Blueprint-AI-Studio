@@ -51,7 +51,7 @@ from app.strategic_resident_transition_locks import (
     assert_legacy_resident_drained as _assert_legacy_resident_drained,
     lock_project_resident_tasks as _lock_project_resident_tasks,
 )
-from app.time_utils import _utcnow
+from app.time_utils import _coerce_naive_utc, _utcnow
 
 
 LEGACY_ENGINE_OWNER = "legacy"
@@ -230,6 +230,7 @@ async def _next_meaningful_wakeup(
     *,
     now: datetime,
 ) -> datetime | None:
+    observed_at = _coerce_naive_utc(now)
     pending_sequence = await session.scalar(
         select(func.max(ProjectMessage.sequence)).where(
             ProjectMessage.project_id == resident.project_id,
@@ -240,21 +241,21 @@ async def _next_meaningful_wakeup(
         )
     )
     if pending_sequence is not None:
-        return now
+        return observed_at
     scheduling = (
         resident.scheduling_state
         if isinstance(resident.scheduling_state, dict)
         else {}
     )
     if scheduling.get("pending_project_change_cursor"):
-        return now
+        return observed_at
     raw_deadline = scheduling.get("deadline_at")
     if isinstance(raw_deadline, str) and raw_deadline:
         try:
             deadline = datetime.fromisoformat(raw_deadline.replace("Z", "+00:00"))
             if deadline.tzinfo is not None:
                 deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
-            return deadline
+            return max(observed_at, deadline)
         except ValueError:
             raise ResidentOwnershipStateError(
                 "Resident scheduling deadline is malformed"
@@ -463,6 +464,12 @@ async def cutover_to_strategic_resident(
             "authority_generation": next_generation,
             "transitioned_at": effective_now.isoformat(),
         }
+        if resident.background_policy == "active":
+            resident.scheduling_state = {
+                **dict(resident.scheduling_state or {}),
+                "background_activation_sequence": 1,
+                "background_activated_at": effective_now.isoformat(),
+            }
         if (
             boundary.pending_message_sequence_start is not None
             and boundary.pending_message_sequence_end is not None
@@ -483,15 +490,17 @@ async def cutover_to_strategic_resident(
                     boundary.pending_message_sequence_end
                 ),
             }
-        resident.next_wakeup_at = (
-            await _next_meaningful_wakeup(
-                session,
-                resident,
-                now=effective_now,
+        if resident.background_policy == "active":
+            resident.next_wakeup_at = (
+                await _next_meaningful_wakeup(
+                    session,
+                    resident,
+                    now=effective_now,
+                )
+                or _coerce_naive_utc(effective_now)
             )
-            if resident.background_policy == "active"
-            else None
-        )
+        else:
+            resident.next_wakeup_at = None
         resident.updated_at = effective_now
         session.add(resident)
         return _transition_result(

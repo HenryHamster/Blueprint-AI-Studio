@@ -2243,6 +2243,7 @@ async def test_clean_success_resets_failure_retry_state(db_session):
     }
     db_session.add(resident)
     await db_session.commit()
+    started = _utcnow()
 
     await reconcile_strategic_resident_turn(
         _factory(db_session),
@@ -2255,7 +2256,10 @@ async def test_clean_success_resets_failure_retry_state(db_session):
     assert stored.recovery_state["failure_count"] == 0
     assert stored.recovery_state["status"] == "recovered"
     assert stored.health_status == "healthy"
-    assert stored.next_wakeup_at is None
+    assert stored.next_wakeup_at is not None
+    assert started + timedelta(minutes=14) < stored.next_wakeup_at
+    assert stored.next_wakeup_at <= started + timedelta(minutes=16)
+    assert stored.scheduling_state["deadline_reason"] == "open_loop_continuation"
 
 
 @pytest.mark.asyncio

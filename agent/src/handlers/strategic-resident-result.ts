@@ -19,6 +19,7 @@ export const FINAL_RESULT_SCHEMA_HINT = [
   'strategy_change, abandon_work, merge, and deploy implications require at least one evidence_id.',
   'proposed_memory: [{"proposal_id":"id","layer":"charter|working_strategy","updates":{"public_key":"value"},"rationale":"text","evidence_ids":[]}]',
   'follow_up: null or {"summary":null,"open_loops":[{"loop_id":"id","summary":"text","owner":null,"due_at":null,"evidence_ids":[]}],"next_wakeup_at":null}',
+  'follow_up.open_loops owner contract: use "resident" for Resident-runnable commitments, "operator" for human-blocked commitments, and null only when genuinely unassigned. Put the actual actor identity in context or summary, never in the free-form owner field.',
   'required_attention: [{"attention_id":"id","severity":"info|warning|critical","summary":"text","evidence_ids":[],"receipt_ids":[]}]',
   'reconciliation: {"accepted_memory_proposal_ids":[],"accepted_implication_ids":[],"accepted_open_loop_ids":[],"resolved_open_loop_ids":[],"evidence_inspections":[]}',
   'unknown_effects, non-proposed operations, receipts, and receipt-bound required_attention are authority-bearing: copy them exactly from server completion_projection values. If the server projected none, return an empty array. Never put narrative uncertainty in unknown_effects.',
@@ -34,6 +35,13 @@ export function residentReplyContract(lane: unknown): string {
   return [
     'When reasoning is complete, include every final key even when null or empty:',
     interactive ? 'This interactive turn requires a nonblank user-facing reply.' : null,
+    !interactive
+      ? 'This background turn owns strategic outcomes. Do useful safe work when evidence supports it; do not create work merely to appear busy. If follow_up.open_loops is nonempty and no operator attention is required, provide a concrete ISO-8601 follow_up.next_wakeup_at so active work cannot become permanently idle.'
+      : null,
+    'Proposed follow_up.open_loops persist only when their loop_id values are included in reconciliation.accepted_open_loop_ids. Resolve existing open loops only through reconciliation.resolved_open_loop_ids.',
+    !interactive
+      ? 'Routine or unchanged background turns must keep reply:null. Use a non-null background reply only for meaningful decisions, required attention, catch-up, or operation outcomes.'
+      : null,
     skeleton,
   ].filter((line): line is string => line !== null).join('\n');
 }
@@ -144,6 +152,40 @@ function optionalStringError(
   return record[key] === undefined
     ? null
     : stringError(record[key], `${path}.${key}`, maxLength, nullable);
+}
+
+const ISO_TIMESTAMP = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d{1,6})?)?(?:Z|[+-](\d{2}):(\d{2}))?$/;
+
+function optionalIsoTimestampError(
+  record: Record<string, unknown>,
+  key: string,
+  path: string,
+): string | null {
+  const value = record[key];
+  if (value === undefined || value === null) return null;
+  const field = `${path}.${key}`;
+  const stringIssue = stringError(value, field, 128);
+  if (stringIssue) return stringIssue;
+  const match = ISO_TIMESTAMP.exec(value as string);
+  if (!match) return `${field} must be a parseable ISO-8601 timestamp`;
+  const [, year, month, day, hour, minute, second = '0', offsetHour = '0', offsetMinute = '0'] = match;
+  const yearNumber = Number(year);
+  const monthNumber = Number(month);
+  const dayNumber = Number(day);
+  const daysInMonth = monthNumber >= 1 && monthNumber <= 12
+    ? new Date(Date.UTC(yearNumber, monthNumber, 0)).getUTCDate()
+    : 0;
+  if (
+    yearNumber < 1
+    || dayNumber < 1
+    || dayNumber > daysInMonth
+    || Number(hour) > 23
+    || Number(minute) > 59
+    || Number(second) > 59
+    || Number(offsetHour) > 23
+    || Number(offsetMinute) > 59
+  ) return `${field} must be a parseable ISO-8601 timestamp`;
+  return null;
 }
 
 function stringListError(
@@ -329,7 +371,7 @@ function validateOpenLoops(value: unknown): string | null {
     const error = stringError(item.loop_id, `${path}.loop_id`, 120)
       ?? stringError(item.summary, `${path}.summary`, 4_000)
       ?? optionalStringError(item, 'owner', path, 200, true)
-      ?? optionalStringError(item, 'due_at', path, 128, true)
+      ?? optionalIsoTimestampError(item, 'due_at', path)
       ?? optionalStringListError(item, 'evidence_ids', path, 20);
     if (error) return error;
   }
@@ -343,7 +385,7 @@ function validateFollowUp(value: unknown): string | null {
   const item = value as Record<string, unknown>;
   return optionalStringError(item, 'summary', 'follow_up', 4_000, true)
     ?? (item.open_loops === undefined ? null : validateOpenLoops(item.open_loops))
-    ?? optionalStringError(item, 'next_wakeup_at', 'follow_up', 128, true);
+    ?? optionalIsoTimestampError(item, 'next_wakeup_at', 'follow_up');
 }
 
 function validateAttention(items: unknown[]): string | null {

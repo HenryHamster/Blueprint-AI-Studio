@@ -3518,6 +3518,179 @@ async def test_queued_age_alert_fires_despite_brief_pause(reaper_db):
 
 
 @pytest.mark.asyncio
+async def test_activation_repair_sqlite_server_filter_scans_past_valid_prefix(
+    reaper_db, mocker
+):
+    import app.strategic_resident_activation_sweep as activation_sweep
+
+    valid_ids = [_uuid_mod.UUID(int=index) for index in range(1, 41)]
+    repair_id = _uuid_mod.UUID(int=100)
+    for index, project_id in enumerate([*valid_ids, repair_id]):
+        reaper_db.add(
+            Project(
+                id=project_id,
+                name=f"activation-sqlite-{index}",
+                user_id="user1",
+            )
+        )
+        reaper_db.add(
+            StrategicResident(
+                project_id=project_id,
+                engine_owner="strategic_resident",
+                background_policy="active",
+                scheduling_state=(
+                    {"background_activation_sequence": 1}
+                    if project_id != repair_id
+                    else {}
+                ),
+            )
+        )
+    await reaper_db.commit()
+
+    Session = sessionmaker(
+        bind=reaper_db.bind,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch.object(activation_sweep, "_empty_scan_not_before", None)
+    sync_policy = mocker.patch.object(
+        activation_sweep,
+        "sync_resident_background_policy",
+        new_callable=AsyncMock,
+    )
+    sync_policy.return_value = mocker.Mock(task_id=_uuid_mod.uuid4())
+
+    queued = await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=Session,
+        now=_utcnow(),
+        batch_size=1,
+        empty_scan_cooldown=timedelta(0),
+    )
+
+    assert queued == 1
+    sync_policy.assert_awaited_once()
+    assert sync_policy.await_args.kwargs["project_id"] == repair_id
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected_queued"),
+    [
+        pytest.param(True, 1, id="boolean"),
+        pytest.param(0, 1, id="zero"),
+        pytest.param(None, 1, id="explicit-null"),
+        pytest.param([1], 1, id="array"),
+        pytest.param({"nested": 1}, 1, id="object"),
+        pytest.param(3, 0, id="positive-integer"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_activation_repair_sqlite_marker_type_contract(
+    reaper_db, mocker, marker, expected_queued
+):
+    import app.strategic_resident_activation_sweep as activation_sweep
+
+    project = await _make_project(reaper_db)
+    reaper_db.add(
+        StrategicResident(
+            project_id=project.id,
+            engine_owner="strategic_resident",
+            background_policy="active",
+            scheduling_state={"background_activation_sequence": marker},
+        )
+    )
+    await reaper_db.commit()
+
+    Session = sessionmaker(
+        bind=reaper_db.bind,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch.object(activation_sweep, "_empty_scan_not_before", None)
+    mocker.patch.object(
+        activation_sweep,
+        "resolve_dialect_name",
+        return_value="sqlite",
+    )
+    sync_policy = mocker.patch.object(
+        activation_sweep,
+        "sync_resident_background_policy",
+        new_callable=AsyncMock,
+    )
+    sync_policy.return_value = mocker.Mock(task_id=_uuid_mod.uuid4())
+
+    queued = await activation_sweep.sweep_missing_background_activation_wakeups(
+        session_factory=Session,
+        now=_utcnow(),
+        batch_size=1,
+        empty_scan_cooldown=timedelta(0),
+    )
+
+    assert queued == expected_queued
+    if expected_queued:
+        sync_policy.assert_awaited_once()
+        assert sync_policy.await_args.kwargs["project_id"] == project.id
+    else:
+        sync_policy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_activation_sweep_failure_preserves_outer_reaper_session_state(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    project = await _make_project(reaper_db)
+    observed = {}
+
+    async def capture_outer_state(session, *_args, **_kwargs):
+        observed["project"] = await session.get(Project, project.id)
+        observed["session"] = session
+
+    async def verify_outer_state(session):
+        loaded = observed["project"]
+        state = inspect(loaded)
+        observed.update(
+            later_step_ran=True,
+            same_session=(
+                state.session is session.sync_session
+                and session is observed["session"]
+            ),
+            detached=state.detached,
+            expired=state.expired,
+        )
+        if not state.detached and not state.expired:
+            observed["project_name"] = loaded.name
+
+    mocker.patch(
+        "app.reaper.sweep_stalled_strategic_cycles",
+        new_callable=AsyncMock,
+        side_effect=capture_outer_state,
+    )
+    activation = mocker.patch(
+        "app.reaper.sweep_missing_background_activation_wakeups",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("activation scan failed"),
+    )
+    later = mocker.patch(
+        "app.reaper.sweep_regression_scan",
+        new_callable=AsyncMock,
+        side_effect=verify_outer_state,
+    )
+
+    await _run_reaper_once()
+
+    activation.assert_awaited_once()
+    later.assert_awaited_once()
+    assert observed["later_step_ran"] is True
+    assert observed["same_session"] is True
+    assert observed["detached"] is False
+    assert observed["expired"] is False
+    assert observed["project_name"] == project.name
+
+
+@pytest.mark.asyncio
 async def test_reaper_contains_shadow_sweep_failure_and_runs_later_phase(
     reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
