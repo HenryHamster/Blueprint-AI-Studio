@@ -772,3 +772,170 @@ def test_dockerfile_network_override_continuation_line_is_rejected(tmp_path, mon
     content = b"FROM python:3.11-slim\nRUN --network=default \\\n    pip install numpy\n"
     with pytest.raises(ValueError, match="network override"):
         _check_dockerfile_network_directives(content)
+
+
+# ── Inflight build persistence and restart recovery ───────────────────────────
+
+
+def test_inflight_cloud_build_state_persisted_and_resumed_after_restart(tmp_path, monkeypatch):
+    """Build-id is persisted before polling; a simulated restart resumes from that id.
+
+    Two logical phases:
+    1. Submit: _persist_fn is called with the build_id *before* the poll loop starts,
+       so an orchestrator crash mid-poll leaves recoverable state.
+    2. Resume: a new call with _load_inflight_fn returning the persisted build_id skips
+       submission entirely and polls using the stored id — no duplicate build.
+    """
+    from app.compute_image_remote_build import remote_build_and_push, _CloudBuildSubmission
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "source-bucket")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+    monkeypatch.setattr("app.compute_image_remote_build._delete_staged_object", lambda _: None)
+
+    repo = _write_repo(tmp_path)
+
+    # ── Phase 1: submit and persist; simulate crash before poll completes ──
+    persisted: dict = {}
+
+    def capture_persist(*, dep_hash, build_id, staged_object):
+        persisted[dep_hash] = {"build_id": build_id, "staged_object": staged_object}
+
+    submit_calls: list = []
+
+    def fake_submit(**kw):
+        sub = _CloudBuildSubmission("build-inflight-001", "https://log.example.com", "staged-src.tgz")
+        submit_calls.append(sub.build_id)
+        return sub
+
+    def crash_poll(*args, **kwargs):
+        raise RuntimeError("simulated orchestrator restart mid-poll")
+
+    with pytest.raises(RuntimeError, match="simulated orchestrator restart"):
+        remote_build_and_push(
+            repo_dir=repo,
+            registry_repo="us-docker.pkg.dev/proj/repo",
+            image_name="img",
+            dockerfile=".blueprint/Dockerfile.compute",
+            dep_files=["requirements.txt"],
+            _tag_exists_fn=lambda *a, **k: False,
+            _submit_fn=fake_submit,
+            _poll_fn=crash_poll,
+            _persist_fn=capture_persist,
+        )
+
+    # _persist_fn must have been called with the build-id before the poll started.
+    assert persisted, "_persist_fn must be called before the poll loop"
+    dep_hash = next(iter(persisted))
+    assert persisted[dep_hash]["build_id"] == "build-inflight-001", (
+        "persisted build_id must match the submitted build"
+    )
+    assert persisted[dep_hash]["staged_object"] == "staged-src.tgz"
+
+    # ── Phase 2: restart recovery — load inflight, skip submission, resume poll ──
+    resumed_polls: list = []
+
+    def load_inflight(dep_hash):
+        return persisted.get(dep_hash)
+
+    def fake_resumed_poll(build_id, **kw):
+        resumed_polls.append(build_id)
+        return {"status": "SUCCESS"}
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="us-docker.pkg.dev/proj/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _tag_exists_fn=lambda *a, **k: False,
+        _load_inflight_fn=load_inflight,
+        _poll_fn=fake_resumed_poll,
+        _resolve_digest_fn=lambda *a, **k: "sha256:resumed0000",
+    )
+
+    # No new submission was made after restart.
+    assert submit_calls == ["build-inflight-001"], (
+        "restart recovery must not submit a new Cloud Build"
+    )
+    # Polling resumed using the persisted build-id.
+    assert resumed_polls == ["build-inflight-001"], (
+        "restart recovery must poll the persisted build_id"
+    )
+    assert result.built is True
+    assert result.already_present is False
+    assert result.pinned_ref.endswith("sha256:resumed0000"), (
+        "resumed build must return digest-pinned ref"
+    )
+
+
+def test_persist_fn_called_before_poll_loop(tmp_path, monkeypatch):
+    """_persist_fn is invoked immediately after submission, before any poll call."""
+    from app.compute_image_remote_build import remote_build_and_push, _CloudBuildSubmission
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "source-bucket")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+    monkeypatch.setattr("app.compute_image_remote_build._delete_staged_object", lambda _: None)
+
+    repo = _write_repo(tmp_path)
+    call_order: list = []
+
+    def ordered_persist(*, dep_hash, build_id, staged_object):
+        call_order.append(("persist", build_id))
+
+    def ordered_poll(build_id, **kw):
+        call_order.append(("poll", build_id))
+        return {"status": "SUCCESS"}
+
+    remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="us-docker.pkg.dev/proj/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _tag_exists_fn=lambda *a, **k: False,
+        _submit_fn=lambda **kw: _CloudBuildSubmission("build-order-test", "", "obj.tgz"),
+        _poll_fn=ordered_poll,
+        _persist_fn=ordered_persist,
+        _resolve_digest_fn=lambda *a, **k: "sha256:abc",
+    )
+
+    assert call_order[0] == ("persist", "build-order-test"), (
+        "persist must be called before poll"
+    )
+    assert call_order[1] == ("poll", "build-order-test"), (
+        "poll must follow persist"
+    )
+
+
+def test_load_inflight_none_falls_through_to_normal_submit(tmp_path, monkeypatch):
+    """When _load_inflight_fn returns None, the normal submission path runs."""
+    from app.compute_image_remote_build import remote_build_and_push, _CloudBuildSubmission
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_SA", "builder@proj.iam.gserviceaccount.com")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_LOCATION", "us-central1")
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILD_SOURCE_BUCKET", "source-bucket")
+    monkeypatch.setenv("GCP_PROJECT_ID", "test-proj")
+    monkeypatch.setattr("app.compute_image_remote_build._delete_staged_object", lambda _: None)
+
+    repo = _write_repo(tmp_path)
+    submit_calls: list = []
+
+    result = remote_build_and_push(
+        repo_dir=repo,
+        registry_repo="us-docker.pkg.dev/proj/repo",
+        image_name="img",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        _tag_exists_fn=lambda *a, **k: False,
+        _load_inflight_fn=lambda dep_hash: None,  # no inflight state
+        _submit_fn=lambda **kw: submit_calls.append("submit") or _CloudBuildSubmission("build-new", "", "obj.tgz"),
+        _poll_fn=lambda *a, **kw: {"status": "SUCCESS"},
+        _resolve_digest_fn=lambda *a, **k: "sha256:new",
+    )
+
+    assert submit_calls == ["submit"], "normal submission must run when no inflight state"
+    assert result.built is True

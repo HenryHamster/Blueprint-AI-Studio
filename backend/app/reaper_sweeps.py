@@ -3487,6 +3487,79 @@ async def sweep_refresh_project_compute_images(
     return summary
 
 
+async def sweep_reconcile_inflight_cloud_builds(
+    session,
+    now=None,
+    *,
+    _get_status_fn=None,
+    stale_threshold_seconds: int = 300,
+) -> dict[str, int]:
+    """Reconcile ProjectComputeImageBuild rows left BUILDING after an orchestrator restart.
+
+    On each reaper cycle, finds rows that have ``cloud_build_id`` set and whose
+    ``updated_at`` is older than *stale_threshold_seconds* (giving normally-polling
+    builds time to finish).  For each row the Cloud Build API is queried once
+    (non-blocking); terminal builds get their status updated in DB.  Still-running
+    builds are left for the next cycle.
+
+    This recovers in-flight state that would otherwise be orphaned when the
+    orchestrator process is replaced between submission and poll completion.
+    """
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    _now = now or _utcnow()
+    cutoff = _now - timedelta(seconds=stale_threshold_seconds)
+
+    rows = (
+        await session.execute(
+            select(ProjectComputeImageBuild).where(
+                ProjectComputeImageBuild.status == ComputeImageBuildStatus.BUILDING,
+                ProjectComputeImageBuild.cloud_build_id.is_not(None),
+                ProjectComputeImageBuild.updated_at < cutoff,
+            )
+        )
+    ).scalars().all()
+
+    summary: dict[str, int] = {"checked": 0, "resolved": 0, "still_running": 0, "errors": 0}
+    if not rows:
+        return summary
+
+    from app.compute_image_remote_build import get_cloud_build_status, _TERMINAL_BUILD_STATUSES
+
+    get_status = _get_status_fn or get_cloud_build_status
+
+    for row in rows:
+        summary["checked"] += 1
+        try:
+            status = get_status(row.cloud_build_id)
+            if status in _TERMINAL_BUILD_STATUSES:
+                if status == "SUCCESS":
+                    row.status = ComputeImageBuildStatus.SUCCEEDED
+                elif status == "TIMEOUT":
+                    row.status = ComputeImageBuildStatus.TIMED_OUT
+                else:
+                    row.status = ComputeImageBuildStatus.FAILED
+                row.error_reason = f"reconciled from Cloud Build: {status}"
+                session.add(row)
+                summary["resolved"] += 1
+                logger.info(
+                    "[REAPER] inflight Cloud Build %s reconciled -> %s (build %s)",
+                    row.id, row.status, row.cloud_build_id,
+                )
+            else:
+                summary["still_running"] += 1
+        except Exception as exc:  # noqa: BLE001 — per-row, fail open
+            logger.warning(
+                "[REAPER] inflight build reconcile error for cloud_build_id=%s: %s",
+                row.cloud_build_id, exc,
+            )
+            summary["errors"] += 1
+
+    if summary["resolved"]:
+        await session.commit()
+    return summary
+
+
 async def sweep_silent_runner_compute_jobs(session, now=None) -> int:
     """Step 22f: Reap silent runner-subprocess and GCP compute jobs.
 
@@ -3705,6 +3778,7 @@ __all__ = [
     "sweep_reconcile_gc_guard_db_pins",
     "get_compute_image_gc_guard_readiness",
     "sweep_refresh_project_compute_images",
+    "sweep_reconcile_inflight_cloud_builds",
     "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
     "VIEWABLE_ARTIFACT_RETENTION_DAYS",

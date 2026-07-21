@@ -315,6 +315,7 @@ from app.reaper_sweeps import (
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
+    sweep_reconcile_inflight_cloud_builds,
     sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
     sweep_silent_runner_compute_jobs,
@@ -3436,7 +3437,23 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
 
-                # Step 22e: Auto-clear moot pending_user_confirmation items —
+                # Step 22e: Inflight Cloud Build reconciliation — detect
+                # ProjectComputeImageBuild rows stuck in BUILDING status because
+                # the orchestrator was replaced mid-poll. Checks Cloud Build API
+                # for the current status and updates the DB row to the terminal
+                # state so callers can detect the outcome. Per-row fail-open.
+                _mark_reaper_progress()
+                try:
+                    await sweep_reconcile_inflight_cloud_builds(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Inflight Cloud Build reconciliation error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22f: Auto-clear moot pending_user_confirmation items —
                 # remove credentials_needed/access_needed asks the runtime can
                 # already prove are resolved (owner LLM-account credential ready,
                 # live cached project repo token) so they drop off the operator's

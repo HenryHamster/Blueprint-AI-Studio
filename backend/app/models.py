@@ -2384,6 +2384,12 @@ class ProjectComputeImageBuild(SQLModel, table=True):
     zone: str | None = Field(
         default=None, sa_column=Column(String(128), nullable=True)
     )
+    cloud_build_id: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    cloud_build_staged_object: str | None = Field(
+        default=None, sa_column=Column(String(512), nullable=True)
+    )
     status: ComputeImageBuildStatus = Field(
         default=ComputeImageBuildStatus.PENDING,
         sa_column=Column(
