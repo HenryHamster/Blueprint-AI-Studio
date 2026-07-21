@@ -1222,9 +1222,14 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #                       deadline_seconds; optional success_criterion {metric,
 #                       operator (<|>|<=|>=), threshold}, accelerator (T4|L4|V100
 #                       — requests ONE GPU, no machine_type needed), container_image
-#                       (run command INSIDE a docker image — REQUIRED for CUDA/NGC
-#                       stacks the repo cannot pip-install natively, else it runs
-#                       BARE and dies ModuleNotFoundError), container_registry_auth
+#                       (run command INSIDE a docker image — if a project-baked image
+#                       is listed in the Self-hosted compute section above, OMIT this
+#                       field and the platform defaults to that digest-pinned image;
+#                       only set it when you need a DIFFERENT NGC/CUDA stack the baked
+#                       image does not cover; for projects with no baked image it is
+#                       REQUIRED for CUDA/NGC stacks the repo cannot pip-install
+#                       natively, else the command runs BARE and dies
+#                       ModuleNotFoundError), container_registry_auth
 #                       {server,username,password} (private/gated registries only),
 #                       setup_step (host-level prep run as bare bash -lc OUTSIDE the
 #                       container; container-dependent installs go in command, NOT
@@ -1261,9 +1266,13 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric as JSON to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # GPU / containerized variant — accelerator requests one GPU; container_image runs
-# the command INSIDE a CUDA/NGC image (REQUIRED when the runtime is not pip-installable,
-# else the command runs bare and dies ModuleNotFoundError). Add container_registry_auth
-# only for a private registry; setup_step is host-level prep run OUTSIDE the container.
+# the command INSIDE a CUDA/NGC image. If a project-baked compute image is listed in
+# the "Self-hosted compute" section above, OMIT container_image — the platform
+# defaults to that digest-pinned image automatically. Only set container_image when
+# you need a DIFFERENT stack the baked image does not cover, or for projects with no
+# baked image where the runtime is not pip-installable (else the command runs bare
+# and dies ModuleNotFoundError). Add container_registry_auth only for a private
+# registry; setup_step is host-level prep run OUTSIDE the container.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable GPU claim with a concrete threshold>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Each arm writes its declared_metric key to $BLUEPRINT_RESULT_FILE as usual; the
