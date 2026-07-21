@@ -2039,6 +2039,77 @@ async def _maybe_create_compute_image_drift_alert(
     return True
 
 
+# Stable title for the per-project compute-image drift-deferred alert. Kept
+# CONSTANT (the dep_hash and reason live in the message) so a build deferred
+# across consecutive hourly sweeps deduplicates to exactly ONE open alert
+# per project. Keep the title stable.
+_COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE = (
+    "Compute image drift detected: dependency manifest changed (rebuild deferred)"
+)
+
+
+async def _maybe_create_compute_image_drift_deferred_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    *,
+    dep_hash: "str | None",
+    reason: str,
+) -> bool:
+    """Create a deduplicated INFO alert when drift is detected but the rebuild is
+    deferred (builder busy or build budget exhausted).
+
+    The hourly refresh sweep logs the deferral at INFO level only — there is no
+    operator-facing signal that a project's image is stale and waiting for a
+    build slot. This surfaces the event in the same Alerts banner so the operator
+    can see which projects drifted and why the rebuild hasn't started yet.
+
+    Deduplicated on a STABLE title so a project deferred across consecutive
+    sweep ticks raises exactly ONE open alert per project; the dep_hash and
+    reason live in the message so a moving metric never defeats dedup.
+    Commits its own ``Alert`` row and broadcasts ``alert_created``; the caller
+    wraps best-effort so an alert failure can never abort the sweep.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.
+    """
+    title = _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    hash_label = (dep_hash or "(unknown)")[:32]
+    message = (
+        f"The project's baked compute image dependency manifest changed "
+        f"(dep_hash={hash_label}), but the rebuild was deferred: {reason}. "
+        f"The hourly refresh sweep will retry on the next pass."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.INFO,
+        title=title,
+        message=message,
+        event_type="compute.image_drift_deferred",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.INFO.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 # Stable title for the per-project compute-image build failure alert.
 # Kept CONSTANT per (project_id, image_name) so a build that fails and
 # is retried deduplicates to exactly ONE open alert; the dep_hash and

@@ -215,6 +215,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # compute.image_drift: baked compute image was auto-rebuilt due to
     # dependency manifest change — informational, operator-visible.
     "compute.image_drift": OPERATOR_FYI,
+    # compute.image_drift_deferred: dependency manifest changed but the
+    # rebuild was deferred (builder busy or build budget exhausted) —
+    # informational, operator-visible.
+    "compute.image_drift_deferred": OPERATOR_FYI,
     # compute.image_protect_fail: GC-protection tag sweep failed — the image
     # digest may be reclaimed by registry retention before being replaced.
     # Operator should verify gcloud / Artifact Registry availability.

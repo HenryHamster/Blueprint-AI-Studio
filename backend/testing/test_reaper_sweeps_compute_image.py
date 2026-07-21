@@ -2390,6 +2390,200 @@ async def test_unchanged_creates_no_drift_alert(db):
     assert alerts == [], "no drift alert expected for unchanged/no_config sweep result"
 
 
+# ── Deferred-drift alert tests ──────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_deferred_creates_drift_alert(db):
+    """A 'deferred' sweep result (build_budget_exhausted) creates an INFO alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+    dep_hash = "deadbeef01234567"
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": dep_hash}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "exactly one deferred-drift alert expected after deferred"
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "deadbeef01234567" in alerts[0].message
+    assert "build_budget_exhausted" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_deferred_builder_busy_creates_alert(db):
+    """A 'deferred' sweep result (builder_busy) creates an INFO alert."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert, AlertSeverity
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "builder_busy", "dep_hash": "aabbccdd"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1
+    assert alerts[0].severity == AlertSeverity.INFO
+    assert "builder_busy" in alerts[0].message
+
+
+@pytest.mark.asyncio
+async def test_deferred_alert_deduped_on_second_sweep(db):
+    """A second deferred pass while the alert is open does NOT create a duplicate."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "aabbccdd"}
+
+    async def _run():
+        with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+            return await sweep_refresh_project_compute_images(
+                db,
+                now=datetime(2026, 6, 1, 12, 0, 0),
+                _refresh_fn=_refresh,
+                _build_semaphore=asyncio.Semaphore(1),
+            )
+
+    await _run()
+    await _run()
+
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+                Alert.dismissed_at.is_(None),
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "open deferred-drift alert must be deduped, not duplicated"
+
+
+@pytest.mark.asyncio
+async def test_deferred_no_alert_when_dep_hash_missing(db):
+    """A 'deferred' result missing dep_hash still works (belt-and-suspenders)."""
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "builder_busy"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(alerts) == 1, "alert still created with fallback '(unknown)' for dep_hash"
+
+
+@pytest.mark.asyncio
+async def test_deferred_alert_type_not_confused_with_rebuilt_alert(db):
+    """Deferred alert uses its own event_type, distinct from the rebuilt alert."""
+    from app.alert_dispatch import (
+        _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+        _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+    )
+    from app.models import Alert
+
+    project = await _make_repo_project(db)
+
+    async def _deferred_refresh(session, p, **kwargs):
+        return {"status": "deferred", "reason": "build_budget_exhausted", "dep_hash": "a"}
+
+    with patch("app.reaper_sweeps._last_compute_image_refresh_sweep", None):
+        result = await sweep_refresh_project_compute_images(
+            db,
+            now=datetime(2026, 6, 1, 12, 0, 0),
+            _refresh_fn=_deferred_refresh,
+            _build_semaphore=asyncio.Semaphore(1),
+        )
+
+    assert result["deferred"] == 1
+    # The deferred alert should be created
+    deferred_alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_DEFERRED_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(deferred_alerts) == 1
+    # The rebuilt alert title should NOT be created
+    rebuilt_alerts = (
+        (await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+            )
+        ))
+        .scalars()
+        .all()
+    )
+    assert len(rebuilt_alerts) == 0
+
+
 # ── ProjectComputeImageBuild model round-trip ─────────────────────────────────
 
 

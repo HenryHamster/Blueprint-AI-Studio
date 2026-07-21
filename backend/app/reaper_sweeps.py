@@ -3270,6 +3270,23 @@ async def sweep_refresh_project_compute_images(
             summary["no_config"] += 1
         elif status == "deferred":
             summary["deferred"] += 1
+            try:
+                from app.alert_dispatch import (
+                    _maybe_create_compute_image_drift_deferred_alert,
+                )
+
+                await _maybe_create_compute_image_drift_deferred_alert(
+                    session,
+                    project_id,
+                    dep_hash=(result or {}).get("dep_hash"),
+                    reason=(result or {}).get("reason", "unknown"),
+                )
+            except Exception:  # noqa: BLE001 — alert is best-effort
+                logger.warning(
+                    "[REAPER] compute-image drift-deferred alert failed for project %s",
+                    project_id,
+                    exc_info=True,
+                )
         else:  # "error" or an unrecognized status
             summary["errors"] += 1
 

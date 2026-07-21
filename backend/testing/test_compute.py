@@ -18724,11 +18724,120 @@ def test_bare_manifest_fallback_files_excludes_pipfile_when_lock_present():
 
 def test_bare_manifest_fallback_files_all_lockfiles_present_returns_nothing():
     """When every ecosystem has a lockfile, no bare manifests are candidates."""
-    all_lockfiles = frozenset(
-        ["package-lock.json", "Pipfile.lock", "requirements.txt"]
-    )
+    all_lockfiles = frozenset([
+        "package-lock.json",
+        "Pipfile.lock",
+        "requirements.txt",
+        "Cargo.lock",
+        "go.sum",
+        "Gemfile.lock",
+        "gradle.lockfile",
+        "composer.lock",
+    ])
     result = _bci.bare_manifest_fallback_files(all_lockfiles)
     assert result == []
+
+
+def test_bare_manifest_fallback_rust_no_lock():
+    """Cargo.toml is a candidate when Cargo.lock is absent."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "Cargo.toml" in result
+
+
+def test_bare_manifest_fallback_rust_excluded_when_lockfile_present():
+    """Cargo.toml is NOT a candidate when Cargo.lock is present."""
+    result = _bci.bare_manifest_fallback_files(frozenset(["Cargo.lock"]))
+    assert "Cargo.toml" not in result
+
+
+def test_bare_manifest_fallback_go_no_sum():
+    """go.mod is a candidate when go.sum is absent."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "go.mod" in result
+
+
+def test_bare_manifest_fallback_go_excluded_when_sum_present():
+    """go.mod is NOT a candidate when go.sum is present."""
+    result = _bci.bare_manifest_fallback_files(frozenset(["go.sum"]))
+    assert "go.mod" not in result
+
+
+def test_bare_manifest_fallback_ruby_no_lock():
+    """Gemfile is a candidate when Gemfile.lock is absent."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "Gemfile" in result
+
+
+def test_bare_manifest_fallback_ruby_excluded_when_lockfile_present():
+    """Gemfile is NOT a candidate when Gemfile.lock is present."""
+    result = _bci.bare_manifest_fallback_files(frozenset(["Gemfile.lock"]))
+    assert "Gemfile" not in result
+
+
+def test_bare_manifest_fallback_jvm_no_lockfile():
+    """pom.xml/build.gradle/build.gradle.kts are candidates when gradle.lockfile is absent."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "pom.xml" in result
+    assert "build.gradle" in result
+    assert "build.gradle.kts" in result
+
+
+def test_bare_manifest_fallback_jvm_excluded_when_gradle_lockfile_present():
+    """JVM bare manifests are NOT candidates when gradle.lockfile is present."""
+    result = _bci.bare_manifest_fallback_files(frozenset(["gradle.lockfile"]))
+    assert "pom.xml" not in result
+    assert "build.gradle" not in result
+    assert "build.gradle.kts" not in result
+
+
+def test_bare_manifest_fallback_php_no_lock():
+    """composer.json is a candidate when composer.lock is absent."""
+    result = _bci.bare_manifest_fallback_files(frozenset())
+    assert "composer.json" in result
+
+
+def test_bare_manifest_fallback_php_excluded_when_lockfile_present():
+    """composer.json is NOT a candidate when composer.lock is present."""
+    result = _bci.bare_manifest_fallback_files(frozenset(["composer.lock"]))
+    assert "composer.json" not in result
+
+
+def test_default_dep_files_includes_rust_go_ruby_jvm_php():
+    """_DEFAULT_DEP_FILES covers all newly added ecosystem lockfiles."""
+    from app.compute_backends import _DEFAULT_DEP_FILES
+
+    assert "Cargo.lock" in _DEFAULT_DEP_FILES
+    assert "go.sum" in _DEFAULT_DEP_FILES
+    assert "Gemfile.lock" in _DEFAULT_DEP_FILES
+    assert "gradle.lockfile" in _DEFAULT_DEP_FILES
+    assert "pom.xml" in _DEFAULT_DEP_FILES
+    assert "build.gradle" in _DEFAULT_DEP_FILES
+    assert "build.gradle.kts" in _DEFAULT_DEP_FILES
+    assert "composer.lock" in _DEFAULT_DEP_FILES
+
+
+def test_discover_dep_files_rust_project(tmp_path):
+    """_discover_dep_files returns Cargo.lock when present in a Rust project."""
+    from app.compute_backends import _discover_dep_files
+
+    (tmp_path / "Cargo.lock").write_bytes(b"# Cargo lock\n")
+    (tmp_path / "Cargo.toml").write_bytes(b"[package]\nname = \"foo\"\n")
+
+    files = _discover_dep_files(str(tmp_path))
+    assert "Cargo.lock" in files
+    # Cargo.toml is the bare-manifest fallback; when Cargo.lock is present it should NOT appear
+    assert "Cargo.toml" not in files
+
+
+def test_discover_dep_files_rust_fallback_to_manifest(tmp_path):
+    """_discover_dep_files returns Cargo.toml when Cargo.lock is absent."""
+    from app.compute_backends import _discover_dep_files
+
+    (tmp_path / "Cargo.toml").write_bytes(b"[package]\nname = \"foo\"\n")
+
+    files = _discover_dep_files(str(tmp_path))
+    assert "Cargo.toml" in files
+    assert "Cargo.lock" not in files
 
 
 def test_bare_manifest_lockfile_less_content_changes_hash():

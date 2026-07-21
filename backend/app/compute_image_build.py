@@ -161,6 +161,32 @@ _BARE_MANIFEST_FALLBACKS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = 
         ),
         ("setup.cfg",),
     ),
+    # Rust: hash Cargo.toml when Cargo.lock absent (library crates omit the lockfile)
+    (
+        ("Cargo.lock",),
+        ("Cargo.toml",),
+    ),
+    # Go: hash go.mod when go.sum absent
+    (
+        ("go.sum",),
+        ("go.mod",),
+    ),
+    # Ruby: hash Gemfile when Gemfile.lock absent
+    (
+        ("Gemfile.lock",),
+        ("Gemfile",),
+    ),
+    # JVM (Maven/Gradle): hash manifest files when no Gradle lockfile present.
+    # Maven has no universal lockfile; pom.xml is always included as the manifest.
+    (
+        ("gradle.lockfile",),
+        ("pom.xml", "build.gradle", "build.gradle.kts"),
+    ),
+    # PHP: hash composer.json when composer.lock absent
+    (
+        ("composer.lock",),
+        ("composer.json",),
+    ),
 )
 
 

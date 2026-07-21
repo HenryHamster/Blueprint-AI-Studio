@@ -4017,6 +4017,19 @@ _DEFAULT_DEP_FILES = (
     "yarn.lock",
     "environment.yml",
     "conda-lock.yml",
+    # Rust
+    "Cargo.lock",
+    # Go
+    "go.sum",
+    # Ruby
+    "Gemfile.lock",
+    # JVM (Gradle lockfile; Maven has no universal lockfile so pom.xml falls through to bare-manifest)
+    "gradle.lockfile",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    # PHP
+    "composer.lock",
 )
 
 
@@ -5272,12 +5285,15 @@ async def resolve_project_baked_image_strict(
     ``compute.image.name`` AND a ``ProjectComputeImage`` row exists with
     ``built=True`` and a non-null ``digest``.
 
-    Returns ``(None, None)`` when the project declares NO baked image (no
-    manifest, manifest error, or no ``compute.image.name`` key) — the caller
+    Returns ``(None, None)`` when the project genuinely declares NO baked image
+    (no manifest at all, no ``compute.image.name`` key, OR a transient manifest
+    failure on a project with zero ``ProjectComputeImage`` history) — the caller
     must preserve image-less behavior, identical to today.
 
     Returns ``(None, reason)`` when the project declares a baked image name but
-    no resolved, digest-pinned build record can be found — the caller MUST
+    no resolved, digest-pinned build record can be found — OR when a transient
+    manifest-fetch failure occurs on a project that HAS ``ProjectComputeImage``
+    rows (i.e., previously declared and built a baked image). The caller MUST
     terminal-fail the dispatch with the returned reason rather than silently
     running image-less on the host toolchain.
 
@@ -5297,9 +5313,40 @@ async def resolve_project_baked_image_strict(
         name = compute_image.get("name") if isinstance(compute_image, dict) else None
         if not name:
             return None, None
-    except Exception:  # noqa: BLE001 — no manifest means no image declared
+    except Exception:  # noqa: BLE001
+        # Check whether the project has existing ProjectComputeImage rows. If it
+        # does, a manifest-fetch failure means the declared image is temporarily
+        # unresolvable — fail CLOSED so the caller refuses to run image-less.
+        # Only projects with ZERO compute-image history get the fail-OPEN pass.
+        has_image_history = False
+        try:
+            from sqlalchemy import select
+
+            row = (
+                await session.execute(
+                    select(ProjectComputeImage)
+                    .where(ProjectComputeImage.project_id == project.id)
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            has_image_history = row is not None
+        except Exception:  # noqa: BLE001
+            has_image_history = False  # Best-effort; treat as no history.
+
+        if has_image_history:
+            reason = (
+                "Project has existing compute-image records but manifest fetch "
+                "failed transiently — refusing to run image-less on host "
+                "toolchain instead of using the declared baked image"
+            )
+            logger.warning(
+                "[COMPUTE] %s (project=%s)", reason, getattr(project, "id", None),
+            )
+            return None, reason
+
         logger.debug(
-            "[COMPUTE] manifest fetch failed for project=%s; treating as no baked image",
+            "[COMPUTE] manifest fetch failed for project=%s; project has no "
+            "baked-image history, falling back to image-less behavior",
             getattr(project, "id", None),
         )
         return None, None
