@@ -54,6 +54,7 @@ from app.strategic_resident_capabilities import (
 )
 from app.strategic_resident_capability_invocation import (
     CapabilityEvidenceRef,
+    CorrectableCapabilityParameterError,
     ResidentCapabilityInvocation,
     validated_capability_parameters,
 )
@@ -335,6 +336,8 @@ async def invoke_resident_capability(
         parameters = validated_capability_parameters(spec, body.parameters)
     except OperationPayloadTooLarge as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except CorrectableCapabilityParameterError as exc:
+        raise HTTPException(status_code=400, detail=exc.detail()) from exc
     except (StrategicAuthorityError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if spec.mode is not CapabilityMode.inspect:

@@ -164,7 +164,12 @@ async def test_authoritative_turn_reconstructs_visible_context_and_is_bounded(
     }
     assert all(
         set(item) == {
-            "id", "mode", "risk", "parameters", "approval", "availability"
+            "id",
+            "mode",
+            "risk",
+            "parameter_specs",
+            "approval",
+            "availability",
         }
         for item in catalog
     )

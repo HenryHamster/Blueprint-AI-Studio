@@ -50,11 +50,40 @@ const providerInput = {
   },
   capabilities: {
     catalog: [
-      { id: 'task.inspect', mode: 'inspect', parameters: ['task_id'], availability: 'invoke' },
-      { id: 'runner.list', mode: 'inspect', parameters: [], availability: 'invoke' },
-      { id: 'pipeline.inspect', mode: 'inspect', parameters: [], availability: 'propose_only' },
-      { id: 'task.reprioritize', mode: 'mutate', availability: 'invoke' },
-      { id: 'task.cancel', mode: 'mutate', availability: 'propose_only' },
+      {
+        id: 'task.inspect',
+        mode: 'inspect',
+        parameter_specs: { task_id: 'uuid' },
+        availability: 'invoke',
+      },
+      {
+        id: 'pr.inspect',
+        mode: 'inspect',
+        parameter_specs: {
+          pr_number: { type: 'integer', min: 1, max: 2 ** 31 - 1 },
+        },
+        availability: 'invoke',
+      },
+      { id: 'runner.list', mode: 'inspect', parameter_specs: {}, availability: 'invoke' },
+      { id: 'pipeline.inspect', mode: 'inspect', parameter_specs: {}, availability: 'propose_only' },
+      {
+        id: 'task.reprioritize',
+        mode: 'mutate',
+        parameter_specs: {
+          task_id: 'uuid',
+          priority: { type: 'integer', min: 0, max: 100 },
+        },
+        availability: 'invoke',
+      },
+      {
+        id: 'task.cancel',
+        mode: 'mutate',
+        parameter_specs: {
+          task_id: 'uuid',
+          reason: { type: 'string', min_len: 1, max_len: 2_000 },
+        },
+        availability: 'propose_only',
+      },
     ],
   },
 };
@@ -2114,6 +2143,194 @@ describe('strategic Resident turn handler', () => {
     ]);
   });
 
+  it.each([
+    {
+      label: 'UUID format',
+      capabilityId: 'task.inspect',
+      invalidParameters: { task_id: 'not-a-uuid' },
+      correctedParameters: { task_id: inspectionTaskId },
+      detail: {
+        code: 'resident_capability_parameter_validation',
+        parameter: 'task_id',
+        issue: 'format',
+        expected: { kind: 'uuid' },
+        message: 'task_id must be a UUID string',
+      },
+    },
+    {
+      label: 'integer type',
+      capabilityId: 'pr.inspect',
+      invalidParameters: { pr_number: '17' },
+      correctedParameters: { pr_number: 17 },
+      detail: {
+        code: 'resident_capability_parameter_validation',
+        parameter: 'pr_number',
+        issue: 'type',
+        expected: { kind: 'integer', minimum: 1, maximum: 2 ** 31 - 1 },
+        message: 'pr_number must be an integer',
+      },
+    },
+  ])('recovers from a correctable inspection $label error', async ({
+    capabilityId, invalidParameters, correctedParameters, detail,
+  }) => {
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: capabilityId, parameters: invalidParameters }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: capabilityId, parameters: correctedParameters }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult()),
+      });
+    let capabilityCalls = 0;
+    mocks.apiPost.mockImplementation((path: string) => {
+      if (path !== '/api/agent/resident-turn/capability') return Promise.resolve({});
+      capabilityCalls += 1;
+      if (capabilityCalls === 1) {
+        return Promise.reject(new Error(
+          'POST /api/agent/resident-turn/capability failed (400): '
+          + JSON.stringify({ error: { code: 400, message: detail } }),
+        ));
+      }
+      return Promise.resolve({ capability_id: capabilityId });
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const correctionPrompt = String(mocks.runClaudeCode.mock.calls[1][0]);
+    expect(correctionPrompt).toContain('resident_capability_parameter_validation');
+    expect(correctionPrompt).toContain('every key is required');
+    expect(correctionPrompt).toContain('a scalar value names its JSON type');
+    expect(correctionPrompt).toContain('min/max, min_len/max_len, or choices constraints');
+    expect(correctionPrompt).toContain('{} means no parameters');
+    expect(correctionPrompt).toContain('UUID values must be canonical UUID-form JSON strings');
+    expect(correctionPrompt).toContain('"retryable":true');
+    expect(correctionPrompt).toContain(`"parameter":"${detail.parameter}"`);
+    expect(correctionPrompt).toContain(JSON.stringify(detail.expected));
+    expect(correctionPrompt).toContain(JSON.stringify(invalidParameters));
+    const calls = mocks.apiPost.mock.calls.filter(
+      ([path]) => path === '/api/agent/resident-turn/capability',
+    );
+    expect(calls.map(([, body]) => body)).toStrictEqual([
+      { capability_id: capabilityId, parameters: invalidParameters },
+      { capability_id: capabilityId, parameters: correctedParameters },
+    ]);
+    expect(mocks.apiPost.mock.calls.at(-1)?.[0]).toBe('/api/agent/resident-turn/complete');
+    expect(mocks.apiPost.mock.calls.some(
+      ([path]) => path === '/api/agent/resident-turn/mutate',
+    )).toBe(false);
+  });
+
+  it('marks a final-action-round validation rejection non-retryable', async () => {
+    const validationDetail = {
+      code: 'resident_capability_parameter_validation',
+      parameter: 'task_id',
+      issue: 'format',
+      expected: { kind: 'uuid' },
+      message: 'task_id must be a UUID string',
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{ capability_id: 'runner.list', parameters: {} }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '',
+        lastResultText: JSON.stringify({
+          capability_requests: [{
+            capability_id: 'task.inspect', parameters: { task_id: 'not-a-uuid' },
+          }],
+        }),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult()),
+      });
+    mocks.apiPost.mockImplementation((path: string, body?: Record<string, unknown>) => {
+      if (path !== '/api/agent/resident-turn/capability') return Promise.resolve({});
+      if (body?.capability_id === 'runner.list') {
+        return Promise.resolve({ capability_id: 'runner.list' });
+      }
+      return Promise.reject(new Error(
+        'POST /api/agent/resident-turn/capability failed (400): '
+        + JSON.stringify({ error: { code: 400, message: validationDetail } }),
+      ));
+    });
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    const finalPrompt = String(mocks.runClaudeCode.mock.calls[2][0]);
+    expect(finalPrompt).toContain('Capability actions are closed for this turn');
+    expect(finalPrompt).toContain('"retryable":false');
+    expect(finalPrompt).toContain('UUID values must be canonical UUID-form JSON strings');
+    expect(mocks.apiPost.mock.calls.filter(
+      ([path]) => path === '/api/agent/resident-turn/capability',
+    )).toHaveLength(2);
+    expect(mocks.apiPost.mock.calls.at(-1)?.[0]).toBe('/api/agent/resident-turn/complete');
+  });
+  it('does not repost an identical correctable inspection request', async () => {
+    const inspectionRequest = {
+      capability_requests: [{
+        capability_id: 'task.inspect', parameters: { task_id: 'not-a-uuid' },
+      }],
+    };
+    mocks.runClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(inspectionRequest),
+      })
+      .mockResolvedValueOnce({
+        exitCode: 0, allOutput: '', lastResultText: JSON.stringify(emptyFinalResult()),
+      });
+    const detail = {
+      code: 'resident_capability_parameter_validation',
+      parameter: 'task_id',
+      issue: 'format',
+      expected: { kind: 'uuid' },
+      message: 'task_id must be a UUID string',
+    };
+    mocks.apiPost.mockImplementation((path: string) => (
+      path === '/api/agent/resident-turn/capability'
+        ? Promise.reject(new Error(
+          'POST /api/agent/resident-turn/capability failed (400): '
+          + JSON.stringify({ error: { code: 400, message: detail } }),
+        ))
+        : Promise.resolve({})
+    ));
+
+    await handleStrategicResidentTurn(
+      'task-id', { _resident_expected_runtime_provider: 'anthropic' }, {}, '', '', '', null, { value: '' },
+    );
+
+    expect(mocks.runClaudeCode).toHaveBeenCalledTimes(3);
+    expect(String(mocks.runClaudeCode.mock.calls[2][0]).match(
+      /resident_capability_parameter_validation/g,
+    )).toHaveLength(1);
+    expect(mocks.apiPost.mock.calls.map(([path]) => path)).toStrictEqual([
+      '/api/agent/resident-turn/capability',
+      '/api/agent/resident-turn/complete',
+    ]);
+  });
   it('recovers once from an unavailable canonical inspection replay', async () => {
     const inspectionRequest = {
       capability_requests: [{
@@ -2159,6 +2376,27 @@ describe('strategic Resident turn handler', () => {
   });
 
   it.each([
+    [
+      'unstructured validation failure',
+      new Error(
+        'POST /api/agent/resident-turn/capability failed (400): '
+        + '{"error":{"code":400,"message":"task_id must be a UUID string"}}',
+      ),
+    ],
+    [
+      'different structured validation code',
+      new Error(
+        'POST /api/agent/resident-turn/capability failed (400): '
+        + '{"error":{"code":400,"message":{"code":"other","parameter":"task_id","issue":"format","expected":{"kind":"uuid"},"message":"bad"}}}',
+      ),
+    ],
+    [
+      'wrong validation status',
+      new Error(
+        'POST /api/agent/resident-turn/capability failed (403): '
+        + '{"error":{"code":403,"message":{"code":"resident_capability_parameter_validation","parameter":"task_id","issue":"format","expected":{"kind":"uuid"},"message":"bad"}}}',
+      ),
+    ],
     ['server failure', new Error('POST /api/agent/resident-turn/capability failed (500): boom')],
     ['network failure', new TypeError('fetch failed')],
     [

@@ -11,8 +11,10 @@ import {
 import { extractJsonObjectDetailed } from '../json-extract.js';
 import {
   ResidentMutationEvidenceUnavailableError,
+  appendCapabilityResult,
   canonicalInspectionReceiptUnavailable,
   canonicalMutationEvidence,
+  correctableInspectionValidationOutcome,
   catalogAvailability,
   proposedCapabilityRejection,
   rejectedCapabilityOutcome,
@@ -33,7 +35,6 @@ const ALL_TOOLS = ['*', 'Task', 'Agent', 'Workflow', 'Skill'];
 const NO_TOOL_PROVIDERS = new Set(['anthropic', 'zai', 'deepseek']);
 const MAX_CAPABILITY_ROUNDS = 2;
 const MAX_CAPABILITY_REQUESTS = 8;
-const MAX_CAPABILITY_RESULTS_BYTES = 48_000;
 const MAX_RESIDENT_PROMPT_BYTES = 160_000;
 const SERVER_AUTHORITY_REVISION_KEYS = new Set([
   'authority_generation',
@@ -354,17 +355,6 @@ function stableJson(value: unknown): string {
   return 'null';
 }
 
-function appendCapabilityResult(
-  current: Record<string, unknown>[],
-  response: Record<string, unknown>,
-): void {
-  const nextBytes = Buffer.byteLength(JSON.stringify([...current, response]), 'utf8');
-  if (nextBytes > MAX_CAPABILITY_RESULTS_BYTES) {
-    throw new Error('Resident capability results exceed the hard byte budget');
-  }
-  current.push(response);
-}
-
 function residentPrompt(
   providerInput: Record<string, unknown>,
   capabilityResults: Record<string, unknown>[],
@@ -376,7 +366,8 @@ function residentPrompt(
     ? [
       `You have ${actionRoundsRemaining} capability action round(s) and ${requestSlotsRemaining} request slot(s) remaining. Batch the decisive requests you need; after those rounds you must synthesize the final structured result.`,
       'Request inspections and mutations in separate rounds.',
-      'The catalog uses id and lists required parameter names. Copy catalog id into request capability_id. Request parameters must be a JSON object keyed by those names; use {} or omit parameters only when the catalog list is empty. Never copy a catalog entry as the request.',
+      'Only retry a rejected inspection when retryable is true; correct only its parameters and resubmit a changed request within the remaining budget.',
+      'Copy catalog id into request capability_id. Request parameters must be a JSON object with every parameter_specs key; use {} or omit parameters only when parameter_specs is {}. Never copy a catalog entry as the request.',
       'You may invoke only catalog entries whose availability is "invoke" by returning:',
       '{"capability_requests":[{"capability_id":"task.inspect","parameters":{"task_id":"UUID"}}]}',
       'After inspecting decisive evidence, you may invoke mutation catalog entries whose availability is "invoke" by returning:',
@@ -387,7 +378,7 @@ function residentPrompt(
       'Return the exact final structured result now using the evidence and receipts already supplied. Represent any further evidence or operation need honestly in follow_up or required_attention; never claim an unperformed operation.',
     ];
   const prompt = [
-    'Return exactly one JSON object and no prose or markdown.',
+    'Return exactly one JSON object and no prose or markdown. Catalog parameter_specs is the required-parameter map: every key is required; a scalar value names its JSON type; an object uses type plus min/max, min_len/max_len, or choices constraints; {} means no parameters. Honor it exactly: UUID values must be canonical UUID-form JSON strings, and integer values must be JSON numbers within declared min/max bounds.',
     residentConversationReplyScope(providerInput),
     ...actionInstructions,
     'In the final reconciliation, evidence_inspections must be an array of objects shaped {"evidence_id":"<result.evidence id>","decisive":true}; decisive is optional. Each evidence_id must name a result.evidence item copied from server-validated inspection evidence; the worker binds the canonical receipt metadata.',
@@ -554,6 +545,8 @@ export async function handleStrategicResidentTurn(
       if (requestKeys.size + action.requests.length > MAX_CAPABILITY_REQUESTS) {
         throw new Error('Resident capability request budget exceeded');
       }
+      const validationRetryable = actionRoundsRemaining > 1
+        && requestKeys.size + action.requests.length < MAX_CAPABILITY_REQUESTS;
       statusRef.value = action.kind === 'inspect'
         ? 'Inspecting bounded Resident evidence...'
         : 'Applying fenced Resident operations...';
@@ -616,6 +609,15 @@ export async function handleStrategicResidentTurn(
               parameters: request.parameters,
             }) as Record<string, unknown>;
           } catch (error) {
+            const validationOutcome = correctableInspectionValidationOutcome(
+              error, request.capability_id, request.parameters, validationRetryable,
+            );
+            if (validationOutcome) {
+              correctedRequestKeys.add(key);
+              appendCapabilityResult(capabilityResults, validationOutcome);
+              sendLog(ws, `Resident inspection parameter rejected: ${request.capability_id}\n`);
+              continue;
+            }
             if (!canonicalInspectionReceiptUnavailable(error)) throw error;
             correctedRequestKeys.add(key);
             appendCapabilityResult(

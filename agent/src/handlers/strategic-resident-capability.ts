@@ -7,6 +7,7 @@ const MUTATION_EVIDENCE_INPUT_KEYS = new Set([
 ]);
 const INSPECTION_RECEIPT_UNAVAILABLE =
   'canonical inspection receipt is unavailable or inconsistent';
+const MAX_CAPABILITY_RESULTS_BYTES = 48_000;
 
 export class ResidentMutationEvidenceUnavailableError extends Error {
   constructor(index: number) {
@@ -87,22 +88,95 @@ export function rejectedCapabilityOutcome(
   };
 }
 
-export function canonicalInspectionReceiptUnavailable(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const prefix = 'POST /api/agent/resident-turn/capability failed (409): ';
-  if (!error.message.startsWith(prefix)) return false;
+function capabilityApiErrorDetail(error: unknown, status: number): unknown {
+  if (!(error instanceof Error)) return undefined;
+  const prefix = `POST /api/agent/resident-turn/capability failed (${status}): `;
+  if (!error.message.startsWith(prefix)) return undefined;
   let body: unknown;
   try {
     body = JSON.parse(error.message.slice(prefix.length));
   } catch {
-    return false;
+    return undefined;
   }
-  if (!isRecord(body)) return false;
-  if (body.detail === INSPECTION_RECEIPT_UNAVAILABLE) return true;
+  if (!isRecord(body)) return undefined;
+  if (Object.prototype.hasOwnProperty.call(body, 'detail')) return body.detail;
   const wrapped = body.error;
-  return isRecord(wrapped)
-    && wrapped.code === 409
-    && wrapped.message === INSPECTION_RECEIPT_UNAVAILABLE;
+  return isRecord(wrapped) && wrapped.code === status ? wrapped.message : undefined;
+}
+
+export function appendCapabilityResult(
+  current: Record<string, unknown>[],
+  response: Record<string, unknown>,
+): void {
+  const nextBytes = Buffer.byteLength(JSON.stringify([...current, response]), 'utf8');
+  if (nextBytes > MAX_CAPABILITY_RESULTS_BYTES) {
+    throw new Error('Resident capability results exceed the hard byte budget');
+  }
+  current.push(response);
+}
+
+export function correctableInspectionValidationOutcome(
+  error: unknown,
+  capabilityId: string,
+  attemptedParameters: Record<string, unknown>,
+  retryable: boolean,
+): Record<string, unknown> | null {
+  const detail = capabilityApiErrorDetail(error, 400);
+  if (!isRecord(detail) || detail.code !== 'resident_capability_parameter_validation') {
+    return null;
+  }
+  const { parameter, issue, message } = detail;
+  if (
+    !nonEmptyString(parameter)
+    || parameter.length > 80
+    || !Object.prototype.hasOwnProperty.call(attemptedParameters, parameter)
+    || !nonEmptyString(message)
+    || message.length > 500
+    || !['type', 'format', 'minimum', 'maximum'].includes(String(issue))
+  ) {
+    return null;
+  }
+  const declared = detail.expected;
+  if (!isRecord(declared)) return null;
+  const keys = Object.keys(declared);
+  let expected: Record<string, unknown>;
+  if (declared.kind === 'uuid') {
+    if (keys.length !== 1 || (issue !== 'type' && issue !== 'format')) return null;
+    expected = { kind: 'uuid' };
+  } else if (declared.kind === 'integer') {
+    if (
+      keys.some((key) => !['kind', 'minimum', 'maximum'].includes(key))
+      || (issue !== 'type' && issue !== 'minimum' && issue !== 'maximum')
+      || (declared.minimum !== undefined && !Number.isInteger(declared.minimum))
+      || (declared.maximum !== undefined && !Number.isInteger(declared.maximum))
+      || (
+        typeof declared.minimum === 'number'
+        && typeof declared.maximum === 'number'
+        && declared.minimum > declared.maximum
+      )
+    ) {
+      return null;
+    }
+    expected = { kind: 'integer' };
+    if (declared.minimum !== undefined) expected.minimum = declared.minimum;
+    if (declared.maximum !== undefined) expected.maximum = declared.maximum;
+  } else {
+    return null;
+  }
+  return {
+    capability_id: capabilityId,
+    mode: 'inspect',
+    status: 'rejected',
+    reason_code: 'resident_capability_parameter_validation',
+    effect: 'none',
+    retryable,
+    validation: { parameter, issue, expected, message },
+    attempted_parameters: attemptedParameters,
+  };
+}
+
+export function canonicalInspectionReceiptUnavailable(error: unknown): boolean {
+  return capabilityApiErrorDetail(error, 409) === INSPECTION_RECEIPT_UNAVAILABLE;
 }
 export function canonicalMutationEvidence(
   items: unknown[],

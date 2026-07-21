@@ -1290,15 +1290,54 @@ export async function persistResidentTurnFailure(
   reason: string,
   failureCategory: FailureCategory,
 ): Promise<void> {
-  await apiPost('/api/agent/resident-turn/fail', {
+  const errorReport = getLastProviderRunErrorReport();
+  const failureBody = {
     task_id: taskId,
     project_id: projectId,
     failure_id: `resident-turn:${taskId}:failure`,
     reason: reason.slice(0, 5_000),
     failure_category: failureCategory,
-  });
+  };
+  if (errorReport?.task_id !== taskId) {
+    await apiPost('/api/agent/resident-turn/fail', failureBody);
+    return;
+  }
+  try {
+    await apiPost('/api/agent/resident-turn/fail', {
+      ...failureBody,
+      error_report: errorReport,
+    });
+  } catch (error) {
+    if (!isLegacyResidentFailErrorReportRejection(error)) throw error;
+    await apiPost('/api/agent/resident-turn/fail', failureBody, 1);
+  }
 }
 
+function isLegacyResidentFailErrorReportRejection(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const prefix = 'POST /api/agent/resident-turn/fail failed (422): ';
+  if (!error.message.startsWith(prefix)) return false;
+  try {
+    const payload = JSON.parse(error.message.slice(prefix.length)) as unknown;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
+    const wrapper = payload as Record<string, unknown>;
+    if (Object.keys(wrapper).length !== 1) return false;
+    const wrappedError = wrapper.error;
+    if (!wrappedError || typeof wrappedError !== 'object' || Array.isArray(wrappedError)) return false;
+    const validation = wrappedError as Record<string, unknown>;
+    if (Object.keys(validation).length !== 3) return false;
+    if (validation.code !== 422 || validation.message !== 'Validation Error') return false;
+    if (!Array.isArray(validation.details) || validation.details.length !== 1) return false;
+    const detail = validation.details[0] as { type?: unknown; loc?: unknown };
+    return detail?.type === 'extra_forbidden'
+      && Array.isArray(detail.loc)
+      && detail.loc.length === 2
+      && detail.loc[0] === 'body'
+      && detail.loc[1] === 'error_report';
+  } catch {
+    return false;
+  }
+}
 // Phase 0 telemetry — start-of-role timestamp captured by main() after a
 // successful claim and reset at the start of each warm role. Used by
 // enrichStatusPayload to derive setup_secs from firstToolUseAt.

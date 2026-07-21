@@ -20,22 +20,17 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
-from app.max_plan_pool import clear_task_llm_runtime_context
+
 from app.strategic_resident_agent_binding import (
     RESIDENT_CLAIM_ATTEMPT_CONTEXT_KEY,
     RESIDENT_CLAIM_NONCE_CONTEXT_KEY,
     ResidentAgentAuthorityError,
 )
+from app.strategic_resident_failure_context import resident_failure_retry_context
 from app.strategic_resident_failure_state import failure_backoff_seconds
-from app.strategic_resident_inspection_runtime import (
-    CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY,
-)
 from app.strategic_resident_promotion import promote_resident_successor
 from app.strategic_resident_runtime import is_authoritative_resident_turn
-from app.strategic_resident_slot_release import (
-    clear_resident_turn_slot_release,
-    stage_resident_turn_slot_release,
-)
+from app.strategic_resident_slot_release import stage_resident_turn_slot_release
 from app.strategic_resident_terminal import commit_release_and_broadcast_failure
 from app.strategic_resident_turns import INPUT_FROZEN_CONTEXT_KEY, _task_payload
 from app.time_utils import _utcnow, set_retry_after
@@ -107,15 +102,7 @@ async def _ensure_interactive_retry(
                 ),
             }
         )
-        context = clear_task_llm_runtime_context(failed.context)
-        for key in (
-            RESIDENT_CLAIM_NONCE_CONTEXT_KEY,
-            RESIDENT_CLAIM_ATTEMPT_CONTEXT_KEY,
-            CAPABILITY_REQUEST_LEDGER_CONTEXT_KEY,
-            "_resident_failure",
-        ):
-            context.pop(key, None)
-        clear_resident_turn_slot_release(context)
+        context = resident_failure_retry_context(failed.context)
         context[INPUT_FROZEN_CONTEXT_KEY] = False
         successor = Task(
             project_id=failed.project_id,

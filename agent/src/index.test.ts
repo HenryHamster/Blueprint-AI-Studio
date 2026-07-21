@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, WORKSPACE, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, persistResidentTurnFailure, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, WORKSPACE, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -2905,6 +2905,126 @@ describe('structured error report shipping (enrichStatusPayload)', () => {
     });
 
     expect(postedStatusBody(fetchMock).error_report).toBeUndefined();
+  });
+
+  it('attaches the matching report to Resident failure posts', async () => {
+    const fetchMock = stubStatusFetch();
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-resident'));
+
+    await persistResidentTurnFailure(
+      'task-er-resident',
+      'project-er-resident',
+      'Resident provider exited with code 1',
+      'fatal',
+    );
+
+    const residentCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).includes('/api/agent/resident-turn/fail'));
+    if (!residentCall) throw new Error('expected a Resident failure POST');
+    const init = residentCall[1] as RequestInit;
+    if (typeof init.body !== 'string') throw new Error('expected a string request body');
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    expect(body.error_report).toMatchObject({
+      task_id: 'task-er-resident',
+      exit_code: 1,
+      model_output_seen: false,
+      result_event_seen: false,
+    });
+  });
+
+  it('retries once without the report for the exact legacy extra-field 422', async () => {
+    const legacy422 = JSON.stringify({
+      error: {
+        code: 422,
+        message: 'Validation Error',
+        details: [{
+          type: 'extra_forbidden',
+          loc: ['body', 'error_report'],
+          msg: 'Extra inputs are not permitted',
+          input: makeReport('task-er-legacy'),
+        }],
+      },
+    });
+    const fetchMock = makeFetchMock()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 422,
+        text: () => Promise.resolve(legacy422),
+        headers: { get: () => null },
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ status: 'failed' }),
+        headers: { get: () => null },
+      });
+    vi.stubGlobal('fetch', fetchMock);
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-legacy'));
+
+    await persistResidentTurnFailure(
+      'task-er-legacy',
+      'project-er-resident',
+      'Resident provider exited with code 1',
+      'fatal',
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const bodies = fetchMock.mock.calls.map(([, init]) => {
+      if (typeof init?.body !== 'string') throw new Error('expected string request body');
+      return JSON.parse(init.body) as Record<string, unknown>;
+    });
+    expect(bodies[0].error_report).toBeDefined();
+    expect(bodies[1].error_report).toBeUndefined();
+    expect(bodies[1].failure_id).toBe(bodies[0].failure_id);
+  });
+
+  it('does not downgrade-retry a 422 with any additional validation error', async () => {
+    const nonLegacy422 = JSON.stringify({
+      error: {
+        code: 422,
+        message: 'Validation Error',
+        details: [
+          { type: 'extra_forbidden', loc: ['body', 'error_report'] },
+          { type: 'missing', loc: ['body', 'failure_id'] },
+        ],
+      },
+    });
+    const fetchMock = makeFetchMock().mockResolvedValue({
+      ok: false,
+      status: 422,
+      text: () => Promise.resolve(nonLegacy422),
+      headers: { get: () => null },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-invalid'));
+
+    await expect(persistResidentTurnFailure(
+      'task-er-invalid',
+      'project-er-resident',
+      'Resident provider exited with code 1',
+      'fatal',
+    )).rejects.toThrow('failed (422)');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not attach a mismatched report to Resident failure posts', async () => {
+    const fetchMock = stubStatusFetch();
+    _setLastProviderRunErrorReportForTesting(makeReport('task-er-prior-resident'));
+
+    await persistResidentTurnFailure(
+      'task-er-current-resident',
+      'project-er-resident',
+      'Resident failed before a provider run',
+      'fatal',
+    );
+
+    const residentCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).includes('/api/agent/resident-turn/fail'));
+    if (!residentCall) throw new Error('expected a Resident failure POST');
+    const init = residentCall[1] as RequestInit;
+    if (typeof init.body !== 'string') throw new Error('expected a string request body');
+    const body = JSON.parse(init.body) as Record<string, unknown>;
+    expect(body.error_report).toBeUndefined();
   });
 });
 
