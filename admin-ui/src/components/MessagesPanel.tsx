@@ -1153,11 +1153,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     // narrows to needsOperatorIds, which is only populated from that model.
     needsActionOnly: needsActionOnly && usesStrategicReadModel,
   });
-  // Legacy fallback when the canonical strategic attention read model is unavailable.
-  const highSignalCount = useMemo(
-    () => countHighSignalMessages(messages, eventPrefs, tempMutes),
-    [messages, eventPrefs, tempMutes],
-  );
+  // Derived on-demand in the effect below; no separate memo needed.
   const conversationMessages = useMemo(() => {
     return messages
       .filter(msg => msg.surface != null
@@ -1650,14 +1646,14 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   // Update the tab-title badge from the canonical attention read model whenever
   // available, including the full message-list view. This keeps it aligned with
   // the closed-panel count; legacy callers without that model retain the
-  // high-signal fallback.
+  // high-signal fallback computed inline.
   useEffect(() => {
     if (usesStrategicReadModel) {
       onMessageCountChange?.(attentionNeeds);
       return;
     }
-    onMessageCountChange?.(highSignalCount);
-  }, [highSignalCount, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
+    onMessageCountChange?.(countHighSignalMessages(messages, eventPrefs, tempMutes));
+  }, [messages, eventPrefs, tempMutes, onMessageCountChange, usesStrategicReadModel, attentionNeeds]);
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
     const el = scrollRef.current;
