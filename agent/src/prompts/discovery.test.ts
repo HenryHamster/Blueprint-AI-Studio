@@ -257,7 +257,7 @@ describe('verifyCloneDelivered', () => {
     let caught: (Error & { failureCategory?: string }) | null = null;
     try { await verifyCloneDelivered({ repo_is_empty: false }, 'main'); } catch (e) { caught = e as Error & { failureCategory?: string }; }
     expect(caught?.failureCategory).toBe('clone_failed');
-    expect(caught?.message).toContain('did not deliver');
+    expect(caught?.message).toContain('the clone did not deliver the expected content');
   });
 
   it('reports observed_repo_is_empty=true to backend before throwing on durable/live mismatch', async () => {
