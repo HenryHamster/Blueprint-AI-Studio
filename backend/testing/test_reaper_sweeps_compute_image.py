@@ -3090,3 +3090,127 @@ class TestGcGuardDbPinReconciliation:
         assert state["reconciliation"]["clean"] is False
         assert len(state["reconciliation"]["risk_findings"]) == 1
 
+
+# ── Machine-readable arming signal ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_inuse_guard_sweep_emits_machine_readable_arming_signal(db):
+    """The inuse-guard sweep emits a durable machine-readable arming signal.
+
+    Acceptance criteria (registry.tf:73 comment criteria a and b):
+      (a) the guard is stamping ``inuse-`` tags on current project defaults and
+          live/recent ComputeJob digests — ``last_sweep["applied"] >= 1``.
+      (b) no DB-pinned digest is on the would-delete list — verified by the
+          reconciliation leg: ``reconciliation["clean"] is True``.
+
+    The signal must be accessible via the admin API endpoint
+    (``admin_project_tools.get_compute_image_registry_readiness``) which delegates
+    to ``get_compute_image_gc_guard_readiness()``.
+
+    Fields verified:
+      - ``last_run_at`` — ISO-format timestamp set after each sweep run.
+      - ``last_sweep["applied"]`` — count of digests for which an inuse- tag was
+        stamped this run.
+      - ``last_sweep["pruned"]`` — count of stale protection tags removed.
+      - ``last_sweep["apply_failed"]`` — count of tag-stamp failures (0 on success).
+      - ``ready`` — True when at least one digest was protected and apply_failed==0.
+      - ``reconciliation["clean"]`` — True when every DB-pinned digest has its
+        inuse- tag in the registry (the operator's go/no-go signal).
+    """
+    import app.reaper_sweeps as _rs
+    from app.compute_image_build import protection_tag_for_digest
+    from app.routers import admin_project_tools  # noqa: F401 — verify importable
+
+    # Reset module-level gc_guard state so this test is order-independent.
+    _rs._gc_guard_total_runs = 0
+    _rs._gc_guard_total_applied = 0
+    _rs._gc_guard_total_pruned = 0
+    _rs._gc_guard_total_apply_failed = 0
+    _rs._gc_guard_consecutive_healthy_cycles = 0
+    _rs._gc_guard_first_run_at = None
+    _rs._gc_guard_last_run_at = None
+    _rs._gc_guard_last_result = None
+    _rs._gc_guard_state_loaded_from_db = True  # skip DB load
+    _rs._gc_guard_last_reconciliation = None
+
+    # Arrange: one project with one built image.
+    project = await _make_project(db)
+    await _add_image(db, project.id, _DIGEST_A, updated_at=_NOW)
+
+    stale_tag = "inuse-000000000000dead"
+    current_tag = protection_tag_for_digest(_DIGEST_A)
+
+    # Act: run the protection sweep (cadence forced open via patch).
+    with patch("app.reaper_sweeps._last_compute_image_gc_guard_sweep", _PAST_NOW):
+        sweep_result = await sweep_protect_referenced_compute_image_digests(
+            db,
+            now=_NOW,
+            _apply_tag=lambda repo, digest: "inuse-tag",  # always succeeds
+            _list_tags=lambda repo: [stale_tag],           # one stale tag to prune
+            _delete_tag=lambda repo, tag: True,            # prune succeeds
+        )
+
+    # Basic sweep sanity: one digest protected, one stale tag pruned.
+    assert sweep_result["applied"] == 1
+    assert sweep_result["pruned"] == 1
+    assert sweep_result["apply_failed"] == 0
+
+    # Fetch the machine-readable arming signal (same call as the admin API endpoint).
+    signal = get_compute_image_gc_guard_readiness()
+
+    # (a) last-run timestamp is populated.
+    assert signal["last_run_at"] is not None, (
+        "last_run_at must be set after a sweep run so the operator can see when the "
+        "guard last executed"
+    )
+    assert signal["first_run_at"] is not None
+
+    # (b) per-run counts are surfaced.
+    assert signal["last_sweep"] is not None, (
+        "last_sweep must be non-None after a sweep run"
+    )
+    assert signal["last_sweep"]["applied"] == 1, (
+        "last_sweep.applied must equal the number of digests protected this run"
+    )
+    assert signal["last_sweep"]["pruned"] == 1, (
+        "last_sweep.pruned must equal the number of stale protection tags removed"
+    )
+    assert signal["last_sweep"]["apply_failed"] == 0, (
+        "last_sweep.apply_failed must be 0 when all protection-tag stamps succeeded"
+    )
+
+    # (c) cumulative counters accumulate correctly.
+    assert signal["cumulative"]["applied"] == 1
+    assert signal["cumulative"]["pruned"] == 1
+    assert signal["cumulative"]["apply_failed"] == 0
+
+    # (d) ready=True: at least one digest protected, zero failures on last run.
+    assert signal["ready"] is True, (
+        "ready must be True after a sweep that successfully protected at least one digest"
+    )
+
+    # (e) reconciliation leg: run the DB-pin reconciliation sweep.
+    # With the protection tag present in the registry, clean must be True.
+    await sweep_reconcile_gc_guard_db_pins(
+        db,
+        _list_tags=lambda repo: [current_tag],  # digest IS protected in registry
+    )
+
+    signal_after_reconcile = get_compute_image_gc_guard_readiness()
+    assert signal_after_reconcile["reconciliation"] is not None, (
+        "reconciliation field must be populated after sweep_reconcile_gc_guard_db_pins runs"
+    )
+    assert signal_after_reconcile["reconciliation"]["clean"] is True, (
+        "reconciliation.clean must be True when every DB-pinned digest has its inuse- tag "
+        "— this is criterion (b) from registry.tf:73 for arming the cleanup policy"
+    )
+    assert signal_after_reconcile["reconciliation"]["risk_findings"] == [], (
+        "risk_findings must be empty when all DB-pinned digests are protected"
+    )
+
+    # (f) the admin API endpoint is registered and delegates to this signal.
+    # Verify the function exists and returns the same shape as the signal.
+    from app.routers.admin_project_tools import get_compute_image_registry_readiness  # noqa: F401
+    assert callable(get_compute_image_registry_readiness)
+

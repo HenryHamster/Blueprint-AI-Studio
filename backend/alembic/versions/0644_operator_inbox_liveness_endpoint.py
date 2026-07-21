@@ -16,4 +16,4 @@ def upgrade():
 
 
 def downgrade():
-    pass
+    raise NotImplementedError("No-op migration — no schema changes to roll back.")
