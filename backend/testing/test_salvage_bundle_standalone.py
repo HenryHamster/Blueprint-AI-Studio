@@ -326,6 +326,38 @@ Findings covered here (17-finding release-qualification salvage bundle, task 03c
   03-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (c17-15)
   03-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (c17-16)
   03-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (c17-17)
+
+Findings covered here (7-finding creation-path fail-closed audience/lifecycle/attention salvage bundle, task d820301f, 2026-07-21):
+  d-1 — design: creation-path fail-closed audience contract → already pinned by test_m1_* + test_m2_* (m-1/m-2; fb-1)
+  d-2 — fix: fail-closed audience at Alert/message creation → already pinned by test_m2_* (m-2; fb-2)
+  d-3 — feat: operator inbox consumes server attention/lifecycle model (operator_action hint, Ack button)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel attention model lifecycle field consumption (m-3; fb-3)
+  d-4 — feat(ui): make operator inbox attention-driven, retire dual effectiveSignal classification
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel needs-action filter (m-4; fb-4)
+  d-5 — fix(chat): make confirmation chips actionable (accept/dismiss in needs-action strip)
+         → already pinned by MessagesPanel.test.tsx::MessagesPanel confirmation chip actionability (m-5; fb-5)
+  d-6 — feat(messages): auto-decay stale open QUESTION messages → already pinned by test_m6_* (m-6; fb-6)
+  d-7 — feat(ui): converge operator notifications on attention model (toast uses attention, not effectiveSignal)
+         → already pinned by MessagesPanel.test.tsx::fires toast for needs_operator message (m-7; fb-7)
+
+Findings covered here (17-finding release-qualification salvage bundle, task 03ca2ee5, 2026-07-21):
+  03-1  — serving-only-import ImportError degrades gate (not hard-block) → already pinned by test_f20_1_* (c17-1)
+  03-2  — data-dependent migration proof design; scratch replay uses schema not row data → already pinned by test_f20_2_* (c17-2)
+  03-3  — encryption-key continuity: probe_key_continuity / assert_plaintext_or_raise present → already pinned by test_f20_3_* + e1/e2/e3 (c17-3)
+  03-4  — MultiFernet.rotate() for staged key rotation → already pinned by test_f20_4_* (c17-4)
+  03-5  — fail closed on keyless/malformed encryption backfill; require_encryption_active raises → already pinned by test_f20_5_* (c17-5)
+  03-6  — scratch-DB URL not in REQUIRED_RUNTIME_ENV (degraded, not boot-fatal) → already pinned by test_f20_6_* (c17-6)
+  03-7  — gate-defer signature derived from error code only (no child failures) → already pinned by test_f20_7_* (c17-7)
+  03-8  — timed-out qualifier children cancelled via _cancel_qualifier_children before state rewrite → already pinned by test_f20_8_* (c17-8)
+  03-9  — _DeterministicMigrationDefect returns 'block' verdict (not 'defer') → already pinned by test_f20_9_* (c17-9)
+  03-10 — env_preflight_enabled independent gate flag; absent evidence is a hard blocker → already pinned by test_f20_10_* (c17-10)
+  03-11 — trigger resolver returns infra_failure_redrive for infra_failure (bespoke loops gated separately) → already pinned by test_f20_11_* (c17-11)
+  03-12 — release_reconciliation references 'claiming' field for orphan containment → already pinned by test_f20_12_* (c17-12)
+  03-13 — migration_apply_gate data-migration proof gate defers DML without proof declaration → already pinned by test_f20_13_* (c17-13)
+  03-14 — admin-ui/src/api/projects.ts exposes getHotfixScopePreview + triggerHotfixPromote → already pinned by test_f20_14_* (c17-14)
+  03-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL surfaces in missing_qualification_env() → already pinned by test_f20_15_* (c17-15)
+  03-16 — _infra_failure_signature stable across candidate rotations → already pinned by test_f20_16_* (c17-16)
+  03-17 — hotfix_policy.py and admin_operator_triggers.py in HOTFIX_ELIGIBLE_MODULES → already pinned by test_f20_17_* (c17-17)
 """
 
 from __future__ import annotations
