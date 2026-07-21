@@ -264,8 +264,6 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
         _last_attempt = _redetect_empty_cooldown.get(_proj_id_key)
         if _last_attempt is not None and (_now_mono - _last_attempt) < _REDETECT_COOLDOWN_S:
             return False
-        if _proj_id_key:
-            _redetect_empty_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -303,6 +301,10 @@ async def maybe_refresh_empty_build_config(project, session, *, ref=None) -> boo
             project.build_config = detected
         flag_modified(project, "build_config")
         await session.commit()
+        # Stamp cooldown after the API call completes so a transient failure
+        # does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_empty_cooldown[_proj_id_key] = _now_mono
         logger.info(
             "[BUILD_CONFIG] Auto-refreshed empty build_config for project %s "
             "(integration branch %s) after repo gained structure",
@@ -845,10 +847,6 @@ async def maybe_redetect_on_emptiness_disagreement(
             _now_mono - _last_attempt
         ) < _REDETECT_COOLDOWN_S:
             return False
-        # Stamp before any API call so concurrent callers in the same window skip
-        # rather than duplicate the expensive walk.
-        if _proj_id_key:
-            _redetect_disagreement_cooldown[_proj_id_key] = _now_mono
 
         from pydantic import ValidationError
         from sqlalchemy.orm.attributes import flag_modified
@@ -886,6 +884,10 @@ async def maybe_redetect_on_emptiness_disagreement(
             project.build_config = detected
         flag_modified(project, "build_config")
         await session.commit()
+        # Stamp cooldown after the API call completes so a transient failure
+        # does not consume the 6-hour window.
+        if _proj_id_key:
+            _redetect_disagreement_cooldown[_proj_id_key] = _now_mono
         logger.info(
             "[BUILD_CONFIG] Re-detected repo emptiness for project %s after "
             "agent/backend disagreement (durable repo_is_empty=%s, agent "

@@ -255,6 +255,19 @@ def test_needs_action_message_types_are_question_and_blocker():
     )
 
 
+def test_needs_action_types_parity_with_operator_attention():
+    # Both sets are load-bearing for the operator needs-action badge; a one-sided
+    # edit silently miscounts the badge. This test enforces parity across modules.
+    from app.operator_attention import _NEEDS_OPERATOR_MESSAGE_TYPES
+
+    assert NEEDS_ACTION_MESSAGE_TYPES == frozenset(
+        mt.value for mt in _NEEDS_OPERATOR_MESSAGE_TYPES
+    ), (
+        "NEEDS_ACTION_MESSAGE_TYPES in message_convergence diverged from "
+        "_NEEDS_OPERATOR_MESSAGE_TYPES in operator_attention — update both together"
+    )
+
+
 def test_derive_needs_action_true_for_open_question_and_blocker():
     assert derive_needs_action(_msg(MessageType.QUESTION, "open")) is True
     assert derive_needs_action(_msg(MessageType.BLOCKER, "linked")) is True
