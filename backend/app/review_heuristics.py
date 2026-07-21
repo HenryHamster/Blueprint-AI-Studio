@@ -8,14 +8,11 @@ callers and tests that import from ``app.review_pipeline`` keep working.
 
 Contains: Jaccard stuck-cycle thresholds, issue-churn detection, the
 repeating-issues formatting helpers, drift-signal computation, feedback
-tokenization/similarity, and the auto-approval heuristic.
+tokenization/similarity, and the diff-size/test-file utilities shared with
+``review_policy`` (which owns the review-skip decisions).
 """
 
 import re
-
-from app.models import Task
-from app.shared_state import runtime_config as _runtime_config
-from app.spawn_calibration import _compute_scope_overflow_warning
 
 STUCK_CYCLE_THRESHOLD_DEFAULT = 0.55
 STUCK_CYCLE_THRESHOLD_REFACTOR = 0.65
@@ -513,12 +510,6 @@ def _is_test_file(path: str) -> bool:
     return ".test." in name or ".spec." in name
 
 
-# Minimum direction acceptance rate required to auto-approve a small diff.
-# Directions with poor merge history still get a full review regardless of
-# diff size — the acceptance gate is independent of the line/file thresholds.
-AUTO_APPROVE_MIN_ACCEPTANCE_RATE = 0.5
-
-
 def _diff_lines_changed(
     diff_summary: list | None, exclude_test_files: bool = False
 ) -> int | None:
@@ -540,93 +531,6 @@ def _diff_lines_changed(
                 continue
         total += int(entry.get("added") or 0) + int(entry.get("removed") or 0)
     return total
-
-
-def should_auto_approve_diff(
-    source_task: Task, direction_data: dict | None
-) -> tuple[bool, str]:
-    """Decide whether to skip the review task for a trivially small/medium diff.
-
-    Returns (skip, reason). Reason is always populated — a short human-
-    readable string suitable for task status messages and operator logs.
-
-    Gates (all must pass):
-    - source task type is create, refactor, or fix
-    - scope is 'small' or 'medium' (large always gets full review). Medium
-      uses tighter line/file thresholds than small and can be disabled
-      independently via auto_approve_medium_max_lines=0.
-    - diff size known and <= per-scope max_lines
-    - non-test file count <= per-scope max_files
-    - direction acceptance_rate > AUTO_APPROVE_MIN_ACCEPTANCE_RATE when
-      direction history is available (new directions pass by default)
-    """
-    source_type = (source_task.first_payload or {}).get("type", "")
-    if source_type not in ("create", "refactor", "fix", "migrate"):
-        return (False, f"source type {source_type!r} not eligible")
-
-    ctx = source_task.context or {}
-    scope = ctx.get("scope", "medium")
-    if scope == "small":
-        max_lines = _runtime_config.get("auto_approve_max_lines", 50)
-        max_files = _runtime_config.get("auto_approve_max_files", 4)
-        if not max_lines or max_lines <= 0:
-            return (False, "auto-approve disabled (auto_approve_max_lines=0)")
-    elif scope == "medium":
-        max_lines = _runtime_config.get("auto_approve_medium_max_lines", 30)
-        max_files = _runtime_config.get("auto_approve_medium_max_files", 2)
-        if not max_lines or max_lines <= 0:
-            return (
-                False,
-                "medium auto-approve disabled (auto_approve_medium_max_lines=0)",
-            )
-    else:
-        return (False, f"scope {scope!r} not eligible (small/medium only)")
-
-    changed_files = ctx.get("_pr_changed_files") or []
-    if not changed_files:
-        return (False, "changed files unknown")
-    overflow_warning = _compute_scope_overflow_warning(changed_files, scope)
-    if overflow_warning:
-        return (
-            False,
-            "scope overflow warning present: "
-            f"{overflow_warning['non_test_file_count']} non-test files > "
-            f"{overflow_warning['threshold']} threshold",
-        )
-    non_test_count = sum(1 for f in changed_files if not _is_test_file(f))
-    if non_test_count > max_files:
-        return (False, f"{non_test_count} non-test files > {max_files}")
-
-    lines_changed = _diff_lines_changed(
-        ctx.get("_pr_diff_summary"), exclude_test_files=True
-    )
-    if lines_changed is None:
-        return (False, "diff size unknown")
-    if lines_changed > max_lines:
-        return (False, f"{lines_changed} non-test lines > {max_lines}")
-
-    if direction_data is not None:
-        from app.research_completion import _compute_acceptance_rate
-
-        acceptance_rate = _compute_acceptance_rate(direction_data)
-        if (
-            acceptance_rate is not None
-            and acceptance_rate <= AUTO_APPROVE_MIN_ACCEPTANCE_RATE
-        ):
-            return (
-                False,
-                f"direction acceptance_rate {acceptance_rate:.0%} "
-                f"≤ {AUTO_APPROVE_MIN_ACCEPTANCE_RATE:.0%}",
-            )
-
-    return (
-        True,
-        f"auto-approve: {lines_changed} non-test lines across {non_test_count} non-test "
-        f"file(s) (≤ {max_lines}/{max_files})",
-    )
-
-
-should_auto_approve_small_diff = should_auto_approve_diff
 
 
 def _feedback_token_set(text: str) -> set[str]:
@@ -672,43 +576,6 @@ LANE_CAP_NON_REVIEW_DEFAULT = 8  # conflict + ci + arbitration collectively
 # is preserved (keeps hardened prompt behavior for attempt 1), and a second
 # failure without resolution confirms the conflict is not auto-resolvable.
 PERSISTENT_CONFLICT_ESCALATION_THRESHOLD = 2
-
-
-_REVIEW_REQUIRED_SCOPES = frozenset({"large"})
-
-
-def should_skip_initial_review(is_intermediate: bool, scope: str) -> tuple[bool, str]:
-    """Whether to skip the automated code review for a newly opened PR.
-
-    Non-intermediate (single-task-to-automain) PRs always skip — the promotion
-    gate and CI are the only required backstop, matching v24 cost plan P2.
-    Intermediate (staging/rollup sub-PR) tasks skip for small/medium scope;
-    the rollup PR to main gets the full review instead.
-    Large-scope intermediate PRs always get a full review.
-
-    Returns (skip, reason).
-    """
-    if not is_intermediate:
-        return (True, "non-intermediate branch: CI and promotion gate backstop review")
-    if scope not in _REVIEW_REQUIRED_SCOPES:
-        return (True, f"{scope} scope on intermediate branch: rollup PR gets full review")
-    return (False, f"{scope} scope on intermediate branch: full review required")
-
-
-def should_skip_rereview(fix_reason: str, skip_rereview_minor_only: bool) -> tuple[bool, str]:
-    """Whether to skip re-review after a fix task completes.
-
-    Skips when the fix addresses mechanical issues that don't change the
-    review decision (CI failures, merge conflicts, migration repairs), or
-    when the initial review flagged only minor-severity issues.
-
-    Returns (skip, reason).
-    """
-    if skip_rereview_minor_only:
-        return (True, "first-pass minor-only verdict: CI gates the merge")
-    if fix_reason in ("ci_failure", "merge_conflict", "migration_guard"):
-        return (True, f"{fix_reason}: original review already approved; CI gates merge")
-    return (False, f"{fix_reason}: re-review required")
 
 
 def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined]  # noqa: F821

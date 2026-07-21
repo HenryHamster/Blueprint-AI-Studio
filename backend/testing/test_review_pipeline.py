@@ -10949,7 +10949,7 @@ def _mock_merge_success_deps(mocker):
 
 def _mock_small_auto_merge_deps(mocker):
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "tiny diff"),
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=1.0)

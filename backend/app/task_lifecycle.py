@@ -64,9 +64,9 @@ from app.review_pipeline import (
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
     reconciled_approve_markers,
-    should_auto_approve_diff,
+    evaluate_auto_approve_small_main,
     should_skip_initial_review,
-    should_skip_rereview,
+    should_skip_re_review,
 )
 from app.failure_classification import (
     classify_failure,
@@ -1996,15 +1996,15 @@ async def _process_post_commit(
                 # through the same security-scan + auto-merge path used for intermediate
                 # small/medium scope. CI still gates the merge.
                 #
-                # QP6: the gate is the single, unit-tested `should_auto_approve_diff`
-                # helper (review_pipeline.py) — NOT a weaker inline copy. The helper
-                # applies the strict checks the old inline logic skipped: source-type
-                # eligibility, test-file exclusion from the line/file budgets, and the
-                # scope-overflow warning. The main-branch path keeps two *additional*
-                # live constraints on top of the helper: it only runs for non-staging
-                # PRs and only when a resolvable direction has favorable acceptance
-                # history (a missing/unknown direction is NOT auto-approved here, even
-                # though the helper would pass `direction_data=None` by default).
+                # QP6: the decision is owned by `review_policy` — the single,
+                # documented home for all review-skip policy — NOT a weaker inline
+                # copy. `evaluate_auto_approve_small_main` applies the strict checks
+                # the old inline logic skipped (source-type eligibility, test-file
+                # exclusion from the line/file budgets, scope-overflow warning) plus
+                # the two main-branch-specific constraints: it only skips for
+                # non-staging PRs and only when a resolvable direction has favorable
+                # acceptance history (a missing/unknown direction is NOT auto-approved,
+                # even though should_auto_approve_diff passes `direction_data=None`).
                 auto_approve_small = False
                 if (
                     not is_intermediate
@@ -2012,9 +2012,9 @@ async def _process_post_commit(
                     and _runtime_config.get("auto_approve_small_diff_enabled", True)
                 ):
                     try:
-                        # Resolve the direction so the helper's acceptance-rate gate
+                        # Resolve the direction so the policy's acceptance-rate gate
                         # runs against real history. The main-branch path additionally
-                        # *requires* a resolvable direction (see comment above).
+                        # *requires* a resolvable direction (see policy docstring).
                         direction_id = (task.context or {}).get("direction_id")
                         _aa_dir = None
                         if direction_id:
@@ -2039,40 +2039,22 @@ async def _process_post_commit(
                                 ),
                                 None,
                             )
-                        # Main-branch path requires a *positive* acceptance signal:
-                        # an unknown direction or a direction with no merge/reject
-                        # history (acceptance == None) is NOT auto-approved here. This
-                        # is intentionally stricter than the helper's default (which
-                        # passes unknown acceptance) because main-branch merges skip
-                        # review entirely.
-                        from app.direction_metrics import _compute_acceptance_rate
-                        from app.review_heuristics import AUTO_APPROVE_MIN_ACCEPTANCE_RATE
-
-                        acceptance = (
-                            _compute_acceptance_rate(_aa_dir)
-                            if _aa_dir is not None
-                            else None
+                        _aa_decision = evaluate_auto_approve_small_main(
+                            task, is_intermediate, scope, _aa_dir
                         )
-                        if acceptance is None or acceptance <= AUTO_APPROVE_MIN_ACCEPTANCE_RATE:
+                        if _aa_decision.skip:
+                            auto_approve_small = True
+                            _aa_acc = (_aa_decision.detail or {}).get("acceptance")
                             logger.info(
-                                f"[PIPELINE] PR #{pr_number} not auto-approved — "
-                                f"direction acceptance={acceptance} (require >{AUTO_APPROVE_MIN_ACCEPTANCE_RATE:.0%} with "
-                                "history); defaulting to review"
+                                f"[PIPELINE] PR #{pr_number} auto-approved for "
+                                f"merge ({_aa_decision.reason}, acceptance={_aa_acc}) "
+                                "— skipping review"
                             )
                         else:
-                            skip, reason = should_auto_approve_diff(task, _aa_dir)
-                            if skip:
-                                auto_approve_small = True
-                                logger.info(
-                                    f"[PIPELINE] PR #{pr_number} auto-approved for "
-                                    f"merge ({reason}, acceptance={acceptance:.2f}) — "
-                                    "skipping review"
-                                )
-                            else:
-                                logger.info(
-                                    f"[PIPELINE] PR #{pr_number} not auto-approved "
-                                    f"({reason}) — defaulting to review"
-                                )
+                            logger.info(
+                                f"[PIPELINE] PR #{pr_number} not auto-approved "
+                                f"({_aa_decision.reason}) — defaulting to review"
+                            )
                     except Exception as _aa_exc:
                         logger.info(
                             f"[PIPELINE] Auto-approve eligibility check failed for PR #{pr_number}: {_aa_exc!r} — defaulting to review"
@@ -5746,10 +5728,18 @@ async def _process_post_commit(
                 #   - minor-only first-pass verdict → the fix only addressed
                 #                   minor nits; a re-review would near-certainly
                 #                   approve, so spend CI as the only gate.
-                skip_rereview, _skip_rereview_reason = should_skip_rereview(
-                    fix_reason, skip_rereview_minor_only
+                #   - security scan blocked → halt and wait for manual approval;
+                #                   neither skip-to-CI nor re-review is spawned.
+                # The full policy (including the scan-blocked override) is owned by
+                # review_policy.should_skip_re_review.
+                _rr_decision = should_skip_re_review(
+                    fix_reason, skip_rereview_minor_only, scan_blocked
                 )
-                if not scan_blocked and skip_rereview:
+                if _rr_decision.rule == "security_blocked":
+                    # Scan blocked the fix output; task already flagged for manual
+                    # approval above. Do not park for CI or spawn a re-review.
+                    pass
+                elif _rr_decision.skip:
                     from app import pause_clock
 
                     ci_loop = review_loop.copy()
@@ -5787,7 +5777,8 @@ async def _process_post_commit(
                     logger.info(
                         f"[REVIEW PIPELINE] {label} for PR #{pr_number} (skip reason={skip_detail}) — skipping re-review, waiting for CI"
                     )
-                elif not scan_blocked:
+                else:
+                    # Not blocked and no skip reason: spawn a fresh re-review.
                     review_task, _ = await _spawn_pipeline_task(
                         task,
                         "review",

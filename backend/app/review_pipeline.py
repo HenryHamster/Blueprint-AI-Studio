@@ -53,7 +53,6 @@ from app.issue_ledger import (  # noqa: F401
 # are re-exported here so existing callers/tests that import them from
 # app.review_pipeline keep working unchanged.
 from app.review_heuristics import (  # noqa: F401
-    AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
     EARLY_NONCONVERGENCE_ESCALATE_AT,
     ISSUE_CHURN_WINDOW,
     LANE_ARBITRATION,
@@ -90,9 +89,19 @@ from app.review_heuristics import (  # noqa: F401
     detect_early_nonconvergence,
     detect_fix_all_issue_class,
     fix_all_occurrences_directive,
+)
+
+# Review-skip decisions live in review_policy (the single documented home for
+# all review-skip policy). Re-exported here so existing callers/tests that
+# import them from app.review_pipeline keep working unchanged.
+from app.review_policy import (  # noqa: F401
+    AUTO_APPROVE_MIN_ACCEPTANCE_RATE,
+    ReviewSkipDecision,
+    evaluate_auto_approve_small_main,
     should_auto_approve_diff,
     should_auto_approve_small_diff,
     should_skip_initial_review,
+    should_skip_re_review,
     should_skip_rereview,
 )
 

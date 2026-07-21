@@ -5227,7 +5227,7 @@ async def test_small_scope_auto_approve_merge_held_on_dual_head(tl_db, mocker):
     # Force the auto_approve_small gate open.
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5317,7 +5317,7 @@ async def test_small_scope_auto_approve_merge_blocked_by_guard_skips_auto_merge(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5410,7 +5410,7 @@ async def test_small_scope_auto_approve_guard_defer_preserves_ci_wait(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(
@@ -5502,7 +5502,7 @@ async def test_small_scope_auto_approve_auto_finalizes_reserved_migration(
     )
     mocker.patch("app.direction_metrics._compute_acceptance_rate", return_value=0.9)
     mocker.patch(
-        "app.task_lifecycle.should_auto_approve_diff",
+        "app.review_policy.should_auto_approve_diff",
         return_value=(True, "small clean diff"),
     )
     mocker.patch(

@@ -5832,16 +5832,25 @@ def test_max_active_directions_all_read_sites_use_ten():
 
 
 def test_auto_approve_acceptance_threshold_not_hardcoded_in_task_lifecycle():
-    """task_lifecycle.py must not hardcode 0.5 as the acceptance-rate threshold.
+    """The acceptance-rate threshold must live behind the shared constant.
 
-    Finding rc-3: the 0.5 threshold was duplicated inline, diverging from
-    AUTO_APPROVE_MIN_ACCEPTANCE_RATE in review_heuristics.py. The constant must
-    be imported and used rather than repeated.
+    Finding rc-3: the 0.5 threshold was duplicated inline in task_lifecycle.py,
+    diverging from AUTO_APPROVE_MIN_ACCEPTANCE_RATE. The auto-approve gate now
+    lives in review_policy.py (the single documented home for review-skip
+    policy), which owns the constant and the acceptance check — so
+    task_lifecycle.py no longer hardcodes 0.5 anywhere in the auto-approve path.
     """
-    src = _find_backend_app_file("task_lifecycle.py").read_text()
-    assert "AUTO_APPROVE_MIN_ACCEPTANCE_RATE" in src, (
-        "task_lifecycle.py must import and use AUTO_APPROVE_MIN_ACCEPTANCE_RATE "
-        "from review_heuristics rather than hardcoding 0.5"
+    policy_src = _find_backend_app_file("review_policy.py").read_text()
+    assert "AUTO_APPROVE_MIN_ACCEPTANCE_RATE" in policy_src, (
+        "review_policy.py must define and use AUTO_APPROVE_MIN_ACCEPTANCE_RATE "
+        "rather than hardcoding 0.5"
+    )
+    # The auto-approve direction gate must not reappear as an inline 0.5 in
+    # task_lifecycle.py — the whole gate delegates to review_policy now.
+    tl_src = _find_backend_app_file("task_lifecycle.py").read_text()
+    assert "acceptance <= 0.5" not in tl_src and "acceptance is None or acceptance <= 0.5" not in tl_src, (
+        "task_lifecycle.py must not re-inline the acceptance-rate threshold; "
+        "the auto-approve gate belongs to review_policy.evaluate_auto_approve_small_main"
     )
 
 
