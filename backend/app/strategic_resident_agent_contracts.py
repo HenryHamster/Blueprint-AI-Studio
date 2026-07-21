@@ -47,6 +47,7 @@ class ResidentTurnFailRequest(BaseModel):
     project_id: uuid.UUID
     failure_id: str = Field(min_length=1, max_length=200)
     reason: str = Field(min_length=1, max_length=5_000)
+    error_report: dict[str, Any] | None = None
     failure_category: Literal[
         "clone_failed",
         "build_failed",

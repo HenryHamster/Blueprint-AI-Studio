@@ -4,61 +4,23 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from app.models import StrategicResident
-from app.strategic_resident_reconciliation_validation import (
-    ReconciliationResultInvalid,
+from app.strategic_resident_reconciliation_cadence import (
+    DEADLINE_STATE_KEYS,
+    decide_cadence,
 )
 from app.strategic_resident_turn_results import StrategicResidentTurnResult
 
 
-def _parse_timestamp(value: Any, *, field: str) -> datetime:
-    if not isinstance(value, str) or not value.strip():
-        raise ReconciliationResultInvalid(f"{field} must be an ISO-8601 timestamp")
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        raise ReconciliationResultInvalid(
-            f"{field} must be an ISO-8601 timestamp"
-        ) from None
-    if parsed.tzinfo is not None:
-        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
-
-
-def _deadline_candidates(
-    body: Mapping[str, Any],
-    result: StrategicResidentTurnResult,
-) -> list[tuple[datetime, str]]:
-    candidates: list[tuple[datetime, str]] = []
-    if result.follow_up and result.follow_up.next_wakeup_at:
-        candidates.append(
-            (
-                _parse_timestamp(
-                    result.follow_up.next_wakeup_at,
-                    field="follow_up.next_wakeup_at",
-                ),
-                "follow_up",
-            )
-        )
-    strategy = body.get("working_strategy")
-    if not isinstance(strategy, Mapping):
-        raise ReconciliationResultInvalid("working_strategy is malformed")
-    for index, item in enumerate(list(strategy.get("open_loops") or [])[:100]):
-        if not isinstance(item, Mapping) or not item.get("due_at"):
-            continue
-        candidates.append(
-            (
-                _parse_timestamp(
-                    item["due_at"],
-                    field=f"working_strategy.open_loops[{index}].due_at",
-                ),
-                "open_loop_deadline",
-            )
-        )
-    return candidates
+def _clear_deadline_state(resident: StrategicResident) -> None:
+    scheduling = dict(resident.scheduling_state or {})
+    for key in DEADLINE_STATE_KEYS:
+        scheduling.pop(key, None)
+    resident.scheduling_state = scheduling
+    resident.next_wakeup_at = None
 
 
 def schedule_meaningful_follow_up(
@@ -69,32 +31,37 @@ def schedule_meaningful_follow_up(
     turn_task_id: uuid.UUID,
     now: datetime,
 ) -> datetime | None:
-    """Persist the earliest explicit follow-up or open-loop deadline."""
+    """Persist the next cadence selected from the effective checkpoint."""
 
-    candidates = _deadline_candidates(body, result)
-    if not candidates:
-        return None
-    deadline, source = min(candidates, key=lambda item: (item[0], item[1]))
-    effective = now if deadline <= now else deadline
-    reason = "overdue_commitment" if deadline <= now else source
     scheduling = dict(resident.scheduling_state or {})
+    decision = decide_cadence(
+        body=body,
+        result=result,
+        scheduling_state=scheduling,
+        now=now,
+    )
+    if decision is None:
+        _clear_deadline_state(resident)
+        return None
+
+    # This turn's effective checkpoint supersedes a wake preserved at pause.
+    scheduling.pop("paused_next_wakeup_at", None)
     scheduling.update(
         {
-            "deadline_at": deadline.isoformat(),
-            "deadline_reason": reason,
-            "deadline_source": source,
+            "deadline_at": decision.effective_at.isoformat(),
+            "deadline_reason": decision.reason,
+            "deadline_source": decision.source,
             "deadline_source_turn_task_id": str(turn_task_id),
             "deadline_scheduled_at": now.isoformat(),
+            "continuation_fingerprint": decision.fingerprint,
+            "continuation_unchanged_count": decision.unchanged_count,
+            "continuation_backoff_seconds": int(decision.backoff.total_seconds()),
         }
     )
     resident.scheduling_state = scheduling
-    if resident.background_policy == "active":
-        existing = resident.next_wakeup_at
-        resident.next_wakeup_at = (
-            min(existing, effective) if existing is not None else effective
-        )
-    else:
-        resident.next_wakeup_at = None
+    resident.next_wakeup_at = (
+        decision.effective_at if resident.background_policy == "active" else None
+    )
     return resident.next_wakeup_at
 
 

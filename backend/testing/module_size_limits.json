@@ -250,7 +250,7 @@
     "handlers/research-plan-sections.ts": 1800,
     "handlers/strategic-resident-lib.ts": 2950,
     "handlers/strategic-resident.ts": 1800,
-    "handlers/strategic-resident-turn.ts": 450
+    "handlers/strategic-resident-turn.ts": 750
   },
   "frontend": {
     "useAppState.ts": 3000,

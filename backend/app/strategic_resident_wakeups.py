@@ -178,6 +178,7 @@ async def sync_resident_background_policy(
     if resident is None:
         return None
     observed_at = now or _utcnow()
+    was_paused = resident.background_policy == "paused"
     resident.background_policy = "paused" if paused else "active"
     scheduling = dict(resident.scheduling_state or {})
     scheduling.update(
@@ -199,17 +200,6 @@ async def sync_resident_background_policy(
     pending = _merge_project_change_cursor(
         {}, raw_pending if isinstance(raw_pending, dict) else None
     )
-    pending_wake: ResidentTurnWake | None = None
-    if resident.engine_owner == "strategic_resident" and pending:
-        pending_wake = await coalesce_meaningful_background_wakeup(
-            session,
-            project_id=project_id,
-            trigger_kind="project_change",
-            now=observed_at,
-            project_change_cursor=pending,
-            locked_resident=resident,
-        )
-        scheduling = dict(resident.scheduling_state or {})
     paused_wakeup = _parse_scheduled_at(
         scheduling.pop("paused_next_wakeup_at", None)
     )
@@ -224,6 +214,68 @@ async def sync_resident_background_policy(
         restored_retry,
     )
     due = [value for value in candidates if value is not None]
+
+    # Preserve real project work before considering a synthetic activation.
+    # If its cursor is already represented, the coalescer returns None and
+    # clears the stale pending cursor; activation can then fill a genuine gap.
+    pending_wake: ResidentTurnWake | None = None
+    if resident.engine_owner == "strategic_resident" and pending:
+        pending_wake = await coalesce_meaningful_background_wakeup(
+            session,
+            project_id=project_id,
+            trigger_kind="project_change",
+            now=observed_at,
+            project_change_cursor=pending,
+            locked_resident=resident,
+        )
+        scheduling = dict(resident.scheduling_state or {})
+
+    # Active is an operational state, not merely an admission flag. Record each
+    # paused->active transition (and repair older active rows) exactly once.
+    raw_activation_sequence = scheduling.get("background_activation_sequence")
+    activation_sequence = (
+        raw_activation_sequence
+        if isinstance(raw_activation_sequence, int)
+        and not isinstance(raw_activation_sequence, bool)
+        and raw_activation_sequence > 0
+        else 0
+    )
+    activation_needed = was_paused or activation_sequence == 0
+    if activation_needed:
+        activation_sequence += 1
+        scheduling.update(
+            {
+                "background_activation_sequence": activation_sequence,
+                "background_activated_at": observed_at.isoformat(),
+            }
+        )
+        resident.scheduling_state = scheduling
+
+    if activation_needed and not due and pending_wake is None:
+        tasks = await _load_pointer_tasks_locked(session, resident)
+        active_background = (
+            resident.active_turn_lane == "background"
+            and is_authoritative_resident_turn(
+                tasks.get(resident.active_turn_task_id), project_id=project_id
+            )
+        )
+        background_successor = is_authoritative_resident_turn(
+            tasks.get(resident.background_successor_task_id),
+            project_id=project_id,
+            mutable_successor=True,
+        )
+        if not active_background and not background_successor:
+            pending_wake = await coalesce_meaningful_background_wakeup(
+                session,
+                project_id=project_id,
+                trigger_kind="project_change",
+                now=observed_at,
+                project_change_cursor={
+                    "resident_activation_sequence": activation_sequence
+                },
+                locked_resident=resident,
+            )
+            scheduling = dict(resident.scheduling_state or {})
     resident.next_wakeup_at = max(observed_at, min(due)) if due else None
     # A failure recorded while background work was paused sets health blocked
     # because it could not arm a retry then. Reconstructing a valid retry on
