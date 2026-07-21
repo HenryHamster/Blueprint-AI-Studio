@@ -11,7 +11,7 @@ const RESULT_KEYS = new Set([
 export const FINAL_RESULT_SCHEMA_HINT = [
   'Use these exact item schemas; omit no top-level key:',
   'facts: [{"fact_id":"id","statement":"text","confidence":null,"evidence_ids":[]}]',
-  'evidence: [{"evidence_id":"id","kind":"task|task_log|runner|runner_capacity|pr|pr_diff|pr_check|ci_run|deployment|artifact|operator_message|other","source_id":"id","revision":null,"checksum":null,"summary":"text"}]',
+  'evidence: [{"evidence_id":"id","kind":"task|task_log|runner|runner_capacity|pipeline|qualification_state|pr|pr_diff|pr_check|ci_run|deployment|artifact|operator_message|other","source_id":"id","revision":null,"checksum":null,"summary":"text"}]',
   'operations: [{"operation_id":"id","capability":"id","status":"proposed|applying|applied|reconciled|failed","summary":"text"}]',
   'receipts: [{"operation_id":"id","receipt_id":"id","status":"pending|applying|applied|reconciling|reconciled|failed|unknown_effect","summary":"text"}]',
   'unknown_effects: [{"effect_id":"id","operation_id":"id","receipt_id":"id","summary":"text","reconciliation_status":"unknown|reconciled|requires_attention"}]',
@@ -255,7 +255,7 @@ function validateEvidence(items: unknown[], allowServerExtras: boolean): string 
     const invalidIndex = items.findIndex((item) => !isRecord(item));
     return invalidIndex < 0 ? null : `evidence[${invalidIndex}] must be an object`;
   }
-  const kinds = ['task', 'task_log', 'runner', 'runner_capacity', 'pr', 'pr_diff', 'pr_check', 'ci_run', 'deployment', 'artifact', 'operator_message', 'other'];
+  const kinds = ['task', 'task_log', 'runner', 'runner_capacity', 'pipeline', 'qualification_state', 'pr', 'pr_diff', 'pr_check', 'ci_run', 'deployment', 'artifact', 'operator_message', 'other'];
   for (let index = 0; index < items.length; index += 1) {
     const path = `evidence[${index}]`;
     const allowedKeys = ['evidence_id', 'kind', 'source_id', 'revision', 'checksum', 'summary'];

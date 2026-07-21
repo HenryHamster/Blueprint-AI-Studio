@@ -8,6 +8,7 @@ export function ResidentEngineHealthChip({ health }: ResidentEngineHealthChipPro
   const activeTurn = health.turns?.active ?? null;
   const successorCount = Number(Boolean(health.turns?.interactive_successor))
     + Number(Boolean(health.turns?.background_successor));
+  const activeStatus = activeTurn?.status?.toUpperCase() ?? null;
   const unsettledOperations = health.operations?.unsettled_receipt_count ?? 0;
   const isStrategicOwner = health.engine_owner === 'strategic_resident';
   const isPaused = health.background_policy === 'paused';
@@ -17,12 +18,18 @@ export function ResidentEngineHealthChip({ health }: ResidentEngineHealthChipPro
     : !isStrategicOwner
       ? 'Resident shadowing'
       : activeTurn
-        ? 'Resident working'
+        ? activeStatus === 'QUEUED'
+          ? 'Resident queued'
+          : activeStatus === 'PROVISIONING'
+            ? 'Resident finding a runner'
+            : activeStatus === 'EVALUATING'
+              ? 'Resident evaluating'
+              : 'Resident working'
         : isPaused
-          ? 'Resident paused'
+          ? 'Background autonomy paused'
           : unhealthy
             ? `Resident ${health.health_status}`
-            : 'Resident ready';
+            : 'Autonomy on · standing by';
   const tone = !health.resident_initialized || isPaused
     ? 'border-amber-800/70 bg-amber-950/35 text-amber-200'
     : unhealthy || unsettledOperations > 0

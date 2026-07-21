@@ -28,7 +28,7 @@ import { useMessagesPanelFilters } from './useMessagesPanelFilters';
 import { MessagesListView, type ConversationListImperativeApi } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, residentAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
@@ -2143,7 +2143,8 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setLastArming(arming);
         clearPendingAttachments(sendIdentity);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
-        addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+        const receiptToast = residentAcceptanceToastCopy(wakeupState, arming);
+        addToast(receiptToast.message, receiptToast.severity);
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
           const optimisticRefresh = {

@@ -39,7 +39,7 @@ describe('ResidentEngineHealthChip', () => {
 
   test('distinguishes paused and shadow rollout states', () => {
     const { rerender } = render(<ResidentEngineHealthChip health={health({ background_policy: 'paused' })} />);
-    expect(screen.getByTestId('resident-engine-health')).toHaveTextContent('Resident paused');
+    expect(screen.getByTestId('resident-engine-health')).toHaveTextContent('Background autonomy paused');
     rerender(<ResidentEngineHealthChip health={health({ engine_owner: 'legacy' })} />);
     expect(screen.getByTestId('resident-engine-health')).toHaveTextContent('Resident shadowing');
   });

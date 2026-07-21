@@ -104,6 +104,11 @@ from app.strategic_resident_runner_inspection import (
     inspect_project_runner,
     inspect_project_runners,
 )
+from app.strategic_resident_project_inspection import (
+    inspect_project_pipeline,
+    inspect_project_qualification,
+    invoke_project_inspection,
+)
 from app.strategic_resident_task_mutation import (
     TASK_MUTATION_SERVICE,
     task_mutation_callback,
@@ -370,6 +375,20 @@ async def invoke_resident_capability(
             binding=binding,
             parameters=parameters,
             inspector=inspect_project_pr_checks,
+        )
+    if body.capability_id == "pipeline.inspect":
+        return await invoke_project_inspection(
+            session,
+            binding=binding,
+            capability_id="pipeline.inspect",
+            inspector=inspect_project_pipeline,
+        )
+    if body.capability_id == "qualification.inspect":
+        return await invoke_project_inspection(
+            session,
+            binding=binding,
+            capability_id="qualification.inspect",
+            inspector=inspect_project_qualification,
         )
     if spec.service not in {
         "resident_task_inspection",
