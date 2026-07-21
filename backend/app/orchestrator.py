@@ -1193,6 +1193,7 @@ async def orchestrator_worker():
     """
     # Late imports to avoid circular dependency with app.main
     from app.max_plan_pool import (
+        detect_persistently_dark_meters,
         load_max_plan_pool,
         refresh_usage_meter_snapshots,
         release_max_plan_account,
@@ -1298,6 +1299,16 @@ async def orchestrator_worker():
             # probes; never blocks dispatch.
             if _is_cadence_due(_last_usage_meter_refresh, 300):
                 await refresh_usage_meter_snapshots()
+                dark = await detect_persistently_dark_meters()
+                if dark:
+                    names = ", ".join(
+                        f"{d['name'] or d['id']} ({d['dark_reason']})" for d in dark
+                    )
+                    logger.warning(
+                        "[POOL] usage meter: %d account(s) persistently dark: %s",
+                        len(dark),
+                        names,
+                    )
                 _last_usage_meter_refresh = _utcnow()
 
             # Periodic zone health persist — prevents retry storms after restart

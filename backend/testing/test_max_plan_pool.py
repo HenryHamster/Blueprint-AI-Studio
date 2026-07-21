@@ -71,6 +71,8 @@ from app.max_plan_pool import (
     _usage_gate_should_skip,
     _usage_headroom_rank,
     _usage_headroom_settings,
+    detect_persistently_dark_meters,
+    _usage_dark_reason,
     _usage_snapshot_summary,
     usage_snapshot_summary_with_fallback,
     alternate_account_recovery_deadline,
@@ -3031,6 +3033,84 @@ class TestUsageSnapshotSummary:
         assert out["known"] is True
 
 
+class TestUsageDarkReason:
+    """Each ineligible/failing dark-meter state has a distinct machine-readable reason."""
+
+    def test_not_oauth_reason(self):
+        acct = _acct(auth_mode="api_key", oauth_token=None)
+        assert _usage_dark_reason(acct) == "not_oauth"
+
+    def test_no_secret_reason(self):
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        assert _usage_dark_reason(acct) == "no_secret"
+
+    def test_secret_fetch_failed_reason(self):
+        """secret_fetch_failed is distinct from no_secret when a fetch was attempted."""
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        acct["secret_fetch_failed"] = True
+        assert _usage_dark_reason(acct) == "secret_fetch_failed"
+
+    def test_never_probed_reason(self):
+        # OAuth + secret but no probe attempt yet — fresh account.
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        assert _usage_dark_reason(acct) == "never_probed"
+
+    def test_endpoint_error_after_failed_probe(self):
+        now = _utcnow()
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        acct["usage_probe_failed_at"] = now
+        assert _usage_dark_reason(acct) == "endpoint_error"
+
+    def test_endpoint_error_when_snapshot_present_but_unknown(self):
+        now = _utcnow()
+        acct = _acct(auth_mode="oauth", oauth_token="tok")
+        acct["usage_snapshot"] = UsageSnapshot.unknown("2026-01-01T00:00:00")
+        acct["usage_snapshot_at"] = now
+        acct["usage_probe_failed_at"] = now
+        assert _usage_dark_reason(acct) == "endpoint_error"
+
+    def test_known_snapshot_dark_reason_is_none_via_summary(self):
+        now = _utcnow()
+        acct = _acct_usage(_acct(), _known_snap(10.0, 20.0), at=now)
+        out = _usage_snapshot_summary(acct, now)
+        assert out["known"] is True
+        assert out["dark_reason"] is None
+
+    def test_not_oauth_surfaced_in_summary(self):
+        acct = _acct(auth_mode="api_key", oauth_token=None)
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "not_oauth"
+
+    def test_no_secret_surfaced_in_summary(self):
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "no_secret"
+
+    def test_secret_fetch_failed_surfaced_in_summary(self):
+        """secret_fetch_failed reason propagates through the summary."""
+        acct = _acct(auth_mode="oauth", oauth_token=None, runtime_secret=None)
+        acct["secret_fetch_failed"] = True
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "secret_fetch_failed"
+
+    def test_never_probed_surfaced_in_summary(self):
+        acct = _acct()  # default: oauth_token="sk-ant-test", no probe done
+        out = _usage_snapshot_summary(acct, _utcnow())
+        assert out["known"] is False
+        assert out["dark_reason"] == "never_probed"
+
+    def test_endpoint_error_surfaced_in_summary(self):
+        now = _utcnow()
+        acct = _acct()
+        acct["usage_probe_failed_at"] = now
+        out = _usage_snapshot_summary(acct, now)
+        assert out["known"] is False
+        assert out["dark_reason"] == "endpoint_error"
+
+
 def _persisted_usage_blob(five, seven, *, updated_at):
     """Mirror the blob _persist_rate_limit_usage_to_db writes to the DB."""
     return {
@@ -3797,6 +3877,96 @@ class TestRefreshUsageMeterSnapshots:
         count = await refresh_usage_meter_snapshots(now)
         assert scheduled == ["aging"]
         assert count == 1
+
+
+class TestDetectPersistentlyDarkMeters:
+    def _register(self, acct):
+        _account_by_id[acct["id"]] = acct
+        return acct
+
+    async def test_stale_failure_appears(self):
+        now = _utcnow()
+        threshold = 1800  # 2x the 900s display stale window
+        acct = self._register(
+            _acct(
+                id="stuck",
+                provider="anthropic",
+                auth_mode="oauth",
+                usage_probe_failed_at=now - timedelta(seconds=threshold + 1),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "stuck" in ids
+        entry = next(r for r in result if r["id"] == "stuck")
+        assert entry["dark_reason"] == "endpoint_error"
+        assert entry["dark_since"] == acct["usage_probe_failed_at"]
+
+    async def test_recent_failure_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        self._register(
+            _acct(
+                id="recent-fail",
+                provider="anthropic",
+                auth_mode="oauth",
+                usage_probe_failed_at=now - timedelta(seconds=threshold - 60),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "recent-fail" not in ids
+
+    async def test_known_snapshot_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        acct = self._register(
+            _acct(id="known", provider="anthropic", auth_mode="oauth")
+        )
+        # Snapshot is known and old enough that it would fail if checked for staleness
+        _acct_usage(acct, _known_snap(10.0, 10.0), at=now - timedelta(seconds=threshold + 1))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "known" not in ids
+
+    async def test_non_eligible_account_excluded(self):
+        now = _utcnow()
+        threshold = 1800
+        # API key account — not OAuth, so not eligible
+        self._register(
+            _acct(
+                id="api-key",
+                provider="anthropic",
+                auth_mode="api_key",
+                usage_probe_failed_at=now - timedelta(seconds=threshold + 1),
+            )
+        )
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "api-key" not in ids
+
+    async def test_never_probed_past_threshold_appears(self):
+        now = _utcnow()
+        threshold = 1800
+        # No stamps at all → never probed, dark_since=None → qualifies (no stamp to bound with)
+        self._register(_acct(id="never", provider="anthropic", auth_mode="oauth"))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "never" in ids
+        entry = next(r for r in result if r["id"] == "never")
+        assert entry["dark_reason"] == "never_probed"
+        assert entry["dark_since"] is None
+
+    async def test_all_fresh_emits_empty(self):
+        now = _utcnow()
+        threshold = 1800
+        acct = self._register(
+            _acct(id="fresh-ok", provider="anthropic", auth_mode="oauth")
+        )
+        _acct_usage(acct, _known_snap(5.0, 5.0), at=now - timedelta(seconds=60))
+        result = await detect_persistently_dark_meters(now, threshold_seconds=threshold)
+        ids = [r["id"] for r in result]
+        assert "fresh-ok" not in ids
 
 
 # ── record_account_startup_failure / startup-failure breaker ────────────────
@@ -4693,6 +4863,65 @@ async def test_persist_rate_limit_usage_no_row_is_noop(monkeypatch):
 
     # Should not raise
     await _persist_rate_limit_usage_to_db("nonexistent-id", snap)
+
+
+@pytest.mark.asyncio
+async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch):
+    """On DB failure, retries once and increments _usage_persist_failures."""
+    import app.max_plan_pool as pool_mod
+
+    from app.max_plan_pool import _persist_rate_limit_usage_to_db
+
+    snap = UsageSnapshot(
+        known=True,
+        window_utilizations={"five_hour": 30.0},
+        resets_at={},
+        probed_at="2026-07-09T12:00:00",
+    )
+
+    commit_call_count = 0
+
+    class FakeRow:
+        rate_limit_usage = None
+        updated_at = None
+
+    class FailThenSucceedSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a, **k):
+            pass
+
+        async def get(self, model, acct_id):
+            return FakeRow()  # row exists
+
+        def add(self, obj):
+            pass
+
+        async def commit(self):
+            nonlocal commit_call_count
+            commit_call_count += 1
+            if commit_call_count == 1:
+                raise Exception("transient DB error")
+
+    monkeypatch.setattr(
+        "app.max_plan_pool.AsyncSessionLocal",
+        lambda: FailThenSucceedSession(),
+    )
+    monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+    before = pool_mod._usage_persist_failures
+    await _persist_rate_limit_usage_to_db("test-id", snap)
+    after = pool_mod._usage_persist_failures
+
+    # Retry fired: commit was called twice (first fails, second succeeds).
+    assert commit_call_count == 2, (
+        f"expected 2 commit calls (1 fail + 1 retry), got {commit_call_count}"
+    )
+    # Counter reflects the first failure.
+    assert after == before + 1, (
+        f"counter should have incremented by 1 (was {before}, now {after})"
+    )
 
 
 # ── get_project_account_usage / get_user_project_pool_summary ────────────────

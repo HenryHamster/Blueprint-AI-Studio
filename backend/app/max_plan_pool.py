@@ -827,6 +827,7 @@ _pending_rl_persists: List[
 _pending_cap_persists: set = (
     set()
 )  # Account IDs with dirty daily_task_count / disabled_reason to flush
+_usage_persist_failures: int = 0  # Count of usage-snapshot DB persist failures since module load
 # Exact substrings from Claude Code CLI / Anthropic API rate-limit messages.
 # Shared between classify_failure() and any caller that needs to detect a real
 # Claude rate-limit (vs GitHub 429, GCP quota, Anthropic 529 overload, etc).
@@ -1173,16 +1174,19 @@ async def load_max_plan_pool():
             provider = acct.provider or LLMProviderName.ANTHROPIC
             auth_mode = acct.auth_mode or LLMAuthMode.OAUTH
             runtime_secret = decrypt_field(acct.secret_blob_ref) or decrypt_field(acct.oauth_token)
+            secret_fetch_failed = False
             if runtime_secret and runtime_secret.startswith("projects/"):
                 try:
                     from app.secrets_manager import get_user_secret
 
                     runtime_secret = await get_user_secret(runtime_secret)
                 except Exception:
-                    logger.exception(
-                        f"[POOL] Failed to fetch secret from Secret Manager for account {acct.name}"
+                    logger.warning(
+                        f"[POOL] Usage meter: failed to fetch secret for account {acct.name}"
+                        " — meter will be dark"
                     )
                     runtime_secret = None
+                    secret_fetch_failed = True
             token = (
                 runtime_secret
                 if provider == LLMProviderName.ANTHROPIC
@@ -1214,6 +1218,7 @@ async def load_max_plan_pool():
                 "runtime_secret": runtime_secret,
                 "oauth_token": token,
                 "runtime_ready": bool(runtime_secret),
+                "secret_fetch_failed": secret_fetch_failed,
                 "claude_config_json": decrypt_field(acct.claude_config_json),
                 "enabled": acct.enabled,
                 "active_tasks": active_per_account.get(acct_id, 0),
@@ -2985,7 +2990,10 @@ async def _persist_rate_limit_usage_to_db(
 ) -> None:
     """Write the usage snapshot into MaxPlanAccount.rate_limit_usage.
 
-    Pure best-effort advisory: failures are logged but never raised.
+    Best-effort advisory: failures are logged but never raised.
+    On failure, increments the ``_usage_persist_failures`` counter and retries
+    once so a transient DB hiccup does not leave the meter dark on non-leader
+    instances (which rely on the persisted ``rate_limit_usage`` column).
     """
     if not snapshot.known:
         return
@@ -3001,21 +3009,33 @@ async def _persist_rate_limit_usage_to_db(
             if reset:
                 entry["resets_at"] = reset
             usage_dict[window] = entry
-    try:
-        from app.models import MaxPlanAccount
+    from app.models import MaxPlanAccount
 
-        async with AsyncSessionLocal() as persist_session:
-            row = await persist_session.get(MaxPlanAccount, uuid.UUID(acct_id))
-            if row is not None:
-                row.rate_limit_usage = usage_dict
-                row.updated_at = _utcnow()
-                persist_session.add(row)
-                await persist_session.commit()
-    except Exception:
-        logger.exception(
-            "[POOL] failed to persist rate_limit_usage for account %s; keeping in-memory only",
-            acct_id,
-        )
+    for attempt in range(2):
+        try:
+            async with AsyncSessionLocal() as persist_session:
+                row = await persist_session.get(
+                    MaxPlanAccount, uuid.UUID(acct_id)
+                )
+                if row is not None:
+                    row.rate_limit_usage = usage_dict
+                    row.updated_at = _utcnow()
+                    persist_session.add(row)
+                    await persist_session.commit()
+                return  # success
+        except Exception:
+            if attempt == 0:
+                global _usage_persist_failures
+                _usage_persist_failures += 1
+                logger.warning(
+                    "[POOL] failed to persist rate_limit_usage for account %s; retrying...",
+                    acct_id,
+                )
+            else:
+                logger.warning(
+                    "[POOL] retry also failed for rate_limit_usage for account %s; keeping in-memory only",
+                    acct_id,
+                )
 
 
 def _schedule_usage_refresh(acct: Dict[str, Any]) -> None:
@@ -3199,6 +3219,53 @@ async def refresh_usage_meter_snapshots(now: datetime | None = None) -> int:
     return scheduled
 
 
+async def detect_persistently_dark_meters(
+    now: datetime | None = None,
+    threshold_seconds: float = _USAGE_METER_DISPLAY_STALE_SECONDS * 2,
+) -> List[Dict[str, Any]]:
+    """Return meter-eligible accounts whose usage snapshot has been stale/dark
+    for longer than ``threshold_seconds``.
+
+    "Dark" means: known=False (never probed, or probe returned unknown).
+    "Persistently dark" means the darkness has persisted beyond the threshold,
+    suggesting a stuck probe rather than a transient failure.
+
+    Returns a list of dicts with keys: id, name, dark_reason, dark_since.
+    """
+    now = now or _utcnow()
+    stale: List[Dict[str, Any]] = []
+    async with _max_plan_pool_lock:
+        for acct in _account_by_id.values():
+            if not _account_meter_eligible(acct):
+                continue
+            snap = acct.get("usage_snapshot")
+            if isinstance(snap, UsageSnapshot) and snap.known:
+                continue
+            # Account is meter-eligible but has no known snapshot.
+            # Determine how long it has been dark using the oldest relevant stamp.
+            failed_at = acct.get("usage_probe_failed_at")
+            at = acct.get("usage_snapshot_at")
+            dark_since: datetime | None = None
+            if failed_at is not None and at is not None:
+                dark_since = min(failed_at, at)
+            elif failed_at is not None:
+                dark_since = failed_at
+            elif at is not None:
+                dark_since = at
+            # No stamps at all → never probed; use None to indicate unknown onset.
+            if dark_since is not None and (now - dark_since).total_seconds() < threshold_seconds:
+                continue
+            stale.append(
+                {
+                    "id": acct.get("id"),
+                    "name": acct.get("name"),
+                    "dark_reason": _usage_dark_reason(acct),
+                    "dark_since": dark_since,
+                }
+            )
+    return stale
+
+
 def _apply_usage_gate(
     candidates: List[Any],
     *,
@@ -3222,6 +3289,41 @@ def _apply_usage_gate(
     return not_exhausted if not_exhausted else candidates
 
 
+def _usage_dark_reason(acct: Dict[str, Any]) -> str | None:
+    """Classify WHY an account's usage meter is dark (known=False).
+
+    Returns one of:
+    - ``"not_oauth"``: account uses API-key or other non-OAuth auth — the
+      provider's probe_usage returns unknown() for all non-OAuth modes.
+    - ``"no_secret"``: OAuth account but both oauth_token and runtime_secret
+      are absent and Secret Manager was not attempted — probe cannot
+      authenticate.
+    - ``"secret_fetch_failed"``: OAuth account whose Secret Manager fetch
+      failed — credential is unreachable, meter cannot authenticate.
+    - ``"never_probed"``: meter-eligible account that has never been probed
+      (no snapshot and no probe-failure stamp).
+    - ``"endpoint_error"``: probe was attempted but the endpoint returned
+      unknown (HTTP error, schema drift, or transient failure).
+    - ``None``: meter is known (should not be called on known snapshots).
+    """
+    auth_mode = _normalize_auth_mode(acct.get("auth_mode")) or LLMAuthMode.OAUTH.value
+    if auth_mode != LLMAuthMode.OAUTH.value:
+        return "not_oauth"
+    secret = acct.get("oauth_token") or acct.get("runtime_secret")
+    if not secret:
+        if acct.get("secret_fetch_failed"):
+            return "secret_fetch_failed"
+        return "no_secret"
+    # Meter-eligible: OAuth + secret present.
+    snap = acct.get("usage_snapshot")
+    failed_at = acct.get("usage_probe_failed_at")
+    at = acct.get("usage_snapshot_at")
+    if snap is None and failed_at is None and at is None:
+        return "never_probed"
+    # Probe was attempted (has a snapshot timestamp or failure stamp).
+    return "endpoint_error"
+
+
 def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, Any]:
     """JSON-safe per-account usage snapshot for the admin health endpoint.
 
@@ -3231,6 +3333,9 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
     the 60s selection TTL, which would flag nearly every render under the
     300s meter cadence. Selection freshness is handled separately by
     ``_cached_usage_snapshot``.
+
+    ``dark_reason`` (str | None) is populated on the ``known=False`` branch so
+    operators can distinguish ineligible accounts from probe failures.
     """
     snap = acct.get("usage_snapshot")
     at = acct.get("usage_snapshot_at")
@@ -3242,6 +3347,7 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         probed_at = snap.probed_at if isinstance(snap, UsageSnapshot) else None
         return {
             "known": False,
+            "dark_reason": _usage_dark_reason(acct),
             "five_hour_utilization": None,
             "seven_day_utilization": None,
             "resets_at": {},
@@ -3250,6 +3356,7 @@ def _usage_snapshot_summary(acct: Dict[str, Any], now: datetime) -> Dict[str, An
         }
     return {
         "known": True,
+        "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
         "seven_day_utilization": snap.window_utilizations.get("seven_day"),
         "resets_at": dict(snap.resets_at),
@@ -3265,6 +3372,7 @@ def _usage_summary_from_snapshot(
     stale = (now - at).total_seconds() >= _USAGE_METER_DISPLAY_STALE_SECONDS
     return {
         "known": True,
+        "dark_reason": None,
         "five_hour_utilization": snap.window_utilizations.get("five_hour"),
         "seven_day_utilization": snap.window_utilizations.get("seven_day"),
         "resets_at": dict(snap.resets_at),
@@ -3313,6 +3421,7 @@ def usage_snapshot_summary_with_fallback(
             return _usage_snapshot_summary(acct, now)
         return {
             "known": False,
+            "dark_reason": None,
             "five_hour_utilization": None,
             "seven_day_utilization": None,
             "resets_at": {},
