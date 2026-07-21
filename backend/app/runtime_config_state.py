@@ -964,11 +964,6 @@ runtime_config: Dict = {
     # dispatch/prompt context, recovery requeues, and KILL/ADOPT measurement.
     # A KILL verdict flips this back to False so every chain leaves full pilot.
     "review_fix_lane_pilot_enabled": False,
-    # Three-value pilot mode: "off" (inert), "shadow" (arm assignment +
-    # checkpoints, no warm reservation or fix routing), "on" (full pilot).
-    # Takes precedence over the boolean pair when set to "shadow" or "on".
-    # Default "off" preserves the legacy boolean-flag semantics.
-    "review_fix_lane_pilot_mode": "off",
     # Event-driven qualification trigger mode.  Controls whether the sweep-based
     # qualification trigger resolver (qualification_triggers.py) actually fires
     # run_qualification for matched versions:
@@ -1340,6 +1335,20 @@ runtime_config: Dict = {
 }
 
 
+def config_get(key: str):
+    """Get a runtime config value by its registered key.
+
+    The ``runtime_config`` dict IS the registry — every callable key has a
+    registered default baked in at module load.  Use this instead of
+    ``runtime_config.get(key, hardcoded_fallback)`` so the fallback always comes
+    from the registration itself, not a per-call literal that can silently drift.
+
+    Raises ``KeyError`` for unregistered keys so drift is caught at development
+    time rather than silently defaulting to an inconsistent value.
+    """
+    return runtime_config[key]
+
+
 # Completion-debt seed: runtime-config knobs whose current default/observe value
 # means an obligation is standing open (a feature ships dark, or a capability is
 # measured-but-not-enforced). ``iter_dormant_knob_debts`` converts these into
@@ -1362,9 +1371,6 @@ _DORMANT_MODE_KNOBS = {
     ),
     "direction_gap_respawn_block_mode": (
         "Direction-gap respawn block in observe-only mode"
-    ),
-    "review_fix_lane_pilot_mode": (
-        "Review-fix lane pilot mode shipping inert (default-off)"
     ),
     # completion_debt_weight_mode graduated to "enforce" (decision #7) — no
     # longer dormant, so it is intentionally absent from this registry.
@@ -1541,7 +1547,7 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 
 
 def _copy_default_provider_matrix(provider: str) -> dict[str, dict[str, Any]]:
-    raw = runtime_config.get("provider_settings_by_effort", {}).get(provider, {})
+    raw = config_get("provider_settings_by_effort").get(provider, {})
     if not isinstance(raw, dict):
         return {}
     return {
@@ -2377,10 +2383,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "review_fix_lane_pilot_enabled",
                         bool(config_json["review_fix_lane_pilot_enabled"]),
                     )
-                if "review_fix_lane_pilot_mode" in config_json:
-                    raw_mode = str(config_json["review_fix_lane_pilot_mode"]).lower()
-                    if raw_mode in ("off", "shadow", "on"):
-                        _set("review_fix_lane_pilot_mode", raw_mode)
                 if "warm_pool_enabled" in config_json:
                     _set(
                         "warm_pool_enabled",
@@ -2699,7 +2701,7 @@ def resolve_retry_budget(failure_class: str, scope: str | None) -> int:
     per_scope = SCOPE_AWARE_RETRY_BUDGETS.get(failure_class)
     if scope and per_scope and scope in per_scope:
         return per_scope[scope]
-    return runtime_config.get("retry_budgets_by_class", {}).get(
+    return config_get("retry_budgets_by_class").get(
         failure_class, runtime_config["max_retries"]
     )
 
@@ -2793,7 +2795,7 @@ def is_improvement_lanes_enabled() -> bool:
     Default False (master kill-switch). When False, all lane code is INERT and
     no existing code path changes. Mirrors ``warm_pool_enabled`` gating style.
     """
-    return bool(runtime_config.get("improvement_lanes_enabled", False))
+    return bool(config_get("improvement_lanes_enabled"))
 
 
 def is_review_fix_lane_pilot_enabled() -> bool:
@@ -2807,7 +2809,7 @@ def is_review_fix_lane_pilot_enabled() -> bool:
     """
     if not is_improvement_lanes_enabled():
         return False
-    return bool(runtime_config.get("review_fix_lane_pilot_enabled", False))
+    return bool(config_get("review_fix_lane_pilot_enabled"))
 
 
 def is_review_fix_lane_shadow_enabled() -> bool:
@@ -2818,28 +2820,24 @@ def is_review_fix_lane_shadow_enabled() -> bool:
     and durable KILL checks before creating shadow lanes.
     """
     return is_improvement_lanes_enabled() and not bool(
-        runtime_config.get("review_fix_lane_pilot_enabled", False)
+        config_get("review_fix_lane_pilot_enabled")
     )
 
 
 def get_lane_pilot_mode() -> str:
     """Return the three-value pilot mode: 'off', 'shadow', or 'on'.
 
-    Derives the canonical mode from the explicit ``review_fix_lane_pilot_mode``
-    key when it is set to 'shadow' or 'on', then falls back to the legacy pair
-    (improvement_lanes_enabled + review_fix_lane_pilot_enabled) so existing
-    deployments that only use the boolean flags continue to work.
+    Derives the mode from the boolean flags (improvement_lanes_enabled +
+    review_fix_lane_pilot_enabled) so existing deployments that only use the
+    boolean flags continue to work.  The explicit ``review_fix_lane_pilot_mode``
+    key was deleted per the default-off-is-guilty principle.
     """
-    explicit = str(runtime_config.get("review_fix_lane_pilot_mode", "off"))
-    if explicit in ("shadow", "on"):
-        return explicit
-    # Legacy fallback: derive from the boolean flags.
+    # Derive from the boolean flags.
     if is_review_fix_lane_pilot_enabled():
         return "on"
     if is_review_fix_lane_shadow_enabled():
-        # Classic armless shadow (master on, pilot off) is NOT the new shadow
-        # pilot mode — it is preserved as the "off" baseline for the three-value
-        # scale, accessible via the substrate's original boolean semantics.
+        # Classic armless shadow (master on, pilot off) is "off" for the
+        # three-value scale — accessible via the substrate's boolean semantics.
         return "off"
     return "off"
 
@@ -2861,7 +2859,7 @@ def get_auto_qualification_triggers_mode() -> str:
     Values: "observe" (default, logs decisions without spawning),
     "on" (actively fires run_qualification), "off" (resolver does not run).
     """
-    raw = runtime_config.get("auto_qualification_triggers", "observe")
+    raw = config_get("auto_qualification_triggers")
     if raw in ("on", "observe", "off"):
         return raw
     return "observe"

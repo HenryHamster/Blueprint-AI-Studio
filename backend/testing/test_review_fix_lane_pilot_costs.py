@@ -14,7 +14,6 @@ from app.review_fix_lane_pilot import (
     _SHADOW_ARM,
     compute_lane_arm_time_medians,
     compute_lane_pilot_aggregates,
-    is_review_fix_lane_pilot_shadow_mode_active_for_project,
     record_lane_arm_assignment,
 )
 from app.capability_trial_verdict import (
@@ -457,33 +456,13 @@ async def test_shadow_pilot_arm_counted_in_n_shadow_not_n_lane(db_session):
 
 
 @pytest.mark.asyncio
-async def test_record_lane_arm_assignment_fires_in_shadow_pilot_mode(mocker):
-    """record_lane_arm_assignment writes an arm assignment in shadow pilot mode."""
+async def test_record_lane_arm_assignment_silent_when_pilot_disabled(mocker):
+    """record_lane_arm_assignment is a no-op when pilot is disabled (no shadow mode)."""
     mocker.patch.dict(
         "app.shared_state.runtime_config",
         {
             "improvement_lanes_enabled": True,
             "review_fix_lane_pilot_enabled": False,
-            "review_fix_lane_pilot_mode": "shadow",
-        },
-        clear=False,
-    )
-    project = make_project(is_self_repo=True)
-    ctx: dict = {}
-    arm = record_lane_arm_assignment(ctx, "seed-task-id-123", project)
-    assert arm in ("lane", "control"), f"expected lane/control arm, got {arm!r}"
-    assert ctx.get(LANE_PILOT_ASSIGNMENT_KEY) == arm
-
-
-@pytest.mark.asyncio
-async def test_record_lane_arm_assignment_silent_when_mode_off(mocker):
-    """record_lane_arm_assignment is a no-op when mode is off and pilot is disabled."""
-    mocker.patch.dict(
-        "app.shared_state.runtime_config",
-        {
-            "improvement_lanes_enabled": True,
-            "review_fix_lane_pilot_enabled": False,
-            "review_fix_lane_pilot_mode": "off",
         },
         clear=False,
     )
@@ -492,38 +471,6 @@ async def test_record_lane_arm_assignment_silent_when_mode_off(mocker):
     arm = record_lane_arm_assignment(ctx, "seed-task-id-999", project)
     assert arm is None
     assert LANE_PILOT_ASSIGNMENT_KEY not in ctx
-
-
-@pytest.mark.asyncio
-async def test_shadow_pilot_mode_active_for_eligible_project(mocker):
-    """is_review_fix_lane_pilot_shadow_mode_active_for_project returns True for eligible project."""
-    mocker.patch.dict(
-        "app.shared_state.runtime_config",
-        {
-            "improvement_lanes_enabled": True,
-            "review_fix_lane_pilot_enabled": False,
-            "review_fix_lane_pilot_mode": "shadow",
-        },
-        clear=False,
-    )
-    project = make_project(is_self_repo=True)
-    assert is_review_fix_lane_pilot_shadow_mode_active_for_project(project) is True
-
-
-@pytest.mark.asyncio
-async def test_shadow_pilot_mode_inactive_for_ineligible_project(mocker):
-    """is_review_fix_lane_pilot_shadow_mode_active_for_project returns False for non-self-repo."""
-    mocker.patch.dict(
-        "app.shared_state.runtime_config",
-        {
-            "improvement_lanes_enabled": True,
-            "review_fix_lane_pilot_enabled": False,
-            "review_fix_lane_pilot_mode": "shadow",
-        },
-        clear=False,
-    )
-    project = make_project(is_self_repo=False)
-    assert is_review_fix_lane_pilot_shadow_mode_active_for_project(project) is False
 
 
 @pytest.mark.asyncio
