@@ -427,8 +427,8 @@ _UNVERIFIED_REASON_LABELS = {
 # AlertSeverity mapping cannot drift from the success-scoring classifier. The
 # resulting dict is byte-for-byte identical to the former literal.
 _UNVERIFIED_REASON_SEVERITY = {
-    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},
-    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},
+    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},  # noqa: C420
+    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},  # noqa: C420
 }
 
 
@@ -620,7 +620,7 @@ async def _maybe_create_migration_slot_contention_alert(
         f"(task {holder_task_id}) for a stuck author/test loop."
     )[:1000]
 
-    holder_uuid: "uuid.UUID | None" = None
+    holder_uuid: "uuid.UUID | None" = None  # noqa: UP037
     if holder_task_id:
         try:
             holder_uuid = uuid.UUID(str(holder_task_id))
@@ -761,9 +761,10 @@ async def _maybe_create_circuit_breaker_alert(
     )
     session.add(alert)
     if expected_legacy_generation is not None:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-        await commit_legacy_authorized(
+        await commit_legacy_authorized(  # noqa: F821
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -873,9 +874,10 @@ async def _maybe_create_spend_ceiling_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-        await commit_legacy_authorized(
+        await commit_legacy_authorized(  # noqa: F821
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -935,9 +937,10 @@ async def _maybe_create_approaching_ceiling_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-        await commit_legacy_authorized(
+        await commit_legacy_authorized(  # noqa: F821
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(
@@ -2271,9 +2274,10 @@ async def _create_strategic_alert(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-        await commit_legacy_authorized(
+        await commit_legacy_authorized(  # noqa: F821
             session, project_id, expected_legacy_generation
         )
     await broadcast_to_project(

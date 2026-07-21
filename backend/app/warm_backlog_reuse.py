@@ -29,7 +29,8 @@ from app.orchestrator_filters import (
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import COMPUTE_SUBSTRATE_TASK_TYPES, READ_ONLY_TASK_TYPES
 from app.time_utils import _utcnow
-from app.strategic_resident_runner_policy import resident_payload
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_runner_policy import resident_payload
 
 logger = logging.getLogger("blueprint")
 
@@ -370,7 +371,7 @@ async def _eligible_backlog_ids(
         for f in ip_files:
             file_counts[f] += 1
         ip_file_set.update(ip_files)
-    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, _ in rows:
+    for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, _ in rows:  # noqa: B007
         if not _is_read_only_payloads(payloads):
             for f in _prod_files((ctx or {}).get("related_files", [])):
                 file_counts[f] += 1
@@ -385,9 +386,10 @@ async def _eligible_backlog_ids(
 
     for task_id, depends_on, ctx, t_provider, t_account_id, t_model, payloads, t_parent_id in rows:
         ctx = ctx or {}
-        if resident_payload(payloads) is not None:
-            skipped_direct_dispatch += 1
-            continue
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+        # if resident_payload(payloads) is not None:
+        #     skipped_direct_dispatch += 1
+        #     continue
         # Dependency-bearing tasks are claimable warm ONLY once the
         # orchestrator's authoritative dep resolution has marked them ready
         # (``_deps_satisfied``). Without the marker the deps are still

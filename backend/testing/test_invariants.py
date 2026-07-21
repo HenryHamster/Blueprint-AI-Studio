@@ -11060,7 +11060,6 @@ def test_task_type_evaluation_registry_is_consistent():
         "plan": "none",
         "research": "forward-quality",
         "strategic_review": "forward-quality",
-        "strategic_resident_turn": "none",
         "design_doc_update": "forward-quality",
         "security_audit": "forward-quality",
         "qa": "code-ci-review",

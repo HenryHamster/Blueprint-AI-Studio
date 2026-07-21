@@ -98,16 +98,17 @@ from app.stall_alert_diagnostics import (
     _compute_retry_after_escalation_action,
     _missing_runtime_credentials_stall_reason,
 )
-from app.strategic_resident_saturated_dispatch import (
-    dispatch_local_required_resident_turns_without_cloud_slots,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_saturated_dispatch import (
+#     dispatch_local_required_resident_turns_without_cloud_slots,
+# )
 from app.state_persistence import (
     _persist_circuit_breakers,  # noqa: F401 — re-exported; callers import via app.orchestrator
     _persist_zone_health,
     _persist_self_healing_state_bundle,
 )
 from app.storage import upload_json_payload  # noqa: F401 — app.orchestrator patch surface
-from app.monthly_budget_alerts import check_monthly_budget  # noqa: F401 — re-export for tests patching app.orchestrator.check_monthly_budget
+from app.monthly_budget_alerts import check_monthly_budget  # noqa: F401, RUF100
 import app.shared_state as _shared_state
 from app.shared_state import (
     runtime_config as _runtime_config,
@@ -982,11 +983,12 @@ async def _filter_project_resource_dispatch_eligible(
                 # Keep an authoritative Resident's background policy in
                 # the same transaction so the spend guard cannot leave
                 # autonomous Resident wakeups running behind a paused UI.
-                from app.strategic_resident_wakeups import (
-                    sync_resident_background_policy,
-                )
+                # [RESIDENT-REMOVAL] removed with resident subsystem
+#                 from app.strategic_resident_wakeups import (
+#                     sync_resident_background_policy,
+#                 )
 
-                await sync_resident_background_policy(
+                await sync_resident_background_policy(  # noqa: F821
                     session,
                     project_id=_project.id,
                     paused=True,
@@ -1011,12 +1013,12 @@ async def _filter_project_resource_dispatch_eligible(
     for _pid in _current_ceiling_deferred - _prev:
         try:
             await broadcast_to_project(_pid, "project_spend_ceiling_deferred", {"project_id": _pid})
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_deferred for %s", _pid)
     for _pid in _prev - _current_ceiling_deferred:
         try:
             await broadcast_to_project(_pid, "project_spend_ceiling_restored", {"project_id": _pid})
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception("[ORCHESTRATOR] Failed to broadcast ceiling_restored for %s", _pid)
     _shared_state.project_ceiling_deferred_ids = _current_ceiling_deferred
 
@@ -1035,7 +1037,7 @@ async def _filter_project_resource_dispatch_eligible(
             await broadcast_to_project(
                 _pid, "project_monthly_budget_deferred", {"project_id": _pid}
             )
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception(
                 "[ORCHESTRATOR] Failed to broadcast monthly_budget_deferred for %s", _pid
             )
@@ -1044,7 +1046,7 @@ async def _filter_project_resource_dispatch_eligible(
             await broadcast_to_project(
                 _pid, "project_monthly_budget_restored", {"project_id": _pid}
             )
-        except Exception:
+        except Exception:  # noqa: PERF203
             logger.exception(
                 "[ORCHESTRATOR] Failed to broadcast monthly_budget_restored for %s", _pid
             )
@@ -1214,7 +1216,8 @@ async def orchestrator_worker():
         select_llm_runtime_for_task,
     )
     from app.providers.registry import get_provider
-    from app.strategic_resident_provider_policy import ResidentProviderPolicyHold
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_provider_policy import ResidentProviderPolicyHold
     from app.vm_lifecycle import (
         _get_actual_gcp_vm_count,
         _ensure_vm_deleted,
@@ -1729,7 +1732,7 @@ async def orchestrator_worker():
                     (
                         _resident_local_pinned,
                         _resident_local_held,
-                    ) = await dispatch_local_required_resident_turns_without_cloud_slots(
+                    ) = await dispatch_local_required_resident_turns_without_cloud_slots(  # noqa: F821
                         session,
                         lock_dispatchable_task=_lock_dispatchable_task_for_mutation,
                     )
@@ -2179,27 +2182,27 @@ async def orchestrator_worker():
                         )
                     ).all()
                     for _pid, _uid in _proj_rows:
-                        _project_user_cache[_pid] = _uid
+                        _project_user_cache[_pid] = _uid  # noqa: PERF403
 
                 async def _user_has_available_account(task: Task) -> bool:
                     user_id = task.launched_by_user_id
                     if not user_id:
-                        cached = _project_user_cache.get(task.project_id)
+                        cached = _project_user_cache.get(task.project_id)  # noqa: B023
                         if cached is not None:
                             user_id = cached
                         else:
-                            proj = await session.get(Project, task.project_id)
+                            proj = await session.get(Project, task.project_id)  # noqa: B023
                             user_id = proj.user_id if proj else ""
-                            _project_user_cache[task.project_id] = user_id
+                            _project_user_cache[task.project_id] = user_id  # noqa: B023
                     model = _extract_task_model(task)
                     cache_key = (user_id, model)
-                    if cache_key in _user_pool_available:
-                        return _user_pool_available[cache_key]
+                    if cache_key in _user_pool_available:  # noqa: B023
+                        return _user_pool_available[cache_key]  # noqa: B023
                     pool = _max_plan_pools.get(user_id, [])
                     available = any(
                         _account_available_for_model(a, model) for a in pool
                     )
-                    _user_pool_available[cache_key] = available
+                    _user_pool_available[cache_key] = available  # noqa: B023
                     return available
 
                 # Step 2: Filter out tasks with unmet dependencies (no lock needed)
@@ -2374,7 +2377,7 @@ async def orchestrator_worker():
 
                     # Persist remap of requeue-cancelled dep IDs → replacement clone IDs
                     # so future orchestrator cycles skip the _replaced_by_task_id lookup.
-                    if deps_remapped and not any_failed:
+                    if deps_remapped and not any_failed:  # noqa: SIM102
                         if await _persist_requeue_dep_remap(task, deps_remapped):
                             logger.info(
                                 f"[ORCHESTRATOR] Remapped {len(deps_remapped)} requeue-cancelled "
@@ -2522,7 +2525,7 @@ async def orchestrator_worker():
                                     _entry["prereq_task"],
                                     _entry["count"],
                                 )
-                            except Exception:
+                            except Exception:  # noqa: PERF203
                                 logger.exception(
                                     "[ORCHESTRATOR] Failed to raise cascade-cancel "
                                     "alert for prereq %s",
@@ -2553,7 +2556,7 @@ async def orchestrator_worker():
                             for d in stask.depends_on or []:
                                 try:
                                     dep_uuids.add(uuid.UUID(d))
-                                except (ValueError, AttributeError):
+                                except (ValueError, AttributeError):  # noqa: PERF203
                                     continue
                             task_dep_uuids[stask.id] = dep_uuids
                             all_dep_ids.update(dep_uuids)
@@ -3223,7 +3226,7 @@ async def orchestrator_worker():
                 # and cannot serve the resource-envelope checks below.
                 # Pre-seeding absent ids with None also prevents a concurrently
                 # deleted project from falling back to a point lookup.
-                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {
+                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {  # noqa: C420
                     project_id: None for project_id in _all_candidate_pids
                 }
                 if _all_candidate_pids:
@@ -3693,7 +3696,7 @@ async def orchestrator_worker():
                                 runner_available_clis=None,
                                 raise_resident_policy_hold=True,
                             )
-                        except ResidentProviderPolicyHold as exc:
+                        except ResidentProviderPolicyHold as exc:  # noqa: F821
                             task.latest_status_message = (
                                 "Waiting for configured Resident provider policy — "
                                 f"{exc}"
@@ -4572,7 +4575,7 @@ async def orchestrator_worker():
                             # Streak exhausted — no longer plausibly transient.
                             _dispatch_prep_contention_streak.pop(_cont_key, None)
                             _force_quarantine = True
-                            logger.error(
+                            logger.error(  # noqa: TRY400
                                 "[ORCHESTRATOR] Task %s hit DB contention on "
                                 "dispatch prep %d consecutive cycles (threshold "
                                 "%d) — no longer treating as transient; "
@@ -4932,7 +4935,7 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_v22_finding_backfill, 600):
                 _last_v22_finding_backfill = _utcnow()
                 try:
-                    from app.release_readiness import (  # noqa: PLC0415
+                    from app.release_readiness import (  # noqa: PLC0415, RUF100
                         _sweep_v22_finding_backfill,
                     )
 

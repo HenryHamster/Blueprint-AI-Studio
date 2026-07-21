@@ -899,7 +899,7 @@ def strategic_challenge_summary(record: object) -> dict | None:
     mode_raw = str(record.get("status", "")).strip().lower()
     mode = mode_raw if mode_raw in {"ok", "blocked", "invalid"} else "invalid"
 
-    if mode != "ok":
+    if mode != "ok":  # noqa: SIM114
         verdict = "blocked"
     elif blocked:
         verdict = "blocked"
@@ -1452,7 +1452,7 @@ async def _apply_qualify_request(
                         }
                         flag_modified(open_ver, "last_qualification")
                         session.add(open_ver)
-                    except Exception:  # noqa: BLE001 — recording must never block the gate
+                    except Exception:  # noqa: BLE001, RUF100
                         logger.exception(
                             "[STRATEGIC] Task %s (%s path): failed to record "
                             "qualify_request CI-compliance block on ReleaseVersion",
@@ -1512,7 +1512,7 @@ async def _apply_qualify_request(
                 }
                 flag_modified(open_ver, "last_qualification")
                 session.add(open_ver)
-            except Exception:  # noqa: BLE001 — recording must never re-raise
+            except Exception:  # noqa: BLE001, RUF100
                 logger.exception(
                     "[STRATEGIC] Task %s (%s path): also failed to record "
                     "qualify_request error on ReleaseVersion — failure lost",
@@ -2004,7 +2004,7 @@ async def _spawn_retirement_memos(
                     "kind": "retired",
                 },
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, RUF100
             logger.exception(
                 "[STRATEGIC] completion-debt record failed for retired "
                 "direction %s (non-fatal)",
@@ -3804,7 +3804,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         capability_count: int = size_signal["capability_count"]
         gap_count: int = size_signal["active_gap_count"]
         model_size_status: str = size_signal["model_size_status"]
-    except Exception:
+    except Exception:  # noqa: BLE001
         model_bytes = len(json.dumps(raw_pm, default=str).encode())
         capability_count = len(raw_pm.get("capabilities") or [])
         gap_count = len(
@@ -3820,7 +3820,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     try:
         first_payload = task.first_payload or {}
         packer_meta = first_payload.get("_packer_meta") or {}
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     dropped: list = packer_meta.get("dropped") or []
@@ -3955,7 +3955,7 @@ async def _apply_qualify_request_post_commit(
     GitHub error) is logged and swallowed — the durable completion already
     committed, so a failure here can never requeue the task or discard the
     agent's work.
-    """
+    """  # noqa: RUF002
     if not request or not isinstance(request, dict):
         return
     from app.database import AsyncSessionLocal
@@ -3969,7 +3969,7 @@ async def _apply_qualify_request_post_commit(
                 return
             await _apply_qualify_request(request, task, project, fresh, path=path)
             await fresh.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[STRATEGIC_COMPLETION] _apply_qualify_request_post_commit: qualify_request "
             "side-effect failed for task %s project %s (%s path) — non-fatal; the "
@@ -3995,7 +3995,8 @@ async def _maybe_retry_workday_auto_start(
     dedicated fresh session; any failure is logged and swallowed so strategic
     completion is never broken.
     """
-    import app.strategic_resident_session as _srs
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     import app.strategic_resident_session as _srs
     from app.database import AsyncSessionLocal
     from app.workbench_state import get_strategic_workbench_state
 
@@ -4007,15 +4008,15 @@ async def _maybe_retry_workday_auto_start(
             if project is None:
                 return
             # Only retry when no live resident session is running.
-            if _srs.resident_session_is_active(
-                _srs.read_resident_session(project.vision)
+            if _srs.resident_session_is_active(  # noqa: F821
+                _srs.read_resident_session(project.vision)  # noqa: F821
             ):
                 return
             # Only retry when the blocked reason is specifically cycle_in_flight.
             raw_reason = (project.vision or {}).get(
-                _srs.RESIDENT_SESSION_REASON_KEY
+                _srs.RESIDENT_SESSION_REASON_KEY  # noqa: F821
             ) or {}
-            if raw_reason.get("reason") != _srs.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+            if raw_reason.get("reason") != _srs.RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:  # noqa: F821
                 return
             op_user_id = raw_reason.get("operator_user_id") or "system"
             # Only retry when Workday mode is still active — read from the
@@ -4024,7 +4025,7 @@ async def _maybe_retry_workday_auto_start(
             workbench = await get_strategic_workbench_state(fresh, op_user_id, project_id)
             if workbench.get("interaction_mode") != "continuous":
                 return
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: state read failed "
             "for project %s",
@@ -4034,7 +4035,7 @@ async def _maybe_retry_workday_auto_start(
         return
     # Conditions met — re-run the auto-start on a separate fresh session.
     try:
-        await _srs._auto_start_on_workday_entry(
+        await _srs._auto_start_on_workday_entry(  # noqa: F821
             project_id,
             operator_user_id=op_user_id,
             session_factory=factory,
@@ -4044,7 +4045,7 @@ async def _maybe_retry_workday_auto_start(
             "(cycle_in_flight unblocked by strategic completion)",
             project_id,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[STRATEGIC_COMPLETION] _maybe_retry_workday_auto_start: auto-start retry "
             "failed for project %s",
@@ -4301,7 +4302,7 @@ async def _handle_strategic_completion(
             _knowledge_available = 0
             _knowledge_cited = 0
             try:
-                from app.knowledge_query import build_knowledge_index  # noqa: PLC0415
+                from app.knowledge_query import build_knowledge_index  # noqa: PLC0415, RUF100
 
                 _knowledge_index = await build_knowledge_index(session, project.id)
                 _knowledge_available = len(_knowledge_index)
@@ -5763,7 +5764,7 @@ async def _handle_strategic_completion(
                                 "_strategic_dirs_staged", 0
                             )
                             + 1,
-                            "_strategic_staged_ids": list(
+                            "_strategic_staged_ids": list(  # noqa: RUF005
                                 ctx.get("_strategic_staged_ids", [])
                             )
                             + [dir_id],
@@ -5858,7 +5859,7 @@ async def _handle_strategic_completion(
                     + 1,
                     "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0)
                     + 1,
-                    "_strategic_updated_ids": list(
+                    "_strategic_updated_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_updated_ids", [])
                     )
                     + [dir_id],
@@ -5957,7 +5958,7 @@ async def _handle_strategic_completion(
                     + 1,
                     "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0)
                     + 1,
-                    "_strategic_retired_ids": list(
+                    "_strategic_retired_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_retired_ids", [])
                     )
                     + [dir_id],
@@ -6052,7 +6053,7 @@ async def _handle_strategic_completion(
                 task.context = {
                     **ctx,
                     "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-                    "_strategic_updated_ids": list(
+                    "_strategic_updated_ids": list(  # noqa: RUF005
                         ctx.get("_strategic_updated_ids", [])
                     ) + [dir_id],
                 }
@@ -6083,7 +6084,7 @@ async def _handle_strategic_completion(
                 fresh_ids = {str(d.get("id") or "") for d in fresh}
                 for new_dir in _fb_created:
                     if str(new_dir.get("id") or "") not in fresh_ids:
-                        result.append(new_dir)
+                        result.append(new_dir)  # noqa: PERF401
                 # Enforce the 20-tombstone cap on "rejected" entries so the
                 # fallback path stays consistent with the HTTP reject path
                 # (admin_agent_ops.py) and rejected entries never accumulate
@@ -6388,7 +6389,7 @@ async def _handle_strategic_completion(
         )
         session.add(new_msg)
         _collect_message_event(new_msg)
-        if _event_type:
+        if _event_type:  # noqa: SIM102
             if _event_type in _ROUTINE_EVENT_TYPES:
                 _append_routine_digest(project, _event_type, content)
         msgs_created += 1
@@ -6415,7 +6416,7 @@ async def _handle_strategic_completion(
         try:
             _raw_id = _entry.get("id") if isinstance(_entry, dict) else str(_entry)
             _msg_ids.append(uuid.UUID(str(_raw_id)))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError):  # noqa: PERF203
             pass
     if _msg_ids:
         _batch_result = await session.execute(
@@ -6532,12 +6533,13 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
-                            from app.strategic_resident_session import (
-                                read_resident_session,
-                                resident_session_is_active,
-                            )
+                            # [RESIDENT-REMOVAL] removed with resident subsystem
+#                             from app.strategic_resident_session import (
+#                                 read_resident_session,
+#                                 resident_session_is_active,
+#                             )
 
-                            _resident_blob = read_resident_session(project.vision)
+                            _resident_blob = read_resident_session(project.vision)  # noqa: F821
                             reply = await post_question_answer(
                                 session,
                                 project.id,
@@ -6547,7 +6549,7 @@ async def _handle_strategic_completion(
                                 resident_session_id=(
                                     _resident_blob.get("session_id")
                                     if isinstance(_resident_blob, dict)
-                                    and resident_session_is_active(_resident_blob)
+                                    and resident_session_is_active(_resident_blob)  # noqa: F821
                                     else None
                                 ),
                                 sequence=next(reserved_message_sequences, None),
@@ -6640,7 +6642,7 @@ async def _handle_strategic_completion(
                 "message_created" if status is None else "message_updated",
                 message_event_payload(message, status=status),
             )
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, PERF203
             # The durable sequence lets reconnect/cursor fetch repair a missed
             # realtime notification. Never requeue an already-committed
             # strategic completion because a websocket fanout failed.

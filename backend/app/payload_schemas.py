@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid
+import uuid  # noqa: F401
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -332,7 +332,7 @@ class AcceptanceEvidence(BaseModel):
     (empty descriptions, a ``test`` path that is not a test file, placeholders
     like ``test_true`` / ``assert True``) are rejected here, fail-closed, so the
     declaration cannot be gamed at validation time.
-    """
+    """  # noqa: RUF002
 
     model_config = ConfigDict(extra="forbid")
 
@@ -403,13 +403,13 @@ class AcceptanceEvidence(BaseModel):
             if self.viewport_width is None:
                 raise ValueError(
                     "visual acceptance_evidence requires viewport_width to be set "
-                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"
+                    f"(must be an integer in {VIEWPORT_WIDTH_MIN}–{VIEWPORT_WIDTH_MAX})"  # noqa: RUF001
                 )
         elif self.kind == "coverage_delta":
             if self.threshold is None:
                 raise ValueError(
                     "coverage_delta acceptance_evidence requires a numeric "
-                    "threshold (coverage percentage 0–100)"
+                    "threshold (coverage percentage 0–100)"  # noqa: RUF001
                 )
         return self
 
@@ -709,81 +709,6 @@ class StrategicReviewPayload(_SystemPopulated):
     resident_exam_leads: list[dict[str, Any]] | None = None
 
 
-class StrategicResidentTurnPayload(BasePayload):
-    """Bounded cursor-only input identity for one Resident turn.
-
-    Raw conversation text and evidence never ride in Task.payloads/context. The
-    worker reconstructs them from the durable checkpoint and the revisioned
-    sequence/cursor bounds below.
-    """
-
-    resident_id: str = Field(..., min_length=36, max_length=36)
-    lane: Literal["interactive", "background"]
-    authority_generation: int = Field(..., ge=1)
-    engine_owner: Literal["legacy", "strategic_resident"] = "legacy"
-    shadow_only: bool = True
-    trigger_kind: Literal[
-        "operator_message",
-        "project_change",
-        "deadline",
-        "follow_up",
-        "migration_shadow",
-    ]
-    trigger_count: int = Field(default=1, ge=1, le=10_000)
-    message_sequence_start: int | None = Field(default=None, ge=1)
-    message_sequence_end: int | None = Field(default=None, ge=1)
-    project_change_cursor: dict[str, int | str | None] | None = None
-    checkpoint_version: int = Field(..., ge=1)
-    checkpoint_hash: str = Field(
-        ...,
-        min_length=64,
-        max_length=64,
-        pattern=r"^[0-9a-f]{64}$",
-    )
-    manifest_version: Literal["resident-turn-input-v1"] = "resident-turn-input-v1"
-
-    @model_validator(mode="after")
-    def _validate_cursor_bounds(self) -> "StrategicResidentTurnPayload":
-        start = self.message_sequence_start
-        end = self.message_sequence_end
-        if (start is None) != (end is None):
-            raise ValueError(
-                "message_sequence_start and message_sequence_end must be supplied together"
-            )
-        if start is not None and end is not None and end < start:
-            raise ValueError("message_sequence_end must be >= message_sequence_start")
-        if self.lane == "interactive" and start is None:
-            raise ValueError("interactive Resident turns require a message sequence range")
-        cursor = self.project_change_cursor
-        if cursor is not None:
-            if len(cursor) > 16:
-                raise ValueError("project_change_cursor may contain at most 16 keys")
-            for key, value in cursor.items():
-                if not isinstance(key, str) or not key or len(key) > 80:
-                    raise ValueError(
-                        "project_change_cursor keys must be non-empty strings up to 80 characters"
-                    )
-                if isinstance(value, bool):
-                    raise ValueError("project_change_cursor boolean values are not allowed")
-                if isinstance(value, int) and value < 0:
-                    raise ValueError(
-                        "project_change_cursor integer values must be non-negative"
-                    )
-                if isinstance(value, str) and len(value) > 160:
-                    raise ValueError(
-                        "project_change_cursor string values may contain at most 160 characters"
-                    )
-        return self
-
-    @field_validator("resident_id")
-    @classmethod
-    def _canonical_resident_id(cls, value: str) -> str:
-        try:
-            return str(uuid.UUID(value))
-        except (TypeError, ValueError, AttributeError) as exc:
-            raise ValueError("resident_id must be a canonical UUID") from exc
-
-
 class DesignDocUpdatePayload(_SystemPopulated):
     design_doc: dict[str, Any] | None = None
     vision: dict[str, Any] | None = None
@@ -961,7 +886,7 @@ class ComputeSuccessCriterion(BaseModel):
     min_file_count: int = 1
 
     @model_validator(mode="after")
-    def _check_kind_fields(self) -> "ComputeSuccessCriterion":
+    def _check_kind_fields(self) -> "ComputeSuccessCriterion":  # noqa: UP037
         if self.kind == "metric":
             if not isinstance(self.metric, str) or not self.metric.strip():
                 raise ValueError("metric is required and non-empty when kind='metric'")
@@ -1319,7 +1244,8 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     TaskType.fix: FixPayload,
     TaskType.research: ResearchPayload,
     TaskType.strategic_review: StrategicReviewPayload,
-    TaskType.strategic_resident_turn: StrategicResidentTurnPayload,
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+    # TaskType.strategic_resident_turn: StrategicResidentTurnPayload,
     TaskType.design_doc_update: DesignDocUpdatePayload,
     TaskType.security_audit: SecurityAuditPayload,
     TaskType.qa: QAPayload,

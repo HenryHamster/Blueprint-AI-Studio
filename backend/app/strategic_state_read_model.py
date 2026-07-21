@@ -22,14 +22,15 @@ from app.models import (
 from app import strategic_cycle
 from app.shared_state import runtime_config
 from app.strategic_constants import STATUS_LATEST_MESSAGE_MAX
-from app.strategic_resident_session import (
-    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
-    RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
-    RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
-    STRATEGIC_SESSION_ENABLED_SETTING,
-    read_resident_session_blocked_reason,
-    resident_session_snapshot,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_session import (
+#     RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+#     RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
+#     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
+#     STRATEGIC_SESSION_ENABLED_SETTING,
+#     read_resident_session_blocked_reason,
+#     resident_session_snapshot,
+# )
 from app.task_movement import build_task_movement_explanation
 
 TASK_FOCUS_BUCKET_LIMIT = 8
@@ -567,7 +568,7 @@ def _resident_session_summary(project: Project) -> Dict[str, Any] | None:
     the strategic-state read model can tell whether a resident session is active
     and its status. Returns ``None`` when no session record exists.
     """
-    return resident_session_snapshot(project.vision)
+    return resident_session_snapshot(project.vision)  # noqa: F821
 
 
 def _resident_session_available() -> bool:
@@ -578,7 +579,7 @@ def _resident_session_available() -> bool:
     UI can hide the Start affordance when the feature is off, instead of letting
     a click 403 at the start endpoint.
     """
-    return bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
+    return bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))  # noqa: F821
 
 
 def _resident_session_has_begun_streaming(snapshot: Dict[str, Any] | None) -> bool:
@@ -673,17 +674,17 @@ def _resident_session_availability(
     runner later attaches) and reports ``ready`` instead of a phantom "blocked: no
     runner" with a runner plainly attached.
     """
-    enabled = bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
-    snapshot = resident_session_snapshot(project.vision)
+    enabled = bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))  # noqa: F821
+    snapshot = resident_session_snapshot(project.vision)  # noqa: F821
     active = bool(
         isinstance(snapshot, dict)
         and snapshot.get("status") == "active"
         and not snapshot.get("stop_requested")
     )
-    recorded_reason = read_resident_session_blocked_reason(project.vision)
+    recorded_reason = read_resident_session_blocked_reason(project.vision)  # noqa: F821
     recorded_start_failed = bool(
         recorded_reason
-        and recorded_reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
+        and recorded_reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)  # noqa: F821
     )
     has_live_runner = (
         eligible_live_runner_count is not None and eligible_live_runner_count > 0
@@ -706,14 +707,14 @@ def _resident_session_availability(
         # agent not yet streaming) from a genuinely ``active`` session.
         if _resident_selected_runner_offline(snapshot, runner_options):
             state = "blocked"
-            reason = RESIDENT_SESSION_REASON_RUNNER_OFFLINE
+            reason = RESIDENT_SESSION_REASON_RUNNER_OFFLINE  # noqa: F821
         else:
             state = (
                 "active"
                 if _resident_session_has_begun_streaming(snapshot)
                 else "starting"
             )
-    elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+    elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:  # noqa: F821
         # A batch strategic cycle is in flight — not an error, just a transient
         # wait. The completion handler re-tries the auto-start when the blocking
         # cycle finishes, so this resolves on its own. Slot before the
@@ -905,7 +906,7 @@ async def _integrity_conflict_trend(
             session, project_id, limit=limit
         )
     except Exception:
-        import logging  # noqa: PLC0415
+        import logging  # noqa: PLC0415, RUF100
         logging.getLogger(__name__).exception(
             "[STRATEGIC_STATE] integrity_conflict_trend query failed for project %s",
             project_id,

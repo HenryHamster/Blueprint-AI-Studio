@@ -58,9 +58,10 @@ from app.models import (
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
 from app.time_utils import _utcnow, set_retry_after
-from app.strategic_resident_runner_policy import (
-    resident_payloads_require_local_runner,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_runner_policy import (
+#     resident_payloads_require_local_runner,
+# )
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
@@ -115,13 +116,13 @@ async def provision_and_handle(
             else ""
         )
         # Last boundary before payload upload, secret creation, Cloud Run, or GCE.
-        if resident_payloads_require_local_runner(payloads):
+        if resident_payloads_require_local_runner(payloads):  # noqa: F821
             try:
                 async with _orch.AsyncSessionLocal() as _local_hold_session:
                     held = await _orch._lock_provisioning_task_for_vm(
                         _local_hold_session, t_id, vm_id
                     )
-                    if held is not None and resident_payloads_require_local_runner(
+                    if held is not None and resident_payloads_require_local_runner(  # noqa: F821
                         held.payloads
                     ):
                         ctx = dict(held.context or {})

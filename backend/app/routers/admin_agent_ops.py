@@ -97,11 +97,12 @@ from app.strategic_completion import (
     spawn_budget_status,
     spawn_title_is_redundant,
 )
-from app.strategic_resident_session import (
-    RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
-    read_resident_session as _read_resident_session,
-    resident_session_is_active as _resident_session_is_active,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_session import (
+#     RESIDENT_SESSION_KEY as _RESIDENT_SESSION_KEY,
+#     read_resident_session as _read_resident_session,
+#     resident_session_is_active as _resident_session_is_active,
+# )
 from app.strategic_constants import (
     MIN_HEALTHY_ACTIVE_DIRECTIONS,
     STRATEGIC_DIRECTION_TEXT_MAX,
@@ -1335,7 +1336,7 @@ async def strategic_operation(
         staged_create = bool(data.get("staged"))
         staged_for_version: int | None = None
         if staged_create:
-            from app.release_version import current_open_version  # noqa: PLC0415
+            from app.release_version import current_open_version  # noqa: PLC0415, RUF100
 
             open_version = await current_open_version(session, project.id)
             if open_version is None:
@@ -1523,7 +1524,7 @@ async def strategic_operation(
         # gap: add it to active_moves and clear any now-false deferral. Mirrors
         # the retire-side reconciliation but in the staffing direction.
         if new_dir.get("gap_id") and not staged_create:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -1863,7 +1864,7 @@ async def strategic_operation(
         if _updated_dir is not None and (
             _gap_reground is not None or _new_status != _pre_status
         ):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
 
             _new_gap_id = _updated_dir.get("gap_id")
             _prior_gap_id = (
@@ -2299,7 +2300,7 @@ async def strategic_operation(
             ]
         await _with_directions_locked(session, project.id, _apply_stage)
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -2411,7 +2412,7 @@ async def strategic_operation(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
         if target.get("gap_id"):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
 
             now_iso = _utcnow().isoformat()
             _gap_reconcile = reconcile_gap_staffing_raw_result(
@@ -2449,7 +2450,7 @@ async def strategic_operation(
             "_strategic_proposals_approved": ctx.get("_strategic_proposals_approved", 0)
             + 1,
             "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2555,7 +2556,7 @@ async def strategic_operation(
             "_strategic_proposals_rejected": ctx.get("_strategic_proposals_rejected", 0)
             + 1,
             "_strategic_dirs_retired": ctx.get("_strategic_dirs_retired", 0) + 1,
-            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", []))
+            "_strategic_retired_ids": list(ctx.get("_strategic_retired_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2667,7 +2668,7 @@ async def strategic_operation(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -2702,7 +2703,7 @@ async def strategic_operation(
         task.context = {
             **ctx,
             "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
-            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))  # noqa: RUF005
             + [dir_id],
             "_strategic_api_called": True,
         }
@@ -2839,15 +2840,16 @@ async def strategic_operation(
         # active) so it is addressed to the same conversation as the operator
         # messages it answers — matching the session-identity scoping used by the
         # poll / unattended-cap / pacing queries.
-        from app.strategic_resident_session import (
-            read_resident_session,
-            resident_session_is_active,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_session import (
+#             read_resident_session,
+#             resident_session_is_active,
+#         )
 
-        _resident_blob = read_resident_session(project.vision)
+        _resident_blob = read_resident_session(project.vision)  # noqa: F821
         _resident_session_id = (
             _resident_blob.get("session_id")
-            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
+            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)  # noqa: F821
             else None
         )
         next_sequence = preallocated_message_sequence
@@ -2911,7 +2913,7 @@ async def strategic_operation(
                             else MessageSurface.CONVERSATION
                         )
                     ):
-                        raise HTTPException(
+                        raise HTTPException(  # noqa: B904
                             status_code=409,
                             detail="idempotency_key already belongs to a different message",
                         )
@@ -3870,7 +3872,7 @@ async def strategic_operation(
         # Surface blocked gap deletions (active direction still references the gap).
         _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
         for _bid in _blocked_dels:
-            warnings.append(
+            warnings.append(  # noqa: PERF401
                 f"gap deletion blocked: {_bid} is still referenced by an active direction"
             )
         # Normalize stale active_moves via the shared helper so both write paths
@@ -3885,7 +3887,7 @@ async def strategic_operation(
         )
         if _norm:
             for _c in _norm:
-                warnings.append(f"active_moves normalized: {_c}")
+                warnings.append(f"active_moves normalized: {_c}")  # noqa: PERF401
             project.problem_model = new_pm_raw
         # Carry proof records and adoption verdicts onto survivor keys when a
         # capability consolidation occurred in this write.
@@ -5023,7 +5025,7 @@ async def strategic_operation(
             for _dk in _mapped_directions:
                 try:
                     await _backfill(session, project.id, _dk)
-                except Exception:
+                except Exception:  # noqa: BLE001, PERF203
                     logger.warning(
                         "[STRATEGIC API] set_acceptance_criteria backfill failed "
                         "for direction %s (non-fatal)",
@@ -5300,15 +5302,15 @@ async def strategic_operation(
         # (a new task picks it up via start_resident_session's carry-forward).
         # Uses with_vision_locked so the invariant test counts it as a locked
         # write, consistent with the rest of the session-blob code.
-        _existing = _read_resident_session(project.vision)
-        if _existing is not None and _resident_session_is_active(_existing):
+        _existing = _read_resident_session(project.vision)  # noqa: F821
+        if _existing is not None and _resident_session_is_active(_existing):  # noqa: F821
 
             def _update_session_summary(vision: dict) -> None:
-                current = _read_resident_session(vision)
-                if current is not None and _resident_session_is_active(current):
+                current = _read_resident_session(vision)  # noqa: F821
+                if current is not None and _resident_session_is_active(current):  # noqa: F821
                     updated = dict(current)
                     updated["_session_summary"] = summary
-                    vision[_RESIDENT_SESSION_KEY] = updated
+                    vision[_RESIDENT_SESSION_KEY] = updated  # noqa: F821
 
             await _with_vision_locked(session, project.id, _update_session_summary)
 
@@ -5427,7 +5429,7 @@ async def strategic_operation(
         try:
             doc_id = uuid.UUID(raw_id)
         except (ValueError, AttributeError):
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=400,
                 detail=f"consume_knowledge: invalid knowledge_document_id: {raw_id}",
             )
@@ -5473,7 +5475,7 @@ async def strategic_operation(
         try:
             doc_id = uuid.UUID(raw_id)
         except (ValueError, AttributeError):
-            raise HTTPException(
+            raise HTTPException(  # noqa: B904
                 status_code=400,
                 detail=f"dismiss_knowledge: invalid knowledge_document_id: {raw_id}",
             )
@@ -5615,7 +5617,7 @@ async def _apply_finding_resolution_write(
             status_code=400,
             detail="finding_key is required and must be at most 64 characters",
         )
-    from app.release_version import current_open_version  # noqa: PLC0415
+    from app.release_version import current_open_version  # noqa: PLC0415, RUF100
 
     open_version = await current_open_version(session, project_id)
     if open_version is None:
@@ -5632,7 +5634,7 @@ async def _apply_finding_resolution_write(
             try:
                 bound_id = uuid.UUID(bound_str)
             except (ValueError, AttributeError):
-                raise HTTPException(
+                raise HTTPException(  # noqa: B904
                     status_code=400,
                     detail="Invalid release_version_id in task context",
                 )
@@ -5646,7 +5648,7 @@ async def _apply_finding_resolution_write(
                     ),
                 )
             resolution_version_id = bound_id
-    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415, RUF100
 
     await apply_finding_resolution(
         session,

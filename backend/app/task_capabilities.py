@@ -21,7 +21,6 @@ class TaskType(str, Enum):
     plan = "plan"
     research = "research"
     strategic_review = "strategic_review"
-    strategic_resident_turn = "strategic_resident_turn"
     design_doc_update = "design_doc_update"
     security_audit = "security_audit"
     qa = "qa"
@@ -351,24 +350,6 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         completion_needs_locked_project=True,
         strategic_phase="phase2",
         evaluation="forward-quality",
-    ),
-    TaskCapability(
-        TaskType.strategic_resident_turn,
-        "Resident Turn",
-        "read_only",
-        execution_owner="agent",
-        default_category="strategic",
-        provider_configurable=True,
-        filter_visible=False,
-        description=(
-            "Run one bounded, checkpoint-derived provider-only Resident turn."
-        ),
-        run_shape="single_agent",
-        output_kind="knowledge",
-        requires_code=False,
-        evaluation_strategy="review_only",
-        cost_ceiling_usd=4.0,
-        evaluation="none",
     ),
     TaskCapability(
         TaskType.design_doc_update,
@@ -1003,7 +984,7 @@ STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
 # Dispatch compatibility is intentionally distinct from legacy strategic-cycle
 # completion membership and its Project lock/handler semantics.
 STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = frozenset(
-    {*STRATEGIC_TASK_TYPES, TaskType.strategic_resident_turn.value}
+    {*STRATEGIC_TASK_TYPES}
 )
 # Default autonomous spawn-budget categories. Runtime config may override these
 # sets, but defaults stay registry-owned so new task types are classified from
@@ -1043,7 +1024,6 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
-        TaskType.strategic_resident_turn.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering

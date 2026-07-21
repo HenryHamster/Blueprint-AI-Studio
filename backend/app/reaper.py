@@ -87,10 +87,12 @@ from app.time_utils import (
 )
 from app.reaper_infra_recovery import run_infra_recovery_and_hold_maintenance
 from app.reaper_post_orphan_sweep import run_post_orphan_sweep
-from app.strategic_resident_failure_recovery import (
-    reap_authoritative_resident_turn,
-)
-from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_failure_recovery import (
+#     reap_authoritative_resident_turn,
+# )
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_turns import STRATEGIC_RESIDENT_TURN_TASK_TYPE
 
 logger = logging.getLogger(__name__)
 
@@ -323,18 +325,23 @@ from app.reaper_sweeps import (
     _sweep_strategic_cycle_starvation,
 )
 from app.acceptance_gate import backfill_acceptance_verdicts
-from app.strategic_resident_shadow import sweep_shadow_resident_turns
-from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
-from app.strategic_resident_project_change_sweep import (
-    sweep_durable_project_change_wakeups,
-)
-from app.strategic_resident_activation_sweep import (
-    sweep_missing_background_activation_wakeups,
-)
-from app.strategic_resident_wakeups import (
-    sweep_due_authoritative_resident_wakeups,
-    sweep_pending_worker_proposal_wakeups,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_shadow import sweep_shadow_resident_turns
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_cleanup import sweep_resident_transition_cleanup
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_project_change_sweep import (
+#     sweep_durable_project_change_wakeups,
+# )
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_activation_sweep import (
+#     sweep_missing_background_activation_wakeups,
+# )
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_wakeups import (
+#     sweep_due_authoritative_resident_wakeups,
+#     sweep_pending_worker_proposal_wakeups,
+# )
 
 
 async def _mark_landed_parent_dependents(parent_id, session) -> None:
@@ -1072,7 +1079,7 @@ async def reaper_service():
                         is_resident_reap = bool(
                             fresh_task.status == TaskStatus.IN_PROGRESS
                             and resident_payload.get("type")
-                            == STRATEGIC_RESIDENT_TURN_TASK_TYPE
+                            == STRATEGIC_RESIDENT_TURN_TASK_TYPE  # noqa: F821
                             and resident_payload.get("shadow_only") is False
                         )
 
@@ -1268,7 +1275,7 @@ async def reaper_service():
                             # Project -> Resident -> Task -> Receipt order.
                             await session.rollback()
                             session.expire_all()
-                            mutation = await reap_authoritative_resident_turn(
+                            mutation = await reap_authoritative_resident_turn(  # noqa: F821
                                 session,
                                 project_id=resident_project_id,
                                 task_id=task_id,
@@ -2785,7 +2792,7 @@ async def reaper_service():
                 # Step 7a: project backend-only Resident shadow turns. This is a
                 # deterministic bounded projection with zero model calls.
                 try:
-                    await sweep_shadow_resident_turns(
+                    await sweep_shadow_resident_turns(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         now=now,
                         batch_size=32,
@@ -2798,7 +2805,7 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
                 try:
-                    await sweep_resident_transition_cleanup(
+                    await sweep_resident_transition_cleanup(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         batch_size=32,
                     )
@@ -2810,7 +2817,7 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
                 try:
-                    await sweep_missing_background_activation_wakeups(
+                    await sweep_missing_background_activation_wakeups(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         now=now,
                         batch_size=32,
@@ -2821,7 +2828,7 @@ async def reaper_service():
                         exc_info=True,
                     )
                 try:
-                    await sweep_due_authoritative_resident_wakeups(
+                    await sweep_due_authoritative_resident_wakeups(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         now=now,
                         batch_size=32,
@@ -2834,7 +2841,7 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
                 try:
-                    await sweep_pending_worker_proposal_wakeups(
+                    await sweep_pending_worker_proposal_wakeups(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         now=now,
                         batch_size=32,
@@ -2847,7 +2854,7 @@ async def reaper_service():
                     with contextlib.suppress(Exception):
                         await session.rollback()
                 try:
-                    await sweep_durable_project_change_wakeups(
+                    await sweep_durable_project_change_wakeups(  # noqa: F821
                         session_factory=AsyncSessionLocal,
                         now=now,
                         batch_size=32,

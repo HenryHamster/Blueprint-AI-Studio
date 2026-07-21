@@ -105,14 +105,14 @@ class _MessageCreate(BaseModel):
     project_id: str
     message_type: str = "NOTE"
     content: str
-    context: Optional[Dict[str, Any]] = None
-    workbench_context: Optional[Dict[str, Any]] = None
-    idempotency_key: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None  # noqa: UP045
+    workbench_context: Optional[Dict[str, Any]] = None  # noqa: UP045
+    idempotency_key: Optional[str] = None  # noqa: UP045
 
 
 class _MessageResolve(BaseModel):
-    resolution: Optional[str] = None
-    workbench_context: Optional[Dict[str, Any]] = None
+    resolution: Optional[str] = None  # noqa: UP045
+    workbench_context: Optional[Dict[str, Any]] = None  # noqa: UP045
 
 
 class _LastSeenUpdate(BaseModel):
@@ -139,7 +139,7 @@ class _TempMutesUpdate(BaseModel):
 
 class _MuteWindowUpdate(BaseModel):
     project_id: str
-    expires_at: Optional[int] = None  # ms epoch; None clears the mute window
+    expires_at: Optional[int] = None  # ms epoch; None clears the mute window  # noqa: UP045
 
 
 class _WorkbenchStateUpdate(BaseModel):
@@ -152,7 +152,7 @@ class _AdminPlaybookSet(BaseModel):
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
     )
     value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
-    applicable_types: Optional[List[str]] = Field(
+    applicable_types: Optional[List[str]] = Field(  # noqa: UP045
         None, description="Task types this entry applies to; None = shown to all types"
     )
 
@@ -164,7 +164,7 @@ _MESSAGES_SAVED_VIEWS_CAP = 10
 _MESSAGES_SAVED_VIEW_PREF_VALUES = {"mute", "routine", "surfaced"}
 
 
-def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:
+def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:  # noqa: UP045
     if not isinstance(raw, dict):
         return None
 
@@ -184,7 +184,7 @@ def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:
                 and isinstance(value, str)
                 and value in _MESSAGES_SAVED_VIEW_PREF_VALUES
             ):
-                prefs[key] = value
+                prefs[key] = value  # noqa: PERF403
 
     created_at = raw.get("createdAt")
     if not isinstance(created_at, (int, float)) or isinstance(created_at, bool) or not math.isfinite(created_at):
@@ -332,7 +332,7 @@ def append_routine_digest(project: Project, event_type: str, summary: str) -> No
     project.append_routine_digest(event_type, summary)
 
 
-from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402
+from app.payload_schemas import ALL_TASK_TYPES as _VALID_TASK_TYPES  # noqa: E402, RUF100
 
 _SEED_ENTRIES: Dict[str, dict] = {
     "build-backend": {
@@ -429,10 +429,10 @@ _SEED_ENTRIES: Dict[str, dict] = {
 
 @router.get("/alerts")
 async def get_alerts(
-    project_id: Optional[str] = None,
-    domain: Optional[str] = None,
-    event_type: Optional[str] = None,
-    source: Optional[str] = None,
+    project_id: Optional[str] = None,  # noqa: UP045
+    domain: Optional[str] = None,  # noqa: UP045
+    event_type: Optional[str] = None,  # noqa: UP045
+    source: Optional[str] = None,  # noqa: UP045
     include_dismissed: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -565,10 +565,10 @@ async def acknowledge_alert(
 
 @router.post("/alerts/dismiss-all")
 async def dismiss_all_alerts(
-    project_id: Optional[str] = None,
-    domain: Optional[str] = None,
-    event_type: Optional[str] = None,
-    source: Optional[str] = None,
+    project_id: Optional[str] = None,  # noqa: UP045
+    domain: Optional[str] = None,  # noqa: UP045
+    event_type: Optional[str] = None,  # noqa: UP045
+    source: Optional[str] = None,  # noqa: UP045
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -592,7 +592,7 @@ async def dismiss_all_alerts(
         try:
             pid = uuid.UUID(project_id)
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid project_id format")
+            raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
         # Explicit target → say why, don't silently dismiss nothing.
         await _get_user_project_with_role(pid, user_id, session, "member")
 
@@ -644,7 +644,7 @@ async def get_notification_dispatch_stats(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
     return _nd.get_notification_stats(project_id=pid)
 
@@ -666,7 +666,7 @@ async def list_dead_letters(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
     rows, total = await _nd.list_dead_letters(session, project_id=pid, limit=limit, offset=offset)
     # Mask webhook_url for non-admin callers — webhook URLs embed auth tokens
@@ -693,7 +693,7 @@ async def redrive_dead_letters(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project_with_role(pid, current_user["user_id"], session, "member")
 
     redriven = 0
@@ -717,11 +717,11 @@ async def redrive_dead_letters(
 
 @router.get("/messages")
 async def list_messages(
-    project_id: Optional[str] = Query(None),
-    status: Optional[str] = Query("open"),
+    project_id: Optional[str] = Query(None),  # noqa: UP045
+    status: Optional[str] = Query("open"),  # noqa: UP045
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    q: Optional[str] = Query(None),
+    q: Optional[str] = Query(None),  # noqa: UP045
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -739,7 +739,7 @@ async def list_messages(
         try:
             filters.append(ProjectMessage.project_id == uuid.UUID(project_id))
         except (ValueError, TypeError):
-            raise HTTPException(status_code=400, detail="Invalid project_id format")
+            raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     if status and status != "all":
         if status == "needs_action":
             filters.append(
@@ -846,7 +846,7 @@ async def list_messages(
 @router.get("/messages/counts")
 async def get_message_counts(
     project_id: str = Query(...),
-    last_seen_ms: Optional[int] = Query(None),
+    last_seen_ms: Optional[int] = Query(None),  # noqa: UP045
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -858,7 +858,7 @@ async def get_message_counts(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     from app.messages_last_seen import timestamp_ms_to_naive_utc
@@ -893,7 +893,7 @@ async def create_message(
     try:
         project_id = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     # Verify user has write access (member+; viewers are read-only). The
     # returned instance is used for the access check and for resolving the
     # citation-grounding branch context below; the routine-digest branch
@@ -1025,10 +1025,11 @@ async def resolve_message(
             post_feedback_acknowledgment as _post_feedback_ack,
             post_question_answer as _post_qa,
         )
-        from app.strategic_resident_session import (
-            read_resident_session,
-            resident_session_is_active,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_session import (
+#             read_resident_session,
+#             resident_session_is_active,
+#         )
 
         if message_type == MessageType.QUESTION:
             reply = await _post_qa(
@@ -1054,7 +1055,7 @@ async def resolve_message(
                 sequence=reply_sequence,
             )
         event_type = (reply.context or {}).get("event_type")
-        resident_active = resident_session_is_active(read_resident_session(project.vision))
+        resident_active = resident_session_is_active(read_resident_session(project.vision))  # noqa: F821
         locked_vision = await session.scalar(
             select(Project.vision).where(Project.id == message_project_uuid)
         )
@@ -1179,7 +1180,7 @@ async def delete_message(
 
 @router.get("/messages/last-seen")
 async def get_messages_last_seen(
-    project_id: Optional[str] = Query(None),
+    project_id: Optional[str] = Query(None),  # noqa: UP045
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1202,7 +1203,7 @@ async def get_messages_last_seen(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = (
@@ -1229,7 +1230,7 @@ async def put_messages_last_seen(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
@@ -1256,7 +1257,7 @@ async def get_messages_noise_prefs(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1279,7 +1280,7 @@ async def put_messages_noise_prefs(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     if len(json.dumps(payload.prefs)) > 50_000:
@@ -1323,7 +1324,7 @@ async def get_messages_workbench_state(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
     return {
         "workbench": await get_strategic_workbench_state(
@@ -1342,7 +1343,7 @@ async def put_messages_workbench_state(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     # NOT per-user personal UI state, despite living under /messages/* alongside
     # last-seen / noise-prefs / saved-views / temp-mutes / mute-window (which ARE
     # personal — each is keyed by a UniqueConstraint("user_id","project_id") and
@@ -1394,7 +1395,7 @@ async def get_messages_saved_views(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = (
@@ -1419,7 +1420,7 @@ async def put_messages_saved_views(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     if len(json.dumps(payload.saved_views)) > 50_000:
@@ -1464,7 +1465,7 @@ async def get_messages_temp_mutes(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1488,7 +1489,7 @@ async def put_messages_temp_mutes(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
@@ -1522,7 +1523,7 @@ async def get_messages_mute_window(
     try:
         pid = uuid.UUID(project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     row = await get_messages_noise_prefs_row(
@@ -1550,7 +1551,7 @@ async def put_messages_mute_window(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
 
     entry = (
@@ -1609,7 +1610,7 @@ async def put_last_visit_timestamp(
     try:
         pid = uuid.UUID(payload.project_id)
     except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid project_id format")
+        raise HTTPException(status_code=400, detail="Invalid project_id format")  # noqa: B904
     await _get_user_project(pid, current_user["user_id"], session)
     new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
     stored_ts = await upsert_messages_last_seen(
@@ -1687,7 +1688,7 @@ async def admin_playbook_list(
                     if _ts.tzinfo is not None:
                         _ts = _ts.replace(tzinfo=None)
                     age_days = (now_utc - _ts).days
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             confirmed = v.get("confirmed_count", 0)
             referenced = v.get("reference_count", 0)

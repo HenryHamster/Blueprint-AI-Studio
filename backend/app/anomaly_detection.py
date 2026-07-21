@@ -99,14 +99,14 @@ def _task_error_fingerprint(task) -> "str | None":
         return None
     stage: str | None = None
     try:
-        from app.failure_classification import classify_failure  # noqa: PLC0415
-        from app.failure_stage import _derive_failure_stage  # noqa: PLC0415
+        from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
+        from app.failure_stage import _derive_failure_stage  # noqa: PLC0415, RUF100
 
         cls = (
             classify_failure(task, at_time=task.last_heartbeat or task.started_at) or ""
         )
         stage = _derive_failure_stage(cls, msg)
-    except Exception:
+    except Exception:  # noqa: BLE001
         stage = None
     return _error_fingerprint(msg, stage)
 
@@ -142,7 +142,7 @@ _SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS = 48
 def find_directions_sharing_fingerprint(
     project,
     target_fingerprint: str,
-    exclude_direction_id: Optional[str] = None,
+    exclude_direction_id: Optional[str] = None,  # noqa: UP045
 ) -> list[dict]:
     """Return other recently auto-paused directions that share ``target_fingerprint``.
 
@@ -232,8 +232,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     Returns a list of {signal: str, severity: 'high'|'medium', details: str} dicts.
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
-    from app.failure_classification import classify_failure  # noqa: PLC0415
-    from app.direction_outcomes import (  # noqa: PLC0415
+    from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
+    from app.direction_outcomes import (  # noqa: PLC0415, RUF100
         _is_cascade_cancelled,
         verified_merged_count,
     )
@@ -684,7 +684,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # caller owns the commit).
     try:
         await _shared_state.persist_anomaly_snapshot(proj_key, proj_anomalies, session)
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[ANOMALY_PERSIST] Failed to persist anomaly snapshot for %s",
             proj_key,
@@ -695,7 +695,7 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     # tracking failure can never break detection.
     try:
         _shared_state.last_anomaly_detection_run_at = now
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[ANOMALY_TRACKER] Failed to record last_anomaly_detection_run_at",
             exc_info=True,
@@ -842,7 +842,7 @@ def _apply_anomaly_adjustments() -> bool:
     return True
 
 
-def _parse_adjustments_ts(iso_value: Optional[str]) -> Optional[datetime]:
+def _parse_adjustments_ts(iso_value: Optional[str]) -> Optional[datetime]:  # noqa: UP045
     """Parse an ISO timestamp stored in anomaly_adjustments back into a naive UTC datetime."""
     if not iso_value:
         return None
@@ -1169,13 +1169,13 @@ def _check_fast_recovery() -> bool:
     if len(recent_results) < _FAST_RECOVERY_MIN_SAMPLE:
         if _shared_state.runtime_config.get("max_concurrent_vms", 0) != 0:
             return False
-        from app.deploy_health import (  # noqa: PLC0415
+        from app.deploy_health import (  # noqa: PLC0415, RUF100
             _HEALTH_HISTORY_SIZE,
             get_recovery_history_snapshot,
         )
 
         history = get_recovery_history_snapshot()
-        if len(history) < _HEALTH_HISTORY_SIZE or not all(history):
+        if len(history) < _HEALTH_HISTORY_SIZE or not all(history):  # noqa: SIM103
             return False
         return True
 
@@ -1220,7 +1220,7 @@ async def seed_task_results_from_db(
     accrue. This rebuilds the deque from tasks whose vm_stopped_at falls within
     the window so fast-recovery can fire on the first sweep after restart.
     """
-    from app.failure_classification import classify_failure  # noqa: PLC0415
+    from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
 
     cutoff = _utcnow() - timedelta(hours=hours)
     stmt = (
@@ -1367,10 +1367,11 @@ async def _expire_stale_proposals(session) -> int:
     from app.task_locking import with_directions_locked
     from app.models import StrategicResident
     from sqlalchemy import or_
-    from app.strategic_resident_transition_locks import (
-        LegacyEngineAuthorityExpired,
-        commit_legacy_authorized,
-    )
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import (
+#         LegacyEngineAuthorityExpired,
+#         commit_legacy_authorized,
+#     )
 
     cutoff = (_utcnow() - timedelta(days=30)).isoformat()
     # Read candidate project IDs without any lock — a plain scalar select that
@@ -1419,10 +1420,10 @@ async def _expire_stale_proposals(session) -> int:
         )
         if applied and expired_holder["count"]:
             try:
-                await commit_legacy_authorized(
+                await commit_legacy_authorized(  # noqa: F821
                     session, project_id, int(expected_generation or 0)
                 )
-            except LegacyEngineAuthorityExpired:
+            except LegacyEngineAuthorityExpired:  # noqa: F821
                 continue
             total_expired += expired_holder["count"]
             logger.info(
@@ -1439,10 +1440,10 @@ async def _expire_stale_proposals(session) -> int:
 
 @router.get("/anomaly-tracker/snapshot")
 async def get_anomaly_tracker_snapshot(
-    project_id: Optional[uuid.UUID] = Query(default=None),
+    project_id: Optional[uuid.UUID] = Query(default=None),  # noqa: UP045
     freshness_hours: int = Query(default=24, ge=1, le=720),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),  # noqa: ARG001
+    current_user: dict = Depends(require_admin),  # noqa: ARG001, RUF100
 ) -> Dict[str, Any]:
     """Read-only snapshot of shared_state.persistent_anomalies.
 

@@ -276,11 +276,12 @@ async def _spawn_residual_fingerprint_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         if expected_legacy_generation is not None:
@@ -546,11 +547,12 @@ async def _spawn_residual_fingerprint_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         return 1
@@ -681,11 +683,12 @@ async def _spawn_viewport_regression_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         if expected_legacy_generation is not None:
@@ -821,11 +824,12 @@ async def _spawn_viewport_regression_remediation(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         return 1

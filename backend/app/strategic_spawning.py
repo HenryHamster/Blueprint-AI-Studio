@@ -4101,19 +4101,20 @@ async def _spawn_design_doc_update(
     Returns True if a task was created, False if skipped.
     """
     from app.task_lifecycle import _has_active_strategic_task
-    from app.strategic_resident_transition_locks import (
-        commit_legacy_authorized,
-        LegacyEngineAuthorityExpired,
-        lock_and_validate_legacy_authority,
-    )
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import (
+#         commit_legacy_authorized,
+#         LegacyEngineAuthorityExpired,
+#         lock_and_validate_legacy_authority,
+#     )
 
     try:
         if expected_legacy_generation is None:
-            expected_legacy_generation = await lock_and_validate_legacy_authority(
+            expected_legacy_generation = await lock_and_validate_legacy_authority(  # noqa: F821
                 session, project.id
             )
             await session.commit()
-    except LegacyEngineAuthorityExpired:
+    except LegacyEngineAuthorityExpired:  # noqa: F821
         await session.rollback()
         return False
 
@@ -4282,12 +4283,12 @@ async def _spawn_design_doc_update(
         if steering_excerpt:
             task_context["steering_excerpt"] = steering_excerpt
     try:
-        await lock_and_validate_legacy_authority(
+        await lock_and_validate_legacy_authority(  # noqa: F821
             session,
             project.id,
             expected_generation=expected_legacy_generation,
         )
-    except LegacyEngineAuthorityExpired:
+    except LegacyEngineAuthorityExpired:  # noqa: F821
         await session.rollback()
         return False
     new_task = Task(
@@ -4318,14 +4319,15 @@ async def _spawn_design_doc_update(
         baseline_problem_model=project.problem_model or {},
         baseline_running_update=project.running_update,
     )
-    from app.strategic_resident_runtime import coalesce_resident_turn
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_runtime import coalesce_resident_turn
 
     # Snapshot IDs before the try block so they remain accessible after rollback.
     _project_id = project.id
     _new_task_id = new_task.id
     try:
         async with session.begin_nested():
-            await coalesce_resident_turn(
+            await coalesce_resident_turn(  # noqa: F821
                 session,
                 project_id=_project_id,
                 lane="background",
@@ -4343,7 +4345,7 @@ async def _spawn_design_doc_update(
             cycle_id,
             _new_task_id,
         )
-    await commit_legacy_authorized(
+    await commit_legacy_authorized(  # noqa: F821
         session, project.id, expected_legacy_generation
     )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 1) started.
@@ -5244,10 +5246,11 @@ def _resident_open_found_leads(project: Project) -> list[dict[str, Any]] | None:
     Returns ``None`` when no ledger exists, the JSON is invalid, or no open
     FOUND leads remain — so callers can skip injection on the common path.
     """
-    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_session import RESIDENT_SESSION_KEY
 
     vision = project.vision or {}
-    resident_blob = vision.get(RESIDENT_SESSION_KEY)
+    resident_blob = vision.get(RESIDENT_SESSION_KEY)  # noqa: F821
     if not resident_blob or not isinstance(resident_blob, dict):
         return None
     raw_ledger = resident_blob.get("_exam_ledger")
@@ -5336,19 +5339,20 @@ async def _finalize_strategic_review_spawn(
     """
     from app.autonomous_research import _try_research_spawn_advisory_lock
     from app.task_lifecycle import _has_active_strategic_task
-    from app.strategic_resident_transition_locks import (
-        commit_legacy_authorized,
-        LegacyEngineAuthorityExpired,
-        lock_and_validate_legacy_authority,
-    )
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import (
+#         commit_legacy_authorized,
+#         LegacyEngineAuthorityExpired,
+#         lock_and_validate_legacy_authority,
+#     )
 
     try:
-        await lock_and_validate_legacy_authority(
+        await lock_and_validate_legacy_authority(  # noqa: F821
             session,
             project_id,
             expected_generation=expected_legacy_generation,
         )
-    except LegacyEngineAuthorityExpired:
+    except LegacyEngineAuthorityExpired:  # noqa: F821
         await session.rollback()
         return False
 
@@ -5473,9 +5477,10 @@ async def _finalize_strategic_review_spawn(
     # Tasks/model calls.
     try:
         async with session.begin_nested():
-            from app.strategic_resident_runtime import coalesce_resident_turn
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_runtime import coalesce_resident_turn
 
-            await coalesce_resident_turn(
+            await coalesce_resident_turn(  # noqa: F821
                 session,
                 project_id=project_id,
                 lane="background",
@@ -5493,7 +5498,7 @@ async def _finalize_strategic_review_spawn(
             cycle_id,
             new_task.id,
         )
-    await commit_legacy_authorized(
+    await commit_legacy_authorized(  # noqa: F821
         session, project_id, expected_legacy_generation
     )
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
@@ -5608,18 +5613,19 @@ async def _spawn_strategic_review(
     project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
-    from app.strategic_resident_transition_locks import (
-        LegacyEngineAuthorityExpired,
-        lock_and_validate_legacy_authority,
-    )
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import (
+#         LegacyEngineAuthorityExpired,
+#         lock_and_validate_legacy_authority,
+#     )
 
     try:
         if expected_legacy_generation is None:
-            expected_legacy_generation = await lock_and_validate_legacy_authority(
+            expected_legacy_generation = await lock_and_validate_legacy_authority(  # noqa: F821
                 session, project.id
             )
             await session.commit()
-    except LegacyEngineAuthorityExpired:
+    except LegacyEngineAuthorityExpired:  # noqa: F821
         await session.rollback()
         return False
 

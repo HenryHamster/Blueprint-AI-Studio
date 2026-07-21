@@ -59,29 +59,72 @@ from app.release_models import (  # noqa: F401
     ResidualVerdict,
     VersionAcceptanceCriterion,
 )
-from app.strategic_resident_models import (  # noqa: F401
-    StrategicOperationApproval,
-    StrategicOperationReceipt,
-    StrategicResident,
-    StrategicResidentCheckpoint,
-    StrategicWorkerMemoryProposal,
-)
-from app.strategic_resident_sweep_models import (  # noqa: F401
-    StrategicResidentSweepState,
-)
-from app.strategic_resident_ordinary_task_events import (  # noqa: F401
-    StrategicResidentOrdinaryTaskTerminalEvent,
-    register_sqlite_ordinary_task_terminal_listener,
-)
-from app.strategic_resident_task_terminal_events import (  # noqa: F401
-    StrategicResidentTaskTerminalEvent,
-    register_sqlite_terminal_event_listener,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem — stub classes preserve importability
+# until callers are de-wired (task a51f5f9a); tables are dropped in migration f0337222.
+# from app.strategic_resident_models import (  # noqa: F401, RUF100
+#     StrategicOperationApproval,
+#     StrategicOperationReceipt,
+#     StrategicResident,
+#     StrategicResidentCheckpoint,
+#     StrategicWorkerMemoryProposal,
+# )
+# from app.strategic_resident_sweep_models import (  # noqa: F401, RUF100
+#     StrategicResidentSweepState,
+# )
+# from app.strategic_resident_ordinary_task_events import (  # noqa: F401, RUF100
+#     StrategicResidentOrdinaryTaskTerminalEvent,
+#     register_sqlite_ordinary_task_terminal_listener,
+# )
+# from app.strategic_resident_task_terminal_events import (  # noqa: F401, RUF100
+#     StrategicResidentTaskTerminalEvent,
+#     register_sqlite_terminal_event_listener,
+# )
 from app.time_utils import _utcnow
 from app.vm_cost_rates import (
     get_cloud_run_rate_for_machine_type,
     get_vm_rate_per_second,
 )
+
+
+class StrategicOperationApproval:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicOperationReceipt:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicResident:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    project_id = None
+    authority_generation = 0
+
+
+class StrategicResidentCheckpoint:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicWorkerMemoryProposal:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicResidentSweepState:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicResidentOrdinaryTaskTerminalEvent:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+class StrategicResidentTaskTerminalEvent:  # [RESIDENT-REMOVAL] stub — removed with resident subsystem
+    id = None
+
+
+def register_sqlite_ordinary_task_terminal_listener(*args, **kwargs):  # [RESIDENT-REMOVAL] stub
+    pass
+
+
+def register_sqlite_terminal_event_listener(*args, **kwargs):  # [RESIDENT-REMOVAL] stub
+    pass
 
 
 # ``NaiveUTCDateTime`` now lives in :mod:`app.models_base` (a dependency-free
@@ -1254,19 +1297,6 @@ class Task(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
-    strategic_operation_receipt_id: uuid.UUID | None = Field(
-        default=None,
-        sa_column=Column(
-            GUID(),
-            ForeignKey(
-                "strategicoperationreceipt.id",
-                name="fk_task_strategic_operation_receipt",
-                ondelete="SET NULL",
-                use_alter=True,
-            ),
-            nullable=True,
-        ),
-    )
     requires_approval: bool = Field(default=False)
     spend_approval_cleared_at: datetime | None = Field(default=None, nullable=True)
 
@@ -1627,12 +1657,6 @@ class Task(SQLModel, table=True):
         Index("ix_task_status_priority_created", "status", "priority", "created_at"),
         Index("ix_task_project_status_created", "project_id", "status", "created_at"),
         Index("ix_task_project_status_updated", "project_id", "status", "updated_at"),
-        Index(
-            "ix_task_strategic_operation_receipt_id",
-            "strategic_operation_receipt_id",
-            postgresql_where=text("strategic_operation_receipt_id IS NOT NULL"),
-            sqlite_where=text("strategic_operation_receipt_id IS NOT NULL"),
-        ),
         Index(
             "ix_task_project_status_completed", "project_id", "status", "completed_at"
         ),
@@ -2123,7 +2147,7 @@ def get_task_cost_by_provider_model(
                     pass
         provider = attempt.get("provider")
         model = attempt.get("model")
-        if provider and model:
+        if provider and model:  # noqa: SIM108
             bucket = f"{provider}|{model}"
         else:
             bucket = "unknown|unknown"
@@ -2134,7 +2158,7 @@ def get_task_cost_by_provider_model(
     if live_cost > 0:
         provider = task.provider
         model = task.model
-        if provider and model:
+        if provider and model:  # noqa: SIM108
             bucket = f"{provider}|{model}"
         else:
             bucket = "unknown|unknown"
@@ -2875,8 +2899,9 @@ class TaskHistory(SQLModel, table=True):
     )
 
 
-register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
-register_sqlite_ordinary_task_terminal_listener(Task)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# register_sqlite_terminal_event_listener(Task, StrategicOperationReceipt)
+# register_sqlite_ordinary_task_terminal_listener(Task)
 
 
 # Auto-append to status_log whenever latest_status_message is set

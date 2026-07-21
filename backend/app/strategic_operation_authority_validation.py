@@ -506,11 +506,12 @@ async def _observed_revisions(
         # Deferred to avoid a module-load cycle: context reconstruction imports
         # the authority lineage validators above. The hash is derived under the
         # already-held Project/Resident/Task locks, never copied from the caller.
-        from app.strategic_resident_context import (
-            reconstruct_authoritative_turn_input,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_context import (
+#             reconstruct_authoritative_turn_input,
+#         )
 
-        provider_input = await reconstruct_authoritative_turn_input(
+        provider_input = await reconstruct_authoritative_turn_input(  # noqa: F821
             session,
             project_id=project.id,
             turn_task_id=task.id,

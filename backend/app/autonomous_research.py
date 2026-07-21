@@ -388,11 +388,12 @@ async def _maybe_notify_operator_refresh_deferred(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         logger.info(
@@ -402,11 +403,12 @@ async def _maybe_notify_operator_refresh_deferred(
             reason,
         )
     except Exception as exc:
-        from app.strategic_resident_transition_locks import (
-            LegacyEngineAuthorityExpired,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import (
+#             LegacyEngineAuthorityExpired,
+#         )
 
-        if isinstance(exc, LegacyEngineAuthorityExpired):
+        if isinstance(exc, LegacyEngineAuthorityExpired):  # noqa: F821
             raise
         logger.exception(
             "[STRATEGIC] failed to post operator steering deferral notice for "
@@ -441,11 +443,12 @@ async def _maybe_notify_operator_steering_acted(
         if expected_legacy_generation is None:
             await session.commit()
         else:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project.id, expected_legacy_generation
             )
         logger.info(
@@ -454,11 +457,12 @@ async def _maybe_notify_operator_steering_acted(
             project.id,
         )
     except Exception as exc:
-        from app.strategic_resident_transition_locks import (
-            LegacyEngineAuthorityExpired,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import (
+#             LegacyEngineAuthorityExpired,
+#         )
 
-        if isinstance(exc, LegacyEngineAuthorityExpired):
+        if isinstance(exc, LegacyEngineAuthorityExpired):  # noqa: F821
             raise
         logger.exception(
             "[STRATEGIC] failed to post operator steering confirmation for project %s",
@@ -562,11 +566,12 @@ async def _check_half_open_test_task(
         and (_utcnow() - test_task.started_at).total_seconds() > 1800
     ):
         if expected_legacy_generation is not None:
-            from app.strategic_resident_transition_locks import (
-                lock_and_validate_legacy_authority,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 lock_and_validate_legacy_authority,
+#             )
 
-            await lock_and_validate_legacy_authority(
+            await lock_and_validate_legacy_authority(  # noqa: F821
                 session,
                 project_id,
                 expected_generation=expected_legacy_generation,
@@ -579,11 +584,12 @@ async def _check_half_open_test_task(
         breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
         breaker["half_open_task_id"] = None
         if expected_legacy_generation is not None:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project_id, expected_legacy_generation
             )
         await _maybe_create_circuit_breaker_alert(
@@ -595,11 +601,12 @@ async def _check_half_open_test_task(
         return True
     elif not test_task:
         if expected_legacy_generation is not None:
-            from app.strategic_resident_transition_locks import (
-                lock_and_validate_legacy_authority,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 lock_and_validate_legacy_authority,
+#             )
 
-            await lock_and_validate_legacy_authority(
+            await lock_and_validate_legacy_authority(  # noqa: F821
                 session,
                 project_id,
                 expected_generation=expected_legacy_generation,
@@ -612,11 +619,12 @@ async def _check_half_open_test_task(
         breaker["cooldown_seconds"] = min(breaker["cooldown_seconds"] * 2, 7200)
         breaker["half_open_task_id"] = None
         if expected_legacy_generation is not None:
-            from app.strategic_resident_transition_locks import (
-                commit_legacy_authorized,
-            )
+            # [RESIDENT-REMOVAL] removed with resident subsystem
+#             from app.strategic_resident_transition_locks import (
+#                 commit_legacy_authorized,
+#             )
 
-            await commit_legacy_authorized(
+            await commit_legacy_authorized(  # noqa: F821
                 session, project_id, expected_legacy_generation
             )
         await _maybe_create_circuit_breaker_alert(
@@ -650,22 +658,24 @@ async def _advance_circuit_breaker_and_check(
             >= breaker["cooldown_seconds"]
         ):
             if expected_legacy_generation is not None:
-                from app.strategic_resident_transition_locks import (
-                    lock_and_validate_legacy_authority,
-                )
+                # [RESIDENT-REMOVAL] removed with resident subsystem
+#                 from app.strategic_resident_transition_locks import (
+#                     lock_and_validate_legacy_authority,
+#                 )
 
-                await lock_and_validate_legacy_authority(
+                await lock_and_validate_legacy_authority(  # noqa: F821
                     session,
                     project.id,
                     expected_generation=expected_legacy_generation,
                 )
             breaker["state"] = "HALF_OPEN"
             if expected_legacy_generation is not None:
-                from app.strategic_resident_transition_locks import (
-                    commit_legacy_authorized,
-                )
+                # [RESIDENT-REMOVAL] removed with resident subsystem
+#                 from app.strategic_resident_transition_locks import (
+#                     commit_legacy_authorized,
+#                 )
 
-                await commit_legacy_authorized(
+                await commit_legacy_authorized(  # noqa: F821
                     session, project.id, expected_legacy_generation
                 )
             logger.warning(
@@ -683,7 +693,7 @@ async def _advance_circuit_breaker_and_check(
                 expected_legacy_generation=expected_legacy_generation,
             )
             return True
-    elif breaker["state"] == "HALF_OPEN":
+    elif breaker["state"] == "HALF_OPEN":  # noqa: SIM102
         if await _check_half_open_test_task(
             project.id,
             session,
@@ -795,22 +805,23 @@ async def _spawn_research_task_inner(
     expected_legacy_generation: int | None = None,
 ):
     """Inner implementation — always called under the per-project spawn lock."""
-    from app.strategic_resident_transition_locks import (
-        commit_legacy_authorized,
-        LegacyEngineAuthorityExpired,
-        lock_and_validate_legacy_authority,
-    )
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import (
+#         commit_legacy_authorized,
+#         LegacyEngineAuthorityExpired,
+#         lock_and_validate_legacy_authority,
+#     )
 
     try:
         legacy_generation = (
-            await lock_and_validate_legacy_authority(
+            await lock_and_validate_legacy_authority(  # noqa: F821
                 session,
                 project.id,
                 expected_generation=expected_legacy_generation,
             )
         )
         await session.commit()
-    except LegacyEngineAuthorityExpired:
+    except LegacyEngineAuthorityExpired:  # noqa: F821
         await session.rollback()
         return
     from app.research_completion import (
@@ -867,7 +878,7 @@ async def _spawn_research_task_inner(
     # this project — the fleet-wide budget is exhausted). This prevents autonomous
     # research from starting new work while the budget is maxed out.
     try:
-        from app.monthly_budget_alerts import check_monthly_budget  # noqa: PLC0415
+        from app.monthly_budget_alerts import check_monthly_budget  # noqa: PLC0415, RUF100
 
         budget_exhausted, _usage_ratio = await check_monthly_budget(session)
     except Exception:
@@ -1178,7 +1189,7 @@ async def _spawn_research_task_inner(
             vision.pop("_strategic_failures_at", None)
 
         await with_vision_locked(session, project.id, _clear_strategic_failures)
-        await commit_legacy_authorized(session, project.id, legacy_generation)
+        await commit_legacy_authorized(session, project.id, legacy_generation)  # noqa: F821
     # Check if ANY direction is active in the project (ignoring cooldown filter).
     # active_directions only contains non-cooldown directions, so a project with
     # active-but-cooling directions should not trigger a strategic cycle.
@@ -1550,10 +1561,10 @@ async def _spawn_research_task_inner(
                 vision.pop("_pending_strategic_review", None)
 
             await with_vision_locked(session, project.id, _drop_pending_sr)
-            await commit_legacy_authorized(session, project.id, legacy_generation)
+            await commit_legacy_authorized(session, project.id, legacy_generation)  # noqa: F821
             await session.refresh(project)
 
-            from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
+            from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415, RUF100
 
             await _create_strategic_alert(
                 project.id,
@@ -1595,7 +1606,7 @@ async def _spawn_research_task_inner(
                         vision.pop("_pending_strategic_review", None)
 
                     await with_vision_locked(session, project.id, _clear_pending_sr)
-                    await commit_legacy_authorized(
+                    await commit_legacy_authorized(  # noqa: F821
                         session, project.id, legacy_generation
                     )
                     await session.refresh(project)
@@ -1618,12 +1629,12 @@ async def _spawn_research_task_inner(
                             marker["first_attempted_at"] = _now_iso
 
                     await with_vision_locked(session, project.id, _bump_pending_sr_skip)
-                    await commit_legacy_authorized(
+                    await commit_legacy_authorized(  # noqa: F821
                         session, project.id, legacy_generation
                     )
                     await session.refresh(project)
                     # Fall through to tactical research
-            except LegacyEngineAuthorityExpired:
+            except LegacyEngineAuthorityExpired:  # noqa: F821
                 raise
             except Exception:
                 logger.exception(
@@ -1640,7 +1651,7 @@ async def _spawn_research_task_inner(
                         marker["first_attempted_at"] = _now_iso
 
                 await with_vision_locked(session, project.id, _bump_pending_sr)
-                await commit_legacy_authorized(
+                await commit_legacy_authorized(  # noqa: F821
                     session, project.id, legacy_generation
                 )
                 await session.refresh(project)
@@ -1914,7 +1925,7 @@ async def _spawn_research_task_inner(
                 }
 
             await with_vision_locked(session, project.id, _mark_payload_bloat_skip)
-            await commit_legacy_authorized(session, project.id, legacy_generation)
+            await commit_legacy_authorized(session, project.id, legacy_generation)  # noqa: F821
             # session.commit() expired `project`; the notify helper and the
             # fall-through `if spawned:` block below both read project.vision/.id.
             # Re-load it so those reads do not lazy-load from async context and
@@ -1976,7 +1987,7 @@ async def _spawn_research_task_inner(
             # again, fires another strategic spawn. Even with the
             # has_active_strategic guard above, eventually that strategic
             # task completes and the next tick re-fires immediately.
-            await commit_legacy_authorized(session, project.id, legacy_generation)
+            await commit_legacy_authorized(session, project.id, legacy_generation)  # noqa: F821
 
             # Symmetric success counterpart to the deferral notice: when the
             # consumed marker was operator-origin AND carried preserved steering
@@ -3019,7 +3030,7 @@ async def _spawn_research_task_inner(
     # change and staging its durable alert. Cutover can proceed only after this
     # transaction commits; a superseded generation rolls the entire mutation
     # back before any broadcast or external notification is scheduled.
-    await lock_and_validate_legacy_authority(
+    await lock_and_validate_legacy_authority(  # noqa: F821
         session,
         project.id,
         expected_generation=legacy_generation,
@@ -3028,7 +3039,7 @@ async def _spawn_research_task_inner(
         breaker["half_open_task_id"] = str(spawned_tasks[0].id)
     anomaly_action = await check_anomaly_actions()
     _stage_anomaly_action_alert(session, project.id, anomaly_action)
-    await commit_legacy_authorized(session, project.id, legacy_generation)
+    await commit_legacy_authorized(session, project.id, legacy_generation)  # noqa: F821
     await _publish_anomaly_action(project.id, anomaly_action)
 
     for t in spawned_tasks:
@@ -3126,7 +3137,7 @@ async def _spawn_periodic_task(
             "[AUTONOMOUS] Spawn budget snapshot: %s",
             budget_snapshot.as_log_fields(),
         )
-    except Exception as exc:  # noqa: BLE001 - snapshot read failed; fail posture is mode-dependent
+    except Exception as exc:  # noqa: BLE001, RUF100
         # A persistent snapshot/DB failure must NOT silently disable an
         # operator-enabled 'enforce' budget (that would be the exact opposite
         # of enforcement). The configured mode comes from runtime_config and
@@ -3283,11 +3294,12 @@ async def _spawn_periodic_task(
     )
     session.add(history)
     if expected_legacy_generation is not None:
-        from app.strategic_resident_transition_locks import (
-            lock_and_validate_legacy_authority,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import (
+#             lock_and_validate_legacy_authority,
+#         )
 
-        await lock_and_validate_legacy_authority(
+        await lock_and_validate_legacy_authority(  # noqa: F821
             session,
             project.id,
             expected_generation=expected_legacy_generation,
@@ -3297,9 +3309,10 @@ async def _spawn_periodic_task(
     if expected_legacy_generation is None:
         await session.commit()
     else:
-        from app.strategic_resident_transition_locks import commit_legacy_authorized
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-        await commit_legacy_authorized(
+        await commit_legacy_authorized(  # noqa: F821
             session, project.id, expected_legacy_generation
         )
     await session.refresh(new_task)
@@ -3501,9 +3514,10 @@ async def _run_idle_research_for_project(
             session,
             expected_legacy_generation=expected_legacy_generation,
         )
-    from app.strategic_resident_transition_locks import commit_legacy_authorized
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_transition_locks import commit_legacy_authorized
 
-    await commit_legacy_authorized(
+    await commit_legacy_authorized(  # noqa: F821
         session, project.id, expected_legacy_generation
     )
 

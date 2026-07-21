@@ -1263,85 +1263,6 @@ runtime_config: Dict = {
     # the agent must not arm the post-edit diagnostics hook regardless of arm
     # assignment. Default True (trial active).
     "diagnostics_after_edit_enabled": True,
-    # --- Resident strategic session (dead-man's-switch safety + resident agent) ---
-    # Master feature flag for the resident strategic session runtime. Default
-    # OFF — the legacy one-shot strategic cadence is completely unchanged until an
-    # operator flips this. Safe to land dark.
-    "strategic_session_enabled": os.getenv(
-        "STRATEGIC_SESSION_ENABLED", "false"
-    ).lower()
-    in ("1", "true", "yes"),
-    # Local-Strategic continuation-marker freshness TTL (seconds). REPLACES the
-    # old hardcoded 12h (43200) wall-clock in workbench_state.py. The marker's
-    # freshness now renews ONLY on operator interaction OR an applied strategic op
-    # (progress) — never on bare runner liveness — so an opened-and-abandoned
-    # continuous local session self-heals (cadence resumes / held tasks fall back
-    # to cloud) within this short window instead of pinning the project locally
-    # for 12h. Default 1500s (25 min) — the lease window.
-    "strategic_continuation_ttl_seconds": int(
-        os.getenv("STRATEGIC_CONTINUATION_TTL_SECONDS", "1500")
-    ),
-    # Bounded wait (seconds) a required-local Strategic task is held QUEUED for a
-    # live local runner before it FALLS BACK TO CLOUD (re-dispatched to normal
-    # cloud provisioning, NOT terminally FAILED). REPLACES the old 6h
-    # hold-then-FAIL for Strategic holds (compute_experiment holds keep the 6h
-    # terminal-fail contract). Default 900s (15 min).
-    "strategic_local_hold_timeout_seconds": int(
-        os.getenv("STRATEGIC_LOCAL_HOLD_TIMEOUT_SECONDS", "900")
-    ),
-    # Resident-loop idle poll cadence (seconds): how often the warm resident
-    # session polls the inbound message endpoint when otherwise idle.
-    "strategic_session_idle_tick_seconds": int(
-        os.getenv("STRATEGIC_SESSION_IDLE_TICK_SECONDS", "5")
-    ),
-    # Per-turn wall-clock budget (seconds) for a single bounded resident turn
-    # (interactive reply or one chunked autonomous step).
-    "strategic_session_turn_timeout_seconds": int(
-        os.getenv("STRATEGIC_SESSION_TURN_TIMEOUT_SECONDS", "120")
-    ),
-    # Floor-tick cadence (seconds): the maximum quiet gap between autonomous
-    # resident ticks even when no world-state change is observed, so the session
-    # reviews periodically and never goes fully dark. Read by the agent's
-    # state-gated pacing (residentConfig); absent => agent floor-tick default.
-    "strategic_session_min_tick_seconds": int(
-        os.getenv("STRATEGIC_SESSION_MIN_TICK_SECONDS", "600")
-    ),
-    # Soft cap (count) on how many independent applied strategic ops the
-    # autonomous work-unit prompt should batch into a single turn. Advisory: a
-    # prompt hint only — the hard per-op server-side spawn/retire gates are
-    # unchanged. Absent => agent default.
-    "strategic_session_max_ops_per_turn": int(
-        os.getenv("STRATEGIC_SESSION_MAX_OPS_PER_TURN", "3")
-    ),
-    # Deep-turn stall budget (seconds) for an AUTONOMOUS resident turn, so a long
-    # single read/verify step is not killed mid-thought. Distinct from the
-    # interactive per-turn timeout (kept short for operator responsiveness); the
-    # 15-min absolute hard ceiling is unchanged. Absent => agent default.
-    "strategic_session_autonomous_turn_timeout_seconds": int(
-        os.getenv("STRATEGIC_SESSION_AUTONOMOUS_TURN_TIMEOUT_SECONDS", "300")
-    ),
-    # Hard cap (seconds) on how long a resident strategic session may run
-    # UNATTENDED before it is wound down — the outer bound on autonomous
-    # operation with no operator interaction. Distinct from the continuation
-    # TTL (which is the short freshness lease that self-heals an abandoned
-    # local pin): this caps the total unattended lifetime of a live session.
-    # Default 14400s (4h); admin-clamped to <= 28800 (8h) so it can never
-    # reintroduce a multi-hour (>12h) unattended wall.
-    "strategic_session_max_unattended_seconds": int(
-        os.getenv("STRATEGIC_SESSION_MAX_UNATTENDED_SECONDS", "14400")
-    ),
-    # Reaper carve-out window (seconds) for a resident strategic session task
-    # (context["_resident_session"] == True). Such a task is EXEMPT from the
-    # thinking-heavy progress-staleness budget (it is warm-but-idle between
-    # operator turns) and is reaped only when the runner itself has gone silent
-    # (last_heartbeat / started_at) beyond this window. Read by
-    # reaper_orphan_classify._resident_session_heartbeat_stale_cutoff. Default
-    # 1500s (25 min) — long enough that a briefly-asleep laptop or transient
-    # network gap does not tear down the warm session, short enough that a
-    # genuinely dead runner is still reclaimed.
-    "resident_session_heartbeat_stale_seconds": int(
-        os.getenv("RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS", "1500")
-    ),
     # Gap-scoped recently-retired direction block (direction_gap_respawn_block_mode).
     # When a direction is proposed for a gap that already has a recently-retired
     # direction, this mode controls whether the respawn is blocked:
@@ -1400,11 +1321,7 @@ _DORMANT_MODE_KNOBS = {
     ),
 }
 # Master feature flags that ship OFF still owe an enablement decision.
-_DORMANT_OFF_FLAGS = {
-    "strategic_session_enabled": (
-        "Resident strategic session runtime shipped disabled (default-off)"
-    ),
-}
+_DORMANT_OFF_FLAGS: dict = {}
 
 
 def iter_dormant_knob_debts() -> list[dict]:
@@ -1494,7 +1411,7 @@ def _read_promotion_policy_file() -> dict | None:
             weights["completion_debt"] = _cd
         result: dict = {"weights": weights, "threshold": threshold}
         if "merge_grade_block_threshold" in parsed:
-            try:
+            try:  # noqa: SIM105
                 result["merge_grade_block_threshold"] = float(
                     parsed["merge_grade_block_threshold"]
                 )
@@ -2172,7 +2089,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "direction_review_recommendation_threshold",
                 ):
                     if _guardrail_int_key in config_json:
-                        try:
+                        try:  # noqa: SIM105
                             _set(
                                 _guardrail_int_key,
                                 int(config_json[_guardrail_int_key]),
@@ -2209,7 +2126,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("completion_debt_weight_mode", raw_mode)
                 if "structural_health_audit_interval_minutes" in config_json:
-                    try:
+                    try:  # noqa: SIM105
                         _set(
                             "structural_health_audit_interval_minutes",
                             int(config_json["structural_health_audit_interval_minutes"]),
@@ -2217,7 +2134,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     except (TypeError, ValueError):
                         pass
                 if "structural_health_audit_fat_row_bytes" in config_json:
-                    try:
+                    try:  # noqa: SIM105
                         _set(
                             "structural_health_audit_fat_row_bytes",
                             int(config_json["structural_health_audit_fat_row_bytes"]),
@@ -2304,36 +2221,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             _ms_val = int(config_json[_ms_int_key])
                             if _ms_val > 0:
                                 _set(_ms_int_key, _ms_val)
-                        except (TypeError, ValueError):
-                            pass
-                # Resident strategic session (dead-man's-switch safety + resident
-                # agent). Persisted so an operator enable/tune survives a Cloud Run
-                # restart and reaches the leader across instances; without these the
-                # in-memory values revert to the env defaults on every restart and a
-                # multi-instance PATCH never propagates. Ints are already range-
-                # clamped by the PATCH handler before they reach the DB.
-                if "strategic_session_enabled" in config_json:
-                    _set(
-                        "strategic_session_enabled",
-                        bool(config_json["strategic_session_enabled"]),
-                    )
-                for _strategic_int_key in (
-                    "strategic_continuation_ttl_seconds",
-                    "strategic_local_hold_timeout_seconds",
-                    "strategic_session_idle_tick_seconds",
-                    "strategic_session_turn_timeout_seconds",
-                    "strategic_session_min_tick_seconds",
-                    "strategic_session_max_ops_per_turn",
-                    "strategic_session_autonomous_turn_timeout_seconds",
-                    "strategic_session_max_unattended_seconds",
-                    "resident_session_heartbeat_stale_seconds",
-                ):
-                    if _strategic_int_key in config_json:
-                        try:
-                            _set(
-                                _strategic_int_key,
-                                int(config_json[_strategic_int_key]),
-                            )
                         except (TypeError, ValueError):
                             pass
                 if "cochange_decomposition_enabled" in config_json:

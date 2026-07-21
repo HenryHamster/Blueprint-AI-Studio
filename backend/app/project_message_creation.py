@@ -236,7 +236,7 @@ async def reserve_project_message_sequences(
         raise ValueError("message sequence reservation count must be between 1 and 100")
 
     dialect = resolve_dialect_name(session)
-    if dialect == "postgresql":
+    if dialect == "postgresql":  # noqa: SIM102
         if lock_timeout_ms is not None:
             await session.execute(
                 text(f"SET LOCAL lock_timeout = '{max(1, int(lock_timeout_ms))}ms'")
@@ -617,7 +617,8 @@ async def create_operator_project_message(
     # or the durable Resident successor. Ownership transitions take these rows
     # in the same Project -> Resident order, so send vs rollback/cutover cannot
     # observe one owner and enqueue for the other.
-    from app.strategic_resident_message_locking import lock_resident_message_owner_state
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_message_locking import lock_resident_message_owner_state
 
     (
         locked_project,
@@ -625,7 +626,7 @@ async def create_operator_project_message(
         refresh_was_pending,
         resident_active,
         resident_session_id,
-    ) = await lock_resident_message_owner_state(session, project_id)
+    ) = await lock_resident_message_owner_state(session, project_id)  # noqa: F821
     if strategic_resident_owns:
         # Never revive legacy refresh/session state after cutover.
         refresh_was_pending = False
@@ -658,7 +659,7 @@ async def create_operator_project_message(
             refresh_was_pending,
             resident_active,
             resident_session_id,
-        ) = await lock_resident_message_owner_state(session, project_id)
+        ) = await lock_resident_message_owner_state(session, project_id)  # noqa: F821
         if strategic_resident_owns:
             arming = ARMING_NOT_ARMED
         elif resident_active:
@@ -738,11 +739,12 @@ async def create_operator_project_message(
     locked_turn_tasks = None
     locked_resident_owner = None
     if surface == MessageSurface.CONVERSATION:
-        from app.strategic_resident_message_locking import (
-            prelock_resident_message_turn_state,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_message_locking import (
+#             prelock_resident_message_turn_state,
+#         )
 
-        prelock = await prelock_resident_message_turn_state(
+        prelock = await prelock_resident_message_turn_state(  # noqa: F821
             session,
             project_id=project_id,
             locked_project=locked_project,
@@ -828,14 +830,15 @@ async def create_operator_project_message(
     if locked_resident is not None:
         try:
             async with session.begin_nested():
-                from app.strategic_resident_runtime import (
-                    coalesce_resident_turn,
-                )
+                # [RESIDENT-REMOVAL] removed with resident subsystem
+#                 from app.strategic_resident_runtime import (
+#                     coalesce_resident_turn,
+#                 )
                 from app.artifact_refs import (
                     artifact_ref_grants_from_message_context,
                 )
 
-                resident_wake = await coalesce_resident_turn(
+                resident_wake = await coalesce_resident_turn(  # noqa: F821
                     session,
                     project_id=project_id,
                     lane="interactive",

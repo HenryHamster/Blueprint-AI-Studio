@@ -208,8 +208,6 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/recovery_post_commit_orphans.py",
         "backend/app/research_direction_state.py",
         "backend/app/strategic_completion.py",
-        "backend/app/strategic_resident_realtime.py",
-        "backend/app/strategic_resident_terminal.py",
         "backend/app/review_pipeline.py",
         "backend/app/rollup_management.py",
         "backend/app/routers/admin_agent_ops.py",

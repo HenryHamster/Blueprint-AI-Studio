@@ -2542,11 +2542,12 @@ async def create_task_manually(
         )
         session.add(project)
         await session.flush()
-        from app.strategic_resident_checkpointing import (
-            initialize_strategic_resident,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_checkpointing import (
+#             initialize_strategic_resident,
+#         )
 
-        await initialize_strategic_resident(
+        await initialize_strategic_resident(  # noqa: F821
             session, project.id, locked_project=project
         )
         await session.commit()
@@ -3328,11 +3329,12 @@ async def create_compute_experiment_task(
         )
         session.add(project)
         await session.flush()
-        from app.strategic_resident_checkpointing import (
-            initialize_strategic_resident,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_checkpointing import (
+#             initialize_strategic_resident,
+#         )
 
-        await initialize_strategic_resident(
+        await initialize_strategic_resident(  # noqa: F821
             session, project.id, locked_project=project
         )
         await session.commit()

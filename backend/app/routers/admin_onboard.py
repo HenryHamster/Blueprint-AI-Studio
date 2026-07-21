@@ -245,7 +245,7 @@ def _is_real_source_file(name: str) -> bool:
         return False
     if any(base.startswith(prefix) for prefix in _NON_SOURCE_FILE_PREFIXES):
         return False
-    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):
+    if any(base.endswith(ext) for ext in _NON_SOURCE_FILE_EXTENSIONS):  # noqa: SIM103
         return False
     return True
 
@@ -1212,17 +1212,19 @@ async def onboard_project(
         session.add(seeded_message)
         session.add(project)
 
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_checkpointing import initialize_strategic_resident
 
-    resident = await initialize_strategic_resident(
+    resident = await initialize_strategic_resident(  # noqa: F821
         session, project.id, locked_project=project
     )
     if seeded_message is not None:
-        from app.strategic_resident_turns import coalesce_shadow_resident_turn
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_turns import coalesce_shadow_resident_turn
 
         try:
             async with session.begin_nested():
-                await coalesce_shadow_resident_turn(
+                await coalesce_shadow_resident_turn(  # noqa: F821
                     session,
                     project_id=project.id,
                     lane="interactive",
@@ -1230,7 +1232,7 @@ async def onboard_project(
                     message_sequence=seed_sequence,
                     locked_resident=resident,
                 )
-        except Exception:
+        except Exception:  # noqa: BLE001
             # Fresh projects are legacy-owned during the shadow rollout. A
             # projection-only enqueue failure must not reject onboarding or the
             # durably accepted initial steering message.

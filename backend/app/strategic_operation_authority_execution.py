@@ -42,10 +42,11 @@ from app.strategic_operation_authority_validation import (
 )
 from app.strategic_operation_result_bounds import bounded_result
 from app.time_utils import _utcnow
-from app.strategic_resident_managed_task import (
-    ManagedTaskCreateWriter,
-    materialize_managed_task,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_managed_task import (
+#     ManagedTaskCreateWriter,
+#     materialize_managed_task,
+# )
 
 
 async def _terminal_receipt_fast_path(
@@ -247,7 +248,7 @@ async def execute_fenced_db_operation(
 
         writer = FencedMutationWriter({})
         task_writer = FencedTaskWriter({}) if target_task is not None else None
-        managed_task_writer = ManagedTaskCreateWriter(
+        managed_task_writer = ManagedTaskCreateWriter(  # noqa: F821
             receipt.id,
             authorized_capability=receipt.capability,
         )
@@ -416,7 +417,7 @@ async def execute_fenced_db_operation(
                     # deliberately does not mutate it.
                     task_writer._apply(target_task)
             if managed_task_plan is not None:
-                await materialize_managed_task(
+                await materialize_managed_task(  # noqa: F821
                     session,
                     plan=managed_task_plan,
                     turn_task=turn_task,

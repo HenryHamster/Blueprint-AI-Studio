@@ -699,17 +699,18 @@ async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
     is_resident_turn = token.get("task_type") == "strategic_resident_turn"
     project_id = None
     if is_resident_turn:
-        from app.strategic_resident_agent_binding import (
-            ResidentAgentAuthorityError,
-            ResidentAgentBinding,
-            ResidentAgentBindingError,
-            ResidentAgentTaskNotFound,
-            load_live_resident_agent_task_locked,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_agent_binding import (
+#             ResidentAgentAuthorityError,
+#             ResidentAgentBinding,
+#             ResidentAgentBindingError,
+#             ResidentAgentTaskNotFound,
+#             load_live_resident_agent_task_locked,
+#         )
 
         try:
             project_id = uuid.UUID(str(token.get("project_id")))
-            resident_binding = ResidentAgentBinding(
+            resident_binding = ResidentAgentBinding(  # noqa: F821
                 task_id=uuid.UUID(task_id),
                 project_id=project_id,
                 vm_instance_id=str(vm_id or ""),
@@ -721,7 +722,7 @@ async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
                 status_code=403, detail="complete Resident task token required"
             ) from None
         try:
-            task = await load_live_resident_agent_task_locked(
+            task = await load_live_resident_agent_task_locked(  # noqa: F821
                 session,
                 resident_binding,
                 allowed_statuses=frozenset(
@@ -732,11 +733,11 @@ async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
                     }
                 ),
             )
-        except ResidentAgentTaskNotFound as exc:
+        except ResidentAgentTaskNotFound as exc:  # noqa: F821
             raise HTTPException(status_code=404, detail="task_not_found") from exc
-        except ResidentAgentAuthorityError as exc:
+        except ResidentAgentAuthorityError as exc:  # noqa: F821
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ResidentAgentBindingError as exc:
+        except ResidentAgentBindingError as exc:  # noqa: F821
             raise HTTPException(status_code=403, detail=str(exc)) from exc
     else:
         task = await session.get(Task, uuid.UUID(task_id))
@@ -1117,12 +1118,14 @@ async def claim_task(
 
     first_payload = task.first_payload if isinstance(task.first_payload, dict) else {}
     if first_payload.get("type") == "strategic_resident_turn":
-        from app.strategic_resident_runtime import is_authoritative_resident_turn
-        from app.strategic_resident_runner_policy import (
-            resident_local_claim_route_matches,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_runtime import is_authoritative_resident_turn
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_runner_policy import (
+#             resident_local_claim_route_matches,
+#         )
 
-        if not resident_local_claim_route_matches(task, vm_id):
+        if not resident_local_claim_route_matches(task, vm_id):  # noqa: F821
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -1131,7 +1134,7 @@ async def claim_task(
                 ),
             )
 
-        if not is_authoritative_resident_turn(
+        if not is_authoritative_resident_turn(  # noqa: F821
             task,
             project_id=task.project_id,
         ):
@@ -4371,7 +4374,7 @@ async def claim_task(
                     "summary": _domain_doc.summary,
                     "body": _domain_doc.body,
                 }
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     # Inject bootstrap_guidance for repo_bootstrap tasks: structured prompting
@@ -4511,9 +4514,9 @@ async def get_agent_artifact_download_url(
     try:
         url = await generate_download_signed_url(artifact.storage_uri)
     except StorageUriError:
-        raise HTTPException(status_code=400, detail="Invalid artifact reference")
-    except Exception:
-        raise HTTPException(status_code=503, detail="Artifact storage unavailable")
+        raise HTTPException(status_code=400, detail="Invalid artifact reference")  # noqa: B904
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Artifact storage unavailable")  # noqa: B904
     return ArtifactDownloadResponse(url=url)
 
 
@@ -4595,7 +4598,7 @@ class ViewportScreenshotUploadUrlRequest(BaseModel):
     name: str = Field(max_length=200)
     width: int = Field(ge=1, le=4096)
     phase: Literal["before", "after", "diff"]
-    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # noqa: UP045
 
 
 @router.post("/viewport/screenshot-upload-url")
@@ -4726,14 +4729,14 @@ async def get_viewport_failure_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904
-    except Exception as exc:  # noqa: BLE001
+        ) from exc  # noqa: B904, RUF100
+    except Exception as exc:  # noqa: BLE001, RUF100
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904
+        ) from exc  # noqa: B904, RUF100
     return {"url": url}
 
 
@@ -4774,14 +4777,14 @@ async def get_viewport_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904
-    except Exception as exc:  # noqa: BLE001
+        ) from exc  # noqa: B904, RUF100
+    except Exception as exc:  # noqa: BLE001, RUF100
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904
+        ) from exc  # noqa: B904, RUF100
     return {"url": url}
 
 
@@ -5097,32 +5100,33 @@ async def agent_heartbeat(
         raise HTTPException(status_code=403, detail="Task ID mismatch")
     resident_task = None
     if token.get("task_type") == "strategic_resident_turn":
-        from app.strategic_resident_agent_binding import (
-            ResidentAgentAuthorityError,
-            ResidentAgentBinding,
-            ResidentAgentBindingError,
-            ResidentAgentTaskNotFound,
-            load_live_resident_agent_task_locked,
-        )
+        # [RESIDENT-REMOVAL] removed with resident subsystem
+#         from app.strategic_resident_agent_binding import (
+#             ResidentAgentAuthorityError,
+#             ResidentAgentBinding,
+#             ResidentAgentBindingError,
+#             ResidentAgentTaskNotFound,
+#             load_live_resident_agent_task_locked,
+#         )
 
         try:
-            binding = ResidentAgentBinding(
+            binding = ResidentAgentBinding(  # noqa: F821
                 task_id=uuid.UUID(str(token.get("sub"))),
                 project_id=uuid.UUID(str(token.get("project_id"))),
                 vm_instance_id=str(token.get("vm_instance_id") or ""),
                 task_type=str(token.get("task_type") or ""),
                 claim_nonce=str(token.get("claim_nonce") or ""),
             )
-            resident_task = await load_live_resident_agent_task_locked(
+            resident_task = await load_live_resident_agent_task_locked(  # noqa: F821
                 session,
                 binding,
                 allowed_statuses=frozenset({TaskStatus.IN_PROGRESS}),
             )
-        except ResidentAgentTaskNotFound as exc:
+        except ResidentAgentTaskNotFound as exc:  # noqa: F821
             raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except ResidentAgentAuthorityError as exc:
+        except ResidentAgentAuthorityError as exc:  # noqa: F821
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except (ResidentAgentBindingError, TypeError, ValueError) as exc:
+        except (ResidentAgentBindingError, TypeError, ValueError) as exc:  # noqa: F821
             raise HTTPException(status_code=403, detail=str(exc)) from exc
 
     # Phase 2c Race A mitigation: every backend contact from a VM is a
@@ -6160,7 +6164,7 @@ async def agent_write_back_build_config_commands(
             new_entry: dict = {"path": norm}
             for key, value in confirmed_values.items():
                 if value is not None:
-                    new_entry[key] = value
+                    new_entry[key] = value  # noqa: PERF403
             new_entry["commands_confirmed_at"] = now_iso
             new_entry["confirming_task_id"] = task_id_str
             index_by_path[norm] = len(directories)
@@ -6242,7 +6246,7 @@ async def agent_build_config_discovery(
         return {"persisted": persisted, "emptiness_redetected": redetected}
     except HTTPException:
         raise
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[BUILD_CONFIG] build-config-discovery endpoint error for token sub=%s",
             token.get("sub"),

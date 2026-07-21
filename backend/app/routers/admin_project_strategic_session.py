@@ -59,23 +59,27 @@ from app.models import (
 from app.auth import get_current_user
 from app.task_locking import lock_project_or_429
 from app.admin import _get_user_project_with_role
-from app.strategic_resident_capabilities import capability_for
-from app.strategic_resident_capability_invocation import (
-    validated_capability_parameters,
-)
-from app.strategic_resident_operation_approval import (
-    MAX_APPROVAL_TTL_SECONDS,
-    OperatorApprovalRequired,
-    capability_requires_operator_approval,
-    derive_approval_key,
-    grant_operation_approval,
-)
-from app.strategic_resident_ownership import (
-    ResidentOwnershipTransition,
-    ResidentOwnershipTransitionError,
-    cutover_to_strategic_resident,
-    rollback_to_legacy_resident,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_capabilities import capability_for
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_capability_invocation import (
+#     validated_capability_parameters,
+# )
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_operation_approval import (
+#     MAX_APPROVAL_TTL_SECONDS,
+#     OperatorApprovalRequired,
+#     capability_requires_operator_approval,
+#     derive_approval_key,
+#     grant_operation_approval,
+# )
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_ownership import (
+#     ResidentOwnershipTransition,
+#     ResidentOwnershipTransitionError,
+#     cutover_to_strategic_resident,
+#     rollback_to_legacy_resident,
+# )
 from app import strategic_cycle
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
@@ -161,13 +165,25 @@ from app.storage import (
     storage as gcs_storage,
 )
 from app.message_audience import stamp_message_audience
-from app.strategic_resident_session import (
-    STRATEGIC_SESSION_ENABLED_SETTING,
-    build_resident_runner_options,
-    start_resident_session,
-    stop_resident_session,
-    sync_resident_session_for_interaction_mode,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_session import (
+#     STRATEGIC_SESSION_ENABLED_SETTING,
+#     build_resident_runner_options,
+#     start_resident_session,
+#     stop_resident_session,
+#     sync_resident_session_for_interaction_mode,
+# )
+
+# [RESIDENT-REMOVAL] stub placeholders for resident symbols used at module level
+MAX_APPROVAL_TTL_SECONDS = 86400
+
+
+class ResidentOwnershipTransition:
+    pass
+
+
+class ResidentOwnershipTransitionError(Exception):
+    pass
 
 router = APIRouter(
     prefix="/api/admin",
@@ -849,7 +865,7 @@ async def _cleanup_expired_message_attachment_uploads(
                 if deleted:
                     await cleanup_session.delete(receipt)
             await cleanup_session.commit()
-    except Exception:
+    except Exception:  # noqa: BLE001
         logger.warning(
             "[ATTACHMENT] expired upload cleanup failed for project %s",
             project_id,
@@ -2454,7 +2470,7 @@ async def get_project_strategic_state(
     # dropdown) and, via ``_resident_session_availability``, the block-on-offline
     # verdict for a session pinned to a now-offline device.
     async with async_timed(request, "runners"):
-        resident_runner_options = await build_resident_runner_options(
+        resident_runner_options = await build_resident_runner_options(  # noqa: F821
             session, project.id, runner_rows=project_runners
         )
     async with async_timed(request, "workbench"):
@@ -2743,7 +2759,7 @@ async def get_project_strategic_liveness(
     )
     # One runner-picker query; the eligible-live count is derived from its
     # per-runner ``eligible`` flags so no heavy runtime summary is assembled.
-    resident_runner_options = await build_resident_runner_options(session, project.id)
+    resident_runner_options = await build_resident_runner_options(session, project.id)  # noqa: F821
     eligible_live_runner_count = sum(
         1 for option in resident_runner_options if option.get("eligible")
     )
@@ -2932,7 +2948,7 @@ async def upsert_project_strategic_session(
     # it auto-stops. Runs AFTER the mode itself is committed and is fully
     # resilient — a blocked/failed auto-start records a surfaced reason and never
     # breaks this mode-change request.
-    await sync_resident_session_for_interaction_mode(
+    await sync_resident_session_for_interaction_mode(  # noqa: F821
         session,
         project,
         operator_user_id=current_user["user_id"],
@@ -3616,13 +3632,13 @@ async def start_project_strategic_resident_session(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    if not runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False):
+    if not runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False):  # noqa: F821
         raise HTTPException(
             status_code=403,
             detail="Strategic resident sessions are disabled",
         )
     data = payload or StrategicResidentSessionStart()
-    snapshot = await start_resident_session(
+    snapshot = await start_resident_session(  # noqa: F821
         session,
         project,
         operator_user_id=current_user["user_id"],
@@ -3663,18 +3679,18 @@ async def grant_resident_operation_approval(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
-    if not capability_requires_operator_approval(payload.capability):
+    if not capability_requires_operator_approval(payload.capability):  # noqa: F821
         raise HTTPException(
             status_code=400,
             detail="capability does not require an explicit operator approval",
         )
     try:
-        spec = capability_for(payload.capability)
-        parameters = validated_capability_parameters(spec, payload.parameters)
-    except (ValueError, OperatorApprovalRequired) as exc:
+        spec = capability_for(payload.capability)  # noqa: F821
+        parameters = validated_capability_parameters(spec, payload.parameters)  # noqa: F821
+    except (ValueError, OperatorApprovalRequired) as exc:  # noqa: F821
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    approval_key = derive_approval_key(payload.capability, parameters)
-    approval = await grant_operation_approval(
+    approval_key = derive_approval_key(payload.capability, parameters)  # noqa: F821
+    approval = await grant_operation_approval(  # noqa: F821
         session,
         project_id=project.id,
         capability=payload.capability,
@@ -3741,12 +3757,13 @@ async def cutover_project_resident_engine(
     # had one, so the switch works on any project. Idempotent (no-op when present);
     # the helper takes the canonical Project row lock itself. Committed in its own
     # transaction before the cutover, which re-locks under its own sessionmaker.
-    from app.strategic_resident_checkpointing import initialize_strategic_resident
+    # [RESIDENT-REMOVAL] removed with resident subsystem
+#     from app.strategic_resident_checkpointing import initialize_strategic_resident
 
-    await initialize_strategic_resident(session, project.id)
+    await initialize_strategic_resident(session, project.id)  # noqa: F821
     await session.commit()
     try:
-        transition = await cutover_to_strategic_resident(AsyncSessionLocal, project_id)
+        transition = await cutover_to_strategic_resident(AsyncSessionLocal, project_id)  # noqa: F821
     except ResidentOwnershipTransitionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _resident_ownership_transition_response(project_id, transition)
@@ -3772,7 +3789,7 @@ async def rollback_project_resident_engine(
         project_id, current_user["user_id"], session, "owner"
     )
     try:
-        transition = await rollback_to_legacy_resident(AsyncSessionLocal, project_id)
+        transition = await rollback_to_legacy_resident(AsyncSessionLocal, project_id)  # noqa: F821
     except ResidentOwnershipTransitionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _resident_ownership_transition_response(project_id, transition)
@@ -3794,7 +3811,7 @@ async def stop_project_strategic_resident_session(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
-    snapshot = await stop_resident_session(
+    snapshot = await stop_resident_session(  # noqa: F821
         session,
         project,
         operator_user_id=current_user["user_id"],

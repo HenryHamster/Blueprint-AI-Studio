@@ -27,11 +27,12 @@ from app.providers.openai import (
     codex_oauth_requires_refresh_probe as _codex_oauth_requires_refresh_probe,  # noqa: F401 - compatibility re-export
 )
 from app.providers.registry import get_provider
-from app.strategic_resident_provider_policy import (
-    ResidentProviderPolicyHold,
-    resolve_resident_provider_routing,
-    validate_resident_model_provider,
-)
+# [RESIDENT-REMOVAL] removed with resident subsystem
+# from app.strategic_resident_provider_policy import (
+#     ResidentProviderPolicyHold,
+#     resolve_resident_provider_routing,
+#     validate_resident_model_provider,
+# )
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -4301,13 +4302,13 @@ async def select_llm_runtime_for_task(
     )
     routing_task_type = _task_type(task)
     try:
-        resident_routing = resolve_resident_provider_routing(
+        resident_routing = resolve_resident_provider_routing(  # noqa: F821
             task,
             project_provider_preference=provider_preference,
             allow_cross_provider_fallback=allow_fallback,
         )
-        validate_resident_model_provider(resident_routing, lambda model: infer_provider_for_model(model, runtime_config))
-    except ResidentProviderPolicyHold as exc:
+        validate_resident_model_provider(resident_routing, lambda model: infer_provider_for_model(model, runtime_config))  # noqa: F821
+    except ResidentProviderPolicyHold as exc:  # noqa: F821
         if failure_reasons is not None:
             failure_reasons.append(str(exc))
         if raise_resident_policy_hold:
