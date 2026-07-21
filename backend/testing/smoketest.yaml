@@ -1,10 +1,28 @@
 # Smoketest configuration — read by the smoketest agent on each run.
 # This file defines WHAT to test and HOW to interpret results.
 #
-# The smoketest agent runs three tiers in order:
-#   1. startup   — can the app import without errors?
-#   2. curated   — hand-picked critical-path tests (pytest -m smoketest)
-#   3. regression — full test suite
+# ── HARD CONSTRAINT: this runs on a READ-ONLY AGENT VM (2 vCPU / 8 GB, no DB) ──
+# The qualifier smoketest clones the candidate commit onto a plain agent VM and
+# drives pytest from an LLM session. That VM has **no PostgreSQL**, and per
+# CLAUDE.md the full DB-backed suite must NEVER run there: it takes 45-60+ min
+# and is OOM-prone on 2 vCPU / 8 GB.
+#
+# Until 2026-07-21 the `regression` suite was literally `testing/` — the entire
+# DB-backed suite. It could never pass: the session ran past its limit or OOM'd
+# on EVERY candidate, the task died `claude_code_failed` (CODE_ERROR), and the
+# qualifier recorded that as the NON-CONCLUSIVE status `infra_failure` and
+# re-drove forever (54 attempts on v26). It was never a candidate signal — it
+# was the harness eating itself.
+#
+# So every suite below MUST be:
+#   * no-DB     — run with `--noconftest`, exactly like the CI standalone gate
+#                 (`scripts/test-backend.sh --standalone`, which is what
+#                 `./check test` runs);
+#   * bounded   — an explicit file list, never a bare directory.
+#
+# Full DB-backed coverage is NOT skipped — it runs sharded in CI on the
+# automain->main promotion PR, which is the right place for it. Duplicating it
+# here is redundant, not additive.
 #
 # Fix tasks spawned from failures must NOT delete or weaken tests.
 # See CLAUDE.md "Test Guidelines" for the rules all agents must follow.
@@ -19,21 +37,26 @@ suites:
     fail_action: "critical"
 
   curated:
-    description: "Hand-picked tests for critical paths (tagged @pytest.mark.smoketest)"
-    pytest_args: "-m smoketest -v --tb=short"
+    description: "Critical-path invariants — security, auth, pipeline, core invariants (no DB, ~614 tests)"
+    pytest_args: "testing/test_security.py testing/test_invariants.py testing/test_admin_auth_invariant.py testing/test_pipeline.py --noconftest -v --tb=short"
     fail_action: "fix_high_priority"
 
   regression:
-    description: "Full test suite"
-    pytest_args: "testing/ -v --tb=short"
+    description: "Remainder of the CI standalone gate — manifests, migration chain, deprecations (no DB, ~212 tests)"
+    pytest_args: "testing/test_impacted_tests.py testing/test_audit_finding_class_guards.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_monthly_budget_alerts.py testing/test_migration_chain.py testing/test_salvage_bundle_standalone.py --noconftest -v --tb=short"
     fail_action: "fix_normal_priority"
 
 guardrails:
+  # Floors guard against a suite silently collapsing to nothing (bad path, mass
+  # collection error) and reporting a vacuous pass. Set well under the observed
+  # collected counts (~614 curated / ~212 regression) so normal drift does not
+  # false-trip them.
   min_test_count:
-    curated: 10
-    regression: 40
+    curated: 200
+    regression: 50
   fix_task_rules:
     - "Do NOT delete or skip tests just to make them pass"
     - "Tests may be removed ONLY when the functionality they test has been removed — explain why in the PR"
     - "Do NOT weaken assertions (e.g., changing assertEqual to assertIn) without justification"
     - "Diagnose whether the failure is in the TEST or the CODE before changing either"
+    - "NEVER point a suite at a bare directory (e.g. `testing/`) or drop `--noconftest` — that reintroduces the full DB-backed suite on a 2 vCPU / 8 GB VM and wedges the qualifier in an infra_failure re-drive loop"
