@@ -1204,18 +1204,21 @@ def _policy_from_build_config(project: Project | None) -> dict[str, Any] | None:
         return None
 
 # The operator-facing graduation gate for the completion-debt pressure signal.
-# ``completion_debt_weight_mode`` is a real runtime_config key (default
-# "observe"); only "enforce" lets the configured completion_debt weight reach
-# the composite blend.
+# ``completion_debt_weight_mode`` is a real runtime_config key graduated to
+# "enforce" (three-state adjudication, decision #7); only "enforce" lets the
+# configured completion_debt weight reach the composite blend. An operator may
+# still pin "off"/"observe" per deployment to roll back.
 _COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
 
 def _resolve_completion_debt_weight_mode() -> str:
-    """Return the live ``completion_debt_weight_mode`` (default "observe").
+    """Return the live ``completion_debt_weight_mode`` (shipped default "enforce").
 
-    Any unrecognised / unset value degrades to the safe "observe" default so a
-    malformed knob can never silently arm the enforce blend.
+    Any unrecognised / malformed value degrades to the conservative "observe"
+    fallback so a garbage knob can never silently arm the enforce blend — the
+    intended "enforce" state must be an explicit (or the shipped-default) value,
+    never a side effect of parsing junk.
     """
-    mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
+    mode = str(_runtime_config.get("completion_debt_weight_mode", "enforce")).strip().lower()
     return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
 
 def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:

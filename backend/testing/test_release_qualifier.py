@@ -977,15 +977,15 @@ class TestCompletionDebtWeightModeGate:
     def test_legacy_three_key_weights_still_resolve(self, mocker):
         """Backward compatibility: a legacy 3-key promotion_weights (no
         completion_debt) resolves exactly as before, with an effective
-        completion_debt weight of 0.0 (key absent) under the default observe
-        mode."""
+        completion_debt weight of 0.0 (key absent) under an explicitly-pinned
+        observe mode."""
         weights = {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}
         mocker.patch.dict(
             rq._runtime_config,
             {
                 "promotion_threshold": 0.90,
                 "promotion_weights": weights,
-                # No completion_debt_weight_mode set → default observe applies.
+                # Pin observe explicitly (the shipped default is now "enforce").
                 "completion_debt_weight_mode": "observe",
             },
             clear=False,
@@ -1143,7 +1143,14 @@ class TestPolicyFromBuildConfig:
             policy = rq._load_policy(proj)
             assert policy["threshold"] > 1.0 - weights["audit"]
 
-    def test_threshold_only_uses_default_weights(self):
+    def test_threshold_only_uses_default_weights(self, mocker):
+        # Pin observe so this asserts the base three-core-weight rubric without
+        # the enforce-default completion_debt overlay (covered separately).
+        mocker.patch.dict(
+            rq._runtime_config,
+            {"completion_debt_weight_mode": "observe"},
+            clear=False,
+        )
         proj = self._proj({"promotion_threshold": 0.85})
         policy, source, _ = rq._resolve_policy_with_provenance(proj)
         assert source == "build_config"
@@ -1250,7 +1257,13 @@ class TestLoadPolicy:
         is specifically about the on-disk file)."""
         mocker.patch.dict(
             rq._runtime_config,
-            {"promotion_threshold": None, "promotion_weights": None},
+            {
+                "promotion_threshold": None,
+                "promotion_weights": None,
+                # Pin observe: assert the on-disk three-core-weight shape without
+                # the enforce-default completion_debt overlay.
+                "completion_debt_weight_mode": "observe",
+            },
             clear=False,
         )
         policy = rq._load_policy()
@@ -1273,6 +1286,11 @@ class TestLoadPolicy:
     def test_fallback_on_missing_file(self, mocker, tmp_path):
         """A missing policy file falls back to hardcoded defaults, no raise."""
         _point_policy_at(mocker, tmp_path, None)
+        # Pin observe so the fallback asserts the base three-core rubric without
+        # the enforce-default completion_debt overlay.
+        mocker.patch.dict(
+            rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
+        )
         policy = rq._load_policy()
         assert policy["weights"] == {
             "audit": 0.40,
@@ -1325,6 +1343,11 @@ class TestLoadPolicy:
             # 0.6 + 0.6 + 0.6 = 1.8 — well outside the 0.01 tolerance.
             "weights:\n  audit: 0.6\n  test_erosion: 0.6\n"
             "  smoketest: 0.6\nthreshold: 0.75\n",
+        )
+        # Pin observe so the fallback asserts the base three-core rubric without
+        # the enforce-default completion_debt overlay.
+        mocker.patch.dict(
+            rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
         )
         policy = rq._load_policy()
         assert policy["weights"] == {
@@ -1510,6 +1533,11 @@ class TestLoadPolicyProvenance:
     def test_hardcoded_defaults_provenance_includes_parse_error(self, mocker, tmp_path):
         """A broken YAML file falls back to hardcoded defaults with an error string."""
         _point_policy_at(mocker, tmp_path, "weights: {unterminated: [1, 2")
+        # Pin observe so the hardcoded fallback asserts the base three-core
+        # rubric without the enforce-default completion_debt overlay.
+        mocker.patch.dict(
+            rq._runtime_config, {"completion_debt_weight_mode": "observe"}, clear=False
+        )
 
         policy, source, error = rq._resolve_policy_with_provenance()
         assert source == "hardcoded_defaults"

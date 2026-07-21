@@ -1175,30 +1175,62 @@ def test_dormant_knob_registry_covers_all_dormant_defaults():
             ), f"Dormant flag '{knob_key}' (value=False) not in registry"
 
 
-def test_completion_debt_weight_mode_seeds_dormant_debt(monkeypatch):
-    """The new completion_debt_weight_mode knob (default 'observe') is a real
-    runtime_config key, so iter_dormant_knob_debts now emits its dormant-knob row.
+def test_completion_debt_weight_mode_graduated_to_enforce_no_dormant_seed(monkeypatch):
+    """completion_debt_weight_mode graduated to "enforce" (three-state
+    adjudication, decision #7): it is no longer a dormant knob.
 
-    Regression guard for Defect 2: before the knob became a real default key,
-    runtime_config.get(key, "") yielded "" (not in {off, observe}) and the row
-    was silently skipped — so the graduation gate seeded no obligation.
+    The shipped default is now "enforce", the key is removed from
+    ``_DORMANT_MODE_KNOBS``, and ``iter_dormant_knob_debts`` never emits its
+    dormant-knob row again — even if an operator pins it back to "observe" the
+    de-registration means it no longer accrues completion debt.
     """
-    # The shipped default must be a member of the dormant set so the row seeds.
-    assert str(runtime_config.get("completion_debt_weight_mode")).lower() == "observe"
+    # The shipped default is now the armed "enforce" state.
+    assert str(runtime_config.get("completion_debt_weight_mode")).lower() == "enforce"
 
-    debts = iter_dormant_knob_debts()
-    by_key = {d["dedupe_key"]: d for d in debts}
-    assert "dormant_knob:completion_debt_weight_mode" in by_key, (
-        "completion_debt_weight_mode in observe mode must seed its dormant-knob debt"
-    )
-    entry = by_key["dormant_knob:completion_debt_weight_mode"]
-    assert entry["kind"] == "dormant_knob"
-    assert entry["detail"] == {"knob": "completion_debt_weight_mode", "value": "observe"}
+    # De-registered: no longer tracked as dormant debt.
+    assert "completion_debt_weight_mode" not in _DORMANT_MODE_KNOBS
 
-    # When graduated to enforce, the knob leaves the dormant set → no seed row.
-    monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "enforce")
     enforced_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
-    assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys
+    assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys, (
+        "graduated completion_debt_weight_mode must not seed a dormant-knob debt"
+    )
+
+    # Even an operator rollback to "observe" no longer re-registers dormant debt,
+    # because the knob has left the registry entirely.
+    monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "observe")
+    rolled_back_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
+    assert "dormant_knob:completion_debt_weight_mode" not in rolled_back_keys
+
+
+def test_completion_debt_weight_default_enforce_blends_weight():
+    """Under the shipped default the enforce blend is armed: the release qualifier
+    lets a configured completion_debt weight reach the composite.
+
+    Ties the promoted runtime_config default to the observable release_qualifier
+    behavior it graduates — a test-only registry edit would not exercise this.
+    """
+    from app.release_qualifier import (
+        _apply_completion_debt_weight_mode,
+        _resolve_completion_debt_weight_mode,
+    )
+    from app.release_scoring import DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    # Shipped default resolves to the armed "enforce" mode.
+    assert _resolve_completion_debt_weight_mode() == "enforce"
+
+    # A configured completion_debt weight survives into the effective blend.
+    configured = {"weights": {"completion_debt": 0.2, "coverage": 0.8}}
+    gated = _apply_completion_debt_weight_mode(configured)
+    assert gated["weights"]["completion_debt"] == 0.2
+
+    # Graduated-but-unset falls back to the nonzero enforce default so promotion
+    # actually changes the composite (never silently zeroed).
+    unset = {"weights": {"coverage": 1.0}}
+    gated_unset = _apply_completion_debt_weight_mode(unset)
+    assert (
+        gated_unset["weights"]["completion_debt"]
+        == DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+    )
 
 
 @pytest.mark.asyncio

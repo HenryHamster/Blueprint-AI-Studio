@@ -354,7 +354,6 @@ def test_scratch_db_url_is_qualification_prereq_not_boot_req():
     from app.required_runtime_env import REQUIRED_RUNTIME_ENV
 
     _SCRATCH_VAR = "MIGRATION_APPLY_SCRATCH_DATABASE_URL"
-
     boot_names = {r.name for r in REQUIRED_RUNTIME_ENV}
 
     assert _SCRATCH_VAR not in boot_names, (
@@ -5149,9 +5148,9 @@ def test_f20_14_hotfix_remediation_api_client_present():
     )
 
 
-# f20-15 — feat(release): declare + diagnose migration-apply scratch prereq
-# Already pinned by test_scratch_db_url_is_qualification_prereq_not_boot_req
-# (same fix as f20-6, which moved the var to QUALIFICATION_ENV).
+# f20-15 — MIGRATION_APPLY_SCRATCH_DATABASE_URL not in REQUIRED_RUNTIME_ENV (boot safe)
+# Already pinned by test_scratch_db_url_is_qualification_prereq_not_boot_req and
+# test_f20_6_scratch_db_url_in_qualification_env_not_required_env.
 # --------------------------------------------------------------------------- #
 
 

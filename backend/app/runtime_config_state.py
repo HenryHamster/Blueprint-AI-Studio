@@ -267,14 +267,18 @@ runtime_config: Dict = {
     #   enforce  — the configured completion_debt weight is applied (falling back
     #              to a sensible nonzero default when the operator left it unset),
     #              so open completion debt actually erodes promotion confidence.
-    # Default "observe" is a member of _DORMANT_KNOB_VALUES, so this knob seeds its
-    # own dormant_knob completion-debt row via iter_dormant_knob_debts.
+    # Graduated to "enforce" (three-state adjudication, decision #7): the debt-
+    # pressure counterfactual has been computed for every qualify run under
+    # observe, so the configured completion_debt weight now blends into the
+    # composite by default. No longer a dormant knob — removed from
+    # _DORMANT_MODE_KNOBS below. An operator may still pin "off"/"observe" via
+    # the env var / PATCH settings for a per-deployment rollback.
     "completion_debt_weight_mode": os.getenv(
-        "COMPLETION_DEBT_WEIGHT_MODE", "observe"
+        "COMPLETION_DEBT_WEIGHT_MODE", "enforce"
     ).lower()
-    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
+    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "enforce").lower()
     in ("off", "observe", "enforce")
-    else "observe",
+    else "enforce",
     # Rollout mode for the capability proof gate — controls whether prerequisite
     # resolution gates on machine-verified proof (enforce) or allows self-reported
     # working status (off/observe).
@@ -1356,9 +1360,8 @@ _DORMANT_MODE_KNOBS = {
     "review_fix_lane_pilot_mode": (
         "Review-fix lane pilot mode shipping inert (default-off)"
     ),
-    "completion_debt_weight_mode": (
-        "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
-    ),
+    # completion_debt_weight_mode graduated to "enforce" (decision #7) — no
+    # longer dormant, so it is intentionally absent from this registry.
     "capability_proof_gate_mode": (
         "Capability proof gate not yet enforcing (off/observe)"
     ),
