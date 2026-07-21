@@ -288,6 +288,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # === Capacity management (internal pipeline) ============================
     # Task deferred because project hit max concurrent compute jobs cap.
     "capacity.compute_cap_deferred": STRATEGIST_INTERNAL,
+    # Usage meter persistently dark — LLM account(s) unreachable or persist-
+    # failing for >30 min, which can prevent usage_headroom from arming.
+    # Operator-visible so a chronically broken meter does not go unnoticed.
+    "capacity.usage_meter_dark": OPERATOR_FYI,
     # === Infrastructure alerts =============================================
     # Compute image GC-protection tag failed to apply; risk of digest loss.
     "vm.gc_protection_failure": OPERATOR_ACTION_NEEDED,

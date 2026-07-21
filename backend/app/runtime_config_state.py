@@ -1204,6 +1204,26 @@ runtime_config: Dict = {
     # at least 4 out of 5 eligible accounts must report fresh data. An operator
     # can lower this to 0 to arm regardless of coverage (not recommended).
     "usage_headroom_min_coverage_pct": 80,
+    # Tri-state control for autonomously arming ``usage_headroom_gate_enabled``
+    # from sustained meter reliability (the ``armable`` verdict computed by
+    # get_meter_reliability_stats). The leader orchestrator runs a reconciler on
+    # the usage-meter cadence:
+    #   "auto"   — the leader ARMS the gate once ``armable`` has held True
+    #              CONTINUOUSLY across usage_headroom_auto_arm_observation_minutes,
+    #              and fail-safe DISARMS it immediately the instant ``armable``
+    #              regresses (no window on the way down).
+    #   "manual" — the reconciler never touches the gate; the operator owns
+    #              usage_headroom_gate_enabled (today's behavior).
+    #   "off"    — force-disarm kill switch: the reconciler drives the gate to
+    #              False and holds it there.
+    # DEFAULT MUST be "auto": defaulting to "manual"/"off" would reproduce the
+    # exact 'a human must flip it' bug this closed loop exists to fix.
+    "usage_headroom_auto_arm_mode": "auto",
+    # Minutes the ``armable`` verdict must hold CONTINUOUSLY before auto mode
+    # arms the gate — sustained above threshold, not a single instantaneous
+    # sample, so a transient healthy blip does not arm. Disarm is always
+    # immediate (fail-safe); this window governs arming only.
+    "usage_headroom_auto_arm_observation_minutes": 60,
     # Task types the claim-time gate applies to (long-running work that burns a
     # large share of an account's budget if it dies mid-run and restarts). The
     # headroom RANKING preference applies to all task types when enabled; only
@@ -2361,6 +2381,23 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     _set(
                         "usage_headroom_gate_enabled",
                         bool(config_json["usage_headroom_gate_enabled"]),
+                    )
+                if "usage_headroom_auto_arm_mode" in config_json:
+                    raw_mode = str(
+                        config_json["usage_headroom_auto_arm_mode"]
+                    ).strip().lower()
+                    if raw_mode in ("auto", "manual", "off"):
+                        _set("usage_headroom_auto_arm_mode", raw_mode)
+                if "usage_headroom_auto_arm_observation_minutes" in config_json:
+                    try:
+                        raw_obs = int(
+                            config_json["usage_headroom_auto_arm_observation_minutes"]
+                        )
+                    except (TypeError, ValueError):
+                        raw_obs = 60
+                    _set(
+                        "usage_headroom_auto_arm_observation_minutes",
+                        max(1, min(1440, raw_obs)),
                     )
                 if "usage_headroom_long_running_task_types" in config_json:
                     raw_types = config_json["usage_headroom_long_running_task_types"]

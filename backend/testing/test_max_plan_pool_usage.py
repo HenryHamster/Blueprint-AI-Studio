@@ -9,14 +9,18 @@ Covers:
 - Dark-meter warning logged for OAuth accounts with missing secrets
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 
 from app.providers.base import UsageSnapshot
 from app.max_plan_pool import (
     _account_by_id,
+    _persist_rate_limit_usage_to_db,
     _snapshot_from_persisted_usage,
+    get_usage_persist_failure_count,
+    get_usage_headroom_armable_since,
+    reconcile_usage_headroom_arming,
     refresh_usage_meter_snapshots,
 )
 from app.time_utils import _utcnow
@@ -375,6 +379,97 @@ class TestSnapshotFromPersistedUsageWithNewBlobs:
         assert _snapshot_from_persisted_usage(raw) is None
 
 
+# ── persist-failure counter recovery ─────────────────────────────────────────
+
+
+class TestPersistFailureCounterRecovery:
+    """_usage_persist_failures must decrement on a successful persist so a
+    transient DB hiccup does not permanently block usage_headroom arming.
+    """
+
+    @pytest.mark.asyncio
+    async def test_persist_failure_counter_recovers_after_success(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        # Seed the module-level counter to simulate a prior failure.
+        monkeypatch.setattr(mpp, "_usage_persist_failures", 1)
+
+        snap = UsageSnapshot(
+            known=True,
+            window_utilizations={"five_hour": 30.0, "seven_day": 45.0},
+            resets_at={},
+            probed_at="2026-07-09T12:00:00",
+        )
+
+        class FakeRow:
+            rate_limit_usage = None
+            updated_at = None
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return FakeRow()
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+        assert get_usage_persist_failure_count() == 1, "counter must be seeded"
+        await _persist_rate_limit_usage_to_db("test-id", snap)
+        assert get_usage_persist_failure_count() == 0, (
+            "counter must decrement to 0 after a successful persist so armable can recover"
+        )
+
+    @pytest.mark.asyncio
+    async def test_counter_does_not_go_below_zero(self, monkeypatch):
+        import app.max_plan_pool as mpp
+
+        monkeypatch.setattr(mpp, "_usage_persist_failures", 0)
+
+        snap = UsageSnapshot(
+            known=True,
+            window_utilizations={"five_hour": 10.0},
+            resets_at={},
+            probed_at="2026-07-09T12:00:00",
+        )
+
+        class FakeRow:
+            rate_limit_usage = None
+            updated_at = None
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a, **k):
+                pass
+
+            async def get(self, model, acct_id):
+                return FakeRow()
+
+            def add(self, obj):
+                pass
+
+            async def commit(self):
+                pass
+
+        monkeypatch.setattr("app.max_plan_pool.AsyncSessionLocal", lambda: FakeSession())
+        monkeypatch.setattr("app.max_plan_pool.uuid.UUID", lambda x: x)
+
+        await _persist_rate_limit_usage_to_db("test-id", snap)
+        assert get_usage_persist_failure_count() == 0, "counter must stay at 0, not go negative"
+
+
 # ── Dark-meter warning for OAuth accounts with missing secrets ────────────────
 
 
@@ -504,3 +599,387 @@ class TestDarkMeterWarningForMissingSecret:
         ]
         assert not secret_warnings
         assert "has-secret" in scheduled
+
+
+# ── reconcile_usage_headroom_arming: close the loop (auto-arm) ────────────────
+
+
+class _FakeDeployState:
+    """Minimal stand-in for models.DeploymentState(id=1)."""
+
+    def __init__(self, config_json=None):
+        self.runtime_config_json = config_json
+
+
+def _install_fake_stats(monkeypatch, holder):
+    """Drive get_meter_reliability_stats' `armable` verdict from a mutable holder
+    so a test can flip reliability without wiring a full account pool."""
+    import app.max_plan_pool as mpp
+
+    async def _fake_stats(now=None, min_coverage_pct=80):
+        return {
+            "armable": holder["armable"],
+            "coverage_ratio": 1.0 if holder["armable"] else 0.0,
+            "persist_failure_count": 0,
+        }
+
+    monkeypatch.setattr(mpp, "get_meter_reliability_stats", _fake_stats)
+
+
+def _install_fake_state(monkeypatch, commits, *, fail=False, missing=False):
+    """Install a fake AsyncSessionLocal that persists into a shared DeploymentState
+    stand-in and records each commit's runtime_config_json snapshot."""
+    import app.max_plan_pool as mpp
+
+    state = None if missing else _FakeDeployState({})
+
+    class _Sess:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, model, pk):
+            return state
+
+        def add(self, obj):
+            pass
+
+        async def commit(self):
+            if fail:
+                raise RuntimeError("simulated commit failure")
+            commits.append(dict(state.runtime_config_json or {}))
+
+    monkeypatch.setattr(mpp, "AsyncSessionLocal", lambda: _Sess())
+    return state
+
+
+def _set_config(monkeypatch, **overrides):
+    import app.shared_state as shared_state
+
+    base = {
+        "usage_headroom_auto_arm_mode": "auto",
+        "usage_headroom_auto_arm_observation_minutes": 60,
+        "usage_headroom_gate_enabled": False,
+        "usage_headroom_min_coverage_pct": 80,
+    }
+    base.update(overrides)
+    for k, v in base.items():
+        monkeypatch.setitem(shared_state.runtime_config, k, v)
+
+
+@pytest.fixture
+def _reset_arm_marker(monkeypatch):
+    import app.max_plan_pool as mpp
+
+    monkeypatch.setattr(mpp, "_usage_headroom_armable_since", None)
+    yield
+
+
+@pytest.mark.asyncio
+class TestReconcileUsageHeadroomArming:
+    """Close-the-loop reconciler: sustained meter reliability arms the gate;
+    a regression fail-safe disarms it; mode governs whether it acts at all."""
+
+    async def test_auto_arms_after_window_elapses(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        state = _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        # First cycle: armable holds but window has not elapsed → wait, not armed.
+        res = await reconcile_usage_headroom_arming(now=now0)
+        assert res["action"] == "waiting"
+        assert res["gate_enabled"] is False
+        assert commits == [], "must NOT persist before the window elapses"
+        assert get_usage_headroom_armable_since() == now0
+
+        # Second cycle past the 60-minute window → arm.
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert res["action"] == "armed"
+        assert res["gate_enabled"] is True
+        # Persisted to DeploymentState BEFORE the in-memory mutation.
+        assert commits == [{"usage_headroom_gate_enabled": True}]
+        assert state.runtime_config_json["usage_headroom_gate_enabled"] is True
+        # In-memory config mirrored after the durable commit.
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
+
+    async def test_auto_stays_off_before_window(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        # 30 minutes < 60-minute window.
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=30))
+        assert res["action"] == "waiting"
+        assert res["gate_enabled"] is False
+        assert commits == []
+
+    async def test_auto_failsafe_disarms_on_regression(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(monkeypatch)
+        holder = {"armable": True}
+        _install_fake_stats(monkeypatch, holder)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
+
+        # Reliability regresses — immediate fail-safe disarm, no window.
+        holder["armable"] = False
+        res = await reconcile_usage_headroom_arming(
+            now=now0 + timedelta(minutes=62)
+        )
+        assert res["action"] == "disarmed"
+        assert res["gate_enabled"] is False
+        assert commits[-1] == {"usage_headroom_gate_enabled": False}
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
+        assert get_usage_headroom_armable_since() is None
+
+    async def test_mid_window_regression_resets_clock(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        _set_config(monkeypatch)
+        holder = {"armable": True}
+        _install_fake_stats(monkeypatch, holder)
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        # Regress before arming — marker resets, gate never armed.
+        holder["armable"] = False
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=30))
+        assert res["action"] == "noop"
+        assert get_usage_headroom_armable_since() is None
+        assert commits == []
+
+        # Recover — the window restarts from the recovery instant, not now0.
+        holder["armable"] = True
+        recover_at = now0 + timedelta(minutes=40)
+        await reconcile_usage_headroom_arming(now=recover_at)
+        assert get_usage_headroom_armable_since() == recover_at
+        # 61 min after now0 is only 21 min into the restarted window → still off.
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert res["action"] == "waiting"
+        assert commits == []
+
+    async def test_manual_mode_never_touches_gate(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(
+            monkeypatch,
+            usage_headroom_auto_arm_mode="manual",
+            usage_headroom_gate_enabled=True,
+        )
+        _install_fake_stats(monkeypatch, {"armable": False})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        # Even with armable False, manual mode leaves the operator's gate as-is.
+        res = await reconcile_usage_headroom_arming(now=_utcnow())
+        assert res["action"] == "noop"
+        assert res["mode"] == "manual"
+        assert commits == []
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is True
+
+    async def test_off_mode_forces_gate_false(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(
+            monkeypatch,
+            usage_headroom_auto_arm_mode="off",
+            usage_headroom_gate_enabled=True,
+        )
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        res = await reconcile_usage_headroom_arming(now=_utcnow())
+        assert res["action"] == "disarmed"
+        assert res["gate_enabled"] is False
+        assert commits == [{"usage_headroom_gate_enabled": False}]
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
+
+    async def test_off_mode_idempotent_when_already_false(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        _set_config(
+            monkeypatch,
+            usage_headroom_auto_arm_mode="off",
+            usage_headroom_gate_enabled=False,
+        )
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        res = await reconcile_usage_headroom_arming(now=_utcnow())
+        assert res["action"] == "noop"
+        assert commits == [], "no redundant write when already disarmed"
+
+    async def test_arm_is_idempotent_no_redundant_writes(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert len(commits) == 1
+        # Subsequent cycles with the gate already armed must not re-persist.
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=120))
+        assert res["action"] == "noop"
+        assert res["gate_enabled"] is True
+        assert len(commits) == 1, "armed gate must not be re-committed each cycle"
+
+    async def test_persist_failure_leaves_memory_unchanged(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits, fail=True)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert res["action"] == "persist_failed"
+        # Persist failed → in-memory gate must remain the un-armed default.
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
+
+    async def test_missing_deployment_state_does_not_arm(
+        self, monkeypatch, _reset_arm_marker
+    ):
+        import app.shared_state as shared_state
+
+        _set_config(monkeypatch)
+        _install_fake_stats(monkeypatch, {"armable": True})
+        commits: list = []
+        _install_fake_state(monkeypatch, commits, missing=True)
+
+        now0 = _utcnow()
+        await reconcile_usage_headroom_arming(now=now0)
+        res = await reconcile_usage_headroom_arming(now=now0 + timedelta(minutes=61))
+        assert res["action"] == "persist_failed"
+        assert shared_state.runtime_config["usage_headroom_gate_enabled"] is False
+
+
+# ── config plumbing: sync + PATCH validation for the auto-arm knobs ──────────
+
+
+class _FakeSyncState:
+    """Minimal DeploymentState stand-in for sync_runtime_config_from_state."""
+
+    def __init__(self, config_json):
+        from app.models import DeploymentStatus
+
+        self.status = DeploymentStatus.STABLE
+        self.runtime_config_json = config_json
+
+
+@pytest.mark.asyncio
+class TestAutoArmConfigPlumbing:
+    """The two new knobs must propagate across instances via
+    sync_runtime_config_from_state and be validated in the PATCH handler."""
+
+    async def test_sync_propagates_auto_arm_keys(self, monkeypatch):
+        import app.shared_state as shared_state
+        from app.runtime_config_state import sync_runtime_config_from_state
+
+        monkeypatch.setitem(
+            shared_state.runtime_config, "usage_headroom_auto_arm_mode", "auto"
+        )
+        monkeypatch.setitem(
+            shared_state.runtime_config,
+            "usage_headroom_auto_arm_observation_minutes",
+            60,
+        )
+        state = _FakeSyncState(
+            {
+                "usage_headroom_auto_arm_mode": "off",
+                "usage_headroom_auto_arm_observation_minutes": 30,
+            }
+        )
+        await sync_runtime_config_from_state(state)
+        assert shared_state.runtime_config["usage_headroom_auto_arm_mode"] == "off"
+        assert (
+            shared_state.runtime_config[
+                "usage_headroom_auto_arm_observation_minutes"
+            ]
+            == 30
+        )
+
+    async def test_sync_rejects_bad_mode_and_clamps_minutes(self, monkeypatch):
+        import app.shared_state as shared_state
+        from app.runtime_config_state import sync_runtime_config_from_state
+
+        monkeypatch.setitem(
+            shared_state.runtime_config, "usage_headroom_auto_arm_mode", "auto"
+        )
+        monkeypatch.setitem(
+            shared_state.runtime_config,
+            "usage_headroom_auto_arm_observation_minutes",
+            60,
+        )
+        state = _FakeSyncState(
+            {
+                # Bogus mode is ignored (stays at prior value).
+                "usage_headroom_auto_arm_mode": "bogus",
+                # Absurd window is clamped to the [1, 1440] bound.
+                "usage_headroom_auto_arm_observation_minutes": 999999,
+            }
+        )
+        await sync_runtime_config_from_state(state)
+        assert shared_state.runtime_config["usage_headroom_auto_arm_mode"] == "auto"
+        assert (
+            shared_state.runtime_config[
+                "usage_headroom_auto_arm_observation_minutes"
+            ]
+            == 1440
+        )
+
+    async def test_patch_validation_rejects_bad_mode(self):
+        from fastapi import HTTPException
+        from app.routers.admin_settings import _apply_settings
+
+        with pytest.raises(HTTPException) as ei:
+            await _apply_settings(
+                {"usage_headroom_auto_arm_mode": "sometimes"}, None, {}
+            )
+        assert ei.value.status_code == 400
+
+    async def test_patch_validation_rejects_out_of_range_minutes(self):
+        from fastapi import HTTPException
+        from app.routers.admin_settings import _apply_settings
+
+        with pytest.raises(HTTPException) as ei:
+            await _apply_settings(
+                {"usage_headroom_auto_arm_observation_minutes": 0}, None, {}
+            )
+        assert ei.value.status_code == 400

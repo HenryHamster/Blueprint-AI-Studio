@@ -40,6 +40,7 @@ from app.auth import get_current_user, require_admin
 from app.github import generate_installation_access_token
 from app.max_plan_pool import (
     get_meter_reliability_stats as _get_meter_reliability_stats,
+    get_usage_headroom_armable_since as _get_usage_headroom_armable_since,
     provider_selection_mode as _provider_selection_mode_from_config,
 )
 from app.providers.registry import get_provider, list_providers
@@ -210,6 +211,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "task_type_routing",
         # Proactive account-usage headroom (advisory; ships dark by default).
         "usage_headroom_gate_enabled",
+        "usage_headroom_auto_arm_mode",
+        "usage_headroom_auto_arm_observation_minutes",
         "usage_headroom_long_running_task_types",
         "usage_headroom_min_coverage_pct",
         "usage_headroom_threshold_pct",
@@ -537,6 +540,11 @@ async def get_settings(
             exc_info=True,
         )
 
+    # Leader-memory 'armable-since' marker for the auto-arm reconciler. None on
+    # non-leader instances (they do not run the reconciler) or when not holding.
+    _armable_since = _get_usage_headroom_armable_since()
+    _armable_since_iso = _armable_since.isoformat() if _armable_since else None
+
     return {
         "max_concurrent_vms": _runtime_config["max_concurrent_vms"],
         "max_retries": _runtime_config["max_retries"],
@@ -688,6 +696,19 @@ async def get_settings(
         "usage_headroom_gate_enabled": bool(
             _runtime_config.get("usage_headroom_gate_enabled", False)
         ),
+        # Auto-arm reconciler state (closes the loop: usage_headroom_gate_enabled
+        # is now the reconciler-written EFFECTIVE state in auto mode). Additive —
+        # existing consumers keep their fields unchanged.
+        "usage_headroom_auto_arm_mode": str(
+            _runtime_config.get("usage_headroom_auto_arm_mode", "auto")
+        ),
+        "usage_headroom_auto_arm_observation_minutes": int(
+            _runtime_config.get("usage_headroom_auto_arm_observation_minutes", 60)
+        ),
+        # Leader-memory marker of when `armable` first became (and has since
+        # continuously held) True. None on non-leader instances or when not
+        # currently holding — the sustained-window clock the reconciler uses.
+        "usage_headroom_armable_since": _armable_since_iso,
         "usage_headroom_min_coverage_pct": _min_coverage_pct,
         "usage_headroom_threshold_pct": _runtime_config.get(
             "usage_headroom_threshold_pct", 90
@@ -1434,6 +1455,36 @@ async def _apply_settings(
                 detail="usage_headroom_gate_enabled must be a boolean",
             )
         _runtime_config["usage_headroom_gate_enabled"] = val
+    if "usage_headroom_auto_arm_mode" in payload:
+        val = payload["usage_headroom_auto_arm_mode"]
+        if not isinstance(val, str) or val.strip().lower() not in (
+            "auto",
+            "manual",
+            "off",
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_mode must be one of "
+                "'auto', 'manual', 'off'",
+            )
+        _runtime_config["usage_headroom_auto_arm_mode"] = val.strip().lower()
+    if "usage_headroom_auto_arm_observation_minutes" in payload:
+        try:
+            val = int(payload["usage_headroom_auto_arm_observation_minutes"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_observation_minutes must be a number",
+            )
+        # A positive number of minutes with a sane upper bound (1 day). The
+        # window governs how long `armable` must hold before auto mode arms.
+        if not (1 <= val <= 1440):
+            raise HTTPException(
+                status_code=400,
+                detail="usage_headroom_auto_arm_observation_minutes must be "
+                "between 1 and 1440",
+            )
+        _runtime_config["usage_headroom_auto_arm_observation_minutes"] = val
     if "usage_headroom_threshold_pct" in payload:
         try:
             val = int(payload["usage_headroom_threshold_pct"])
@@ -3850,6 +3901,28 @@ async def _apply_settings(
                     # restart. Managed by admin_migration_exemptions; only echoed here.
                     "migration_divergence_exemptions": _runtime_config.get(
                         "migration_divergence_exemptions", []
+                    ),
+                    # Preserve the usage-headroom selection gate and its auto-arm
+                    # controls across this wholesale rebuild. sync_runtime_config_from_state
+                    # reads all three keys back on boot / every sync cycle; without
+                    # echoing them here an unrelated settings PATCH silently drops
+                    # them, so on the next restart the module defaults
+                    # (gate off, mode "auto") take over — the reconciler then
+                    # re-arms the gate against an operator who set mode="off"
+                    # (documented force-disarm kill switch) or "manual". The gate
+                    # value itself is normally reconciler-managed (via a targeted
+                    # merge-persist), but echoing it here keeps the armed state
+                    # from being reverted by an operator settings PATCH.
+                    "usage_headroom_gate_enabled": bool(
+                        _runtime_config.get("usage_headroom_gate_enabled", False)
+                    ),
+                    "usage_headroom_auto_arm_mode": str(
+                        _runtime_config.get("usage_headroom_auto_arm_mode", "auto")
+                    ),
+                    "usage_headroom_auto_arm_observation_minutes": int(
+                        _runtime_config.get(
+                            "usage_headroom_auto_arm_observation_minutes", 60
+                        )
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

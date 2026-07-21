@@ -2358,3 +2358,118 @@ async def _maybe_create_no_progress_watchdog_alert(
             "title": alert.title,
         },
     )
+
+
+_USAGE_METER_DARK_ALERT_TITLE = "Usage meter persistently dark: LLM account(s) unreachable"
+
+
+async def _maybe_create_usage_meter_dark_alert(
+    session: AsyncSession,
+    dark_count: int,
+    persist_failures: int,
+) -> None:
+    """Fleet-broadcast WARNING when usage meters are persistently dark or persist-failing.
+
+    Deduplicates: skips if an undismissed alert with the stable title already
+    exists for a project.  Called from the orchestrator's 300 s meter cadence.
+    The companion :func:`_resolve_usage_meter_dark_alert` dismisses these alerts
+    when both conditions clear.
+    """
+    msg = (
+        f"{dark_count} LLM account(s) have been unreachable for >30 minutes"
+        if dark_count
+        else ""
+    )
+    if persist_failures:
+        suffix = (
+            f"{persist_failures} DB persist failure(s) in the usage-meter pipeline"
+        )
+        msg = f"{msg}; {suffix}" if msg else suffix
+    msg = (msg or "Usage meter is dark — check logs for details.") + (
+        " Usage headroom gate may be unable to arm."
+    )
+
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_maybe_create_usage_meter_dark_alert: project_ids capped at %d",
+            global_limit,
+        )
+    existing_rows = (
+        (
+            await session.execute(
+                select(Alert.project_id).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _USAGE_METER_DARK_ALERT_TITLE,
+                )
+            )
+        ).all()
+        if project_ids
+        else []
+    )
+    projects_with_alert = {row[0] for row in existing_rows}
+    for pid in project_ids:
+        if pid in projects_with_alert:
+            continue
+        alert = Alert(
+            project_id=pid,
+            severity=AlertSeverity.WARNING,
+            title=_USAGE_METER_DARK_ALERT_TITLE,
+            message=msg,
+            event_type="capacity.usage_meter_dark",
+        )
+        session.add(alert)
+        await broadcast_to_project(
+            str(pid),
+            "alert_created",
+            {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+        )
+
+
+async def _resolve_usage_meter_dark_alert(session: AsyncSession) -> None:
+    """Dismiss all open usage-meter-dark alerts when meters recover.
+
+    Called from the orchestrator's meter cadence when both dark_count and
+    persist_failures are zero.  Paired with
+    :func:`_maybe_create_usage_meter_dark_alert`.
+    """
+    now = _utcnow()
+    global_limit = _runtime_config.get("project_broadcast_limit", 1000)
+    rows = (
+        await session.execute(
+            select(Project.id, Project.design_doc).limit(global_limit)
+        )
+    ).all()
+    project_ids = [pid for pid, doc in rows if _get_broadcast_limit(doc) > 0]
+    if len(rows) == global_limit:
+        logger.warning(
+            "_resolve_usage_meter_dark_alert: project_ids capped at %d",
+            global_limit,
+        )
+    open_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id.in_(project_ids),
+                    Alert.task_id.is_(None),
+                    Alert.dismissed_at.is_(None),
+                    Alert.title == _USAGE_METER_DARK_ALERT_TITLE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+        if project_ids
+        else []
+    )
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)

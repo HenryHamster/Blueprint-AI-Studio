@@ -1196,6 +1196,7 @@ async def orchestrator_worker():
         detect_persistently_dark_meters,
         get_usage_persist_failure_count,
         load_max_plan_pool,
+        reconcile_usage_headroom_arming,
         refresh_usage_meter_snapshots,
         release_max_plan_account,
         recheck_disabled_accounts,
@@ -1235,6 +1236,8 @@ async def orchestrator_worker():
         _maybe_create_failure_alert,
         _maybe_create_cascade_cancel_alert,
         _create_orchestrator_error_alerts,
+        _maybe_create_usage_meter_dark_alert,
+        _resolve_usage_meter_dark_alert,
     )
     from app.routers.agent_status import record_task_result
     from app.deploy_health import (
@@ -1317,6 +1320,32 @@ async def orchestrator_worker():
                     logger.warning(
                         "[POOL] usage meter: persist_failures=%d (no dark accounts)",
                         persist_failures,
+                    )
+                try:
+                    async with AsyncSessionLocal() as _meter_alert_session:
+                        if dark or persist_failures:
+                            await _maybe_create_usage_meter_dark_alert(
+                                _meter_alert_session,
+                                dark_count=len(dark),
+                                persist_failures=persist_failures,
+                            )
+                        else:
+                            await _resolve_usage_meter_dark_alert(_meter_alert_session)
+                        await _meter_alert_session.commit()
+                except Exception:
+                    logger.exception(
+                        "[POOL] Failed to create/resolve usage-meter-dark alerts"
+                    )
+                # Close the loop: autonomously arm/disarm the usage_headroom gate
+                # from sustained meter reliability. Leader-only (this is the leader
+                # dispatch cycle, and the observation-window marker is
+                # leader-memory). Fire-and-forget; a failure here must never block
+                # or crash dispatch, exactly like the neighbors above.
+                try:
+                    await reconcile_usage_headroom_arming()
+                except Exception:
+                    logger.exception(
+                        "[POOL] usage_headroom auto-arm reconciler failed"
                     )
                 _last_usage_meter_refresh = _utcnow()
 

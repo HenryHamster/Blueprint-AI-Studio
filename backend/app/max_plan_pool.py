@@ -2995,6 +2995,7 @@ async def _persist_rate_limit_usage_to_db(
     once so a transient DB hiccup does not leave the meter dark on non-leader
     instances (which rely on the persisted ``rate_limit_usage`` column).
     """
+    global _usage_persist_failures
     if not snapshot.known:
         return
     usage_dict = snapshot.to_dict()
@@ -3012,10 +3013,11 @@ async def _persist_rate_limit_usage_to_db(
                     row.updated_at = _utcnow()
                     persist_session.add(row)
                     await persist_session.commit()
+                if _usage_persist_failures > 0:
+                    _usage_persist_failures -= 1
                 return  # success
         except Exception:  # noqa: PERF203 - bounded persist-retry, not a hot loop
             if attempt == 0:
-                global _usage_persist_failures
                 _usage_persist_failures += 1
                 logger.warning(
                     "[POOL] failed to persist rate_limit_usage for account %s; retrying...",
@@ -3402,6 +3404,256 @@ async def get_meter_reliability_stats(
         "coverage_ratio": coverage_ratio,
         "persist_failure_count": persist_failures,
         "armable": armable,
+    }
+
+
+# Leader-memory marker: the timestamp at which ``armable`` first became — and has
+# since continuously stayed — True. Reset to None the instant ``armable`` regresses
+# (or the mode leaves "auto"), so the sustained-observation clock restarts. A leader
+# restart also resets it via module reload, which is fail-closed / conservative: the
+# window is simply re-observed before the gate is (re-)armed.
+_usage_headroom_armable_since: datetime | None = None
+
+
+def get_usage_headroom_armable_since() -> datetime | None:
+    """Return the leader-memory 'armable-since' marker (None if not currently
+    holding, or if this instance is not the leader that runs the reconciler)."""
+    return _usage_headroom_armable_since
+
+
+async def _persist_usage_headroom_gate_enabled(value: bool) -> bool:
+    """Persist ``usage_headroom_gate_enabled`` into DeploymentState.runtime_config_json
+    (id=1) BEFORE mutating in-memory ``runtime_config``.
+
+    A process must never run a gate state that was not durably committed, so the
+    DB write happens first; only on a successful commit do we mirror the value
+    into process-local config (non-leader instances pick it up via
+    ``sync_runtime_config_from_state``). A persist failure leaves in-memory state
+    unchanged and returns False — it never raises.
+    """
+    from app.models import DeploymentState
+
+    try:
+        async with AsyncSessionLocal() as session:
+            state = await session.get(DeploymentState, 1)
+            if state is None:
+                logger.warning(
+                    "[POOL] usage_headroom auto-arm: DeploymentState id=1 missing; "
+                    "gate left unchanged (wanted=%s)",
+                    value,
+                )
+                return False
+            config_json = dict(getattr(state, "runtime_config_json", None) or {})
+            config_json["usage_headroom_gate_enabled"] = value
+            state.runtime_config_json = config_json
+            session.add(state)
+            await session.commit()
+    except Exception:
+        logger.warning(
+            "[POOL] usage_headroom auto-arm: failed to persist gate=%s to "
+            "DeploymentState; in-memory state unchanged",
+            value,
+            exc_info=True,
+        )
+        return False
+
+    # Durably committed — now mirror into process-local runtime_config.
+    try:
+        from app.shared_state import runtime_config as _rc
+
+        if isinstance(_rc, dict):
+            _rc["usage_headroom_gate_enabled"] = value
+    except Exception:  # pragma: no cover - config mirror is best-effort
+        logger.warning(
+            "[POOL] usage_headroom auto-arm: persisted gate=%s but failed to "
+            "update in-memory runtime_config",
+            value,
+            exc_info=True,
+        )
+    return True
+
+
+async def reconcile_usage_headroom_arming(
+    now: datetime | None = None,
+) -> Dict[str, Any]:
+    """Autonomously arm/disarm the usage_headroom selection gate from sustained
+    meter reliability. Leader-only (probes and the observation-window marker are
+    leader-memory). Returns a JSON-safe decision dict for logging/observability.
+
+    Governed by ``usage_headroom_auto_arm_mode`` (default "auto"):
+
+    - ``"auto"``: ARM (set ``usage_headroom_gate_enabled`` True) only once the
+      ``armable`` verdict has held True CONTINUOUSLY for
+      ``usage_headroom_auto_arm_observation_minutes`` (default 60). DISARM
+      immediately (fail-safe, no window) the instant ``armable`` goes False.
+    - ``"manual"``: the reconciler never touches the gate — operator owns it.
+    - ``"off"``: force-disarm kill switch — drive the gate to False and hold it.
+
+    Flips are persisted to DeploymentState BEFORE the in-memory mutation and are
+    idempotent (only written when the value actually changes). A persist failure
+    leaves state unchanged and never crashes the caller.
+    """
+    global _usage_headroom_armable_since
+    now = now or _utcnow()
+
+    cfg = _runtime_config_snapshot()
+    mode = str(cfg.get("usage_headroom_auto_arm_mode", "auto") or "auto").strip().lower()
+    if mode not in ("auto", "manual", "off"):
+        mode = "auto"
+    current_enabled = bool(cfg.get("usage_headroom_gate_enabled", False))
+
+    # manual: reconciler is a no-op; the operator owns the gate. Reset the window
+    # so a later switch to auto starts a fresh observation rather than arming on a
+    # marker that accrued while manual.
+    if mode == "manual":
+        _usage_headroom_armable_since = None
+        return {
+            "mode": "manual",
+            "action": "noop",
+            "gate_enabled": current_enabled,
+            "armable": None,
+            "armable_since": None,
+        }
+
+    # off: force-disarm kill switch. Hold the gate False.
+    if mode == "off":
+        _usage_headroom_armable_since = None
+        if not current_enabled:
+            return {
+                "mode": "off",
+                "action": "noop",
+                "gate_enabled": False,
+                "armable": None,
+                "armable_since": None,
+            }
+        ok = await _persist_usage_headroom_gate_enabled(False)
+        if ok:
+            logger.info(
+                "[POOL] usage_headroom auto-arm: mode=off — force-disarmed gate"
+            )
+            return {
+                "mode": "off",
+                "action": "disarmed",
+                "gate_enabled": False,
+                "armable": None,
+                "armable_since": None,
+            }
+        return {
+            "mode": "off",
+            "action": "persist_failed",
+            "gate_enabled": current_enabled,
+            "armable": None,
+            "armable_since": None,
+        }
+
+    # auto mode.
+    min_coverage_pct = 80
+    try:
+        min_coverage_pct = int(cfg.get("usage_headroom_min_coverage_pct", 80))
+    except (TypeError, ValueError):
+        min_coverage_pct = 80
+    stats = await get_meter_reliability_stats(
+        now=now, min_coverage_pct=min_coverage_pct
+    )
+    armable = bool(stats.get("armable"))
+
+    observation_minutes = 60
+    try:
+        observation_minutes = int(
+            cfg.get("usage_headroom_auto_arm_observation_minutes", 60)
+        )
+    except (TypeError, ValueError):
+        observation_minutes = 60
+    if observation_minutes < 1:
+        observation_minutes = 1
+
+    # Fail-safe: the instant armable regresses, reset the window and disarm now
+    # (no observation window on the way down).
+    if not armable:
+        _usage_headroom_armable_since = None
+        if not current_enabled:
+            return {
+                "mode": "auto",
+                "action": "noop",
+                "gate_enabled": False,
+                "armable": False,
+                "armable_since": None,
+            }
+        ok = await _persist_usage_headroom_gate_enabled(False)
+        if ok:
+            logger.info(
+                "[POOL] usage_headroom auto-arm: armable regressed — fail-safe "
+                "disarmed gate (coverage_ratio=%s, persist_failures=%s)",
+                stats.get("coverage_ratio"),
+                stats.get("persist_failure_count"),
+            )
+            return {
+                "mode": "auto",
+                "action": "disarmed",
+                "gate_enabled": False,
+                "armable": False,
+                "armable_since": None,
+            }
+        return {
+            "mode": "auto",
+            "action": "persist_failed",
+            "gate_enabled": current_enabled,
+            "armable": False,
+            "armable_since": None,
+        }
+
+    # armable is True — track the sustained-observation window.
+    if _usage_headroom_armable_since is None:
+        _usage_headroom_armable_since = now
+    since = _usage_headroom_armable_since
+    elapsed_seconds = (now - since).total_seconds()
+    window_seconds = observation_minutes * 60
+
+    # Already armed — idempotent no-op (do NOT re-persist each cycle).
+    if current_enabled:
+        return {
+            "mode": "auto",
+            "action": "noop",
+            "gate_enabled": True,
+            "armable": True,
+            "armable_since": since.isoformat(),
+        }
+
+    # Not yet armed and the window has not elapsed — keep waiting.
+    if elapsed_seconds < window_seconds:
+        return {
+            "mode": "auto",
+            "action": "waiting",
+            "gate_enabled": False,
+            "armable": True,
+            "armable_since": since.isoformat(),
+            "elapsed_seconds": elapsed_seconds,
+            "window_seconds": window_seconds,
+        }
+
+    # Sustained across the window — arm the gate.
+    ok = await _persist_usage_headroom_gate_enabled(True)
+    if ok:
+        logger.info(
+            "[POOL] usage_headroom auto-arm: armable sustained %.0fs "
+            "(window=%.0fs) — armed gate (coverage_ratio=%s)",
+            elapsed_seconds,
+            window_seconds,
+            stats.get("coverage_ratio"),
+        )
+        return {
+            "mode": "auto",
+            "action": "armed",
+            "gate_enabled": True,
+            "armable": True,
+            "armable_since": since.isoformat(),
+        }
+    return {
+        "mode": "auto",
+        "action": "persist_failed",
+        "gate_enabled": current_enabled,
+        "armable": True,
+        "armable_since": since.isoformat(),
     }
 
 

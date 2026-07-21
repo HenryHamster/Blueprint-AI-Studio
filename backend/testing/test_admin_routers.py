@@ -10937,6 +10937,60 @@ class TestEvergreenFillSettingsPersist:
         assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
 
     @pytest.mark.asyncio
+    async def test_usage_headroom_auto_arm_override_persists_and_restores(
+        self, client: AsyncClient, db_session
+    ):
+        """An operator's usage_headroom auto-arm override (the mode='off'
+        force-disarm kill switch and observation window) must land in
+        DeploymentState.runtime_config_json so it survives the wholesale
+        rebuild in _apply_settings and is restored on restart — otherwise the
+        module default 'auto' takes over and the reconciler re-arms the gate
+        against the operator's intent."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "usage_headroom_auto_arm_mode": "off",
+                "usage_headroom_auto_arm_observation_minutes": 120,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Override is echoed into the persisted JSONB column, not dropped by
+        # the wholesale rebuild.
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["usage_headroom_auto_arm_mode"] == "off"
+        assert (
+            row.runtime_config_json["usage_headroom_auto_arm_observation_minutes"]
+            == 120
+        )
+
+        # Config-sync restores the operator override onto a fresh in-memory
+        # config that has drifted back to the module defaults.
+        _shared_state.runtime_config["usage_headroom_auto_arm_mode"] = "auto"
+        _shared_state.runtime_config[
+            "usage_headroom_auto_arm_observation_minutes"
+        ] = 60
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["usage_headroom_auto_arm_mode"] == "off"
+        assert (
+            _shared_state.runtime_config[
+                "usage_headroom_auto_arm_observation_minutes"
+            ]
+            == 120
+        )
+
+    @pytest.mark.asyncio
     async def test_autonomous_spawn_budget_settings_persist_and_restore(
         self, client: AsyncClient, db_session
     ):

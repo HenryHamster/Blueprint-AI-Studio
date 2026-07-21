@@ -1846,3 +1846,145 @@ def test_null_audience_nonactionable_message_excluded_from_operator_counts():
         "A NOTE with no event_type must stamp STRATEGIST_INTERNAL (fail-closed); "
         "once stamped, operator_visible_nonactionable_message_filter excludes it"
     )
+
+
+# ── capacity.usage_meter_dark audience + alert dispatch ────────────────────
+
+
+def test_capacity_usage_meter_dark_routes_operator_fyi():
+    """capacity.usage_meter_dark resolves to OPERATOR_FYI in the audience registry."""
+    from app.message_audience import route_event, is_operator_visible
+
+    audience = route_event("capacity.usage_meter_dark")
+    assert audience == OPERATOR_FYI, (
+        f"capacity.usage_meter_dark must route to OPERATOR_FYI, got {audience!r}"
+    )
+    assert is_operator_visible(audience)
+
+
+def test_capacity_usage_meter_dark_in_operator_event_types():
+    """capacity.usage_meter_dark appears in the operator-visible event-type set."""
+    from app.message_audience import get_operator_event_types
+
+    assert "capacity.usage_meter_dark" in get_operator_event_types()
+
+
+@pytest.mark.asyncio
+async def test_maybe_create_usage_meter_dark_alert_creates_on_dark(monkeypatch):
+    """_maybe_create_usage_meter_dark_alert creates a WARNING alert per project when dark."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.alert_dispatch import _maybe_create_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    # Simulate two project rows returned by the DB query
+    project_rows = [(pid, None)]
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    # execute() returns: (1) project select, (2) existing-alert select
+    project_result = MagicMock()
+    project_result.all.return_value = project_rows
+    no_existing = MagicMock()
+    no_existing.all.return_value = []
+    mock_session.execute = AsyncMock(side_effect=[project_result, no_existing])
+
+    with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()) as bcast:
+        await _maybe_create_usage_meter_dark_alert(mock_session, dark_count=2, persist_failures=0)
+
+    mock_session.add.assert_called_once()
+    added_alert = mock_session.add.call_args[0][0]
+    assert added_alert.event_type == "capacity.usage_meter_dark"
+    assert added_alert.severity.value == "WARNING"
+    assert added_alert.title == "Usage meter persistently dark: LLM account(s) unreachable"
+    assert "2 LLM account(s)" in added_alert.message
+    bcast.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_maybe_create_usage_meter_dark_alert_deduplicates(monkeypatch):
+    """_maybe_create_usage_meter_dark_alert skips if an undismissed alert already exists."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.alert_dispatch import _maybe_create_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    project_rows = [(pid, None)]
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = project_rows
+    # Simulate existing alert already present
+    existing_result = MagicMock()
+    existing_result.all.return_value = [(pid,)]
+    mock_session.execute = AsyncMock(side_effect=[project_result, existing_result])
+
+    with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()) as bcast:
+        await _maybe_create_usage_meter_dark_alert(mock_session, dark_count=1, persist_failures=0)
+
+    mock_session.add.assert_not_called()
+    bcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resolve_usage_meter_dark_alert_dismisses_open_alerts():
+    """_resolve_usage_meter_dark_alert dismisses open usage-meter-dark alerts."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.alert_dispatch import _resolve_usage_meter_dark_alert
+    from app.models import Alert, AlertSeverity
+
+    pid = uuid.uuid4()
+    open_alert = Alert(
+        project_id=pid,
+        severity=AlertSeverity.WARNING,
+        title="Usage meter persistently dark: LLM account(s) unreachable",
+        message="test",
+        event_type="capacity.usage_meter_dark",
+    )
+    assert open_alert.dismissed_at is None
+
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = [(pid, None)]
+    alert_scalars = MagicMock()
+    alert_scalars.all.return_value = [open_alert]
+    alert_result = MagicMock()
+    alert_result.scalars.return_value = alert_scalars
+    mock_session.execute = AsyncMock(side_effect=[project_result, alert_result])
+
+    await _resolve_usage_meter_dark_alert(mock_session)
+
+    assert open_alert.dismissed_at is not None, (
+        "_resolve_usage_meter_dark_alert must set dismissed_at on open alerts"
+    )
+    mock_session.add.assert_called_once_with(open_alert)
+
+
+@pytest.mark.asyncio
+async def test_resolve_usage_meter_dark_alert_no_op_when_none_open():
+    """_resolve_usage_meter_dark_alert is a no-op when no open dark-meter alerts exist."""
+    import uuid
+    from unittest.mock import AsyncMock, MagicMock
+
+    from app.alert_dispatch import _resolve_usage_meter_dark_alert
+
+    pid = uuid.uuid4()
+    mock_session = AsyncMock()
+    mock_session.add = MagicMock()
+    project_result = MagicMock()
+    project_result.all.return_value = [(pid, None)]
+    alert_scalars = MagicMock()
+    alert_scalars.all.return_value = []
+    alert_result = MagicMock()
+    alert_result.scalars.return_value = alert_scalars
+    mock_session.execute = AsyncMock(side_effect=[project_result, alert_result])
+
+    await _resolve_usage_meter_dark_alert(mock_session)
+
+    mock_session.add.assert_not_called()

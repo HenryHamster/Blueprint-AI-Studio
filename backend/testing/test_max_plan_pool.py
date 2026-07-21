@@ -4990,9 +4990,13 @@ async def test_persist_rate_limit_usage_retries_and_counts_failures(monkeypatch)
     assert commit_call_count == 2, (
         f"expected 2 commit calls (1 fail + 1 retry), got {commit_call_count}"
     )
-    # Counter reflects the first failure.
-    assert after == before + 1, (
-        f"counter should have incremented by 1 (was {before}, now {after})"
+    # The attempt-0 failure increments the counter, but the attempt-1 retry
+    # succeeds and decrements it back down (see the decrement-on-success fix),
+    # so a transient hiccup that recovers nets zero — this is exactly what lets
+    # `armable` recover instead of being permanently pinned False.
+    assert after == before, (
+        f"counter should net zero after a transient fail+retry-success "
+        f"(was {before}, now {after})"
     )
 
 
