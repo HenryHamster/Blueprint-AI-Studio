@@ -29,6 +29,8 @@ from app.message_audience import (
     is_external_webhook_operator_visible,
     is_operator_visible,
     operator_visible_alert_filter,
+    operator_visible_audience_filter,
+    operator_visible_nonactionable_message_filter,
     route_event,
     route_external_webhook_event,
     stamp_message_audience,
@@ -407,6 +409,8 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
 
     # Operator-visible undotted event types that are intentionally non-conversational:
     # lifecycle notices, pipeline alerts, and direct escalations route to ACTIVITY.
+    # MONTHLY_BUDGET_ALERT is an Alert event type (goes through Alert() constructor,
+    # not build_project_message), so it routes to the alert surface, not CONVERSATION.
     _NON_CONVERSATIONAL_OPERATOR_LEDGER_TYPES: frozenset[str] = frozenset({
         "handmerge_pr_preserved",
         "unsafe_branch_configuration",
@@ -420,6 +424,7 @@ def test_operator_visible_undotted_event_types_not_conversational_must_be_explic
         "operator_command",
         "strategic_check_in",
         "agent_annotation",
+        "MONTHLY_BUDGET_ALERT",
     })
 
     registered = get_registered_event_types()
@@ -1738,4 +1743,72 @@ def test_no_alert_constructor_bypasses_event_type_gate():
         "leaking the alert into the operator badge/preview. Fix by adding "
         "event_type=<registered_key> to the Alert(...) call (register the key in "
         "message_audience.py if needed):\n" + "\n".join(all_offenders)
+    )
+
+
+# ── NULL-audience quarantine for non-actionable messages ────────────────
+
+
+def test_null_audience_nonactionable_message_excluded_from_operator_counts():
+    """NULL-audience NOTE messages are excluded from the operator badge count.
+
+    ``operator_visible_audience_filter`` is the legacy-preserving filter that
+    retains NULL-audience rows so pre-registry BLOCKER/QUESTION rows remain
+    operator-visible even without an audience stamp.  Non-actionable types
+    (NOTE/FEEDBACK/VISION) carry no such implicit operator intent — a NOTE with
+    no audience stamp is pre-registry bookkeeping that should be treated as
+    strategist-internal, not operator-visible.
+
+    ``operator_visible_nonactionable_message_filter`` is the strict variant: it
+    requires an *explicit* operator audience stamp and does NOT retain NULL rows.
+    ``get_operator_message_counts`` uses this strict filter for its NOTE count
+    and NOTE unread-count queries, so a NULL-audience NOTE no longer inflates
+    the operator badge.
+
+    This test compiles both filters to SQL and verifies the structural difference:
+    the strict filter has no IS NULL pass-through, while the legacy filter does.
+    """
+    from sqlalchemy.dialects import postgresql
+    from app.models import ProjectMessage
+
+    def _compile(clause) -> str:
+        return str(
+            clause.compile(
+                dialect=postgresql.dialect(),
+                compile_kwargs={"literal_binds": True},
+            )
+        )
+
+    legacy_sql = _compile(operator_visible_audience_filter(ProjectMessage.context))
+    strict_sql = _compile(operator_visible_nonactionable_message_filter(ProjectMessage.context))
+
+    # The legacy filter retains NULL-audience rows (IS NULL pass-through).
+    assert "IS NULL" in legacy_sql, (
+        "operator_visible_audience_filter must retain NULL-audience rows (legacy behaviour)"
+    )
+
+    # The strict filter does NOT retain NULL-audience rows — no IS NULL clause.
+    assert "IS NULL" not in strict_sql, (
+        "operator_visible_nonactionable_message_filter must NOT retain NULL-audience rows; "
+        "a NULL-audience NOTE is pre-registry bookkeeping and must be excluded from operator counts"
+    )
+
+    # The strict filter includes explicit operator audiences.
+    assert "operator-action-needed" in strict_sql
+    assert "operator-fyi" in strict_sql
+
+    # The strict filter uses an IN clause, not NOT IN — it does not fall back
+    # to "anything not explicitly non-operator" (which would retain NULL).
+    assert "NOT IN" not in strict_sql, (
+        "operator_visible_nonactionable_message_filter must use IN (explicit allowlist), "
+        "not NOT IN (exclusion denylist), so NULL-audience rows are not implicitly retained"
+    )
+
+    # Verify that stamping a NULL-audience NOTE with an unregistered event_type
+    # produces a STRATEGIST_INTERNAL audience — after a quarantine sweep, such
+    # rows would be explicitly classified and excluded by both filters.
+    stamped_ctx = stamp_message_audience({}, "", message_type="NOTE")
+    assert stamped_ctx["audience"] == STRATEGIST_INTERNAL, (
+        "A NOTE with no event_type must stamp STRATEGIST_INTERNAL (fail-closed); "
+        "once stamped, operator_visible_nonactionable_message_filter excludes it"
     )

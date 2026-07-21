@@ -45,6 +45,7 @@ from app.message_audience import (
     OPERATOR_ACTION_NEEDED,
     operator_visible_alert_filter,
     operator_visible_audience_filter,
+    operator_visible_nonactionable_message_filter,
 )
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
@@ -1864,6 +1865,9 @@ async def get_operator_message_counts(
     counts = {mt: int(cnt or 0) for mt, cnt in count_rows}
 
     # Count high-signal NOTE escalations, excluding muted event types.
+    # NOTE queries use operator_visible_nonactionable_message_filter (strict, no NULL
+    # pass-through) so pre-registry or improperly-stamped NULL-audience NOTE rows
+    # do not inflate the operator badge count.
     included_note_ets = list(HIGH_SIGNAL_NOTE_EVENT_TYPES - muted_event_types)
     note_count = 0
     if included_note_ets:
@@ -1874,6 +1878,7 @@ async def get_operator_message_counts(
                     .select_from(ProjectMessage)
                     .where(
                         *_operator_visible_message_filters,
+                        operator_visible_nonactionable_message_filter(ProjectMessage.context),
                         ProjectMessage.message_type == MessageType.NOTE,
                         ProjectMessage.context.op("->>")(
                             "event_type"
@@ -1909,6 +1914,7 @@ async def get_operator_message_counts(
                     .select_from(ProjectMessage)
                     .where(
                         *_operator_visible_message_filters,
+                        operator_visible_nonactionable_message_filter(ProjectMessage.context),
                         ProjectMessage.message_type == MessageType.NOTE,
                         ProjectMessage.context.op("->>")(
                             "event_type"

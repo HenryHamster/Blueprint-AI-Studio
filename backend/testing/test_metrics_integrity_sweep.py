@@ -7779,3 +7779,66 @@ async def test_operator_inbox_liveness_covers_alerts_and_bidirectional_drift(db)
     assert "INFO" in r.detail or "alert" in r.detail.lower(), (
         f"expected alert-channel mention in detail: {r.detail}"
     )
+
+
+# --- Standalone operator-inbox liveness (always-on, sweep-mode-independent) ---
+
+
+@pytest.fixture(autouse=False)
+def _clean_liveness():
+    """Reset the standalone liveness module's process-local state between tests."""
+    from app.operator_inbox_liveness import _reset_liveness_for_tests
+    _reset_liveness_for_tests()
+    yield
+    _reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_operator_inbox_leak_signal_counts_null_audience_noise(db, _clean_liveness):
+    """Standalone liveness check counts NULL-audience non-actionable messages as
+    forward-leak noise and fires even when metrics_integrity_sweep_mode is 'off'.
+
+    This is the acceptance test for the always-on operator-inbox liveness signal:
+    a NULL-audience open NOTE (operator-visible by legacy fail-open, but not
+    needs-action and not operator-fyi) must appear in ``forward_leaked`` regardless
+    of the sweep mode, proving the signal is independent of the cuttable sweep.
+    """
+    from app.operator_inbox_liveness import run_operator_inbox_liveness_check
+
+    # Disable the metrics-integrity sweep entirely — the standalone signal must
+    # still fire and count the noise.
+    _rc["metrics_integrity_sweep_mode"] = "off"
+
+    project = await _project(db)
+    # NULL-audience NOTE: legacy fail-open makes it operator-visible, but it is
+    # not needs-action (not BLOCKER/QUESTION) and not operator-fyi.  It should be
+    # counted as forward-leaked noise by the standalone liveness signal.
+    msg = ProjectMessage(
+        project_id=project.id,
+        context={},  # NULL audience (no "audience" key)
+        message_type=MessageType.NOTE,
+        status="open",
+        from_type="agent",
+    )
+    db.add(msg)
+    await db.commit()
+
+    results = await run_operator_inbox_liveness_check(db, _utcnow(), _force=True)
+
+    assert results is not None, "expected results (not gated out)"
+    pid = str(project.id)
+    project_results = [r for r in results if r.project_id == pid]
+    assert len(project_results) == 1, f"expected one result for project, got {project_results}"
+    r = project_results[0]
+
+    assert r.status == "flagged", (
+        f"expected 'flagged' for NULL-audience NOTE, got '{r.status}': {r.detail}"
+    )
+    assert r.forward_leaked == 1, (
+        f"expected forward_leaked=1, got {r.forward_leaked}: {r.detail}"
+    )
+    assert r.badge_invisible == 0
+    assert r.info_alert_noise == 0
+    assert "forward leak" in r.detail or "not genuinely needs-action" in r.detail, (
+        f"expected forward-leak mention in detail: {r.detail}"
+    )

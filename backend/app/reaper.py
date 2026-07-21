@@ -308,6 +308,7 @@ from app.reaper_sweeps import (
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
     sweep_metrics_integrity,
+    sweep_operator_inbox_liveness,
     sweep_capability_backing_proofs,
     sweep_auto_clear_moot_pending_confirmations,
     sweep_decay_stale_pending_confirmations,
@@ -3185,6 +3186,22 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Metrics-integrity sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16d: Operator-inbox liveness — always-on signal that
+                # measures forward-leaked non-actionable messages and
+                # badge-invisible linked BLOCKER/QUESTION messages per project.
+                # Runs regardless of metrics_integrity_sweep_mode; survives if
+                # that sweep is cut.  Cadence- and error-isolated.
+                _mark_reaper_progress()
+                try:
+                    await sweep_operator_inbox_liveness(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Operator-inbox liveness sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

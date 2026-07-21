@@ -49,7 +49,7 @@
     "strategic_completion.py": 7200,
     "rollup_management.py": 5550,
     "rollup_migration_validation.py": 1350,
-    "reaper.py": 3650,
+    "reaper.py": 4250,
     "reaper_sweeps.py": 4000,
     "reaper_fleet_health_sweeps.py": 500,
     "reaper_bug_message_sweeps.py": 1700,

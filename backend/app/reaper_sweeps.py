@@ -724,6 +724,21 @@ async def sweep_metrics_integrity(session, now=None) -> dict | None:
     return await run_metrics_integrity_sweep(session, now)
 
 
+async def sweep_operator_inbox_liveness(session, now=None) -> list | None:
+    """Always-on operator-inbox liveness signal — independent of sweep mode.
+
+    Thin delegator to
+    :func:`app.operator_inbox_liveness.run_operator_inbox_liveness_check`.
+    Cadence-gated inside the callee; returns the per-project result list, or
+    ``None`` when gated out.  Never mode-gated — fires regardless of
+    ``metrics_integrity_sweep_mode``.  The reaper wraps this call in its own
+    try/except+rollback so a raised error can never crash the cycle.
+    """
+    from app.operator_inbox_liveness import run_operator_inbox_liveness_check
+
+    return await run_operator_inbox_liveness_check(session, now)
+
+
 # Cadence gate for the capability backing-proof sweep. Hourly to bound overall
 # reaper cycle time — the sweep iterates projects and verifies file paths via
 # git ls-files, so a slow project or deep file tree should not run every tick.

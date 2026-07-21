@@ -219,6 +219,10 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # digest may be reclaimed by registry retention before being replaced.
     # Operator should verify gcloud / Artifact Registry availability.
     "compute.image_protect_fail": OPERATOR_FYI,
+    # compute.image_build_failure: baked compute image build failed — authoring
+    # agents and compute jobs may use a stale or missing image until retried.
+    # Operator-visible so the build failure appears in the alert surface.
+    "compute.image_build_failure": OPERATOR_FYI,
     # === Research / direction drift =======================================
     # research.direction_drift: direction claim vs. shipped-code drift
     # detected — operator should review the flagged directions.
@@ -384,6 +388,23 @@ def operator_visible_audience_filter(context: Any) -> Any:
     """
     audience = context["audience"].as_string()
     return or_(audience.is_(None), audience.notin_(_NON_OPERATOR_AUDIENCES))
+
+
+def operator_visible_nonactionable_message_filter(context: Any) -> Any:
+    """Return the strict SQL filter for non-actionable (NOTE/FEEDBACK) messages.
+
+    Unlike :func:`operator_visible_audience_filter`, this does NOT retain
+    NULL-audience rows.  Use for query paths already restricted to
+    non-BLOCKER/QUESTION/BUG_REPORT message types, where a NULL audience means
+    the row was never properly stamped and must be treated as non-operator
+    (fail-closed, same as the emitter-side default via :func:`route_event`).
+
+    A NULL-audience NOTE is a pre-registry or improperly-constructed row that
+    would otherwise fail-open to the operator inbox — this filter quarantines
+    those rows by requiring an explicit operator audience stamp.
+    """
+    audience = context["audience"].as_string()
+    return audience.in_(list(_AUDIENCES_THAT_REACH_OPERATOR))
 
 
 def operator_visible_alert_filter(event_type_column: Any) -> Any:
