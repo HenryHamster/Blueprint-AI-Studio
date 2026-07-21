@@ -116,6 +116,11 @@ Findings covered here (4-finding runtime-config / usage-meter / anti-hedging sal
   rc-6 — assembleFailureGuidanceBlocks includes ANTI_HEDGING_GUIDANCE
   rc-7 — review MAJOR tier names hedging / default-off as a severity example
 
+Findings covered here (1-finding baked-image authoring-prompt salvage bundle, 2026-07-21):
+  bi-1 — thinker.ts instructs agents to OMIT container_image when a project-baked image is listed;
+          research-plan.ts injects baked_image_ref preference into the local-runner note;
+          strategic.ts buildLocalRunnerSection emits baked-image guidance when baked_image_ref present
+
 Findings covered here (7-finding operator audience/lifecycle salvage bundle, 2026-07-21):
   m-1 — research.dedup_deadlock + research.already_fixed_deadlock registered STRATEGIST_INTERNAL
   m-2 — research.direction_auto_completed registered STRATEGIST_INTERNAL; emitter has event_type=;
@@ -5948,4 +5953,65 @@ def test_review_major_tier_names_hedging():
         "review-prompt.ts MAJOR tier must name hedging patterns "
         "(default-off flag, fail-open fallback, or observe-mode wrapper) "
         "as MAJOR-severity review findings"
+    )
+
+
+# ── bi-1: baked-image authoring-prompt guidance ───────────────────────────────
+
+
+def test_thinker_prefers_baked_image_over_always_set_explicitly():
+    """thinker.ts must instruct agents to OMIT container_image when a project-baked image exists.
+
+    Finding bi-1: thinker.ts previously said 'Always set container_image explicitly
+    ... never rely on whatever toolchain the host happens to have', with no mention
+    of the project-baked image default. This caused agents to always set container_image
+    explicitly, suppressing the backend's resolve_project_default_container_image default
+    that would have picked the digest-pinned baked image.
+    """
+    src = _find_repo_file("agent/src/prompts/thinker.ts").read_text()
+    assert "Prefer the project-baked image" in src, (
+        "thinker.ts must contain 'Prefer the project-baked image' guidance so authoring "
+        "agents know to omit container_image when a baked image is listed"
+    )
+    assert "OMIT `container_image`" in src or "OMIT \\`container_image\\`" in src, (
+        "thinker.ts must instruct agents to OMIT container_image (not always set it) "
+        "so the backend's project-baked image default can apply"
+    )
+
+
+def test_research_plan_injects_baked_image_ref_into_local_runner_note():
+    """research-plan.ts must inject baked_image_ref preference into the local-runner note.
+
+    Finding bi-1: the authoring prompt for research-plan agents had no channel to
+    communicate the project-baked image reference; agents were told to always set
+    container_image explicitly. The fix injects baked_image_ref from local_runner_status
+    into the localRunnerNote so agents can see and prefer the baked image.
+    """
+    src = _find_repo_file("agent/src/handlers/research-plan.ts").read_text()
+    assert "baked_image_ref" in src, (
+        "research-plan.ts must read baked_image_ref from local_runner_status payload "
+        "to surface the project-baked image to authoring agents"
+    )
+    assert "PREFER to omit" in src, (
+        "research-plan.ts must include 'PREFER to omit' in the baked-image note "
+        "injected into the local-runner availability section"
+    )
+
+
+def test_strategic_local_runner_section_includes_baked_image_guidance():
+    """strategic.ts buildLocalRunnerSection must emit baked-image guidance when baked_image_ref present.
+
+    Finding bi-1: strategic.ts presented container_image only as an NGC URI example,
+    never mentioning the project image. The fix adds baked_image_ref handling to
+    buildLocalRunnerSection so the strategist's self-hosted compute note advertises
+    the baked image and instructs agents to omit container_image.
+    """
+    src = _find_repo_file("agent/src/handlers/strategic.ts").read_text()
+    assert "baked_image_ref" in src, (
+        "strategic.ts buildLocalRunnerSection must read baked_image_ref from the "
+        "local runner status to surface the project-baked image"
+    )
+    assert "PREFER to omit" in src, (
+        "strategic.ts must include 'PREFER to omit' guidance in the baked-image note "
+        "so the strategist knows to omit container_image for experiments"
     )
