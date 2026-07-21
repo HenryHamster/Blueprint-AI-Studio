@@ -35,6 +35,7 @@ from app.reaper_sweeps import (
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
 )
+from app.reaper import reaper_service
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
@@ -2729,6 +2730,62 @@ async def test_poll_sweep_success_preserves_stored_digest_when_result_digestless
     assert row.digest == stored_digest
 
 
+# ── Poll sweep: SUCCEEDED fires drift alert ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_succeeded_fires_drift_alert(db):
+    """A SUCCEEDED build fires _maybe_create_compute_image_drift_alert with the
+    correct project_id, dep_hash, and pinned_ref from the build result.
+
+    Regression guard: without the alert call in the SUCCEEDED branch the operator
+    receives no signal that a project's compute image was rebuilt by the async lane.
+    """
+    from app.alert_dispatch import _COMPUTE_IMAGE_DRIFT_ALERT_TITLE
+    from app.compute_backends import ImageBuildStatusResult
+    from app.models import Alert
+
+    project = await _make_project(db)
+    dep_hash = "aabbccdd11223344"
+    pinned = f"{_FULL_REPO}@{_DIGEST_B}"
+    await _add_build(
+        db, project.id, dep_hash=dep_hash, deadline_at=_NOW + timedelta(minutes=30)
+    )
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=0,
+            result={
+                "pinned_ref": pinned,
+                "tag": dep_hash,
+                "dep_hash": dep_hash,
+                "already_present": False,
+                "built": True,
+                "digest": _DIGEST_B,
+            },
+            reason="completed",
+        )
+    )
+
+    result = await sweep_poll_image_builds(
+        db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+    )
+
+    assert result["succeeded"] == 1
+
+    alerts = (
+        await db.execute(
+            select(Alert).where(
+                Alert.project_id == project.id,
+                Alert.title == _COMPUTE_IMAGE_DRIFT_ALERT_TITLE,
+            )
+        )
+    ).scalars().all()
+    assert len(alerts) == 1, "exactly one drift alert expected after SUCCEEDED build"
+    assert dep_hash[:32] in alerts[0].message
+    assert pinned[:120] in alerts[0].message
+
+
 # ── Poll sweep: TIMED_OUT transition ──────────────────────────────────────────
 
 
@@ -2848,6 +2905,142 @@ async def test_poll_sweep_isolates_per_row_failure(db):
 
     assert result["errors"] == 1
     assert result["succeeded"] == 0
+
+
+# ── Poll sweep: operator alerts on terminal failures ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_failed_creates_alert(db):
+    """A FAILED terminal state creates one ERROR alert with the correct title."""
+    project = await _make_project(db)
+    await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
+    from app.compute_backends import ImageBuildStatusResult
+    from app.models import Alert, AlertSeverity
+
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.FAILED,
+            exit_code=3,
+            reason="exit_3_build_failure",
+        )
+    )
+
+    with patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock):
+        result = await sweep_poll_image_builds(
+            db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+        )
+
+    assert result["failed"] == 1
+    alerts = (await db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.ERROR
+    assert alert.project_id == project.id
+    assert _IMAGE_NAME in alert.title
+    assert "exit_3_build_failure" in alert.message
+    assert alert.dismissed_at is None
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_timed_out_creates_alert(db):
+    """A TIMED_OUT terminal state creates one ERROR alert."""
+    project = await _make_project(db)
+    deadline = _NOW - timedelta(minutes=5)  # already past deadline
+    await _add_build(db, project.id, deadline_at=deadline)
+    from app.models import Alert, AlertSeverity
+
+    backend = _FakeImageBuilderBackend()  # poll should not be called
+
+    with patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock):
+        result = await sweep_poll_image_builds(
+            db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+        )
+
+    assert result["timed_out"] == 1
+    alerts = (await db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.ERROR
+    assert alert.project_id == project.id
+    assert "timed out" in alert.message
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_failed_alert_dedups(db):
+    """A second FAILED sweep does not create a duplicate alert when one is open."""
+    project = await _make_project(db)
+    from app.compute_backends import ImageBuildStatusResult
+    from app.models import Alert
+
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.FAILED,
+            exit_code=1,
+            reason="oom_killed",
+        )
+    )
+
+    with patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock):
+        await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
+        await sweep_poll_image_builds(
+            db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+        )
+        # Second failing build on same image name — should dedup.
+        await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
+        backend2 = _FakeImageBuilderBackend(
+            ImageBuildStatusResult(
+                status=ComputeImageBuildStatus.FAILED,
+                exit_code=1,
+                reason="oom_killed_again",
+            )
+        )
+        await sweep_poll_image_builds(
+            db, now=_NOW, _backend=backend2, _record_fn=_record_build_row
+        )
+
+    alerts = (await db.execute(select(Alert))).scalars().all()
+    assert len(alerts) == 1, "dedup must prevent a second open alert for the same project+image"
+
+
+@pytest.mark.asyncio
+async def test_poll_sweep_succeeded_creates_no_failure_alert(db):
+    """A SUCCEEDED build produces no failure alert (only the INFO drift alert)."""
+    project = await _make_project(db)
+    build = await _add_build(db, project.id, deadline_at=_NOW + timedelta(minutes=30))
+    from app.alert_dispatch import _COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX
+    from app.compute_backends import ImageBuildStatusResult
+    from app.models import Alert
+
+    pinned = f"{_FULL_REPO}@{_DIGEST_A}"
+    backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=0,
+            result={
+                "pinned_ref": pinned,
+                "tag": build.dep_hash,
+                "dep_hash": build.dep_hash,
+                "already_present": False,
+                "built": True,
+            },
+        )
+    )
+
+    with patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock):
+        result = await sweep_poll_image_builds(
+            db, now=_NOW, _backend=backend, _record_fn=_record_build_row
+        )
+
+    assert result["succeeded"] == 1
+    failure_alerts = (
+        await db.execute(
+            select(Alert).where(
+                Alert.title.startswith(_COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX)
+            )
+        )
+    ).scalars().all()
+    assert failure_alerts == [], "a successful build must not produce a failure alert"
 
 
 # ── Serial-marker parsing ─────────────────────────────────────────────────────
@@ -3133,6 +3326,102 @@ async def test_progress_cb_cancellation_signals_cancel_event_and_drains_semaphor
     assert sem.locked() is False, "build_semaphore must be released after thread drain"
 
 
+# ── Reaper-cycle wiring — Step 22d-ii (async image-build poll) ─────────────
+
+
+class _StopLoop(Exception):
+    """Raised from mocked asyncio.sleep to break the reaper's infinite loop."""
+
+
+@pytest_asyncio.fixture()
+async def reaper_db(mocker):
+    """Isolated in-memory DB bound into app.reaper.AsyncSessionLocal."""
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.reaper.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_halt.AsyncSessionLocal", Session)
+    mocker.patch("app.reaper_post_orphan_sweep.AsyncSessionLocal", Session)
+
+    async with Session() as s:
+        yield s
+
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.drop_all)
+    await engine.dispose()
+
+
+@pytest.fixture()
+def stop_after_one_cycle(mocker):
+    """Force reaper_service to exit after a single loop iteration."""
+    mocker.patch("asyncio.sleep", side_effect=_StopLoop())
+
+
+@pytest.fixture()
+def reaper_side_effects(mocker):
+    """Neutralize the side-effecting imports used by reaper_service."""
+    mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.rollup_management._check_and_trigger_rollup", new_callable=AsyncMock
+    )
+    mocker.patch("app.reaper_orphan_io._capture_serial_for_vm", return_value=None)
+    mocker.patch("app.reaper.record_zone_failure")
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.reaper.any_zone_available", return_value=True)
+
+
+async def _run_reaper_once():
+    try:
+        await reaper_service()
+    except _StopLoop:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_reaper_cycle_invokes_poll_image_builds(
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
+):
+    """Step 22d-ii wiring: the reaper cycle must call sweep_poll_image_builds
+    every iteration so the async off-orchestrator image-builder lane can
+    finalise BUILDING rows to terminal (SUCCEEDED / FAILED / TIMED_OUT).
+
+    Regression guard: sweep_poll_image_builds is imported and wired as a
+    named step in the reaper loop (right after Step 22d).  Without this
+    wiring enabling the async builder backend leaks VMs and hangs builds.
+    """
+    mock_sweep = mocker.patch(
+        "app.reaper.sweep_poll_image_builds", new_callable=AsyncMock
+    )
+
+    await _run_reaper_once()
+
+    mock_sweep.assert_awaited_once()
+    # The sweep must receive the DB session and the cycle timestamp so it
+    # can run the building->terminal state machine against fresh data.
+    call_args = mock_sweep.await_args
+    assert call_args is not None
+    assert call_args.args[0] is not None  # session (positional)
+    assert call_args.args[1] is not None  # now / cycle timestamp (positional)
+
+
 @pytest.mark.asyncio
 async def test_non_progress_cb_cancellation_signals_cancel_event_and_drains_semaphore(db):
     """Outer cancellation in the direct-await path sets cancel_event and defers semaphore
@@ -3195,3 +3484,120 @@ async def test_non_progress_cb_cancellation_signals_cancel_event_and_drains_sema
     for _ in range(5):
         await asyncio.sleep(0)
     assert sem.locked() is False, "build_semaphore must be released after thread drain"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# End-to-end: full async image-build lane (dispatch → BUILDING → poll → pin)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_async_image_build_lane_end_to_end(db, monkeypatch):
+    """Full lane: dispatch→reserve→BUILDING→poll→SUCCEEDED→pin recorded.
+
+    Walks every seam from the off-orchestrator dispatch (reserve + start VM)
+    through the poll sweep's SUCCEEDED finalization: a row goes PENDING →
+    BUILDING via dispatch, then the sweep transitions it to SUCCEEDED, records
+    the digest-pinned image, stamps image_published_at, and reaps the VM.
+    This is the gate that makes enabling the COMPUTE_IMAGE_BUILDER_BACKEND
+    flag defensible.
+    """
+    from app.compute_backends import ImageBuildStatusResult
+    from app.models import ComputeImageBuildStatus, ProjectComputeImageBuild
+
+    monkeypatch.setenv("COMPUTE_IMAGE_BUILDER_BACKEND_ENABLED", "true")
+    # Route AsyncSessionLocal → the test session so the dispatch step's
+    # reserve call writes into our in-memory DB.
+    _patch_app_session_to(monkeypatch, db)
+
+    project = await _make_repo_project(db)
+    dep_hash = "cafef00d01234567"
+
+    # ── Step 1: dispatch the build (reserve row + start VM) ───────────────────
+    dispatch_backend = _StubImageBuilderBackend(
+        external_id="img-build-lane-e2e", zone="us-east1-b"
+    )
+
+    dispatch = await _cb._dispatch_async_image_build(
+        project=project,
+        registry_repo=_REGISTRY_REPO,
+        image_name=_IMAGE_NAME,
+        dep_hash=dep_hash,
+        owner="acme",
+        repo="widget",
+        ref="main",
+        repo_token="ghs_test_token",
+        dockerfile=".blueprint/Dockerfile.compute",
+        dep_files=["requirements.txt"],
+        build_args={},
+        parent=None,
+        _backend=dispatch_backend,
+    )
+
+    assert isinstance(dispatch, _cb.AsyncImageBuildDispatch)
+    assert dispatch.status == "BUILDING"
+    assert dispatch.builder_vm_id == "img-build-lane-e2e"
+    assert dispatch.adopted is False
+    assert len(dispatch_backend.started) == 1
+
+    # The tracking row must be BUILDING with the VM details wired in.
+    build_rows = (await db.execute(select(ProjectComputeImageBuild))).scalars().all()
+    assert len(build_rows) == 1
+    build_row = build_rows[0]
+    assert build_row.status == ComputeImageBuildStatus.BUILDING
+    assert build_row.dep_hash == dep_hash
+    assert build_row.builder_vm_id == "img-build-lane-e2e"
+    assert build_row.zone == "us-east1-b"
+    assert build_row.deadline_at is not None
+
+    # ── Step 2: poll sweep drives BUILDING → SUCCEEDED ────────────────────────
+    pinned = f"{_REGISTRY_REPO}/{_IMAGE_NAME}@{_DIGEST_A}"
+    poll_backend = _FakeImageBuilderBackend(
+        ImageBuildStatusResult(
+            status=ComputeImageBuildStatus.SUCCEEDED,
+            exit_code=0,
+            result={
+                "pinned_ref": pinned,
+                "tag": dep_hash,
+                "dep_hash": dep_hash,
+                "already_present": False,
+                "built": True,
+                "digest": _DIGEST_A,
+            },
+            reason="completed",
+        )
+    )
+
+    with patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock):
+        sweep_result = await sweep_poll_image_builds(
+            db,
+            now=_NOW,
+            _backend=poll_backend,
+            _record_fn=_record_build_row,
+        )
+
+    # ── Assertions: sweep summary ─────────────────────────────────────────────
+    assert sweep_result["succeeded"] == 1
+    assert sweep_result["failed"] == 0
+    assert sweep_result["timed_out"] == 0
+    assert sweep_result["errors"] == 0
+
+    # ── Assertions: tracking row ──────────────────────────────────────────────
+    await db.refresh(build_row)
+    assert build_row.status == ComputeImageBuildStatus.SUCCEEDED
+    assert build_row.result_json is not None
+    assert _DIGEST_A in build_row.result_json
+    # image_published_at is stamped by the production sweep on SUCCEEDED.
+    assert build_row.image_published_at == _NOW
+
+    # ── Assertions: builder VM was reaped after terminal transition ───────────
+    assert poll_backend.aborted, "VM must be reaped after SUCCEEDED finalization"
+    assert poll_backend.aborted[0][0] == build_row.id
+
+    # ── Assertions: pin recorded ──────────────────────────────────────────────
+    pin_rows = (await db.execute(select(ProjectComputeImage))).scalars().all()
+    assert len(pin_rows) == 1
+    assert pin_rows[0].digest == _DIGEST_A
+    assert pin_rows[0].dep_hash == dep_hash
+    assert pin_rows[0].built is True
+

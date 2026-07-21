@@ -3291,6 +3291,13 @@ async def sweep_poll_image_builds(
                 build.updated_at = _now
                 session.add(build)
                 await session.commit()
+                with contextlib.suppress(Exception):
+                    from app.alert_dispatch import (
+                        _maybe_create_compute_image_build_failure_alert,
+                    )
+                    await _maybe_create_compute_image_build_failure_alert(
+                        session, build, failure_kind="timed_out"
+                    )
                 summary["timed_out"] += 1
                 continue
 
@@ -3319,9 +3326,19 @@ async def sweep_poll_image_builds(
                 build.result_json = build_result.to_json()
                 build.error_reason = None
                 build.updated_at = _now
+                build.image_published_at = _now
                 session.add(build)
                 await session.commit()
                 await reap_fn(build)
+                with contextlib.suppress(Exception):
+                    from app.alert_dispatch import _maybe_create_compute_image_drift_alert
+
+                    await _maybe_create_compute_image_drift_alert(
+                        session,
+                        build.project_id,
+                        dep_hash=build.dep_hash,
+                        pinned_ref=getattr(build_result, "pinned_ref", None),
+                    )
                 summary["succeeded"] += 1
                 continue
 
@@ -3332,6 +3349,13 @@ async def sweep_poll_image_builds(
             session.add(build)
             await session.commit()
             await reap_fn(build)
+            with contextlib.suppress(Exception):
+                from app.alert_dispatch import (
+                    _maybe_create_compute_image_build_failure_alert,
+                )
+                await _maybe_create_compute_image_build_failure_alert(
+                    session, build, failure_kind="failed"
+                )
             summary["failed"] += 1
         except Exception:  # noqa: BLE001 — isolate a per-row failure
             logger.warning(
@@ -3574,6 +3598,7 @@ __all__ = [
     "sweep_closed_handmerge_prs",
     "sweep_protect_referenced_compute_image_digests",
     "sweep_refresh_project_compute_images",
+    "sweep_poll_image_builds",
     "sweep_silent_runner_compute_jobs",
     "sweep_stranded_runner_subprocess_compute_jobs",
     "VIEWABLE_ARTIFACT_RETENTION_DAYS",

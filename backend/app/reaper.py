@@ -314,6 +314,7 @@ from app.reaper_sweeps import (
     sweep_closed_handmerge_prs,
     sweep_protect_referenced_compute_image_digests,
     sweep_refresh_project_compute_images,
+    sweep_poll_image_builds,
     sweep_stranded_runner_subprocess_compute_jobs,
     sweep_proof_earn_loop,
     sweep_silent_runner_compute_jobs,
@@ -3414,6 +3415,25 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Compute-image auto-refresh sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 22d-ii: Async image-build poll — finalise BUILDING
+                # off-orchestrator compute-image builds.  The inline image-build
+                # lane (Cloud Build) completes synchronously in Step 22d.  The
+                # async lane (ephemeral builder VM) must be polled independently:
+                # this sweep drives each BUILDING row to terminal (SUCCEEDED,
+                # FAILED, TIMED_OUT), records the pinned image digest through the
+                # same preservation guard the inline path uses, and reaps the
+                # throwaway VM.  Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_poll_image_builds(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Async image-build poll sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

@@ -2039,6 +2039,74 @@ async def _maybe_create_compute_image_drift_alert(
     return True
 
 
+# Stable title for the per-project compute-image build failure alert.
+# Kept CONSTANT per (project_id, image_name) so a build that fails and
+# is retried deduplicates to exactly ONE open alert; the dep_hash and
+# failure reason live in the message.
+_COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX = "Compute image build failed: "
+
+
+async def _maybe_create_compute_image_build_failure_alert(
+    session: AsyncSession,
+    build: "object",
+    *,
+    failure_kind: str,
+) -> bool:
+    """Create a deduplicated ERROR alert when an async compute-image build
+    reaches a terminal failure state (``FAILED`` or ``TIMED_OUT``).
+
+    Deduplicated on a STABLE title keyed to ``(project_id, image_name)`` so a
+    project whose build fails on consecutive sweep ticks raises exactly ONE open
+    alert; the dep_hash and failure reason live in the message body.
+
+    Returns ``True`` when a NEW alert was created, ``False`` when dedup
+    short-circuited.  Caller wraps best-effort so an alert failure can never
+    abort the sweep.
+    """
+    image_label = (getattr(build, "image_name", None) or "unknown")[:64]
+    title = f"{_COMPUTE_IMAGE_BUILD_FAILURE_ALERT_TITLE_PREFIX}{image_label}"
+    project_id = getattr(build, "project_id", None)
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    dep_hash_label = (getattr(build, "dep_hash", None) or "(unknown)")[:32]
+    reason_label = (getattr(build, "error_reason", None) or "(unknown)")[:256]
+    kind_label = "timed out" if failure_kind == "timed_out" else "failed"
+    message = (
+        f"The async compute-image build for project {project_id} {kind_label}. "
+        f"dep_hash={dep_hash_label}. "
+        f"Reason: {reason_label}. "
+        f"Authoring agents and compute jobs may use a stale or missing image "
+        f"until the build is retried."
+    )[:1000]
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="compute.image_build_failure",
+    )
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+        },
+    )
+    return True
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,
