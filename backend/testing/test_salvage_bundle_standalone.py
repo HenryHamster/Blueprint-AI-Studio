@@ -107,6 +107,15 @@ Findings covered here (5-finding operator-inbox lifecycle/convergence salvage bu
   n4 — QUESTION auto-decay (already fixed; see m3 tests above)
   n5 — confirmation chips actionable (already fixed; see m2 tests above)
 
+Findings covered here (4-finding runtime-config / usage-meter / anti-hedging salvage bundle, 2026-07-21):
+  rc-1 — blind_multi_reviewer_gate_enabled registered True and read with True fallback
+  rc-2 — max_active_directions registered 10 and all read-sites use 10 as fallback
+  rc-3 — task_lifecycle auto-approve gate uses AUTO_APPROVE_MIN_ACCEPTANCE_RATE (not inline 0.5)
+  rc-4 — _snapshot_from_persisted_usage accepts messages_api_header schema (unified_5h → five_hour)
+  rc-5 — _USAGE_SNAPSHOT_TTL_SECONDS matches _USAGE_METER_REFRESH_INTERVAL_SECONDS (no stale-80%% gap)
+  rc-6 — assembleFailureGuidanceBlocks includes ANTI_HEDGING_GUIDANCE
+  rc-7 — review MAJOR tier names hedging / default-off as a severity example
+
 Findings covered here (7-finding operator audience/lifecycle salvage bundle, 2026-07-21):
   m-1 — research.dedup_deadlock + research.already_fixed_deadlock registered STRATEGIST_INTERNAL
   m-2 — research.direction_auto_completed registered STRATEGIST_INTERNAL; emitter has event_type=;
@@ -5682,4 +5691,242 @@ def test_image_cache_by_project_structure():
     )
     assert "total_bytes" in result, (
         "_sanitize_image_cache_by_project must preserve total_bytes from valid input"
+    )
+
+
+# ── rc-1: blind_multi_reviewer_gate_enabled default-on alignment ─────────────
+
+
+def _find_backend_app_file(rel_path: str):
+    """Locate a backend/app file using standard candidate paths."""
+    import pathlib
+
+    candidates = [
+        pathlib.Path(__file__).parent.parent / "app" / rel_path,
+        pathlib.Path(__file__).resolve().parents[2] / "backend" / "app" / rel_path,
+        pathlib.Path("/repo/backend/app") / rel_path,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError(f"Could not locate backend/app/{rel_path}")
+
+
+def _find_repo_file(rel_path: str):
+    """Locate a repo-root-relative file using standard candidate paths."""
+    import pathlib
+
+    candidates = [
+        pathlib.Path(__file__).resolve().parents[2] / rel_path,
+        pathlib.Path("/repo") / rel_path,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise FileNotFoundError(f"Could not locate repo/{rel_path}")
+
+
+def test_blind_multi_reviewer_gate_registered_default_true():
+    """blind_multi_reviewer_gate_enabled must be registered True in runtime_config_state.
+
+    Finding rc-1: the knob was registered True but read with a False fallback in
+    task_lifecycle.py, silently disabling blind multi-review on any config path
+    that omits the key. The registry default must be True and every read-site
+    must use True as its fallback.
+    """
+    src = _find_backend_app_file("runtime_config_state.py").read_text()
+    assert '"blind_multi_reviewer_gate_enabled": True' in src, (
+        "runtime_config_state.py must register blind_multi_reviewer_gate_enabled as True — "
+        "any config path that omits the key must enable blind multi-review"
+    )
+
+
+def test_blind_multi_reviewer_gate_task_lifecycle_fallback_true():
+    """task_lifecycle.py must read blind_multi_reviewer_gate_enabled with fallback True.
+
+    Finding rc-1: the fallback was False, so bare/test/reset configs silently
+    disabled blind multi-review. The fallback must match the registered default.
+    """
+    import ast
+
+    src = _find_backend_app_file("task_lifecycle.py").read_text()
+    tree = ast.parse(src)
+    bad_fallbacks = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "get"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if not (isinstance(first, ast.Constant) and first.value == "blind_multi_reviewer_gate_enabled"):
+            continue
+        if len(node.args) < 2:
+            continue
+        fallback = node.args[1]
+        if not (isinstance(fallback, ast.Constant) and fallback.value is True):
+            bad_fallbacks.append(f"line {node.lineno}: fallback={ast.unparse(fallback)}")
+    assert not bad_fallbacks, (
+        "task_lifecycle.py reads blind_multi_reviewer_gate_enabled with wrong fallback — "
+        f"must use True to match the registry default; found: {bad_fallbacks}"
+    )
+
+
+# ── rc-2: max_active_directions fallback alignment ────────────────────────────
+
+
+def test_max_active_directions_registered_default_ten():
+    """max_active_directions must be registered default 10 in runtime_config_state.
+
+    Finding rc-2: the knob is registered 10 but several read-sites used 5 as
+    the fallback, meaning bare/test/reset configs capped active directions at 5.
+    """
+    src = _find_backend_app_file("runtime_config_state.py").read_text()
+    assert '"max_active_directions": 10' in src, (
+        "runtime_config_state.py must register max_active_directions as 10"
+    )
+
+
+def test_max_active_directions_all_read_sites_use_ten():
+    """Every .get('max_active_directions', <fallback>) in backend/app/ must use 10.
+
+    Finding rc-2: directions_repo.py, strategic_completion.py, and
+    admin_agent_ops.py all had fallback 5, causing cap divergence when the key
+    was absent. The fallback must match the registered default everywhere.
+    """
+    import ast
+
+    app_dir = _find_backend_app_file("runtime_config_state.py").parent
+    mismatch = []
+    for py_file in app_dir.rglob("*.py"):
+        try:
+            src = py_file.read_text()
+            tree = ast.parse(src)
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "get"):
+                continue
+            if not node.args:
+                continue
+            first = node.args[0]
+            if not (isinstance(first, ast.Constant) and first.value == "max_active_directions"):
+                continue
+            if len(node.args) < 2:
+                continue
+            fallback = node.args[1]
+            if isinstance(fallback, ast.Constant) and fallback.value != 10:
+                mismatch.append(f"{py_file.name}:{node.lineno} fallback={fallback.value}")
+    assert not mismatch, (
+        "max_active_directions .get() fallback must be 10 everywhere — "
+        f"found wrong fallbacks at: {mismatch}"
+    )
+
+
+# ── rc-3: auto-approve gate uses the shared constant, not inline 0.5 ─────────
+
+
+def test_auto_approve_acceptance_threshold_not_hardcoded_in_task_lifecycle():
+    """task_lifecycle.py must not hardcode 0.5 as the acceptance-rate threshold.
+
+    Finding rc-3: the 0.5 threshold was duplicated inline, diverging from
+    AUTO_APPROVE_MIN_ACCEPTANCE_RATE in review_heuristics.py. The constant must
+    be imported and used rather than repeated.
+    """
+    src = _find_backend_app_file("task_lifecycle.py").read_text()
+    assert "AUTO_APPROVE_MIN_ACCEPTANCE_RATE" in src, (
+        "task_lifecycle.py must import and use AUTO_APPROVE_MIN_ACCEPTANCE_RATE "
+        "from review_heuristics rather than hardcoding 0.5"
+    )
+
+
+# ── rc-4/rc-5: usage meter freshness ─────────────────────────────────────────
+
+
+def test_usage_snapshot_ttl_matches_refresh_interval():
+    """_USAGE_SNAPSHOT_TTL_SECONDS must equal _USAGE_METER_REFRESH_INTERVAL_SECONDS.
+
+    Finding rc-5: TTL was 60 s but probe runs every 300 s, so the selection gate
+    saw unknown ~80%% of the time and degraded to a no-op.
+    """
+    from app.max_plan_pool import (
+        _USAGE_METER_REFRESH_INTERVAL_SECONDS,
+        _USAGE_SNAPSHOT_TTL_SECONDS,
+    )
+
+    assert _USAGE_SNAPSHOT_TTL_SECONDS == _USAGE_METER_REFRESH_INTERVAL_SECONDS, (
+        f"_USAGE_SNAPSHOT_TTL_SECONDS={_USAGE_SNAPSHOT_TTL_SECONDS} must equal "
+        f"_USAGE_METER_REFRESH_INTERVAL_SECONDS={_USAGE_METER_REFRESH_INTERVAL_SECONDS} "
+        "so the selection gate considers probes fresh for as long as the probe cadence runs"
+    )
+
+
+def test_snapshot_from_persisted_usage_accepts_messages_api_header():
+    """_snapshot_from_persisted_usage must accept the messages_api_header schema.
+
+    Finding rc-4: the function only accepted oauth_usage_probe blobs, so the
+    per-response header data written by direct_llm_client was silently discarded
+    when non-leader instances rebuilt their pool state from the DB column.
+    """
+    from datetime import datetime, timezone
+
+    from app.max_plan_pool import _snapshot_from_persisted_usage
+
+    at = datetime.now(timezone.utc)
+    raw = {
+        "source": "messages_api_header",
+        "updated_at": at.isoformat(),
+        "unified_5h": {"utilization": 72.5, "resets_at": "2026-07-12T05:00:00Z"},
+    }
+    result = _snapshot_from_persisted_usage(raw)
+    assert result is not None, (
+        "_snapshot_from_persisted_usage must parse messages_api_header blobs — "
+        "unified_5h.utilization maps to the five_hour load-bearing window"
+    )
+    snap, _stamp = result
+    assert snap.known is True
+    assert snap.window_utilizations.get("five_hour") == 72.5, (
+        "unified_5h.utilization must map to the five_hour window"
+    )
+    assert snap.resets_at.get("five_hour") == "2026-07-12T05:00:00Z"
+
+
+# ── rc-6/rc-7: anti-hedging guidance ─────────────────────────────────────────
+
+
+def test_anti_hedging_guidance_in_failure_guidance_blocks():
+    """assembleFailureGuidanceBlocks must include ANTI_HEDGING_GUIDANCE.
+
+    Finding rc-6: the code-writing agent had no standing instruction against
+    introducing default-off flags, fail-open fallbacks, or observe-mode wrappers.
+    """
+    src = _find_repo_file("agent/src/prompt.ts").read_text()
+    assert "ANTI_HEDGING_GUIDANCE" in src, (
+        "agent/src/prompt.ts must define and export ANTI_HEDGING_GUIDANCE"
+    )
+    idx_fn = src.find("function assembleFailureGuidanceBlocks")
+    assert idx_fn != -1, "assembleFailureGuidanceBlocks not found in agent/src/prompt.ts"
+    fn_body = src[idx_fn : idx_fn + 300]
+    assert "ANTI_HEDGING_GUIDANCE" in fn_body, (
+        "assembleFailureGuidanceBlocks must include ANTI_HEDGING_GUIDANCE "
+        "so every code-change agent receives standing anti-hedging instruction"
+    )
+
+
+def test_review_major_tier_names_hedging():
+    """The review MAJOR severity tier must name hedging as a finding class.
+
+    Finding rc-7: the reviewer had no guidance to flag default-off guards or
+    fail-open fallbacks as MAJOR findings, so hedging could pass review silently.
+    """
+    src = _find_repo_file("agent/src/prompts/review-prompt.ts").read_text()
+    assert "default-off" in src or "fail-open" in src or "observe-mode" in src, (
+        "review-prompt.ts MAJOR tier must name hedging patterns "
+        "(default-off flag, fail-open fallback, or observe-mode wrapper) "
+        "as MAJOR-severity review findings"
     )

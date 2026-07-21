@@ -225,10 +225,11 @@ Use these definitions when assigning severity to issues. Severity affects how th
   - Missing auth check on a new endpoint that exposes sensitive data
   - Off-by-one in a loop that silently skips or double-processes records in a DB migration
 
-- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, or violations of the codebase's established patterns. Examples:
+- **MAJOR** — Logic errors, missing error handling, race conditions, missing tests for new behavior, violations of the codebase's established patterns, or hedging that leaves new behavior dark. Examples:
   - Async function whose rejection is silently swallowed (missing try/catch or .catch())
   - New API endpoint with no test coverage at all
   - New code that bypasses an existing invariant (e.g., writing to a field that has a single designated writer elsewhere in the codebase)
+  - New feature hidden behind a default-off flag, fail-open fallback, or observe-mode wrapper when the task called for the feature to be on
 
 - **MINOR** — Style inconsistencies, naming suggestions, documentation gaps, or optional improvements that do not affect correctness. Examples:
   - Variable named \`data\` where \`userRecord\` would be clearer

@@ -553,12 +553,28 @@ Guidelines:
 - Omitting the field entirely is acceptable; it is never required.
 `;
 
+// Anti-hedging instinct: code-writing agents must ship the feature on, not
+// wrapped in a default-off flag, fail-open fallback, or observe-mode shim.
+export const ANTI_HEDGING_GUIDANCE = `
+## Anti-Hedging: Ship It On
+
+When implementing a feature or fix, do NOT introduce:
+- Default-off feature flags, observe-mode wrappers, or "gate_enabled=False" guards
+  that leave the new behavior dark on the first deploy
+- Fail-open fallbacks that silently skip the new logic when an input is missing or unexpected
+- "Log-only" / observe mode that defers enforcement to a follow-up task
+
+These patterns re-introduce the hedging that every clean-up cycle has to remove later.
+If the change is correct, ship it on. If it is unsafe without a flag, the task scope is
+too broad — narrow the scope and ship the safe portion, then file a follow-up.
+`;
+
 // Canonical concatenation of the cross-cutting failure-guidance blocks
 // shared by code-change handlers (standard.ts, review-fix.ts fix path).
 // Centralized so block order, inclusion, and future additions only need
 // to change in one place.
 export function assembleFailureGuidanceBlocks(includeRetryGuidance = true): string {
-  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE;
+  return READ_THE_FAILURE_MESSAGE + SIZE_GUARDRAIL_GUIDANCE + (includeRetryGuidance ? PRIOR_ATTEMPT_DIVERGENCE : '') + BEYOND_SCOPE_REPORTING + EDGES_CONSIDERED_GUIDANCE + ANTI_HEDGING_GUIDANCE;
 }
 
 // Compute a stable 12-hex-char fingerprint of the static prompt guidance for

@@ -3632,8 +3632,38 @@ class TestSnapshotFromPersistedUsage:
         assert snap.resets_at == {"five_hour": "2026-07-11T05:00:00Z"}
         assert snap.probed_at == at.isoformat()
 
+    def test_round_trips_messages_api_header_blob(self):
+        at = _utcnow()
+        raw = {
+            "source": "messages_api_header",
+            "updated_at": at.isoformat(),
+            "unified_5h": {"utilization": 55.0, "resets_at": "2026-07-11T05:00:00Z"},
+        }
+        parsed = _snapshot_from_persisted_usage(raw)
+        assert parsed is not None
+        snap, stamp = parsed
+        assert stamp == at
+        assert snap.known is True
+        assert snap.window_utilizations == {"five_hour": 55.0}
+        assert snap.resets_at == {"five_hour": "2026-07-11T05:00:00Z"}
+
+    def test_messages_api_header_without_utilization_returns_none(self):
+        at = _utcnow()
+        # unified_5h present but no numeric utilization → no loadbearing window → None
+        assert (
+            _snapshot_from_persisted_usage(
+                {
+                    "source": "messages_api_header",
+                    "updated_at": at.isoformat(),
+                    "unified_5h": {"status": "live"},
+                }
+            )
+            is None
+        )
+
     def test_rejects_foreign_source_and_garbage(self):
         assert _snapshot_from_persisted_usage(None) is None
+        # messages_api_header with no updated_at or unified_5h → None
         assert _snapshot_from_persisted_usage({"source": "messages_api_header"}) is None
         assert (
             _snapshot_from_persisted_usage(

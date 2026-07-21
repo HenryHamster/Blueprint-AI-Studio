@@ -2046,16 +2046,17 @@ async def _process_post_commit(
                         # passes unknown acceptance) because main-branch merges skip
                         # review entirely.
                         from app.direction_metrics import _compute_acceptance_rate
+                        from app.review_heuristics import AUTO_APPROVE_MIN_ACCEPTANCE_RATE
 
                         acceptance = (
                             _compute_acceptance_rate(_aa_dir)
                             if _aa_dir is not None
                             else None
                         )
-                        if acceptance is None or acceptance <= 0.5:
+                        if acceptance is None or acceptance <= AUTO_APPROVE_MIN_ACCEPTANCE_RATE:
                             logger.info(
                                 f"[PIPELINE] PR #{pr_number} not auto-approved — "
-                                f"direction acceptance={acceptance} (require >0.5 with "
+                                f"direction acceptance={acceptance} (require >{AUTO_APPROVE_MIN_ACCEPTANCE_RATE:.0%} with "
                                 "history); defaulting to review"
                             )
                         else:

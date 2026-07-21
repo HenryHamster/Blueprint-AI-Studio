@@ -2806,11 +2806,11 @@ async def _persist_rate_limit_state_best_effort(acct_id: str, reason: str) -> No
 # Everything here is advisory: an unknown snapshot makes selection behave
 # exactly as it did before this feature. The reactive rate-limit cooldowns
 # (disable_account_model / _account_state_for_model) remain the backstop.
-_USAGE_SNAPSHOT_TTL_SECONDS = 60
+_USAGE_SNAPSHOT_TTL_SECONDS = 300
 # Cadence for the display-oriented usage-meter refresh (orchestrator calls
-# refresh_usage_meter_snapshots on this interval). Distinct from the 60s
-# selection TTL above: selection wants near-real-time data when the headroom
-# gate is enabled; the admin meter only needs minutes-fresh data.
+# refresh_usage_meter_snapshots on this interval). Aligned with the selection
+# TTL above: probes run every 300 s, so the selection gate considers a snapshot
+# fresh for the same window to avoid treating the gap as "unknown" on every call.
 _USAGE_METER_REFRESH_INTERVAL_SECONDS = 300
 # A snapshot older than this renders as "stale" on the admin meter — three
 # missed meter refreshes. The 60s selection TTL is intentionally NOT used for
@@ -3061,26 +3061,44 @@ def _snapshot_from_persisted_usage(
 ) -> tuple[UsageSnapshot, datetime] | None:
     """Rebuild (UsageSnapshot, its wall-clock stamp) from a persisted
     ``MaxPlanAccount.rate_limit_usage`` blob written by
-    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch."""
-    if not isinstance(raw, Mapping) or raw.get("source") != "oauth_usage_probe":
+    ``_persist_rate_limit_usage_to_db``. None on any structural mismatch.
+
+    Accepts two source schemas:
+    - ``oauth_usage_probe``: five_hour/seven_day window cells with utilization.
+    - ``messages_api_header``: unified_5h cell with utilization (0..100 scale),
+      mapped to the five_hour window so per-response header data is not silently
+      discarded on non-leader instances that read the DB-persisted blob.
+    """
+    if not isinstance(raw, Mapping):
         return None
+    source = raw.get("source")
     try:
         updated_at = datetime.fromisoformat(raw.get("updated_at"))
     except (TypeError, ValueError):
         return None
     utils: dict[str, float] = {}
     resets: dict[str, str | None] = {}
-    for window in ("five_hour", "seven_day"):
-        entry = raw.get(window)
-        if not isinstance(entry, Mapping):
-            continue
-        util = entry.get("utilization")
-        if isinstance(util, bool) or not isinstance(util, (int, float)):
-            continue
-        utils[window] = float(util)
-        reset = entry.get("resets_at")
-        if isinstance(reset, str):
-            resets[window] = reset
+    if source == "oauth_usage_probe":
+        for window in ("five_hour", "seven_day"):
+            entry = raw.get(window)
+            if not isinstance(entry, Mapping):
+                continue
+            util = entry.get("utilization")
+            if isinstance(util, bool) or not isinstance(util, (int, float)):
+                continue
+            utils[window] = float(util)
+            reset = entry.get("resets_at")
+            if isinstance(reset, str):
+                resets[window] = reset
+    elif source == "messages_api_header":
+        entry = raw.get("unified_5h")
+        if isinstance(entry, Mapping):
+            util = entry.get("utilization")
+            if not isinstance(util, bool) and isinstance(util, (int, float)):
+                utils["five_hour"] = float(util)
+                reset = entry.get("resets_at")
+                if isinstance(reset, str):
+                    resets["five_hour"] = reset
     if not utils:
         return None
     snapshot = UsageSnapshot(
