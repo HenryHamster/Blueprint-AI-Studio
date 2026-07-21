@@ -1591,3 +1591,40 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     assert "another_agent_key" not in project.design_doc, (
         "over-ceiling agent write must not be persisted"
     )
+
+
+def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
+    """Regression: cochange_index and cochange_applied_prs (written by
+    direction_outcomes.py, ~38KB each) must be reserved so they don't
+    consume the agent-write 500KB budget.  Also covers the full set of
+    code-written analytics keys discovered in the 2026-07 audit.
+    """
+    from app.task_locking import _RESERVED_DESIGN_DOC_KEYS
+
+    # Primary fix: cochange keys written by direction_outcomes.py
+    assert "cochange_index" in _RESERVED_DESIGN_DOC_KEYS
+    assert "cochange_applied_prs" in _RESERVED_DESIGN_DOC_KEYS
+
+    # Audit additions: background analytics/sweep keys
+    audit_keys = {
+        "repo_overview",
+        "review_effectiveness",
+        "playbook_deleted_keys",
+        "fresh_reviewer_trend",
+        "edges_trend",
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_regression_risk_test_signal_trends",
+        "sr_false_attestation_trends",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
+    }
+    missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
+    assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"

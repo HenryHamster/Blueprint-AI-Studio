@@ -56,6 +56,7 @@ DESIGN_DOC_MAX_BYTES = 500_000
 # guard in that module so the two never diverge.
 _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
     {
+        # Originally reserved
         "playbook_archive",
         "proposed_changes",
         "lane_baselines",
@@ -63,6 +64,29 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "sr_catch_rate_trends",
         "efficiency_baseline",
         "retired_diagnoses_archive",
+        # Co-change index written by direction_outcomes.py (~38KB); excluded so
+        # it doesn't consume the agent-write 500KB budget.
+        "cochange_index",
+        "cochange_applied_prs",
+        # Analytics/sweep keys written by background code (not by agents)
+        "repo_overview",
+        "review_effectiveness",
+        "playbook_deleted_keys",
+        "fresh_reviewer_trend",
+        "edges_trend",
+        "sr_reviewer_disagreements",
+        "sr_catch_rate_trends_alert",
+        "sr_catch_rate_floor_alert",
+        "sr_quadrant_alert",
+        "sr_pass_engagement_alert",
+        "sr_regression_risk_test_signal_trends",
+        "sr_false_attestation_trends",
+        "sr_blind_spot_signal_last_computed_at",
+        "fix_loop_divergence_signal_last_computed_at",
+        "fix_loop_divergence_alerted_window",
+        "fix_loop_divergence_regressions",
+        "fix_loop_divergence_detected_at",
+        "viewport_coverage_snapshot",
     }
 )
 
