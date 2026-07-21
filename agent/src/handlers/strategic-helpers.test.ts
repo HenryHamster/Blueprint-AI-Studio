@@ -264,6 +264,41 @@ describe('writeStrategicHelpers', () => {
       // Body is surfaced to stderr on non-retryable 4xx so the error detail is visible
       expect(s).toContain('"$body" >&2');
     });
+
+    it('_call uses exponential backoff (10s/20s/40s) not attempt*2', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Old linear backoff must not be present
+      expect(s).not.toContain('delay=$((attempt * 2))');
+      // Exponential formula: 10 * 2^(attempt-1), ceiling 60
+      expect(s).toContain('10 * (1 << (attempt - 1))');
+      expect(s).toContain('[ "$delay" -gt 60 ] && delay=60');
+      // Retry-After minimum enforced at 10s
+      expect(s).toContain('[ "$delay" -lt 10 ]');
+    });
+  });
+
+  describe('fetch 429/5xx retry', () => {
+    it('fetch retries on 429 with exponential backoff (10s/20s/40s)', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+      // 429 is in the retry branch
+      expect(s).toContain('"429"');
+      // 5xx range is also retried
+      expect(s).toContain('-ge 500');
+      // Exponential formula present
+      expect(s).toContain('10 * (1 << (');
+      expect(s).toContain('[ "$_delay" -gt 60 ] && _delay=60');
+      // Retry-After header captured and honored
+      expect(s).toContain("grep -i '^retry-after:'");
+      expect(s).toContain('sleep "$_delay"');
+    });
+
+    it('generated fetch script passes bash -n after retry changes', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const p = `${testWorkspace}/fetch`;
+      expect(() => execFileSync('bash', ['-n', p], { stdio: 'pipe' })).not.toThrow();
+    });
   });
 
   it('supports fetching a message by short ref via the messages endpoint', () => {

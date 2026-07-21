@@ -101,7 +101,13 @@ _call() {
     # Treat it as a transient failure and retry alongside 429/5xx so a network
     # blip (or a token-budget hiccup) is not booked as a permanent failure.
     if [ "$http_code" = "000" ] || [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
-      [ -z "$delay" ] && delay=$((attempt * 2))
+      if [ -z "$delay" ]; then
+        # Exponential backoff: 10s, 20s, 40s (floor=10, ceiling=60)
+        delay=$((10 * (1 << (attempt - 1))))
+        [ "$delay" -gt 60 ] && delay=60
+      elif [ "$delay" -lt 10 ]; then
+        delay=10
+      fi
       echo "[RETRY $attempt/$((max - 1))] $1 failed (HTTP $http_code), retrying in \${delay}s..." >&2
       sleep "$delay"
     elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
@@ -292,49 +298,63 @@ if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND
   exit 1
 fi
 
-# Fetch with HTTP status awareness. Capture response body and status code
-# separately so we can surface HTTP errors clearly.
-response=$(curl -sS --max-time 20 --connect-timeout 10 \\
-  -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
-  -H "X-Agent-Token: $TOKEN" \\
-  -w '\\n%{http_code}')
-http_code=$(printf '%s' "$response" | tail -n1)
-body=$(printf '%s' "$response" | head -n -1)
-
-# On 401/403: the spawn-time token may have rotated (resident session token
-# refresh). Re-read the live token and retry ONCE before surfacing the error.
-if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-  _load_agent_token || exit 1
+# Fetch with HTTP status awareness. Retry on 429/5xx with exponential backoff
+# (10s/20s/40s, ceiling 60s); honor Retry-After header as minimum-10s floor.
+# On 401/403: re-read the rotated token and retry ONCE before surfacing the error.
+_fetch_url="$API/api/agent/projects/$PROJECT/$PATH_SUFFIX"
+_fetch_attempt=0
+_fetch_max=3
+_fetch_auth_retried=0
+while true; do
+  _dump=$(mktemp)
   response=$(curl -sS --max-time 20 --connect-timeout 10 \\
-    -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
+    -X GET "$_fetch_url" \\
     -H "X-Agent-Token: $TOKEN" \\
+    -D "$_dump" \\
     -w '\\n%{http_code}')
   http_code=$(printf '%s' "$response" | tail -n1)
   body=$(printf '%s' "$response" | head -n -1)
-fi
-
-# On 2xx: pass body through as today (success)
-if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-  printf '%s' "$body"
-  echo ""
-  exit 0
-fi
-
-# On 409: ambiguous ref or constraint violation. Surface the body (which contains
-# candidate refs and minimum hex length) with a clear ambiguity signal so the
-# agent knows to retry with a longer ref.
-if [ "$http_code" -eq 409 ]; then
-  printf '%s' "$body"
-  echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+  _retry_after=$(grep -i '^retry-after:' "$_dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+  rm -f "$_dump"
+  # On 2xx: success
+  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+    printf '%s' "$body"
+    echo ""
+    exit 0
+  fi
+  # On 401/403: re-read the rotated token and retry ONCE (not counted against
+  # the transient-error budget — auth retries are a separate concern).
+  if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $_fetch_auth_retried -eq 0 ]; then
+    _fetch_auth_retried=1
+    _load_agent_token || exit 1
+    continue
+  fi
+  # On 409: ambiguous ref or constraint violation.
+  if [ "$http_code" -eq 409 ]; then
+    printf '%s' "$body"
+    echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+    echo ""
+    exit 1
+  fi
+  # On 429 or 5xx: retry with exponential backoff (floor=10s, ceiling=60s).
+  _fetch_attempt=$((_fetch_attempt + 1))
+  if { [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; } && [ $_fetch_attempt -lt $_fetch_max ]; then
+    if [ -n "$_retry_after" ] && [ "$_retry_after" -ge 10 ] 2>/dev/null; then
+      _delay=$_retry_after
+    else
+      _delay=$((10 * (1 << (_fetch_attempt - 1))))
+      [ "$_delay" -gt 60 ] && _delay=60
+    fi
+    echo "[RETRY $_fetch_attempt/$((_fetch_max - 1))] fetch $KIND failed (HTTP $http_code), retrying in \${_delay}s..." >&2
+    sleep "$_delay"
+    continue
+  fi
+  # Non-retryable or exhausted retries.
+  printf '%s' "$body" >&2
+  echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
   echo ""
   exit 1
-fi
-
-# On any other non-2xx (404, 400, 5xx, etc.): surface the body and report error.
-# The agent can then decide how to handle missing/invalid refs.
-printf '%s' "$body" >&2
-echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
-echo ""
+done
 exit 1
 `;
 }
