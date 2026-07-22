@@ -3752,16 +3752,6 @@ class ProjectMessage(SQLModel, table=True):
     idempotency_key: str | None = Field(
         default=None, sa_column=Column(String(255), nullable=True)
     )
-    # Resident-session identity stamp. Set to the live resident Workday session's
-    # ``session_id`` when the message is created while a session is active, so each
-    # session's poll / unattended-cap / pacing queries can scope to their OWN
-    # conversation instead of every open operator message project-wide. NULL means
-    # the row predates the feature (legacy) or was created outside an active
-    # session (cadence path); NULL is always treated as unscoped/visible so no
-    # pre-migration backlog is silently dropped (see alembic 0396).
-    resident_session_id: str | None = Field(
-        default=None, sa_column=Column(String(255), nullable=True)
-    )
     resolved_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
@@ -3859,14 +3849,6 @@ class ProjectMessage(SQLModel, table=True):
             "ix_projectmessage_project_message_created",
             "project_id",
             "message_type",
-            "created_at",
-        ),
-        # Serves the session-scoped poll / unattended-cap / pacing queries
-        # (project_id + resident_session_id + created_at ordering/aggregation).
-        Index(
-            "ix_projectmessage_project_session_created",
-            "project_id",
-            "resident_session_id",
             "created_at",
         ),
     )

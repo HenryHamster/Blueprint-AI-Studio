@@ -2875,12 +2875,6 @@ async def strategic_operation(
 #             resident_session_is_active,
 #         )
 
-        _resident_blob = read_resident_session(project.vision)  # noqa: F821
-        _resident_session_id = (
-            _resident_blob.get("session_id")
-            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)  # noqa: F821
-            else None
-        )
         next_sequence = preallocated_message_sequence
         if next_sequence is None:
             raise HTTPException(status_code=500, detail="Message sequence was not allocated")
@@ -2906,7 +2900,6 @@ async def strategic_operation(
             content=content,
             context=msg_ctx,
             idempotency_key=idem_key,
-            resident_session_id=_resident_session_id,
         )
         session.add(new_msg)
         # Snapshot project.id before commit: the IntegrityError rollback below

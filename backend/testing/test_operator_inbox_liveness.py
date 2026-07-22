@@ -944,6 +944,96 @@ async def test_forward_leak_converges_to_zero_after_remediation(db_session):
 
 
 @pytest.mark.asyncio
+async def test_internal_bookkeeping_events_do_not_leak_to_operator_counters(db_session):
+    """A clean project with only correctly-routed messages yields forward_leaked=0
+    and info_alert_noise=0 — directly encoding the d-7c851b3f success criterion.
+
+    Seeds a project with:
+    - Three STRATEGIST_INTERNAL bookkeeping messages (self_improvement.payload_too_large,
+      research.dedup_deadlock, hotfix_backmerge.size_violation) that must be invisible
+      to the operator because operator_visible_audience_filter excludes them.
+    - One open BLOCKER with OPERATOR_ACTION_NEEDED audience (satisfies derive_needs_action
+      → not a forward leak).
+    - One open NOTE with OPERATOR_FYI audience (excluded by the != OPERATOR_FYI guard).
+    - No INFO-severity Alert rows → info_alert_noise=0.
+
+    Asserts that a single liveness tick returns status="ok", forward_leaked=0,
+    and info_alert_noise=0, proving that correctly-routed messages do not inflate
+    the operator inbox counters.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import OPERATOR_ACTION_NEEDED, OPERATOR_FYI, STRATEGIST_INTERNAL
+    from app.models import ProjectMessage
+
+    _liveness_mod._reset_liveness_for_tests()
+
+    project_id = await _create_test_project(db_session, "clean-tick-zero-leak-test")
+    pid = _uuid.UUID(project_id)
+
+    # Internal bookkeeping messages — must be invisible to the operator.
+    # These represent the kinds of chatter (size-cap, dedup, hotfix notices) that
+    # the success criterion says must NOT reach operator counters.
+    for event_type in (
+        "self_improvement.payload_too_large",
+        "research.dedup_deadlock",
+        "hotfix_backmerge.size_violation",
+    ):
+        db_session.add(ProjectMessage(
+            project_id=pid,
+            from_type="system",
+            message_type="NOTE",
+            status="open",
+            content=f"Internal bookkeeping: {event_type}",
+            context={"audience": STRATEGIST_INTERNAL, "event_type": event_type},
+        ))
+
+    # Correctly-routed BLOCKER — satisfies derive_needs_action() → not a forward leak.
+    db_session.add(ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="BLOCKER",
+        status="open",
+        content="Operator-facing blocker requiring attention",
+        context={"audience": OPERATOR_ACTION_NEEDED},
+    ))
+
+    # Correctly-routed FYI NOTE — excluded by the != OPERATOR_FYI guard → not a leak.
+    db_session.add(ProjectMessage(
+        project_id=pid,
+        from_type="system",
+        message_type="NOTE",
+        status="open",
+        content="Informational operator-fyi notice",
+        context={"audience": OPERATOR_FYI},
+    ))
+
+    await db_session.flush()
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None, "run_operator_inbox_liveness_check returned None with _force=True"
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result returned for project {project_id} — project not included in check"
+
+    r = proj[0]
+    assert r.forward_leaked == 0, (
+        f"forward_leaked must be 0 for a clean project (got {r.forward_leaked}); "
+        f"internal bookkeeping events are leaking into the operator inbox counter"
+    )
+    assert r.info_alert_noise == 0, (
+        f"info_alert_noise must be 0 when no INFO Alert rows exist (got {r.info_alert_noise})"
+    )
+    assert r.status in ("ok", "skipped"), (
+        f"Expected status 'ok' or 'skipped' for a clean project, got {r.status!r}; "
+        f"detail: {r.detail!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
 async def test_operator_fyi_message_is_not_remediated(db_session):
     """An OPERATOR_FYI message is explicitly excluded from the forward-leak
     predicate and must never be remediated.

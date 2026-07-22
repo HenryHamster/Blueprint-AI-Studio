@@ -6539,19 +6539,12 @@ async def _handle_strategic_completion(
 #                                 resident_session_is_active,
 #                             )
 
-                            _resident_blob = read_resident_session(project.vision)  # noqa: F821
                             reply = await post_question_answer(
                                 session,
                                 project.id,
                                 msg.id,
                                 msg.resolution or "Addressed by strategic review",
                                 task.id,
-                                resident_session_id=(
-                                    _resident_blob.get("session_id")
-                                    if isinstance(_resident_blob, dict)
-                                    and resident_session_is_active(_resident_blob)  # noqa: F821
-                                    else None
-                                ),
                                 sequence=next(reserved_message_sequences, None),
                             )
                             _collect_message_event(reply)
