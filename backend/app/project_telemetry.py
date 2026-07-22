@@ -169,13 +169,13 @@ async def upsert_telemetry(
     stmt = _pg_insert(ProjectTelemetry).values(
         project_id=project_id,
         key=key,
-        blob=blob,
+        value=blob,
         updated_at=func.now(),
     )
     stmt = stmt.on_conflict_do_update(
-        constraint="uq_project_telemetry",
+        constraint="uq_project_telemetry_project_key",
         set_={
-            "blob": stmt.excluded.blob,
+            "value": stmt.excluded.value,
             "updated_at": func.now(),
         },
     )
@@ -189,7 +189,7 @@ async def read_telemetry(
 ) -> Dict[str, Any] | None:
     """Return the telemetry blob for (project_id, key), or ``None`` if absent."""
     result = await session.execute(
-        select(ProjectTelemetry.blob).where(
+        select(ProjectTelemetry.value).where(
             ProjectTelemetry.project_id == project_id,
             ProjectTelemetry.key == key,
         )
@@ -210,7 +210,7 @@ async def read_telemetry_many(
     if not keys:
         return {}
     result = await session.execute(
-        select(ProjectTelemetry.key, ProjectTelemetry.blob).where(
+        select(ProjectTelemetry.key, ProjectTelemetry.value).where(
             ProjectTelemetry.project_id == project_id,
             ProjectTelemetry.key.in_(list(keys)),
         )

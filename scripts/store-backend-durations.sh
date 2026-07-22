@@ -9,16 +9,13 @@
 #
 # When to run:
 #   - After adding or removing a large batch of tests
-#   - When the freshness guard in backend/testing/test_audit_finding_class_guards.py
-#     (TestTestDurationsCommittedAndFresh) fails with a staleness warning
+#   - When the freshness guard in backend/testing/test_test_durations_freshness.py
+#     fails with a staleness warning
 #   - Periodically (e.g. after merging a large feature branch) to keep time-balancing accurate
 #
 # After running:
 #   1. Commit the updated backend/.test_durations to version control so CI shards
-#      can auto-detect it and switch from count-based to time-based splitting.
-#   2. Bump _DISTINCT_VALUE_FLOOR in backend/testing/test_test_durations_freshness.py
-#      to >=50 to activate the hard gate that blocks future regressions to synthetic
-#      placeholder values (the warning-only guard becomes a hard assertion).
+#      use time-based splitting.
 #
 # Requirements:
 #   - Docker with access to the backend deps image

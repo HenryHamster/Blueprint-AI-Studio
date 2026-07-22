@@ -145,9 +145,9 @@ def test_durations_coverage_fraction_within_threshold() -> None:
 
 
 # Ratchet floor: how many *distinct* duration values the committed file must have.
-# Real measured baselines have thousands of distinct values; 50 is a permanent
-# hard floor that blocks regression back to synthetic/degenerate (2-value) data.
-_DISTINCT_VALUE_FLOOR = 50
+# A real measured baseline has thousands of distinct values; floor=100 hard-blocks
+# any future regression to synthetic placeholder data (e.g. all entries 0.1 or 0.5).
+_DISTINCT_VALUE_FLOOR = 100
 
 # Warn threshold: ≤ this many distinct values triggers a loud regeneration notice.
 # The warning surfaces in pytest's warnings summary without failing the blocking suite.
@@ -166,10 +166,11 @@ def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
 
     Two-tier response:
     1. WARN loudly when distinct_count <= _DEGENERATE_WARN_THRESHOLD — visible in
-       pytest's warnings summary right now, but does NOT fail the blocking CI gate.
-    2. HARD-FAIL when distinct_count < _DISTINCT_VALUE_FLOOR (floor=50).
+       pytest's warnings summary.
+    2. HARD-FAIL when distinct_count < _DISTINCT_VALUE_FLOOR (100) — blocks any
+       regression to synthetic placeholder values.
 
-    Regenerating a real baseline:
+    To regenerate a fresh baseline:
         bash scripts/store-backend-durations.sh   # ~15-20 min, requires Docker+Postgres
         git add backend/.test_durations && git commit
     """
@@ -188,8 +189,7 @@ def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
             f"will be time-imbalanced.\n"
             f"\n"
             f"  To fix: bash scripts/store-backend-durations.sh  (Docker+Postgres, ~15-20 min)\n"
-            f"  Commit the result, then bump _DISTINCT_VALUE_FLOOR in\n"
-            f"  backend/testing/test_test_durations_freshness.py to >=50.\n",
+            f"  Then: git add backend/.test_durations && git commit\n",
             stacklevel=2,
         )
 

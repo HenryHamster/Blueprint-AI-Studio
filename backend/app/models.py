@@ -5984,27 +5984,41 @@ class ProjectEfficiencySnapshot(SQLModel, table=True):
 class ProjectLaneBaseline(SQLModel, table=True):
     """Persisted lane-baseline telemetry for a project.
 
-    Replaces design_doc["lane_baselines"] — moves per-version lane diagnostic
-    snapshots out of the design_doc God-column. One row per project.
+    Replaces design_doc["lane_baselines"] — one row per (project, version_number).
+    Migration 0681 rebuilt this table from the original one-row-per-project
+    schema to this multi-row schema so project_telemetry.py can store and
+    retrieve baselines per release version with retention pruning.
     """
 
     __tablename__ = "project_lane_baseline"
 
+    id: uuid.UUID = Field(
+        default_factory=uuid.uuid4,
+        sa_column=Column(GUID(), primary_key=True, nullable=False),
+    )
     project_id: uuid.UUID = Field(
         sa_column=Column(
             GUID(),
             ForeignKey("project.id", ondelete="CASCADE"),
-            primary_key=True,
             nullable=False,
         )
     )
-    data: Dict[str, Any] = Field(
+    version_number: int = Field(
+        sa_column=Column(Integer(), nullable=False),
+    )
+    captured_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False),
+    )
+    baseline_def_version: str = Field(
+        sa_column=Column(String(64), nullable=False),
+    )
+    blob: Dict[str, Any] = Field(
         default_factory=dict,
         sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
     )
-    updated_at: datetime = Field(
-        default_factory=_utcnow,
-        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    __table_args__ = (
+        UniqueConstraint("project_id", "version_number", name="uq_proj_lane_baseline"),
+        Index("ix_project_lane_baseline_project_id", "project_id"),
     )
 
 
@@ -6045,6 +6059,8 @@ class ProjectTelemetry(SQLModel, table=True):
     project.  Writers dual-write to both design_doc and this table during the
     transition; readers continue to use design_doc until migrated.
     """
+
+    __tablename__ = "project_telemetry"
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     project_id: uuid.UUID = Field(
