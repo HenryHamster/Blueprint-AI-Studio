@@ -45,6 +45,11 @@ DEFAULT_ORCHESTRATOR_URL = "https://blueprint-orchestrator-mmtfi5aysa-uc.a.run.a
 # own fail-closed preflight.
 MIN_NODE_MAJOR = 22
 MIN_CODEX_VERSION = (0, 144, 1)
+
+# Canonical first-launch subcommands documented in docs/RUNNER_RUNBOOK.md.
+# Keep this tuple in sync with the "Enroll and start" section of the runbook.
+# test_docs_runbook_drift.py::test_first_launch_matches_shipped_cli guards the alignment.
+FIRST_LAUNCH_COMMANDS: tuple[str, ...] = ("start", "check", "install")
 PINNED_CODEX_VERSION = "0.144.1"
 _CODEX_REPAIR = (
     f"Reinstall Codex with optional native packages: npm install -g "
