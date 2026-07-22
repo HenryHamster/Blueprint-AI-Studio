@@ -956,11 +956,13 @@ describe('writeDesignDocHelper', () => {
     expect(script.startsWith('#!/bin/bash')).toBe(true);
     expect(script).toContain('design-doc get|set|delete|list');
     expect(script).toContain('TASK="task-xyz"');
-    // POST body shape the backend op handler parses must be unchanged.
-    // KEY and TASK are encoded via _json_str (not bare %s) to survive quotes/newlines.
-    expect(script).toContain('"op":"set","key":%s,"value":%s');
-    expect(script).toContain('"op":"delete","key":%s}');
-    expect(script).toContain('$(_json_str "$KEY")');
+    // POST body shape the backend op handler parses must use json.dumps for all fields.
+    // set: task_id, key, value all passed via sys.argv to avoid printf escape issues.
+    expect(script).toContain('"op":"set"');
+    expect(script).toContain('"op":"delete"');
+    // Payload building uses python3 sys.argv, not printf %s substitution.
+    expect(script).toContain('python3 -c');
+    expect(script).toContain('json.dumps');
   });
 
   it('makes set/delete durable: a retry loop honoring Retry-After on 429/5xx', () => {
@@ -994,19 +996,23 @@ describe('writeDesignDocHelper', () => {
     expect(script).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
   });
 
-  it('design-doc escapes adversarial key/value: _json_str routes KEY and TASK through JSON encoder', () => {
+  it('design-doc payload building: python3 sys.argv passes KEY, TASK, VALUE safely — no printf escape layer', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];
-    // _json_str function must be injected so quotes/backslashes/newlines in KEY do not break JSON.
-    expect(script).toContain('_json_str()');
-    // Every operation (set, delete, get, list) routes KEY and TASK through the encoder.
-    expect(script).toContain('$(_json_str "$KEY")');
-    expect(script).toContain('$(_json_str "$TASK")');
-    // VALUE in set is raw JSON from the caller — must NOT be re-encoded as a string.
+    // No printf format-string substitution for payload building — the old pattern
+    // broke when _json_str output contained '%' chars that printf re-interpreted.
+    expect(script).not.toContain('printf \'{"task_id"');
+    // No _json_str in the generated script: replaced by python3 sys.argv passing.
+    expect(script).not.toContain('_json_str()');
+    expect(script).not.toContain('$(_json_str "$KEY")');
+    expect(script).not.toContain('$(_json_str "$TASK")');
     expect(script).not.toContain('$(_json_str "$VALUE")');
-    // Old bare-%s encoding must be gone for key and task_id fields.
-    expect(script).not.toContain('"task_id":"%s"');
-    expect(script).not.toContain('"key":"%s"');
+    // All ops use python3 -c with sys.argv to route KEY, TASK, VALUE safely.
+    expect(script).toContain('python3 -c \'import json,sys');
+    // VALUE in set is parsed as JSON via json.loads (validates format, safe from quoting).
+    expect(script).toContain('json.loads(v)');
+    // python3 availability check so failures are caught at invocation, not deep in a curl call.
+    expect(script).toContain('command -v python3 >/dev/null 2>&1');
   });
 
   it('keeps read ops (list/get) fail-fast with no retry', () => {
@@ -1014,8 +1020,8 @@ describe('writeDesignDocHelper', () => {
     const script = capturedScripts['/tmp/workspace/design-doc'];
     expect(script).toContain('_post_once()');
     // list and get route through the single-shot helper, not the retry loop.
-    expect(script).toContain(`printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once`);
-    expect(script).toContain(`printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once`);
+    expect(script).toContain(`python3 -c 'import json,sys;sys.stdout.write(json.dumps({"task_id":sys.argv[1],"op":"list"}))' "$TASK" | _post_once`);
+    expect(script).toContain(`python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"get","key":k}))' "$TASK" "$KEY" | _post_once`);
   });
 
   it('generated design-doc script passes `bash -n` syntax check', async () => {
@@ -1033,6 +1039,95 @@ describe('writeDesignDocHelper', () => {
     } finally {
       try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
     }
+  });
+
+  // ── Payload safety: double-quotes, backslashes, newlines in KEY and VALUE ──────
+  // These tests execute the python3 one-liners extracted from the generated script
+  // to verify they handle adversarial inputs without producing invalid JSON.
+  describe('python3 payload builder: adversarial KEY and VALUE inputs', () => {
+    let capturedScript: string;
+
+    beforeEach(() => {
+      writeDesignDocHelper('task-xyz');
+      capturedScript = capturedScripts['/tmp/workspace/design-doc'];
+    });
+
+    async function runPy3(args: string[]): Promise<unknown> {
+      const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      // The one-liner embedded in the script — identical to what the shell would run.
+      const SET_ONELINER =
+        'import json,sys;t,k,v=sys.argv[1],sys.argv[2],sys.argv[3];sys.stdout.write(json.dumps({"task_id":t,"op":"set","key":k,"value":json.loads(v)}))';
+      const GET_ONELINER =
+        'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"get","key":k}))';
+      const oneliner = args[0] === 'set' ? SET_ONELINER : GET_ONELINER;
+      const pyArgs = args[0] === 'set'
+        ? ['task-xyz', args[1], args[2]]   // task, key, value
+        : ['task-xyz', args[1]];           // task, key
+      const out = realCp.execFileSync(
+        'python3', ['-c', oneliner, ...pyArgs],
+        { encoding: 'utf8' },
+      );
+      return JSON.parse(out);
+    }
+
+    it('set VALUE containing double-quotes produces valid JSON and round-trips correctly', async () => {
+      // Simulate agent passing a JSON string that itself contains double-quotes.
+      const jsonValue = JSON.stringify('hello "world"');   // → '"hello \\"world\\""'
+      const payload = await runPy3(['set', 'my-key', jsonValue]) as Record<string, unknown>;
+      expect(payload['op']).toBe('set');
+      expect(payload['key']).toBe('my-key');
+      expect(payload['value']).toBe('hello "world"');
+    });
+
+    it('set VALUE containing backslashes produces valid JSON and round-trips correctly', async () => {
+      const jsonValue = JSON.stringify('path\\to\\file');  // → '"path\\\\to\\\\file"'
+      const payload = await runPy3(['set', 'my-key', jsonValue]) as Record<string, unknown>;
+      expect(payload['value']).toBe('path\\to\\file');
+    });
+
+    it('set VALUE containing newlines produces valid JSON and round-trips correctly', async () => {
+      const jsonValue = JSON.stringify('line1\nline2\n');
+      const payload = await runPy3(['set', 'my-key', jsonValue]) as Record<string, unknown>;
+      expect(payload['value']).toBe('line1\nline2\n');
+    });
+
+    it('set KEY containing double-quotes produces valid JSON', async () => {
+      const jsonValue = '"simple"';
+      const payload = await runPy3(['set', 'section/key "with" quotes', jsonValue]) as Record<string, unknown>;
+      expect(payload['key']).toBe('section/key "with" quotes');
+    });
+
+    it('set KEY containing backslashes produces valid JSON', async () => {
+      const jsonValue = '"simple"';
+      const payload = await runPy3(['set', 'path\\subkey', jsonValue]) as Record<string, unknown>;
+      expect(payload['key']).toBe('path\\subkey');
+    });
+
+    it('set KEY containing newlines produces valid JSON', async () => {
+      const jsonValue = '"simple"';
+      const payload = await runPy3(['set', 'key\nwith\nnewline', jsonValue]) as Record<string, unknown>;
+      expect(payload['key']).toBe('key\nwith\nnewline');
+    });
+
+    it('set VALUE containing percent signs does not corrupt payload (printf format-specifier guard)', async () => {
+      // The old printf approach could misinterpret %s/%d in _json_str output.
+      // python3 sys.argv is immune: % in data is just data.
+      const jsonValue = JSON.stringify('100% complete %s %d %i');
+      const payload = await runPy3(['set', 'my-key', jsonValue]) as Record<string, unknown>;
+      expect(payload['value']).toBe('100% complete %s %d %i');
+    });
+
+    it('the generated script contains the expected python3 one-liner for set', () => {
+      expect(capturedScript).toContain(
+        `python3 -c 'import json,sys;t,k,v=sys.argv[1],sys.argv[2],sys.argv[3];sys.stdout.write(json.dumps({"task_id":t,"op":"set","key":k,"value":json.loads(v)}))' "$TASK" "$KEY" "$VALUE"`,
+      );
+    });
+
+    it('the generated script contains the expected python3 one-liner for delete', () => {
+      expect(capturedScript).toContain(
+        `python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"delete","key":k}))' "$TASK" "$KEY"`,
+      );
+    });
   });
 
   it('reads the live token file each invocation and retries a write on 401 (live write-token fix)', () => {
@@ -1062,8 +1157,8 @@ describe('writeDesignDocHelper', () => {
       expect(script).toContain('TASK="task-xyz"');
       // get and list still route through the fail-fast single-shot helper.
       expect(script).toContain('_post_once()');
-      expect(script).toContain(`printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once`);
-      expect(script).toContain(`printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once`);
+      expect(script).toContain(`python3 -c 'import json,sys;sys.stdout.write(json.dumps({"task_id":sys.argv[1],"op":"list"}))' "$TASK" | _post_once`);
+      expect(script).toContain(`python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"get","key":k}))' "$TASK" "$KEY" | _post_once`);
     });
 
     it('rejects set/delete (no write path, no retry loop) in read-only workspaces', () => {

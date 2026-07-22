@@ -988,18 +988,22 @@ export function writeDesignDocHelper(
   // so 429 (lock contention) and 5xx (transient) are never silently dropped.
   // Non-retryable 4xx responses surface immediately.
   const retryFn = readOnly ? '' : retryPostShellFn();
+  // Payload builders use python3 with sys.argv to pass all values — no printf
+  // format-string substitution, no shell-quoting escape layers. Any character
+  // (double-quote, backslash, newline, %) in KEY or VALUE reaches python3 as a
+  // plain sys.argv element and is serialised correctly by json.dumps / json.loads.
   const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
   echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  printf '{"task_id":%s,"op":"set","key":%s,"value":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" "$VALUE" | \\
+  python3 -c 'import json,sys;t,k,v=sys.argv[1],sys.argv[2],sys.argv[3];sys.stdout.write(json.dumps({"task_id":t,"op":"set","key":k,"value":json.loads(v)}))' "$TASK" "$KEY" "$VALUE" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc set"
 elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":%s,"op":"delete","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | \\
+  python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"delete","key":k}))' "$TASK" "$KEY" | \\
     _post_with_retry "$API/api/agent/design-doc" "design-doc delete"`;
   const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
   const helperScript = `#!/bin/bash
@@ -1013,9 +1017,9 @@ KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
-${jsonStrShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
+command -v python3 >/dev/null 2>&1 || { echo "[ERROR] design-doc requires python3" >&2; exit 1; }
 
 # Fail-fast POST for read operations (list/get): single curl, no retry.
 _post_once() {
@@ -1028,12 +1032,12 @@ _post_once() {
 }
 ${retryFn}
 if [ "$OP" = "list" ]; then
-  printf '{"task_id":%s,"op":"list"}' "$(_json_str "$TASK")" | _post_once
+  python3 -c 'import json,sys;sys.stdout.write(json.dumps({"task_id":sys.argv[1],"op":"list"}))' "$TASK" | _post_once
 elif [ "$OP" = "get" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: get requires <key>" >&2; exit 1
   fi
-  printf '{"task_id":%s,"op":"get","key":%s}' "$(_json_str "$TASK")" "$(_json_str "$KEY")" | _post_once
+  python3 -c 'import json,sys;t,k=sys.argv[1],sys.argv[2];sys.stdout.write(json.dumps({"task_id":t,"op":"get","key":k}))' "$TASK" "$KEY" | _post_once
 ${writeBranches}
 else
   echo "Unknown op: $OP. ${unknownUsage}" >&2; exit 1
