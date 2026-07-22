@@ -800,11 +800,12 @@ async def _process_direction_lifecycle_locked(
             return
         from app.problem_model import (  # noqa: PLC0415, RUF100
             reconcile_gaps_for_retired_directions,
+            sanitize_problem_model_raw,
         )
 
         try:
             _reconciled, _ = reconcile_gaps_for_retired_directions(
-                raw, [retired_id], _utcnow().isoformat()
+                sanitize_problem_model_raw(raw), [retired_id], _utcnow().isoformat()
             )
         except Exception as _reconcile_exc:  # fail-open — never block the retire  # noqa: BLE001
             logger.warning(

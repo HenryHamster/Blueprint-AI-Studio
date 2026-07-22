@@ -828,7 +828,8 @@ async def with_problem_model_locked(
     ) as project:
         if project is None:
             return False
-        problem_model = dict(project.problem_model or {})
+        from app.problem_model import sanitize_problem_model_raw  # noqa: PLC0415
+        problem_model = sanitize_problem_model_raw(dict(project.problem_model or {}))
         mutate_fn(problem_model)
         project.problem_model = problem_model
         flag_modified(project, "problem_model")

@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from app.acceptance_criteria import criterion_coverage_to_evidence_status
 from app.problem_model import (
     ARCHIVED_GAPS_DURABLE_MAX,
+    sanitize_problem_model_raw,
     CAPABILITIES_DURABLE_MAX,
     DEFERRAL_STALE_GRACE_DAYS,
     FRICTION_DURABLE_MAX,
@@ -6242,3 +6243,76 @@ def test_apply_agent_update_both_current_and_proposed_poisoned_succeeds():
     assert new_raw["revision"] == 11
     assert new_raw["intent"]["purpose"] == "Fresh purpose."
     assert "truncated" not in new_raw
+
+
+# ---------------------------------------------------------------------------
+# sanitize_problem_model_raw
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_problem_model_raw_strips_packer_markers():
+    """All three packer markers are removed by sanitize_problem_model_raw."""
+    raw = {
+        "revision": 5,
+        "intent": {"purpose": "p", "current_focus": ""},
+        "truncated": True,
+        "_agent_view_floor_applied": "gap-abc",
+        "_gap_memory_trimmed": True,
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert "truncated" not in result
+    assert "_agent_view_floor_applied" not in result
+    assert "_gap_memory_trimmed" not in result
+    # Known fields are preserved
+    assert result["revision"] == 5
+    assert result["intent"] == {"purpose": "p", "current_focus": ""}
+
+
+def test_sanitize_problem_model_raw_strips_unknown_keys():
+    """Unknown top-level keys (beyond packer markers) are also removed."""
+    raw = {
+        "revision": 1,
+        "some_unknown_field": "should be gone",
+        "_another_directive": [1, 2, 3],
+    }
+    result = sanitize_problem_model_raw(raw)
+    assert "some_unknown_field" not in result
+    assert "_another_directive" not in result
+    assert result["revision"] == 1
+
+
+def test_sanitize_problem_model_raw_preserves_all_known_keys():
+    """All ProblemModel fields pass through sanitize_problem_model_raw unchanged."""
+    from app.problem_model import ProblemModel
+    known_fields = set(ProblemModel.model_fields)
+    raw = {k: None for k in known_fields}
+    raw["revision"] = 3
+    result = sanitize_problem_model_raw(raw)
+    # Every known field is present in the output
+    for field in known_fields:
+        assert field in result
+    # No unexpected extras
+    assert set(result.keys()) == known_fields
+
+
+def test_sanitize_problem_model_raw_empty_dict():
+    """Empty dict is returned unchanged (no crash, no phantom keys)."""
+    result = sanitize_problem_model_raw({})
+    assert result == {}
+
+
+def test_sanitize_problem_model_raw_output_is_pydantic_parseable():
+    """sanitize_problem_model_raw output round-trips through ProblemModel cleanly."""
+    raw = {
+        "revision": 2,
+        "truncated": True,
+        "_agent_view_floor_applied": "g-1",
+        "intent": {"purpose": "test purpose", "current_focus": "current"},
+        "gaps": [],
+        "capabilities": [],
+    }
+    sanitized = sanitize_problem_model_raw(raw)
+    # Must not raise ValidationError
+    model = parse_problem_model(sanitized)
+    assert model.revision == 2
+    assert model.intent.purpose == "test purpose"
