@@ -28418,6 +28418,42 @@ class TestPatchRunnerHealthThresholds:
             )
             assert bad.status_code == 400, f"{key} should reject non-numeric"
 
+    @pytest.mark.asyncio
+    async def test_runner_list_reflects_configured_thresholds(
+        self, client: AsyncClient, db_session
+    ):
+        """Runner list endpoint returns liveness_window_seconds and failure_streak_threshold
+        driven by the runtime-configurable values, not hardcoded constants."""
+        project = await _make_project(db_session)
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="a" * 64,
+            hostname="threshold-test-runner",
+            status="active",
+            last_seen_at=_utcnow(),
+        )
+        db_session.add(runner)
+        await db_session.commit()
+
+        # Patch to non-default values.
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"runner_liveness_seconds": 120, "runner_degraded_failure_threshold": 7},
+        )
+        assert resp.status_code == 200, resp.text
+
+        listed = (
+            await client.get(f"/api/admin/projects/{project.id}/runners")
+        ).json()
+        assert len(listed) == 1
+        health = listed[0]["health"]
+        assert health["liveness_window_seconds"] == 120, (
+            "runner health must reflect configured liveness_seconds, not the hardcoded default"
+        )
+        assert health["failure_streak_threshold"] == 7, (
+            "runner health must reflect configured degraded_failure_threshold, not the hardcoded default"
+        )
+
 
 class TestTaskLlmCostFields:
     """Unit tests for _task_llm_cost_fields helper in admin.py."""

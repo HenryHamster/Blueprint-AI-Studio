@@ -12942,3 +12942,78 @@ def test_all_backend_test_files_collect_without_error():
         + "\n\nFull output tail:\n"
         + "\n".join(all_output.splitlines()[-40:])
     )
+
+
+def test_no_set_derived_word_tokens_in_durable_writes():
+    """No app/ file may store set-derived word-tokens into a durable list via list(set(...split()...)).
+
+    The rev-1367 bug: strategic_completion.py stored direction text_tokens via
+    list(set(text.split()) - stopwords), then strategic_analysis.py re-joined them
+    with ' '.join(text_tokens), producing scrambled operator-visible text because
+    Python set iteration order is non-deterministic.
+
+    Correct pattern: sorted(set(...split()...)) for deterministic ordering, or just
+    split() without set() when dedup is not needed.
+
+    This invariant blocks the whole corruption class from recurring.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    violating_files: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            # Detect: list(set(... .split() ...))
+            # i.e. a Call to 'list' whose sole arg is a Call to 'set',
+            # and somewhere inside that set(...) call is a .split() invocation.
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Name) and node.func.id == "list"):
+                continue
+            if len(node.args) != 1 or node.keywords:
+                continue
+            inner = node.args[0]
+            # Allow list(set(...) - ...) via BinOp (set difference) as well as
+            # direct list(set(...)) — walk the entire inner subtree for a set() call
+            # that itself contains a .split() call.
+            set_call = None
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name) and inner.func.id == "set":
+                set_call = inner
+            elif isinstance(inner, ast.BinOp) and isinstance(inner.op, ast.Sub):
+                # list(set(...) - stopwords)
+                left = inner.left
+                if isinstance(left, ast.Call) and isinstance(left.func, ast.Name) and left.func.id == "set":
+                    set_call = left
+
+            if set_call is None:
+                continue
+
+            # Check whether the set() call's argument subtree contains a .split() call
+            contains_split = False
+            for sub in ast.walk(set_call):
+                if (
+                    isinstance(sub, ast.Call)
+                    and isinstance(sub.func, ast.Attribute)
+                    and sub.func.attr == "split"
+                ):
+                    contains_split = True
+                    break
+
+            if contains_split:
+                rel = py_file.relative_to(BACKEND_ROOT)
+                violating_files.append(f"  {rel}:{node.lineno}")
+                break  # one report per file
+
+    assert not violating_files, (
+        f"Found list(set(...split()...)) in {len(violating_files)} app/ file(s).\n"
+        "This pattern stores word tokens in non-deterministic set order, which\n"
+        "produces scrambled text when tokens are later re-joined with ' '.join(...).\n"
+        "Replace list(set(...)) with sorted(set(...)) to fix the ordering, or\n"
+        "use a different dedup approach that preserves insertion order.\n\n"
+        "Offending files:\n" + "\n".join(violating_files)
+    )

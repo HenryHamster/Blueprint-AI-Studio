@@ -74,7 +74,7 @@ from app.storage import (
     VIEWABLE_ARTIFACT_RETENTION_DAYS,
     delete_storage_uri_best_effort,
 )
-from app.runner_health_monitors import _RUNNER_LIVENESS_SECONDS
+from app.runner_health_monitors import _get_liveness_seconds
 from app.time_utils import _is_cadence_due, _utcnow
 from app.reaper_fleet_health_sweeps import (
     sweep_merge_gate_verification_degradation,
@@ -3542,7 +3542,7 @@ async def sweep_stranded_runner_subprocess_compute_jobs(
     STARTING/RUNNING forever.  ``ran_on_runner_id`` is the authoritative claim
     record; never use the dispatch-only ``runner_target_id`` pin here.
     """
-    liveness_cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    liveness_cutoff = now - timedelta(seconds=_get_liveness_seconds())
     candidates = (
         await session.execute(
             select(ComputeJob.id, ComputeJob.ran_on_runner_id)

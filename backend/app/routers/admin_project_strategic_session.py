@@ -82,7 +82,7 @@ from app.strategic_runtime_work import build_strategic_runtime_summary, load_pro
 # Canonical runner-liveness window (300s). is_live in _runner_health is purely
 # time-derived (status=='active' AND now-last_seen < this), so the broad-revision
 # fingerprint must probe it against the wall clock, not just max(last_seen_at).
-from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS
+from app.runner_health_monitors import _get_liveness_seconds as _get_runner_liveness_seconds
 from app.runner_project_binding import runner_allowed_for_project
 from app.work_session_actions import build_work_session_actions
 from app.work_session_command_execution import (
@@ -1779,7 +1779,7 @@ async def _compute_strategic_state_fingerprints(
     # a live runner stops heartbeating, last_seen_at is frozen so runner_max_seen
     # cannot catch the transition — this count drops from N to N-1 the moment the
     # frozen heartbeat ages past the cutoff, flipping the revision.
-    _liveness_cutoff = _utcnow() - _dt.timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    _liveness_cutoff = _utcnow() - _dt.timedelta(seconds=_get_runner_liveness_seconds())
     live_runner_count = await session.scalar(
         select(func.count()).where(
             runner_allowed_for_project(project_id),
