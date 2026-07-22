@@ -53,14 +53,19 @@ vi.mock('../index.js', () => ({
 
 // The test verification loop now lives in utils/test-fix-loop.ts; handlers import
 // captureTestBaseline and testFixLoop from there.
-vi.mock('../utils/test-fix-loop.js', () => ({
-  captureTestBaseline: vi.fn().mockResolvedValue(null),
-  testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
-}));
+vi.mock('../utils/test-fix-loop.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/test-fix-loop.js')>();
+  return {
+    ...actual,
+    captureTestBaseline: vi.fn().mockResolvedValue(null),
+    testFixLoop: vi.fn().mockResolvedValue({ passed: true, testFailuresDetected: false, failureSummary: '' }),
+  };
+});
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -86,9 +91,10 @@ vi.mock('../build-config.js', () => ({
 
 // Mock the code-change module so handleFix tests can assert on what was
 // passed to runCodeChangeTask without exercising marker-detection branches.
-vi.mock('./code-change.js', () => ({
-  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('./code-change.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./code-change.js')>();
+  return { ...actual, runCodeChangeTask: vi.fn().mockResolvedValue(undefined) };
+});
 
 // Spy on the read-only ./fetch writer while keeping buildFetchGuidance and the
 // PLAN_FETCH_VERBS constant real, so prompt-guidance assertions exercise the

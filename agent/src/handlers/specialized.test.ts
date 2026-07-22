@@ -86,9 +86,10 @@ vi.mock('../index.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../workspacePrep.js', () => ({
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();
@@ -124,9 +125,10 @@ vi.mock('../telemetry.js', async (importOriginal) => {
 
 // Mock the code-change module so handleMigrate tests can assert on what was
 // passed to runCodeChangeTask without exercising the marker-detection branches.
-vi.mock('./code-change.js', () => ({
-  runCodeChangeTask: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('./code-change.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./code-change.js')>();
+  return { ...actual, runCodeChangeTask: vi.fn().mockResolvedValue(undefined) };
+});
 
 // fs is consumed by both default + namespace imports across the modules under
 // test. Mock both shapes so vitest doesn't reject either access pattern.

@@ -9,7 +9,6 @@ let capturedThinkerParams: Record<string, unknown> | undefined;
 
 const {
   INDEX_EXPORT_NAMES,
-  WORKSPACE_PREP_EXPORT_NAMES,
   STRATEGIC_HELPERS_EXPORT_NAMES,
   DESIGN_DOC_PRESENCE_EXPORT_NAMES,
   RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES,
@@ -19,7 +18,6 @@ const {
 } = vi.hoisted(() => {
   // Type-safe export name lists: satisfies ensures each name exists in the actual module exports
   type IndexExportKey = keyof typeof import('../index.js');
-  type WorkspacePrepExportKey = keyof typeof import('../workspacePrep.js');
   type StrategicHelpersExportKey = keyof typeof import('./strategic-helpers.js');
   type DesignDocPresenceExportKey = keyof typeof import('../utils/design-doc-presence.js');
   type ResearchDirectionContextExportKey = keyof typeof import('./research-direction-context.js');
@@ -84,6 +82,7 @@ const {
     'bootstrapPoolMode',
     'buildTargetedPytestRunners',
     'captureTestBaseline',
+    'claimTask',
     'clearLastProviderRunErrorReport',
     'clearLogBuffer',
     'clearToolTrace',
@@ -113,6 +112,7 @@ const {
     'getOperatorDecisionCaptureTelemetry',
     'getLlmTelemetry',
     'getProviderRunner',
+    'getResidentTurnLatencyTelemetry',
     'git',
     'gitAsync',
     'isBootstrapToken',
@@ -149,6 +149,7 @@ const {
     'recordProviderReportedUsage',
     'recordNumTurns',
     'recordOperatorDecisionCapture',
+    'recordResidentTurnLatency',
     'recordToolUse',
     'recordToolResultBytes',
     'refreshRuntimeState',
@@ -159,6 +160,7 @@ const {
     'resetLlmTelemetry',
     'resetOperatorDecisionCaptureTelemetry',
     'resetPerRoleModuleState',
+    'resetResidentTurnLatencyTelemetry',
     'resolveBaseBranch',
     'resolveCredentialsFromSecretVersion',
     'resolveTaskBranchNamespace',
@@ -180,13 +182,6 @@ const {
     'testFixLoop',
     'validateBranchName',
   ] satisfies IndexExportKey[],
-    WORKSPACE_PREP_EXPORT_NAMES: [
-    'getLastWorkspacePrepOutcome',
-    'prepareWorkspaceForRole',
-    'listWorkspaceTopDirs',
-    'resetWorkspacePrepOutcome',
-    'resolveReferenceRepo',
-  ] satisfies WorkspacePrepExportKey[],
     STRATEGIC_HELPERS_EXPORT_NAMES: [
     'DESIGN_DOC_FETCH_VERBS',
     'FETCH_VERB_HELP',
@@ -292,6 +287,7 @@ const {
     'getFormatComplianceTelemetry',
     'getLlmTelemetry',
     'getOperatorDecisionCaptureTelemetry',
+    'getResidentTurnLatencyTelemetry',
     'recordFormatMiss',
     'recordFormatRepairAttempt',
     'recordFormatRepairInfraFailure',
@@ -303,11 +299,13 @@ const {
     'recordNumTurns',
     'recordOperatorDecisionCapture',
     'recordProviderReportedUsage',
+    'recordResidentTurnLatency',
     'recordToolResultBytes',
     'recordViewportScreenshotDownload',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
     'resetOperatorDecisionCaptureTelemetry',
+    'resetResidentTurnLatencyTelemetry',
     'restoreOperatorDecisionCaptureTelemetry',
     'setCurrentPromptFingerprint',
     'setPromptSizeTelemetry',
@@ -339,10 +337,10 @@ vi.mock('../index.js', () => ({
   sendHeartbeatSync: vi.fn(),
 }));
 
-vi.mock('../workspacePrep.js', () => ({
-  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../prompt.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../prompt.js')>();

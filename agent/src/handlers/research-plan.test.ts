@@ -5,7 +5,6 @@ import { CAPABILITY_DECLARATION_DOC as CAP_DOC_FROM_BLOCKS, ACCEPTANCE_EVIDENCE_
 
 const {
   INDEX_EXPORT_NAMES,
-  WORKSPACE_PREP_EXPORT_NAMES,
 } = vi.hoisted(() => ({
   INDEX_EXPORT_NAMES: [
     'AUTH_MODE',
@@ -63,6 +62,7 @@ const {
     'bootstrapPoolMode',
     'buildTargetedPytestRunners',
     'captureTestBaseline',
+    'claimTask',
     'clearLastProviderRunErrorReport',
     'clearLogBuffer',
     'clearToolTrace',
@@ -92,6 +92,7 @@ const {
     'getLlmTelemetry',
     'getOperatorDecisionCaptureTelemetry',
     'getProviderRunner',
+    'getResidentTurnLatencyTelemetry',
     'git',
     'gitAsync',
     'isBootstrapToken',
@@ -129,6 +130,7 @@ const {
     'recordProviderReportedUsage',
     'recordNumTurns',
     'recordOperatorDecisionCapture',
+    'recordResidentTurnLatency',
     'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
@@ -139,6 +141,7 @@ const {
     'resetLlmTelemetry',
     'resetOperatorDecisionCaptureTelemetry',
     'resetPerRoleModuleState',
+    'resetResidentTurnLatencyTelemetry',
     'resolveBaseBranch',
     'resolveCredentialsFromSecretVersion',
     'resolveTaskBranchNamespace',
@@ -159,13 +162,6 @@ const {
     'strVal',
     'testFixLoop',
     'validateBranchName',
-  ],
-  WORKSPACE_PREP_EXPORT_NAMES: [
-    'getLastWorkspacePrepOutcome',
-    'listWorkspaceTopDirs',
-    'prepareWorkspaceForRole',
-    'resetWorkspacePrepOutcome',
-    'resolveReferenceRepo',
   ],
 }));
 
@@ -222,10 +218,10 @@ vi.mock('child_process', () => ({
   }),
 }));
 
-vi.mock('../workspacePrep.js', () => ({
-  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
-}));
+vi.mock('../workspacePrep.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../workspacePrep.js')>();
+  return { ...actual, prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined) };
+});
 
 vi.mock('../telemetry.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../telemetry.js')>();
