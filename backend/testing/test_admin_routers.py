@@ -28186,6 +28186,233 @@ class TestCloudRunAllowlistPersistence:
             )
 
 
+class TestPatchRunnerHealthThresholds:
+    """PATCH /api/admin/settings round-trip and validation for runner health thresholds.
+
+    These knobs control liveness detection, degradation sensitivity, resource-pressure
+    floors, escalation cadence, and data-retention windows for runners and task VMs.
+    """
+
+    @pytest.mark.asyncio
+    async def test_defaults_appear_in_get(self, client: AsyncClient):
+        """GET /api/admin/settings returns the documented defaults for all 11 keys."""
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["runner_liveness_seconds"] == 300
+        assert body["runner_degraded_failure_threshold"] == 3
+        assert body["runner_low_disk_threshold_bytes"] == 1_073_741_824
+        assert body["runner_low_memory_threshold_bytes"] == 536_870_912
+        assert body["runner_escalation_age_seconds"] == 14_400
+        assert body["runner_idle_gpu_threshold_pct"] == 10
+        assert body["runner_token_stale_days"] == 90
+        assert body["runner_post_update_silence_seconds"] == 600
+        assert body["runner_heartbeat_retention_days"] == 7
+        assert body["vm_low_disk_threshold_bytes"] == 1_073_741_824
+        assert body["vm_low_memory_threshold_bytes"] == 536_870_912
+
+    @pytest.mark.asyncio
+    async def test_runner_liveness_seconds_round_trip(self, client: AsyncClient):
+        """PATCH runner_liveness_seconds=120 -> GET confirms it; out-of-range rejected."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"runner_liveness_seconds": 120}
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_liveness_seconds"
+            ]
+            == 120
+        )
+        # Below minimum (30).
+        bad = await client.patch(
+            "/api/admin/settings", json={"runner_liveness_seconds": 10}
+        )
+        assert bad.status_code == 400
+        # Above maximum (3600).
+        bad = await client.patch(
+            "/api/admin/settings", json={"runner_liveness_seconds": 99999}
+        )
+        assert bad.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_runner_degraded_failure_threshold_round_trip(
+        self, client: AsyncClient
+    ):
+        """PATCH runner_degraded_failure_threshold=5 -> GET confirms; out-of-range rejected."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"runner_degraded_failure_threshold": 5},
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_degraded_failure_threshold"
+            ]
+            == 5
+        )
+        for bad_val in (0, 99):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_degraded_failure_threshold": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_resource_threshold_bytes_round_trip(self, client: AsyncClient):
+        """PATCH low-disk, low-memory, and VM resource thresholds round-trip."""
+        keys_thresholds = {
+            "runner_low_disk_threshold_bytes": 2_147_483_648,  # 2 GiB
+            "runner_low_memory_threshold_bytes": 268_435_456,  # 256 MiB
+            "vm_low_disk_threshold_bytes": 5_368_709_120,  # 5 GiB
+            "vm_low_memory_threshold_bytes": 134_217_728,  # 128 MiB
+        }
+        for key, val in keys_thresholds.items():
+            resp = await client.patch(
+                "/api/admin/settings", json={key: val}
+            )
+            assert resp.status_code == 200, f"{key} PATCH failed: {resp.text}"
+            assert (
+                (await client.get("/api/admin/settings")).json()[key] == val
+            ), f"{key} GET did not match after PATCH"
+            # Below minimum (1 MiB).
+            bad = await client.patch(
+                "/api/admin/settings", json={key: 42}
+            )
+            assert bad.status_code == 400, (
+                f"{key}=42 should be below minimum"
+            )
+
+    @pytest.mark.asyncio
+    async def test_runner_escalation_age_seconds_round_trip(
+        self, client: AsyncClient
+    ):
+        """PATCH runner_escalation_age_seconds=7200 -> GET confirms; out-of-range rejected."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"runner_escalation_age_seconds": 7200}
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_escalation_age_seconds"
+            ]
+            == 7200
+        )
+        for bad_val in (30, 999_999):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_escalation_age_seconds": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_runner_idle_gpu_threshold_pct_round_trip(
+        self, client: AsyncClient
+    ):
+        """PATCH runner_idle_gpu_threshold_pct=25 -> GET confirms."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"runner_idle_gpu_threshold_pct": 25}
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_idle_gpu_threshold_pct"
+            ]
+            == 25
+        )
+        for bad_val in (-1, 101):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_idle_gpu_threshold_pct": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_runner_token_stale_days_round_trip(self, client: AsyncClient):
+        """PATCH runner_token_stale_days=180 -> GET confirms; out-of-range rejected."""
+        resp = await client.patch(
+            "/api/admin/settings", json={"runner_token_stale_days": 180}
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_token_stale_days"
+            ]
+            == 180
+        )
+        for bad_val in (0, 366):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_token_stale_days": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_runner_post_update_silence_seconds_round_trip(
+        self, client: AsyncClient
+    ):
+        """PATCH runner_post_update_silence_seconds=300 -> GET confirms."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"runner_post_update_silence_seconds": 300},
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_post_update_silence_seconds"
+            ]
+            == 300
+        )
+        for bad_val in (30, 9999):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_post_update_silence_seconds": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_runner_heartbeat_retention_days_round_trip(
+        self, client: AsyncClient
+    ):
+        """PATCH runner_heartbeat_retention_days=14 -> GET confirms; out-of-range rejected."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"runner_heartbeat_retention_days": 14},
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "runner_heartbeat_retention_days"
+            ]
+            == 14
+        )
+        for bad_val in (0, 366):
+            bad = await client.patch(
+                "/api/admin/settings",
+                json={"runner_heartbeat_retention_days": bad_val},
+            )
+            assert bad.status_code == 400, f"{bad_val=} should be rejected"
+
+    @pytest.mark.asyncio
+    async def test_non_number_rejected(self, client: AsyncClient):
+        """Non-numeric values for any runner health key are rejected with 400."""
+        for key in (
+            "runner_liveness_seconds",
+            "runner_degraded_failure_threshold",
+            "runner_low_disk_threshold_bytes",
+            "runner_low_memory_threshold_bytes",
+            "runner_escalation_age_seconds",
+            "runner_idle_gpu_threshold_pct",
+            "runner_token_stale_days",
+            "runner_post_update_silence_seconds",
+            "runner_heartbeat_retention_days",
+            "vm_low_disk_threshold_bytes",
+            "vm_low_memory_threshold_bytes",
+        ):
+            bad = await client.patch(
+                "/api/admin/settings", json={key: "not-a-number"}
+            )
+            assert bad.status_code == 400, f"{key} should reject non-numeric"
+
+
 class TestTaskLlmCostFields:
     """Unit tests for _task_llm_cost_fields helper in admin.py."""
 

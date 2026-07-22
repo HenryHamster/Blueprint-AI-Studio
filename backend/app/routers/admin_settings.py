@@ -246,6 +246,21 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "direction_lifetime_non_merge_threshold",
         "direction_lifetime_min_merge_rate",
         "direction_review_recommendation_threshold",
+        # Runner health thresholds — govern liveness, degradation, resource-pressure
+        # detection, escalation, and data-retention windows.  All are configurable
+        # at runtime so operators with different hardware profiles can tune without
+        # a deploy.
+        "runner_liveness_seconds",
+        "runner_degraded_failure_threshold",
+        "runner_low_disk_threshold_bytes",
+        "runner_low_memory_threshold_bytes",
+        "runner_escalation_age_seconds",
+        "runner_idle_gpu_threshold_pct",
+        "runner_token_stale_days",
+        "runner_post_update_silence_seconds",
+        "runner_heartbeat_retention_days",
+        "vm_low_disk_threshold_bytes",
+        "vm_low_memory_threshold_bytes",
     }
 )
 
@@ -1008,6 +1023,40 @@ async def get_settings(
         ),
         "direction_review_recommendation_threshold": int(
             _runtime_config.get("direction_review_recommendation_threshold", 2)
+        ),
+        # Runner health thresholds
+        "runner_liveness_seconds": int(
+            _runtime_config.get("runner_liveness_seconds", 300)
+        ),
+        "runner_degraded_failure_threshold": int(
+            _runtime_config.get("runner_degraded_failure_threshold", 3)
+        ),
+        "runner_low_disk_threshold_bytes": int(
+            _runtime_config.get("runner_low_disk_threshold_bytes", 1_073_741_824)
+        ),
+        "runner_low_memory_threshold_bytes": int(
+            _runtime_config.get("runner_low_memory_threshold_bytes", 536_870_912)
+        ),
+        "runner_escalation_age_seconds": int(
+            _runtime_config.get("runner_escalation_age_seconds", 14_400)
+        ),
+        "runner_idle_gpu_threshold_pct": int(
+            _runtime_config.get("runner_idle_gpu_threshold_pct", 10)
+        ),
+        "runner_token_stale_days": int(
+            _runtime_config.get("runner_token_stale_days", 90)
+        ),
+        "runner_post_update_silence_seconds": int(
+            _runtime_config.get("runner_post_update_silence_seconds", 600)
+        ),
+        "runner_heartbeat_retention_days": int(
+            _runtime_config.get("runner_heartbeat_retention_days", 7)
+        ),
+        "vm_low_disk_threshold_bytes": int(
+            _runtime_config.get("vm_low_disk_threshold_bytes", 1_073_741_824)
+        ),
+        "vm_low_memory_threshold_bytes": int(
+            _runtime_config.get("vm_low_memory_threshold_bytes", 536_870_912)
         ),
     }
 
@@ -2417,6 +2466,42 @@ async def _apply_settings(
                 detail="direction_review_recommendation_threshold must be between 1 and 100",
             )
         _runtime_config["direction_review_recommendation_threshold"] = val
+    # ── Runner health thresholds ─────────────────────────────────────────────
+    for _rh_key, _rh_lo, _rh_hi in (
+        # Liveness window: 30s minimum (fast heartbeat cycle) to 3600s (1h).
+        ("runner_liveness_seconds", 30, 3_600),
+        # Degraded-failure threshold: 1 (any failure = degraded) to 50 (tolerant).
+        ("runner_degraded_failure_threshold", 1, 50),
+        # Resource-pressure floors: 1 MiB to 1 TiB.
+        ("runner_low_disk_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("runner_low_memory_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("vm_low_disk_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        ("vm_low_memory_threshold_bytes", 1_048_576, 1_099_511_627_776),
+        # Escalation age: 60s to 7 days.
+        ("runner_escalation_age_seconds", 60, 604_800),
+        # Idle-GPU threshold: 0%–100%.
+        ("runner_idle_gpu_threshold_pct", 0, 100),
+        # Token staleness: 1–365 days.
+        ("runner_token_stale_days", 1, 365),
+        # Post-update silence window: 60s to 1h.
+        ("runner_post_update_silence_seconds", 60, 3_600),
+        # Heartbeat retention: 1–365 days.
+        ("runner_heartbeat_retention_days", 1, 365),
+    ):
+        if _rh_key in payload:
+            try:
+                _rh_val = int(payload[_rh_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_rh_key} must be a number",
+                )
+            if not (_rh_lo <= _rh_val <= _rh_hi):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_rh_key} must be between {_rh_lo} and {_rh_hi}",
+                )
+            _runtime_config[_rh_key] = _rh_val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -3878,6 +3963,53 @@ async def _apply_settings(
                     "direction_review_recommendation_threshold": int(
                         _runtime_config.get(
                             "direction_review_recommendation_threshold", 2
+                        )
+                    ),
+                    # Runner health thresholds — persist so operator overrides
+                    # survive Cloud Run restarts.
+                    "runner_liveness_seconds": int(
+                        _runtime_config.get("runner_liveness_seconds", 300)
+                    ),
+                    "runner_degraded_failure_threshold": int(
+                        _runtime_config.get("runner_degraded_failure_threshold", 3)
+                    ),
+                    "runner_low_disk_threshold_bytes": int(
+                        _runtime_config.get(
+                            "runner_low_disk_threshold_bytes", 1_073_741_824
+                        )
+                    ),
+                    "runner_low_memory_threshold_bytes": int(
+                        _runtime_config.get(
+                            "runner_low_memory_threshold_bytes", 536_870_912
+                        )
+                    ),
+                    "runner_escalation_age_seconds": int(
+                        _runtime_config.get("runner_escalation_age_seconds", 14_400)
+                    ),
+                    "runner_idle_gpu_threshold_pct": int(
+                        _runtime_config.get("runner_idle_gpu_threshold_pct", 10)
+                    ),
+                    "runner_token_stale_days": int(
+                        _runtime_config.get("runner_token_stale_days", 90)
+                    ),
+                    "runner_post_update_silence_seconds": int(
+                        _runtime_config.get(
+                            "runner_post_update_silence_seconds", 600
+                        )
+                    ),
+                    "runner_heartbeat_retention_days": int(
+                        _runtime_config.get(
+                            "runner_heartbeat_retention_days", 7
+                        )
+                    ),
+                    "vm_low_disk_threshold_bytes": int(
+                        _runtime_config.get(
+                            "vm_low_disk_threshold_bytes", 1_073_741_824
+                        )
+                    ),
+                    "vm_low_memory_threshold_bytes": int(
+                        _runtime_config.get(
+                            "vm_low_memory_threshold_bytes", 536_870_912
                         )
                     ),
                     # Preserve the operator-approved migration-divergence exemption
