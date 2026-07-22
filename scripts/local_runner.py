@@ -7,7 +7,9 @@ Usage:
     python3 scripts/local_runner.py
 
 Required environment variables:
-    BLUEPRINT_RUNNER_TOKEN      Token from POST /api/admin/projects/{id}/runners/register
+    BLUEPRINT_RUNNER_TOKEN      One-time enroll token from the admin UI: Runtime tab →
+                                      Devices and runners → click "Enroll runner" (default)
+                                      or "Strategic runner" (strategic_local preset).
     BLUEPRINT_ORCHESTRATOR_URL  Base URL, e.g. https://api.example.com
 
 Optional environment variables:

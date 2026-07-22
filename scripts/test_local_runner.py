@@ -9636,3 +9636,45 @@ class TestRunnerEnrollmentDocumentation(unittest.TestCase):
             section8,
             "runner-install.md Section 8 must mention the 'Enroll runner' button.",
         )
+
+    # ── scripts/local_runner.py: --help / module docstring ────────────────────
+
+    def _help_docstring(self) -> str:
+        """Return the module-level docstring from local_runner.py (shown by --help)."""
+        import ast
+        source = self._LOCAL_RUNNER_PY.read_text()
+        tree = ast.parse(source)
+        docstring = ast.get_docstring(tree)
+        self.assertIsNotNone(docstring, "local_runner.py must have a module docstring")
+        return docstring  # type: ignore[return-value]
+
+    def test_help_token_description_does_not_cite_raw_api_endpoint(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must not point at the raw API endpoint."""
+        doc = self._help_docstring()
+        self.assertNotIn(
+            "POST /api/admin/projects",
+            doc,
+            "local_runner.py --help describes BLUEPRINT_RUNNER_TOKEN as coming from "
+            "a raw API endpoint. The token is obtained via the admin UI enrollment "
+            "flow, not by calling the API directly.",
+        )
+
+    def test_help_token_description_references_runtime_tab(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must reference the Runtime tab."""
+        doc = self._help_docstring()
+        self.assertIn(
+            "Runtime",
+            doc,
+            "local_runner.py --help must reference the Runtime tab when describing "
+            "where to obtain BLUEPRINT_RUNNER_TOKEN.",
+        )
+
+    def test_help_token_description_references_enroll_runner_button(self):
+        """The --help BLUEPRINT_RUNNER_TOKEN description must reference the 'Enroll runner' button."""
+        doc = self._help_docstring()
+        self.assertIn(
+            "Enroll runner",
+            doc,
+            "local_runner.py --help must name the 'Enroll runner' button when "
+            "describing how to obtain BLUEPRINT_RUNNER_TOKEN.",
+        )
