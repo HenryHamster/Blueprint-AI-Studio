@@ -538,16 +538,22 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     } catch {
       // The continuation still has task/routing identity if local inspection fails.
     }
+    const sanitizedPrompt = sanitize(opts.prompt).trim();
+    const originalTask = sanitizedPrompt.length > 8_000
+      ? `${sanitizedPrompt.slice(0, 4_000)}\n...[bounded middle omitted]...\n${sanitizedPrompt.slice(-4_000)}`
+      : sanitizedPrompt || '<unavailable>';
     const priorOutputTail = sanitize(allOutput.slice(-1500)).replace(/\s+/g, ' ').trim() || '<none>';
-    const continuationState = `Task state: task_id=${opts.taskId}; repo=${opts.owner}/${opts.repo}; work_branch=${opts.workBranch}; base=${opts.baseBranch}@${opts.baseCommit}; existing_pr=${opts.existingPrNumber ?? 'none'}; changed_files=${changedFiles}; working_tree=${workingTreeState}; prior_output_tail=${priorOutputTail}.`;
+    const continuationState = `Original task:\n${originalTask}\n\nTask state: task_id=${opts.taskId}; repo=${opts.owner}/${opts.repo}; work_branch=${opts.workBranch}; base=${opts.baseBranch}@${opts.baseCommit}; existing_pr=${opts.existingPrNumber ?? 'none'}; changed_files=${changedFiles}; working_tree=${workingTreeState}; prior_output_tail=${priorOutputTail}.`;
     const continuationPrompt =
       continuationState + ' ' +
       'Your previous turn ended with a text message and no tool call, so the run was about ' +
       'to be discarded. THERE IS NO MONITOR OR BACKGROUND PROCESS THAT WILL RESUME YOU. You ' +
-      'have uncommitted changes that were never shipped. RIGHT NOW, run ./pr open --title ' +
-      '"<title>" --body "<body>" then ./done. If the work cannot be completed call ./fail ' +
-      '"<reason>"; if blocked upstream call ./blocked "<reason>". Do not reply with prose — ' +
-      'invoke a terminal verb.';
+      'must re-read the original task, inspect the current repository state, and finish every ' +
+      'required validation step. Only if the work is complete and the required checks pass, ' +
+      'run ./pr open --title "<title>" --body "<body>" then ./done. If validation fails or the ' +
+      'work cannot be completed, call ./fail "<reason>"; if blocked upstream call ./blocked ' +
+      '"<reason>". Do not publish before validating, and do not reply with prose — invoke an ' +
+      'appropriate terminal verb.';
     try {
       await runClaudeCode(continuationPrompt, ws, statusRef, model, effort, disallowedTools, true);
     } catch (e) {

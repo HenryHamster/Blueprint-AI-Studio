@@ -373,22 +373,46 @@ describe('handleSmoketest — URL health checks', () => {
     expect(stored.env_preflight_error).toBeTruthy();
   });
 
-  it('reports COMPLETED with SMOKETEST_RESULT even when smoketestResult.passed is false (genuine test failure, not agent crash)', async () => {
-    // A genuine smoketest failure (tests ran but failed) must post COMPLETED so the
-    // qualifier reads the SMOKETEST_RESULT artifact and calls _score_smoketest to
-    // produce a quality verdict.  Posting FAILED here causes the qualifier to route
-    // through _handle_infra_failure and stall promotion forever.
+  it('reports FAILED with SMOKETEST_RESULT for an ordinary genuine test failure', async () => {
     const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
     vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
 
     await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
 
     const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
-    expect(call.status).toBe('COMPLETED');
+    expect(call.status).toBe('FAILED');
     expect(call.artifact_type).toBe('SMOKETEST_RESULT');
     expect(call.failure_category).toBeUndefined();
     const stored = JSON.parse(call.logs as string) as { passed: boolean };
     expect(stored.passed).toBe(false);
+  });
+
+  it('reports COMPLETED with SMOKETEST_RESULT for a qualifier genuine test failure', async () => {
+    const smoketestResult = { passed: false, tests: [{ name: 'pytest', status: 'fail', message: 'AssertionError' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+    const qualifierTask = {
+      ...BASE_TASK,
+      context: { qualifier_smoketest: true },
+    };
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, qualifierTask, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('COMPLETED');
+    expect(call.artifact_type).toBe('SMOKETEST_RESULT');
+    const stored = JSON.parse(call.logs as string) as { passed: boolean };
+    expect(stored.passed).toBe(false);
+  });
+
+  it('instructs setup and execution blockers to use error rather than skip', async () => {
+    const smoketestResult = { passed: false, tests: [{ name: 'setup', status: 'error', message: 'database unavailable' }] };
+    vi.mocked(readHandlerOutput).mockReturnValue(smoketestResult);
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(prompt).toContain('Use status "error" for collection, setup, environment, or command-execution failures');
+    expect(prompt).toContain('Use status "skip" only when a test is intentionally inapplicable');
   });
 
 

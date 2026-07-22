@@ -1012,6 +1012,9 @@ export async function apiRequest(
       }
     } catch (e) {
       const caught = controller.signal.aborted ? new Error(`${method} ${path} timed out during ${phase} phase on attempt ${attempt + 1}/${retries} after ${Date.now() - startedAt}ms`) : e;
+      if (controller.signal.aborted && attempt < retries - 1) {
+        log(`[API_TIMEOUT] ${caught instanceof Error ? caught.message : String(caught)}; retrying`);
+      }
       // Re-throw 4xx errors and final-attempt errors immediately. 429 is
       // intentionally excluded from the 4xx bail-out via the explicit check
       // above, which uses `continue` before this catch runs.
@@ -3977,7 +3980,9 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
   let task: Record<string, unknown>;
   try {
-    task = await apiPost('/api/agent/claim') as Record<string, unknown>;
+    // A timed-out claim may keep building its response server-side. Do not fan
+    // one claim into the generic five overlapping request attempts.
+    task = await apiPost('/api/agent/claim', {}, 1) as Record<string, unknown>;
   } catch (claimErr) {
     const errMsg = claimErr instanceof Error ? `${claimErr.message}${claimErr.stack ? '\n' + claimErr.stack : ''}` : String(claimErr);
     reportPreClaimFailure(`claim failed: ${errMsg}`);

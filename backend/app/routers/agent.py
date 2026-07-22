@@ -4453,13 +4453,14 @@ async def claim_task(
     _claim_metrics = claim_timing.finish(response)
     logger.info(
         "[CLAIM_TIMING] task=%s type=%s vm=%s replay=%s total_ms=%s "
-        "response_bytes=%s phase_ms=%s",
+        "response_bytes_approx=%s size_measurement_ms=%s phase_ms=%s",
         _claimed_task_id,
         task_type or "unknown",
         _truncate_vm_instance_id(vm_id),
         idempotent_replay,
         _claim_metrics["total_ms"],
-        _claim_metrics["response_bytes"],
+        _claim_metrics["response_bytes_approx"],
+        _claim_metrics["size_measurement_ms"],
         json.dumps(
             _claim_metrics["phase_ms"], sort_keys=True, separators=(",", ":")
         ),

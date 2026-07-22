@@ -425,16 +425,44 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
     // The continuation must have fired exactly once (two total runClaudeCode calls).
     expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(2);
     const continuationPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(continuationPrompt).toContain(baseOpts.prompt);
     expect(continuationPrompt).toContain(`task_id=${taskId}`);
     expect(continuationPrompt).toContain(`repo=${baseOpts.owner}/${baseOpts.repo}`);
     expect(continuationPrompt).toContain(`work_branch=${baseOpts.workBranch}`);
     expect(continuationPrompt).toContain('changed_files=agent/src/handlers/code-change.ts');
+    expect(continuationPrompt).toContain('finish every required validation step');
+    expect(continuationPrompt).toContain('Do not publish before validating');
+    expect(continuationPrompt).not.toContain('RIGHT NOW, run ./pr');
     // The done marker wins → the bash ./done already posted COMPLETED, so the
     // wrapper must NOT post any terminal status itself, and definitely not FAILED.
     const failedCalls = vi.mocked(persistAndPostStatus).mock.calls.filter(
       c => c[1].status === 'FAILED',
     );
     expect(failedCalls).toHaveLength(0);
+  });
+
+  it('preserves task-specific text at the tail of a long production prompt', async () => {
+    const taskRequest = 'TASK-SPECIFIC: preserve the acceptance criteria';
+    const longPrompt = `${'generic stable guidance '.repeat(500)}\n${taskRequest}`;
+    let continued = false;
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'waiting', lastResultText: '' })
+      .mockImplementationOnce(() => {
+        continued = true;
+        return Promise.resolve({ exitCode: 0, allOutput: '', lastResultText: '' });
+      });
+    vi.mocked(fs.existsSync).mockImplementation((path: fs.PathLike) =>
+      continued && (String(path) === prUrlMarker || String(path) === doneMarker),
+    );
+    vi.mocked(fs.readFileSync).mockImplementation((path: fs.PathOrFileDescriptor) =>
+      String(path) === prUrlMarker ? validPrUrl : '',
+    );
+
+    await runCodeChangeTask({ ...baseOpts, prompt: longPrompt });
+
+    const continuationPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
+    expect(continuationPrompt).toContain(taskRequest);
+    expect(continuationPrompt).toContain('[bounded middle omitted]');
   });
 
   it('does NOT finalize COMPLETED when a PR-URL marker is present but base..HEAD nets to zero effective diff', async () => {

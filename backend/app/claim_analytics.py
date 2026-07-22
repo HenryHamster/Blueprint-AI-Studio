@@ -39,7 +39,7 @@ class ClaimResponseTiming:
     def finish(self, response: object) -> dict[str, Any]:
         """Return log-safe timing and approximate serialized-size metrics."""
 
-        finished_at = self._clock()
+        measurement_started_at = self._clock()
         response_bytes: int | None
         try:
             response_bytes = len(
@@ -52,10 +52,14 @@ class ClaimResponseTiming:
             )
         except (TypeError, ValueError, OverflowError):
             response_bytes = None
+        finished_at = self._clock()
         return {
             "total_ms": max(0, round((finished_at - self._started_at) * 1000)),
             "phase_ms": dict(self._phase_ms),
-            "response_bytes": response_bytes,
+            "response_bytes_approx": response_bytes,
+            "size_measurement_ms": max(
+                0, round((finished_at - measurement_started_at) * 1000)
+            ),
         }
 
 

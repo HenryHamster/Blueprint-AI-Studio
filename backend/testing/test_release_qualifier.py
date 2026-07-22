@@ -5960,10 +5960,54 @@ class TestScoreSmoketest:
         """A None result (no artifact) is treated as a startup failure."""
         assert rq._score_smoketest(None) is None
 
-    def test_no_tests_cannot_score_as_passing_evidence(self):
-        """A top-level pass claim without test evidence scores zero."""
+    def test_no_tests_are_unavailable_evidence(self):
+        """A top-level pass claim without test evidence hard-blocks scoring."""
         result = {"passed": True, "tests": [], "suites": {}}
-        assert rq._score_smoketest(result) == pytest.approx(0.0)
+        assert rq._score_smoketest(result) is None
+
+    def test_error_bearing_result_is_unavailable_evidence(self):
+        result = {
+            "passed": False,
+            "tests": [
+                {"name": "a", "status": "pass"},
+                {"name": "database setup", "status": "error"},
+            ],
+        }
+        assert rq._score_smoketest(result) is None
+
+    def test_all_skipped_result_is_unavailable_evidence(self):
+        result = {
+            "passed": False,
+            "tests": [{"name": "suite unavailable", "status": "skip"}],
+        }
+        assert rq._score_smoketest(result) is None
+
+    def test_top_level_failure_cannot_be_erased_by_flat_passes(self):
+        result = {
+            "passed": False,
+            "tests": [{"name": "health", "status": "pass"}],
+        }
+        assert rq._score_smoketest(result) is None
+
+    def test_malformed_test_entry_is_unavailable_evidence(self):
+        result = {
+            "passed": False,
+            "tests": [
+                {"name": "health", "status": "pass"},
+                {"name": "pytest"},
+            ],
+        }
+        assert rq._score_smoketest(result) is None
+
+    def test_unknown_status_is_unavailable_evidence(self):
+        result = {
+            "passed": False,
+            "tests": [
+                {"name": "health", "status": "pass"},
+                {"name": "pytest", "status": "could-not-run"},
+            ],
+        }
+        assert rq._score_smoketest(result) is None
 
 
 class TestExtractTestErosionDetail:

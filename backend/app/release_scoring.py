@@ -2389,14 +2389,32 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
 
     tests = result.get("tests")
     if not isinstance(tests, list) or not tests:
-        # A top-level claim cannot substitute for actual test evidence.
-        return 0.0
+        # No executable evidence is an unavailable qualifier dimension, not a
+        # soft zero that a low weight/threshold could outvote.
+        return None
+
+    statuses = [
+        test.get("status") if isinstance(test, dict) else None for test in tests
+    ]
+    supported_statuses = {"pass", "fail", "skip", "error"}
+    if any(status not in supported_statuses for status in statuses):
+        return None
+    if "error" in statuses:
+        return None
+    verifiable_statuses = [status for status in statuses if status in {"pass", "fail"}]
+    if not verifiable_statuses:
+        return None
 
     total = len(tests)
     # Only status=="pass" counts toward the score — a "skip" (or any non-pass
     # status) contributes 0.  This is intentionally conservative: a skipped
     # qualifier test is unverified coverage, so it should pull the score down
     # rather than be treated as a pass.
+    if result.get("passed") is False and "fail" not in statuses:
+        # Preserve suite/guardrail failures that are not represented by a flat
+        # failing test entry; health-check enrichment must not erase them.
+        return None
+
     passed = sum(1 for t in tests if isinstance(t, dict) and t.get("status") == "pass")
     return _clamp01(passed / total) if total else 0.0
 
