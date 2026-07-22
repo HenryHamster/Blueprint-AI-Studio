@@ -400,6 +400,6 @@ async def read_all_lane_baselines(
     result = await session.execute(
         select(ProjectLaneBaseline)
         .where(ProjectLaneBaseline.project_id == project_id)
-        .order_by(ProjectLaneBaseline.updated_at.desc())
+        .order_by(ProjectLaneBaseline.captured_at.desc())
     )
     return list(result.scalars().all())

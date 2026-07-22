@@ -963,7 +963,7 @@ async def update_project_tool(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Update a tool's metadata: enable/disable, rename, config/placement (owner)."""
+    """Update a tool's metadata: enable/disable, rename, config (owner)."""
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "owner"
     )
