@@ -48,6 +48,7 @@ from app.direction_refractory import (
     stamp_direction_refractory,
 )
 from app.max_plan_pool import _max_plan_pools, _account_by_id
+from app.task_locking import reload_project_full
 
 
 @pytest.fixture(autouse=True)
@@ -1939,7 +1940,12 @@ async def test_handle_research_completion_no_findings_skips_update(db_session, m
 
     await _handle_research_completion(task, "", db_session)
 
-    await db_session.refresh(project)
+    # Safe re-read: the completion handler mutates project JSON columns under
+    # ``with_*_locked`` (load_only projection → raiseload on the shared instance), so
+    # ``db_session.refresh()`` would honor that raiseload and leave the asserted column
+    # expired → MissingGreenlet on the sync read below. A full populate_existing
+    # re-SELECT reloads every column. See app.task_locking.reload_project_full.
+    await reload_project_full(db_session, project)
     directions = project.directions
     researched = next(d for d in directions if d["id"] == direction_id)
     assert "last_researched_at" not in researched, (
@@ -4017,7 +4023,7 @@ async def test_auto_recovery_after_cooldown(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     recovered = next(d for d in project.directions if d["id"] == "d-recov001")
     assert recovered["status"] == "active", (
         "Direction should be reactivated after cooldown"
@@ -4053,7 +4059,7 @@ async def test_auto_recovery_blocked_by_needs_manual_intervention(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-manint01")
     assert d["status"] == "paused", (
         "Direction with needs_manual_intervention must stay paused after cooldown"
@@ -4119,7 +4125,7 @@ async def test_auto_recovery_with_frozen_churn_history(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-churn001")
     # Grace-period contract: the direction recovers to active and STAYS active at
     # auto_pause_count=1 — the frozen churn history is ignored until a new cycle is
@@ -4156,7 +4162,7 @@ async def test_auto_recovery_before_cooldown_stays_paused(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-early001")
     assert d["status"] == "paused", (
         "Direction should stay paused before cooldown expires"
@@ -4190,7 +4196,7 @@ async def test_user_paused_direction_never_auto_recovered(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-usrpaus1")
     assert d["status"] == "paused", "User-paused direction must NOT be auto-recovered"
 
@@ -4219,7 +4225,7 @@ async def test_auto_recovery_respects_custom_cooldown(db_session, monkeypatch):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-cstmcld1")
     assert d["status"] == "paused", (
         "Direction should stay paused within the custom 100h cooldown"
@@ -4248,7 +4254,7 @@ async def test_auto_recovery_starts_remediation_monitoring(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-remed001")
     assert d["status"] == "active"
     assert d.get("remediation_monitor_started_at"), (
@@ -4290,7 +4296,7 @@ async def test_re_pause_during_monitoring_flags_manual_intervention(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-escal001")
     assert d["status"] == "paused"
     assert d.get("needs_manual_intervention") is True, (
@@ -4324,7 +4330,7 @@ async def test_re_pause_without_monitoring_does_not_flag_intervention(db_session
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
     d = next(x for x in project.directions if x["id"] == "d-nomon001")
     assert d["status"] == "paused"
     assert "needs_manual_intervention" not in d
@@ -5140,7 +5146,7 @@ async def test_retire_direction_reconciles_problem_model_gap(db_session, mocker)
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "ok"
 
-        await db_session.refresh(project)
+        await reload_project_full(db_session, project)  # safe re-read; refresh() honors the handler-left raiseload (see note above)
         gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-staffed")
         assert gap["active_moves"] == []
         assert gap["past_moves"] == [direction_id]

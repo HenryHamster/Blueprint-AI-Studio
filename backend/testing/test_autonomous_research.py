@@ -39,6 +39,7 @@ from app.autonomous_spawn_budget import (
     compute_autonomous_spawn_budget_snapshot,
 )
 from app.research_completion import _handle_research_completion
+from app.task_locking import reload_project_full
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
 from app.capability_demand import collect_missing_capability_demand
@@ -6975,7 +6976,12 @@ async def test_direction_proposals_capped_at_10_pending_total(db_session, mocker
 
     await _handle_research_completion(task, "", db_session)
 
-    await db_session.refresh(project)
+    # Safe re-read: the completion handler mutates project JSON columns under
+    # ``with_*_locked`` (load_only projection → raiseload on the shared instance),
+    # so ``db_session.refresh(project)`` would honor that raiseload and leave the
+    # asserted column expired → MissingGreenlet on the sync read below. A full
+    # populate_existing re-SELECT reloads every column. See reload_project_full.
+    await reload_project_full(db_session, project)
     proposed = [d for d in project.directions if d.get("status") == "proposed"]
     assert len(proposed) == 10, "Must not exceed 10 pending proposals"
 
@@ -7627,7 +7633,7 @@ async def test_recent_findings_evidence_absent_when_no_findings(db_session, mock
     task = await _make_research_task(project, direction, db_session)
     await _handle_research_completion(task, "", db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() would MG on the handler-projected column (see note above)
     dirs = project.directions or []
     d = next((x for x in dirs if x.get("id") == direction_id), None)
     assert d is not None
@@ -12936,7 +12942,7 @@ async def test_followed_count_not_incremented_when_no_impl_spawned(db_session, m
 
     await _handle_research_completion(task, "", db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() would MG on the handler-projected column (see note above)
     shown = project.design_doc["playbook/shown-entry"]
     assert shown["followed_count"] == 3, (
         "followed_count must not change when no impl tasks are spawned"
@@ -16580,7 +16586,7 @@ async def test_no_findings_saturated_proven_direction_auto_completes(
 
     await _handle_research_completion(task, "", db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() would MG on the handler-projected column (see note above)
     dirs = project.directions or []
     target = next((d for d in dirs if d.get("id") == direction_id), None)
     assert target is not None, "Direction must still exist"
@@ -17687,7 +17693,7 @@ async def test_first_task_spawned_stamped_on_research_spawn(db_session):
 
     await _spawn_research_task(project, db_session)
 
-    await db_session.refresh(project)
+    await reload_project_full(db_session, project)  # safe re-read; refresh() would MG on the handler-projected column (see note above)
     assert (project.build_config or {}).get("first_task_spawned_at") is not None, (
         "first_task_spawned_at must be stamped in build_config after the first "
         "successful autonomous research spawn"

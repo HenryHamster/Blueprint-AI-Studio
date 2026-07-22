@@ -42,6 +42,7 @@ from app.max_plan_pool import _max_plan_pools, _account_available_for_model
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import (
     acquire_direction_research_spawn_lock,
+    reload_project_full,
     with_vision_locked,
 )
 from app.time_utils import _utcnow
@@ -123,6 +124,29 @@ def project_parallelism_cap(
     if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 1:
         return raw
     return _runtime_config.get(runtime_key, default)
+
+
+async def _reload_project(session, project):
+    """Re-materialize ``project`` fully — the MissingGreenlet-safe replacement for
+    ``session.refresh(project)`` in the spawn flow.
+
+    Earlier in the flow ``project`` is locked via ``project_lock`` /
+    ``with_vision_locked`` with a ``load_only(Project.id, Project.vision,
+    raiseload=True)`` projection, which leaves a PERSISTENT raiseload loader on
+    the shared instance. A plain ``session.refresh(project)`` then EXPIRES every
+    column and, honoring that raiseload, DOES NOT reload the projected-away ones —
+    so the many SYNC spawn reads (``project_parallelism_cap`` /
+    ``_get_project_integration_branch`` / inline guards) lazy-load outside the
+    asyncpg greenlet → ``MissingGreenlet`` (the projection-deferred-identity fault
+    documented on ``task_lock``). A full ``select(Project) ... populate_existing``
+    re-SELECT (no ``load_only``) reloads every column's value into ``__dict__``
+    without leaving them expired, so the raiseload loader is never reached.
+
+    Thin module-local alias for :func:`app.task_locking.reload_project_full`
+    (the canonical helper, colocated with the projection locks that cause the
+    fault); kept for the many call sites already spelled ``_reload_project``.
+    """
+    await reload_project_full(session, project)
 
 
 def _direction_in_refractory(d: dict, now: datetime) -> bool:
@@ -770,6 +794,11 @@ async def _spawn_research_task_inner(
     except LegacyEngineAuthorityExpired:
         await session.rollback()
         return
+    # The caller may hand us a ``project`` already downgraded to a load_only
+    # projection (raiseload) — or expired by the entry commit — so the many SYNC
+    # column reads below would lazy-load outside the greenlet → MissingGreenlet.
+    # Re-materialize it fully up front (see ``_reload_project``).
+    await _reload_project(session, project)
     from app.research_completion import (
         _compute_momentum_factor,
         _compute_productivity_score,
@@ -1531,7 +1560,7 @@ async def _spawn_research_task_inner(
 
             await with_vision_locked(session, project.id, _drop_pending_sr)
             await commit_legacy_authorized(session, project.id, legacy_generation)
-            await session.refresh(project)
+            await _reload_project(session, project)
 
             from app.alert_dispatch import _create_strategic_alert
 
@@ -1578,7 +1607,7 @@ async def _spawn_research_task_inner(
                     await commit_legacy_authorized(
                         session, project.id, legacy_generation
                     )
-                    await session.refresh(project)
+                    await _reload_project(session, project)
                     logger.info(
                         f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
                     )
@@ -1601,7 +1630,7 @@ async def _spawn_research_task_inner(
                     await commit_legacy_authorized(
                         session, project.id, legacy_generation
                     )
-                    await session.refresh(project)
+                    await _reload_project(session, project)
                     # Fall through to tactical research
             except LegacyEngineAuthorityExpired:
                 raise
@@ -1623,7 +1652,7 @@ async def _spawn_research_task_inner(
                 await commit_legacy_authorized(
                     session, project.id, legacy_generation
                 )
-                await session.refresh(project)
+                await _reload_project(session, project)
                 # Fall through to tactical research
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's
@@ -1899,7 +1928,7 @@ async def _spawn_research_task_inner(
             # fall-through `if spawned:` block below both read project.vision/.id.
             # Re-load it so those reads do not lazy-load from async context and
             # raise MissingGreenlet on asyncpg.
-            await session.refresh(project)
+            await _reload_project(session, project)
             # A pending operator steering marker survives this skip (the spawn
             # never happened, so it is not consumed). Tell the operator their
             # steering is paused on payload bloat rather than leaving it silent.
@@ -1978,7 +2007,7 @@ async def _spawn_research_task_inner(
     # PostgreSQL/asyncpg (MissingGreenlet). Re-load the row here so those reads
     # never lazy-load — mirrors the refreshes the strategic paths above already
     # perform after committing.
-    await session.refresh(project)
+    await _reload_project(session, project)
 
     # Guard: limit parallel research tasks per project.
     # EVALUATING parents are just waiting on children — they don't block new research.

@@ -848,6 +848,33 @@ async def with_vision_locked(
     return True
 
 
+async def reload_project_full(session: AsyncSession, project: Project) -> None:
+    """Re-materialize a projected ``project`` fully in place — the
+    MissingGreenlet-safe replacement for ``session.refresh(project)`` after a
+    projection lock.
+
+    :func:`project_lock` / :func:`with_vision_locked` load the project under a
+    ``load_only(..., raiseload=True)`` projection, which leaves a PERSISTENT
+    raiseload loader on the shared identity-mapped instance. A later
+    ``session.refresh(project)`` RESPECTS that loader — it expires the
+    projected-away columns without reloading them — so the next SYNC attribute
+    read (``problem_model``, ``build_config``, ``autonomous_enabled``, …)
+    lazy-loads outside the asyncpg greenlet → ``MissingGreenlet``. This is the
+    projection-deferred-identity fault documented on :func:`task_lock`.
+
+    A full ``populate_existing`` re-SELECT (no ``load_only``) reloads EVERY
+    column's value into the instance ``__dict__`` and resets the loaders, so
+    later sync reads never reach the raiseload. Use this — not
+    ``session.refresh`` — whenever a project may have passed through a
+    projection lock and its non-projected columns are read afterward.
+    """
+    await session.execute(
+        select(Project)
+        .where(Project.id == project.id)
+        .execution_options(populate_existing=True)
+    )
+
+
 async def with_task_context_locked(
     session: AsyncSession,
     task_id,
