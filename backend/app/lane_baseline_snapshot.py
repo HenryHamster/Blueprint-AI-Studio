@@ -23,7 +23,7 @@ from sqlmodel import select
 from app.digest_metrics import compute_lane_waste_diagnostics
 from app.models import ImprovementLane, Project, Task, TaskStatus, _utcnow
 from app.review_fix_lane_pilot import LANE_RECOVERY_MANIFEST_KEY, LANE_RECOVERY_REASON_KEY
-from app.task_locking import with_design_doc_locked
+from app.task_locking import with_lane_baseline_locked
 from app.routers.admin_analytics import (
     _compute_lane_diag,
     _review_loop_pr_number,
@@ -325,7 +325,7 @@ async def persist_version_lane_baseline(
         doc[DESIGN_DOC_KEY] = baselines
         result["stored"] = slimmed
 
-    applied = await with_design_doc_locked(session, project_id, _store_baseline)
+    applied = await with_lane_baseline_locked(session, project_id, _store_baseline)
     if not applied:
         logger.warning(
             "[LANE_BASELINE] project %s not found; v%d baseline not persisted",
@@ -378,7 +378,7 @@ async def backfill_missing_lane_baselines(
     from app.database import AsyncSessionLocal
     from app.models import Project, ReleaseVersion
 
-    # Read the project and list of closed versions in one pass to determine gaps.
+    # Read the list of closed versions and existing lane baseline keys.
     async with AsyncSessionLocal() as session:
         project_row = (
             await session.execute(select(Project).where(Project.id == project_id))
@@ -386,9 +386,17 @@ async def backfill_missing_lane_baselines(
         if project_row is None:
             return []
 
-        existing_keys = set(
-            (project_row.design_doc or {}).get(DESIGN_DOC_KEY, {}).keys()
-        )
+        from app.models import ProjectLaneBaseline  # noqa: PLC0415
+
+        lb_row = await session.get(ProjectLaneBaseline, project_id)
+        if lb_row is not None:
+            existing_keys = set((lb_row.data or {}).keys())
+        else:
+            # Backward compat: fall back to design_doc for projects written
+            # before migration 0656.
+            existing_keys = set(
+                (project_row.design_doc or {}).get(DESIGN_DOC_KEY, {}).keys()
+            )
 
         versions = list(
             (
@@ -453,11 +461,20 @@ async def backfill_missing_lane_baselines(
 def read_version_lane_baseline(
     project: Project,
     version_number: int,
+    *,
+    lane_baseline_data: Dict[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
     """Return the persisted lane baseline for the given version, or None.
 
-    Zero DB queries — the ``project`` row must already be loaded by the caller.
+    When ``lane_baseline_data`` is provided (pre-loaded from the
+    ``project_lane_baseline`` table), it takes precedence. Falls back to
+    ``project.design_doc["lane_baselines"]`` for data written before
+    migration 0656.  Zero additional DB queries in either case — the caller
+    must pre-load the appropriate row.
     """
+    if lane_baseline_data is not None:
+        return lane_baseline_data.get(str(version_number))
+    # Backward compat: check design_doc for old data.
     if not project.design_doc:
         return None
     baselines = project.design_doc.get(DESIGN_DOC_KEY)

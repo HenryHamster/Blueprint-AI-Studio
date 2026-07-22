@@ -2922,7 +2922,7 @@ async def check_sr_catch_rate_cache_freshness(
     Bounded to ``max_projects`` projects. Projects without any
     ``sr_catch_rate_trends`` cache are skipped (the cache is optional).
     """
-    from app.models import Project
+    from app.models import Project, ProjectSRAnalytics
     from app.sr_review_quality_metrics import _SR_TREND_STALENESS_DAYS
     from app.time_utils import _to_naive_utc
 
@@ -2941,11 +2941,20 @@ async def check_sr_catch_rate_cache_freshness(
             )
         ]
 
+    project_ids = [r[0] for r in projects]
+    _sr_rows = (
+        await ctx.session.execute(
+            select(ProjectSRAnalytics).where(ProjectSRAnalytics.project_id.in_(project_ids))
+        )
+    ).scalars().all()
+    _sr_data_by_id = {str(r.project_id): r.data for r in _sr_rows}
+
     stale_threshold = timedelta(days=_SR_TREND_STALENESS_DAYS)
     results: List[CheckResult] = []
     for project_id, design_doc in projects:
         pid = str(project_id)
-        trends = (design_doc or {}).get("sr_catch_rate_trends") or {}
+        _sr_data = _sr_data_by_id.get(pid)
+        trends = (_sr_data or (design_doc or {})).get("sr_catch_rate_trends") or {}
         if not trends:
             results.append(
                 CheckResult(

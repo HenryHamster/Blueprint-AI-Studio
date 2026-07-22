@@ -42,6 +42,7 @@ from app.models import (
     Alert,
     AlertSeverity,
     Project,
+    ProjectSRAnalytics,
     Task,
     TaskStatus,
 )
@@ -388,7 +389,9 @@ async def run_pipeline_alert_scan_once(
     project = await session.get(Project, project_id)
     if project is None:
         return 0
-    design_doc = project.design_doc
+    _pas_sr_row = await session.get(ProjectSRAnalytics, project_id)
+    _pas_sr_data = _pas_sr_row.data if _pas_sr_row else None
+    design_doc = _pas_sr_data or (project.design_doc or {})
 
     created = 0
     emitters: list[tuple[str, Any]] = [

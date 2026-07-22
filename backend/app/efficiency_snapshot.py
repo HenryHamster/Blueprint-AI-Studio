@@ -50,6 +50,7 @@ from app.models import (
     PoolVm,
     PoolVmState,
     Project,
+    ProjectEfficiencySnapshot,
     Task,
     TaskStatus,
     _utcnow,
@@ -2919,8 +2920,15 @@ async def write_snapshot(
         if project is None:
             raise ValueError(f"Project {project_id} not found")
 
-        doc = dict(project.design_doc or {})
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        await session.execute(
+            pg_insert(ProjectEfficiencySnapshot)
+            .values(project_id=project_id, data={})
+            .on_conflict_do_nothing()
+        )
+        eff_row = await session.get(ProjectEfficiencySnapshot, project_id, populate_existing=True)
+        container = dict(eff_row.data or {})
 
         if not container.get("baseline"):
             container["baseline"] = dict(snapshot)
@@ -3082,10 +3090,9 @@ async def write_snapshot(
         container["snapshots"] = snapshots
         container["last_run_at"] = captured_at
 
-        doc[DESIGN_DOC_KEY] = container
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
+        eff_row.data = container
+        flag_modified(eff_row, "data")
+        session.add(eff_row)
 
     logger.info(
         "[EFFICIENCY_SNAPSHOT] project=%s captured_at=%s axes=%s",
@@ -3403,7 +3410,11 @@ async def read_baseline_with_drift(
     _pool_amortization_windowed_idle_usd = _windowed_idle_result["total"]
     _pool_amortization_windowed_by_account = _windowed_idle_result["by_account"]
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
+    if eff_row is not None:
+        container = dict(eff_row.data or {})
+    else:
+        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     baseline = container.get("baseline") or {}
     snapshots = container.get("snapshots") or []
     latest = snapshots[-1] if snapshots else {}
@@ -3898,7 +3909,11 @@ async def maybe_write_daily_snapshot(
     if project is None:
         return None
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
+    if eff_row is not None:
+        container = dict(eff_row.data or {})
+    else:
+        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     if not _last_run_due(container.get("last_run_at"), now):
         return None
     return await write_snapshot(session, project_id)
@@ -3936,7 +3951,7 @@ async def maybe_alert_pool_payoff_transition(
     from app.alert_dispatch import _maybe_create_pool_payoff_alert
     from app.alert_policy import alert_policy_allows
     from app.models import AlertSeverity
-    from app.task_locking import project_lock, with_design_doc_locked
+    from app.task_locking import with_efficiency_snapshot_locked
     from app.warm_pool import is_project_warm_pool_scoped
 
     if not is_project_warm_pool_scoped(project_id):
@@ -3974,14 +3989,15 @@ async def maybe_alert_pool_payoff_transition(
     # last state we have a durable alert for. The marker is advanced only after
     # an active alert row exists; otherwise a policy race could record "alerted"
     # without any operator-visible alert.
-    should_fire = False
-    async with project_lock(session, project_id, skip_locked=False) as project:
-        if project is None:
+    eff_row_read = await session.get(ProjectEfficiencySnapshot, project_id)
+    if eff_row_read is None:
+        _proj = await session.get(Project, project_id)
+        if _proj is None:
             return None
-        doc = dict(project.design_doc or {})
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
-        should_fire = container.get(LAST_ALERTED_PAYOFF_KEY) != state
-    await session.rollback()
+        container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
+    else:
+        container_read = dict(eff_row_read.data or {})
+    should_fire = container_read.get(LAST_ALERTED_PAYOFF_KEY) != state
 
     if not should_fire:
         return None
@@ -3999,15 +4015,13 @@ async def maybe_alert_pool_payoff_transition(
 
     changed = {"fire": False}
 
-    def _advance_marker(doc: Dict[str, Any]) -> None:
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+    def _advance_marker(container: Dict[str, Any]) -> None:
         if container.get(LAST_ALERTED_PAYOFF_KEY) == state:
             return
         container[LAST_ALERTED_PAYOFF_KEY] = state
-        doc[DESIGN_DOC_KEY] = container
         changed["fire"] = True
 
-    wrote_marker = await with_design_doc_locked(
+    wrote_marker = await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if wrote_marker and changed["fire"]:
@@ -4055,7 +4069,7 @@ async def maybe_alert_unpriced_models_coverage(
     """
     from app.alert_dispatch import _maybe_create_unpriced_models_alert
     from app.models import AlertSeverity
-    from app.task_locking import with_design_doc_locked
+    from app.task_locking import with_efficiency_snapshot_locked
 
     tasks = await _load_recent_tasks(session, project_id)
     coverage = _compute_llm_cost_pricing_coverage(tasks)
@@ -4070,23 +4084,19 @@ async def maybe_alert_unpriced_models_coverage(
 
     # Transition edge: fire only when crossing into degraded from a non-degraded
     # marker; re-arm the marker on recovery so a future degradation alerts again.
-    # Locked read-modify-write via the canonical design_doc helper so a
-    # concurrent snapshot writer cannot clobber the marker; the lock is held
-    # until the alert helper commits so the marker advance and the Alert row land
-    # atomically.
+    # Locked read-modify-write via the dedicated efficiency snapshot helper so a
+    # concurrent snapshot writer cannot clobber the marker.
     changed = {"fire": False}
 
-    def _advance_marker(doc: Dict[str, Any]) -> None:
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+    def _advance_marker(container: Dict[str, Any]) -> None:
         prev = container.get(LAST_ALERTED_UNPRICED_KEY)
         new_state = "degraded" if degraded else "healthy"
         if prev == new_state:
             return  # no transition — leave the marker untouched
         container[LAST_ALERTED_UNPRICED_KEY] = new_state
-        doc[DESIGN_DOC_KEY] = container
         changed["fire"] = degraded  # only the degraded crossing raises an alert
 
-    await with_design_doc_locked(
+    await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if not changed["fire"]:
@@ -4135,7 +4145,7 @@ async def maybe_alert_self_repair_burn_share(
     """
     from app.alert_dispatch import _maybe_create_self_repair_burn_share_alert
     from app.models import AlertSeverity
-    from app.task_locking import with_design_doc_locked
+    from app.task_locking import with_efficiency_snapshot_locked
 
     from app.digest_metrics import _accumulate_format_compliance
 
@@ -4161,20 +4171,18 @@ async def maybe_alert_self_repair_burn_share(
 
     # Transition edge: fire only when crossing into elevated from a non-elevated
     # marker; re-arm the marker on recovery so a future elevation alerts again.
-    # Locked read-modify-write via the canonical design_doc helper.
+    # Locked read-modify-write via the dedicated efficiency snapshot helper.
     changed = {"fire": False}
 
-    def _advance_marker(doc: Dict[str, Any]) -> None:
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+    def _advance_marker(container: Dict[str, Any]) -> None:
         prev = container.get(LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY)
         new_state = "elevated" if elevated else "healthy"
         if prev == new_state:
             return  # no transition — leave the marker untouched
         container[LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY] = new_state
-        doc[DESIGN_DOC_KEY] = container
         changed["fire"] = elevated  # only the elevated crossing raises an alert
 
-    await with_design_doc_locked(
+    await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if not changed["fire"]:
@@ -4218,7 +4226,7 @@ async def maybe_alert_provider_routing_transition(
     from app.alert_dispatch import _maybe_create_provider_routing_alert
     from app.alert_policy import alert_policy_allows
     from app.models import AlertSeverity
-    from app.task_locking import project_lock, with_design_doc_locked
+    from app.task_locking import with_efficiency_snapshot_locked
 
     drift = await read_baseline_with_drift(session, project_id)
     verdict = drift.get("provider_routing_verdict") or {}
@@ -4249,14 +4257,15 @@ async def maybe_alert_provider_routing_transition(
 
     # Transition edge: only fire when the alert-worthy state differs from the
     # last state we have a durable alert for.
-    should_fire = False
-    async with project_lock(session, project_id, skip_locked=False) as project:
-        if project is None:
+    eff_row_read = await session.get(ProjectEfficiencySnapshot, project_id)
+    if eff_row_read is None:
+        _proj = await session.get(Project, project_id)
+        if _proj is None:
             return None
-        doc = dict(project.design_doc or {})
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
-        should_fire = container.get(LAST_ALERTED_ROUTING_KEY) != state
-    await session.rollback()
+        container_read = dict((_proj.design_doc or {}).get(DESIGN_DOC_KEY) or {})
+    else:
+        container_read = dict(eff_row_read.data or {})
+    should_fire = container_read.get(LAST_ALERTED_ROUTING_KEY) != state
 
     if not should_fire:
         return None
@@ -4272,19 +4281,17 @@ async def maybe_alert_provider_routing_transition(
     if alert is None:
         return None
 
-    # Advance the marker inside a design-doc locked block so a concurrent
+    # Advance the marker inside an efficiency-snapshot locked block so a concurrent
     # snapshot writer cannot clobber it.
     changed = {"fire": False}
 
-    def _advance_marker(doc: Dict[str, Any]) -> None:
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+    def _advance_marker(container: Dict[str, Any]) -> None:
         if container.get(LAST_ALERTED_ROUTING_KEY) == state:
             return
         container[LAST_ALERTED_ROUTING_KEY] = state
-        doc[DESIGN_DOC_KEY] = container
         changed["fire"] = True
 
-    wrote_marker = await with_design_doc_locked(
+    wrote_marker = await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if wrote_marker and changed["fire"]:
@@ -4723,7 +4730,11 @@ async def agent_get_efficiency_snapshot_format_compliance(
     if project is None:
         raise HTTPException(status_code=404, detail="project_not_found")
 
-    container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
+    eff_row = await session.get(ProjectEfficiencySnapshot, project_id)
+    if eff_row is not None:
+        container = dict(eff_row.data or {})
+    else:
+        container = (project.design_doc or {}).get(DESIGN_DOC_KEY) or {}
     snapshots = container.get("snapshots") or []
     if not snapshots:
         raise HTTPException(status_code=404, detail="no_snapshot_available")

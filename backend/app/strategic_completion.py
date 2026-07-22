@@ -6533,12 +6533,6 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
-                            # [RESIDENT-REMOVAL] removed with resident subsystem
-#                             from app.strategic_resident_session import (
-#                                 read_resident_session,
-#                                 resident_session_is_active,
-#                             )
-
                             reply = await post_question_answer(
                                 session,
                                 project.id,

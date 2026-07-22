@@ -2,8 +2,8 @@
   "_doc": "Per-file occurrence-count ratchet for direct attribute assignments to project.design_doc, project.directions, project.vision, and project.running_update. Read by TestDesignDocLockInvariant, TestDirectionsLockInvariant, TestVisionLockInvariant, and TestRunningUpdateLockInvariant in test_invariants.py. Counts are derived from AST-based scanning (ast.Assign / ast.AugAssign nodes), so docstrings, comments, and string literals are excluded. Counts should only decrease over time as write sites are migrated to canonical helpers (with_design_doc_locked / with_directions_locked / with_vision_locked in task_locking.py; reconcile_running_update / apply_reconciled_running_update in running_update_merge.py for running_update). Never increase a count \u2014 that widens the tripwire hole. When a site is migrated to the canonical helper, lower the count by 1. Remove the entry when the count reaches 0.",
   "design_doc": {
     "direction_outcomes.py": 1,
-    "efficiency_snapshot.py": 1,
-    "playbook_learning.py": 2,
+    "efficiency_snapshot.py": 0,
+    "playbook_learning.py": 0,
     "playbook_lifecycle.py": 0,
     "playbook_sr_metrics.py": 0,
     "playbook_storage.py": 1,
@@ -16,10 +16,10 @@
     "routers/agent.py": 2,
     "routers/agent_status.py": 3,
     "sr_analytics.py": 0,
-    "sr_analytics_catch_rate_impl.py": 10,
+    "sr_analytics_catch_rate_impl.py": 0,
     "sr_catch_rate_trends.py": 0,
-    "sr_reviewer_trends.py": 3,
-    "sr_signal_trends.py": 2,
+    "sr_reviewer_trends.py": 0,
+    "sr_signal_trends.py": 0,
     "task_locking.py": 1
   },
   "directions": {

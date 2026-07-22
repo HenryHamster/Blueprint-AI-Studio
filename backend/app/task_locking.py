@@ -36,7 +36,7 @@ from typing import AsyncIterator, Callable
 
 import uuid
 from fastapi import HTTPException
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
@@ -77,13 +77,15 @@ class DesignDocSizeLimitExceeded(Exception):
 # guard in that module so the two never diverge.
 _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
     {
+        # NOTE: efficiency_baseline, lane_baselines, and all sr_* / viewport /
+        # fix_loop_divergence keys have been moved to dedicated tables
+        # (project_efficiency_snapshot, project_lane_baseline, project_sr_analytics)
+        # as of migration 0656.  They are no longer stored in design_doc and are
+        # therefore no longer listed here.
         # Originally reserved
         "playbook_archive",
         "proposed_changes",
-        "lane_baselines",
         "module_feedback",
-        "sr_catch_rate_trends",
-        "efficiency_baseline",
         "retired_diagnoses_archive",
         # Co-change index written by direction_outcomes.py (~38KB); excluded so
         # it doesn't consume the agent-write 500KB budget.
@@ -93,21 +95,6 @@ _RESERVED_DESIGN_DOC_KEYS: frozenset = frozenset(
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
-        "fresh_reviewer_trend",
-        "edges_trend",
-        "sr_reviewer_disagreements",
-        "sr_catch_rate_trends_alert",
-        "sr_catch_rate_floor_alert",
-        "sr_quadrant_alert",
-        "sr_pass_engagement_alert",
-        "sr_regression_risk_test_signal_trends",
-        "sr_false_attestation_trends",
-        "sr_blind_spot_signal_last_computed_at",
-        "fix_loop_divergence_signal_last_computed_at",
-        "fix_loop_divergence_alerted_window",
-        "fix_loop_divergence_regressions",
-        "fix_loop_divergence_detected_at",
-        "viewport_coverage_snapshot",
     }
 )
 
@@ -685,6 +672,134 @@ async def with_design_doc_locked(
         project.design_doc = doc
         flag_modified(project, "design_doc")
         session.add(project)
+    return True
+
+
+async def with_efficiency_snapshot_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of ProjectEfficiencySnapshot.data.
+
+    Mirrors with_design_doc_locked but targets the dedicated efficiency
+    snapshot row rather than the design_doc God-column. Acquires
+    SELECT FOR UPDATE on the ProjectEfficiencySnapshot row (inserting an
+    empty row first if none exists), calls mutate_fn with the data dict,
+    then writes the result back.
+    """
+    from app.models import ProjectEfficiencySnapshot
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    # Ensure the row exists before locking it.
+    await session.execute(
+        pg_insert(ProjectEfficiencySnapshot)
+        .values(project_id=project_id, data={}, updated_at=func.now())
+        .on_conflict_do_nothing()
+    )
+
+    stmt = (
+        select(ProjectEfficiencySnapshot)
+        .where(ProjectEfficiencySnapshot.project_id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    result = await session.execute(stmt)
+    eff_row = result.scalar_one_or_none()
+    if eff_row is None:
+        return False
+
+    data = dict(eff_row.data or {})
+    mutate_fn(data)
+    eff_row.data = data
+    eff_row.updated_at = func.now()
+    flag_modified(eff_row, "data")
+    session.add(eff_row)
+    return True
+
+
+async def with_lane_baseline_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of ProjectLaneBaseline.data.
+
+    Mirrors with_design_doc_locked but targets the dedicated lane baseline
+    row. Acquires SELECT FOR UPDATE on the ProjectLaneBaseline row (inserting
+    an empty row first if none exists), calls mutate_fn with the data dict,
+    then writes the result back.
+    """
+    from app.models import ProjectLaneBaseline
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    await session.execute(
+        pg_insert(ProjectLaneBaseline)
+        .values(project_id=project_id, data={}, updated_at=func.now())
+        .on_conflict_do_nothing()
+    )
+
+    stmt = (
+        select(ProjectLaneBaseline)
+        .where(ProjectLaneBaseline.project_id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    result = await session.execute(stmt)
+    lb_row = result.scalar_one_or_none()
+    if lb_row is None:
+        return False
+
+    data = dict(lb_row.data or {})
+    mutate_fn(data)
+    lb_row.data = data
+    lb_row.updated_at = func.now()
+    flag_modified(lb_row, "data")
+    session.add(lb_row)
+    return True
+
+
+async def with_sr_analytics_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+) -> bool:
+    """Atomic read-modify-write of ProjectSRAnalytics.data.
+
+    Mirrors with_design_doc_locked but targets the dedicated SR analytics
+    row. Acquires SELECT FOR UPDATE on the ProjectSRAnalytics row (inserting
+    an empty row first if none exists), calls mutate_fn with the data dict,
+    then writes the result back.
+    """
+    from app.models import ProjectSRAnalytics
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    await session.execute(
+        pg_insert(ProjectSRAnalytics)
+        .values(project_id=project_id, data={}, updated_at=func.now())
+        .on_conflict_do_nothing()
+    )
+
+    stmt = (
+        select(ProjectSRAnalytics)
+        .where(ProjectSRAnalytics.project_id == project_id)
+        .with_for_update(skip_locked=skip_locked)
+    )
+    result = await session.execute(stmt)
+    sr_row = result.scalar_one_or_none()
+    if sr_row is None:
+        return False
+
+    data = dict(sr_row.data or {})
+    mutate_fn(data)
+    sr_row.data = data
+    sr_row.updated_at = func.now()
+    flag_modified(sr_row, "data")
+    session.add(sr_row)
     return True
 
 

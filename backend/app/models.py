@@ -6052,3 +6052,88 @@ class OperatorInboxLivenessObservation(SQLModel, table=True):
         ),
     )
 
+
+class ProjectEfficiencySnapshot(SQLModel, table=True):
+    """Persisted efficiency-baseline telemetry for a project.
+
+    Replaces design_doc["efficiency_baseline"] — moves the large daily
+    snapshot blob out of the design_doc God-column into a dedicated row.
+    One row per project; project_id is the primary key.
+    """
+
+    __tablename__ = "project_efficiency_snapshot"
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class ProjectLaneBaseline(SQLModel, table=True):
+    """Persisted lane-baseline telemetry for a project.
+
+    Replaces design_doc["lane_baselines"] — moves per-version lane diagnostic
+    snapshots out of the design_doc God-column. One row per project.
+    """
+
+    __tablename__ = "project_lane_baseline"
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class ProjectSRAnalytics(SQLModel, table=True):
+    """Persisted self-review analytics telemetry for a project.
+
+    Replaces the sr_catch_rate_trends, fresh_reviewer_trend, edges_trend,
+    sr_reviewer_disagreements, sr_regression_risk_test_signal_trends,
+    sr_false_attestation_trends, sr_blind_spot_signal_last_computed_at,
+    viewport_coverage_snapshot, fix_loop_divergence_* keys in design_doc.
+    One row per project; the data dict holds all SR analytics keys.
+    """
+
+    __tablename__ = "project_sr_analytics"
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            primary_key=True,
+            nullable=False,
+        )
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+

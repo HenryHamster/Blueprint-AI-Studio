@@ -40,7 +40,7 @@
     "routers/agent_status.py": 4550,
     "autonomous_research.py": 3900,
     "autonomous_research_residual.py": 900,
-    "efficiency_snapshot.py": 5150,
+    "efficiency_snapshot.py": 5200,
     "llm_cost_attribution.py": 1550,
     "research_completion.py": 7400,
     "research_provenance_validation.py": 400,

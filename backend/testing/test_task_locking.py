@@ -1540,11 +1540,13 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
     import json as _json
 
     # Build large reserved blobs: a single 600KB string under a reserved key.
+    # Use cochange_index and playbook_archive — both remain in _RESERVED_DESIGN_DOC_KEYS
+    # after the 0656 migration moved efficiency/lane/sr telemetry to separate tables.
     huge_blob = "z" * 600_000
     project = Project(name="reserved-ceiling-regression", user_id="user")
     project.design_doc = {
-        "efficiency_baseline": huge_blob,
-        "lane_baselines": huge_blob,
+        "cochange_index": huge_blob,
+        "playbook_archive": huge_blob,
     }
     from sqlalchemy.orm.attributes import flag_modified as _flag_modified
 
@@ -1573,8 +1575,8 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
         "agent-owned write must be persisted"
     )
     # Reserved blobs must be preserved (mutate_fn only added a new key).
-    assert project.design_doc.get("efficiency_baseline") == huge_blob
-    assert project.design_doc.get("lane_baselines") == huge_blob
+    assert project.design_doc.get("cochange_index") == huge_blob
+    assert project.design_doc.get("playbook_archive") == huge_blob
 
     # Step 3: grow agent-owned content over the ceiling — must be rejected.
     def _grow_agent_over_ceiling(doc: dict) -> None:
@@ -1804,26 +1806,13 @@ def test_reserved_design_doc_keys_contains_cochange_and_audit_keys():
     assert "cochange_index" in _RESERVED_DESIGN_DOC_KEYS
     assert "cochange_applied_prs" in _RESERVED_DESIGN_DOC_KEYS
 
-    # Audit additions: background analytics/sweep keys
+    # Audit additions: background analytics/sweep keys still written to design_doc
+    # (keys moved to project_efficiency_snapshot, project_lane_baseline, and
+    # project_sr_analytics in migration 0656 are no longer listed here)
     audit_keys = {
         "repo_overview",
         "review_effectiveness",
         "playbook_deleted_keys",
-        "fresh_reviewer_trend",
-        "edges_trend",
-        "sr_reviewer_disagreements",
-        "sr_catch_rate_trends_alert",
-        "sr_catch_rate_floor_alert",
-        "sr_quadrant_alert",
-        "sr_pass_engagement_alert",
-        "sr_regression_risk_test_signal_trends",
-        "sr_false_attestation_trends",
-        "sr_blind_spot_signal_last_computed_at",
-        "fix_loop_divergence_signal_last_computed_at",
-        "fix_loop_divergence_alerted_window",
-        "fix_loop_divergence_regressions",
-        "fix_loop_divergence_detected_at",
-        "viewport_coverage_snapshot",
     }
     missing = audit_keys - _RESERVED_DESIGN_DOC_KEYS
     assert not missing, f"code-written keys not yet reserved: {sorted(missing)}"

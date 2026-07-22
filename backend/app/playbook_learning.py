@@ -22,7 +22,6 @@ from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.models import (
@@ -588,20 +587,30 @@ async def check_fix_loop_divergence_regression(
     iso_year, iso_week, _ = now.isocalendar()
     window_key = f"{iso_year}-W{iso_week:02d}"
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if not project:
-        return None
-    doc = dict(project.design_doc or {})
-    if doc.get("fix_loop_divergence_alerted_window") == window_key:
-        doc["fix_loop_divergence_signal_last_computed_at"] = now.isoformat()
-        project.design_doc = doc
-        flag_modified(project, "design_doc")
-        session.add(project)
+    from app.models import ProjectSRAnalytics  # noqa: PLC0415
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+
+    # Read current SR analytics data (no lock) to check the dedup window.
+    # Backward compat: fall back to design_doc if no SR analytics row yet.
+    _sr_row = await session.get(ProjectSRAnalytics, project_id)
+    if _sr_row is not None:
+        _current_sr_data = dict(_sr_row.data or {})
+        _alerted_window = _current_sr_data.get("fix_loop_divergence_alerted_window")
+    else:
+        _proj_check = await session.get(Project, project_id, populate_existing=True)
+        if _proj_check is None:
+            return None
+        _alerted_window = (_proj_check.design_doc or {}).get(
+            "fix_loop_divergence_alerted_window"
+        )
+
+    if _alerted_window == window_key:
+        _now_iso = now.isoformat()
+
+        def _update_signal(data: dict) -> None:
+            data["fix_loop_divergence_signal_last_computed_at"] = _now_iso
+
+        await with_sr_analytics_locked(session, project_id, _update_signal)
         await session.commit()
         return None
 
@@ -679,13 +688,17 @@ async def check_fix_loop_divergence_regression(
         return None
 
     await post_fix_loop_divergence_regression_message(session, project_id, regressions)
-    doc["fix_loop_divergence_alerted_window"] = window_key
-    doc["fix_loop_divergence_regressions"] = regressions
-    doc["fix_loop_divergence_detected_at"] = now.isoformat()
-    doc["fix_loop_divergence_signal_last_computed_at"] = now.isoformat()
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    _window_key = window_key
+    _regressions = regressions
+    _now_iso = now.isoformat()
+
+    def _store_divergence(data: dict) -> None:
+        data["fix_loop_divergence_alerted_window"] = _window_key
+        data["fix_loop_divergence_regressions"] = _regressions
+        data["fix_loop_divergence_detected_at"] = _now_iso
+        data["fix_loop_divergence_signal_last_computed_at"] = _now_iso
+
+    await with_sr_analytics_locked(session, project_id, _store_divergence)
     await session.commit()
     logger.info(
         "[FIX_LOOP_DIVERGENCE] project=%s loops=%s",

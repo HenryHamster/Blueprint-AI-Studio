@@ -32,6 +32,7 @@ from app.models import (
     Task,
     TaskStatus,
     Project,
+    ProjectSRAnalytics,
     Alert,
     AlertSeverity,
     _utcnow,
@@ -992,27 +993,30 @@ async def compute_pipeline_health_summary(
         if recurrence:
             review_recurrence_by_category = recurrence
 
-    # SR catch-rate trends from compute_sr_catch_rate_trends stored in project.design_doc.
+    # SR catch-rate trends from compute_sr_catch_rate_trends stored in project_sr_analytics.
     self_review_prediction_accuracy_trends: Optional[Dict[str, Any]] = None
     sr_regression_risk_test_signal_trends: Optional[Dict[str, Any]] = None
     sr_false_attestation_trends: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        sr_trends = project.design_doc.get("sr_catch_rate_trends") or {}
+    _ph_sr_row = await session.get(ProjectSRAnalytics, project_id)
+    _ph_sr_data = _ph_sr_row.data if _ph_sr_row else None
+    _ph_sr_source = _ph_sr_data or (project.design_doc if project else None) or {}
+    if project and _ph_sr_source:
+        sr_trends = _ph_sr_source.get("sr_catch_rate_trends") or {}
         if sr_trends:
             self_review_prediction_accuracy_trends = _serialize_sr_catch_rate_trends(
                 sr_trends
             )
-        sr_rrts = project.design_doc.get("sr_regression_risk_test_signal_trends")
+        sr_rrts = _ph_sr_source.get("sr_regression_risk_test_signal_trends")
         if sr_rrts:
             sr_regression_risk_test_signal_trends = sr_rrts
-        sft = project.design_doc.get("sr_false_attestation_trends")
+        sft = _ph_sr_source.get("sr_false_attestation_trends")
         if sft:
             sr_false_attestation_trends = sft
 
-    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project.design_doc.
+    # Fresh-reviewer cycle-over-cycle trend from compute_fresh_reviewer_trend stored in project_sr_analytics.
     fresh_reviewer_trend: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        fr_trends = project.design_doc.get("fresh_reviewer_trend") or {}
+    if project and _ph_sr_source:
+        fr_trends = _ph_sr_source.get("fresh_reviewer_trend") or {}
         if fr_trends:
             fresh_reviewer_trend = {
                 "computed_at": fr_trends.get("computed_at"),
@@ -1026,10 +1030,10 @@ async def compute_pipeline_health_summary(
                 "approval_rate_lift": fr_trends.get("approval_rate_lift") or {},
             }
 
-    # Edges-considered cycle-over-cycle trend from compute_edges_trend stored in project.design_doc.
+    # Edges-considered cycle-over-cycle trend from compute_edges_trend stored in project_sr_analytics.
     edges_trend: Optional[Dict[str, Any]] = None
-    if project and project.design_doc:
-        et = project.design_doc.get("edges_trend") or {}
+    if project and _ph_sr_source:
+        et = _ph_sr_source.get("edges_trend") or {}
         if et:
             edges_trend = {
                 "computed_at": et.get("computed_at"),

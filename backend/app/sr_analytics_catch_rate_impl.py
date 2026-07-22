@@ -15,6 +15,7 @@ from app.models import (
     Alert,
     AlertSeverity,
     Project,
+    ProjectSRAnalytics,
     StrategicCycle,
     Task,
     TaskStatus,
@@ -223,25 +224,19 @@ async def _compute_sr_catch_rate_trends_impl(
         current_finding_count < _MIN_SR_FINDINGS
         or previous_finding_count < _MIN_SR_FINDINGS
     ):
-        # skip_locked=True: a concurrent refresh holding the project row is
+        # skip_locked=True: a concurrent refresh holding the SR analytics row is
         # already updating this marker — drop rather than serialize the claim.
-        # scalar_one_or_none() then yields None for both "no project" and
-        # "row held", and the existing not-None guard skips the write.
-        proj_row = await session.execute(
-            select(Project)
-            .where(Project.id == project_id)
-            .with_for_update(skip_locked=True, key_share=True)
-        )
-        project = proj_row.scalar_one_or_none()
-        if project is not None:
-            doc = dict(project.design_doc or {})
-            trends = dict(doc.get("sr_catch_rate_trends") or {})
-            trends["signal_last_computed_at"] = now.isoformat()
+        from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+
+        _now_iso = now.isoformat()
+
+        def _mark_insufficient(data: dict) -> None:
+            trends = dict(data.get("sr_catch_rate_trends") or {})
+            trends["signal_last_computed_at"] = _now_iso
             trends["data_sufficient"] = False
-            doc["sr_catch_rate_trends"] = trends
-            project.design_doc = doc
-            flag_modified(project, "design_doc")
-            session.add(project)
+            data["sr_catch_rate_trends"] = trends
+
+        await with_sr_analytics_locked(session, project_id, _mark_insufficient, skip_locked=True)
         return None
 
     all_cats = (
@@ -438,21 +433,36 @@ async def _compute_sr_catch_rate_trends_impl(
         if examples:
             categories[cat]["examples"] = examples
 
-    # skip_locked=True: if a concurrent refresh already holds the project row,
-    # skip this recompute's write rather than serialize the claim path behind
-    # it. scalar_one_or_none() returns None when the row is held (or absent),
-    # and the existing not-found guard below skips the write — the in-flight
-    # refresh produces the updated trend, so behavior is preserved.
-    proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=True, key_share=True)
+    # skip_locked=True: if a concurrent refresh already holds the SR analytics
+    # row, skip this recompute's write rather than serialize the claim path
+    # behind it. scalar_one_or_none() returns None when the row is held (or
+    # absent), and the existing not-found guard below skips the write — the
+    # in-flight refresh produces the updated trend, so behavior is preserved.
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
+    from sqlalchemy.dialects.postgresql import insert as pg_insert  # noqa: PLC0415
+
+    # Ensure the SR analytics row exists, then lock it.
+    await session.execute(
+        pg_insert(ProjectSRAnalytics)
+        .values(project_id=project_id, data={})
+        .on_conflict_do_nothing()
     )
-    project = proj_row.scalar_one_or_none()
-    if not project:
+    sr_proj_row = await session.execute(
+        select(ProjectSRAnalytics)
+        .where(ProjectSRAnalytics.project_id == project_id)
+        .with_for_update(skip_locked=True)
+    )
+    sr_row = sr_proj_row.scalar_one_or_none()
+    if not sr_row:
         return None
 
-    doc = dict(project.design_doc or {})
+    # Fetch the project (read-only) for directions data.
+    proj_row = await session.execute(
+        select(Project).where(Project.id == project_id)
+    )
+    project = proj_row.scalar_one_or_none()
+
+    doc = dict(sr_row.data or {})
     existing: dict = dict(doc.get("sr_catch_rate_trends") or {})
     existing_computed_at: Optional[str] = existing.get("computed_at")
 
@@ -1058,9 +1068,9 @@ async def _compute_sr_catch_rate_trends_impl(
         }
 
     doc["sr_catch_rate_trends"] = result
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    sr_row.data = doc
+    flag_modified(sr_row, "data")
+    session.add(sr_row)
 
     logger.info(
         "[SR_CATCH_RATE_TRENDS] project=%s categories=%d",
@@ -1239,9 +1249,9 @@ async def _compute_sr_catch_rate_trends_impl(
                     "categories": current_regressing_cats,
                     "severities": current_regressing_sevs,
                 }
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
+                sr_row.data = doc
+                flag_modified(sr_row, "data")
+                session.add(sr_row)
         elif doc.get("sr_catch_rate_trends_alert"):
             stale_alerts = (
                 (
@@ -1262,9 +1272,9 @@ async def _compute_sr_catch_rate_trends_impl(
                 alert.dismissed_at = now
                 session.add(alert)
             doc.pop("sr_catch_rate_trends_alert", None)
-            project.design_doc = doc
-            flag_modified(project, "design_doc")
-            session.add(project)
+            sr_row.data = doc
+            flag_modified(sr_row, "data")
+            session.add(sr_row)
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] notification failed, suppressing")
 
@@ -1407,9 +1417,9 @@ async def _compute_sr_catch_rate_trends_impl(
                     "cycle_id": current_cycle_id,
                     "categories": current_floor_cats,
                 }
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
+                sr_row.data = doc
+                flag_modified(sr_row, "data")
+                session.add(sr_row)
         elif doc.get("sr_catch_rate_floor_alert"):
             stale_floor_alerts = (
                 (
@@ -1430,9 +1440,9 @@ async def _compute_sr_catch_rate_trends_impl(
                 alert.dismissed_at = now
                 session.add(alert)
             doc.pop("sr_catch_rate_floor_alert", None)
-            project.design_doc = doc
-            flag_modified(project, "design_doc")
-            session.add(project)
+            sr_row.data = doc
+            flag_modified(sr_row, "data")
+            session.add(sr_row)
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] floor notification failed, suppressing")
 
@@ -1559,9 +1569,9 @@ async def _compute_sr_catch_rate_trends_impl(
                     "cycle_id": current_cycle_id,
                     "categories": current_quadrant_cats,
                 }
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
+                sr_row.data = doc
+                flag_modified(sr_row, "data")
+                session.add(sr_row)
         elif doc.get("sr_quadrant_alert"):
             stale_q_alerts = (
                 (
@@ -1582,9 +1592,9 @@ async def _compute_sr_catch_rate_trends_impl(
                 alert.dismissed_at = now
                 session.add(alert)
             doc.pop("sr_quadrant_alert", None)
-            project.design_doc = doc
-            flag_modified(project, "design_doc")
-            session.add(project)
+            sr_row.data = doc
+            flag_modified(sr_row, "data")
+            session.add(sr_row)
     except Exception:
         logger.exception("[SR_CATCH_RATE_TRENDS] quadrant notification failed, suppressing")
 
@@ -1723,9 +1733,9 @@ async def _compute_sr_catch_rate_trends_impl(
                     "cycle_id": current_cycle_id,
                     "categories": current_thinning_cats,
                 }
-                project.design_doc = doc
-                flag_modified(project, "design_doc")
-                session.add(project)
+                sr_row.data = doc
+                flag_modified(sr_row, "data")
+                session.add(sr_row)
         elif doc.get("sr_pass_engagement_alert"):
             stale_eng_alerts = (
                 (
@@ -1748,9 +1758,9 @@ async def _compute_sr_catch_rate_trends_impl(
                 alert.dismissed_at = now
                 session.add(alert)
             doc.pop("sr_pass_engagement_alert", None)
-            project.design_doc = doc
-            flag_modified(project, "design_doc")
-            session.add(project)
+            sr_row.data = doc
+            flag_modified(sr_row, "data")
+            session.add(sr_row)
     except Exception:
         logger.exception(
             "[SR_CATCH_RATE_TRENDS] engagement thinning notification failed, suppressing"

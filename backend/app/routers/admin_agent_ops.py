@@ -2869,12 +2869,6 @@ async def strategic_operation(
         # active) so it is addressed to the same conversation as the operator
         # messages it answers — matching the session-identity scoping used by the
         # poll / unattended-cap / pacing queries.
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_session import (
-#             read_resident_session,
-#             resident_session_is_active,
-#         )
-
         next_sequence = preallocated_message_sequence
         if next_sequence is None:
             raise HTTPException(status_code=500, detail="Message sequence was not allocated")

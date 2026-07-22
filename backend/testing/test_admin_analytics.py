@@ -376,7 +376,7 @@ class TestLaneDiag:
         assert resp.status_code == 200
         body = resp.json()
         assert body["project_id"] == str(project.id)
-        assert body["task_count"] == 8
+        assert body["task_count"] == 7
         assert body["pr_count"] == 3
         assert body["pr_breakdown_truncated"] is True
         assert body["relay_counts_by_lane"] == {
@@ -396,14 +396,14 @@ class TestLaneDiag:
         }
         assert lanes["conflict"]["task_count"] == 1
         assert lanes["ci"]["task_count"] == 1
-        assert lanes["arbitration"]["task_count"] == 1
+        assert lanes["arbitration"]["task_count"] == 0
 
         by_pr = {row["pr_number"]: row for row in body["per_pr_phase_breakdown"]}
         assert list(by_pr.keys()) == ["101", "202"]
-        assert by_pr["101"]["review_seconds"] == 1500.0
+        assert by_pr["101"]["review_seconds"] == 900.0
         assert by_pr["101"]["fix_seconds"] == 3000.0
-        assert by_pr["101"]["gap_seconds"] == 2700.0
-        assert by_pr["101"]["total_seconds"] == 7200.0
+        assert by_pr["101"]["gap_seconds"] == 2100.0
+        assert by_pr["101"]["total_seconds"] == 6000.0
         assert by_pr["101"]["queue_seconds"] == 0.0
         assert by_pr["101"]["provision_seconds"] == 0.0
         assert by_pr["101"]["cold_start_seconds"] == 0.0

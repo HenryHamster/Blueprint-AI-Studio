@@ -347,24 +347,23 @@ async def _seed_routing_verdict_from_snapshot():
     try:
         from app.shared_state import runtime_config as _rc
         from app.efficiency_snapshot import DESIGN_DOC_KEY
+        from app.models import ProjectEfficiencySnapshot
 
         async with AsyncSessionLocal() as seed_session:
-            project_rows = (
+            # Primary: read from the dedicated ProjectEfficiencySnapshot table.
+            eff_rows = (
                 (
                     await seed_session.execute(
-                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True)).limit(5000)
+                        select(ProjectEfficiencySnapshot).limit(5000)
                     )
                 )
                 .scalars()
                 .all()
             )
-            for project in project_rows:
-
-                if not project or not project.design_doc:
+            for eff_row in eff_rows:
+                if not eff_row or not eff_row.data:
                     continue
-                container = project.design_doc.get(DESIGN_DOC_KEY)
-                if not container:
-                    continue
+                container = eff_row.data
                 # Read the verdict from where write_snapshot actually stores it.
                 # Priority (newest-first):
                 #   1. snapshots[-1]["provider_routing_verdict"] — latest snapshot,
@@ -393,6 +392,48 @@ async def _seed_routing_verdict_from_snapshot():
                     _rc["provider_routing_verdict_state"] = state
                     logger.info(
                         "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s",
+                        state,
+                        eff_row.project_id,
+                    )
+                    return  # First project with a verdict is sufficient
+
+            # Fallback: scan design_doc for projects not yet migrated.
+            project_rows = (
+                (
+                    await seed_session.execute(
+                        select(Project).options(load_only(Project.id, Project.design_doc, raiseload=True)).limit(5000)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for project in project_rows:
+                if not project or not project.design_doc:
+                    continue
+                container = project.design_doc.get(DESIGN_DOC_KEY)
+                if not container:
+                    continue
+                provider_routing_verdict = None
+                snapshots = container.get("snapshots") or []
+                if snapshots:
+                    provider_routing_verdict = snapshots[-1].get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = (container.get("baseline") or {}).get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    provider_routing_verdict = container.get(
+                        "provider_routing_verdict"
+                    )
+                if not provider_routing_verdict:
+                    continue
+                state = provider_routing_verdict.get("state")
+                if state:
+                    _rc["provider_routing_verdict_state"] = state
+                    logger.info(
+                        "[STARTUP] Seeded provider_routing_verdict_state=%s from project %s (design_doc fallback)",
                         state,
                         project.id,
                     )

@@ -10,10 +10,9 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.models import Alert, AlertSeverity, Project, StrategicCycle, _utcnow
+from app.models import Alert, AlertSeverity, StrategicCycle, _utcnow
 from app.sr_blind_spots import _REVIEWER_ORIGINS, safe_check_results
 from app.sr_catch_rate_trends import (
     _MIN_SR_SAMPLE,
@@ -226,20 +225,16 @@ async def compute_sr_regression_risk_test_signal_trends(
         "trend": trend,
     }
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if not project:
-        return None
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
 
-    doc = dict(project.design_doc or {})
-    doc["sr_regression_risk_test_signal_trends"] = result
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    _result = result
+
+    def _store(data: dict) -> None:
+        data["sr_regression_risk_test_signal_trends"] = _result
+
+    applied = await with_sr_analytics_locked(session, project_id, _store)
+    if not applied:
+        return None
 
     logger.info(
         "[SR_REGRESSION_RISK_TEST_SIGNAL] project=%s trend=%s miss_rate=%s n=%d",
@@ -397,20 +392,16 @@ async def compute_sr_false_attestation_trends(
         "per_category": per_category,
     }
 
-    _proj_row = await session.execute(
-        select(Project)
-        .where(Project.id == project_id)
-        .with_for_update(skip_locked=False, key_share=True)
-    )
-    project = _proj_row.scalar_one_or_none()
-    if not project:
-        return None
+    from app.task_locking import with_sr_analytics_locked  # noqa: PLC0415
 
-    doc = dict(project.design_doc or {})
-    doc["sr_false_attestation_trends"] = result
-    project.design_doc = doc
-    flag_modified(project, "design_doc")
-    session.add(project)
+    _result = result
+
+    def _store_false_attest(data: dict) -> None:
+        data["sr_false_attestation_trends"] = _result
+
+    applied = await with_sr_analytics_locked(session, project_id, _store_false_attest)
+    if not applied:
+        return None
 
     logger.info(
         "[SR_FALSE_ATTESTATION] project=%s bucket=%s cats=%s",

@@ -25,6 +25,7 @@ from app.models import (
     Task,
     TaskStatus,
     Project,
+    ProjectSRAnalytics,
     Artifact,
     ArtifactType,
     _utcnow,
@@ -1015,7 +1016,9 @@ async def get_direction_sr_breakdown(
             did = str(d.get("id") or d.get("direction_id") or "")
             if did:
                 dir_text[did] = d.get("text") or d.get("description") or ""
-        stored_trends = (project.design_doc or {}).get("sr_catch_rate_trends") or {}
+        sr_row = await session.get(ProjectSRAnalytics, project_id)
+        _sr_data = sr_row.data if sr_row else None
+        stored_trends = (_sr_data or (project.design_doc or {})).get("sr_catch_rate_trends") or {}
         stored_by_dir = stored_trends.get("by_direction") or {}
 
     if stored_by_dir:
@@ -1378,7 +1381,9 @@ async def get_sr_catch_rate_health(
 
     now = _utcnow()
     general_window = _SIGNAL_STALENESS_WINDOWS["sr_catch_rate"]
-    trends: Dict[str, Any] = (project.design_doc or {}).get(
+    _sr_row = await session.get(ProjectSRAnalytics, project_id)
+    _sr_data = _sr_row.data if _sr_row else None
+    trends: Dict[str, Any] = (_sr_data or (project.design_doc or {})).get(
         "sr_catch_rate_trends"
     ) or {}
 
