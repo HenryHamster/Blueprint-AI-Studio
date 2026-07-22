@@ -3,6 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import { PR_INELIGIBLE_TASK_TYPES } from './research-plan.js';
+import { AGENT_TASK_TYPE_IDS } from '../taskCapabilities.js';
 
 describe('PR-ineligible task type contract', () => {
   it('keeps the agent stats renderer in sync with the backend denominator contract', () => {
@@ -20,11 +21,18 @@ describe('PR-ineligible task type contract', () => {
     while ((m = readOnlyPattern.exec(capabilitiesSource)) !== null) {
       backendTypes.push(m[1]);
     }
+    // Compare only the read_only types the agent still dispatches. The backend
+    // may list read_only capabilities the agent runtime no longer knows about
+    // (retired handlers whose backend entries are removed in their own cleanup
+    // task); those are excluded here so the agent-side contract stays in sync
+    // with what the agent can actually run.
+    const agentKnown = new Set<string>(AGENT_TASK_TYPE_IDS);
+    const comparableBackendTypes = backendTypes.filter(t => agentKnown.has(t));
     expect(
-      backendTypes.length,
+      comparableBackendTypes.length,
       'backend task_capabilities.py must contain at least one read_only TaskCapability',
     ).toBeGreaterThan(0);
-    expect([...PR_INELIGIBLE_TASK_TYPES].sort()).toEqual(backendTypes.sort());
+    expect([...PR_INELIGIBLE_TASK_TYPES].sort()).toEqual(comparableBackendTypes.sort());
   });
 });
 

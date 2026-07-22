@@ -17,6 +17,7 @@ from app.models import (
 from app.project_message_projection import (
     MESSAGE_CONTEXT_PROJECTION_MAX_BYTES,
     MESSAGE_EVENT_MAX_BYTES,
+    WAKEUP_STATE_CONTEXT_KEY,
     admin_message_dict,
     admin_message_list_dict,
     agent_fetch_message_dict,
@@ -208,7 +209,7 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
             "artifact_refs": [
                 {"kind": "whiteboard", "id": "board-1", "checksum": "abc123"}
             ],
-            "operator_intent": {"kind": "verify", "lane_owner": "resident"},
+            "operator_intent": {"kind": "verify", "lane_owner": "operator"},
             "huge": "not returned",
         }
     )
@@ -221,7 +222,7 @@ def test_message_preview_preserves_visible_sources_as_bounded_structured_data():
     assert data["context"]["artifact_refs"][0]["checksum"] == "abc123"
     assert data["context"]["operator_intent"] == {
         "kind": "verify",
-        "lane_owner": "resident",
+        "lane_owner": "operator",
     }
     assert "huge" not in data["context"]
 
@@ -255,7 +256,7 @@ def test_visible_source_projection_strips_secrets_uris_and_unknown_metadata():
             }],
             "operator_intent": {
                 "kind": "verify",
-                "lane_owner": "resident",
+                "lane_owner": "operator",
                 "authorization": "Bearer private",
             },
         }
@@ -277,7 +278,7 @@ def test_all_full_and_agent_projections_strip_internal_receipts_and_typed_secret
     msg = _message(
         context={
             "_message_request_fingerprint": "private-fingerprint",
-            "_resident_wakeup_state": "queued",
+            WAKEUP_STATE_CONTEXT_KEY: "queued",
             "attachments": [{
                 "attachment_id": "att-1",
                 "filename": "evidence.txt",
@@ -301,7 +302,7 @@ def test_all_full_and_agent_projections_strip_internal_receipts_and_typed_secret
     ):
         serialized = json.dumps(projection, separators=(",", ":"), default=str)
         assert "private-fingerprint" not in serialized
-        assert "_resident_wakeup_state" not in serialized
+        assert WAKEUP_STATE_CONTEXT_KEY not in serialized
         assert "private-bucket" not in serialized
         assert "signed.example" not in serialized
         assert "nested-secret" not in serialized
@@ -720,7 +721,7 @@ async def test_strategic_open_message_payload_keeps_agent_aliases(db_session):
                 "attachment_id": "22222222-2222-4222-8222-222222222222",
                 "filename": "evidence.txt",
                 "size_bytes": 12,
-                "storage_uri": "gs://must-not-reach-resident/private",
+                "storage_uri": "gs://must-not-reach/private",
             }],
         },
         status="open",

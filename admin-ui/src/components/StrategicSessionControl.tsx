@@ -14,7 +14,7 @@ import {
 import type { LucideIcon } from 'lucide-react';
 
 // The strategic interaction vocabulary is collapsed to two modes: conversational
-// "Chat" and the resident "Workday" (``continuous``) session. The retired
+// "Chat" and the "Workday" (``continuous``) session. The retired
 // ``check_in`` / ``monitor`` modes are no longer offered here; a legacy value read
 // off old data is coerced to ``chat`` by ``normalizeStrategicInteractionMode``.
 export type StrategicInteractionMode = 'chat' | 'continuous';
@@ -110,10 +110,10 @@ export interface StrategicRuntimeWorkStatus {
 }
 
 /**
- * One device-picker option for the resident (Workday) session (mirrors an entry
- * of `build_resident_runner_options` in `strategic_resident_session.py`).
+ * One device-picker option for the Workday session (mirrors an entry
+ * of the session's enrolled runners).
  */
-export interface StrategicResidentRunnerOption {
+export interface StrategicSessionRunnerOption {
   id: string;
   name: string;
   hostname?: string | null;
@@ -146,10 +146,10 @@ export interface StrategicSessionControlProps {
   runtimeWork?: StrategicRuntimeWorkStatus | null;
   accountSpend?: StrategicAccountSpendStatus | null;
   /**
-   * Resident-session controls. The container passes `onStartSession` only when
-   * resident sessions are enabled (the `strategic_session_enabled` feature flag)
+   * Session controls. The container passes `onStartSession` only when
+   * sessions are enabled (the `strategic_session_enabled` feature flag)
    * and keeps `onStopSession` wired unconditionally so a live session can always
-   * be reclaimed. `sessionActive` reflects whether a resident session is
+   * be reclaimed. `sessionActive` reflects whether a session is
    * currently live and `sessionStatus` is its status string (`active` or
    * `ended`), used for the live-status chip. `sessionBusy` disables the button
    * while a start/stop request is in flight. The Start/Stop affordance only
@@ -158,8 +158,8 @@ export interface StrategicSessionControlProps {
   sessionActive?: boolean;
   sessionStatus?: string | null;
   /**
-   * Legible resident-session state from the read model's
-   * `resident_session_availability`: `dark` (feature off) / `ready` (Workday +
+   * Legible session state from the read model's
+   * availability projection: `dark` (feature off) / `ready` (Workday +
    * runner live, auto-starting) / `active` / `blocked` (e.g. no runner) /
    * `error` (last auto-start failed). Drives the status chip in Workday mode so
    * the operator sees why a session isn't running instead of a bare Start button.
@@ -180,10 +180,10 @@ export interface StrategicSessionControlProps {
    * `onSelectRunner(null)` selects auto-pick. Passing `sessionRunners` (with an
    * `onSelectRunner`) renders the device dropdown in Workday mode.
    */
-  sessionRunners?: StrategicResidentRunnerOption[] | null;
+  sessionRunners?: StrategicSessionRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
   /**
-   * Operator-decision capture telemetry for the live resident session (mirrors
+   * Operator-decision capture telemetry for the live session (mirrors
    * `operator_decision_summary` on the session snapshot). When present, a small
    * "op-decision capture: N/M (X%)" chip renders in Workday mode so the operator
    * can see whether operator corrections are reaching the durable decisions
@@ -197,7 +197,7 @@ export interface StrategicSessionControlProps {
     capture_rate: number | null;
   } | null;
   /**
-   * Per-kind turn-latency telemetry for the live resident session (mirrors
+   * Per-kind turn-latency telemetry for the live session (mirrors
    * `turn_latency_summary` on the session snapshot). When present, a small chip
    * renders in Workday mode showing rolling mean/max turn times for operator
    * and/or autonomous turns so the operator can see the session's responsiveness.
@@ -701,16 +701,16 @@ function sessionStatusLabel(status: string | null | undefined): string {
   return trimmed ? humanizeStatus(value) : 'Active';
 }
 
-// Turn a backend resident-session reason code into operator-readable detail.
+// Turn a backend session reason code into operator-readable detail.
 // `start_failed: <msg>` carries the real cause; strip the code prefix and show
 // the message. `no_runner` / `sessions_disabled` map to plain English.
-function humanizeResidentReason(
+function humanizeSessionReason(
   reason: string | null | undefined,
   selectedDeviceName?: string | null,
 ): string | null {
   const trimmed = cleanText(reason);
   if (!trimmed) return null;
-  if (trimmed === 'sessions_disabled') return 'Resident sessions disabled';
+  if (trimmed === 'sessions_disabled') return 'Sessions disabled';
   if (trimmed === 'no_runner') return 'No live local runner';
   if (trimmed === 'cycle_in_flight') return 'Waiting for the current strategic cycle to finish…';
   if (trimmed === 'runner_offline') {
@@ -733,7 +733,7 @@ function humanizeResidentReason(
 // operator sees each device's status inline while picking. An offline device is
 // still selectable (an explicit override) — the backend blocks the start with a
 // clear reason rather than silently choosing another.
-function runnerOptionLabel(option: StrategicResidentRunnerOption): string {
+function runnerOptionLabel(option: StrategicSessionRunnerOption): string {
   const name =
     cleanText(option.name) ?? cleanText(option.hostname) ?? shortId(option.id) ?? 'device';
   if (!option.online) return `${name} — offline`;
@@ -741,7 +741,7 @@ function runnerOptionLabel(option: StrategicResidentRunnerOption): string {
   return name;
 }
 
-interface ResidentSessionView {
+interface SessionStatusView {
   tone: Tone;
   Icon: LucideIcon;
   label: string;
@@ -753,7 +753,7 @@ interface ResidentSessionView {
   showAddRunner: boolean;
 }
 
-// Map the resident-session state (+ reason) to a single legible status chip.
+// Map the session state (+ reason) to a single legible status chip.
 // Entering Workday auto-starts the session, so the chip — not a Start button —
 // is the primary affordance across the formal state machine:
 //   off      — feature flag off (no controls).
@@ -764,7 +764,7 @@ interface ResidentSessionView {
 //   error    — the last auto-start failed (reason surfaced).
 // Stop stays on a live/starting session; Start remains only as an explicit
 // fallback.
-function residentSessionView(
+function computeSessionStatusView(
   state: string | null | undefined,
   reason: string | null | undefined,
   sessionActive: boolean,
@@ -773,7 +773,7 @@ function residentSessionView(
   hasStop: boolean,
   hasAddRunner: boolean,
   selectedDeviceName?: string | null,
-): ResidentSessionView {
+): SessionStatusView {
   const normalized = normalizedStatus(state);
   const reasonCode = normalizedStatus(reason);
   // Block-on-offline: the pinned device went offline mid-session. The blob is
@@ -784,7 +784,7 @@ function residentSessionView(
   // auto-start once the cycle completes — show a calm waiting state, not an error.
   const cycleInFlight = normalized === 'blocked' && reasonCode === 'cycle_in_flight';
   const active = (sessionActive || normalized === 'active') && !runnerOffline && !cycleInFlight;
-  const detail = humanizeResidentReason(reason, selectedDeviceName);
+  const detail = humanizeSessionReason(reason, selectedDeviceName);
   if (cycleInFlight) {
     return {
       tone: 'info',
@@ -835,7 +835,7 @@ function residentSessionView(
       tone: 'danger',
       Icon: AlertTriangle,
       label: 'Start failed',
-      detail: detail ?? 'Resident session could not start',
+      detail: detail ?? 'Session could not start',
       showStop: false,
       showStart: hasStart,
       showAddRunner: false,
@@ -847,7 +847,7 @@ function residentSessionView(
       tone: 'warning',
       Icon: AlertTriangle,
       label: 'Not running',
-      detail: detail ?? 'Resident session unavailable',
+      detail: detail ?? 'Session unavailable',
       showStop: false,
       showStart: hasStart,
       showAddRunner: noRunner && hasAddRunner,
@@ -859,7 +859,7 @@ function residentSessionView(
       tone: 'neutral',
       Icon: InfinityIcon,
       label: 'Sessions off',
-      detail: detail ?? 'Resident sessions disabled',
+      detail: detail ?? 'Sessions disabled',
       showStop: false,
       showStart: false,
       showAddRunner: false,
@@ -880,7 +880,7 @@ function residentSessionView(
 /**
  * capture_rate (integer percent) below this is toned as a warning in the chip.
  * Mirrors the backend enforcement floor (`OPERATOR_DECISION_CAPTURE_LOW_RATE_PCT`
- * in `strategic_resident_session.py`) so the operator-visible signal and the
+ * enforcement floor) so the operator-visible signal and the
  * strategist-internal notice agree on what "chronically low" means.
  */
 const OPERATOR_DECISION_LOW_RATE_PCT = 60;
@@ -1035,14 +1035,14 @@ export function StrategicSessionControl({
   const openAccountSpend = onOpenAccounts ?? onOpenSpend;
   const accountSpendOpenLabel = onOpenAccounts ? 'Open accounts' : 'Open spend';
 
-  // Resident session status: only meaningful in the "Workday" (continuous) mode.
+  // Session status: only meaningful in the "Workday" (continuous) mode.
   // Entering Workday is the on-switch (the backend auto-starts the session), so
   // the primary affordance is a legible status chip — off / ready / starting /
   // active / blocked / error — that always shows the reason when it can't start.
   // Stop stays on a live session; a manual Start remains only as an explicit
   // fallback, and `blocked:no_runner` surfaces an "Add runner" fix-it link.
   // Shown when the container wired session info (callbacks / active / explicit
-  // state); absent that, this stays inert so callers that don't use resident
+  // state); absent that, this stays inert so callers that don't use session
   // sessions render exactly as before.
   // Multi-device picker state. `runnerOptions` are the enrolled devices; the
   // selected/pinned device drives the name shown in the block-on-offline prompt
@@ -1058,7 +1058,7 @@ export function StrategicSessionControl({
   const showDevicePicker =
     selectedMode === 'continuous' && Boolean(onSelectRunner) && runnerOptions.length > 0;
 
-  const sessionView = residentSessionView(
+  const sessionView = computeSessionStatusView(
     sessionState,
     sessionReason,
     sessionActive,
@@ -1151,13 +1151,13 @@ export function StrategicSessionControl({
                 compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
               } ${toneClasses[sessionView.tone].border} ${toneClasses[sessionView.tone].bg}`}
               role="status"
-              aria-label={`Resident Strategic session: ${sessionView.label}${
+              aria-label={`Strategic session: ${sessionView.label}${
                 sessionView.detail ? `, ${sessionView.detail}` : ''
               }`}
               title={
                 sessionView.detail
-                  ? `Resident Strategic session: ${sessionView.label} — ${sessionView.detail}`
-                  : `Resident Strategic session: ${sessionView.label}`
+                  ? `Strategic session: ${sessionView.label} — ${sessionView.detail}`
+                  : `Strategic session: ${sessionView.label}`
               }
             >
               <SessionIcon className={`h-3.5 w-3.5 shrink-0 ${toneClasses[sessionView.tone].icon}`} aria-hidden="true" />
@@ -1259,8 +1259,8 @@ export function StrategicSessionControl({
                 className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-red-500/30 bg-red-500/10 text-left transition-colors hover:border-red-400/50 hover:bg-red-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
                   compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
                 }`}
-                aria-label="Stop resident Strategic session"
-                title="Stop resident Strategic session"
+                aria-label="Stop Strategic session"
+                title="Stop Strategic session"
               >
                 {sessionBusy ? (
                   <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-red-300" aria-hidden="true" />
@@ -1278,8 +1278,8 @@ export function StrategicSessionControl({
                 className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 text-left transition-colors hover:border-emerald-400/50 hover:bg-emerald-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
                   compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
                 }`}
-                aria-label="Start resident Strategic session"
-                title="Start resident Strategic session"
+                aria-label="Start Strategic session"
+                title="Start Strategic session"
               >
                 {sessionBusy ? (
                   <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300" aria-hidden="true" />

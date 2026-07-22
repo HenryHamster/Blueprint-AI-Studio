@@ -589,7 +589,7 @@ def apply_strategic_local_continuation_marker(
     OP (progress). When ``renewal_reason`` is supplied the marker's freshness is
     bumped to *now* (and the reason recorded on the marker) even if the caller's
     ``workbench_state`` does not carry a fresh ``last_interaction_at`` — this is
-    what the resident session heartbeat calls to renew the lease on progress.
+    what a progress heartbeat calls to renew the lease on progress.
 
     Bare runner liveness must NOT reach this path: the dead-man's switch depends
     on freshness tracking real interaction/progress, not the runner merely being
@@ -639,9 +639,9 @@ def apply_strategic_local_continuation_marker(
     # ``last_seen_at`` is the dead-man's-switch FRESHNESS anchor. It advances to
     # *now* ONLY on a genuine renewal — a truthy ``renewal_reason``
     # ('operator_interaction' from an operator workbench save, or
-    # 'strategic_progress' from the resident heartbeat reporting an applied
+    # 'strategic_progress' from a heartbeat reporting an applied
     # strategic op). A ``renewal_reason`` of None is a LIVENESS-ONLY touch (e.g.
-    # a bare resident heartbeat with progress=False): record that the marker was
+    # a bare heartbeat with progress=False): record that the marker was
     # seen (bump ``updated_at`` below) but DO NOT advance freshness, so an
     # alive-but-idle session still goes stale on schedule and the cloud cadence /
     # cloud fallback can reclaim it. Freshness must track real interaction /
@@ -925,7 +925,7 @@ async def refresh_strategic_local_continuation_on_runner_heartbeat(
     ``False``.
 
     The legitimate renewal path is ``apply_strategic_local_continuation_marker``
-    (operator workbench save, or the resident session heartbeat calling it with a
+    (operator workbench save, or a progress heartbeat calling it with a
     ``renewal_reason`` on applied progress). Kept as a callable no-op so the
     runner heartbeat handler's call site stays unchanged; the parameters are
     accepted and ignored.

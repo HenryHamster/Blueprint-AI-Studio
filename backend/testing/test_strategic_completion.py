@@ -9414,19 +9414,17 @@ async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a qualify_request embedded in a set_problem_model call is
-    applied synchronously within the API handler so resident sessions (where the
-    task stays open for the entire conversation) get immediate effect.
+    applied synchronously within the API handler so it takes immediate effect.
 
     The strategic agent embeds qualify_request as a top-level sibling of the
     problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
     is extra="forbid"), applies it synchronously by calling _apply_qualify_request
     directly, and pops the context key so _handle_strategic_completion is a
-    no-op — no double-application for non-resident tasks that also complete
-    normally.
+    no-op — no double-application for tasks that also complete normally.
 
-    Regression for fr-resident-qualify-request-application-timing: a qualify_request
+    Regression for fr-qualify-request-application-timing: a qualify_request
     submitted mid-session can no longer sit queued for the entire remaining duration
-    of the resident conversation.
+    of the conversation.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9513,7 +9511,7 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
     )
 
     # Synchronous apply: run_qualification fired during set_problem_model itself —
-    # not deferred to task completion. This is the resident-session fix.
+    # not deferred to task completion.
     run_qualification.assert_awaited_once()
     call_args = run_qualification.await_args.args
     # run_qualification(session, project_id, version) — the handler's own session
@@ -18384,7 +18382,7 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
 
     Exercises the seam end-to-end using the real HTTP transport (not a mocked
     context write). The context key is popped after synchronous apply so the
-    completion handler is a no-op (idempotency guard for non-resident tasks).
+    completion handler is a no-op (idempotency guard for tasks).
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -19193,10 +19191,6 @@ async def test_unparseable_strategic_failure_counter_is_atomic(db_session, mocke
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="P",
@@ -19249,10 +19243,6 @@ async def test_fallback_activate_direction_applied(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="FallbackActivate",
@@ -19333,10 +19323,6 @@ async def test_fallback_reject_direction_no_mid_loop_write(db_session, mocker):
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="FallbackRejectSingleWrite",
@@ -19420,10 +19406,6 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     concurrent_dir = {
         "id": "d-concurrent",
@@ -19524,10 +19506,6 @@ async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, moc
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     project = Project(
         name="NoteDedup",
@@ -19618,10 +19596,6 @@ async def test_retire_direction_succeeds_when_criterion_is_covered(
     from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
-    mocker.patch(
-        "app.strategic_completion._maybe_retry_workday_auto_start",
-        new_callable=AsyncMock,
-    )
 
     direction_id = "d-cov-covered"
     direction_dict = {

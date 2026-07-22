@@ -314,7 +314,7 @@ async def test_app_discovery_token_is_not_double_cached_by_resolver(
 async def test_dedicated_resolver_session_releases_connection_before_external_io(
     db_session, monkeypatch
 ):
-    """Resident inspections must not pin a DB connection during token discovery."""
+    """Token discovery must not pin a DB connection during external I/O."""
     import app.github as github
     from app.github_token_resolver import get_github_token_for_task
 

@@ -1608,28 +1608,3 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
   return lines.join('\n');
 }
 
-/**
- * Render open FOUND leads from the resident session's exam ledger. These are
- * surfaces the resident session examined and found actionable work on, but the
- * session ended before acting. The batch strategist should prioritise these
- * before re-deriving from scratch.
- *
- * Returns '' when the leads array is empty.
- */
-export function buildResidentExamLeadsSection(leads: Array<Record<string, unknown>>): string {
-  if (leads.length === 0) return '';
-  const lines: string[] = ['\n## Resident exam open leads'];
-  lines.push(
-    'The resident session examined these surfaces and recorded open FOUND leads before ending. ' +
-    'Prioritise investigating or acting on them before re-deriving from scratch.',
-  );
-  for (const lead of leads) {
-    const surface = strVal(lead.surfaceKey, '?');
-    const note = strVal(lead.note, '');
-    const at = strVal(lead.at, '');
-    const notePart = note ? ` — ${note}` : '';
-    const atPart = at ? ` (examined at ${at})` : '';
-    lines.push(`- **${surface}**${notePart}${atPart}`);
-  }
-  return lines.join('\n');
-}

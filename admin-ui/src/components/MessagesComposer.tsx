@@ -149,7 +149,7 @@ export const MessagesComposer = memo(function MessagesComposer({
     : sendState === 'needs_retry'
       ? 'Send not confirmed. Retry will first check whether it was accepted.'
       : sendState === 'waiting'
-        ? (wakeupState === 'paused' ? 'Message accepted. Resident is paused.' : 'Message accepted. Resident is waiting for capacity.')
+        ? (wakeupState === 'paused' ? 'Message accepted. Autonomy is paused.' : 'Message accepted. Waiting for capacity.')
         : sendState === 'accepted'
           ? 'Message accepted.'
           : null;
@@ -368,7 +368,7 @@ export const MessagesComposer = memo(function MessagesComposer({
       )}
 
       {displayedSourceRefs.length > 0 && (
-        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached Resident sources" role="list">
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex flex-wrap gap-2 px-1`} aria-label="Attached sources" role="list">
           {displayedSourceRefs.map((ref, index) => {
             const identity = String(ref.artifact_ref_id || ref.id || `source-${index}`);
             const fallbackKind = ref.kind ? ref.kind.replace(/_/g, ' ') : 'Source';

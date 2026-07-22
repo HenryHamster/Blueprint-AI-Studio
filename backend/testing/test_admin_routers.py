@@ -3135,15 +3135,11 @@ class TestPurgeArchive:
         assert gone is None
 
     @pytest.mark.asyncio
-    async def test_purge_deletes_payloadless_and_agent_executed_resident_archive(
+    async def test_purge_deletes_payloadless_and_agent_executed_archive(
         self, client: AsyncClient, db_session
     ):
-        # Since #be905b401 made strategic_resident_turn agent-executed,
-        # BACKEND_MANAGED_TASK_TYPES is empty, so the archive-purge no longer
-        # special-cases resident-turn shadow rows — both archived tasks are
-        # purged. The durable Resident control-plane state (checkpoints /
-        # operation receipts) is preserved by its own FKs, independent of the
-        # ephemeral turn task, so purging the archived turn row is safe.
+        # BACKEND_MANAGED_TASK_TYPES is empty, so the archive-purge does not
+        # special-case any agent-executed rows — both archived tasks are purged.
         # NOTE: with no backend-managed task types currently defined, the purge's
         # "keep backend-managed" branch is presently vacuous — follow-up: prune
         # it or reintroduce a backend-managed type to re-cover it.
@@ -3155,15 +3151,15 @@ class TestPurgeArchive:
             archived=True,
             status=TaskStatus.COMPLETED,
         )
-        shadow = Task(
+        agent_executed = Task(
             project_id=project.id,
-            title="Resident shadow",
-            payloads=[{"type": "strategic_resident_turn"}],
+            title="Agent-executed archive",
+            payloads=[{"type": "create"}],
             archived=True,
             status=TaskStatus.QUEUED,
         )
         db_session.add(payloadless)
-        db_session.add(shadow)
+        db_session.add(agent_executed)
         await db_session.commit()
 
         response = await client.post("/api/admin/tasks/purge-archive", json={})
@@ -3172,14 +3168,16 @@ class TestPurgeArchive:
         remaining_ids = set(
             (
                 await db_session.execute(
-                    select(Task.id).where(Task.id.in_([payloadless.id, shadow.id]))
+                    select(Task.id).where(
+                        Task.id.in_([payloadless.id, agent_executed.id])
+                    )
                 )
             )
             .scalars()
             .all()
         )
         assert payloadless.id not in remaining_ids
-        assert shadow.id not in remaining_ids
+        assert agent_executed.id not in remaining_ids
 
     @pytest.mark.asyncio
     async def test_purge_older_than_days_filter(self, client: AsyncClient, db_session):
@@ -3622,42 +3620,6 @@ class TestAutonomousMode:
 
         await db_session.refresh(project)
         assert project.paused is False
-
-    @pytest.mark.asyncio
-    async def test_project_pause_syncs_resident_policy_and_restores_deadline(
-        self, client: AsyncClient, db_session
-    ):
-        from app.strategic_resident_checkpointing import initialize_strategic_resident
-
-        project = await _make_project(db_session)
-        resident = await initialize_strategic_resident(
-            db_session,
-            project.id,
-            locked_project=project,
-        )
-        deadline = _utcnow() + timedelta(hours=2)
-        resident.scheduling_state = {"deadline_at": deadline.isoformat()}
-        resident.next_wakeup_at = deadline
-        db_session.add(resident)
-        await db_session.commit()
-
-        paused = await client.patch(
-            f"/api/admin/projects/{project.id}/pause",
-            json={"paused": True},
-        )
-        assert paused.status_code == 200
-        await db_session.refresh(resident)
-        assert resident.background_policy == "paused"
-        assert resident.next_wakeup_at is None
-
-        resumed = await client.patch(
-            f"/api/admin/projects/{project.id}/pause",
-            json={"paused": False},
-        )
-        assert resumed.status_code == 200
-        await db_session.refresh(resident)
-        assert resident.background_policy == "active"
-        assert resident.next_wakeup_at == deadline
 
     @pytest.mark.asyncio
     async def test_pause_project_missing_field_returns_400(
@@ -6385,7 +6347,7 @@ class TestMessages:
         assert len(replies) == 1
         assert replies[0].content == "Take path A."
         assert (
-            replies[0].context["_resident_wakeup_state"]
+            replies[0].context["_operator_wakeup_state"]
             == first.json()["wakeup_state"]
         )
 
@@ -6581,7 +6543,7 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Use approach A."
-        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
+        assert note.context.get("_operator_wakeup_state") == body["wakeup_state"]
         assert "strategic_session" not in note.context
         assert body["reply_message_id"] == str(note.id)
         assert body["reply_message"]["id"] == str(note.id)
@@ -6748,7 +6710,7 @@ class TestMessages:
         note = notes[0]
         assert note.actor_user_id == TEST_USER_ID
         assert note.context.get("event_type") == "feedback_reply"
-        assert note.context.get("_resident_wakeup_state") == body["wakeup_state"]
+        assert note.context.get("_operator_wakeup_state") == body["wakeup_state"]
         assert note.context.get("reply_to") == str(feedback.id)
         assert (
             note.context.get("resolution")
@@ -7351,67 +7313,6 @@ class TestMessages:
             **attachment,
             "filename": "screenshot.png",
         }]
-
-    @pytest.mark.asyncio
-    async def test_create_message_stamps_resident_session_id_when_active(
-        self, client: AsyncClient, db_session
-    ):
-        """A message created during an active resident session is stamped with
-        the session's ID (resident_session_id column). Verifies the write path
-        in create_operator_project_message that reads resident_blob and sets
-        resident_session_id on the new ProjectMessage row."""
-        from sqlalchemy.orm.attributes import flag_modified
-
-        SESSION_ID = "ss-stamp-test-001"
-        project = await _make_project(db_session)
-        project.vision = {
-            "_resident_strategic_session": {
-                "session_id": SESSION_ID,
-                "status": "active",
-                "stop_requested": False,
-            }
-        }
-        flag_modified(project, "vision")
-        db_session.add(project)
-        await db_session.commit()
-
-        resp = await client.post(
-            "/api/admin/messages",
-            json={
-                "project_id": str(project.id),
-                "message_type": "NOTE",
-                "content": "Message sent during active session.",
-            },
-        )
-        assert resp.status_code == 200, resp.text
-        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
-        assert msg is not None
-        assert msg.resident_session_id == SESSION_ID, (
-            f"expected resident_session_id={SESSION_ID!r}, got {msg.resident_session_id!r}"
-        )
-
-    @pytest.mark.asyncio
-    async def test_create_message_no_stamp_when_no_active_session(
-        self, client: AsyncClient, db_session
-    ):
-        """A message created without an active resident session has
-        resident_session_id=None (cadence / legacy path)."""
-        project = await _make_project(db_session)
-
-        resp = await client.post(
-            "/api/admin/messages",
-            json={
-                "project_id": str(project.id),
-                "message_type": "NOTE",
-                "content": "Cadence message, no active session.",
-            },
-        )
-        assert resp.status_code == 200, resp.text
-        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
-        assert msg is not None
-        assert msg.resident_session_id is None, (
-            f"expected resident_session_id=None (no active session), got {msg.resident_session_id!r}"
-        )
 
     @pytest.mark.asyncio
     async def test_get_message_counts_empty(self, client: AsyncClient, db_session):
@@ -9576,8 +9477,8 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_resident_strategic_session_settings(self, client: AsyncClient):
-        """The seven resident-strategic-session settings expose their contract
+    async def test_strategic_session_settings(self, client: AsyncClient):
+        """The six strategic-session settings expose their contract
         defaults on GET, round-trip through PATCH, and reject bad values.
 
         Other builders reference these by name, so the names + defaults are
@@ -9586,8 +9487,7 @@ class TestNotificationConfigSettings:
         strategic_local_hold_timeout_seconds (900),
         strategic_session_idle_tick_seconds (5),
         strategic_session_turn_timeout_seconds (120),
-        strategic_session_max_unattended_seconds (14400),
-        resident_session_heartbeat_stale_seconds (1500)."""
+        strategic_session_max_unattended_seconds (14400)."""
         get_resp = await client.get("/api/admin/settings")
         assert get_resp.status_code == 200
         data = get_resp.json()
@@ -9597,7 +9497,6 @@ class TestNotificationConfigSettings:
         assert data["strategic_session_idle_tick_seconds"] == 5
         assert data["strategic_session_turn_timeout_seconds"] == 120
         assert data["strategic_session_max_unattended_seconds"] == 14400
-        assert data["resident_session_heartbeat_stale_seconds"] == 1500
 
         # Feature flag round-trips; only a real boolean is accepted.
         resp = await client.patch(
@@ -9624,7 +9523,6 @@ class TestNotificationConfigSettings:
                 "strategic_session_idle_tick_seconds": 3,
                 "strategic_session_turn_timeout_seconds": 300,
                 "strategic_session_max_unattended_seconds": 7200,
-                "resident_session_heartbeat_stale_seconds": 1200,
             },
         )
         assert resp.status_code == 200, resp.text
@@ -9634,7 +9532,6 @@ class TestNotificationConfigSettings:
         assert data["strategic_session_idle_tick_seconds"] == 3
         assert data["strategic_session_turn_timeout_seconds"] == 300
         assert data["strategic_session_max_unattended_seconds"] == 7200
-        assert data["resident_session_heartbeat_stale_seconds"] == 1200
 
         # Out-of-range / non-numeric are rejected. The continuation TTL and
         # local-hold timeout ceilings are lowered to 7200s (2h) so an operator
@@ -9648,8 +9545,6 @@ class TestNotificationConfigSettings:
             ("strategic_session_turn_timeout_seconds", 99999),  # > 3600
             ("strategic_session_max_unattended_seconds", 30),  # < 60
             ("strategic_session_max_unattended_seconds", 99999),  # > 28800
-            ("resident_session_heartbeat_stale_seconds", 10),  # < 60
-            ("resident_session_heartbeat_stale_seconds", 99999),  # > 7200
         ):
             bad = await client.patch("/api/admin/settings", json={key: bad_val})
             assert bad.status_code == 400, f"{key}={bad_val!r} should be rejected"
@@ -11176,7 +11071,7 @@ class TestEvergreenFillSettingsPersist:
     async def test_strategic_session_settings_persist_across_sync(
         self, client: AsyncClient, db_session
     ):
-        """The resident-strategic-session settings persist into
+        """The strategic-session settings persist into
         DeploymentState.runtime_config_json AND are restored by
         sync_runtime_config_from_state, so an enable/tune survives a Cloud Run
         restart and reaches the leader across instances (regression: they were
@@ -11198,7 +11093,6 @@ class TestEvergreenFillSettingsPersist:
                 "strategic_session_idle_tick_seconds": 3,
                 "strategic_session_turn_timeout_seconds": 300,
                 "strategic_session_max_unattended_seconds": 7200,
-                "resident_session_heartbeat_stale_seconds": 1200,
             },
         )
         assert resp.status_code == 200, resp.text
@@ -11215,9 +11109,6 @@ class TestEvergreenFillSettingsPersist:
         assert (
             row.runtime_config_json["strategic_session_max_unattended_seconds"] == 7200
         )
-        assert (
-            row.runtime_config_json["resident_session_heartbeat_stale_seconds"] == 1200
-        )
 
         # Config-sync restore applies persisted values to a fresh in-memory config
         # (mirrors what a cold Cloud Run instance / the leader does on boot).
@@ -11227,7 +11118,6 @@ class TestEvergreenFillSettingsPersist:
         _shared_state.runtime_config["strategic_session_idle_tick_seconds"] = 5
         _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] = 120
         _shared_state.runtime_config["strategic_session_max_unattended_seconds"] = 14400
-        _shared_state.runtime_config["resident_session_heartbeat_stale_seconds"] = 1500
 
         await sync_runtime_config_from_state(row)
 
@@ -11243,10 +11133,6 @@ class TestEvergreenFillSettingsPersist:
         assert (
             _shared_state.runtime_config["strategic_session_max_unattended_seconds"]
             == 7200
-        )
-        assert (
-            _shared_state.runtime_config["resident_session_heartbeat_stale_seconds"]
-            == 1200
         )
 
 
@@ -30928,29 +30814,29 @@ class TestTaskListPlanSubtasksContract:
     ):
         project = await _make_project(db_session)
         normal = Task(project_id=project.id, title="normal", payloads=[])
-        shadow = Task(
+        archived = Task(
             project_id=project.id,
-            title="shadow",
-            payloads=[{"type": "strategic_resident_turn"}],
+            title="archived",
+            payloads=[{"type": "create"}],
             archived=True,
         )
         db_session.add(normal)
-        db_session.add(shadow)
+        db_session.add(archived)
         await db_session.commit()
 
         default = await client.get(f"/api/admin/tasks?project_id={project.id}")
         # BACKEND_MANAGED_TASK_TYPES is empty now, so the default view no longer
-        # hides the backend-managed shadow row — it matches the debug view below.
+        # hides any backend-managed row — it matches the debug view below.
         assert {row["title"] for row in default.json()["tasks"]} == {
             "normal",
-            "shadow",
+            "archived",
         }
         debug = await client.get(
             f"/api/admin/tasks?project_id={project.id}&include_backend_managed=true"
         )
         assert {row["title"] for row in debug.json()["tasks"]} == {
             "normal",
-            "shadow",
+            "archived",
         }
 
     @pytest.mark.asyncio

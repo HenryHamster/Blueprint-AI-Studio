@@ -7,7 +7,7 @@ import type { ProjectMessage } from '../types/messages';
 import { parseTimestamp } from '../utils/time';
 import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 
-export function compareResidentMessages(a: ProjectMessage, b: ProjectMessage): number {
+export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
     if (a.sequence == null) return -1;
     if (b.sequence == null) return 1;
@@ -18,7 +18,7 @@ export function compareResidentMessages(a: ProjectMessage, b: ProjectMessage): n
   return timeDelta || a.id.localeCompare(b.id);
 }
 
-export function mergeResidentConversationPages(
+export function mergeConversationPages(
   existing: ProjectMessage[],
   incoming: ProjectMessage[],
 ): ProjectMessage[] {
@@ -34,15 +34,15 @@ export function mergeResidentConversationPages(
       }
     }
     const current = mergedById.get(message.id);
-    mergedById.set(message.id, current && residentMessagesEqual(current, message) ? current : message);
+    mergedById.set(message.id, current && conversationMessagesEqual(current, message) ? current : message);
   }
-  const merged = [...mergedById.values()].sort(compareResidentMessages);
+  const merged = [...mergedById.values()].sort(compareConversationMessages);
   return merged.length === existing.length && merged.every((message, index) => message === existing[index])
     ? existing
     : merged;
 }
 
-export function residentMessagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
+export function conversationMessagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
   return a.id === b.id
     && a.project_id === b.project_id
     && a.message_type === b.message_type
@@ -65,7 +65,7 @@ export function residentMessagesEqual(a: ProjectMessage, b: ProjectMessage): boo
     && JSON.stringify(a.context ?? {}) === JSON.stringify(b.context ?? {});
 }
 
-interface UseResidentConversationOptions {
+interface UseConversationOptions {
   enabled: boolean;
   projectId: string | null;
   actorUserId: string | null;
@@ -85,7 +85,7 @@ interface UseResidentConversationOptions {
   onTargetFetched?: (messageId: string) => void;
 }
 
-export function useResidentConversation({
+export function useConversation({
   enabled,
   projectId,
   actorUserId,
@@ -100,7 +100,7 @@ export function useResidentConversation({
   onLoadingChange,
   onError,
   onTargetFetched,
-}: UseResidentConversationOptions) {
+}: UseConversationOptions) {
   const [hasMore, setHasMore] = useState(false);
   const [nextBeforeSequence, setNextBeforeSequence] = useState<number | null>(null);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -194,13 +194,13 @@ export function useResidentConversation({
         if (!isCurrentRequest()) return;
         if (isStrategicConversationNotModified(gapResult)) break;
         const gapItems = gapResult.conversation.items ?? [];
-        page = mergeResidentConversationPages(page, gapItems);
+        page = mergeConversationPages(page, gapItems);
         cursor = gapResult.conversation.next_before_sequence ?? null;
         pageHasMore = Boolean(gapResult.conversation.has_more);
         gapPages += 1;
       }
       if (!isCurrentRequest()) return;
-      const merged = normalizedSearch ? page.slice().sort(compareResidentMessages) : mergeResidentConversationPages(existing, page);
+      const merged = normalizedSearch ? page.slice().sort(compareConversationMessages) : mergeConversationPages(existing, page);
       setMessages(merged);
       if (forwardFrom == null) {
         setHasMore(normalizedSearch ? false : pageHasMore);
@@ -240,7 +240,7 @@ export function useResidentConversation({
         limit: 100,
       }, controller.signal);
       if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
-      setMessages(previous => mergeResidentConversationPages(previous, result.conversation.items ?? []));
+      setMessages(previous => mergeConversationPages(previous, result.conversation.items ?? []));
       setHasMore(Boolean(result.conversation.has_more));
       setNextBeforeSequence(result.conversation.next_before_sequence ?? null);
     } catch (error) {
@@ -274,7 +274,7 @@ export function useResidentConversation({
       if (isStrategicConversationNotModified(result) || !isCurrentRequest()) return;
       const canonical = (result.conversation.items ?? []).find(message => message.id === messageId);
       if (canonical) {
-        setMessages(previous => mergeResidentConversationPages(previous, [canonical]));
+        setMessages(previous => mergeConversationPages(previous, [canonical]));
       }
     } catch (error) {
       if (isCurrentRequest() && !(error instanceof DOMException && error.name === 'AbortError')) {
@@ -309,7 +309,7 @@ export function useResidentConversation({
       }, 0);
       return () => window.clearTimeout(timer);
     }
-    setMessages(previous => mergeResidentConversationPages(previous, [realtimeMessage]));
+    setMessages(previous => mergeConversationPages(previous, [realtimeMessage]));
     const timer = window.setTimeout(() => { void refresh(priorMax != null, priorMax); }, 0);
     return () => window.clearTimeout(timer);
   }, [enabled, getMessages, normalizedSearch, projectId, realtimeMessage, realtimeMessageRequiresCanonicalRefetch, refetchCanonicalMessage, refresh, setMessages]);

@@ -495,7 +495,7 @@ export default function App() {
 
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId, { pollerEnabled: chatPollersEnabled });
   // Monotonic epoch that advances each time the strategic-state poll delivers
-  // new data. Threaded into MessagesPanel → useResidentConversation so the
+  // new data. Threaded into MessagesPanel → useConversation so the
   // conversation refresh piggybacks on the strategic-state poll cadence instead
   // of running its own independent timer (eliminating the duplicate assembly).
   const strategicPollEpochRef = useRef(0);
@@ -506,8 +506,8 @@ export default function App() {
       setStrategicPollEpoch(strategicPollEpochRef.current);
     }
   }, [strategicReadModel.data]);
-  // Fast mode + resident-session liveness probe: resolves the mode indicator and
-  // active/dead chip on reload well before the heavy strategic-state fetch lands.
+  // Fast mode + session liveness probe: resolves the mode indicator on reload
+  // well before the heavy strategic-state fetch lands.
   // Once strategicReadModel.data hydrates, its values take precedence (fallback
   // in useStrategicSession), so there is no flicker when the full state arrives.
   const strategicLiveness = useStrategicLiveness(s.selectedProjectId, { enabled: chatPollersEnabled });
@@ -522,30 +522,16 @@ export default function App() {
   const {
     strategicWorkbenchState,
     strategicInteractionMode,
-    strategicSessionActive,
-    strategicSessionStatus,
-    residentStrategicSession,
-    residentStrategicSessionAvailable,
-    strategicSessionState,
-    strategicSessionReason,
-    residentStrategicSessionRunners,
-    strategicSessionSelectedRunnerId,
     savingStrategicWorkbench,
     checkingInStrategicSession,
-    strategicSessionBusy,
     chatComposerContextDescriptor,
     taskContextSessionProps,
     persistStrategicWorkbench,
     updateStrategicSessionRefs,
-    handleSelectStrategicRunner,
     handleStrategicCheckIn,
-    handleStartStrategicSession,
-    handleStopStrategicSession,
     strategicWorkbenchOperatorSurfaceTouchedRef,
     strategicWorkbenchRestoreProjectRef,
   } = useStrategicSession({ selectedProjectId, addToast: s.addToast, strategicReadModel, strategicLiveness: strategicLiveness.data });
-  const strategicOperatorDecisionSummary = residentStrategicSession?.operator_decision_summary ?? null;
-  const strategicTurnLatencySummary = residentStrategicSession?.turn_latency_summary ?? null;
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -1274,19 +1260,7 @@ export default function App() {
         savingSession={savingStrategicWorkbench}
         savingSessionRefs={savingStrategicWorkbench}
         accountSpend={strategicAccountSpend}
-        sessionActive={strategicSessionActive}
-        sessionStatus={strategicSessionStatus}
-        sessionState={strategicSessionState}
-        sessionReason={strategicSessionReason}
-        sessionBusy={strategicSessionBusy}
-        sessionRunners={residentStrategicSessionRunners}
-        sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
-        operatorDecisionSummary={strategicOperatorDecisionSummary}
-        turnLatencySummary={strategicTurnLatencySummary}
         projectId={selectedProjectId}
-        onSelectRunner={handleSelectStrategicRunner}
-        onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
-        onStopSession={handleStopStrategicSession}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
@@ -1361,18 +1335,6 @@ export default function App() {
                 localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
                 accountSpend={strategicAccountSpend}
-                sessionActive={strategicSessionActive}
-                sessionStatus={strategicSessionStatus}
-                sessionState={strategicSessionState}
-                sessionReason={strategicSessionReason}
-                sessionBusy={strategicSessionBusy}
-                sessionRunners={residentStrategicSessionRunners}
-                sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
-                operatorDecisionSummary={strategicOperatorDecisionSummary}
-                turnLatencySummary={strategicTurnLatencySummary}
-                onSelectRunner={handleSelectStrategicRunner}
-                onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
-                onStopSession={handleStopStrategicSession}
                 onModeChange={setStrategicInteractionMode}
                 onOpenDevices={() => {
                   setRuntimeSection('devices');

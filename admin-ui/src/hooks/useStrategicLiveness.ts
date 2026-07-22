@@ -4,7 +4,7 @@ import { fetchStrategicLiveness, type StrategicLivenessResponse } from '../strat
 
 /**
  * Lightweight probe that resolves the operator's interaction mode and the
- * resident-session liveness chip on reload BEFORE the heavy
+ * strategic-session liveness chip on reload BEFORE the heavy
  * {@link useStrategicReadModel} fetch lands. Hits the cheap
  * `strategic-liveness` endpoint (no Phase-1/Phase-2 assembly) once per project,
  * so the mode indicator and active/dead chip render fast; the full read model

@@ -55,7 +55,7 @@ describe('MessagesComposer — clickable pending image preview', () => {
       onRemoveArtifactRef,
     });
 
-    expect(screen.getByLabelText('Attached Resident sources')).toBeTruthy();
+    expect(screen.getByLabelText('Attached sources')).toBeTruthy();
     expect(screen.getByText('Notes revision 7')).toBeTruthy();
     fireEvent.click(screen.getByLabelText('Remove Notes revision 7'));
     expect(onRemoveArtifactRef).toHaveBeenCalledWith('tool-ref-7');

@@ -6,24 +6,6 @@ import {
   ConflictError,
   type ToolContent,
 } from '../api/projectTools';
-import { auth } from '../firebase';
-import { deleteMessageAttachmentUpload } from '../strategicStateApi';
-import { uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
-import { renderWhiteboardArtifact } from '../utils/renderWhiteboardArtifact';
-import { dispatchResidentToolHandoff } from '../utils/residentToolHandoff';
-import {
-  createPendingWhiteboardArtifactOperation,
-  isPendingWhiteboardArtifactStorageKey,
-  loadPendingWhiteboardArtifactOperations,
-  persistPendingWhiteboardArtifactOperation,
-  removePendingWhiteboardArtifactOperation,
-  settlePendingWhiteboardArtifactOperation,
-  type PendingWhiteboardArtifactOperation,
-} from '../utils/pendingWhiteboardArtifactRef';
-import {
-  ToolResidentHandoffControls,
-  type ToolResidentHandoffIntent,
-} from './ToolResidentHandoffControls';
 
 // ---------------------------------------------------------------------------
 // Canvas content model
@@ -159,12 +141,6 @@ type LoadState =
   | { status: 'error'; message: string }
   | { status: 'ready' };
 
-type ArtifactPreparationState =
-  | { status: 'idle' }
-  | { status: 'preparing'; operation: PendingWhiteboardArtifactOperation }
-  | { status: 'waiting'; operation: PendingWhiteboardArtifactOperation }
-  | { status: 'terminal'; operation: PendingWhiteboardArtifactOperation };
-
 export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -182,7 +158,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
   const [dirty, setDirty] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [artifactPreparation, setArtifactPreparation] = useState<ArtifactPreparationState>({ status: 'idle' });
 
   // Refs mirror the latest values so async save handlers and pointer handlers
   // always read fresh state without re-binding.
@@ -354,156 +329,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       }
     }
   }, [projectId, tool.id, mergeAfterConflict]);
-
-  const settleArtifactPreparation = useCallback(async (
-    operation: PendingWhiteboardArtifactOperation,
-  ) => {
-    if (mountedRef.current) {
-      setActionError(null);
-      setArtifactPreparation({ status: 'preparing', operation });
-    }
-    const settlement = await settlePendingWhiteboardArtifactOperation(operation);
-    if (settlement.state === 'ready') {
-      const currentActorUserId = auth.currentUser?.uid ?? auth.currentUser?.email;
-      if (currentActorUserId !== operation.actor_user_id) {
-        const retained = {
-          ...settlement.operation,
-          last_error: 'Operator changed while the Whiteboard was preparing. Sign back in to finish this handoff.',
-          updated_at: Date.now(),
-        };
-        persistPendingWhiteboardArtifactOperation(retained);
-        if (mountedRef.current) setArtifactPreparation({ status: 'waiting', operation: retained });
-        return false;
-      }
-      const handedOff = dispatchResidentToolHandoff({
-        projectId: operation.project_id,
-        artifactRef: settlement.artifactRef,
-        intent: operation.intent,
-        laneOwner: operation.lane_owner,
-        prompt: operation.prompt,
-      });
-      if (handedOff) {
-        removePendingWhiteboardArtifactOperation(settlement.operation);
-        if (mountedRef.current) setArtifactPreparation({ status: 'idle' });
-        return true;
-      }
-      const retained = {
-        ...settlement.operation,
-        last_error: 'Resident handoff could not be stored. Resume to retry safely.',
-        updated_at: Date.now(),
-      };
-      persistPendingWhiteboardArtifactOperation(retained);
-      if (mountedRef.current) setArtifactPreparation({ status: 'waiting', operation: retained });
-      return false;
-    }
-    if (mountedRef.current) {
-      setArtifactPreparation({ status: settlement.state, operation: settlement.operation });
-    }
-    return false;
-  }, []);
-
-  const createAndSettleArtifactPreparation = useCallback(async (
-    intent: ToolResidentHandoffIntent,
-    laneOwner?: string,
-    replaces?: PendingWhiteboardArtifactOperation,
-  ) => {
-    let saved = await flush();
-    if (saved && serialize(contentRef.current) !== lastSavedRef.current) saved = await flush();
-    if (!saved || serialize(contentRef.current) !== lastSavedRef.current) {
-      throw new Error('Whiteboard is not durably saved yet. Wait for Saved, then retry.');
-    }
-
-    const revision = revisionRef.current;
-    const rendered = await renderWhiteboardArtifact(contentRef.current, revision);
-    const { uploaded } = await uploadConversationAttachments(projectId, [{
-      file: rendered.file,
-      mime_type: rendered.file.type,
-      name: rendered.file.name,
-    }]);
-    const upload = uploaded[0];
-    if (!upload?.attachment_id || !upload.storage_uri) {
-      if (upload?.attachment_id) {
-        await deleteMessageAttachmentUpload(projectId, upload.attachment_id).catch(() => undefined);
-      }
-      throw new Error('Whiteboard image upload did not return a durable receipt.');
-    }
-    const renderedImage = {
-      attachment_id: upload.attachment_id,
-      storage_uri: upload.storage_uri,
-      checksum: rendered.checksum,
-      mime_type: rendered.file.type,
-      width: rendered.width,
-      height: rendered.height,
-    };
-    const actorUserId = auth.currentUser?.uid ?? auth.currentUser?.email;
-    if (!actorUserId) {
-      await deleteMessageAttachmentUpload(projectId, upload.attachment_id).catch(() => undefined);
-      throw new Error('Your operator session is not ready. Sign in, then retry.');
-    }
-    const operation = createPendingWhiteboardArtifactOperation({
-      actorUserId,
-      projectId,
-      toolId: tool.id,
-      toolTitle: tool.title,
-      revision,
-      intent,
-      laneOwner,
-      prompt: intent === 'ask'
-        ? `Review Whiteboard "${tool.title}" revision ${revision} and answer my question.`
-        : `Use Whiteboard "${tool.title}" revision ${revision} as exact project context.`,
-      renderedImage,
-    });
-    // This is the effect boundary: persist the exact receipt, render metadata,
-    // and user intent before the first POST. Every retry reuses this object;
-    // no retry can rerender or upload a second image.
-    if (!persistPendingWhiteboardArtifactOperation(operation)) {
-      await deleteMessageAttachmentUpload(projectId, upload.attachment_id).catch(() => undefined);
-      throw new Error('Could not durably store the Whiteboard preparation. Free browser storage, then retry.');
-    }
-    if (replaces) removePendingWhiteboardArtifactOperation(replaces);
-    const ready = await settleArtifactPreparation(operation);
-    if (!ready) {
-      const latest = loadPendingWhiteboardArtifactOperations(actorUserId, projectId, tool.id)
-        .find(item => item.operation_id === operation.operation_id);
-      if (latest?.state === 'terminal') {
-        throw new Error(latest.last_error || 'Whiteboard preparation was rejected. Retry with a fresh render.');
-      }
-      throw new Error('Whiteboard is still preparing. Resume will reuse the same durable upload.');
-    }
-  }, [flush, projectId, settleArtifactPreparation, tool.id, tool.title]);
-
-  const handoffToResident = useCallback(async (
-    intent: ToolResidentHandoffIntent,
-    laneOwner?: string,
-  ) => createAndSettleArtifactPreparation(intent, laneOwner), [createAndSettleArtifactPreparation]);
-
-  // Pending preparation belongs to the operator/project/tool, not this mounted
-  // tab. Resume it on remount and when another tab persists the same operation.
-  useEffect(() => {
-    const actorUserId = auth.currentUser?.uid ?? auth.currentUser?.email;
-    if (!actorUserId) return;
-    let cancelled = false;
-    const resumeStored = async () => {
-      const operations = loadPendingWhiteboardArtifactOperations(actorUserId, projectId, tool.id);
-      const terminal = [...operations].reverse().find(item => item.state === 'terminal');
-      if (!cancelled && terminal) setArtifactPreparation({ status: 'terminal', operation: terminal });
-      for (const operation of operations.filter(item => item.state === 'pending')) {
-        if (cancelled) return;
-        await settleArtifactPreparation(operation);
-      }
-    };
-    void resumeStored();
-    const onStorage = (event: StorageEvent) => {
-      if (isPendingWhiteboardArtifactStorageKey(event.key, actorUserId, projectId, tool.id)) {
-        void resumeStored();
-      }
-    };
-    window.addEventListener('storage', onStorage);
-    return () => {
-      cancelled = true;
-      window.removeEventListener('storage', onStorage);
-    };
-  }, [projectId, settleArtifactPreparation, tool.id]);
 
   // Debounced autosave. Re-armed on every content change while dirty; a bare
   // revision refresh (dirty=false) never schedules a save.
@@ -1090,69 +915,6 @@ export default function WhiteboardTool({ projectId, tool }: ToolComponentProps) 
       />
 
       {actionError && <p className="text-xs text-amber-400">{actionError}</p>}
-
-      <ToolResidentHandoffControls
-        toolLabel="Whiteboard"
-        disabledReason={
-          saveStatus === 'saving'
-            ? 'Wait for the current save to finish.'
-            : saveStatus === 'error'
-              ? 'Retry the failed save before sharing this revision.'
-              : artifactPreparation.status === 'waiting'
-                ? 'Resume the durable preparation below; a new upload is not needed.'
-                : artifactPreparation.status === 'terminal'
-                  ? 'Use the fresh-render retry below to preserve this Share/Ask intent.'
-                  : null
-        }
-        preparing={artifactPreparation.status === 'preparing'}
-        onHandoff={handoffToResident}
-      />
-
-      {artifactPreparation.status === 'waiting' && (
-        <div className="rounded border border-sky-500/30 bg-sky-950/20 p-2 text-xs text-sky-200" role="status">
-          <p>The Whiteboard preparation is durable but still waiting. Its exact upload receipt will be reused.</p>
-          <button
-            type="button"
-            className="mt-1 min-h-[44px] rounded border border-sky-500/40 px-2 hover:bg-sky-500/10"
-            onClick={() => {
-              setActionError(null);
-              void settleArtifactPreparation(artifactPreparation.operation).then(ready => {
-                if (!ready && mountedRef.current) {
-                  setActionError('Whiteboard is still preparing. You can safely resume again.');
-                }
-              });
-            }}
-          >
-            Resume preparation
-          </button>
-        </div>
-      )}
-
-      {artifactPreparation.status === 'terminal' && (
-        <div className="rounded border border-amber-500/30 bg-amber-950/20 p-2 text-xs text-amber-200" role="alert">
-          <p>{artifactPreparation.operation.last_error || 'Whiteboard preparation needs a fresh render.'}</p>
-          <p className="mt-1 text-amber-300/80">Your Share/Ask intent and lane ownership are preserved.</p>
-          <button
-            type="button"
-            className="mt-1 min-h-[44px] rounded border border-amber-500/40 px-2 hover:bg-amber-500/10"
-            onClick={() => {
-              const previous = artifactPreparation.operation;
-              setActionError(null);
-              void createAndSettleArtifactPreparation(
-                previous.intent,
-                previous.lane_owner,
-                previous,
-              ).catch(cause => {
-                if (mountedRef.current) {
-                  setActionError(cause instanceof Error ? cause.message : 'Whiteboard retry failed.');
-                }
-              });
-            }}
-          >
-            Retry with fresh render
-          </button>
-        </div>
-      )}
 
       {/* Canvas surface */}
       <div

@@ -420,7 +420,7 @@ describe('StrategicSessionControl', () => {
     expect(screen.getByLabelText(/runtime work idle/i)).toBeInTheDocument();
   });
 
-  it('shows an off resident-session chip when the feature is off', () => {
+  it('shows an off session chip when the feature is off', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -431,10 +431,10 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: sessions off/i }),
+      screen.getByRole('status', { name: /strategic session: sessions off/i }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /stop resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /start strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /stop strategic session/i })).toBeNull();
   });
 
   it('still renders the legacy dark state as sessions off', () => {
@@ -448,11 +448,11 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: sessions off/i }),
+      screen.getByRole('status', { name: /strategic session: sessions off/i }),
     ).toBeInTheDocument();
   });
 
-  it('shows a starting resident session with Stop and no Start', () => {
+  it('shows a starting session with Stop and no Start', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -464,13 +464,13 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: starting/i }),
+      screen.getByRole('status', { name: /strategic session: starting/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/agent not yet streaming/i)).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /stop resident strategic session/i }),
+      screen.getByRole('button', { name: /stop strategic session/i }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /start strategic session/i })).toBeNull();
   });
 
   it('surfaces a no-runner reason with a Start fallback in Workday mode', () => {
@@ -486,7 +486,7 @@ describe('StrategicSessionControl', () => {
 
     expect(screen.getByText('No live local runner')).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /start resident strategic session/i }),
+      screen.getByRole('button', { name: /start strategic session/i }),
     ).toBeInTheDocument();
   });
 
@@ -538,12 +538,12 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: start failed/i }),
+      screen.getByRole('status', { name: /strategic session: start failed/i }),
     ).toBeInTheDocument();
     expect(screen.getByText(/start failed: no task to host session/i)).toBeInTheDocument();
   });
 
-  it('shows an active resident session with Stop and no Start', () => {
+  it('shows an active session with Stop and no Start', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -557,15 +557,15 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: active/i }),
+      screen.getByRole('status', { name: /strategic session: active/i }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole('button', { name: /stop resident strategic session/i }),
+      screen.getByRole('button', { name: /stop strategic session/i }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /start strategic session/i })).toBeNull();
   });
 
-  it('shows a ready resident session that auto-starts on Workday entry', () => {
+  it('shows a ready session that auto-starts on Workday entry', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -576,7 +576,7 @@ describe('StrategicSessionControl', () => {
     );
 
     expect(
-      screen.getByRole('status', { name: /resident strategic session: ready/i }),
+      screen.getByRole('status', { name: /strategic session: ready/i }),
     ).toBeInTheDocument();
   });
 
@@ -638,9 +638,9 @@ describe('StrategicSessionControl', () => {
     // Stop stays available so the operator can restart; Start does not show for a
     // still-"active" blob.
     expect(
-      screen.getByRole('button', { name: /stop resident strategic session/i }),
+      screen.getByRole('button', { name: /stop strategic session/i }),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /start strategic session/i })).toBeNull();
     // The device dropdown remains so a new device can be chosen for the restart.
     expect(screen.getByRole('combobox', { name: /workday device/i })).toBeInTheDocument();
   });

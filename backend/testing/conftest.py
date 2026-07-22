@@ -87,23 +87,8 @@ _app_database._LazyEngine._engine = engine
 
 
 def _postgres_cleanup_tables():
-    """Return a delete order that also handles the Resident checkpoint cycle."""
+    """Return a FK-order delete list (children before parents)."""
     ordered_tables = list(reversed(SQLModel.metadata.sorted_tables))
-
-    # A Resident owns checkpoints (checkpoint.project_id -> resident, CASCADE)
-    # while also pointing at its current/previous checkpoint (SET NULL). The
-    # generic dependency sort cannot linearize that cycle and puts checkpoints
-    # first. Deleting one then fires the production rotation fence, which
-    # correctly refuses to clear a live Resident pointer. Delete the Resident
-    # first instead: PostgreSQL cascades its checkpoints/receipts atomically,
-    # and the remaining generic sweep sees empty child tables.
-    resident = next(
-        (table for table in ordered_tables if table.name == "strategicresident"),
-        None,
-    )
-    if resident is not None:
-        ordered_tables.remove(resident)
-        ordered_tables.insert(0, resident)
     return ordered_tables
 
 
@@ -494,9 +479,8 @@ def missing_greenlet_proxy():
         # any read of proxy.id now raises MissingGreenlet
 
     This fixture generalises the ad-hoc ``_ProjectIdPoisonAfterRollback`` proxy
-    used in ``test_sync_resident_snapshots_project_id_before_rollback`` so that
-    future MissingGreenlet regression tests can reach for a shared, reusable
-    helper instead of reinventing the proxy each time.
+    pattern so that future MissingGreenlet regression tests can reach for a
+    shared, reusable helper instead of reinventing the proxy each time.
     """
     from sqlalchemy.exc import MissingGreenlet as _MG
 

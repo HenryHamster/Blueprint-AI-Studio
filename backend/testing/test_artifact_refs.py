@@ -1,4 +1,4 @@
-"""Tests for exact-revision human-tool handoff to the Strategic Resident."""
+"""Tests for exact-revision project-tool artifact refs and handoff."""
 
 from __future__ import annotations
 
@@ -10,12 +10,10 @@ import uuid
 from datetime import timedelta
 
 import pytest
-from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlmodel import select
 
 from app.artifact_refs import (
-    RESIDENT_ARTIFACT_REF_GRANTS_KEY,
     artifact_ref_projection,
     create_tool_artifact_ref,
 )
@@ -47,16 +45,6 @@ from app.routers.admin_project_strategic_session import (
     StrategicSessionMessageCreate,
     _validated_message_scoped_context,
 )
-from app.routers.agent_resident_artifacts import (
-    MAX_ARTIFACT_RETRIEVALS_PER_TURN,
-    _register_artifact_retrieval,
-    get_resident_turn_artifact,
-)
-from app.resident_agent_rate_limits import (
-    resident_remote_rate_key,
-    resident_task_token_rate_key,
-)
-from app.strategic_resident_context import _project_revisioned_refs
 from testing.conftest import USE_POSTGRES
 from app.storage import (
     ARTIFACT_BUCKET_NAME,
@@ -69,8 +57,6 @@ from app.storage import (
     delete_artifact_ref_project_prefix_best_effort,
     promote_artifact_ref_render,
 )
-from app.strategic_resident_checkpointing import initialize_strategic_resident
-from testing._resident_seed import seed_without_authority_enforcement
 
 
 TEST_USER_ID = "test-user-123"
@@ -117,7 +103,7 @@ async def test_notes_artifact_ref_endpoint_freezes_exact_bounded_revision(
     assert len(chip["excerpt"]) == 2_000
     assert chip["retrieval"] == {
         "capability": "inline_bounded_text",
-        "href": f"/api/agent/resident-turn/artifact?artifact_ref_id={chip['id']}",
+        "href": f"/api/admin/projects/{project.id}/artifact-refs/{chip['id']}",
     }
 
     fetched = await client.get(
@@ -1466,7 +1452,7 @@ async def test_message_context_accepts_exact_tool_ref_and_rejects_stale_checksum
         "author": "spoofed-user",
         "retrieval": {
             "capability": "inline_bounded_text",
-            "href": f"/api/agent/resident-turn/artifact?artifact_ref_id={ref.id}",
+            "href": f"/api/admin/projects/{project.id}/artifact-refs/{ref.id}",
         },
     }
     payload = StrategicSessionMessageCreate(
@@ -1479,12 +1465,6 @@ async def test_message_context_accepts_exact_tool_ref_and_rejects_stale_checksum
     )
     assert context["artifact_refs"][0]["artifact_ref_id"] == str(ref.id)
     assert context["artifact_refs"][0] == artifact_ref_projection(ref)
-    projected, omitted = _project_revisioned_refs(
-        context["artifact_refs"], project_id=project.id
-    )
-    assert omitted == 0
-    assert projected[0]["retrieval"]["capability"] == "inline_bounded_text"
-    assert projected[0]["artifact_ref_id"] == str(ref.id)
 
     payload.artifact_refs[0]["checksum"] = "0" * 64
     with pytest.raises(Exception) as caught:
@@ -1530,203 +1510,3 @@ def test_artifact_ref_model_is_registered():
         index.name for index in ProjectMessageAttachmentUpload.__table__.indexes
     }
     assert "ix_projectmessageattachmentupload_artifact_ref_id" in receipt_indexes
-
-
-def _resident_token(task: Task) -> dict:
-    return {
-        "sub": str(task.id),
-        "project_id": str(task.project_id),
-        "vm_instance_id": "runner:test",
-        "task_type": "strategic_resident_turn",
-        "claim_nonce": "nonce",
-    }
-
-
-def _rate_request(*, token: str, remote: str = "10.0.0.5"):
-    from starlette.requests import Request
-
-    return Request({
-        "type": "http",
-        "method": "GET",
-        "path": "/api/agent/resident-turn/artifact",
-        "headers": [(b"x-agent-token", token.encode())],
-        "client": (remote, 443),
-        "server": ("test", 80),
-        "scheme": "http",
-        "query_string": b"",
-    })
-
-
-def test_resident_agent_rate_keys_limit_token_and_remote_independently():
-    first = _rate_request(token="task-token-a")
-    same = _rate_request(token="task-token-a")
-    rotated = _rate_request(token="task-token-b")
-    other_remote = _rate_request(token="task-token-a", remote="10.0.0.6")
-
-    assert resident_task_token_rate_key(first) == resident_task_token_rate_key(same)
-    assert resident_task_token_rate_key(first) != resident_task_token_rate_key(rotated)
-    assert resident_remote_rate_key(first) == resident_remote_rate_key(rotated)
-    assert resident_remote_rate_key(first) != resident_remote_rate_key(other_remote)
-
-
-def test_artifact_retrieval_budget_counts_repeated_signing_requests():
-    artifact_ref_id = uuid.uuid4()
-    task = Task(project_id=uuid.uuid4(), context={})
-    for _ in range(MAX_ARTIFACT_RETRIEVALS_PER_TURN):
-        assert _register_artifact_retrieval(task, artifact_ref_id)
-    with pytest.raises(HTTPException) as exhausted:
-        _register_artifact_retrieval(task, artifact_ref_id)
-    assert exhausted.value.status_code == 429
-
-
-@pytest.mark.asyncio
-async def test_resident_artifact_retrieval_denies_unattached_and_cross_project(
-    db_session, mocker
-):
-    project = await _project(db_session)
-    foreign = await _project(db_session, user_id="other-user")
-    own_ref = ArtifactRef(
-        project_id=project.id,
-        tool_id=uuid.uuid4(),
-        kind="notes",
-        revision=1,
-        checksum="1" * 64,
-        content_snapshot={"text": "own"},
-    )
-    foreign_ref = ArtifactRef(
-        project_id=foreign.id,
-        tool_id=uuid.uuid4(),
-        kind="notes",
-        revision=1,
-        checksum="2" * 64,
-        content_snapshot={"text": "foreign"},
-    )
-    task = Task(
-        project_id=project.id,
-        context={RESIDENT_ARTIFACT_REF_GRANTS_KEY: []},
-    )
-    db_session.add_all([own_ref, foreign_ref, task])
-    await db_session.commit()
-
-    async def _load(*args, **kwargs):
-        return task
-
-    mocker.patch(
-        "app.routers.agent_resident_artifacts.load_live_resident_agent_task_locked",
-        new=_load,
-    )
-    with pytest.raises(HTTPException) as unattached:
-        await get_resident_turn_artifact(
-            None, own_ref.id, db_session, _resident_token(task)
-        )
-    assert unattached.value.status_code == 404
-
-    task.context = {
-        RESIDENT_ARTIFACT_REF_GRANTS_KEY: [str(foreign_ref.id)]
-    }
-    with pytest.raises(HTTPException) as cross_project:
-        await get_resident_turn_artifact(
-            None, foreign_ref.id, db_session, _resident_token(task)
-        )
-    assert cross_project.value.status_code == 404
-
-
-@pytest.mark.asyncio
-async def test_message_route_freezes_tool_ref_before_message_insert(
-    client: AsyncClient, db_session, mocker
-):
-    project = await _project(db_session)
-    resident = await initialize_strategic_resident(db_session, project.id)
-    tool = ProjectTool(
-        project_id=project.id,
-        kind="notes",
-        slug="notes",
-        title="Notes",
-        content={"text": "decisive evidence"},
-        content_revision=1,
-    )
-    async with seed_without_authority_enforcement(db_session):
-        resident.engine_owner = "strategic_resident"
-        resident.authority_generation += 1
-        db_session.add_all([resident, tool])
-        await db_session.commit()
-    await db_session.refresh(tool)
-    ref = await create_tool_artifact_ref(
-        db_session,
-        project_id=project.id,
-        tool_id=tool.id,
-        actor_user_id=TEST_USER_ID,
-        expected_revision=1,
-    )
-    await db_session.commit()
-
-    response = await client.post(
-        f"/api/admin/projects/{project.id}/strategic-session/messages",
-        json={
-            "message_type": "NOTE",
-            "content": "Use the exact Notes revision.",
-            "artifact_refs": [artifact_ref_projection(ref)],
-            "idempotency_key": "production-order-artifact-grant",
-        },
-    )
-    assert response.status_code == 200, response.text
-    assert response.json()["wakeup_state"] in {"queued", "waiting_for_capacity"}
-    await db_session.refresh(resident)
-    task = await db_session.get(Task, resident.active_turn_task_id)
-    assert task is not None
-    assert task.context[RESIDENT_ARTIFACT_REF_GRANTS_KEY] == [str(ref.id)]
-
-    async def _load(*args, **kwargs):
-        return task
-
-    mocker.patch(
-        "app.routers.agent_resident_artifacts.load_live_resident_agent_task_locked",
-        new=_load,
-    )
-    retrieved = await get_resident_turn_artifact(
-        None, ref.id, db_session, _resident_token(task)
-    )
-    assert retrieved["content"]["text"] == "decisive evidence"
-
-
-@pytest.mark.asyncio
-async def test_whiteboard_signing_runs_after_authority_locks_release(db_session, mocker):
-    project = await _project(db_session)
-    ref = ArtifactRef(
-        project_id=project.id,
-        tool_id=uuid.uuid4(),
-        kind="whiteboard",
-        revision=1,
-        checksum="3" * 64,
-        content_snapshot={"stroke_count": 1},
-        retrieval_metadata={
-            "capability": "project_tool_rendered_image",
-            "storage_uri": "gs://bucket/board.png",
-        },
-    )
-    task = Task(
-        project_id=project.id,
-        context={RESIDENT_ARTIFACT_REF_GRANTS_KEY: [str(ref.id)]},
-    )
-    db_session.add_all([ref, task])
-    await db_session.commit()
-
-    async def _load(*args, **kwargs):
-        return task
-
-    async def _sign(*args, **kwargs):
-        assert not db_session.in_transaction()
-        return "https://signed.example/board.png"
-
-    mocker.patch(
-        "app.routers.agent_resident_artifacts.load_live_resident_agent_task_locked",
-        new=_load,
-    )
-    mocker.patch(
-        "app.routers.agent_resident_artifacts.generate_download_signed_url",
-        new=_sign,
-    )
-    response = await get_resident_turn_artifact(
-        None, ref.id, db_session, _resident_token(task)
-    )
-    assert response["retrieval"]["download_url"].startswith("https://signed.example")

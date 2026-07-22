@@ -1,5 +1,5 @@
 /**
- * Live agent-token FILE — the fix for the resident-session "write goes 401 after
+ * Live agent-token FILE — the fix for the long-lived-session "write goes 401 after
  * ~1h" bug.
  *
  * Background: agent JWTs carry a 1h TTL (backend AGENT_TOKEN_TTL_HOURS). The
@@ -9,7 +9,7 @@
  * working, and the LLM stream (authenticated to Anthropic, not Blueprint) is
  * unaffected. BUT the provisioned bash helpers (./strategic, ./messages,
  * ./fetch, ./design-doc, ./playbook) authenticate with the AGENT_API_TOKEN env
- * var, which is a SNAPSHOT captured when the long-lived resident Claude
+ * var, which is a SNAPSHOT captured when the long-lived Claude
  * subprocess was spawned. A running process's env cannot be mutated by the
  * parent, so the helpers keep using the spawn-time token; once it hits the 1h
  * TTL every helper write 401s ("Agent token expired") while streaming survives.
@@ -278,7 +278,7 @@ export function jsonFieldShellFn(): string {
  * authenticates to the orchestrator, that resolves the agent token into `$TOKEN`.
  *
  * It prefers the live token FILE (`$AGENT_TOKEN_FILE`, kept fresh by the agent
- * process at spawn + on every ~45min refresh) so a long-lived resident session
+ * process at spawn + on every ~45min refresh) so a long-lived session
  * authenticates with the ROTATED token instead of the stale spawn-time env
  * snapshot, and falls back to `$AGENT_API_TOKEN` for one-shot agents or when the
  * file is unset/empty. Re-callable after a 401 to re-read a token that rotated
@@ -294,7 +294,7 @@ export function agentTokenShellFn(): string {
   return [
     '# Resolve the agent token into $TOKEN, preferring the live token file the',
     '# agent process keeps fresh (written at spawn + on every ~45min refresh) so a',
-    '# long-lived resident session authenticates with the ROTATED token, not the',
+    '# long-lived session authenticates with the ROTATED token, not the',
     '# stale spawn-time env snapshot. Falls back to AGENT_API_TOKEN when the file',
     '# is unset/empty. Re-callable after a 401 to re-read a rotated token.',
     '_agent_token_looks_like_jwt() {',

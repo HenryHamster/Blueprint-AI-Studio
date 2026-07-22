@@ -15,11 +15,10 @@ import type { MessageAttachment, ProjectMessage } from '../types/messages';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
-  computeResidentActivityState,
   countStrategicReplies,
   type StrategicLiveActivity,
 } from '../utils/strategicSessionLive';
-import { StrategicStreamingBubble, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { StrategicStreamingBubble } from './StrategicLiveTurn';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
 import { SaveViewDialog } from './SaveViewDialog';
@@ -28,16 +27,14 @@ import { useMessagesPanelFilters } from './useMessagesPanelFilters';
 import { MessagesListView, type ConversationListImperativeApi } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer, type PendingAttachment } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, residentAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, conversationAcceptanceToastCopy, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { useConversationSend } from '../hooks/useConversationSend';
-import { compareResidentMessages, useResidentConversation } from '../hooks/useResidentConversation';
-import { useResidentEngineHealth } from '../hooks/useResidentEngineHealth';
-import { ResidentEngineHealthChip } from './ResidentEngineHealthChip';
+import { compareConversationMessages, useConversation } from '../hooks/useConversation';
 import { useStrategistStatus } from '../hooks/useStrategistStatus';
 import { StrategistStatusChip } from './StrategistStatusChip';
 import { DirectionsAddForm } from './DirectionsAddForm';
@@ -58,15 +55,6 @@ import { finalizeLastAttachmentRemoval, type ConversationComposerIntent, updateC
 import { ComposerRequestOwnershipGuard } from '../utils/composerRequestOwnership';
 import { ConversationAttachmentUploadError, uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
 import {
-  acknowledgeQueuedResidentToolHandoffs,
-  enqueueResidentToolHandoff,
-  isResidentToolHandoffEvent,
-  isResidentToolHandoffQueueStorageKey,
-  loadQueuedResidentToolHandoffEntries,
-  RESIDENT_TOOL_HANDOFF_EVENT,
-  type ResidentToolHandoffQueueEntry,
-} from '../utils/residentToolHandoff';
-import {
   clearPendingAttachments as clearStoredPendingAttachments,
   deletePendingAttachment as deleteStoredPendingAttachment,
   listPendingAttachments as listStoredPendingAttachments,
@@ -75,7 +63,7 @@ import {
 } from '../utils/pendingAttachmentStore';
 const DEFAULT_VIEW_ID = '__default__';
 const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
-// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in agent/src/handlers/strategic-resident-lib.ts.
+// Mirrors MAX_IMAGE_DOWNLOAD_BYTES in the agent's strategic image handling.
 // Images above this threshold are uploaded but the agent silently skips them.
 const MAX_AGENT_IMAGE_BYTES = Math.floor(13_000_000 * 3 / 4);
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
@@ -422,14 +410,14 @@ export interface MessagesPanelProps {
   onOpenStrategicContextWorkspace?: () => void;
   /** Open the global command palette from the Strategic composer. */
   onOpenCommandPalette?: () => void;
-  /** Open the project Activity inbox from the calm Resident operation status. */
+  /** Open the project Activity inbox from the calm operation status. */
   onOpenActivityFeed?: () => void;
   /** Backwards-compatible alias for older call sites. */
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
   onStrategicRefresh?: () => void;
   /**
-   * Live resident-session transcript deltas (from `useLogViewer`, one per
+   * Live strategic-session transcript deltas (from `useLogViewer`, one per
    * `strategic_session` WS frame). Rendered as a streaming/"typing" bubble in the
    * conversation transcript while a turn streams; reconciled into the durable
    * `from_type=strategic` ProjectMessage once it lands via the conversation refresh.
@@ -504,7 +492,7 @@ function makePendingPreviewUrl(file: File): string | null {
   }
   return null;
 }
-export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenActivityFeed, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
+export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, realtimeCanonicalMessage, realtimeCanonicalRefetchRequired, strategicPollEpoch, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript, alerts, onDismissAlert, onDismissAllAlerts, onViewAlertTask }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -514,11 +502,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
   const usesStrategicReadModel = currentStrategicState != null;
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
-  const residentEngineHealth = useResidentEngineHealth({
-    enabled: conversationMode,
-    projectId: selectedProjectId,
-    refreshKey: `${strategicPollEpoch ?? 0}:${realtimeRefreshSignal ?? 0}`,
-  });
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicAttentionRef = useRef(strategicAttention);
   // eslint-disable-next-line react-hooks/refs
@@ -711,108 +694,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     });
     saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
   }, [currentActorUserId, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
-  const applyToolHandoffs = useCallback((entries: ResidentToolHandoffQueueEntry[]) => {
-    if (!conversationMode || !currentActorUserId || !selectedProjectId || entries.length === 0) return false;
-    // A composer envelope has one operator intent. Consume one immutable queue
-    // entry at a time so refs from other handoffs cannot be acknowledged under
-    // the wrong prompt, revision, lane owner, or intent.
-    const entry = entries[0];
-    const handoff = entry.detail;
-    const current = composerIntentRef.current;
-    if (current.operator_intent && current.artifact_refs.length > 0) return false;
-    const artifactRefs = mergeArtifactRefs(
-      current.artifact_refs,
-      [handoff.artifactRef as unknown as Record<string, unknown>],
-    );
-    const content = current.content.trim() ? current.content : handoff.prompt;
-    const operatorIntent: Record<string, unknown> = {
-      kind: handoff.intent,
-      expected_revision: handoff.artifactRef.revision,
-      ...(handoff.laneOwner ? { lane_owner: handoff.laneOwner } : {}),
-    };
-    const next = updateComposerIntent({
-      content,
-      artifact_refs: artifactRefs,
-      operator_intent: operatorIntent,
-    });
-    setNewContent(content);
-    setDraftArtifactRefs(artifactRefs);
-    const persisted = saveComposerDraftSnapshot(currentActorUserId, selectedProjectId, next);
-    if (persisted) {
-      acknowledgeQueuedResidentToolHandoffs(currentActorUserId, selectedProjectId, [entry]);
-    }
-    focusComposerTextarea();
-    return persisted;
-  }, [conversationMode, currentActorUserId, focusComposerTextarea, saveComposerDraftSnapshot, selectedProjectId, updateComposerIntent]);
-
-  useEffect(() => {
-    const blocked = () => submitting || sendState === 'sending' || sendState === 'needs_retry';
-    const applyQueued = () => {
-      if (!currentActorUserId || !selectedProjectId || blocked()) return false;
-      return applyToolHandoffs(
-        loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId),
-      );
-    };
-    const onToolHandoff = (event: Event) => {
-      if (!conversationMode) return;
-      if (!isResidentToolHandoffEvent(event) || event.detail.projectId !== selectedProjectId) return;
-      if (!currentActorUserId || event.detail.artifactRef.author !== currentActorUserId) return;
-      // Direct test/integration callers may emit without using the durable
-      // dispatch helper. Replacing the same per-ref entry remains idempotent.
-      const queued = enqueueResidentToolHandoff(currentActorUserId, selectedProjectId, event.detail);
-      if (!queued) {
-        addToastRef.current('Could not queue the tool revision locally. Retry Share with Resident.', 'error');
-        return;
-      }
-      if (composerIntentRef.current.operator_intent && composerIntentRef.current.artifact_refs.length > 0) {
-        addToastRef.current('Exact tool revision queued for your next Resident message', 'info');
-        return;
-      }
-      if (blocked()) {
-        addToastRef.current(
-          'Exact tool revision queued for your next Resident message',
-          'info',
-        );
-        return;
-      }
-      if (applyQueued()) {
-        addToastRef.current('Exact tool revision attached to Resident conversation', 'success');
-      } else {
-        addToastRef.current('Could not preserve the tool revision draft locally. Retry Share with Resident.', 'error');
-      }
-    };
-    const onStorage = (event: StorageEvent) => {
-      if (
-        currentActorUserId
-        && selectedProjectId
-        && isResidentToolHandoffQueueStorageKey(event.key, currentActorUserId, selectedProjectId)
-        && applyQueued()
-      ) {
-        addToastRef.current('Tool revision from another tab is ready in your next Resident message', 'success');
-      }
-    };
-    window.addEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
-    window.addEventListener('storage', onStorage);
-    return () => {
-      window.removeEventListener(RESIDENT_TOOL_HANDOFF_EVENT, onToolHandoff);
-      window.removeEventListener('storage', onStorage);
-    };
-  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
-
-  useEffect(() => {
-    if (
-      !currentActorUserId
-      || !selectedProjectId
-      || !conversationMode
-      || submitting
-      || sendState === 'sending'
-      || sendState === 'needs_retry'
-    ) return;
-    const queued = loadQueuedResidentToolHandoffEntries(currentActorUserId, selectedProjectId);
-    if (queued.length > 0 && applyToolHandoffs(queued)) {
-      addToastRef.current('Queued tool revision is ready in your next Resident message', 'success');
-    }
-  }, [applyToolHandoffs, conversationMode, currentActorUserId, selectedProjectId, sendState, submitting]);
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -1009,11 +890,11 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     }
   }, []);
   const {
-    refresh: refreshResidentConversation,
+    refresh: refreshConversation,
     loadOlder: loadOlderConversation,
     hasMore: conversationHasMore,
     loadingOlder: loadingOlderConversation,
-  } = useResidentConversation({
+  } = useConversation({
     enabled: conversationMode,
     projectId: selectedProjectId,
     actorUserId: currentActorUserId,
@@ -1170,9 +1051,9 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         ? msg.surface === 'conversation'
         : isConversationMessage(msg, eventPrefs, tempMutes))
       .slice()
-      .sort(compareResidentMessages);
+      .sort(compareConversationMessages);
   }, [messages, eventPrefs, tempMutes]);
-  // Live streaming turn: the resident strategist's in-flight reply, previewed as a
+  // Live streaming turn: the strategist's in-flight reply, previewed as a
   // "typing" bubble at the tail of the chat and reconciled into the durable
   // ProjectMessage once it lands (see computeStrategicStreamingTurn). Only relevant
   // in conversation mode; the persisted-message path renders regardless.
@@ -1186,26 +1067,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       ? computeStrategicSessionActivity(strategicSessionTranscript, conversationMessages)
       : { items: [], latestLifecycle: null } as StrategicLiveActivity),
     [conversationMode, strategicSessionTranscript, conversationMessages],
-  );
-  // Slow wall-clock tick so the persistent resident-activity widget can transition
-  // to its `dead` state on heartbeat staleness even when NO further WS frame arrives
-  // (a silently-dead session emits nothing). Only runs while a resident session is
-  // present in conversation mode; the InFlightCounter drives the sub-second display.
-  const [residentNowTick, setResidentNowTick] = useState<number>(() => Date.now());
-  const residentSessionSnapshot = currentStrategicState?.resident_session ?? null;
-  useEffect(() => {
-    if (!conversationMode || !residentSessionSnapshot) return;
-    const id = window.setInterval(() => setResidentNowTick(Date.now()), 5000);
-    return () => window.clearInterval(id);
-  }, [conversationMode, residentSessionSnapshot]);
-  // Truthful three-state (executing / idle / dead) resident live-activity, derived
-  // from real feed data + the resident_session snapshot — persistent whenever a
-  // resident session exists, never gated on an in-flight turn.
-  const residentActivity = useMemo(
-    () => (conversationMode
-      ? computeResidentActivityState(strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick)
-      : null),
-    [conversationMode, strategicSessionTranscript, conversationMessages, residentSessionSnapshot, residentNowTick],
   );
   // Render the operator's optimistic bubble until the durable copy lands. Client
   // identity, never message content, is the reconciliation key: identical text
@@ -1492,7 +1353,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         // duplicate strategic-state assembly the conversation handler would
         // otherwise trigger on the backend.
         if (!usesStrategicReadModelRef.current) {
-          await refreshResidentConversation(false);
+          await refreshConversation(false);
         }
         const sessionMessages = messagesRef.current;
         sessionMessages.forEach(message => seenMessageIdsRef.current.add(message.id));
@@ -1592,7 +1453,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           }).catch(() => {});
       }
     }
-  }, [conversationMode, selectedProjectId, onMessageCountChange, refreshResidentConversation, searchQuery, usesStrategicReadModel]);
+  }, [conversationMode, selectedProjectId, onMessageCountChange, refreshConversation, searchQuery, usesStrategicReadModel]);
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
   useEffect(() => {
     if (conversationMode || !realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
@@ -1875,7 +1736,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
     setSubmitting(true);
     try {
       // The activity inbox retains its legacy operational-resolution endpoint.
-      // Resident conversation replies always use the durable idempotent message
+      // Strategist conversation replies always use the durable idempotent message
       // POST below, whose reply contract resolves open questions atomically.
       if (!conversationMode && submitReplyTo && submitReplyTo.message_type === 'QUESTION' && submitReplyTo.status === 'open') {
         if (attachmentsForSubmit.length > 0) {
@@ -1909,7 +1770,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         ? (isRetry ? optimisticSend.key : conversationSend.ensureIdentity(generateIdempotencyKey))
         : (idempotencyKeyRef.current ?? generateIdempotencyKey());
       if (!conversationMode) idempotencyKeyRef.current = sendIdentity;
-      // The continuous Resident conversation no longer inherits hidden
+      // The continuous strategist conversation no longer inherits hidden
       // Chat/Workday workbench state. Activity-inbox writes retain the legacy
       // workbench snapshot until that surface is retired.
       const workbenchContext = conversationMode
@@ -2149,7 +2010,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         setLastArming(arming);
         clearPendingAttachments(sendIdentity);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
-        const receiptToast = residentAcceptanceToastCopy(wakeupState, arming);
+        const receiptToast = conversationAcceptanceToastCopy(wakeupState, arming);
         addToast(receiptToast.message, receiptToast.severity);
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -2761,7 +2622,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
           expanded={chatChromeExpanded} onExpand={() => persistChatChrome(true)} onCollapse={() => persistChatChrome(false)}
           searchQuery={searchQuery} onSearchChange={setSearchQuery}
           needsActionCount={usesStrategicReadModel ? attentionNeedsActionItems.length : 0} alertCount={alerts?.length ?? 0}
-          residentHealth={residentEngineHealth ? <ResidentEngineHealthChip health={residentEngineHealth} /> : null}
         />
       )}
 
@@ -3065,9 +2925,6 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
         onLoadOlderConversationMessages={() => loadOlderConversation()}
         conversationListRef={conversationListRef}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} segments={streamingTurn.segments} /> : null}
-        operationItem={residentActivity && residentEngineHealth?.engine_owner !== 'strategic_resident' ? (
-          <StrategicResidentActivityWidget state={residentActivity} onOpenActivity={onOpenActivityFeed} />
-        ) : null}
         scrollRef={scrollRef}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}

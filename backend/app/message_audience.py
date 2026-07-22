@@ -80,10 +80,6 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     "capability_verdict_decided": OPERATOR_FYI,
     "capability_trial_ambiguous_lift_escalation": OPERATOR_FYI,
     "question_answer": OPERATOR_FYI,
-    # resident_reply: Resident strategist's conversational outcome notification
-    # — the Resident produced a reply (e.g. operation outcome or
-    # user-facing message). Informational, operator-visible.
-    "resident_reply": OPERATOR_FYI,
     # feedback_reply: user replied to a feedback/notification — informational,
     # operator-visible. The strategist is armed (via maybe_arm_operator_refresh)
     # to process the answer, same as question_answer.
@@ -321,7 +317,7 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # already fail-closed to STRATEGIST_INTERNAL via route_event; this entry makes
     # the fallback explicit so it is self-documenting and test-stable.
     "strategic_message": STRATEGIST_INTERNAL,
-    # Resident strategist self-observability. A chronically-low operator-decision
+    # Strategist self-observability. A chronically-low operator-decision
     # capture rate means operator corrections are silently failing to reach the
     # durable decisions register. This is internal strategist bookkeeping — the
     # strategist acts on it (re-emit the marker) but it must NEVER reach the

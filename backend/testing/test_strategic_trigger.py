@@ -632,51 +632,6 @@ async def test_maybe_arm_returns_passive_note_without_requesting(db_session):
     req.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_maybe_arm_suppressed_when_resident_session_active():
-    """A genuine steering message is NOT armed while a resident Workday session
-    owns the project: the standing agent replies live, so the cadence marker
-    (and the steering-acted receipt it drives) must never fire. Returns the
-    dedicated ARMING_RESIDENT_SESSION outcome and never calls
-    request_strategic_refresh. No DB — the resident gate short-circuits."""
-    from app.models import MessageType
-
-    with patch(
-        "app.strategic_trigger.request_strategic_refresh",
-        new=AsyncMock(return_value=True),
-    ) as req:
-        outcome = await st.maybe_arm_operator_refresh(
-            None,
-            "proj-1",
-            MessageType.FEEDBACK,
-            message_content="Operator: pivot to X.",
-            resident_session_active=True,
-        )
-    assert outcome == st.ARMING_RESIDENT_SESSION
-    req.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_maybe_arm_passive_note_unaffected_by_resident_session():
-    """A passive NOTE keeps its own classification even with a resident session
-    active — it never armed anything, so the resident gate is a no-op for it."""
-    from app.models import MessageType
-
-    with patch(
-        "app.strategic_trigger.request_strategic_refresh",
-        new=AsyncMock(return_value=True),
-    ) as req:
-        outcome = await st.maybe_arm_operator_refresh(
-            None,
-            "proj-1",
-            MessageType.NOTE,
-            message_content="fyi",
-            resident_session_active=True,
-        )
-    assert outcome == st.ARMING_PASSIVE_NOTE
-    req.assert_not_awaited()
-
-
 # ===========================================================================
 # Operator cancel — retract an armed steer without leaving a receipt
 # ===========================================================================

@@ -131,21 +131,6 @@ export function configureAgentPermissions(taskType: string): string[] {
   return [];
 }
 
-/**
- * Configure the resident seat's explicit read-only posture.
- *
- * The resident uses a live credential helper to keep `git fetch origin`
- * working, so we only install the inner-agent write blockers and commit/push
- * hooks here. The remote URL itself stays untouched.
- */
-export function configureResidentAgentPermissions(taskType: string): string[] {
-  if (!isReadOnlyTaskType(taskType)) {
-    throw new Error(`resident permissions require a read-only task type, got "${taskType}"`);
-  }
-  installReadOnlyBlockHooks(`${WORKSPACE}/.git/hooks`);
-  return ['Write', 'Edit', 'NotebookEdit'];
-}
-
 export function strVal(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }

@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, persistResidentTurnFailure, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, WORKSPACE, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, WORKSPACE, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -86,8 +86,6 @@ import {
   claudeHelpSupportsPartialMessages,
   probeClaudeCapabilities,
   stripUnsupportedClaudeOptionalArgs,
-  applyProviderProcessBoundary,
-  requireResidentClaudeCapabilities,
   type ProviderRunErrorReport,
 } from './providers/runners.js';
 import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
@@ -1928,72 +1926,11 @@ describe('VmConfigMissingError', () => {
 });
 
 describe('provider runner prompt transport', () => {
-  it('applies the Resident boundary without ambient credentials or customization', () => {
-    const runner = getProviderRunner('anthropic', 'api_key');
-    const command = runner.buildRunCommand('prompt', undefined, undefined, ['*']);
-    command.env.ORCHESTRATOR_URL = 'secret-control-plane';
-    command.env.AGENT_API_TOKEN = 'secret-agent-token';
-    command.env.GITHUB_TOKEN = 'secret-github-token';
-    command.env.ANTHROPIC_API_KEY = 'provider-key';
-    applyProviderProcessBoundary(command, 'anthropic', ['*'], {
-      cwd: '/tmp/resident/work',
-      promptDirectory: '/tmp/resident/tmp',
-      allowedEnvKeys: ['PATH', 'ANTHROPIC_API_KEY'],
-      envOverrides: {
-        HOME: '/tmp/resident/home',
-        CLAUDE_CONFIG_DIR: '/tmp/resident/config',
-      },
-      skipAmbientHelpers: true,
-      enforceNoTools: true,
-    });
-
-    expect(command.env).toMatchObject({
-      ANTHROPIC_API_KEY: 'provider-key',
-      HOME: '/tmp/resident/home',
-      CLAUDE_CONFIG_DIR: '/tmp/resident/config',
-    });
-    expect(command.env).not.toHaveProperty('ORCHESTRATOR_URL');
-    expect(command.env).not.toHaveProperty('AGENT_API_TOKEN');
-    expect(command.env).not.toHaveProperty('GITHUB_TOKEN');
-    expect(command.args).toEqual(expect.arrayContaining([
-      '--disallowedTools', '*', '--safe-mode', '--tools', '',
-      '--disable-slash-commands', '--strict-mcp-config', '--no-session-persistence',
-    ]));
-    const denied = command.args.flatMap((arg, index) => (
-      arg === '--disallowedTools' ? [command.args[index + 1]] : []
-    ));
-    expect(denied).toEqual(['*']);
-  });
-
-  it('requires every Resident Claude safety capability when help is available', () => {
-    const allCapabilities = new Set([
-      '--disallowedTools', '--safe-mode', '--tools', '--disable-slash-commands',
-      '--strict-mcp-config', '--no-session-persistence',
-    ]);
-    expect(() => { requireResidentClaudeCapabilities(allCapabilities); }).not.toThrow();
-    allCapabilities.delete('--strict-mcp-config');
-    expect(() => { requireResidentClaudeCapabilities(allCapabilities); })
-      .toThrow('missing --strict-mcp-config');
-    expect(() => { requireResidentClaudeCapabilities(null); }).not.toThrow();
-  });
-
-  it('rejects a Resident boundary without the wildcard tool fence', () => {
-    const command = getProviderRunner('anthropic', 'api_key').buildRunCommand('prompt');
-    expect(() => { applyProviderProcessBoundary(command, 'anthropic', [], {
-      cwd: '/tmp/resident/work',
-      promptDirectory: '/tmp/resident/tmp',
-      allowedEnvKeys: ['PATH'],
-      envOverrides: {},
-      skipAmbientHelpers: true,
-      enforceNoTools: true,
-    }); }).toThrow('cannot satisfy the Resident no-tool process boundary');
-  });
-
   it('passes the documented all-tools deny rule to Claude-compatible CLIs', () => {
     const runner = getProviderRunner('anthropic', 'api_key');
     const deniedTools = ['*', 'Task', 'Agent', 'Workflow', 'Skill'];
     const command = runner.buildRunCommand(
-      'Bounded Resident prompt', undefined, undefined, deniedTools,
+      'Bounded prompt', undefined, undefined, deniedTools,
     );
 
     const denied = command.args.flatMap((arg, index) => (
@@ -2246,10 +2183,10 @@ describe('provider runner prompt transport', () => {
   it('sets the documented DeepSeek Claude Code model env and aligns ANTHROPIC_MODEL with the requested model', () => {
     // DeepSeek's documented integration selects models via env; without it the
     // CLI resolves its claude-* aliases, which DeepSeek silently remaps
-    // (unknown/sonnet/haiku ids → v4-flash) — the Resident Pro-task failure
+    // (unknown/sonnet/haiku ids → v4-flash) — the Pro-task failure
     // mode. The env must carry the documented defaults, and ANTHROPIC_MODEL
     // must track the explicitly requested model so the env-driven paths
-    // (resident stream-json session, subagent spawns) resolve the same model
+    // (stream-json session, subagent spawns) resolve the same model
     // the --model flag names.
     process.env.PROVIDER = 'deepseek';
     process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
@@ -2333,8 +2270,8 @@ describe('provider runner prompt transport', () => {
   it('validates the requested model instead of a bare auth probe (Claude-compat providers)', () => {
     // A validation that never names the model proves only that the key
     // authenticates — AGENT_AUTH_OK could pass while the requested model is
-    // broken (the DeepSeek Resident failure mode: Pro tasks validated OK,
-    // then every resident session died on its first turn).
+    // broken (the DeepSeek broken-model failure mode: Pro tasks validated OK,
+    // then every session died on its first turn).
     process.env.PROVIDER = 'deepseek';
     process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
     refreshRuntimeState();
@@ -2907,125 +2844,6 @@ describe('structured error report shipping (enrichStatusPayload)', () => {
     expect(postedStatusBody(fetchMock).error_report).toBeUndefined();
   });
 
-  it('attaches the matching report to Resident failure posts', async () => {
-    const fetchMock = stubStatusFetch();
-    _setLastProviderRunErrorReportForTesting(makeReport('task-er-resident'));
-
-    await persistResidentTurnFailure(
-      'task-er-resident',
-      'project-er-resident',
-      'Resident provider exited with code 1',
-      'fatal',
-    );
-
-    const residentCall = fetchMock.mock.calls.find(([url]) =>
-      String(url).includes('/api/agent/resident-turn/fail'));
-    if (!residentCall) throw new Error('expected a Resident failure POST');
-    const init = residentCall[1] as RequestInit;
-    if (typeof init.body !== 'string') throw new Error('expected a string request body');
-    const body = JSON.parse(init.body) as Record<string, unknown>;
-    expect(body.error_report).toMatchObject({
-      task_id: 'task-er-resident',
-      exit_code: 1,
-      model_output_seen: false,
-      result_event_seen: false,
-    });
-  });
-
-  it('retries once without the report for the exact legacy extra-field 422', async () => {
-    const legacy422 = JSON.stringify({
-      error: {
-        code: 422,
-        message: 'Validation Error',
-        details: [{
-          type: 'extra_forbidden',
-          loc: ['body', 'error_report'],
-          msg: 'Extra inputs are not permitted',
-          input: makeReport('task-er-legacy'),
-        }],
-      },
-    });
-    const fetchMock = makeFetchMock()
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 422,
-        text: () => Promise.resolve(legacy422),
-        headers: { get: () => null },
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve({ status: 'failed' }),
-        headers: { get: () => null },
-      });
-    vi.stubGlobal('fetch', fetchMock);
-    _setLastProviderRunErrorReportForTesting(makeReport('task-er-legacy'));
-
-    await persistResidentTurnFailure(
-      'task-er-legacy',
-      'project-er-resident',
-      'Resident provider exited with code 1',
-      'fatal',
-    );
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    const bodies = fetchMock.mock.calls.map(([, init]) => {
-      if (typeof init?.body !== 'string') throw new Error('expected string request body');
-      return JSON.parse(init.body) as Record<string, unknown>;
-    });
-    expect(bodies[0].error_report).toBeDefined();
-    expect(bodies[1].error_report).toBeUndefined();
-    expect(bodies[1].failure_id).toBe(bodies[0].failure_id);
-  });
-
-  it('does not downgrade-retry a 422 with any additional validation error', async () => {
-    const nonLegacy422 = JSON.stringify({
-      error: {
-        code: 422,
-        message: 'Validation Error',
-        details: [
-          { type: 'extra_forbidden', loc: ['body', 'error_report'] },
-          { type: 'missing', loc: ['body', 'failure_id'] },
-        ],
-      },
-    });
-    const fetchMock = makeFetchMock().mockResolvedValue({
-      ok: false,
-      status: 422,
-      text: () => Promise.resolve(nonLegacy422),
-      headers: { get: () => null },
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    _setLastProviderRunErrorReportForTesting(makeReport('task-er-invalid'));
-
-    await expect(persistResidentTurnFailure(
-      'task-er-invalid',
-      'project-er-resident',
-      'Resident provider exited with code 1',
-      'fatal',
-    )).rejects.toThrow('failed (422)');
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it('does not attach a mismatched report to Resident failure posts', async () => {
-    const fetchMock = stubStatusFetch();
-    _setLastProviderRunErrorReportForTesting(makeReport('task-er-prior-resident'));
-
-    await persistResidentTurnFailure(
-      'task-er-current-resident',
-      'project-er-resident',
-      'Resident failed before a provider run',
-      'fatal',
-    );
-
-    const residentCall = fetchMock.mock.calls.find(([url]) =>
-      String(url).includes('/api/agent/resident-turn/fail'));
-    if (!residentCall) throw new Error('expected a Resident failure POST');
-    const init = residentCall[1] as RequestInit;
-    if (typeof init.body !== 'string') throw new Error('expected a string request body');
-    const body = JSON.parse(init.body) as Record<string, unknown>;
-    expect(body.error_report).toBeUndefined();
-  });
 });
 
 describe('stale result retry envelopes', () => {

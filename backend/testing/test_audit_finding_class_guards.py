@@ -920,7 +920,7 @@ class TestMissingGreenletTestsFaithful:
             "The following tests mention MissingGreenlet in their docstring but "
             "use no recognised fidelity mechanism (see class docstring for the "
             "full list). Either inject the fault (raise MissingGreenlet via a "
-            "proxy — see test_strategic_resident_session.py::_ProjectIdPoisonAfterRollback), "
+            "proxy that poisons an expired attribute after rollback), "
             "use the expire_fidelity or missing_greenlet_proxy fixtures, call "
             "expunge_all() (not expire_all() — it is a no-op on SQLite), use raiseload=True, or mark the "
             "test Postgres-only with @pytest.mark.skipif(not USE_POSTGRES, ...):\n"

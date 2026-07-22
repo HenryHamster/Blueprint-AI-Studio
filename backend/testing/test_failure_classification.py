@@ -1413,20 +1413,6 @@ class TestClassifyFailureAgentTimeout:
         assert result["timeout_count"] == 0
         assert result["by_subtype"]["cascade_cancellation"]["count"] == 0
 
-    def test_resident_session_stop_failure_category_routes_to_admin_cancel(self):
-        """A strategic_review task stopped by the operator should classify as ADMIN_CANCEL.
-
-        stop_resident_session stamps failure_category='ADMIN_CANCEL' on the task
-        context so the classifier's fast-path (agent_category in INFRA_CLASSES)
-        returns ADMIN_CANCEL immediately, without falling through to text-matching
-        on the status message 'Resident strategic session stopped by operator'.
-        """
-        task = _task(
-            "Resident strategic session stopped by operator",
-            ctx={"failure_category": ADMIN_CANCEL},
-        )
-        assert classify_failure(task) == ADMIN_CANCEL
-
 
 class TestAdminSupersedesPersistsAdminCancel:
     def test_admin_superseded_task_persists_admin_cancel_not_agent_timeout(self):

@@ -1655,7 +1655,6 @@ class TestSchemaRevisionSync:
         _models_owned_modules = {
             "app.models",
             "app.release_models",
-            "app.strategic_resident_models",
         }
         facade_missing = sorted(
             mapper.class_.__name__
@@ -1918,7 +1917,6 @@ class TestSchemaRevisionSync:
                 ("strategiccycle", "phase2_completed_at"),
                 ("strategiccycle", "phase2_started_at"),
                 ("strategiccycle", "updated_at"),
-                ("strategicresidentsweepstate", "updated_at"),
                 ("task", "blocked_at"),
                 ("task", "completed_at"),
                 ("task", "last_heartbeat"),
@@ -8826,7 +8824,7 @@ class TestTypedMockAssertConvention:
 # This block closes that gap using the same precedent as the SR-category mirror
 # (``AGENT_SELF_REVIEW_CATEGORIES`` / ``test_agent_categories_match_prompt_source``)
 # and the helper-exclusion scan above:
-#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-resident declarative table of
+#   1. ``AGENT_TEST_RUNNER_COMMANDS`` — a backend-side declarative table of
 #      the family → emitted-command mapping the agent detector produces. Lives in
 #      the backend so it ships in CI's ``./backend`` Docker context.
 #   2. An ALWAYS-ON test pinning that table to the shared fixture (family
@@ -9259,7 +9257,7 @@ class TestAgentEnvFailureSignatureParity:
             )
 
 class TestAgentTestRunnerTableParity:
-    """ALWAYS-ON: the backend-resident agent runner table is pinned to the shared
+    """ALWAYS-ON: the backend-side agent runner table is pinned to the shared
     fixture. Runs in plain GitHub CI (no agent/src required).
 
     The backend onboarding detector is already pinned to the same fixture by

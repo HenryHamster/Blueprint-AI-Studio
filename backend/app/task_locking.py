@@ -750,8 +750,7 @@ async def with_task_context_locked(
 
     ``Task.context`` is a whole-column JSON blob written from several
     strategic-API paths (``routers/admin_agent_ops.py``) and the
-    resident-session heartbeat ledger/cursor mirror
-    (``strategic_resident_session.renew_resident_session_lease``). Each writer
+    heartbeat ledger/cursor mirror. Each writer
     sets a *disjoint* set of keys (``_strategic_api_called`` /
     ``_strategic_vision_set`` on one side, ``_exam_ledger`` /
     ``message_cursor`` on the other) but did so via a stale-read whole-column
@@ -763,7 +762,7 @@ async def with_task_context_locked(
     CANONICAL LOCK ORDER: this helper takes ONLY the task row lock. Callers that
     also need the project row lock MUST acquire the project lock FIRST
     (Project→Task — see :func:`lock_project_then_task`); taking the task lock
-    first risks the C1 cross-table deadlock. The resident-heartbeat caller
+    first risks the C1 cross-table deadlock. The heartbeat caller
     already holds the project lock (via :func:`with_vision_locked`) when it
     invokes this, so ordering is preserved.
 

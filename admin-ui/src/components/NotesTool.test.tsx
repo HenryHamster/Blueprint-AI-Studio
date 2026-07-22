@@ -7,29 +7,16 @@ vi.mock('../api/projectTools', async () => {
   const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
   return {
     ...actual,
-    createResidentToolArtifactRef: vi.fn(),
     fetchToolContent: vi.fn(),
     saveToolContent: vi.fn(),
   };
 });
 
-vi.mock('../utils/residentToolHandoff', async () => {
-  const actual = await vi.importActual<typeof import('../utils/residentToolHandoff')>(
-    '../utils/residentToolHandoff',
-  );
-  return {
-    ...actual,
-    dispatchResidentToolHandoff: vi.fn(),
-  };
-});
-
 import {
-  createResidentToolArtifactRef,
   fetchToolContent,
   saveToolContent,
   ConflictError,
 } from '../api/projectTools';
-import { dispatchResidentToolHandoff } from '../utils/residentToolHandoff';
 import NotesTool from './NotesTool';
 
 const SAMPLE_TOOL = {
@@ -42,28 +29,8 @@ const SAMPLE_TOOL = {
   content_revision: 2,
 };
 
-const NOTES_ARTIFACT_REF = {
-  id: 'ref-notes-3',
-  artifact_ref_id: 'ref-notes-3',
-  tool_id: 'notes-1',
-  project_id: 'proj-a',
-  kind: 'notes' as const,
-  revision: 3,
-  checksum: 'notes-sha256',
-  author: 'operator-a',
-  timestamp: '2026-07-17T00:00:00Z',
-  retrieval: {
-    capability: 'inline_bounded_text' as const,
-    href: '/api/admin/projects/proj-a/tools/notes-1/artifact-refs/ref-notes-3',
-  },
-};
-
 beforeAll(() => {
   registerToolKind('notes', NotesTool);
-});
-
-beforeEach(() => {
-  vi.mocked(dispatchResidentToolHandoff).mockReturnValue(true);
 });
 
 // Drive a React onChange on the textarea via the native value setter.
@@ -172,84 +139,6 @@ describe('NotesTool — autosave loop + conflict data-loss', () => {
     root = null;
 
     expect(saveToolContent).toHaveBeenCalledWith('proj-a', 'notes-1', { text: 'save before leaving' }, 2);
-  });
-
-  test('Share with Resident flushes the exact dirty revision before creating its reference', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
-    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 3 });
-    vi.mocked(createResidentToolArtifactRef).mockResolvedValue({ state: 'ready', artifact_ref: NOTES_ARTIFACT_REF });
-
-    const textarea = await mount();
-    await act(async () => { typeInto(textarea, 'exact resident context'); });
-    const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(saveToolContent).toHaveBeenCalledWith(
-      'proj-a',
-      'notes-1',
-      { text: 'exact resident context' },
-      2,
-    );
-    expect(createResidentToolArtifactRef).toHaveBeenCalledWith('proj-a', 'notes-1', 3);
-    expect(vi.mocked(saveToolContent).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(createResidentToolArtifactRef).mock.invocationCallOrder[0],
-    );
-    expect(dispatchResidentToolHandoff).toHaveBeenCalledWith(expect.objectContaining({
-      projectId: 'proj-a',
-      artifactRef: NOTES_ARTIFACT_REF,
-      intent: 'share',
-    }));
-  });
-
-  test('an unresolved conflict refuses Resident handoff', async () => {
-    vi.mocked(fetchToolContent)
-      .mockResolvedValueOnce({ content: { text: 'loaded' }, content_revision: 2 })
-      .mockResolvedValueOnce({ content: { text: 'server version' }, content_revision: 9 });
-    vi.mocked(saveToolContent).mockRejectedValue(new ConflictError());
-
-    const textarea = await mount();
-    await act(async () => { typeInto(textarea, 'local edit'); });
-    await act(async () => { await vi.advanceTimersByTimeAsync(1500); });
-    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
-
-    const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    expect(share.disabled).toBe(true);
-    await act(async () => { share.click(); await Promise.resolve(); });
-
-    expect(createResidentToolArtifactRef).not.toHaveBeenCalled();
-    expect(dispatchResidentToolHandoff).not.toHaveBeenCalled();
-  });
-
-  test('a failed flush never creates a Resident reference', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { text: 'loaded' }, content_revision: 2 });
-    vi.mocked(saveToolContent).mockRejectedValue(new Error('storage unavailable'));
-
-    const textarea = await mount();
-    await act(async () => { typeInto(textarea, 'still unsaved'); });
-    const share = Array.from(host!.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(saveToolContent).toHaveBeenCalledTimes(1);
-    expect(createResidentToolArtifactRef).not.toHaveBeenCalled();
-    expect(dispatchResidentToolHandoff).not.toHaveBeenCalled();
-    expect(host!.querySelector('[role="alert"]')?.textContent).toContain('Notes changed while saving');
   });
 
   test('queues an edit made during a slow save against its returned revision', async () => {

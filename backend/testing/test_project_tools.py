@@ -3039,7 +3039,7 @@ async def test_research_claim_includes_project_skills(client, db_session):
 
 # ---------------------------------------------------------------------------
 # Agent-token fetch endpoint: GET /api/agent/projects/{id}/tools
-# (operator-facing strategic resident reads project tool content via ./fetch tools)
+# (operator-facing strategic agent reads project tool content via ./fetch tools)
 # ---------------------------------------------------------------------------
 
 

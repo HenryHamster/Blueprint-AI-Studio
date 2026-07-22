@@ -402,7 +402,7 @@ const TASK_CLASS_MAP = {
   deps:              'code-change',
   // Salvage bundle (1): consolidated fix PR from decayed research findings
   salvage_bundle:    'code-change',
-  // Read-only / investigative (14): analysis only, must not push code
+  // Read-only / investigative (13): analysis only, must not push code
   review:            'read-only',
   panel_review:      'read-only',
   security_audit:    'read-only',

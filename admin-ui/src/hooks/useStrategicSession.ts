@@ -2,12 +2,8 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import {
   checkInStrategicSession,
-  startStrategicSession,
-  stopStrategicSession,
   updateStrategicWorkbenchState,
   type StrategicLivenessResponse,
-  type StrategicResidentRunnerOption,
-  type StrategicResidentSessionSnapshot,
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
 import { parseArmingOutcome, workbenchArmingToastCopy } from '../components/messageArming';
@@ -25,7 +21,7 @@ interface UseStrategicSessionOptions {
   strategicReadModel: StrategicReadModel;
   /**
    * Lightweight liveness probe ({@link useStrategicLiveness}) used purely as a
-   * FALLBACK source for the mode indicator and resident-session liveness chip on
+   * FALLBACK source for the mode indicator and session liveness chip on
    * reload, before the heavy read model hydrates. Once `strategicReadModel.data`
    * lands for the selected project its values take precedence, so no flicker.
    */
@@ -44,7 +40,6 @@ export function useStrategicSession({
   const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
   const [checkingInStrategicSession, setCheckingInStrategicSession] = useState(false);
-  const [strategicSessionBusy, setStrategicSessionBusy] = useState(false);
   const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
   const strategicWorkbenchSaveSeqRef = useRef(0);
   const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -62,7 +57,6 @@ export function useStrategicSession({
     strategicWorkbenchRestoreProjectRef.current = null;
     strategicCheckInIdempotencyKeyRef.current = null;
     setCheckingInStrategicSession(false);
-    setStrategicSessionBusy(false);
   }, [selectedProjectId]);
 
   const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
@@ -79,26 +73,6 @@ export function useStrategicSession({
       ? strategicLiveness
       : null;
 
-  // Resident-session fields: the heavy read model is fully authoritative ONCE
-  // it has loaded for this project (including a legitimate null session), so it
-  // is not `??`-merged with the probe — that would let a stale liveness snapshot
-  // resurface after the read model reports the session gone. The liveness probe
-  // is used ONLY while the read model is still absent (pre-hydration reload).
-  const residentSource = selectedStrategicReadModel ?? selectedStrategicLiveness;
-  const residentStrategicSession =
-    (residentSource as { resident_session?: StrategicResidentSessionSnapshot | null } | null)?.resident_session
-    ?? null;
-  const strategicSessionActive = residentStrategicSession?.status === 'active' && !residentStrategicSession?.stop_requested;
-  const strategicSessionStatus = residentStrategicSession?.status ?? null;
-  const residentStrategicSessionAvailable =
-    (residentSource as { resident_session_available?: boolean } | null)?.resident_session_available === true;
-  const residentStrategicSessionAvailability =
-    (residentSource as {
-      resident_session_availability?: { available?: boolean; state?: string | null; reason?: string | null } | null;
-    } | null)?.resident_session_availability ?? null;
-  const strategicSessionState = residentStrategicSessionAvailability?.state
-    ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'off');
-  const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
   // Mode indicator source: prefer the workbench state (optimistic or heavy read
   // model), fall back to the fast liveness probe so the mode chip renders on
@@ -108,15 +82,6 @@ export function useStrategicSession({
   const strategicInteractionMode =
     strategicWorkbenchState?.interaction_mode
     ?? selectedStrategicLiveness?.interaction_mode
-    ?? null;
-  const residentStrategicSessionRunners =
-    (selectedStrategicReadModel as { resident_session_runners?: StrategicResidentRunnerOption[] | null } | null)
-      ?.resident_session_runners
-    ?? selectedStrategicLiveness?.resident_session_runners
-    ?? null;
-  const strategicSessionSelectedRunnerId =
-    strategicWorkbenchState?.preferred_runner_id
-    ?? residentStrategicSession?.runner_id
     ?? null;
 
   const chatComposerContextDescriptor = useMemo(
@@ -219,43 +184,6 @@ export function useStrategicSession({
     }
   }, [checkingInStrategicSession, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId]);
 
-  const handleStartStrategicSession = useCallback(async () => {
-    const projectId = selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
-    setStrategicSessionBusy(true);
-    try {
-      const preferredRunnerId = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.preferred_runner_id ?? null;
-      await startStrategicSession(projectId, preferredRunnerId ? { runner_id: preferredRunnerId } : {});
-      if (selectedProjectIdRef.current !== projectId) return;
-      addToast('Strategic session starting', 'success');
-      void strategicReadModel.refresh();
-    } catch (err) {
-      if (selectedProjectIdRef.current === projectId) {
-        addToast(err instanceof Error ? err.message : 'Could not start Strategic session', 'error');
-      }
-    } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
-    }
-  }, [strategicSessionBusy, addToast, strategicReadModel, strategicReadModelWorkbench, selectedProjectId]);
-
-  const handleStopStrategicSession = useCallback(async () => {
-    const projectId = selectedProjectId;
-    if (!projectId || strategicSessionBusy) return;
-    setStrategicSessionBusy(true);
-    try {
-      await stopStrategicSession(projectId);
-      if (selectedProjectIdRef.current !== projectId) return;
-      addToast('Strategic session stopping', 'success');
-      void strategicReadModel.refresh();
-    } catch (err) {
-      if (selectedProjectIdRef.current === projectId) {
-        addToast(err instanceof Error ? err.message : 'Could not stop Strategic session', 'error');
-      }
-    } finally {
-      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
-    }
-  }, [strategicSessionBusy, addToast, strategicReadModel, selectedProjectId]);
-
   const taskContextSessionProps = useMemo(() => ({
     sessionRefs: strategicWorkbenchState?.selected_refs,
     savingSessionRefs: savingStrategicWorkbench,
@@ -265,26 +193,14 @@ export function useStrategicSession({
   return {
     strategicWorkbenchState,
     strategicInteractionMode,
-    residentStrategicSession,
-    strategicSessionActive,
-    strategicSessionStatus,
-    residentStrategicSessionAvailable,
-    residentStrategicSessionAvailability,
-    strategicSessionState,
-    strategicSessionReason,
-    residentStrategicSessionRunners,
-    strategicSessionSelectedRunnerId,
     savingStrategicWorkbench,
     checkingInStrategicSession,
-    strategicSessionBusy,
     chatComposerContextDescriptor,
     taskContextSessionProps,
     persistStrategicWorkbench,
     updateStrategicSessionRefs,
     handleSelectStrategicRunner,
     handleStrategicCheckIn,
-    handleStartStrategicSession,
-    handleStopStrategicSession,
     strategicWorkbenchOperatorSurfaceTouchedRef,
     strategicWorkbenchRestoreProjectRef,
   };

@@ -2420,7 +2420,7 @@ def _select_viewable_candidates_from_bundle_path(
     exceed ``_MAX_VIEWABLE_FILE_COUNT`` objects, no in-memory member exceeds
     ``_MAX_VIEWABLE_FILE_BYTES``, and streamed videos add only the copy buffer —
     nothing else about the bundle (its total size, its non-viewable payload, its
-    count of rejected images) is ever resident. Returns ``(selected, dropped)``
+    count of rejected images) is ever held in memory. Returns ``(selected, dropped)``
     with the same contract as the in-memory extractor's caller.
 
     Defensive by contract: a non-gzip/non-tar file or ANY parse error yields
@@ -2606,7 +2606,7 @@ def _extract_viewable_candidates_from_bundle(
                 relname, content_type, kind = classified
                 if relname in seen:
                     continue
-                # The whole bundle is already resident here, so materializing one
+                # The whole bundle is already in memory here, so materializing one
                 # member (image or video) under its per-kind cap adds no new peak.
                 data = _read_capped_member(
                     tar, member, _viewable_size_cap_for_kind(kind)

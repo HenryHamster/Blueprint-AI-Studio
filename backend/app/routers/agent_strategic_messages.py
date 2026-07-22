@@ -1,7 +1,7 @@
 """Agent-facing inbound strategic-message poll endpoint.
 
-The resident strategic agent (a persistent provider session pinned to the
-operator's local runner) polls this to pick up new operator chat messages in
+The strategic agent (a provider session pinned to the operator's local runner)
+polls this to pick up new operator chat messages in
 near-real time. The ``since`` cursor plus ascending order let it drain only what
 arrived after its last poll — no re-reading the whole thread and no cold
 context rebuild — which is what makes the interactive latency target
@@ -40,7 +40,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -121,7 +120,7 @@ async def agent_poll_messages(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """Return operator messages at-or-after ``since`` for the resident agent.
+    """Return operator messages at-or-after ``since`` for the strategic agent.
 
     Filters on ``project_id`` + ``from_type`` (default ``user``) + ``status``
     (default ``open``) and, when a cursor is supplied, ``created_at >= since``
@@ -152,20 +151,9 @@ async def agent_poll_messages(
         # instant closes both the >limit truncation skip and the commit-race
         # skip a strict > would open (see module docstring).
         conditions.append(ProjectMessage.created_at >= since_dt)
-    if session_id:
-        # Session scoping: a resident session sees only messages stamped for it,
-        # PLUS legacy/cadence NULL-session rows (never hidden — backward compat so
-        # pre-migration backlog and out-of-session sends stay visible). A message
-        # stamped for a DIFFERENT session is excluded, so session A's chat does
-        # not bleed into session B's poll. An absent session_id (older agents)
-        # degrades to the project-wide behaviour unchanged. Served by the
-        # ix_projectmessage_project_session_created composite index.
-        conditions.append(
-            or_(
-                ProjectMessage.resident_session_id == session_id,
-                ProjectMessage.resident_session_id.is_(None),
-            )
-        )
+    # ``session_id`` is accepted for backward compatibility with older agents but
+    # no longer scopes the poll: messages are returned project-wide (per-session
+    # scoping was retired), so every agent sees the full project message stream.
 
     rows = (
         (

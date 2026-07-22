@@ -11,8 +11,6 @@ import type { StrategicLivenessResponse, StrategicStateResponse } from '../strat
 vi.mock('../strategicStateApi', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../strategicStateApi')>()),
   checkInStrategicSession: vi.fn(),
-  startStrategicSession: vi.fn(),
-  stopStrategicSession: vi.fn(),
   updateStrategicWorkbenchState: vi.fn(),
 }));
 vi.mock('../utils/strategicContextDescriptor', async (importOriginal) => ({
@@ -36,25 +34,15 @@ function makeLiveness(): StrategicLivenessResponse {
   return {
     project_id: 'proj-1',
     interaction_mode: 'continuous',
-    resident_session: { session_id: 'ss-live', status: 'active', stop_requested: false },
-    resident_session_available: true,
-    resident_session_availability: { available: true, state: 'active', reason: null },
-    resident_session_runners: [
-      { id: 'r-1', name: 'desk', online: true, agent_ready: true, eligible: true },
-    ],
   };
 }
 
-// Minimal heavy read-model state carrying its own (different) resident-session
-// fields so we can prove the read model wins once it lands.
+// Minimal heavy read-model state carrying its own (different) interaction mode so
+// we can prove the read model's workbench wins once it lands.
 function makeHeavyState(): StrategicStateResponse {
   return {
     project_id: 'proj-1',
     strategic: { active_cycle: null, active_task: null, active_phase: null, latest_cycle: null, refresh: { pending: null } },
-    resident_session: { session_id: 'ss-heavy', status: 'active', stop_requested: false },
-    resident_session_available: true,
-    resident_session_availability: { available: true, state: 'starting', reason: null },
-    resident_session_runners: [],
     workbench: {
       version: 1,
       interaction_mode: 'chat',
@@ -74,7 +62,7 @@ describe('useStrategicSession liveness fallback', () => {
   beforeEach(() => vi.clearAllMocks());
   afterEach(() => cleanup());
 
-  it('resolves mode + session fields from the liveness probe before the read model lands', () => {
+  it('resolves the interaction mode from the liveness probe before the read model lands', () => {
     const { result } = renderHook(() =>
       useStrategicSession({
         selectedProjectId: 'proj-1',
@@ -84,14 +72,9 @@ describe('useStrategicSession liveness fallback', () => {
       }),
     );
     expect(result.current.strategicInteractionMode).toBe('continuous');
-    expect(result.current.residentStrategicSession?.session_id).toBe('ss-live');
-    expect(result.current.strategicSessionActive).toBe(true);
-    expect(result.current.strategicSessionState).toBe('active');
-    expect(result.current.residentStrategicSessionAvailable).toBe(true);
-    expect(result.current.residentStrategicSessionRunners).toHaveLength(1);
   });
 
-  it('lets the heavy read model take precedence once it hydrates', () => {
+  it('lets the heavy read model workbench take precedence once it hydrates', () => {
     const { result } = renderHook(() =>
       useStrategicSession({
         selectedProjectId: 'proj-1',
@@ -100,9 +83,7 @@ describe('useStrategicSession liveness fallback', () => {
         strategicLiveness: makeLiveness(),
       }),
     );
-    // Read model wins: session id, availability state, and mode all come from it.
-    expect(result.current.residentStrategicSession?.session_id).toBe('ss-heavy');
-    expect(result.current.strategicSessionState).toBe('starting');
+    // Read model workbench wins: the mode comes from it, not the liveness probe.
     expect(result.current.strategicInteractionMode).toBe('chat');
   });
 
@@ -116,8 +97,6 @@ describe('useStrategicSession liveness fallback', () => {
         strategicLiveness: other,
       }),
     );
-    expect(result.current.residentStrategicSession).toBeNull();
     expect(result.current.strategicInteractionMode).toBeNull();
-    expect(result.current.strategicSessionState).toBe('off');
   });
 });

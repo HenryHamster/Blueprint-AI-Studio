@@ -748,7 +748,7 @@ export function buildTriageItems(p: BuildParams): { items: TriageItem[]; section
 export interface MessagesListViewProps {
   presentation?: 'triage' | 'conversation';
   /**
-   * Live resident-session streaming preview, rendered at the tail of the
+   * Live strategic-session streaming preview, rendered at the tail of the
    * conversation transcript (conversation presentation only). Reconciled away by
    * the caller once the durable strategic ProjectMessage lands, so it never
    * duplicates a persisted message.

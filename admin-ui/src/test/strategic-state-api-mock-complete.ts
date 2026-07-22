@@ -15,7 +15,6 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     updateStrategicWorkbenchState: vi.fn(),
     fetchStrategicSession: vi.fn(),
     fetchStrategicConversation: vi.fn(),
-    fetchResidentEngineHealth: vi.fn().mockResolvedValue(null),
     findStrategicMessageByClientIdentity: vi.fn(),
     createStrategicSessionMessage: vi.fn(),
     StrategicSessionMessageCreateError: class StrategicSessionMessageCreateError extends Error {
@@ -23,8 +22,6 @@ export function createStrategicStateApiMock(overrides: Record<string, unknown> =
     },
     checkInStrategicSession: vi.fn(),
     executeStrategicWorkSessionCommand: vi.fn(),
-    startStrategicSession: vi.fn(),
-    stopStrategicSession: vi.fn(),
     getMessageAttachmentUploadUrl: vi.fn(),
     deleteMessageAttachmentUpload: vi.fn(),
     getMessageAttachmentDownloadUrl: vi.fn(),

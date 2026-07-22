@@ -194,7 +194,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
-        # Resident strategic session (dead-man's-switch safety + resident agent).
+        # Strategic session cadence and safety knobs.
         "strategic_session_enabled",
         "strategic_continuation_ttl_seconds",
         "strategic_local_hold_timeout_seconds",
@@ -204,7 +204,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_session_max_ops_per_turn",
         "strategic_session_autonomous_turn_timeout_seconds",
         "strategic_session_max_unattended_seconds",
-        "resident_session_heartbeat_stale_seconds",
         "task_type_categories",
         "task_type_model_preferences",
         "task_type_provider_overrides",
@@ -781,9 +780,6 @@ async def get_settings(
         ),
         "strategic_session_max_unattended_seconds": _runtime_config.get(
             "strategic_session_max_unattended_seconds", 14400
-        ),
-        "resident_session_heartbeat_stale_seconds": _runtime_config.get(
-            "resident_session_heartbeat_stale_seconds", 1500
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_enabled_by_project": {
@@ -1693,15 +1689,12 @@ async def _apply_settings(
         _runtime_config["strategic_session_enabled"] = val
         if val:
             _debt_keys_to_resolve.append("dormant_knob:strategic_session_enabled")
-    # Resident strategic-session integer knobs. Each is clamped to a sane range:
+    # Strategic-session integer knobs. Each is clamped to a sane range:
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
-    # operator can NEVER reintroduce a >12h local-pin wall — the exact regression
-    # the resident-session dead-man's switch removed); the idle tick and turn
-    # timeout bound the resident loop cadence; the unattended cap bounds total
-    # autonomous lifetime (ceiling 8h, still well under a 12h wall); the resident
-    # heartbeat-stale window is the reaper carve-out (<=2h so a dead runner is
-    # still reclaimed).
+    # operator can NEVER reintroduce a >12h local-pin wall); the idle tick and
+    # turn timeout bound the session loop cadence; the unattended cap bounds total
+    # autonomous lifetime (ceiling 8h, still well under a 12h wall).
     for _key, _lo, _hi in (
         ("strategic_continuation_ttl_seconds", 60, 7_200),
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
@@ -1718,7 +1711,6 @@ async def _apply_settings(
         # 15-min absolute hard ceiling enforced agent-side.
         ("strategic_session_autonomous_turn_timeout_seconds", 30, 3_600),
         ("strategic_session_max_unattended_seconds", 60, 28_800),
-        ("resident_session_heartbeat_stale_seconds", 60, 7_200),
     ):
         if _key in payload:
             try:
@@ -3815,12 +3807,12 @@ async def _apply_settings(
                     "cloud_run_task_type_allowlist": sorted(
                         _runtime_config.get("cloud_run_task_type_allowlist") or []
                     ),
-                    # Persist the resident strategic-session settings so an operator
+                    # Persist the strategic-session settings so an operator
                     # enable/tune survives a Cloud Run restart and propagates to the
                     # leader across instances. runtime_config_state.sync_* reads these
                     # keys back on boot / every sync cycle; without them an enable
                     # reverts to the env default on restart and a multi-instance PATCH
-                    # never reaches the leader that owns the resident session.
+                    # never reaches the leader that owns the session.
                     "strategic_session_enabled": bool(
                         _runtime_config.get("strategic_session_enabled", False)
                     ),
@@ -3854,11 +3846,6 @@ async def _apply_settings(
                     "strategic_session_max_unattended_seconds": int(
                         _runtime_config.get(
                             "strategic_session_max_unattended_seconds", 14400
-                        )
-                    ),
-                    "resident_session_heartbeat_stale_seconds": int(
-                        _runtime_config.get(
-                            "resident_session_heartbeat_stale_seconds", 1500
                         )
                     ),
                     "direction_gap_respawn_block_mode": str(

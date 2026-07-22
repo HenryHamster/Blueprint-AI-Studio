@@ -1213,8 +1213,8 @@ async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
     """with_task_context_locked must atomically apply the mutate_fn and PRESERVE
     pre-existing keys owned by another writer — the lost-update property.
 
-    Regression for finding 8ff6c48f: the resident-session heartbeat mirror
-    (``renew_resident_session_lease``) writes ``_exam_ledger`` / ``message_cursor``
+    Regression for finding 8ff6c48f: a heartbeat mirror writes
+    ``_exam_ledger`` / ``message_cursor``
     into ``task.context`` while the strategic-API paths in admin_agent_ops.py
     write ``_strategic_api_called`` — each via a whole-column overwrite. Loading
     the context INSIDE the FOR UPDATE lock and merging must keep the other
@@ -1227,7 +1227,7 @@ async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
     # Simulate a strategic-API write already present on the row.
     task = Task(
         project_id=project.id,
-        title="resident session task",
+        title="context lock task",
         status=TaskStatus.IN_PROGRESS,
         context={"_strategic_api_called": True},
     )
@@ -1272,7 +1272,7 @@ async def test_with_task_context_locked_serializes_concurrent_writers(db_session
     """Two concurrent callers writing disjoint keys via with_task_context_locked
     must both survive — the second must see the first's committed write.
 
-    This is the exact race in finding 8ff6c48f: the heartbeat ledger mirror
+    This is the exact race in finding 8ff6c48f: a heartbeat ledger mirror
     (``_exam_ledger``) and a strategic-API write (``_strategic_api_called``)
     targeting the SAME task row. Without the FOR UPDATE re-read inside the
     helper, whichever commits second drops the other's key."""
@@ -1282,7 +1282,7 @@ async def test_with_task_context_locked_serializes_concurrent_writers(db_session
 
     task = Task(
         project_id=project.id,
-        title="contended resident task",
+        title="contended context task",
         status=TaskStatus.IN_PROGRESS,
         context={},
     )

@@ -1,11 +1,10 @@
 import { afterEach, describe, test } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { StrategicStreamingBubble, StrategicActivityStrip, StrategicResidentActivityWidget } from './StrategicLiveTurn';
+import { StrategicStreamingBubble, StrategicActivityStrip } from './StrategicLiveTurn';
 import type {
   StrategicActivityItem,
   StrategicTurnSegment,
-  ResidentActivityState,
 } from '../utils/strategicSessionLive';
 import {
   expectNoOverflowAt,
@@ -87,17 +86,6 @@ describe('StrategicLiveTurn — viewport regression', () => {
     root = r;
     return act(async () => {
       r.render(<StrategicStreamingBubble segments={REASONING_PLUS_REPLY_SEGMENTS} />);
-    });
-  }
-
-  function mountResidentWidget(state: ResidentActivityState) {
-    host = document.createElement('div');
-    host.style.padding = '12px';
-    document.body.appendChild(host);
-    const r = createRoot(host);
-    root = r;
-    return act(async () => {
-      r.render(<StrategicResidentActivityWidget state={state} />);
     });
   }
 
@@ -184,47 +172,4 @@ describe('StrategicLiveTurn — viewport regression', () => {
     });
   });
 
-  test('resident widget — executing shows the running command + live timer at 900px', async () => {
-    await expectNoOverflowAt(900, async () => {
-      await mountResidentWidget({
-        phase: 'executing',
-        label: 'Working',
-        commandText: `bash scripts/${'e'.repeat(280)}/test-backend.sh`,
-        startMs: Date.now() - 4000,
-      });
-    });
-    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
-    if (widget?.getAttribute('data-phase') !== 'executing') throw new Error('expected executing phase');
-    if (!(widget?.textContent ?? '').includes('running…')) {
-      throw new Error(`expected a live timer in executing state, got: "${(widget?.textContent ?? '').slice(0, 120)}"`);
-    }
-  });
-
-  test('resident widget — idle shows waiting copy and NO ticking timer at 900px', async () => {
-    await expectNoOverflowAt(900, async () => {
-      await mountResidentWidget({ phase: 'idle', label: 'Waiting for direction', endMs: Date.now() });
-    });
-    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
-    if (widget?.getAttribute('data-phase') !== 'idle') throw new Error('expected idle phase');
-    const text = widget?.textContent ?? '';
-    if (!text.includes('Waiting for direction')) throw new Error(`expected idle copy, got: "${text}"`);
-    if (text.includes('running…')) throw new Error('idle state must not render a ticking timer');
-  });
-
-  test('resident widget — dead/ended shows frozen ended presentation, no timer, at 900px', async () => {
-    await expectNoOverflowAt(900, async () => {
-      await mountResidentWidget({ phase: 'dead', label: 'Session ended', endMs: Date.now() - 60000 });
-    });
-    const widget = host?.querySelector('[data-testid="strategic-resident-activity"]');
-    if (widget?.getAttribute('data-phase') !== 'dead') throw new Error('expected dead phase');
-    const text = widget?.textContent ?? '';
-    if (!text.includes('Session ended')) throw new Error(`expected ended copy, got: "${text}"`);
-    if (text.includes('running…')) throw new Error('dead state must never render a ticking timer');
-  });
-
-  test('resident widget — dead state fits 320px without horizontal overflow', async () => {
-    await expectNoOverflowAt(320, async () => {
-      await mountResidentWidget({ phase: 'dead', label: 'Session ended', endMs: Date.now() });
-    });
-  });
 });

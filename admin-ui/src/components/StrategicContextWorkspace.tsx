@@ -30,7 +30,7 @@ import {
   StrategicSessionControl,
   type StrategicAccountSpendStatus,
   type StrategicInteractionMode,
-  type StrategicResidentRunnerOption,
+  type StrategicSessionRunnerOption,
 } from './StrategicSessionControl';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
@@ -49,7 +49,7 @@ interface StrategicContextWorkspaceProps {
   sessionState?: string | null;
   sessionReason?: string | null;
   sessionBusy?: boolean;
-  sessionRunners?: StrategicResidentRunnerOption[] | null;
+  sessionRunners?: StrategicSessionRunnerOption[] | null;
   sessionSelectedRunnerId?: string | null;
   operatorDecisionSummary?: {
     total: number;

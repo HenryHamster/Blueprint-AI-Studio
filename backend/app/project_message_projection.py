@@ -106,9 +106,12 @@ _STRUCTURED_FIELD_ALLOWLISTS: dict[str, frozenset[str]] = {
     }),
 }
 _UNSAFE_STRUCTURED_VALUE = object()
+# Durable internal context key stamping the operator refresh wakeup_state on a
+# message row.
+WAKEUP_STATE_CONTEXT_KEY = "_operator_wakeup_state"
 _INTERNAL_MESSAGE_CONTEXT_KEYS = frozenset({
     "_message_request_fingerprint",
-    "_resident_wakeup_state",
+    WAKEUP_STATE_CONTEXT_KEY,
 })
 
 
@@ -125,7 +128,7 @@ def _message_context(message: ProjectMessage) -> dict[str, Any]:
     if not isinstance(context, dict):
         return {}
     # Internal delivery/idempotency receipts are durable server state, not
-    # operator-visible chips and not Resident prompt context.
+    # operator-visible chips and not strategist prompt context.
     projected: dict[str, Any] = {}
     preferred = [
         *DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS,

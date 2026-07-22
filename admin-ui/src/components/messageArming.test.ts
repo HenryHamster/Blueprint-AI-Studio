@@ -5,7 +5,7 @@ import {
   composerHintCopy,
   predictArming,
   parseArmingOutcome,
-  residentAcceptanceToastCopy,
+  conversationAcceptanceToastCopy,
   workbenchArmingToastCopy,
 } from './messageArming';
 
@@ -34,20 +34,20 @@ describe('armingToastCopy — post-send toast grounded in the real outcome', () 
     expect(armingToastCopy(undefined)).toBe('Message sent');
   });
 });
-describe('residentAcceptanceToastCopy — canonical conversation receipt wins', () => {
+describe('conversationAcceptanceToastCopy — canonical conversation receipt wins', () => {
   test('queued overrides a contradictory legacy not_armed outcome', () => {
-    const receipt = residentAcceptanceToastCopy('queued', 'not_armed');
+    const receipt = conversationAcceptanceToastCopy('queued', 'not_armed');
     expect(receipt).toEqual({
-      message: 'Message accepted — Resident queued',
+      message: 'Message accepted — queued',
       severity: 'success',
     });
     expect(receipt.message).not.toContain('wasn’t woken');
   });
 
   test('capacity and paused receipts stay truthful', () => {
-    expect(residentAcceptanceToastCopy('waiting_for_capacity', 'steering').message)
+    expect(conversationAcceptanceToastCopy('waiting_for_capacity', 'steering').message)
       .toContain('waiting to start');
-    expect(residentAcceptanceToastCopy('paused', 'steering').severity).toBe('info');
+    expect(conversationAcceptanceToastCopy('paused', 'steering').severity).toBe('info');
   });
 });
 

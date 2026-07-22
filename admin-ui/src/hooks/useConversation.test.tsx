@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectMessage } from '../types/messages';
-import { mergeResidentConversationPages, useResidentConversation } from './useResidentConversation';
+import { mergeConversationPages, useConversation } from './useConversation';
 
 const { fetchStrategicConversation } = vi.hoisted(() => ({
   fetchStrategicConversation: vi.fn(),
@@ -21,11 +21,11 @@ function message(sequence: number): ProjectMessage {
   };
 }
 
-describe('resident conversation pagination', () => {
+describe('conversation pagination', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
   test('merges overlapping pages by canonical id while preserving sequence order', () => {
-    const merged = mergeResidentConversationPages(
+    const merged = mergeConversationPages(
       [message(1), message(2)],
       [{ ...message(2), content: 'updated' }, message(3)],
     );
@@ -35,7 +35,7 @@ describe('resident conversation pagination', () => {
 
   test('preserves the existing array and message identities when a page is unchanged', () => {
     const existing = [message(1), message(2)];
-    const merged = mergeResidentConversationPages(existing, existing.map(item => ({ ...item })));
+    const merged = mergeConversationPages(existing, existing.map(item => ({ ...item })));
     expect(merged).toBe(existing);
     expect(merged[0]).toBe(existing[0]);
   });
@@ -43,7 +43,7 @@ describe('resident conversation pagination', () => {
   test('reconciles a canonical message by client identity without duplicating its optimistic predecessor', () => {
     const optimistic = { ...message(1), id: 'optimistic:send-1', idempotency_key: 'send-1' };
     const canonical = { ...message(2), id: 'canonical-1', client_idempotency_key: 'send-1' };
-    const merged = mergeResidentConversationPages([optimistic], [canonical]);
+    const merged = mergeConversationPages([optimistic], [canonical]);
     expect(merged).toEqual([canonical]);
   });
 
@@ -57,7 +57,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ realtimeMessage }) => useResidentConversation({
+      ({ realtimeMessage }) => useConversation({
         enabled: true,
         projectId: 'project-1',
         actorUserId: 'actor-1',
@@ -94,7 +94,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ realtimeMessage, requiresRefetch }) => useResidentConversation({
+      ({ realtimeMessage, requiresRefetch }) => useConversation({
         enabled: true,
         projectId: 'project-1',
         actorUserId: 'actor-1',
@@ -134,7 +134,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ searchQuery }) => useResidentConversation({
+      ({ searchQuery }) => useConversation({
         enabled: true,
         projectId: 'project-1',
         actorUserId: 'actor-1',
@@ -165,7 +165,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const onTargetFetched = vi.fn();
-    const { result } = renderHook(() => useResidentConversation({
+    const { result } = renderHook(() => useConversation({
       enabled: true,
       projectId: 'project-1',
       actorUserId: 'actor-1',
@@ -195,7 +195,7 @@ describe('resident conversation pagination', () => {
       .mockResolvedValueOnce({ conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [message(1), message(2)] } });
     const setMessages = vi.fn(update => { messages = typeof update === 'function' ? update(messages) : update; });
     const onTargetFetched = vi.fn();
-    const { result } = renderHook(() => useResidentConversation({
+    const { result } = renderHook(() => useConversation({
       enabled: true,
       projectId: 'project-1',
       actorUserId: 'actor-1',
@@ -226,7 +226,7 @@ describe('resident conversation pagination', () => {
     const setMessages = vi.fn(update => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
-    const { result } = renderHook(() => useResidentConversation({
+    const { result } = renderHook(() => useConversation({
       enabled: true,
       projectId: 'project-1',
       actorUserId: 'actor-1',
@@ -273,7 +273,7 @@ describe('resident conversation pagination', () => {
     const setMessages = vi.fn(update => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
-    const { result } = renderHook(() => useResidentConversation({
+    const { result } = renderHook(() => useConversation({
       enabled: true,
       projectId: 'project-1',
       actorUserId: 'actor-1',
@@ -301,7 +301,7 @@ describe('resident conversation pagination', () => {
       .mockReturnValueOnce(secondPage);
     const setMessages = vi.fn();
     const { result, rerender } = renderHook(
-      ({ projectId, actorUserId }) => useResidentConversation({
+      ({ projectId, actorUserId }) => useConversation({
         enabled: true,
         projectId,
         actorUserId,
@@ -334,7 +334,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ strategicPollEpoch }) => useResidentConversation({
+      ({ strategicPollEpoch }) => useConversation({
         enabled: true,
         projectId: 'project-1',
         actorUserId: 'actor-1',
@@ -377,7 +377,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ strategicPollEpoch }) => useResidentConversation({
+      ({ strategicPollEpoch }) => useConversation({
         enabled: true,
         projectId: 'project-1',
         actorUserId: 'actor-1',
@@ -410,7 +410,7 @@ describe('resident conversation pagination', () => {
       messages = typeof update === 'function' ? update(messages) : update;
     });
     const { rerender } = renderHook(
-      ({ enabled, strategicPollEpoch }) => useResidentConversation({
+      ({ enabled, strategicPollEpoch }) => useConversation({
         enabled,
         projectId: 'project-1',
         actorUserId: 'actor-1',

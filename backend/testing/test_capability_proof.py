@@ -3006,8 +3006,8 @@ class TestNamedTestCoverageHelpers:
         ]
 
     def test_candidate_test_paths_ts_sibling(self):
-        assert _candidate_test_paths("agent/src/handlers/strategic-resident-lib.ts") == [
-            "agent/src/handlers/strategic-resident-lib.test.ts"
+        assert _candidate_test_paths("agent/src/handlers/code-change-lib.ts") == [
+            "agent/src/handlers/code-change-lib.test.ts"
         ]
         assert _candidate_test_paths("admin-ui/src/components/KnowledgeBrowser.tsx") == [
             "admin-ui/src/components/KnowledgeBrowser.test.tsx"
@@ -3028,12 +3028,12 @@ class TestNamedTestCoverageHelpers:
         assert _test_references_source(content, "scripts/local_runner.py")
 
     def test_test_references_source_js_require(self):
-        content = "const foo = require('./strategic-resident-lib')\n"
-        assert _test_references_source(content, "agent/src/handlers/strategic-resident-lib.ts")
+        content = "const foo = require('./code-change-lib')\n"
+        assert _test_references_source(content, "agent/src/handlers/code-change-lib.ts")
 
     def test_test_references_source_no_match(self):
         # File exists but does not import the module → not a real coverage signal.
-        content = "import os\nimport unrelated_module\n# strategic-resident-lib mentioned only in a comment\n"
+        content = "import os\nimport unrelated_module\n# code-change-lib mentioned only in a comment\n"
         assert not _test_references_source(content, "backend/app/capability_proof.py")
         assert not _test_references_source("", "backend/app/capability_proof.py")
 

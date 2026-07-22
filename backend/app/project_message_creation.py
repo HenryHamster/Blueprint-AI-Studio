@@ -28,12 +28,15 @@ from app.models import (
     ProjectMessageSequence,
     _utcnow,
 )
-from app.project_message_projection import message_event_payload
+from app.project_message_projection import (
+    WAKEUP_STATE_CONTEXT_KEY,
+    message_event_payload,
+)
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
-    ARMING_RESIDENT_SESSION,
     ARMING_STEERING,
     maybe_arm_operator_refresh,
+    strategic_refresh_pending,
 )
 from app.workbench_state import (
     build_message_strategic_session_snapshot,
@@ -78,7 +81,6 @@ CONVERSATION_EVENT_TYPES = frozenset(
         "capability_verdict_decided",
         "capability_trial_ambiguous_lift_escalation",
         "question_answer",
-        "resident_reply",
         "feedback_reply",
         "capability_proof_gate_graduated_observe",
         "capability_proof_gate_graduated_enforce",
@@ -236,7 +238,7 @@ async def reserve_project_message_sequences(
         raise ValueError("message sequence reservation count must be between 1 and 100")
 
     dialect = resolve_dialect_name(session)
-    if dialect == "postgresql":  # noqa: SIM102
+    if dialect == "postgresql":
         if lock_timeout_ms is not None:
             await session.execute(
                 text(f"SET LOCAL lock_timeout = '{max(1, int(lock_timeout_ms))}ms'")
@@ -379,8 +381,6 @@ def wakeup_state_for_arming(
     *,
     refresh_was_pending: bool,
 ) -> str:
-    if arming == ARMING_RESIDENT_SESSION:
-        return "queued"
     if arming == ARMING_STEERING:
         return "coalesced" if refresh_was_pending else "queued"
     if arming == ARMING_NOT_ARMED:
@@ -390,7 +390,7 @@ def wakeup_state_for_arming(
 
 def stored_wakeup_state(message: ProjectMessage) -> str:
     context = message.context if isinstance(message.context, dict) else {}
-    value = context.get("_resident_wakeup_state")
+    value = context.get(WAKEUP_STATE_CONTEXT_KEY)
     if value in {"queued", "coalesced", "paused", "waiting_for_capacity"}:
         return value
     return "waiting_for_capacity"
@@ -613,35 +613,23 @@ async def create_operator_project_message(
             }
     _ensure_context_size(message_context, compact=compact_context_size)
 
-    # Fence the ownership decision before touching either legacy arming state
-    # or the durable Resident successor. Ownership transitions take these rows
-    # in the same Project -> Resident order, so send vs rollback/cutover cannot
-    # observe one owner and enqueue for the other.
-    # [RESIDENT-REMOVAL] removed with resident subsystem
-#     from app.strategic_resident_message_locking import lock_resident_message_owner_state
-
-    (
-        locked_project,
-        strategic_resident_owns,
-        refresh_was_pending,
-        resident_active,
-        resident_session_id,
-    ) = await lock_resident_message_owner_state(session, project_id)  # noqa: F821
-    if strategic_resident_owns:
-        # Never revive legacy refresh/session state after cutover.
-        refresh_was_pending = False
-        arming = ARMING_NOT_ARMED
-    else:
-        arming = await maybe_arm_operator_refresh(
-            session,
-            project_id,
-            message_type,
-            message_content=trimmed_content,
-            resident_session_active=resident_active,
-        )
+    # Fence the arming decision on the locked Project so send vs
+    # rollback/cutover observe a consistent refresh state.
+    locked_vision = await session.scalar(
+        select(Project.vision)
+        .where(Project.id == project_id)
+        .with_for_update(read=True, key_share=True)
+    )
+    refresh_was_pending = strategic_refresh_pending(locked_vision)
+    arming = await maybe_arm_operator_refresh(
+        session,
+        project_id,
+        message_type,
+        message_content=trimmed_content,
+    )
     if not session.in_transaction():
-        # A failed legacy wake releases every lock. Restore the canonical
-        # prefs -> Project order before refencing Project -> Resident.
+        # A failed wake releases every lock. Restore the canonical
+        # prefs -> Project order before re-deriving the arming state.
         if should_persist_workbench:
             await persist_strategic_workbench_update(
                 session,
@@ -653,17 +641,12 @@ async def create_operator_project_message(
                 commit=False,
             )
             await session.flush()
-        (
-            locked_project,
-            strategic_resident_owns,
-            refresh_was_pending,
-            resident_active,
-            resident_session_id,
-        ) = await lock_resident_message_owner_state(session, project_id)  # noqa: F821
-        if strategic_resident_owns:
-            arming = ARMING_NOT_ARMED
-        elif resident_active:
-            arming = ARMING_RESIDENT_SESSION
+        locked_vision = await session.scalar(
+            select(Project.vision)
+            .where(Project.id == project_id)
+            .with_for_update(read=True, key_share=True)
+        )
+        refresh_was_pending = strategic_refresh_pending(locked_vision)
 
     if idem_key:
         # Same-identity retries serialize before reply/source/attachment
@@ -735,52 +718,9 @@ async def create_operator_project_message(
         if validated_context is not None:
             message_context = validated_context
 
-    locked_resident = None
-    locked_turn_tasks = None
-    locked_resident_owner = None
-    if surface == MessageSurface.CONVERSATION:
-        # [RESIDENT-REMOVAL] removed with resident subsystem
-#         from app.strategic_resident_message_locking import (
-#             prelock_resident_message_turn_state,
-#         )
-
-        prelock = await prelock_resident_message_turn_state(  # noqa: F821
-            session,
-            project_id=project_id,
-            locked_project=locked_project,
-        )
-        if prelock.error is not None:
-            # Lock contention or a shadow-only projection defect must not reject
-            # legacy-owned conversation. Once ownership flips, the same gap is
-            # authoritative and acceptance fails closed.
-            if prelock.engine_owner == "strategic_resident":
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Message was not accepted because the Resident turn "
-                        "state is busy; retry with the same idempotency key"
-                    ),
-                    headers={"Retry-After": "1"},
-                ) from prelock.error
-            logger.error(
-                "[RESIDENT_SHADOW] pre-lock failed for legacy conversation "
-                "(project=%s); accepting without a shadow successor",
-                project_id,
-                exc_info=(
-                    type(prelock.error),
-                    prelock.error,
-                    prelock.error.__traceback__,
-                ),
-            )
-        else:
-            locked_resident = prelock.resident
-            locked_turn_tasks = prelock.tasks
-            locked_resident_owner = prelock.engine_owner
-
     # Reserve only after all potentially slow validation. From this point to
-    # commit, all pre-existing Resident/Task rows are already locked, keeping
-    # the counter window bounded to idempotency race closure, bounded successor
-    # mutation/insert, canonical message insert, and their atomic commit.
+    # commit, the counter window is bounded to idempotency race closure,
+    # canonical message insert, and their atomic commit.
     next_sequence = await lock_project_and_next_message_sequence(
         session,
         project_id,
@@ -818,73 +758,13 @@ async def create_operator_project_message(
                 wakeup_state=stored_wakeup_state(existing),
             )
 
-    # Migration shadow: mirror genuine operator wakeups into the bounded
-    # backend-managed Resident turn runtime in this SAME message transaction.
-    # The legacy refresh/session path above remains authoritative and its
-    # operator-facing wakeup_state is unchanged. While the project is still
-    # legacy-owned, a shadow comparison gap fails open under a SAVEPOINT so a
-    # rollout-only defect cannot reject an otherwise durable operator message.
-    # Once ownership flips, turn enqueue is authoritative and therefore fails
-    # closed with the message (atomic message + successor contract).
-    resident_wake = None
-    if locked_resident is not None:
-        try:
-            async with session.begin_nested():
-                # [RESIDENT-REMOVAL] removed with resident subsystem
-#                 from app.strategic_resident_runtime import (
-#                     coalesce_resident_turn,
-#                 )
-                from app.artifact_refs import (
-                    artifact_ref_grants_from_message_context,
-                )
-
-                resident_wake = await coalesce_resident_turn(  # noqa: F821
-                    session,
-                    project_id=project_id,
-                    lane="interactive",
-                    trigger_kind="operator_message",
-                    message_sequence=next_sequence,
-                    locked_resident=locked_resident,
-                    prelocked_tasks=locked_turn_tasks,
-                    artifact_ref_grants=artifact_ref_grants_from_message_context(
-                        message_context
-                    ),
-                )
-        except Exception as exc:
-            # The outer Resident lock survives SAVEPOINT rollback, so ownership
-            # cannot flip while this transaction decides whether enqueue is
-            # authoritative.
-            if locked_resident_owner == "strategic_resident":
-                raise HTTPException(
-                    status_code=503,
-                    detail=(
-                        "Message was not accepted because the Resident turn "
-                        "successor could not be queued; retry with the same "
-                        "idempotency key"
-                    ),
-                    headers={"Retry-After": "1"},
-                ) from exc
-            logger.exception(
-                "[RESIDENT_SHADOW] enqueue failed for accepted legacy message "
-                "(project=%s sequence=%s); legacy wake remains authoritative",
-                project_id,
-                next_sequence,
-            )
-
-    wakeup_state = (
-        resident_wake.state
-        if (
-            resident_wake is not None
-            and locked_resident_owner == "strategic_resident"
-        )
-        else wakeup_state_for_arming(
-            arming,
-            refresh_was_pending=refresh_was_pending,
-        )
+    wakeup_state = wakeup_state_for_arming(
+        arming,
+        refresh_was_pending=refresh_was_pending,
     )
     message_context = {
         **message_context,
-        "_resident_wakeup_state": wakeup_state,
+        WAKEUP_STATE_CONTEXT_KEY: wakeup_state,
         _REQUEST_FINGERPRINT_KEY: request_fingerprint,
     }
     _ensure_context_size(message_context, compact=compact_context_size)
@@ -901,7 +781,6 @@ async def create_operator_project_message(
         content=trimmed_content,
         context=message_context,
         idempotency_key=idem_key,
-        resident_session_id=resident_session_id,
     )
     session.add(msg)
     try:

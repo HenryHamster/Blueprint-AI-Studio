@@ -54,7 +54,7 @@ DECLINED_BY_CONTEXT_KEY = "declined_by"
 # at 900s ``_fail_stale_local_runner_holds`` clears the local-required pin and
 # FORCES CLOUD FALLBACK. An exclusion of 1800s could therefore never expire in
 # time: one transient decline (a Popen spawn failure) would deterministically
-# evict a Resident Strategic Agent task off local execution, defeating
+# evict a Strategic Agent task off local execution, defeating
 # continuous-local mode.
 #
 # 600s sits comfortably under the 900s default: the excluded runner becomes

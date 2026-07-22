@@ -38,7 +38,7 @@ export function applyDeepSeekModelEnv(env: Record<string, string>): void {
 
 /**
  * Pin ANTHROPIC_MODEL to the explicitly requested model for a DeepSeek CLI
- * spawn (run or validation), so env-driven paths — the resident stream-json
+ * spawn (run or validation), so env-driven paths — the stream-json
  * session, subagent spawns, CLI internals that consult the env before the
  * flag — resolve the SAME model the --model flag names. Non-DeepSeek
  * providers (isDeepSeek=false) get the env back untouched.

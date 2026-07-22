@@ -16,7 +16,6 @@ vi.mock('../api/projectTools', async () => {
   const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
   return {
     ...actual,
-    createResidentToolArtifactRef: vi.fn(),
     fetchToolContent: vi.fn(),
     saveToolContent: vi.fn(),
   };
@@ -36,36 +35,12 @@ vi.mock('../utils/renderWhiteboardArtifact', () => ({
   renderWhiteboardArtifact: vi.fn(),
 }));
 
-vi.mock('../utils/residentToolHandoff', async () => {
-  const actual = await vi.importActual<typeof import('../utils/residentToolHandoff')>(
-    '../utils/residentToolHandoff',
-  );
-  return {
-    ...actual,
-    dispatchResidentToolHandoff: vi.fn(),
-  };
-});
-
 import {
-  createResidentToolArtifactRef,
   fetchToolContent,
   saveToolContent,
   ConflictError,
-  ToolArtifactRequestError,
 } from '../api/projectTools';
-import { deleteMessageAttachmentUpload } from '../strategicStateApi';
-import { uploadConversationAttachments } from '../utils/conversationAttachmentUpload';
-import { renderWhiteboardArtifact } from '../utils/renderWhiteboardArtifact';
-import { dispatchResidentToolHandoff } from '../utils/residentToolHandoff';
-import {
-  createPendingWhiteboardArtifactOperation,
-  persistPendingWhiteboardArtifactOperation,
-} from '../utils/pendingWhiteboardArtifactRef';
 import WhiteboardTool from './WhiteboardTool';
-
-beforeEach(() => {
-  vi.mocked(dispatchResidentToolHandoff).mockReturnValue(true);
-});
 
 interface Stroke {
   color: string;
@@ -90,29 +65,6 @@ const SAMPLE_TOOL = {
   enabled: true,
   placement: 'project_section' as const,
   content_revision: 3,
-};
-
-const WHITEBOARD_ARTIFACT_REF = {
-  id: 'ref-wb-4',
-  artifact_ref_id: 'ref-wb-4',
-  tool_id: 'wb-1',
-  project_id: 'proj-a',
-  kind: 'whiteboard' as const,
-  revision: 4,
-  checksum: 'whiteboard-sha256',
-  author: 'operator-a',
-  timestamp: '2026-07-17T00:00:00Z',
-  retrieval: {
-    capability: 'project_tool_rendered_image' as const,
-    href: '/api/admin/projects/proj-a/tools/wb-1/artifact-refs/ref-wb-4',
-  },
-};
-
-const RENDERED_WHITEBOARD = {
-  file: new File(['png'], 'whiteboard-r4.png', { type: 'image/png' }),
-  checksum: 'whiteboard-sha256',
-  width: 1600,
-  height: 900,
 };
 
 beforeAll(() => {
@@ -253,244 +205,6 @@ describe('WhiteboardTool — autosave loop + conflict data-loss + save-status', 
     root = null;
     await act(async () => { await Promise.resolve(); });
     expect(saveToolContent).toHaveBeenCalledTimes(1);
-  });
-
-  test('Share with Resident saves before rendering and referencing the exact Whiteboard revision', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { strokes: [], nodes: [] }, content_revision: 3 });
-    vi.mocked(saveToolContent).mockResolvedValue({ content_revision: 4 });
-    vi.mocked(renderWhiteboardArtifact).mockResolvedValue(RENDERED_WHITEBOARD);
-    vi.mocked(uploadConversationAttachments).mockResolvedValue({
-      uploaded: [{
-        type: 'image',
-        attachment_id: 'upload-wb-4',
-        storage_uri: 'gs://resident/upload-wb-4',
-        name: 'whiteboard-r4.png',
-        mime_type: 'image/png',
-        size_bytes: 3,
-      }],
-      visible: [],
-    });
-    vi.mocked(createResidentToolArtifactRef).mockResolvedValue({ state: 'ready', artifact_ref: WHITEBOARD_ARTIFACT_REF });
-
-    const el = await mount();
-    enterDrawMode(el);
-    await act(async () => { drawStroke(surfaceOf(el)); });
-    const share = Array.from(el.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(saveToolContent).toHaveBeenCalledTimes(1);
-    expect(renderWhiteboardArtifact).toHaveBeenCalledWith(
-      expect.objectContaining({ strokes: expect.any(Array), nodes: [] }),
-      4,
-    );
-    expect(uploadConversationAttachments).toHaveBeenCalledWith('proj-a', [{
-      file: RENDERED_WHITEBOARD.file,
-      mime_type: 'image/png',
-      name: 'whiteboard-r4.png',
-    }]);
-    expect(createResidentToolArtifactRef).toHaveBeenCalledWith('proj-a', 'wb-1', 4, {
-      attachment_id: 'upload-wb-4',
-      storage_uri: 'gs://resident/upload-wb-4',
-      checksum: 'whiteboard-sha256',
-      mime_type: 'image/png',
-      width: 1600,
-      height: 900,
-    });
-    expect(vi.mocked(saveToolContent).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(renderWhiteboardArtifact).mock.invocationCallOrder[0],
-    );
-    expect(vi.mocked(renderWhiteboardArtifact).mock.invocationCallOrder[0]).toBeLessThan(
-      vi.mocked(createResidentToolArtifactRef).mock.invocationCallOrder[0],
-    );
-    expect(dispatchResidentToolHandoff).toHaveBeenCalledWith(expect.objectContaining({
-      artifactRef: WHITEBOARD_ARTIFACT_REF,
-      intent: 'share',
-    }));
-    expect(deleteMessageAttachmentUpload).not.toHaveBeenCalled();
-  });
-
-  test('remount resumes a durable receipt without rerendering or reuploading', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { strokes: [], nodes: [] }, content_revision: 4 });
-    vi.mocked(createResidentToolArtifactRef).mockResolvedValue({ state: 'ready', artifact_ref: WHITEBOARD_ARTIFACT_REF });
-    const pending = createPendingWhiteboardArtifactOperation({
-      actorUserId: 'operator-a',
-      projectId: 'proj-a',
-      toolId: 'wb-1',
-      toolTitle: 'Whiteboard',
-      revision: 4,
-      intent: 'ask',
-      laneOwner: 'Operator owns layout',
-      prompt: 'Review Whiteboard revision 4.',
-      renderedImage: {
-        attachment_id: 'persisted-upload',
-        storage_uri: 'gs://resident/persisted-upload',
-        checksum: 'whiteboard-sha256',
-        mime_type: 'image/png',
-        width: 1600,
-        height: 900,
-      },
-    });
-    expect(persistPendingWhiteboardArtifactOperation(pending)).toBe(true);
-
-    await mount();
-    await act(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(createResidentToolArtifactRef).toHaveBeenCalledWith(
-      'proj-a',
-      'wb-1',
-      4,
-      pending.rendered_image,
-    );
-    expect(renderWhiteboardArtifact).not.toHaveBeenCalled();
-    expect(uploadConversationAttachments).not.toHaveBeenCalled();
-    expect(dispatchResidentToolHandoff).toHaveBeenCalledWith(expect.objectContaining({
-      intent: 'ask',
-      laneOwner: 'Operator owns layout',
-      prompt: 'Review Whiteboard revision 4.',
-    }));
-  });
-
-  test('retains the rendered upload and durable intent if reference creation is uncertain', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { strokes: [], nodes: [] }, content_revision: 3 });
-    vi.mocked(renderWhiteboardArtifact).mockResolvedValue(RENDERED_WHITEBOARD);
-    vi.mocked(uploadConversationAttachments).mockResolvedValue({
-      uploaded: [{
-        type: 'image',
-        attachment_id: 'orphan-upload',
-        storage_uri: 'gs://resident/orphan-upload',
-        name: 'whiteboard-r3.png',
-        mime_type: 'image/png',
-        size_bytes: 3,
-      }],
-      visible: [],
-    });
-    vi.mocked(createResidentToolArtifactRef).mockRejectedValue(
-      new ToolArtifactRequestError('revision conflict', 409, false),
-    );
-    vi.mocked(deleteMessageAttachmentUpload).mockResolvedValue(undefined);
-
-    const el = await mount();
-    const share = Array.from(el.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(createResidentToolArtifactRef).toHaveBeenCalled();
-    expect(deleteMessageAttachmentUpload).not.toHaveBeenCalled();
-    expect(dispatchResidentToolHandoff).not.toHaveBeenCalled();
-    expect(el.querySelector('[role="alert"]')?.textContent).toContain('revision conflict');
-  });
-
-  test('terminal retry preserves intent but creates one fresh render receipt', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { strokes: [], nodes: [] }, content_revision: 3 });
-    vi.mocked(renderWhiteboardArtifact).mockResolvedValue(RENDERED_WHITEBOARD);
-    vi.mocked(uploadConversationAttachments)
-      .mockResolvedValueOnce({
-        uploaded: [{
-          type: 'image',
-          attachment_id: 'upload-old',
-          storage_uri: 'gs://resident/upload-old',
-          name: 'whiteboard-r3.png',
-          mime_type: 'image/png',
-          size_bytes: 3,
-        }],
-        visible: [],
-      })
-      .mockResolvedValueOnce({
-        uploaded: [{
-          type: 'image',
-          attachment_id: 'upload-fresh',
-          storage_uri: 'gs://resident/upload-fresh',
-          name: 'whiteboard-r3.png',
-          mime_type: 'image/png',
-          size_bytes: 3,
-        }],
-        visible: [],
-      });
-    vi.mocked(createResidentToolArtifactRef)
-      .mockRejectedValueOnce(new ToolArtifactRequestError('receipt rejected', 400, false))
-      .mockResolvedValueOnce({ state: 'ready', artifact_ref: { ...WHITEBOARD_ARTIFACT_REF, revision: 3 } });
-
-    const el = await mount();
-    const share = Array.from(el.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    const retry = Array.from(el.querySelectorAll('button')).find(
-      button => button.textContent === 'Retry with fresh render',
-    ) as HTMLButtonElement;
-    expect(retry).toBeTruthy();
-    await act(async () => {
-      retry.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(renderWhiteboardArtifact).toHaveBeenCalledTimes(2);
-    expect(uploadConversationAttachments).toHaveBeenCalledTimes(2);
-    expect(createResidentToolArtifactRef).toHaveBeenNthCalledWith(
-      2,
-      'proj-a',
-      'wb-1',
-      3,
-      expect.objectContaining({ attachment_id: 'upload-fresh' }),
-    );
-    expect(dispatchResidentToolHandoff).toHaveBeenCalledWith(expect.objectContaining({
-      intent: 'share',
-      artifactRef: expect.objectContaining({ revision: 3 }),
-    }));
-    expect(deleteMessageAttachmentUpload).not.toHaveBeenCalled();
-  });
-
-  test('a failed Whiteboard flush refuses rendering, upload, and Resident reference creation', async () => {
-    vi.mocked(fetchToolContent).mockResolvedValue({ content: { strokes: [], nodes: [] }, content_revision: 3 });
-    vi.mocked(saveToolContent).mockRejectedValue(new Error('storage unavailable'));
-
-    const el = await mount();
-    enterDrawMode(el);
-    await act(async () => { drawStroke(surfaceOf(el)); });
-    const share = Array.from(el.querySelectorAll('button')).find(
-      button => button.textContent === 'Share with Resident',
-    ) as HTMLButtonElement;
-    await act(async () => {
-      share.click();
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(saveToolContent).toHaveBeenCalledTimes(1);
-    expect(renderWhiteboardArtifact).not.toHaveBeenCalled();
-    expect(uploadConversationAttachments).not.toHaveBeenCalled();
-    expect(createResidentToolArtifactRef).not.toHaveBeenCalled();
-    expect(el.querySelector('[role="alert"]')?.textContent).toContain('not durably saved');
   });
 
   test('adding a text block persists a text node in the v2 payload', async () => {

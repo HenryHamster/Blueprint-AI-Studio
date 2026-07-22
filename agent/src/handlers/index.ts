@@ -58,6 +58,7 @@ const dispatchStrategic: Handler = (taskId, payload, task, ghToken, owner, repo,
   return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
 };
 
+
 // research task type forwards to the strategic handler when research_mode is
 // 'strategic'; otherwise it runs the tactical research path. strategic_review
 // always goes through dispatchStrategic.

@@ -41,13 +41,7 @@ from app.models import (
     _utcnow,
 )
 from app.messages_last_seen import naive_utc_to_epoch_ms
-from app.shared_state import runtime_config
 from app.storage import ARTIFACT_BUCKET_NAME
-from app.strategic_resident_session import (
-    RESIDENT_SESSION_KEY,
-    STATUS_ACTIVE,
-    STRATEGIC_SESSION_ENABLED_SETTING,
-)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -550,12 +544,6 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "persistent operator chat" in data["strategic"]["refresh"]["pending"]["excerpt"]
     assert len(data["strategic"]["refresh"]["pending"]["excerpt"]) <= 280
     assert "huge" not in data["strategic"]["refresh"]["pending"]
-    # No resident session started for this project → null-safe projection.
-    assert "resident_session" in data
-    assert data["resident_session"] is None
-    # The resident-session feature flag defaults off, so the read model reports
-    # the Start affordance as unavailable (the UI hides it in that case).
-    assert data["resident_session_available"] is False
     assert data["problem_model"]["current_focus"] == "Persistent Strategic interaction"
     assert data["problem_model"]["active_gap_count"] == 1
     assert data["problem_model"]["capability_count"] == 2
@@ -685,321 +673,6 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "A blocker is owned by a direction" not in str(package)
     assert "DO NOT EMBED KNOWLEDGE BODY" not in str(package)
     assert "DO NOT EMBED ARTIFACT LOGS" not in str(package)
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_active_resident_session(
-    client: AsyncClient, db_session
-):
-    """An active resident session in Project.vision is projected to the UI.
-
-    The operator console polls /strategic-state and derives sessionActive from
-    ``resident_session.status == 'active' && !resident_session.stop_requested``,
-    so the read model must reflect the session-state blob written under
-    ``Project.vision[RESIDENT_SESSION_KEY]``.
-    """
-    project = await _make_project(db_session)
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-active-1234",
-            "task_id": str(resident_task.id),
-            "runner_id": "runner-abc",
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "ended_at": None,
-            "last_progress_at": None,
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
-    assert resp.status_code == 200
-    resident = resp.json()["resident_session"]
-    assert resident is not None
-    assert resident["session_id"] == "ss-active-1234"
-    assert resident["task_id"] == str(resident_task.id)
-    assert resident["runner_id"] == "runner-abc"
-    assert resident["status"] == STATUS_ACTIVE
-    assert resident["stop_requested"] is False
-    assert resident["started_at"] == started_at
-    assert resident["last_operator_interaction_at"] == started_at
-    # The bounded projection must not leak internal-only session fields.
-    assert "operator_user_id" not in resident
-    assert "version" not in resident
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_resident_runner_options(
-    client: AsyncClient, db_session
-):
-    """The read model exposes ``resident_session_runners`` (the device-picker
-    options) — one entry per enrolled runner with online / agent-ready / eligible
-    flags — so the UI can render the auto-pick + override dropdown."""
-    project = await _make_project(db_session)
-    live = LocalRunner(
-        project_id=project.id,
-        token_hash="a" * 64,
-        hostname="desk-live",
-        status="active",
-        last_seen_at=_utcnow(),
-        capabilities={"task_types": "all", "agent_available": True},
-    )
-    offline = LocalRunner(
-        project_id=project.id,
-        token_hash="b" * 64,
-        hostname="desk-offline",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add_all([live, offline])
-    await db_session.commit()
-    await db_session.refresh(live)
-    await db_session.refresh(offline)
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
-    assert resp.status_code == 200
-    runners = resp.json()["resident_session_runners"]
-    by_id = {r["id"]: r for r in runners}
-    assert set(by_id) == {str(live.id), str(offline.id)}
-    assert by_id[str(live.id)]["name"] == "desk-live"
-    assert by_id[str(live.id)]["online"] is True
-    assert by_id[str(live.id)]["eligible"] is True
-    assert by_id[str(offline.id)]["online"] is False
-    assert by_id[str(offline.id)]["eligible"] is False
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_active_session_pinned_offline_reports_blocked(
-    client: AsyncClient, db_session
-):
-    """Block-on-offline end-to-end: an ACTIVE resident session pinned to a device
-    that is now offline reports ``resident_session_availability`` = blocked /
-    ``runner_offline`` (the UI prompts a restart), while the raw
-    ``resident_session`` blob still reads active."""
-    project = await _make_project(db_session)
-    offline_runner = LocalRunner(
-        project_id=project.id,
-        token_hash="c" * 64,
-        hostname="desk-gone",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add(offline_runner)
-    await db_session.commit()
-    await db_session.refresh(offline_runner)
-
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-offline-1",
-            "task_id": str(resident_task.id),
-            "runner_id": str(offline_runner.id),
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "last_progress_at": (_utcnow() - timedelta(minutes=1)).isoformat(),
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-    assert resp.status_code == 200
-    data = resp.json()
-    # Raw blob unchanged (still active) — no auto-migration, no blob mutation.
-    assert data["resident_session"]["status"] == STATUS_ACTIVE
-    # Availability derives the mid-session offline block for the UI.
-    availability = data["resident_session_availability"]
-    assert availability["state"] == "blocked"
-    assert availability["reason"] == "runner_offline"
-
-
-@pytest.mark.asyncio
-async def test_strategic_state_surfaces_resident_session_availability_flag(
-    client: AsyncClient, db_session
-):
-    """`resident_session_available` mirrors the ``strategic_session_enabled`` flag.
-
-    The operator console gates the Start affordance on this boolean so the button
-    is hidden when the feature is off (a click would otherwise 403 at the start
-    endpoint). The default is off; toggling the runtime flag flips the field.
-    """
-    project = await _make_project(db_session)
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = False
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-        assert resp.status_code == 200
-        assert resp.json()["resident_session_available"] is False
-
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-state"
-        )
-        assert resp.status_code == 200
-        assert resp.json()["resident_session_available"] is True
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-
-
-@pytest.mark.asyncio
-async def test_strategic_liveness_returns_mode_and_session_without_heavy_state(
-    client: AsyncClient, db_session
-):
-    """The lightweight liveness probe returns mode + resident-session fields and
-    omits every heavy strategic-state segment (context package, runtime, events,
-    fingerprints, attention, tasks, cost).
-    """
-    project = await _make_project(db_session)
-    resident_task = Task(
-        project_id=project.id,
-        title="Resident strategic session",
-        payloads=[{"type": "strategic_review"}],
-        status=TaskStatus.IN_PROGRESS,
-    )
-    db_session.add(resident_task)
-    await db_session.commit()
-    await db_session.refresh(resident_task)
-
-    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
-    project.vision = {
-        **(project.vision or {}),
-        RESIDENT_SESSION_KEY: {
-            "version": 1,
-            "session_id": "ss-live-9",
-            "task_id": str(resident_task.id),
-            "runner_id": "runner-xyz",
-            "operator_user_id": TEST_USER_ID,
-            "status": STATUS_ACTIVE,
-            "stop_requested": False,
-            "started_at": started_at,
-            "updated_at": started_at,
-            "last_progress_at": None,
-            "last_operator_interaction_at": started_at,
-        },
-    }
-    db_session.add(project)
-    await db_session.commit()
-
-    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-liveness")
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["project_id"] == str(project.id)
-    # Mode from the workbench row (default "chat" absent an explicit selection).
-    assert data["interaction_mode"] == "chat"
-    # Resident-session liveness projection (mirrors the heavy endpoint's shape).
-    resident = data["resident_session"]
-    assert resident is not None
-    assert resident["session_id"] == "ss-live-9"
-    assert resident["status"] == STATUS_ACTIVE
-    assert resident["stop_requested"] is False
-    # Bounded projection: internal-only fields never leak.
-    assert "operator_user_id" not in resident
-    assert data["resident_session_availability"]["state"] is not None
-    assert data["resident_session_runners"] == []
-    # None of the heavy Phase-1/Phase-2 segments are assembled.
-    for heavy_key in (
-        "context_package",
-        "runtime",
-        "work_session",
-        "attention",
-        "tasks",
-        "messages",
-        "problem_model",
-        "sha_freshness",
-        "state_revision",
-        "model_integrity",
-    ):
-        assert heavy_key not in data, f"heavy key {heavy_key!r} leaked into liveness probe"
-
-
-@pytest.mark.asyncio
-async def test_strategic_liveness_runner_options_and_availability(
-    client: AsyncClient, db_session
-):
-    """The probe surfaces the same runner-picker options and availability verdict
-    the heavy endpoint would, computed from the cheap helpers only.
-
-    With no live runner and the feature enabled, availability is blocked/no_runner;
-    the eligible-live count is derived from the runner options' ``eligible`` flags.
-    """
-    project = await _make_project(db_session)
-    offline = LocalRunner(
-        project_id=project.id,
-        token_hash="d" * 64,
-        hostname="desk-cold",
-        status="active",
-        last_seen_at=_utcnow() - timedelta(hours=1),
-        capabilities={"task_types": "all"},
-    )
-    db_session.add(offline)
-    await db_session.commit()
-    await db_session.refresh(offline)
-
-    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
-    try:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
-        resp = await client.get(
-            f"/api/admin/projects/{project.id}/strategic-liveness"
-        )
-    finally:
-        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
-    assert resp.status_code == 200
-    data = resp.json()
-    assert data["resident_session_available"] is True
-    runners = data["resident_session_runners"]
-    assert {r["id"] for r in runners} == {str(offline.id)}
-    assert runners[0]["online"] is False
-    assert runners[0]["eligible"] is False
-    # No eligible live runner -> blocked / no_runner.
-    availability = data["resident_session_availability"]
-    assert availability["state"] == "blocked"
-    assert availability["reason"] == "no_runner"
 
 
 @pytest.mark.asyncio
@@ -2987,7 +2660,7 @@ async def test_strategic_conversation_target_and_identity_lookup_are_bounded(
             from_type="user",
             content=f"conversation {index}",
             idempotency_key="recover-me" if index == 3 else None,
-            context={"_resident_wakeup_state": "paused"} if index == 3 else {},
+            context={"_operator_wakeup_state": "paused"} if index == 3 else {},
         )
         for index in range(1, 6)
     ]
@@ -4459,17 +4132,6 @@ async def test_strategic_reply_post_is_idempotent_and_resolves_question_atomical
         )
     )
     assert reply_count == 1
-    resident_turns = (
-        await db_session.execute(
-            select(Task).where(
-                Task.project_id == project.id,
-                Task.payloads[0]["type"].as_string()
-                == "strategic_resident_turn",
-            )
-        )
-    ).scalars().all()
-    assert len(resident_turns) == 1
-    assert resident_turns[0].first_payload["message_sequence_start"] == canonical["sequence"]
     receipt = await db_session.get(ProjectMessageAttachmentUpload, attachment_id)
     assert receipt is not None
     assert receipt.message_id == uuid.UUID(first.json()["id"])
@@ -8940,7 +8602,7 @@ async def test_fingerprint_live_runner_count_flips_on_time_derived_staleness(
     (and thus runner_max_seen / runner_count) never moves, yet is_live flips to
     False once the heartbeat ages past _RUNNER_LIVENESS_SECONDS. The broad-revision
     fingerprint must catch it via live_runner_count so no false 304 pins the
-    resident-session picker / availability on a now-offline runner."""
+    runner picker / availability on a now-offline runner."""
     from app.routers.admin_project_strategic_session import (
         _RUNNER_LIVENESS_SECONDS,
         _compute_strategic_state_fingerprints,
@@ -9451,30 +9113,6 @@ async def test_build_operator_attention_accepts_preloaded_runner_rows(db_session
     assert isinstance(attention, dict)
     runner_items = [item for item in attention.get("items", []) if item.get("kind") == "dead_runner"]
     assert runner_items == []
-
-
-@pytest.mark.asyncio
-async def test_build_resident_runner_options_accepts_preloaded_runner_rows(db_session):
-    """build_resident_runner_options with runner_rows= uses the provided list, not the DB."""
-    from app.strategic_resident_session import build_resident_runner_options
-
-    project = await _make_project(db_session)
-    # No runners in DB for this project, but we pass a synthetic list.
-    runner = LocalRunner(
-        project_id=project.id,
-        token_hash="cc" * 32,
-        hostname="synthetic-host",
-        status="active",
-        last_seen_at=_utcnow(),
-        capabilities={"task_types": "all", "agent_available": True},
-    )
-    db_session.add(runner)
-    await db_session.commit()
-    await db_session.refresh(runner)
-
-    options = await build_resident_runner_options(db_session, project.id, runner_rows=[runner])
-    assert len(options) == 1
-    assert options[0]["hostname"] == "synthetic-host"
 
 
 def test_task_summary_caps_latest_status_message():

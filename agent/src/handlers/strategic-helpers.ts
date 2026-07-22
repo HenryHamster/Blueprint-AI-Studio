@@ -69,7 +69,7 @@ _call() {
   local attempt=0 saw_auth=0 max=3 delay http_code body dump response
   while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
-    # (the agent refreshes at ~45min) is picked up — the resident-session
+    # (the agent refreshes at ~45min) is picked up — the long-lived-session
     # write-token-expiry fix.
     _load_agent_token || return 1
     dump=$(mktemp)
@@ -121,7 +121,7 @@ _call() {
     fi
   done
   if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
-    echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The resident session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
+    echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
   else
     echo "[ERROR] $1 failed after $max attempts (HTTP $http_code)" >&2
   fi

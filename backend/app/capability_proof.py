@@ -1576,7 +1576,7 @@ def _test_references_source(content: str, source_path: str) -> bool:
     looks for the importable dotted path (``app.routers.admin_compute_jobs``);
     otherwise it requires the bare module stem to appear on an ``import``/``from``
     line (e.g. ``import local_runner`` for a script, or a JS/TS
-    ``import ... from './strategic-resident-lib'``).
+    ``import ... from './strategic-runtime-lib'``).
     """
     if not isinstance(content, str) or not content:
         return False

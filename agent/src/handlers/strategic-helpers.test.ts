@@ -164,11 +164,11 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('[ "$KIND" != "tools" ]');
   });
 
-  // ── Live token resolution (resident write-token-expiry fix) ─────────────────
+  // ── Live token resolution (write-token-expiry fix) ─────────────────
   // The strategic/fetch helpers must read the ROTATED token FRESH on each
   // invocation (from $AGENT_TOKEN_FILE, kept current by the agent's ~45min
   // refresh) instead of the stale spawn-time AGENT_API_TOKEN env snapshot; a
-  // long-lived resident session otherwise write-401s once the 1h TTL elapses.
+  // long-lived session otherwise write-401s once the 1h TTL elapses.
   describe('live token resolution', () => {
     it('strategic reads the live token file each invocation with an env fallback', () => {
       writeStrategicHelpers('t', 'p', testWorkspace);
@@ -192,7 +192,7 @@ describe('writeStrategicHelpers', () => {
       expect(s).toContain('"$http_code" -eq 401');
       // ...then, if still failing, fails LOUD rather than silently going write-dead.
       expect(s).toContain('agent token expired');
-      expect(s).toContain('resident session must be restarted');
+      expect(s).toContain('session must be restarted');
     });
 
     it('fetch reads the live token file and retries once on a 401', () => {

@@ -306,7 +306,7 @@ async def agent_fetch_open_messages_list(
     message with ``./fetch message <ref>``.
 
     Path is the ``/messages/open`` sub-collection, NOT bare ``/messages`` — the
-    latter is owned by the resident agent's cursor-poll list in
+    latter is owned by the strategic agent's cursor-poll list in
     ``agent_strategic_messages.py`` (``{messages, server_time}``). Keeping this on
     a distinct literal path avoids the route collision where this listing (being
     included first in ``app.main``) silently shadowed that poll. Registered before
@@ -1344,7 +1344,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
     "available_capabilities": None, "local_runner_status": None,
-    # Tiny resident/autonomous session cadence scalars — runtime config, no fetch path
+    # Tiny autonomous session cadence scalars — runtime config, no fetch path
     "strategic_session_idle_tick_seconds": None,
     "strategic_session_min_tick_seconds": None,
     "strategic_session_max_ops_per_turn": None,
@@ -1363,7 +1363,6 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "prediction_calibration_factor": None,
     "prediction_calibration_note": None,
     "system_maturity": None,
-    "resident_exam_leads": None,    # exempt (never dropped); session-scoped, no fetch path
     # Low — dedicated fetch verb; tiny persisted trend across recent cycles
     "integrity_conflict_trend": "integrity-conflict-trend",
     # Medium — dedicated fetch verbs; operator-facing tools/skills readable by strategist
@@ -1616,7 +1615,7 @@ async def agent_fetch_project_skills(
     means no skills are declared.  Authenticated via agent JWT; cross-project
     access returns 404.
 
-    This endpoint is the backend for the strategic resident's ``./fetch skills``
+    This endpoint is the backend for the strategic agent's ``./fetch skills``
     verb.
     """
     project = await _resolve_agent_project(project_id, token, session)
@@ -1643,9 +1642,9 @@ async def agent_fetch_project_tools(
     An empty array means no enabled tool has renderable content. Authenticated
     via agent JWT; cross-project access returns 404.
 
-    This endpoint is the backend for the strategic resident's ``./fetch tools``
+    This endpoint is the backend for the strategic agent's ``./fetch tools``
     verb — the operator-facing companion to the task-claim ``project_tools``
-    injection, so the resident strategist can read the operator's notes/sketches.
+    injection, so the strategist can read the operator's notes/sketches.
     """
     project = await _resolve_agent_project(project_id, token, session)
     from app.project_tool_context import load_project_tool_context  # noqa: PLC0415

@@ -1,8 +1,7 @@
 import { Search, ChevronUp } from 'lucide-react';
-import type { ReactNode } from 'react';
 
 /**
- * Compact, collapsible utility bar shown above the Resident conversation. Collapsed by
+ * Compact, collapsible utility bar shown above the strategist conversation. Collapsed by
  * default — a search icon plus optional "N need your action" / "N alerts" count pills —
  * so the conversation stays clean. Expanding reveals the full conversation-search input;
  * the caller renders the inline alerts banner and the needs-action strip below, gated on
@@ -16,7 +15,6 @@ export function ConversationUtilityBar({
   onSearchChange,
   needsActionCount,
   alertCount,
-  residentHealth,
 }: {
   expanded: boolean;
   onExpand: () => void;
@@ -25,14 +23,13 @@ export function ConversationUtilityBar({
   onSearchChange: (value: string) => void;
   needsActionCount: number;
   alertCount: number;
-  residentHealth?: ReactNode;
 }) {
   return (
     <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4">
       <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-2">
         {expanded ? (
           <input
-            aria-label="Search Resident conversation"
+            aria-label="Search strategist conversation"
             type="search"
             value={searchQuery}
             onChange={event => onSearchChange(event.target.value)}
@@ -74,7 +71,6 @@ export function ConversationUtilityBar({
             )}
           </>
         )}
-        <div className="ml-auto flex min-w-0 items-center gap-2">{residentHealth}</div>
         {expanded && (
           <button
             type="button"

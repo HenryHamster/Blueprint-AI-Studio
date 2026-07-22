@@ -1936,7 +1936,7 @@ async def test_heartbeat_writes_task_scoped_contact_on_multiplexed_runner(
     is what let a working sibling mask a hung agent's stall forever.
 
     The heartbeat must therefore ALSO write a TASK-scoped taskcontact row, so the
-    two co-resident tasks end up with INDEPENDENT progress stamps: the working
+    two co-located tasks end up with INDEPENDENT progress stamps: the working
     sibling's tool calls advance the shared row and its OWN row, while the hung
     task's row keeps a NULL/stale last_tool_use_at — which is exactly the signal
     the reaper needs to reap it."""
@@ -10578,7 +10578,7 @@ async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
 @pytest.mark.asyncio
 async def test_agent_ws_strategic_session_frame_forwards_to_emit(mocker):
     """A ``strategic_session`` WS frame forwards its payload to
-    ``emit_strategic_session_delta`` (the resident-session live transcript path).
+    ``emit_strategic_session_delta`` (the strategic-session live transcript path).
     """
     import json as _json
     import app.routers.projects as projects_module

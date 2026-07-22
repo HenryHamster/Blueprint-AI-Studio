@@ -67,7 +67,6 @@ def test_route_event_high_signal_maps_to_operator_fyi():
     assert route_event("release_calcifying") == OPERATOR_FYI
     assert route_event("promotion_readiness_reached") == OPERATOR_FYI
     assert route_event("strategic_steering_deferred") == OPERATOR_FYI
-    assert route_event("resident_reply") == OPERATOR_FYI
 
 
 def test_route_event_criterion_mutations_maps_to_operator_action_needed():
@@ -1328,56 +1327,6 @@ def test_no_operator_visible_emitter_bypasses_audience_gate():
         "(stamp_message_audience/route_event). Every operator-reaching emitter must "
         "be stamped so a fail-closed audience classification is guaranteed:\n"
         + "\n".join(all_offenders)
-    )
-
-
-def test_no_operator_reaching_emitter_outside_scan_leaks():
-    """Exhaustive-glob scan catches every operator-reaching emitter, including
-    any module outside the old allowlist.
-
-    The previous allowlist-based scan only checked 11 known modules, so a 12th
-    operator-reaching emitter (e.g. strategic_resident_reconciliation.py) could
-    silently land rows with a NULL audience that the read filter fails OPEN on.
-    This test verifies that:
-
-    1. The exhaustive glob scan covers ``strategic_resident_reconciliation.py``
-       (which previously bypassed the gate).
-    2. ``"resident_reply"`` is registered in the audience registry as OPERATOR_FYI.
-    3. The stamped context in ``_create_resident_reply`` passes the gate scan.
-    """
-    import glob
-
-    # (1) Verify the event_type is registered in the audience registry.
-    assert route_event("resident_reply") == OPERATOR_FYI, (
-        "resident_reply must be registered as OPERATOR_FYI"
-    )
-    non_operator = get_non_operator_event_types()
-    assert "resident_reply" not in non_operator, (
-        "resident_reply is operator-visible, must not be in the non-operator filter"
-    )
-
-    # (2) Verify the glob scan includes strategic_resident_reconciliation.py.
-    app_dir = os.path.normpath(
-        os.path.join(os.path.dirname(__file__), "..", "app")
-    )
-    all_files = sorted(glob.glob(os.path.join(app_dir, "**/*.py"), recursive=True))
-    reconciliation_file = os.path.join(app_dir, "strategic_resident_reconciliation.py")
-    assert reconciliation_file in all_files, (
-        "strategic_resident_reconciliation.py must be in the glob scan set"
-    )
-
-    # (3) Scan that file and confirm no offenders — the stamp closes the hole.
-    with open(reconciliation_file, encoding="utf-8") as f:
-        source = f.read()
-    offenders = _collect_ungated_emitters(
-        source,
-        filename=reconciliation_file,
-        rel="strategic_resident_reconciliation.py",
-    )
-    assert not offenders, (
-        "strategic_resident_reconciliation.py must route its operator-reaching "
-        "build_project_message call through the audience gate. "
-        "Offenders found:\n" + "\n".join(offenders)
     )
 
 

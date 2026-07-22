@@ -71,7 +71,6 @@ import {
   writeMessagesHelper,
   writeDesignDocHelper,
   writePlaybookHelper,
-  configureResidentAgentPermissions,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
   codeChangeGuidanceVariant,
@@ -2272,16 +2271,6 @@ describe('configureAgentPermissions', () => {
     expect(fs.unlinkSync).not.toHaveBeenCalled();
   });
 
-  it('gives the strategic resident seat an explicit read-only posture without rewriting origin', () => {
-    const result = configureResidentAgentPermissions('strategic_review');
-
-    expect(result).toEqual(['Write', 'Edit', 'NotebookEdit']);
-    expect(execFileSync).not.toHaveBeenCalled();
-    const writes = vi.mocked(fs.writeFileSync).mock.calls;
-    const hookPaths = writes.map((c) => c[0]);
-    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-commit');
-    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-push');
-  });
 });
 
 // ── getTaskTypeHints ──────────────────────────────────────────────────────────
@@ -4904,7 +4893,7 @@ describe('writeDesignDocHelper', () => {
     }
   });
 
-  it('reads the live token file each invocation and retries a write on 401 (resident write-token fix)', () => {
+  it('reads the live token file each invocation and retries a write on 401 (live write-token fix)', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];
     // Fresh live-token resolution, env fallback, no stale hard-`:?` snapshot.
@@ -5002,7 +4991,7 @@ describe('writeMessagesHelper', () => {
     }
   });
 
-  it('reads the live token, captures stdin, retries on 401, and fails loud (resident write-token fix)', async () => {
+  it('reads the live token, captures stdin, retries on 401, and fails loud (live write-token fix)', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
     // Fresh live-token resolution with env fallback (no stale hard-`:?` snapshot).

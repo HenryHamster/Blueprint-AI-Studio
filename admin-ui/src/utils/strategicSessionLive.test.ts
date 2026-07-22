@@ -2,14 +2,11 @@ import { describe, it, expect } from 'vitest';
 import {
   computeStrategicStreamingTurn,
   computeStrategicSessionActivity,
-  computeResidentActivityState,
-  RESIDENT_HEARTBEAT_STALE_MS,
   countStrategicReplies,
   isStrategicReplyDelta,
 } from './strategicSessionLive';
 import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 import type { ProjectMessage } from '../types/messages';
-import type { StrategicResidentSessionSnapshot } from '../strategicStateApi';
 
 function delta(p: Partial<StrategicSessionDelta> & { id: number }): StrategicSessionDelta {
   return { session_id: 'ss-1', text: '', ...p };
@@ -200,97 +197,6 @@ describe('computeStrategicSessionActivity', () => {
     const activity = computeStrategicSessionActivity(transcript, []);
     expect(activity.items).toHaveLength(8);
     expect(activity.items[activity.items.length - 1].text).toBe('$ cmd-11');
-  });
-});
-
-describe('computeResidentActivityState', () => {
-  const NOW = new Date('2026-06-01T12:00:00Z').getTime();
-  function session(p: Partial<StrategicResidentSessionSnapshot> = {}): StrategicResidentSessionSnapshot {
-    // Fresh heartbeat by default so a session is presumed alive unless overridden.
-    return { status: 'active', updated_at: '2026-06-01T11:59:55Z', ...p };
-  }
-
-  it('returns null when there is no resident session (nothing to render)', () => {
-    expect(computeResidentActivityState([], [], null, NOW)).toBeNull();
-    expect(computeResidentActivityState([], [], undefined, NOW)).toBeNull();
-  });
-
-  it('EXECUTING: an in-flight command surfaces its text + a live start time', () => {
-    const transcript = [
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: 'bash scripts/test-backend.sh', ts: '2026-06-01T11:59:58Z' }),
-    ];
-    const state = computeResidentActivityState(transcript, [], session(), NOW);
-    expect(state?.phase).toBe('executing');
-    expect(state?.commandText).toBe('bash scripts/test-backend.sh');
-    // A live start time drives the ticking counter; no frozen endMs in this phase.
-    expect(state?.startMs).toBe(new Date('2026-06-01T11:59:58Z').getTime());
-    expect(state?.endMs).toBeUndefined();
-  });
-
-  it('IDLE: a trailing tool_result means the command finished — no ticking timer', () => {
-    const transcript = [
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: '$ ls' }),
-      delta({ id: 3, seq: 3, kind: 'tool_result', text: '✓ done' }),
-    ];
-    const state = computeResidentActivityState(transcript, [], session(), NOW);
-    expect(state?.phase).toBe('idle');
-    // No live start time in idle: nothing should tick.
-    expect(state?.startMs).toBeUndefined();
-  });
-
-  it('IDLE: an active session whose turn is done shows idle, not executing', () => {
-    const transcript = [
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: '$ ran' }),
-      delta({ id: 3, seq: 3, kind: 'status', text: 'done', status: 'done' }),
-    ];
-    const state = computeResidentActivityState(transcript, [], session(), NOW);
-    expect(state?.phase).toBe('idle');
-  });
-
-  it('DEAD: status ended freezes the counter at ended_at and never ticks', () => {
-    const endedAt = '2026-06-01T11:58:00Z';
-    const transcript = [
-      // A command is still "in flight" per the feed, but the session snapshot says ended.
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: '$ hung', ts: '2026-06-01T11:57:00Z' }),
-    ];
-    const state = computeResidentActivityState(
-      transcript, [], session({ status: 'ended', ended_at: endedAt }), NOW,
-    );
-    expect(state?.phase).toBe('dead');
-    expect(state?.startMs).toBeUndefined();
-    // Frozen at the end time — the counter must not tick against the wall clock.
-    expect(state?.endMs).toBe(new Date(endedAt).getTime());
-  });
-
-  it('DEAD: stop_requested marks the session gone even without ended_at', () => {
-    const state = computeResidentActivityState([], [], session({ stop_requested: true }), NOW);
-    expect(state?.phase).toBe('dead');
-  });
-
-  it('DEAD: a heartbeat stale beyond the threshold is presumed dead (no done frame ever arrives)', () => {
-    const staleAt = new Date(NOW - RESIDENT_HEARTBEAT_STALE_MS - 5000).toISOString();
-    const transcript = [
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: '$ hung forever', ts: staleAt }),
-    ];
-    const state = computeResidentActivityState(transcript, [], session({ updated_at: staleAt }), NOW);
-    expect(state?.phase).toBe('dead');
-    // Frozen at the last heartbeat — no forever-ticking counter for a dead session.
-    expect(state?.endMs).toBe(new Date(staleAt).getTime());
-  });
-
-  it('stays EXECUTING while the heartbeat is fresh and a command is in flight', () => {
-    const freshAt = new Date(NOW - 3000).toISOString();
-    const transcript = [
-      delta({ id: 1, seq: 1, kind: 'status', text: 'working', status: 'working' }),
-      delta({ id: 2, seq: 2, kind: 'command', text: '$ running', ts: freshAt }),
-    ];
-    const state = computeResidentActivityState(transcript, [], session({ updated_at: freshAt }), NOW);
-    expect(state?.phase).toBe('executing');
   });
 });
 

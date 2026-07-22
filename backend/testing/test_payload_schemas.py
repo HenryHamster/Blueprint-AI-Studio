@@ -309,7 +309,6 @@ EXPECTED_TYPES = {
     "plan",
     "research",
     "strategic_review",
-    "strategic_resident_turn",
     "design_doc_update",
     "security_audit",
     "qa",

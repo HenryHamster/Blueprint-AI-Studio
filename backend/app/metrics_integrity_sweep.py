@@ -2052,7 +2052,7 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
     "be staged before a hard breach.",
 )
 async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
-    """Ground truth: disk-resident line count of each capped backend module vs
+    """Ground truth: on-disk line count of each capped backend module vs
     its cap in ``module_size_limits.json``.  Modules at >= ``_NEAR_CAP_RATIO`` of
     their cap (but not yet breached) are flagged; chronic offenders escalate to
     ``severity=error``.  No DB interaction — reads disk only.

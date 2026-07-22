@@ -722,7 +722,7 @@ async def recent_integrity_conflict_trend(
 
     # Walk rows newest-first to compute the streak. Unstamped cycles break the
     # streak just like dirty cycles do: an unstamped completed cycle (e.g. one
-    # spawned via the resident-minimal path, which skips reconciliation) is an
+    # spawned via a minimal path that skips reconciliation) is an
     # unverified interval — claiming a clean streak through it is incorrect.
     # Legacy pre-feature cycles naturally appear at the tail of the window; if
     # all rows in the window are unstamped the streak stays 0, which is the

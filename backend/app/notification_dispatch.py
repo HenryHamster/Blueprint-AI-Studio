@@ -977,7 +977,7 @@ async def post_operator_decision_capture_low_message(
 ) -> Optional[ProjectMessage]:
     """Strategist-internal notice that operator-decision capture is chronically low.
 
-    Fired by the resident-session heartbeat when a session accumulates enough
+    Fired by the strategic-session heartbeat when a session accumulates enough
     operator turns and its capture rate stays below the low-rate floor — a signal
     that the OPERATOR-DECISION marker is being systematically forgotten and that
     operator corrections may not be reaching the durable decisions register. The
@@ -2501,7 +2501,6 @@ async def post_question_answer(
     answer: str,
     task_id: Optional[uuid.UUID] = None,
     from_type: str = "strategic",
-    resident_session_id: Optional[str] = None,
     actor_user_id: Optional[str] = None,
     content_override: str | None = None,
     sequence: int | None = None,
@@ -2512,10 +2511,6 @@ async def post_question_answer(
     a first-class strategist response; pass from_type="user" for operator replies.
     The event_type "question_answer" is a cross-component contract consumed
     by the frontend threading logic — use it verbatim.
-
-    ``resident_session_id`` stamps the reply with the resident session it belongs
-    to (NULL/None when none is active), matching the session-identity scoping on
-    the operator-send surface so the reply is addressed to the same conversation.
     """
     # Route the context through the shared audience gate so the reply carries a
     # fail-closed audience classification instead of an unstamped context dict.
@@ -2547,7 +2542,6 @@ async def post_question_answer(
         from_task_id=task_id,
         content=content_override if content_override is not None else f"Answer: {answer}",
         context=context,
-        resident_session_id=resident_session_id,
     )
     session.add(msg)
     return msg

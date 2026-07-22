@@ -21,8 +21,6 @@ vi.mock('../strategicStateApi', async () => {
   createStrategicSessionMessage: vi.fn(),
   checkInStrategicSession: vi.fn(),
   executeStrategicWorkSessionCommand: vi.fn(),
-  startStrategicSession: vi.fn(),
-  stopStrategicSession: vi.fn(),
   getMessageAttachmentUploadUrl: vi.fn(),
   deleteMessageAttachmentUpload: vi.fn(),
   getMessageAttachmentDownloadUrl: vi.fn(),
@@ -33,7 +31,6 @@ vi.mock('../strategicStateApi', async () => {
   },
   fetchStrategicState: vi.fn(),
   fetchStrategicLiveness: vi.fn(),
-  fetchResidentEngineHealth: vi.fn(),
   };
 });
 

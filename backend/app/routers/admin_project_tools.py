@@ -1129,7 +1129,7 @@ async def create_project_tool_artifact_ref(
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
-    """Freeze an exact Notes/Whiteboard revision for a Resident handoff."""
+    """Freeze an exact Notes/Whiteboard revision for a handoff."""
 
     del request
     await _get_user_project_with_role(

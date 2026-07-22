@@ -1,5 +1,5 @@
 /**
- * Presentational pieces for the resident "Workday" LIVE turn: the streaming
+ * Presentational pieces for the "Workday" LIVE turn: the streaming
  * reply preview bubble and the ephemeral activity strip. Split out of
  * MessagesPanel to keep that file under its size cap. Pure derivations live in
  * utils/strategicSessionLive.ts.
@@ -8,7 +8,6 @@ import { useState, useEffect } from 'react';
 import type {
   StrategicActivityItem,
   StrategicTurnSegment,
-  ResidentActivityState,
 } from '../utils/strategicSessionLive';
 
 // Compact glyph per activity kind for the strip (monospace, muted).
@@ -22,7 +21,7 @@ const STRATEGIC_ACTIVITY_GLYPH: Record<string, string> = {
   action: '★',
 };
 
-/** Live "typing"/streaming preview bubble for the resident strategist's in-flight
+/** Live "typing"/streaming preview bubble for the strategist's in-flight
  *  turn. Reasoning (train-of-thought) is rendered in a muted, clearly-labelled
  *  block set apart from the primary reply so the two are never confused. Text uses
  *  `whitespace-pre-wrap break-words`: the fragment's own newlines survive and prose
@@ -99,7 +98,7 @@ function InFlightCounter({ startMs, endMs }: { startMs?: number; endMs?: number 
 
 /**
  * The LIVE, ephemeral activity strip: a compact scrolling feed of the commands /
- * tools the resident strategist is running for the current turn. Cleared the
+ * tools the strategist is running for the current turn. Cleared the
  * moment the turn ends (`done` / durable reply lands) — it never becomes part of
  * the durable transcript.
  */
@@ -145,79 +144,6 @@ export function StrategicActivityStrip({
             ))}
           </div>
         )}
-      </div>
-    </div>
-  );
-}
-
-/**
- * The PERSISTENT, truthful resident live-activity widget shown in the chat view
- * whenever a resident session exists. This compact item is always present, links to
- * the separate Activity inbox for details, and shows one of three
- * visually-distinct, feed-driven states:
- *   - `executing` — cyan pulse + a calm operation label + elapsed timer;
- *   - `idle`      — neutral steady dot, "Waiting for direction", NO ticking timer;
- *   - `dead`      — muted/red dot, "Session ended", timer frozen/hidden.
- * The timer only ever runs in `executing`, so it can never tick for a finished or
- * dead session.
- */
-export function StrategicResidentActivityWidget({ state, onOpenActivity }: { state: ResidentActivityState; onOpenActivity?: () => void }) {
-  const base =
-    'group flex scroll-mt-24 justify-start rounded-md';
-  const inner =
-    'flex w-full min-w-0 max-w-[92%] flex-col items-start md:max-w-[76%]';
-
-  if (state.phase === 'executing') {
-    return (
-      <div data-testid="strategic-resident-activity" data-phase="executing" className={base}>
-        <div className={inner}>
-          <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-cyan-900/50 bg-neutral-950/60 px-2 py-1.5 text-ui-md text-neutral-300">
-            <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
-            <span className="shrink-0 font-medium text-cyan-300">{state.label}</span>
-            <span className="min-w-0 flex-1" />
-            <InFlightCounter startMs={state.startMs} />
-            {onOpenActivity && (
-              <button type="button" onClick={onOpenActivity} className="min-h-11 shrink-0 rounded px-2 text-neutral-400 hover:text-neutral-200">
-                Activity
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  if (state.phase === 'idle') {
-    return (
-      <div data-testid="strategic-resident-activity" data-phase="idle" className={base}>
-        <div className={inner}>
-          <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-400">
-            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500/70" aria-hidden="true" />
-            <span className="min-w-0 truncate font-medium text-neutral-400">{state.label}</span>
-            {onOpenActivity && (
-              <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
-                Activity
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  // dead / not-running: explicit ended presentation, no ticking timer.
-  return (
-    <div data-testid="strategic-resident-activity" data-phase="dead" className={base}>
-      <div className={inner}>
-        <div className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/40 px-2 py-1.5 text-ui-md text-neutral-500">
-          <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-rose-500/70" aria-hidden="true" />
-          <span className="min-w-0 truncate font-medium text-neutral-500">{state.label}</span>
-          {onOpenActivity && (
-            <button type="button" onClick={onOpenActivity} className="ml-auto min-h-11 shrink-0 rounded px-2 text-neutral-500 hover:text-neutral-200">
-              Activity
-            </button>
-          )}
-        </div>
       </div>
     </div>
   );

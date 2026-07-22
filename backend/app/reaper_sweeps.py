@@ -456,7 +456,6 @@ async def sweep_stalled_strategic_cycles(
         AlertSeverity,
         Project,
         StrategicCycle,
-        StrategicResident,
     )
     from app.broadcast import broadcast_to_project as _bcast
     from app.strategic_runtime_work import task_is_strategic_local_runner_hold
@@ -474,9 +473,9 @@ async def sweep_stalled_strategic_cycles(
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
 
-    # Fence the legacy reaper against ownership cutover without locking the
+    # Lock the owning projects (then cycles, then tasks) without locking the
     # broad discovery scan. These bounded statements follow the canonical
-    # Project -> Resident -> Cycle -> Task order used by cutover/completion.
+    # Project -> Cycle -> Task order used by completion.
     _project_ids = sorted({c.project_id for c in stalled}, key=str)
     _locked_projects = (
         (
@@ -492,30 +491,6 @@ async def sweep_stalled_strategic_cycles(
         .all()
     )
     _locked_project_ids = {project.id for project in _locked_projects}
-    _locked_residents = (
-        (
-            await session.execute(
-                select(StrategicResident)
-                .where(StrategicResident.project_id.in_(_project_ids))
-                .order_by(StrategicResident.project_id.asc())
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    _resident_by_project = {
-        resident.project_id: resident for resident in _locked_residents
-    }
-    _legacy_project_ids = {
-        project_id
-        for project_id in _locked_project_ids
-        if (
-            _resident_by_project.get(project_id) is None
-            or _resident_by_project[project_id].engine_owner == "legacy"
-        )
-    }
     _candidate_cycle_ids = sorted({c.id for c in stalled})
     _locked_cycles = (
         (
@@ -523,7 +498,7 @@ async def sweep_stalled_strategic_cycles(
                 select(StrategicCycle)
                 .where(
                     StrategicCycle.id.in_(_candidate_cycle_ids),
-                    StrategicCycle.project_id.in_(_legacy_project_ids),
+                    StrategicCycle.project_id.in_(_locked_project_ids),
                 )
                 .order_by(StrategicCycle.project_id.asc(), StrategicCycle.id.asc())
                 .with_for_update()
@@ -532,7 +507,7 @@ async def sweep_stalled_strategic_cycles(
         )
         .scalars()
         .all()
-        if _legacy_project_ids
+        if _locked_project_ids
         else []
     )
     _linked_task_ids = sorted(

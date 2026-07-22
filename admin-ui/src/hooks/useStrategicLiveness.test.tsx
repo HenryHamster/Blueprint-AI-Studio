@@ -14,10 +14,6 @@ function makeLiveness(projectId = 'proj-1'): StrategicLivenessResponse {
   return {
     project_id: projectId,
     interaction_mode: 'chat',
-    resident_session: { session_id: `ss-${projectId}`, status: 'active', stop_requested: false },
-    resident_session_available: true,
-    resident_session_availability: { available: true, state: 'active', reason: null },
-    resident_session_runners: [],
   };
 }
 
@@ -54,7 +50,7 @@ describe('useStrategicLiveness', () => {
     mockFetch.mockResolvedValueOnce(makeLiveness('proj-1'));
     const { result } = renderHook(() => useStrategicLiveness('proj-1'));
     await waitFor(() => expect(result.current.data?.project_id).toBe('proj-1'));
-    expect(result.current.data?.resident_session?.session_id).toBe('ss-proj-1');
+    expect(result.current.data?.interaction_mode).toBe('chat');
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 

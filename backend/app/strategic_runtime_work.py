@@ -707,8 +707,8 @@ async def load_project_runners(
     """Fetch the project's non-deleted allow-listed runners, newest-seen first.
 
     Call once per strategic-state assembly and pass the result to
-    build_strategic_runtime_summary, build_resident_runner_options, and
-    build_operator_attention to avoid three identical DB round-trips.
+    build_strategic_runtime_summary and
+    build_operator_attention to avoid duplicate DB round-trips.
     """
     return list(
         (

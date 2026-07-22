@@ -23173,7 +23173,7 @@ async def test_viewable_pipeline_streams_large_video_over_image_cap(
     Rollout/training videos routinely exceed the per-file in-memory ceiling that
     governs images. Rather than being silently dropped (locked inside the opaque
     bundle), they are streamed member-by-member to storage through the dedicated
-    streaming seam (``upload_compute_job_viewable_stream``), while a co-resident
+    streaming seam (``upload_compute_job_viewable_stream``), while a companion
     image keeps taking the in-memory path.
     """
     job = await _create_bundle_compute_job(db_session)
@@ -24899,7 +24899,7 @@ def test_viewable_pipeline_streams_bundle_and_peak_memory_is_bounded(tmp_path):
         return True
 
     async def _fake_whole_bundle_download(_job_id):
-        return src.read_bytes()  # a real whole-object fetch: 48+ MiB resident
+        return src.read_bytes()  # a real whole-object fetch: 48+ MiB in memory
 
     uploaded: list = []
 
@@ -24995,7 +24995,7 @@ def test_checkpoint_resume_streams_predecessor_bundle_and_peak_memory_is_bounded
         return True
 
     async def _fake_whole_bundle_download(_job_id):
-        return src.read_bytes()  # a real whole-object fetch: 48+ MiB resident
+        return src.read_bytes()  # a real whole-object fetch: 48+ MiB in memory
 
     dest_dir = tmp_path / "artifacts"
 

@@ -1,12 +1,4 @@
 {
-  "api/projectTools.residentArtifact.test.ts": {
-    "./core": [
-      "COST_PER_VM_HR",
-      "MESSAGE_CONTENT_MAX",
-      "authGet",
-      "authHeaders"
-    ]
-  },
   "components/KanbanBoard.test.tsx": {
     "./TaskCard": [
       "ResearchFindings",
@@ -41,17 +33,6 @@
       "useElapsedTime"
     ]
   },
-  "components/NotesTool.test.tsx": {
-    "../utils/residentToolHandoff": [
-      "RESIDENT_TOOL_HANDOFF_EVENT",
-      "acknowledgeQueuedResidentToolHandoffs",
-      "enqueueResidentToolHandoff",
-      "isResidentToolHandoffEvent",
-      "isResidentToolHandoffQueueStorageKey",
-      "loadQueuedResidentToolHandoffEntries",
-      "loadQueuedResidentToolHandoffs"
-    ]
-  },
   "components/WhiteboardTool.test.tsx": {
     "../firebase": [
       "getIdTokenAfterAuthRestore",
@@ -61,15 +42,6 @@
     ],
     "../utils/conversationAttachmentUpload": [
       "ConversationAttachmentUploadError"
-    ],
-    "../utils/residentToolHandoff": [
-      "RESIDENT_TOOL_HANDOFF_EVENT",
-      "acknowledgeQueuedResidentToolHandoffs",
-      "enqueueResidentToolHandoff",
-      "isResidentToolHandoffEvent",
-      "isResidentToolHandoffQueueStorageKey",
-      "loadQueuedResidentToolHandoffEntries",
-      "loadQueuedResidentToolHandoffs"
     ]
   }
 }

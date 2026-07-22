@@ -1,7 +1,7 @@
 """Tests for the inbound strategic-message poll endpoint
 (app.routers.agent_strategic_messages).
 
-The resident strategic agent polls
+The strategic agent polls
 ``GET /api/agent/projects/{project_id}/messages`` with a ``since`` cursor to
 drain new operator messages. These cover: the exact response shape, ascending
 order, the ``since`` cursor, the ``from_type`` / ``status`` filters, the limit
@@ -387,66 +387,45 @@ async def test_poll_max_created_at_cursor_redelivers_boundary(
 
 
 @pytest.mark.asyncio
-async def test_poll_session_id_scoping(client: AsyncClient, db_session):
-    """Passing session_id to the poll endpoint:
-    - Returns messages stamped for that session (resident_session_id == session_id).
-    - Returns NULL-session messages (backward-compat / cadence messages).
-    - Excludes messages stamped for a DIFFERENT session.
-    Verifies the or_(resident_session_id==session_id, resident_session_id IS NULL)
-    filter on the agent_poll_messages endpoint.
-    """
+async def test_poll_session_id_is_accepted_but_no_longer_scopes(
+    client: AsyncClient, db_session
+):
+    """``session_id`` is retained on the poll endpoint for backward compatibility
+    with older agents, but per-session scoping has been retired: the poll now
+    returns the project's messages project-wide whether or not a ``session_id`` is
+    supplied. This guards against a regression where passing ``session_id`` would
+    hide messages (the old per-session scoping behaviour, since retired)."""
     project, task = await _make_project_task(db_session)
 
-    SESSION_A = "ss-poll-scope-A"
-    SESSION_B = "ss-poll-scope-B"
-
-    # Message scoped to session A — must be visible when polling with session_id=A.
-    msg_a = await _add_message(
+    msg_1 = await _add_message(
         db_session, project, from_type="user", status="open",
-        message_type=MessageType.NOTE, content="session A msg",
+        message_type=MessageType.NOTE, content="first msg",
         created_at=_BASE,
     )
-    # Stamp resident_session_id directly (column added by this PR).
-    msg_a.resident_session_id = SESSION_A
-    db_session.add(msg_a)
-
-    # NULL-session (legacy/cadence) message — must always be visible.
-    msg_null = await _add_message(
+    msg_2 = await _add_message(
         db_session, project, from_type="user", status="open",
-        message_type=MessageType.NOTE, content="unscoped legacy msg",
+        message_type=MessageType.NOTE, content="second msg",
         created_at=_BASE + timedelta(minutes=1),
     )
-
-    # Message scoped to session B — must be excluded when polling with session_id=A.
-    msg_b = await _add_message(
-        db_session, project, from_type="user", status="open",
-        message_type=MessageType.NOTE, content="session B msg",
-        created_at=_BASE + timedelta(minutes=2),
-    )
-    msg_b.resident_session_id = SESSION_B
-    db_session.add(msg_b)
-
     await db_session.commit()
 
-    # Poll with session_id=A — should see msg_a and msg_null, not msg_b.
+    # Poll WITH an arbitrary session_id — all project messages are still returned
+    # (session_id no longer filters anything).
     res = await client.get(
         f"/api/agent/projects/{project.id}/messages",
-        params={"session_id": SESSION_A},
+        params={"session_id": "any-session-token"},
         headers=_headers(task),
     )
     assert res.status_code == 200, res.text
     ids = [m["id"] for m in res.json()["messages"]]
-    assert str(msg_a.id) in ids, "session-A message must be visible to session-A poll"
-    assert str(msg_null.id) in ids, "NULL-session message must always be visible"
-    assert str(msg_b.id) not in ids, "session-B message must be excluded from session-A poll"
+    assert str(msg_1.id) in ids
+    assert str(msg_2.id) in ids
 
-    # Poll without session_id — project-wide; all three messages are visible.
+    # Poll WITHOUT session_id — identical project-wide result.
     res_wide = await client.get(
         f"/api/agent/projects/{project.id}/messages",
         headers=_headers(task),
     )
     assert res_wide.status_code == 200, res_wide.text
     ids_wide = [m["id"] for m in res_wide.json()["messages"]]
-    assert str(msg_a.id) in ids_wide
-    assert str(msg_null.id) in ids_wide
-    assert str(msg_b.id) in ids_wide
+    assert ids_wide == ids

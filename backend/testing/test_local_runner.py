@@ -4018,8 +4018,8 @@ class TestRunnerEndpoints:
         FORCES CLOUD FALLBACK.
 
         If the exclusion outlived that timeout (it was 1800s), one transient
-        decline — a Popen spawn failure — would DETERMINISTICALLY evict a Resident
-        Strategic Agent task off local execution, defeating continuous-local mode:
+        decline — a Popen spawn failure — would DETERMINISTICALLY evict a
+        Strategic task off local execution, defeating continuous-local mode:
         the runner could not become eligible again until 15 min after the task had
         already been shipped to the cloud.
         """
@@ -4029,7 +4029,7 @@ class TestRunnerEndpoints:
         assert hold_timeout == 900  # documented default; the bound below is vs this
         assert hold_timeout > DECLINE_EXCLUSION_SECONDS, (
             "a decline exclusion that outlives the Strategic hold timeout evicts "
-            "the Resident Strategic Agent to cloud on a single transient decline"
+            "the Strategic task to cloud on a single transient decline"
         )
 
     def test_strategic_decline_exclusion_waived_rather_than_emptying_pool(self):
@@ -4120,7 +4120,7 @@ class TestRunnerEndpoints:
         which does NOT accept `design_doc_update`. If the waiver asks "did any other
         candidate row survive the exclusion?", dgx-1 answers yes — so the exclusion
         is applied, dgx-1 then falls out on the task-type gate, `eligible` is empty,
-        and the Resident Strategic Agent is parked and evicted to cloud by the 900s
+        and the Strategic task is parked and evicted to cloud by the 900s
         hold sweep on ONE transient decline. Precisely the eviction the waiver was
         written to prevent, defeated by a runner that could never have run the task.
 

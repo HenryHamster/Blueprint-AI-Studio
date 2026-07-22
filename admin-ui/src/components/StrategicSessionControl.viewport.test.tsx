@@ -102,7 +102,7 @@ describe('StrategicSessionControl viewport', () => {
     expect(getComputedStyle(detailBlock as Element).display).toBe('none');
   });
 
-  // Acceptance gate: the resident-session panel must render the turn-latency
+  // Acceptance gate: the session panel must render the turn-latency
   // chip legibly at the declared viewport width without horizontal overflow.
   function renderWithTurnLatency() {
     host = document.createElement('div');

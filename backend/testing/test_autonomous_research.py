@@ -2625,7 +2625,7 @@ async def test_concurrent_spawn_ticks_create_exactly_one_research_task(
     # This eligibility read doubles as the rendezvous point: it is the last shared
     # step BOTH ticks execute before the task INSERT. (M4 relocated
     # check_anomaly_actions to AFTER the spawn/flush and wrapped the post-flush
-    # staging in a Project->Resident authority FOR UPDATE, so it can no longer be
+    # staging in a project-authority FOR UPDATE, so it can no longer be
     # the pre-INSERT barrier: a tick that flushed first holds the idempotency-key
     # index lock while waiting there, and the second tick blocks on the duplicate
     # insert and never arrives — a deadlock.) Rendezvousing here forces both ticks
@@ -8261,8 +8261,7 @@ async def test_strategic_failures_auto_decay_triggers_force_strategic(db_session
     # cycle) or strategic_review (strategy-only cycle).
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
-    # M4 also spawns a background strategic_resident_turn shadow task alongside the
-    # legacy strategic task; filter to the strategic type under test before asserting.
+    # Filter to the strategic type under test before asserting.
     strategic = [
         t
         for t in tasks

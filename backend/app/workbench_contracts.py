@@ -947,8 +947,7 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                     # Mirrors the live continuation status default, which now reads
                     # the ``strategic_continuation_ttl_seconds`` runtime setting
                     # (default 1500s / 25 min) — REPLACES the old hardcoded 12h
-                    # (43200) wall that the resident-session dead-man's switch
-                    # removed.
+                    # (43200) wall that the dead-man's switch removed.
                     "ttl_seconds": 1500,
                     "updated_at": None,
                 },

@@ -5139,7 +5139,7 @@ async def test_retire_direction_clears_criterion_keys(
 
     # Wire BOTH the Direction ORM row AND the blob entry with criterion_keys
     # so the real propagation path (blob -> sync_directions -> upsert_direction)
-    # is exercised.  Without blob-resident keys the dual-write is a no-op and
+    # is exercised.  Without blob-side keys the dual-write is a no-op and
     # the resurrection regression isn't tested.
     project.directions = [
         {

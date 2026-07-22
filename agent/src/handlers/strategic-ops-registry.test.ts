@@ -14,9 +14,9 @@ import { writeStrategicHelpers } from './strategic-helpers.js';
 
 // The single canonical registry (strategic-ops-registry.ts) is the source of
 // truth for the strategist mutating-op surface. These drift-guards fail if the
-// generated ./strategic CLI, the resident bootstrap prompt, or the checked-in
-// shared manifest list a different op set than the registry — so the three
-// surfaces (four counting the backend, guarded by test_strategic_ops_registry.py)
+// generated ./strategic CLI or the checked-in
+// shared manifest list a different op set than the registry — so the
+// surfaces (plus the backend, guarded by test_strategic_ops_registry.py)
 // can never silently diverge again.
 
 const MANIFEST_PATH = path.resolve(

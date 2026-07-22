@@ -76,7 +76,6 @@ import {
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
   type LLMCliTranslation, type ClaudeOutput, type RunnerCommand,
   type ValidationCommand, type ProviderRunner, type ProviderRunErrorReport,
-  type ProviderRunOptions,
 } from './providers/runners.js';
 
 export {
@@ -90,7 +89,7 @@ export {
   runClaudeCode, runProviderAgent,
   getLastProviderRunErrorReport, clearLastProviderRunErrorReport,
 };
-export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport, ProviderRunOptions };
+export type { LLMCliTranslation, ClaudeOutput, RunnerCommand, ValidationCommand, ProviderRunner, ProviderRunErrorReport };
 export { computeRefreshDelayMs, isBootstrapToken };
 
 // ── Failure categories ───────────────────────────────────────────────────────
@@ -376,8 +375,8 @@ initTokenModule({
   setToken: (newToken: string) => {
     AGENT_TOKEN = newToken;
     apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
-    // Mirror the refreshed token to the live token file so the long-lived
-    // resident session's bash helpers (./strategic, ./messages, ...) read the
+    // Mirror the refreshed token to the live token file so a long-lived
+    // session's bash helpers (./strategic, ./messages, ...) read the
     // ROTATED token on their next invocation instead of the stale spawn-time
     // AGENT_API_TOKEN env snapshot. Best-effort + no-op unless the file is
     // configured (agent startup); never throws, never logs the token.
@@ -1284,60 +1283,6 @@ export async function persistAndPostStatus(taskId: string, payload: Record<strin
   return result;
 }
 
-export async function persistResidentTurnFailure(
-  taskId: string,
-  projectId: string,
-  reason: string,
-  failureCategory: FailureCategory,
-): Promise<void> {
-  const errorReport = getLastProviderRunErrorReport();
-  const failureBody = {
-    task_id: taskId,
-    project_id: projectId,
-    failure_id: `resident-turn:${taskId}:failure`,
-    reason: reason.slice(0, 5_000),
-    failure_category: failureCategory,
-  };
-  if (errorReport?.task_id !== taskId) {
-    await apiPost('/api/agent/resident-turn/fail', failureBody);
-    return;
-  }
-  try {
-    await apiPost('/api/agent/resident-turn/fail', {
-      ...failureBody,
-      error_report: errorReport,
-    });
-  } catch (error) {
-    if (!isLegacyResidentFailErrorReportRejection(error)) throw error;
-    await apiPost('/api/agent/resident-turn/fail', failureBody, 1);
-  }
-}
-
-function isLegacyResidentFailErrorReportRejection(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const prefix = 'POST /api/agent/resident-turn/fail failed (422): ';
-  if (!error.message.startsWith(prefix)) return false;
-  try {
-    const payload = JSON.parse(error.message.slice(prefix.length)) as unknown;
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return false;
-    const wrapper = payload as Record<string, unknown>;
-    if (Object.keys(wrapper).length !== 1) return false;
-    const wrappedError = wrapper.error;
-    if (!wrappedError || typeof wrappedError !== 'object' || Array.isArray(wrappedError)) return false;
-    const validation = wrappedError as Record<string, unknown>;
-    if (Object.keys(validation).length !== 3) return false;
-    if (validation.code !== 422 || validation.message !== 'Validation Error') return false;
-    if (!Array.isArray(validation.details) || validation.details.length !== 1) return false;
-    const detail = validation.details[0] as { type?: unknown; loc?: unknown };
-    return detail.type === 'extra_forbidden'
-      && Array.isArray(detail.loc)
-      && detail.loc.length === 2
-      && detail.loc[0] === 'body'
-      && detail.loc[1] === 'error_report';
-  } catch {
-    return false;
-  }
-}
 // Phase 0 telemetry — start-of-role timestamp captured by main() after a
 // successful claim and reset at the start of each warm role. Used by
 // enrichStatusPayload to derive setup_secs from firstToolUseAt.
@@ -1958,7 +1903,7 @@ function activateClaimedRole(
   if (claim.agentToken) {
     AGENT_TOKEN = claim.agentToken;
     apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
-    // Mirror the freshly-claimed token to the live token file so a resident
+    // Mirror the freshly-claimed token to the live token file so a long-lived
     // session provisioned for this role starts with a current token on disk.
     writeAgentTokenFile(AGENT_TOKEN);
     stopProactiveTokenRefresh();
@@ -2230,8 +2175,6 @@ export function resetPerRoleModuleState(flags: ResetPerRoleModuleStateFlags = {}
   // File-tree cache in discovery.ts — buildFileTree result is stale when the
   // workspace changes between roles.
   clearFileTreeCache();
-  // Per-task resident-session turn-latency telemetry.
-  resetResidentTurnLatencyTelemetry();
   // Per-task operator-decision capture telemetry.
   resetOperatorDecisionCaptureTelemetry();
   // Disk-metric cache — clear so the first heartbeat of each task gets a fresh
@@ -2869,7 +2812,7 @@ export function sendLog(ws: WebSocket | null, content: string) {
 
 /**
  * Send an arbitrary typed WebSocket frame to the live viewer socket (e.g. the
- * resident strategist's `{type:"strategic_session", payload:{…}}` transcript
+ * strategist's `{type:"strategic_session", payload:{…}}` transcript
  * deltas the backend maps to `emit_strategic_session_delta`). Returns true when
  * the frame went out on an OPEN socket; false when there is no live socket, so
  * the caller can fall back to a buffered `sendLog`. Centralizes the same
@@ -3336,9 +3279,6 @@ import {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
-  recordResidentTurnLatency,
-  getResidentTurnLatencyTelemetry,
-  resetResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture,
   getOperatorDecisionCaptureTelemetry,
   resetOperatorDecisionCaptureTelemetry,
@@ -3361,9 +3301,6 @@ export {
   getFormatComplianceTelemetry,
   resetFormatComplianceTelemetry,
   estimateTokensFromChars,
-  recordResidentTurnLatency,
-  getResidentTurnLatencyTelemetry,
-  resetResidentTurnLatencyTelemetry,
   recordOperatorDecisionCapture,
   getOperatorDecisionCaptureTelemetry,
   resetOperatorDecisionCaptureTelemetry,
@@ -3623,7 +3560,7 @@ export async function main() {
   // helper scripts read the ROTATED token on each invocation instead of the
   // stale spawn-time AGENT_API_TOKEN env snapshot, and mirror the current token
   // there now. Kept fresh on every claim (activateClaimedRole) and refresh
-  // (setToken). Fixes the resident-session "writes 401 after ~1h" bug while
+  // (setToken). Fixes the long-lived-session "writes 401 after ~1h" bug while
   // leaving the 1h security TTL untouched.
   ensureAgentTokenFileEnv();
   writeAgentTokenFile(AGENT_TOKEN);
@@ -4039,11 +3976,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   const payloads = Array.isArray(task.payloads) ? task.payloads as Record<string, unknown>[] : [];
   const payload: Record<string, unknown> = payloads[0] ?? {};
   const taskType = strVal(payload.type, 'create');
-  const claimAgentToken = requireClaimAgentToken(taskType, strVal(task.agent_token));
+  const claimAgentToken = strVal(task.agent_token);
   if (claimAgentToken) {
     activateClaimedRole(
       { taskId, agentToken: claimAgentToken },
-      'resident claim token rotation failed',
+      'claim token rotation failed',
     );
   }
   process.env.TASK_ID = taskId;  // Expose for crash handlers (they can't access local vars)
@@ -4097,38 +4034,32 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     let ghToken = '';
     let owner = '';
     let repo = '';
-    const credentialFreeResidentTurn = !taskRequiresGithubCredentials(taskType);
-    // Get GitHub credentials only for repository-backed tasks. Resident turns
-    // are deliberately provider-only: no GitHub token, clone, or workspace.
+    // Fetch GitHub credentials for the repository-backed task.
     // Timeout must cover the backend's worst case for get_github_token_for_task:
     // _github_request sleeps up to 120s on a near-empty rate-limit bucket, plus up
     // to 3 retries each with a 15s httpx timeout. 180s comfortably covers the full
     // backoff. The same path is already covered at 240s for the PR-create call
     // (line ~2724); the token-only fetch here uses 180s (no extra GitHub round-trips
     // beyond token minting). Any failure here is infrastructure, not a code fault.
-    if (!credentialFreeResidentTurn) {
-      statusRef.value = 'Fetching GitHub credentials...';
-      let ghRes: { data: { token: string; owner: string; repo: string } };
-      try {
-        ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
-      } catch (e) {
-        const err = e instanceof Error ? e : new Error(String(e));
-        (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
-        throw err;
-      }
-      ({ token: ghToken, owner, repo } = ghRes.data);
-      log(`GitHub: ${owner}/${repo}`);
+    statusRef.value = 'Fetching GitHub credentials...';
+    let ghRes: { data: { token: string; owner: string; repo: string } };
+    try {
+      ghRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`, API_MAX_RETRIES, 180_000) as { data: { token: string; owner: string; repo: string } };
+    } catch (e) {
+      const err = e instanceof Error ? e : new Error(String(e));
+      (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'github_token_fetch_failed';
+      throw err;
     }
+    ({ token: ghToken, owner, repo } = ghRes.data);
+    log(`GitHub: ${owner}/${repo}`);
 
     // Seed the GitHub token file immediately so bash helpers can use it from
     // the first invocation. Then schedule proactive refreshes every 45 min
     // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
     // so force_refresh=false hits the cache at zero GitHub API cost).
-    if (!credentialFreeResidentTurn) {
-      ensureGithubTokenFileEnv();
-      writeGithubTokenFile(ghToken);
-      scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
-    }
+    ensureGithubTokenFileEnv();
+    writeGithubTokenFile(ghToken);
+    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //
@@ -4226,17 +4157,11 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // Keep heartbeat alive during retries so the reaper doesn't kill us mid-report.
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        if (taskType === 'strategic_resident_turn') {
-          const projectId = strVal(projectMetadata?.project_id);
-          if (!projectId) throw new Error('Resident claim is missing project_id');
-          await persistResidentTurnFailure(taskId, projectId, safeErr, failureCategory);
-        } else {
-          await persistAndPostStatus(taskId, {
-            task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
-            logs: sanitize(`Fatal error: ${errMsg}`),
-            failure_category: failureCategory,
-          });
-        }
+        await persistAndPostStatus(taskId, {
+          task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+          logs: sanitize(`Fatal error: ${errMsg}`),
+          failure_category: failureCategory,
+        });
         break; // Success — stop retrying
       } catch (e) {
         const postErr = e instanceof Error ? e.message : String(e);
@@ -4274,17 +4199,6 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   }
 
   return { taskId, prNumber, baseBranch: baseBranchForReset, parkDirective: null };
-}
-
-export function taskRequiresGithubCredentials(taskType: string): boolean {
-  return taskType !== 'strategic_resident_turn';
-}
-
-export function requireClaimAgentToken(taskType: string, token: string): string {
-  if (taskType === 'strategic_resident_turn' && !token) {
-    throw new Error('resident claim token rotation failed: missing agent_token');
-  }
-  return token;
 }
 
 // Global crash handlers — report errors via heartbeat before dying.

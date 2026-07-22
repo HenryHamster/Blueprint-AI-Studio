@@ -132,8 +132,8 @@ class TaskCapability:
     agent_mode: AgentMode
     # Which runtime owns execution. ``agent`` is the normal provision/claim
     # path; ``backend`` is reserved for bounded control-plane tasks that must
-    # never be handed to an agent process (for example migration-shadow
-    # Resident turns completed by a zero-model backend sweep).
+    # never be handed to an agent process (completed by a zero-model backend
+    # sweep).
     execution_owner: ExecutionOwner = "agent"
     default_category: str | None = None
     user_launchable: bool = False

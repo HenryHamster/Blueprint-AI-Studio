@@ -41,10 +41,10 @@ import {
  */
 /**
  * List the top-level directory names of a prepared workspace — the
- * project-shape-agnostic seed for the resident strategist's `code:<dir>`
+ * project-shape-agnostic seed for the strategist's `code:<dir>`
  * examination surfaces (no hardcoded project types). Skips dotfiles/`.git` and
  * non-directories; returns [] on any fs error so a scan failure at session start
- * never breaks the resident loop.
+ * never breaks the strategic loop.
  */
 export function listWorkspaceTopDirs(workspace: string): string[] {
   try {
