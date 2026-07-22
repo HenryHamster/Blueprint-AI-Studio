@@ -1464,9 +1464,10 @@ async def test_auto_remediation_recovery_serializes_concurrent_writers(db_sessio
 async def test_background_write_rejects_growth_over_ceiling_but_allows_shrink(
     db_session,
 ):
-    """Core acceptance test: with_design_doc_locked must reject a mutate_fn
-    that would grow design_doc past DESIGN_DOC_MAX_BYTES, but must allow a
-    shrinking write even when the doc is already over the ceiling.
+    """Core acceptance test: with_design_doc_locked with explicit
+    raise_on_size_limit=False must reject a mutate_fn that would grow
+    design_doc past DESIGN_DOC_MAX_BYTES, but must allow a shrinking write
+    even when the doc is already over the ceiling.
 
     Growth over ceiling → returns False, doc unchanged.
     Shrink from over-ceiling → returns True, doc is written (recovery path).
@@ -1482,7 +1483,9 @@ async def test_background_write_rejects_growth_over_ceiling_but_allows_shrink(
     def _grow(doc: dict) -> None:
         doc["new_key"] = "y" * 100  # adds ~100 bytes, crossing the ceiling
 
-    result = await with_design_doc_locked(db_session, project.id, _grow)
+    result = await with_design_doc_locked(
+        db_session, project.id, _grow, raise_on_size_limit=False
+    )
     await db_session.commit()
     await db_session.refresh(project)
 
@@ -1545,7 +1548,8 @@ async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_gr
     db_session,
 ):
     """When the existing doc is already over the ceiling and mutate_fn would
-    grow it further, the write must be skipped (False returned)."""
+    grow it further, the write must be skipped (False returned) when
+    raise_on_size_limit=False is passed explicitly."""
     bloated = "x" * (DESIGN_DOC_MAX_BYTES + 50)
     project = Project(name="ceiling-already-over", user_id="user")
     project.design_doc = {"pad": bloated}
@@ -1558,7 +1562,9 @@ async def test_with_design_doc_locked_skips_when_doc_already_over_ceiling_and_gr
     def _grow_more(doc: dict) -> None:
         doc["extra"] = "y" * 100
 
-    result = await with_design_doc_locked(db_session, project.id, _grow_more)
+    result = await with_design_doc_locked(
+        db_session, project.id, _grow_more, raise_on_size_limit=False
+    )
     await db_session.commit()
     await db_session.refresh(project)
 
@@ -1628,7 +1634,7 @@ async def test_with_design_doc_locked_reserved_blobs_excluded_from_ceiling(
         doc["another_agent_key"] = "x" * DESIGN_DOC_MAX_BYTES
 
     result2 = await with_design_doc_locked(
-        db_session, project.id, _grow_agent_over_ceiling
+        db_session, project.id, _grow_agent_over_ceiling, raise_on_size_limit=False
     )
     await db_session.commit()
     await db_session.refresh(project)
@@ -1938,7 +1944,9 @@ async def test_stripped_key_counts_toward_agent_ceiling(db_session):
     def _add_agent_key(doc: dict) -> None:
         doc["agent_key"] = "small"
 
-    result = await with_design_doc_locked(db_session, project.id, _add_agent_key)
+    result = await with_design_doc_locked(
+        db_session, project.id, _add_agent_key, raise_on_size_limit=False
+    )
     await db_session.commit()
     await db_session.refresh(project)
 
@@ -1989,11 +1997,12 @@ async def test_with_design_doc_locked_raises_on_size_limit_when_opted_in(db_sess
 
 
 @pytest.mark.asyncio
-async def test_with_design_doc_locked_silent_on_size_limit_by_default(db_session):
-    """Default raise_on_size_limit=False preserves backward-compatible behavior:
-    a growth-over-ceiling write returns False without raising.
+async def test_raise_on_size_limit_default_raises_on_growth(db_session):
+    """Default raise_on_size_limit=True raises DesignDocSizeLimitExceeded
+    when a growth-over-ceiling write would silently drop the mutation.
 
-    Existing callers that check the boolean return value must continue to work.
+    Callers that relied on the old silent-False default must either catch
+    the exception or pass raise_on_size_limit=False explicitly.
     """
     padding = "x" * (DESIGN_DOC_MAX_BYTES - 30)
     project = Project(name="silent-limit-test", user_id="user")
@@ -2004,13 +2013,15 @@ async def test_with_design_doc_locked_silent_on_size_limit_by_default(db_session
     def _grow(doc: dict) -> None:
         doc["new_key"] = "y" * 100
 
-    # Default: no raise_on_size_limit kwarg — must return False, not raise.
-    result = await with_design_doc_locked(db_session, project.id, _grow)
-    assert result is False, (
-        "growth over ceiling with default raise_on_size_limit=False must return False"
-    )
+    # Default: no raise_on_size_limit kwarg — must raise, not return False.
+    with pytest.raises(DesignDocSizeLimitExceeded) as exc_info:
+        await with_design_doc_locked(db_session, project.id, _grow)
+    exc = exc_info.value
+    assert exc.project_id == project.id, "exception must carry the project id"
+    assert exc.new_size > exc.old_size, "new_size must be larger than old_size"
+    assert exc.ceiling == DESIGN_DOC_MAX_BYTES, "ceiling must match DESIGN_DOC_MAX_BYTES"
 
-    # Explicit False — same expectation.
+    # Explicit False — must still return False (backward-compatible opt-out).
     result2 = await with_design_doc_locked(
         db_session, project.id, _grow, raise_on_size_limit=False
     )

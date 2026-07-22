@@ -23,7 +23,10 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.alert_dispatch import _maybe_create_problem_model_wipe_alert
+from app.alert_dispatch import (
+    _maybe_create_problem_model_live_core_alert,
+    _maybe_create_problem_model_wipe_alert,
+)
 from app.broadcast import broadcast_to_project
 from app.capability_proof import carry_proof_records_for_consolidation
 from app.capability_trial_verdict import (
@@ -409,13 +412,14 @@ async def _backfill_one_project(session: AsyncSession, project_id: uuid.UUID) ->
         updated = True
 
     try:
-        await _with_design_doc_locked(session, project_id, _mutate, raise_on_size_limit=True)
+        await _with_design_doc_locked(session, project_id, _mutate)
     except DesignDocSizeLimitExceeded as exc:
         logger.warning(
             "[backfill_file_to_system_index] skipped project %s: %s",
             project_id,
             exc,
         )
+        updated = False
     return updated
 
 
@@ -4219,6 +4223,11 @@ async def strategic_operation(
                 await _maybe_create_problem_model_wipe_alert(
                     project.id, session, field=_wipe_field
                 )
+        # Fire a deduplicated ERROR alert when the live core alone exceeds the
+        # byte budget — byte eviction is futile and the model was committed
+        # oversized (rev-1367 wipe precondition).
+        if pm_diff.get("live_core_exceeds_budget"):
+            await _maybe_create_problem_model_live_core_alert(project.id, session)
         # Normalize stale active_moves via the shared helper so both write paths
         # (op-endpoint + log-parse fallback) stay converged.
         _active_dir_ids = {

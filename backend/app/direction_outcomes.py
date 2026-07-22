@@ -56,7 +56,7 @@ from app.models import (
 )
 from app.project_telemetry import read_telemetry, upsert_telemetry
 from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
-from app.task_locking import with_design_doc_locked, with_directions_locked
+from app.task_locking import DesignDocSizeLimitExceeded, with_design_doc_locked, with_directions_locked
 
 # Task types that never open a PR. Derived directly from the registry so that
 # newly-registered read_only types are automatically excluded from the
@@ -2715,22 +2715,29 @@ async def _update_direction_research_outcomes(
                 doc.get("cochange_applied_prs") or []
             )
 
-        applied = await with_design_doc_locked(
-            session, project_id, _apply_and_capture
-        )
-        if applied and cochange_capture:
-            # Dual-write the merged co-change blob into the dedicated KV table.
-            # The design_doc cochange_index/cochange_applied_prs keys above stay
-            # as the rollback fallback for this phase.
-            await upsert_telemetry(
-                session,
-                project_id,
-                "cochange_state",
-                {
-                    "index": cochange_capture["index"],
-                    "applied_prs": cochange_capture["applied_prs"],
-                },
+        try:
+            await with_design_doc_locked(
+                session, project_id, _apply_and_capture
             )
+        except DesignDocSizeLimitExceeded:
+            # Cap hit — design_doc write skipped, but the directions mutation
+            # above still succeeded. Skip the cochange telemetry dual-write
+            # (same semantic as the old applied=False guard) and commit.
+            pass
+        else:
+            if cochange_capture:
+                # Dual-write the merged co-change blob into the dedicated KV table.
+                # The design_doc cochange_index/cochange_applied_prs keys above stay
+                # as the rollback fallback for this phase.
+                await upsert_telemetry(
+                    session,
+                    project_id,
+                    "cochange_state",
+                    {
+                        "index": cochange_capture["index"],
+                        "applied_prs": cochange_capture["applied_prs"],
+                    },
+                )
 
     await session.commit()
 

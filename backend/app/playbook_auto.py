@@ -41,7 +41,7 @@ from app.playbook_storage import (
     _is_auto_playbook_suppressed,
 )
 from app.shared_state import DEFAULT_TASK_SCOPE
-from app.task_locking import with_design_doc_locked
+from app.task_locking import DesignDocSizeLimitExceeded, with_design_doc_locked
 
 logger = logging.getLogger(__name__)
 
@@ -364,7 +364,9 @@ async def _maybe_auto_playbook(
         doc["_meta"] = meta
         entry_created = True
 
-    if not await with_design_doc_locked(session, task.project_id, _mutate_design_doc):
+    try:
+        await with_design_doc_locked(session, task.project_id, _mutate_design_doc)
+    except DesignDocSizeLimitExceeded:
         return None
 
     if not entry_created:

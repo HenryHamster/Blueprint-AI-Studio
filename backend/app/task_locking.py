@@ -628,7 +628,7 @@ async def with_design_doc_locked(
     mutate_fn: Callable[[dict], None],
     *,
     skip_locked: bool = False,
-    raise_on_size_limit: bool = False,
+    raise_on_size_limit: bool = True,
 ) -> bool:
     """Atomic read-modify-write of project.design_doc under a project row lock.
 
@@ -643,18 +643,19 @@ async def with_design_doc_locked(
             by another session — preserves best-effort / non-blocking
             semantics for hot dispatch paths where lock contention should
             degrade gracefully rather than block.
-        raise_on_size_limit: When True, raise DesignDocSizeLimitExceeded
-            instead of silently returning False when the agent-owned portion
-            of design_doc would exceed DESIGN_DOC_MAX_BYTES. Use this on
-            agent-facing paths so the caller can return a visible error
-            rather than letting the strategist believe the write persisted.
-            Defaults to False for backward compatibility.
+        raise_on_size_limit: When True (the default), raise
+            DesignDocSizeLimitExceeded when the agent-owned portion of
+            design_doc would exceed DESIGN_DOC_MAX_BYTES — ensuring callers
+            do not silently believe a write persisted when it was dropped.
+            Pass False explicitly to opt back into the legacy silent-return
+            behavior.
 
     Returns:
         True if mutate_fn was applied, False if the row was held and
         skip_locked=True caused an immediate skip (or raise_on_size_limit is
-        False and the size cap was hit — use raise_on_size_limit=True to
-        distinguish cap failures from lock-skip failures).
+        explicitly False and the size cap was hit — use the default
+        raise_on_size_limit=True to distinguish cap failures from lock-skip
+        failures via the exception type).
 
     This is the canonical helper for all design_doc mutations. Using it
     consistently prevents concurrent writers from clobbering each other's

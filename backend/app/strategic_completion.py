@@ -4812,6 +4812,17 @@ async def _handle_strategic_completion(
                         await _maybe_create_problem_model_wipe_alert(
                             project.id, session, field=_wipe_field
                         )
+                if pm_diff.get("live_core_exceeds_budget"):
+                    logger.error(
+                        f"[STRATEGIC] Task {task.id}: problem_model live core exceeds "
+                        f"byte budget — model committed oversized (rev-1367 wipe precondition)"
+                    )
+                    from app.alert_dispatch import (
+                        _maybe_create_problem_model_live_core_alert,
+                    )
+                    await _maybe_create_problem_model_live_core_alert(
+                        project.id, session
+                    )
                 # Normalize stale active_moves via shared helper so both write
                 # paths (op-endpoint + log-parse fallback) stay converged.
                 _active_dir_ids = {

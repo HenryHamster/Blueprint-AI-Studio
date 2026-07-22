@@ -1326,6 +1326,54 @@ async def _maybe_create_problem_model_wipe_alert(
     )
 
 
+async def _maybe_create_problem_model_live_core_alert(
+    project_id: "uuid.UUID",
+    session: AsyncSession,
+) -> None:
+    """Create a deduplicated ERROR alert when the problem_model live core alone
+    exceeds PROBLEM_MODEL_BYTE_BUDGET, making byte eviction futile.
+
+    This is the exact precondition for the rev-1367 wipe: the oversized model
+    is committed to the durable store, then the next strategic cycle's packer
+    truncates the agent view, the agent echoes back the truncated view, and the
+    non-destructive merge cannot fully protect state.
+
+    Deduplicated by stable title so repeated oversized writes raise exactly ONE
+    alert per project until the operator dismisses it.
+    """
+    title = f"Problem-model live core over byte budget on project {str(project_id)[:8]}"
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.task_id.is_(None),
+            Alert.dismissed_at.is_(None),
+            Alert.title == title,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    message = (
+        "The problem model's live core (active gaps, live capabilities, active "
+        "friction) alone exceeds the PROBLEM_MODEL_BYTE_BUDGET. Byte eviction "
+        "cannot help — the model was committed oversized. This is the "
+        "precondition for the rev-1367 agent-view truncation / wipe cycle. "
+        "Prune the problem model or increase the byte budget."
+    )
+    alert = Alert(
+        project_id=project_id,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        event_type="problem_model.live_core_over_budget",
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "ERROR", "title": alert.title},
+    )
+
+
 async def _maybe_create_precondition_blocker_alert(
     task: "Task",
     session: AsyncSession,

@@ -1262,9 +1262,24 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     # Byte cap: only re-order/evict when we are genuinely over budget so the
     # no-op path leaves the model byte-identical (no spurious archived re-sort).
     ledger_trimmed = 0
-    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and _byte_evictable(
+    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and not _byte_evictable(
         model
     ):
+        # The live core alone (active gaps + live capabilities + active friction)
+        # exceeds the budget — evicting reference-only history cannot help.  This
+        # is the exact mechanism behind the rev-1367 wipe: the oversized model is
+        # committed to the durable store and the packer truncates the agent view
+        # next cycle.  Signal loudly so operators can intervene before that
+        # truncation / wipe cycle occurs.
+        import logging as _logging
+        _logging.getLogger(__name__).error(
+            "gc_problem_model: live core exceeds PROBLEM_MODEL_BYTE_BUDGET (%d bytes) "
+            "— byte eviction cannot help; model committed oversized. "
+            "Investigate problem model size on this project.",
+            PROBLEM_MODEL_BYTE_BUDGET,
+        )
+        summary["live_core_exceeds_budget"] = True
+    elif _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
         # Oldest-first so list.pop(0) drops the oldest archived gap.
         model.archived_gaps = sorted(model.archived_gaps, key=_archived_gap_recency_key)
         while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
@@ -3136,6 +3151,13 @@ def apply_agent_update(
     gc_summary = gc_problem_model(proposed)
     if gc_summary:
         diff.update(gc_summary)
+    # Report when the model is still over budget after GC — the byte pass may
+    # skip when the live core alone exceeds the budget (_byte_evictable=False),
+    # leaving the model oversized in the durable store. This diagnostic makes
+    # that condition observable in the revision log so the operator knows the
+    # durable problem model may be truncated on the next strategic read.
+    if _serialized_model_bytes(proposed) > PROBLEM_MODEL_BYTE_BUDGET:
+        diff["model_over_budget"] = True
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 
