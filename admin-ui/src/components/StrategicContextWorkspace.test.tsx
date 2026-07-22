@@ -5,7 +5,6 @@ import { StrategicContextWorkspace } from './StrategicContextWorkspace';
 import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
-  StrategicWorkSessionEvent,
 } from '../strategicStateApi';
 
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
@@ -294,23 +293,6 @@ describe('StrategicContextWorkspace', () => {
     return { host, props };
   }
 
-  function stateWithWorkSessionEvents(events: StrategicWorkSessionEvent[]): StrategicStateResponse {
-    const workSession = STATE.work_session;
-    if (!workSession) throw new Error('STATE fixture must include work_session');
-    return {
-      ...STATE,
-      work_session: {
-        ...workSession,
-        events: {
-          version: 1,
-          limit: 24,
-          has_more: true,
-          items: events,
-        },
-      },
-    };
-  }
-
   test('does not render while closed', () => {
     const { host } = mount({ open: false });
     expect(host.textContent).toBe('');
@@ -329,13 +311,10 @@ describe('StrategicContextWorkspace', () => {
 
     expect(host.textContent).toContain('Strategic context');
     expect(host.textContent).toContain('Session');
-    expect(host.querySelector('[data-testid="strategic-session-control"]')).not.toBeNull();
-    expect(host.textContent).toContain('Workday');
     expect(host.textContent).toContain('Runner');
     expect(host.textContent).toContain('1 runner ready');
     expect(host.textContent).toContain('Compute');
     expect(host.textContent).toContain('needs check');
-    expect(host.textContent).toContain('One operator decision is waiting.');
     expect(host.textContent).toContain('failed compute');
     expect(host.textContent).not.toContain('open messages');
     expect(host.textContent).toContain('Reply to operator question');
@@ -356,52 +335,6 @@ describe('StrategicContextWorkspace', () => {
       '[data-testid="strategic-context-workspace-artifacts"] [data-testid="strategic-context-descriptor-context_map"]',
     )).toBeNull();
     expect(host.querySelector('[data-testid="strategic-context-workspace-map"]')).not.toBeNull();
-  });
-
-  test('exposes Strategic mode and account controls from the drawer', () => {
-    const onClose = vi.fn();
-    const onModeChange = vi.fn();
-    const onOpenAccounts = vi.fn();
-    const { host } = mount({
-      onClose,
-      onModeChange,
-      onOpenAccounts,
-      accountSpend: {
-        totalAccounts: 3,
-        availableAccounts: 2,
-        enabledAccounts: 3,
-        cooldownAccounts: 0,
-        trackedSpendUsd: 12.34,
-      },
-    });
-
-    const control = host.querySelector('[data-testid="strategic-session-control"]');
-    expect(control?.textContent).toContain('Workday');
-    // The check-in "Mark checked" affordance was retired with the mode collapse.
-    expect(control?.textContent).not.toContain('Mark checked');
-    expect(control?.textContent).toContain('Accounts');
-
-    const buttons = Array.from(host.querySelectorAll('button'));
-    expect(buttons.filter(button => button.title === 'Open Runner')).toHaveLength(1);
-    expect(buttons.filter(button => button.title === 'Open Compute')).toHaveLength(1);
-    expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open devices: runner'))).toBe(false);
-    expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open compute: runtime work'))).toBe(false);
-    // Only Chat and Workday remain in the mode picker.
-    expect(buttons.some(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Monitor')).toBe(false);
-    expect(buttons.some(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Check-in')).toBe(false);
-
-    // The drawer opens in Workday (continuous); switching to the other mode, Chat,
-    // routes through onModeChange with the backend value.
-    buttons
-      .find(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Chat')
-      ?.click();
-    expect(onModeChange).toHaveBeenCalledWith('chat');
-
-    buttons
-      .find(button => button.getAttribute('aria-label')?.startsWith('Open accounts: accounts'))
-      ?.click();
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(onOpenAccounts).toHaveBeenCalledTimes(1);
   });
 
   test('keeps canvas resources with the rendered map instead of duplicating them in resources', () => {
@@ -550,42 +483,6 @@ describe('StrategicContextWorkspace', () => {
       ?.click();
     expect(onOpenMessageTarget).toHaveBeenLastCalledWith({ messageId: 'msg-operator', action: 'reply' });
     expect(onClose).toHaveBeenCalledTimes(3);
-  });
-
-  test('renders recent session flow and opens existing targets', () => {
-    const onClose = vi.fn();
-    const onOpenTarget = vi.fn();
-    const { host } = mount({
-      onClose,
-      onOpenTarget,
-      state: stateWithWorkSessionEvents([
-        {
-          id: 'event-runtime',
-          schema_version: 1,
-          project_id: 'proj-1',
-          resource: 'alert',
-          action: 'raised',
-          refetch: { surfaces: ['runtime'] },
-          occurred_at: '2026-06-29T01:02:00Z',
-          source: 'runner',
-          title: 'Runner stale',
-          summary: 'The local runner stopped heartbeating.',
-          tone: 'warning',
-          target: { surface: 'runtime', section: 'devices' },
-        },
-      ]),
-    });
-
-    expect(host.querySelector('[data-testid="strategic-context-workspace-events"]')?.textContent).toContain('Recent flow');
-    expect(host.textContent).toContain('Runner stale');
-    expect(host.textContent).toContain('The local runner stopped heartbeating.');
-
-    Array.from(host.querySelectorAll('button'))
-      .find(button => button.title === 'Open Runner stale')
-      ?.click();
-
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'devices' });
   });
 
   test('renders model-integrity conflicts with recovery hints and criterion links', () => {

@@ -2573,7 +2573,7 @@ async def _load_gc_guard_state_from_db(session) -> None:
         last_result = state.get("last_result")
         if isinstance(last_result, dict):
             _gc_guard_last_result = dict(last_result)
-    except Exception:  # noqa: BLE001 — never crash the sweep on a DB restore failure
+    except Exception:
         logger.exception("_load_gc_guard_state_from_db: failed to restore GC-guard state")
 
 
@@ -3094,7 +3094,7 @@ async def sweep_protect_referenced_compute_image_digests(
             )
         )
         await session.commit()
-    except Exception:  # noqa: BLE001 — persistence failure must never crash the sweep
+    except Exception:
         logger.exception(
             "sweep_protect_referenced_compute_image_digests: failed to persist GC-guard state"
         )

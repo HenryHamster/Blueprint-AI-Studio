@@ -3230,9 +3230,7 @@ async def orchestrator_worker():
                 # and cannot serve the resource-envelope checks below.
                 # Pre-seeding absent ids with None also prevents a concurrently
                 # deleted project from falling back to a point lookup.
-                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = {  # noqa: C420
-                    project_id: None for project_id in _all_candidate_pids
-                }
+                _project_cache_for_dispatch: dict[uuid.UUID, Project | None] = dict.fromkeys(_all_candidate_pids)
                 if _all_candidate_pids:
                     _dispatch_projects = (
                         (
@@ -4941,7 +4939,7 @@ async def orchestrator_worker():
             if _is_cadence_due(_last_v22_finding_backfill, 600):
                 _last_v22_finding_backfill = _utcnow()
                 try:
-                    from app.release_readiness import (  # noqa: PLC0415, RUF100
+                    from app.release_readiness import (
                         _sweep_v22_finding_backfill,
                     )
 

@@ -25,13 +25,6 @@ import {
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
 import { ArtifactViewablePreviews, StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
-import { StrategicSessionEvents } from './StrategicSessionEvents';
-import {
-  StrategicSessionControl,
-  type StrategicAccountSpendStatus,
-  type StrategicInteractionMode,
-  type StrategicSessionRunnerOption,
-} from './StrategicSessionControl';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
@@ -41,56 +34,11 @@ interface StrategicContextWorkspaceProps {
   open: boolean;
   state: StrategicStateResponse | null;
   workbenchState?: StrategicWorkbenchState | null;
-  savingSession?: boolean;
   savingSessionRefs?: boolean;
-  accountSpend?: StrategicAccountSpendStatus | null;
-  sessionActive?: boolean;
-  sessionStatus?: string | null;
-  sessionState?: string | null;
-  sessionReason?: string | null;
-  sessionBusy?: boolean;
-  sessionRunners?: StrategicSessionRunnerOption[] | null;
-  sessionSelectedRunnerId?: string | null;
-  operatorDecisionSummary?: {
-    total: number;
-    captured: number;
-    missed: number;
-    capture_rate: number | null;
-  } | null;
-  turnLatencySummary?: {
-    operator: {
-      count: number;
-      mean_turn_ms: number | null;
-      max_turn_ms: number;
-      mean_ttft_ms: number | null;
-      interrupted_count: number;
-      total_tool_calls: number;
-      total_tool_call_duration_ms: number;
-      mean_inter_token_ms: number | null;
-      mean_pickup_lag_ms: number | null;
-    };
-    autonomous: {
-      count: number;
-      mean_turn_ms: number | null;
-      max_turn_ms: number;
-      mean_ttft_ms: number | null;
-      interrupted_count: number;
-      total_tool_calls: number;
-      total_tool_call_duration_ms: number;
-      mean_inter_token_ms: number | null;
-      mean_pickup_lag_ms: number | null;
-    };
-  } | null;
   projectId?: string | null;
-  onSelectRunner?: (runnerId: string | null) => void;
-  onStartSession?: () => void;
-  onStopSession?: () => void;
   onClose: () => void;
   onOpenTarget: (target?: StrategicContextTarget | null) => void;
   onOpenMessageTarget?: (target?: StrategicMessageTarget) => void;
-  onModeChange?: (mode: StrategicInteractionMode) => void;
-  onOpenAccounts?: () => void;
-  onOpenSpend?: () => void;
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
@@ -615,28 +563,11 @@ export function StrategicContextWorkspace({
   open,
   state,
   workbenchState,
-  savingSession = false,
   savingSessionRefs = false,
-  accountSpend = null,
-  sessionActive = false,
-  sessionStatus = null,
-  sessionState = null,
-  sessionReason = null,
-  sessionBusy = false,
-  sessionRunners = null,
-  sessionSelectedRunnerId = null,
-  operatorDecisionSummary = null,
-  turnLatencySummary = null,
   projectId,
-  onSelectRunner,
-  onStartSession,
-  onStopSession,
   onClose,
   onOpenTarget,
   onOpenMessageTarget,
-  onModeChange,
-  onOpenAccounts,
-  onOpenSpend,
   onUpdateSessionRefs,
 }: StrategicContextWorkspaceProps) {
   useEffect(() => {
@@ -780,7 +711,6 @@ export function StrategicContextWorkspace({
   const runtimeWork = state?.runtime?.work ?? null;
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
   const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
-  const workSessionEvents = workSession?.events?.items ?? [];
   const showDescriptorOnlyContextMap = Boolean(contextMapDescriptor && !canvas);
   const strategicMemoryNotes = state?.strategic_memory_notes ?? [];
 
@@ -882,34 +812,6 @@ export function StrategicContextWorkspace({
               testId="strategic-context-workspace-session"
             >
               <div className="space-y-3">
-                <StrategicSessionControl
-                  mode={sessionMode}
-                  saving={savingSession}
-                  accountSpend={accountSpend}
-                  sessionActive={sessionActive}
-                  sessionStatus={sessionStatus}
-                  sessionState={sessionState}
-                  sessionReason={sessionReason}
-                  sessionBusy={sessionBusy}
-                  sessionRunners={sessionRunners}
-                  sessionSelectedRunnerId={sessionSelectedRunnerId}
-                  operatorDecisionSummary={operatorDecisionSummary}
-                  turnLatencySummary={turnLatencySummary}
-                  onSelectRunner={onSelectRunner}
-                  onStartSession={onStartSession}
-                  onStopSession={onStopSession}
-                  onModeChange={onModeChange}
-                  onOpenAccounts={onOpenAccounts ? () => {
-                    onClose();
-                    onOpenAccounts();
-                  } : undefined}
-                  onOpenSpend={onOpenSpend ? () => {
-                    onClose();
-                    onOpenSpend();
-                  } : undefined}
-                  className="items-stretch sm:items-stretch sm:justify-start"
-                />
-
                 <div className="grid gap-2 md:grid-cols-2">
                   {localRunner && localRunnerStatus && (
                     <SessionSummaryButton
@@ -1041,21 +943,6 @@ export function StrategicContextWorkspace({
                     </div>
                   ))}
                 </div>
-              </Section>
-            )}
-
-            {workSessionEvents.length > 0 && (
-              <Section
-                title="Recent flow"
-                meta={workSession?.events?.has_more ? `${workSessionEvents.length}+` : `${workSessionEvents.length}`}
-                testId="strategic-context-workspace-events"
-              >
-                <StrategicSessionEvents
-                  events={workSessionEvents}
-                  limit={10}
-                  density="comfortable"
-                  onOpenTarget={handleOpenTarget}
-                />
               </Section>
             )}
 

@@ -669,7 +669,7 @@ async def _process_direction_lifecycle(
     tick to be skipped rather than queue behind a 30s lock timeout.  The next
     scheduled cycle will pick up any directions that were not processed.
     """
-    from app.task_locking import project_lock  # noqa: PLC0415, RUF100
+    from app.task_locking import project_lock
 
     async with project_lock(session, project.id, skip_locked=True) as _locked:
         if _locked is None:
@@ -794,7 +794,7 @@ async def _process_direction_lifecycle_locked(
         )
         if not in_active:
             return
-        from app.problem_model import (  # noqa: PLC0415, RUF100
+        from app.problem_model import (
             reconcile_gaps_for_retired_directions,
             sanitize_problem_model_raw,
         )
@@ -824,7 +824,7 @@ async def _process_direction_lifecycle_locked(
         gap_id = direction.get("gap_id")
         if not did or not gap_id:
             return
-        from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+        from app.problem_model import reconcile_gap_staffing_raw_result
 
         result = reconcile_gap_staffing_raw_result(
             project.problem_model,
@@ -874,7 +874,7 @@ async def _process_direction_lifecycle_locked(
             f"[AUTONOMOUS] Auto-retired lifetime-burn direction {did} after "
             f"{lb_pause_count} burn-pause cycles: {d.get('text', '')[:60]}"
         )
-        from app.models import Alert, AlertSeverity  # noqa: PLC0415, RUF100
+        from app.models import Alert, AlertSeverity
 
         session.add(
             Alert(
@@ -892,7 +892,7 @@ async def _process_direction_lifecycle_locked(
         try:
             from app.notification_dispatch import (
                 post_direction_milestone_message,
-            )  # noqa: PLC0415, RUF100
+            )
 
             await post_direction_milestone_message(
                 session,
@@ -964,7 +964,7 @@ async def _process_direction_lifecycle_locked(
                 f"{_sc_flag_cycles} scaffolding-flagged cycles (designated pass): "
                 f"{_d.get('text', '')[:60]}"
             )
-            from app.models import Alert, AlertSeverity  # noqa: PLC0415, RUF100
+            from app.models import Alert, AlertSeverity
 
             session.add(
                 Alert(
@@ -980,7 +980,7 @@ async def _process_direction_lifecycle_locked(
                 )
             )
             try:
-                from app.notification_dispatch import (  # noqa: PLC0415, RUF100
+                from app.notification_dispatch import (
                     post_direction_milestone_message,
                 )
 
@@ -1674,7 +1674,7 @@ async def _process_direction_lifecycle_locked(
                 if pause_reason.startswith("Lifetime burn backstop:"):
                     from app.notification_dispatch import (
                         post_direction_burn_pause_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_burn_pause_message(
                         session,
@@ -1687,7 +1687,7 @@ async def _process_direction_lifecycle_locked(
                 elif pause_reason.startswith("Churn guardrail:"):
                     from app.notification_dispatch import (
                         post_direction_churn_pause_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_churn_pause_message(
                         session,
@@ -1700,7 +1700,7 @@ async def _process_direction_lifecycle_locked(
                 else:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1784,7 +1784,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1847,7 +1847,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_milestone_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_milestone_message(
                         session,
@@ -1924,7 +1924,7 @@ async def _process_direction_lifecycle_locked(
                 try:
                     from app.notification_dispatch import (
                         post_direction_outcome_stalled_message,
-                    )  # noqa: PLC0415, RUF100
+                    )
 
                     await post_direction_outcome_stalled_message(
                         session,
@@ -1941,8 +1941,8 @@ async def _process_direction_lifecycle_locked(
                 # Spawn one memo task to capture this signal as a citable artifact.
                 # The flag already gates first-detection only so no dedup query needed.
                 try:
-                    from app.plan_completion import TASK_PRIORITY_MAP  # noqa: PLC0415, RUF100
-                    from app.task_completion import _apply_synthesized_memo  # noqa: PLC0415, RUF100
+                    from app.plan_completion import TASK_PRIORITY_MAP
+                    from app.task_completion import _apply_synthesized_memo
 
                     _scaffolding_topic = (d.get("text") or "")[
                         :120
@@ -2044,7 +2044,7 @@ async def _process_direction_lifecycle_locked(
                     elif _advanced_flag_cycle and _flag_cycles == _esc_threshold:
                         # Escalation notification at mid-threshold.
                         try:
-                            from app.notification_dispatch import (  # noqa: PLC0415, RUF100
+                            from app.notification_dispatch import (
                                 post_direction_outcome_scaffolding_escalation_message,
                             )
 

@@ -172,7 +172,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
-    strategicSessionTranscript,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   } = useLogViewer({
     fetchTasksRef,
@@ -742,7 +741,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     activeTab, setActiveTab,
     // Directions
     showDirections, setShowDirections,
-    fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion, strategicSessionTranscript,
+    fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion,
     // Metrics
     showMetrics, setShowMetrics, metricsHistory, cumulativeCost, cumulativeVmHours, metricsWindow, setMetricsWindow,
     // Archive

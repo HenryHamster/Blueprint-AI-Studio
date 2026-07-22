@@ -575,7 +575,7 @@ async def shutdown_tracked_artifact_ref_promotions(
             asyncio.shield(completion),
             timeout=max(0.01, float(timeout_seconds)),
         )
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         logger.warning(
             "Tracked ArtifactRef promotions exceeded the %.1fs shutdown bound",
             timeout_seconds,

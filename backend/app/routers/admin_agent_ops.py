@@ -1357,7 +1357,7 @@ async def strategic_operation(
         staged_create = bool(data.get("staged"))
         staged_for_version: int | None = None
         if staged_create:
-            from app.release_version import current_open_version  # noqa: PLC0415, RUF100
+            from app.release_version import current_open_version
 
             open_version = await current_open_version(session, project.id)
             if open_version is None:
@@ -1545,7 +1545,7 @@ async def strategic_operation(
         # gap: add it to active_moves and clear any now-false deferral. Mirrors
         # the retire-side reconciliation but in the staffing direction.
         if new_dir.get("gap_id") and not staged_create:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -1885,7 +1885,7 @@ async def strategic_operation(
         if _updated_dir is not None and (
             _gap_reground is not None or _new_status != _pre_status
         ):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _new_gap_id = _updated_dir.get("gap_id")
             _prior_gap_id = (
@@ -2321,7 +2321,7 @@ async def strategic_operation(
             ]
         await _with_directions_locked(session, project.id, _apply_stage)
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -2433,7 +2433,7 @@ async def strategic_operation(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
         if target.get("gap_id"):
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             now_iso = _utcnow().isoformat()
             _gap_reconcile = reconcile_gap_staffing_raw_result(
@@ -2689,7 +2689,7 @@ async def strategic_operation(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
         if _gap_id:
-            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415, RUF100
+            from app.problem_model import reconcile_gap_staffing_raw_result
 
             _gap_reconcile = reconcile_gap_staffing_raw_result(
                 project.problem_model,
@@ -5602,7 +5602,7 @@ async def _apply_finding_resolution_write(
             status_code=400,
             detail="finding_key is required and must be at most 64 characters",
         )
-    from app.release_version import current_open_version  # noqa: PLC0415, RUF100
+    from app.release_version import current_open_version
 
     open_version = await current_open_version(session, project_id)
     if open_version is None:
@@ -5633,7 +5633,7 @@ async def _apply_finding_resolution_write(
                     ),
                 )
             resolution_version_id = bound_id
-    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415, RUF100
+    from app.release_readiness import apply_finding_resolution
 
     await apply_finding_resolution(
         session,

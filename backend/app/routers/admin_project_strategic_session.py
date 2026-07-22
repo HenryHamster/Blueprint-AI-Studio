@@ -2790,11 +2790,6 @@ async def get_project_strategic_conversation(
             if matched_message is not None
             else None
         ),
-        "wakeup_state": (
-            (matched_message.context or {}).get("_resident_wakeup_state")
-            if matched_message is not None and isinstance(matched_message.context, dict)
-            else None
-        ),
     }
     # A selected message can already be in the visible window, making the
     # rendered transcript identical to the unpinned one.  Bind the validator

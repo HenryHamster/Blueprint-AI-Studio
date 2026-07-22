@@ -10,7 +10,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -99,8 +99,8 @@ def _task_error_fingerprint(task) -> "str | None":
         return None
     stage: str | None = None
     try:
-        from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
-        from app.failure_stage import _derive_failure_stage  # noqa: PLC0415, RUF100
+        from app.failure_classification import classify_failure
+        from app.failure_stage import _derive_failure_stage
 
         cls = (
             classify_failure(task, at_time=task.last_heartbeat or task.started_at) or ""
@@ -142,7 +142,7 @@ _SHARED_FINGERPRINT_PAUSED_WINDOW_HOURS = 48
 def find_directions_sharing_fingerprint(
     project,
     target_fingerprint: str,
-    exclude_direction_id: Optional[str] = None,  # noqa: UP045
+    exclude_direction_id: str | None = None,
 ) -> list[dict]:
     """Return other recently auto-paused directions that share ``target_fingerprint``.
 
@@ -232,8 +232,8 @@ async def _compute_research_anomalies(project_id, session: AsyncSession) -> list
     Returns a list of {signal: str, severity: 'high'|'medium', details: str} dicts.
     """
     # Deferred import to avoid circular dependency (main.py imports this module)
-    from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
-    from app.direction_outcomes import (  # noqa: PLC0415, RUF100
+    from app.failure_classification import classify_failure
+    from app.direction_outcomes import (
         _is_cascade_cancelled,
         verified_merged_count,
     )
@@ -842,7 +842,7 @@ def _apply_anomaly_adjustments() -> bool:
     return True
 
 
-def _parse_adjustments_ts(iso_value: Optional[str]) -> Optional[datetime]:  # noqa: UP045
+def _parse_adjustments_ts(iso_value: str | None) -> datetime | None:
     """Parse an ISO timestamp stored in anomaly_adjustments back into a naive UTC datetime."""
     if not iso_value:
         return None
@@ -1169,7 +1169,7 @@ def _check_fast_recovery() -> bool:
     if len(recent_results) < _FAST_RECOVERY_MIN_SAMPLE:
         if _shared_state.runtime_config.get("max_concurrent_vms", 0) != 0:
             return False
-        from app.deploy_health import (  # noqa: PLC0415, RUF100
+        from app.deploy_health import (
             _HEALTH_HISTORY_SIZE,
             get_recovery_history_snapshot,
         )
@@ -1220,7 +1220,7 @@ async def seed_task_results_from_db(
     accrue. This rebuilds the deque from tasks whose vm_stopped_at falls within
     the window so fast-recovery can fire on the first sweep after restart.
     """
-    from app.failure_classification import classify_failure  # noqa: PLC0415, RUF100
+    from app.failure_classification import classify_failure
 
     cutoff = _utcnow() - timedelta(hours=hours)
     stmt = (
@@ -1420,10 +1420,10 @@ async def _expire_stale_proposals(session) -> int:
 
 @router.get("/anomaly-tracker/snapshot")
 async def get_anomaly_tracker_snapshot(
-    project_id: Optional[uuid.UUID] = Query(default=None),  # noqa: UP045
+    project_id: uuid.UUID | None = Query(default=None),
     freshness_hours: int = Query(default=24, ge=1, le=720),
     session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(require_admin),  # noqa: ARG001, RUF100
+    current_user: dict = Depends(require_admin),
 ) -> Dict[str, Any]:
     """Read-only snapshot of shared_state.persistent_anomalies.
 

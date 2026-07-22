@@ -6,7 +6,7 @@ import uuid
 import json
 import math
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, List
+from typing import Dict, Any, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -51,6 +51,7 @@ from app.project_message_creation import (
     wakeup_state_for_arming,
 )
 from app.project_message_projection import (
+    WAKEUP_STATE_CONTEXT_KEY,
     admin_message_dict,
     admin_message_list_dict,
     message_event_payload,
@@ -105,14 +106,14 @@ class _MessageCreate(BaseModel):
     project_id: str
     message_type: str = "NOTE"
     content: str
-    context: Optional[Dict[str, Any]] = None  # noqa: UP045
-    workbench_context: Optional[Dict[str, Any]] = None  # noqa: UP045
-    idempotency_key: Optional[str] = None  # noqa: UP045
+    context: Dict[str, Any] | None = None
+    workbench_context: Dict[str, Any] | None = None
+    idempotency_key: str | None = None
 
 
 class _MessageResolve(BaseModel):
-    resolution: Optional[str] = None  # noqa: UP045
-    workbench_context: Optional[Dict[str, Any]] = None  # noqa: UP045
+    resolution: str | None = None
+    workbench_context: Dict[str, Any] | None = None
 
 
 class _LastSeenUpdate(BaseModel):
@@ -139,7 +140,7 @@ class _TempMutesUpdate(BaseModel):
 
 class _MuteWindowUpdate(BaseModel):
     project_id: str
-    expires_at: Optional[int] = None  # ms epoch; None clears the mute window  # noqa: UP045
+    expires_at: int | None = None  # ms epoch; None clears the mute window
 
 
 class _WorkbenchStateUpdate(BaseModel):
@@ -152,7 +153,7 @@ class _AdminPlaybookSet(BaseModel):
         ..., description="Playbook key: alphanumeric + hyphens, max 50 chars"
     )
     value: str = Field(..., description="Playbook value: plain text, max 2048 bytes")
-    applicable_types: Optional[List[str]] = Field(  # noqa: UP045
+    applicable_types: List[str] | None = Field(
         None, description="Task types this entry applies to; None = shown to all types"
     )
 
@@ -164,7 +165,7 @@ _MESSAGES_SAVED_VIEWS_CAP = 10
 _MESSAGES_SAVED_VIEW_PREF_VALUES = {"mute", "routine", "surfaced"}
 
 
-def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:  # noqa: UP045
+def _sanitize_message_saved_view(raw: Any) -> Dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
 
@@ -429,10 +430,10 @@ _SEED_ENTRIES: Dict[str, dict] = {
 
 @router.get("/alerts")
 async def get_alerts(
-    project_id: Optional[str] = None,  # noqa: UP045
-    domain: Optional[str] = None,  # noqa: UP045
-    event_type: Optional[str] = None,  # noqa: UP045
-    source: Optional[str] = None,  # noqa: UP045
+    project_id: str | None = None,
+    domain: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
     include_dismissed: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -565,10 +566,10 @@ async def acknowledge_alert(
 
 @router.post("/alerts/dismiss-all")
 async def dismiss_all_alerts(
-    project_id: Optional[str] = None,  # noqa: UP045
-    domain: Optional[str] = None,  # noqa: UP045
-    event_type: Optional[str] = None,  # noqa: UP045
-    source: Optional[str] = None,  # noqa: UP045
+    project_id: str | None = None,
+    domain: str | None = None,
+    event_type: str | None = None,
+    source: str | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -717,11 +718,11 @@ async def redrive_dead_letters(
 
 @router.get("/messages")
 async def list_messages(
-    project_id: Optional[str] = Query(None),  # noqa: UP045
-    status: Optional[str] = Query("open"),  # noqa: UP045
+    project_id: str | None = Query(None),
+    status: str | None = Query("open"),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
-    q: Optional[str] = Query(None),  # noqa: UP045
+    q: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -846,7 +847,7 @@ async def list_messages(
 @router.get("/messages/counts")
 async def get_message_counts(
     project_id: str = Query(...),
-    last_seen_ms: Optional[int] = Query(None),  # noqa: UP045
+    last_seen_ms: int | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1075,7 +1076,7 @@ async def resolve_message(
         )
         reply.context = {
             **(reply.context or {}),
-            "_resident_wakeup_state": wakeup_state,
+            WAKEUP_STATE_CONTEXT_KEY: wakeup_state,
         }
         session.add(reply)
         return reply, arming, wakeup_state, True
@@ -1173,7 +1174,7 @@ async def delete_message(
 
 @router.get("/messages/last-seen")
 async def get_messages_last_seen(
-    project_id: Optional[str] = Query(None),  # noqa: UP045
+    project_id: str | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):

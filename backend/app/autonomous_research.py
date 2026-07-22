@@ -7,7 +7,7 @@ import os
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, exists, func
+from sqlalchemy import case, exists, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -468,7 +468,6 @@ async def _fetch_direction_reasoning_memos(
     already documented as unactionable (investigation_unactionable,
     direction_retirement, outcome_scaffolding, etc.).
     """
-    from sqlalchemy import or_
 
     cutoff = _utcnow() - timedelta(days=days)
     rows = (
@@ -825,7 +824,7 @@ async def _spawn_research_task_inner(
     # this project — the fleet-wide budget is exhausted). This prevents autonomous
     # research from starting new work while the budget is maxed out.
     try:
-        from app.monthly_budget_alerts import check_monthly_budget  # noqa: PLC0415, RUF100
+        from app.monthly_budget_alerts import check_monthly_budget
 
         budget_exhausted, _usage_ratio = await check_monthly_budget(session)
     except Exception:
@@ -945,7 +944,7 @@ async def _spawn_research_task_inner(
     #   - _resurrection_count not yet set (can still be resurrected once)
     # Genuinely-dead tasks (CODE_ERROR / OOM / pr_closed_unmerged /
     # already-resurrected) won't match and won't block.
-    from sqlalchemy import or_, and_
+    from sqlalchemy import and_
     from app.failure_classification import INFRA_CLASSES
 
     busy_direction_ids: set = set()
@@ -1534,7 +1533,7 @@ async def _spawn_research_task_inner(
             await commit_legacy_authorized(session, project.id, legacy_generation)
             await session.refresh(project)
 
-            from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415, RUF100
+            from app.alert_dispatch import _create_strategic_alert
 
             await _create_strategic_alert(
                 project.id,
@@ -3106,7 +3105,7 @@ async def _spawn_periodic_task(
             "[AUTONOMOUS] Spawn budget snapshot: %s",
             budget_snapshot.as_log_fields(),
         )
-    except Exception as exc:  # noqa: BLE001, RUF100
+    except Exception as exc:
         # A persistent snapshot/DB failure must NOT silently disable an
         # operator-enabled 'enforce' budget (that would be the exact opposite
         # of enforcement). The configured mode comes from runtime_config and

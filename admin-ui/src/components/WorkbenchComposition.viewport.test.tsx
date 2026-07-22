@@ -4,7 +4,6 @@ import { act } from 'react';
 import { HeaderBar, PrimaryTabNav } from './HeaderBar';
 import { MessagesPanel } from './MessagesPanel';
 import { StrategicContextRail } from './StrategicContextRail';
-import { StrategicSessionControl } from './StrategicSessionControl';
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
 import { expectNoOverflowAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
@@ -372,34 +371,7 @@ describe('WorkbenchComposition viewport regression', () => {
             <WorkbenchSurface
               title="Strategic"
               showTitle={false}
-              actions={(
-                <>
-                  <StrategicSessionControl
-                    mode="continuous"
-                    saving={false}
-                    localRunner={STATE.runtime.local_runner}
-                    runtimeWork={null}
-                    accountSpend={{
-                      totalAccounts: 2,
-                      availableAccounts: 1,
-                      enabledAccounts: 1,
-                      activeAccountTasks: 1,
-                      configuredCapAccounts: 1,
-                      disabledModelCount: 0,
-                      trackedSpendUsd: 12.34,
-                      dailyCostCeilingUsd: 50,
-                    }}
-                    onModeChange={vi.fn()}
-                    onOpenDevices={options.onOpenDevices ?? vi.fn()}
-                    onOpenCompute={options.onOpenCompute ?? vi.fn()}
-                    onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
-                    showMonitoringControls={false}
-                    density="compact"
-                    hideDetailsOnMobile
-                    className="flex"
-                  />
-                </>
-              )}
+              actions={<></>}
               flush
             >
               <WorkbenchSplit

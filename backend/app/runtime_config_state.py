@@ -1991,6 +1991,26 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "compute_experiment_spend_threshold_usd",
                         float(config_json["compute_experiment_spend_threshold_usd"]),
                     )
+                if "strategic_session_enabled" in config_json:
+                    _set(
+                        "strategic_session_enabled",
+                        bool(config_json["strategic_session_enabled"]),
+                    )
+                for _int_key in (
+                    "strategic_continuation_ttl_seconds",
+                    "strategic_local_hold_timeout_seconds",
+                    "strategic_session_idle_tick_seconds",
+                    "strategic_session_turn_timeout_seconds",
+                    "strategic_session_min_tick_seconds",
+                    "strategic_session_max_ops_per_turn",
+                    "strategic_session_autonomous_turn_timeout_seconds",
+                    "strategic_session_max_unattended_seconds",
+                ):
+                    if _int_key in config_json:
+                        try:
+                            _set(_int_key, int(config_json[_int_key]))
+                        except (TypeError, ValueError):
+                            pass
                 if "auto_archive_enabled" in config_json:
                     _set(
                         "auto_archive_enabled",

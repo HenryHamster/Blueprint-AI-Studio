@@ -899,9 +899,7 @@ def strategic_challenge_summary(record: object) -> dict | None:
     mode_raw = str(record.get("status", "")).strip().lower()
     mode = mode_raw if mode_raw in {"ok", "blocked", "invalid"} else "invalid"
 
-    if mode != "ok":  # noqa: SIM114
-        verdict = "blocked"
-    elif blocked:
+    if mode != "ok" or blocked:
         verdict = "blocked"
     elif warned:
         verdict = "warned"
@@ -1452,7 +1450,7 @@ async def _apply_qualify_request(
                         }
                         flag_modified(open_ver, "last_qualification")
                         session.add(open_ver)
-                    except Exception:  # noqa: BLE001, RUF100
+                    except Exception:
                         logger.exception(
                             "[STRATEGIC] Task %s (%s path): failed to record "
                             "qualify_request CI-compliance block on ReleaseVersion",
@@ -1512,7 +1510,7 @@ async def _apply_qualify_request(
                 }
                 flag_modified(open_ver, "last_qualification")
                 session.add(open_ver)
-            except Exception:  # noqa: BLE001, RUF100
+            except Exception:
                 logger.exception(
                     "[STRATEGIC] Task %s (%s path): also failed to record "
                     "qualify_request error on ReleaseVersion — failure lost",
@@ -2004,7 +2002,7 @@ async def _spawn_retirement_memos(
                     "kind": "retired",
                 },
             )
-        except Exception:  # noqa: BLE001, RUF100
+        except Exception:
             logger.exception(
                 "[STRATEGIC] completion-debt record failed for retired "
                 "direction %s (non-fatal)",
@@ -4229,7 +4227,7 @@ async def _handle_strategic_completion(
             _knowledge_available = 0
             _knowledge_cited = 0
             try:
-                from app.knowledge_query import build_knowledge_index  # noqa: PLC0415, RUF100
+                from app.knowledge_query import build_knowledge_index
 
                 _knowledge_index = await build_knowledge_index(session, project.id)
                 _knowledge_available = len(_knowledge_index)
@@ -6466,6 +6464,7 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
+
                             reply = await post_question_answer(
                                 session,
                                 project.id,

@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 import logging
 import re
-import uuid  # noqa: F401
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -696,13 +695,6 @@ class StrategicReviewPayload(_SystemPopulated):
     # >= what byte-packing surfaces, so the agent can reliably distinguish a
     # dropped inbox from a genuinely empty one and knows to ./fetch messages.
     open_message_count: int | None = None
-    # Open FOUND leads from the resident session's examination ledger: surfaces
-    # keyed by the latest FOUND verdict that has not been superseded by a later
-    # CLEAR/advanced/unevidenced on the same surface. Compact shape per entry:
-    # {surfaceKey, note, at}. Optional + default None; injected only when the
-    # ledger is present and has at least one open FOUND entry, so existing
-    # payloads and callers are unaffected.
-    resident_exam_leads: list[dict[str, Any]] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -893,7 +885,7 @@ class ComputeSuccessCriterion(BaseModel):
     min_file_count: int = 1
 
     @model_validator(mode="after")
-    def _check_kind_fields(self) -> "ComputeSuccessCriterion":  # noqa: UP037
+    def _check_kind_fields(self) -> ComputeSuccessCriterion:
         if self.kind == "metric":
             if not isinstance(self.metric, str) or not self.metric.strip():
                 raise ValueError("metric is required and non-empty when kind='metric'")

@@ -715,7 +715,7 @@ async def _integrity_conflict_trend(
             session, project_id, limit=limit
         )
     except Exception:
-        import logging  # noqa: PLC0415, RUF100
+        import logging
         logging.getLogger(__name__).exception(
             "[STRATEGIC_STATE] integrity_conflict_trend query failed for project %s",
             project_id,

@@ -842,6 +842,20 @@ export interface StrategicMemoryNote {
   set_at: string;
 }
 
+export interface StrategicAccountSpendStatus {
+  totalAccounts?: number | null;
+  availableAccounts?: number | null;
+  enabledAccounts?: number | null;
+  activeAccountTasks?: number | null;
+  cooldownAccounts?: number | null;
+  cappedAccounts?: number | null;
+  configuredCapAccounts?: number | null;
+  disabledModelCount?: number | null;
+  cumulativeCostUsd?: number | null;
+  trackedSpendUsd?: number | null;
+  dailyCostCeilingUsd?: number | null;
+}
+
 export interface StrategicWorkbenchStateResponse {
   status?: string;
   workbench: StrategicWorkbenchState;

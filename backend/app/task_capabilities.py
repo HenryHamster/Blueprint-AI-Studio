@@ -984,9 +984,7 @@ STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
 )
 # Dispatch compatibility is intentionally distinct from legacy strategic-cycle
 # completion membership and its Project lock/handler semantics.
-STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = frozenset(
-    {*STRATEGIC_TASK_TYPES}
-)
+STRATEGIC_LOCAL_AGENT_TASK_TYPES: frozenset[str] = STRATEGIC_TASK_TYPES
 # Default autonomous spawn-budget categories. Runtime config may override these
 # sets, but defaults stay registry-owned so new task types are classified from
 # the same catalog that defines their capabilities.

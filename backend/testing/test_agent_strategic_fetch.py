@@ -3488,23 +3488,8 @@ async def test_fetch_efficiency_snapshot_includes_llm_cost_attribution(
     assert "total_llm_usd" in attr
     assert isinstance(attr["by_task_type"], list)
 
-    # Rolling-window gate-health verdict present with a valid state. No gate
-    # invocations in this fixture, so the verdict is NO_DATA.
-    assert "gate_health" in data
-    assert data["gate_health"]["state"] in {
-        "NO_DATA",
-        "DEGRADED",
-        "INSUFFICIENT",
-        "PARTIAL",
-        "HEALTHY",
-    }
-    assert data["gate_health"]["state"] == "NO_DATA"
-    assert data["gate_health"]["min_sample"] == 30
-
-    # Deploy-scoped companion keys are present and null when no deploy boundary
-    # is known (no efficiency_baseline snapshot under a serving SHA here).
-    assert "gate_health_post_deploy" in data
-    assert data["gate_health_post_deploy"] is None
+    # gate_health and gate_health_post_deploy were removed when panel_review was
+    # removed in automain (998c53c). They are no longer present in the response.
 
 
 @pytest.mark.asyncio

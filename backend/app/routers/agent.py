@@ -9,7 +9,7 @@ import re
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
@@ -4384,7 +4384,7 @@ class ViewportScreenshotUploadUrlRequest(BaseModel):
     name: str = Field(max_length=200)
     width: int = Field(ge=1, le=4096)
     phase: Literal["before", "after", "diff"]
-    magnitude: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # noqa: UP045
+    magnitude: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 @router.post("/viewport/screenshot-upload-url")
@@ -4515,14 +4515,14 @@ async def get_viewport_failure_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904, RUF100
-    except Exception as exc:  # noqa: BLE001, RUF100
+        ) from exc
+    except Exception as exc:
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904, RUF100
+        ) from exc
     return {"url": url}
 
 
@@ -4563,14 +4563,14 @@ async def get_viewport_screenshot_download_url_agent(
         logger.warning("[VIEWPORT] invalid screenshot reference: %s", exc)
         raise HTTPException(
             status_code=400, detail="Invalid screenshot reference"
-        ) from exc  # noqa: B904, RUF100
-    except Exception as exc:  # noqa: BLE001, RUF100
+        ) from exc
+    except Exception as exc:
         logger.warning(
             "[VIEWPORT] signed download URL failed for %s: %s", object_name, exc
         )
         raise HTTPException(
             status_code=503, detail="Artifact storage unavailable"
-        ) from exc  # noqa: B904, RUF100
+        ) from exc
     return {"url": url}
 
 

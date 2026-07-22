@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from './useLogViewer';
+import type { StrategicCycleProgress, StrategicCycleCompletion } from './useLogViewer';
 import type { StrategicStateCycle } from '../strategicStateApi';
 
 export type StrategistPhase = 'idle' | 'busy' | 'error' | 'done';
@@ -17,7 +17,6 @@ export interface UseStrategistStatusInput {
   strategistActive?: boolean;
   cycleProgress?: StrategicCycleProgress | null;
   lastCycleCompletion?: StrategicCycleCompletion | null;
-  strategicSessionTranscript?: StrategicSessionDelta[];
   activeCycle?: StrategicStateCycle | null;
   pendingRefreshAt?: string | null;
   lastFiredAt?: string | null;

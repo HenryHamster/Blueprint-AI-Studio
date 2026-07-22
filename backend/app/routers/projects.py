@@ -5,7 +5,6 @@ import json
 import logging
 import time
 import uuid
-from typing import Optional
 
 from fastapi import (
     APIRouter,
@@ -232,7 +231,7 @@ async def list_projects(
     request: Request,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    status: Optional[ProjectStatus] = None,  # noqa: UP045
+    status: ProjectStatus | None = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -322,9 +321,9 @@ async def get_project_tasks(
     project_id: uuid.UUID,
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    status: Optional[TaskStatus] = None,  # noqa: UP045
-    direction_id: Optional[str] = None,  # noqa: UP045
-    task_type: Optional[str] = None,  # noqa: UP045
+    status: TaskStatus | None = None,
+    direction_id: str | None = None,
+    task_type: str | None = None,
     include_backend_managed: bool = Query(False, include_in_schema=False),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
@@ -702,7 +701,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
             await _safe_ws_close(websocket, code=1008)
             return
 
-        from app.routers.agent import _terminated_task_ids  # noqa: PLC0415, RUF100
+        from app.routers.agent import _terminated_task_ids
 
         if (
             str(task.id) in _terminated_task_ids
@@ -757,7 +756,7 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
     _DB_RECHECK_INTERVAL = _RECHECK_INTERVAL
     last_recheck = 0.0  # force first DB recheck on first tick
 
-    receive_task: Optional[asyncio.Task] = None  # noqa: UP045
+    receive_task: asyncio.Task | None = None
     try:
         last_message_time = time.time()
         message_count = 0
@@ -950,8 +949,8 @@ async def cancel_project(
 
     Rate limit: 10 requests/minute.
     """
-    from app.vm_lifecycle import _ensure_vm_deleted  # noqa: PLC0415, RUF100
-    from app.admin import _get_user_project_with_role  # noqa: PLC0415, RUF100
+    from app.vm_lifecycle import _ensure_vm_deleted
+    from app.admin import _get_user_project_with_role
 
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, min_role="owner"
@@ -991,7 +990,7 @@ async def cancel_project(
     _CANCEL_BATCH_SIZE = 5000
     active_tasks: list[Task] = []
     vm_ids_to_delete: list[str] = []
-    _last_seen_id: Optional[int] = None  # noqa: UP045
+    _last_seen_id: int | None = None
     while True:
         stmt = tasks_stmt
         if _last_seen_id is not None:

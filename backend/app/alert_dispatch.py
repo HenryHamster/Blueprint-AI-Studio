@@ -428,8 +428,8 @@ _UNVERIFIED_REASON_LABELS = {
 # AlertSeverity mapping cannot drift from the success-scoring classifier. The
 # resulting dict is byte-for-byte identical to the former literal.
 _UNVERIFIED_REASON_SEVERITY = {
-    **{reason: AlertSeverity.ERROR for reason in DEGRADED_UNVERIFIED_REASONS},  # noqa: C420
-    **{reason: AlertSeverity.WARNING for reason in BENIGN_UNVERIFIED_REASONS},  # noqa: C420
+    **dict.fromkeys(DEGRADED_UNVERIFIED_REASONS, AlertSeverity.ERROR),
+    **dict.fromkeys(BENIGN_UNVERIFIED_REASONS, AlertSeverity.WARNING),
 }
 
 
@@ -621,7 +621,7 @@ async def _maybe_create_migration_slot_contention_alert(
         f"(task {holder_task_id}) for a stuck author/test loop."
     )[:1000]
 
-    holder_uuid: "uuid.UUID | None" = None  # noqa: UP037
+    holder_uuid: uuid.UUID | None = None
     if holder_task_id:
         try:
             holder_uuid = uuid.UUID(str(holder_task_id))

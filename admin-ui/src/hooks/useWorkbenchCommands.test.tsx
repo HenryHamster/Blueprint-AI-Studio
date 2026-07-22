@@ -5,7 +5,7 @@ import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
 import { WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY } from './useWorkbenchShortcutRouter';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
-import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
+import type { StrategicInteractionMode } from '../utils/strategicWorkbenchSession';
 import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction, StrategicWorkSessionCommand } from '../strategicStateApi';
 import type { ViewMode } from './useViewPreferences';
 

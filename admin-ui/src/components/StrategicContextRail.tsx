@@ -5,6 +5,7 @@ import type { PendingConfirmation, PendingConfirmationType } from '../types';
 import { PendingConfirmationList } from './ProblemModelAttention';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
+  StrategicAccountSpendStatus,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
   StrategicLocalRunnerState,
@@ -17,7 +18,6 @@ import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
-  StrategicWorkSessionEvent,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import {
@@ -25,10 +25,6 @@ import {
   removeStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
-import type { StrategicLiveActivity } from '../utils/strategicSessionLive';
-import { StrategicSessionEvents } from './StrategicSessionEvents';
-import { StrategicActivityStrip } from './StrategicLiveTurn';
-import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { RailMiniCanvas } from './RailMiniCanvas';
 import { WhiteboardRailSection } from './WhiteboardRailSection';
@@ -47,7 +43,6 @@ interface StrategicContextRailProps {
   strategistActive?: boolean;
   cycleProgress?: StrategicCycleProgress | null;
   lastCycleCompletion?: StrategicCycleCompletion | null;
-  liveActivity?: StrategicLiveActivity;
   onOpenProjectSection: (section: ProjectTarget) => void;
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
@@ -308,12 +303,6 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
     (work.parked_wakes?.counts.active ?? 0) > 0 ||
     (work.parked_wakes?.counts.problem ?? 0) > 0
   );
-}
-
-function workSessionEventHasActionableSignal(event: StrategicWorkSessionEvent): boolean {
-  const tone = event.tone?.toLowerCase();
-  if (tone === 'critical' || tone === 'warning') return true;
-  return event.target?.surface === 'messages' && event.target.action === 'reply';
 }
 
 function RailButton({
@@ -864,19 +853,6 @@ function ContextPackageBlock({
   );
 }
 
-/** Ephemeral live-activity section at the top of the rail. Self-hides when
- *  the activity strip has nothing to show (idle or turn finished). */
-function RailLiveActivitySection({ liveActivity }: { liveActivity?: StrategicLiveActivity }) {
-  if (!liveActivity) return null;
-  const { items, latestLifecycle } = liveActivity;
-  if (!items.length || latestLifecycle === 'done') return null;
-  return (
-    <div className="border-b border-neutral-800 pb-3" data-testid="rail-live-activity">
-      <StrategicActivityStrip items={items.slice(-3)} latestLifecycle={latestLifecycle} />
-    </div>
-  );
-}
-
 export const StrategicContextRail = memo(function StrategicContextRail({
   state,
   loading = false,
@@ -884,7 +860,6 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   strategistActive = false,
   cycleProgress = null,
   lastCycleCompletion = null,
-  liveActivity,
   onOpenProjectSection,
   onOpenPipeline,
   onOpenRuntimeHealth,
@@ -996,7 +971,6 @@ export const StrategicContextRail = memo(function StrategicContextRail({
   const accountActionText = onOpenAccounts ? 'Accounts' : 'Spend';
   const accountActionLabel = onOpenAccounts ? 'accounts' : 'spend';
   const workSessionActions = state?.work_session?.actions ?? [];
-  const workSessionEvents = state?.work_session?.events?.items ?? [];
   const visibleWorkSessionActions = useMemo(
     () => workSessionActions.filter(action => action.enabled).slice(0, 4),
     [workSessionActions],
@@ -1009,11 +983,6 @@ export const StrategicContextRail = memo(function StrategicContextRail({
     () => attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`)),
     [attentionItems, visibleWorkSessionActionIds],
   );
-  const actionableWorkSessionEvents = useMemo(
-    () => workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2),
-    [workSessionEvents],
-  );
-  const showActionableSessionActivity = visibleWorkSessionActions.length === 0 && actionableWorkSessionEvents.length > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
   const selectedRefDescriptors = useMemo(() => {
@@ -1117,7 +1086,6 @@ export const StrategicContextRail = memo(function StrategicContextRail({
 
   return (
     <div className="space-y-3" data-testid="strategic-context-rail">
-      <RailLiveActivitySection liveActivity={liveActivity} />
       <WorkbenchPanel title="Strategic" meta={loading ? 'loading' : error ? 'stale' : 'live'}>
         <div className="flex min-w-0 items-start gap-3">
           <span className={`mt-1 h-2 w-2 shrink-0 rounded-full ${statusTone}`} aria-hidden="true" />
@@ -1266,22 +1234,6 @@ export const StrategicContextRail = memo(function StrategicContextRail({
                 />
               ))}
             </div>
-          </div>
-        )}
-        {showActionableSessionActivity && (
-          <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-session-activity">
-            <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
-              <span className="truncate text-xs font-semibold text-neutral-100">Recent signal</span>
-              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
-                {formatCompactNumber(actionableWorkSessionEvents.length)}
-              </span>
-            </div>
-            <StrategicSessionEvents
-              events={actionableWorkSessionEvents}
-              limit={2}
-              density="compact"
-              onOpenTarget={openContextTarget}
-            />
           </div>
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />

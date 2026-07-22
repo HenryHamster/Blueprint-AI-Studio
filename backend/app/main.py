@@ -1600,7 +1600,7 @@ async def resolve_artifact_download_url(
     # indistinguishable from "not found".
     owning_compute_job_id = compute_job_id_for_artifact_uri(storage_uri)
     if owning_compute_job_id is not None:
-        from app.models import ComputeJob, Artifact, ComputeJobFile  # noqa: PLC0415, RUF100
+        from app.models import ComputeJob, Artifact, ComputeJobFile
 
         job = await session.get(ComputeJob, owning_compute_job_id)
         allowed_uris: set[str] = set()
@@ -1629,7 +1629,7 @@ async def resolve_artifact_download_url(
             # viewable files extracted from the bundle are recorded as
             # ComputeJobFile rows — query by storage_uri and verify the
             # owning job matches.
-            from sqlalchemy import select as _select  # noqa: PLC0415, RUF100
+            from sqlalchemy import select as _select
 
             cjf_query = _select(ComputeJobFile).where(
                 ComputeJobFile.storage_uri == storage_uri

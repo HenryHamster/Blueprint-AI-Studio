@@ -3,15 +3,6 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { registerToolKind } from '../toolRegistry';
 
-vi.mock('../firebase', () => ({
-  auth: { currentUser: { uid: 'operator-a', email: 'operator@example.com' } },
-  getIdToken: vi.fn().mockResolvedValue('token'),
-  getIdTokenAfterAuthRestore: vi.fn().mockResolvedValue('token'),
-  onAuthChange: vi.fn(),
-  signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
-}));
-
 vi.mock('../api/projectTools', async () => {
   const actual = await vi.importActual<typeof import('../api/projectTools')>('../api/projectTools');
   return {
@@ -34,6 +25,7 @@ vi.mock('../utils/conversationAttachmentUpload', () => ({
 vi.mock('../utils/renderWhiteboardArtifact', () => ({
   renderWhiteboardArtifact: vi.fn(),
 }));
+
 
 import {
   fetchToolContent,

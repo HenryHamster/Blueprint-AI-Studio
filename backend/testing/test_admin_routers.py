@@ -4421,6 +4421,7 @@ class TestAlerts:
                 severity="ERROR",
                 title="Test Alert",
                 message="Something failed",
+                event_type="failure_alert",
             )
         )
         await db_session.commit()
@@ -4681,6 +4682,7 @@ class TestAlerts:
                 severity="INFO",
                 title="Old",
                 message="old",
+                event_type="failure_alert",
                 dismissed_at=_utcnow(),
             )
         )
@@ -5496,7 +5498,7 @@ class TestMessages:
 
         @asynccontextmanager
         async def _fake_project_lock(
-            session, project_id, *, skip_locked=True, timeout=30.0
+            session, project_id, *, skip_locked=True, timeout=30.0, load_columns=None
         ):
             lock_calls.append((skip_locked, timeout))
             if skip_locked:
@@ -7427,18 +7429,19 @@ class TestMessages:
     async def test_get_message_counts_high_signal_note(self, client: AsyncClient, db_session):
         """NOTE messages with HIGH_SIGNAL_NOTE_EVENT_TYPES event_type are counted in high_signal_note."""
         from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+        from app.message_audience import route_event
 
         project = await _make_project(db_session)
         hs_event = next(iter(HIGH_SIGNAL_NOTE_EVENT_TYPES))  # pick any valid high-signal event type
 
-        # High-signal NOTE — should be counted
+        # High-signal NOTE — should be counted; stamp audience so nonactionable filter passes.
         db_session.add(ProjectMessage(
             project_id=project.id,
             message_type=MessageType.NOTE,
             from_type="system",
             content="high signal note",
             status="open",
-            context={"event_type": hs_event},
+            context={"event_type": hs_event, "audience": route_event(hs_event)},
         ))
         # NOTE with non-high-signal event_type — should NOT be counted
         db_session.add(ProjectMessage(
@@ -7447,7 +7450,7 @@ class TestMessages:
             from_type="system",
             content="routine note",
             status="open",
-            context={"event_type": "some_low_signal_event"},
+            context={"event_type": "some_low_signal_event", "audience": "operator-fyi"},
         ))
         # Resolved high-signal NOTE — should NOT be counted
         db_session.add(ProjectMessage(
@@ -7456,7 +7459,7 @@ class TestMessages:
             from_type="system",
             content="resolved high signal note",
             status="resolved",
-            context={"event_type": hs_event},
+            context={"event_type": hs_event, "audience": route_event(hs_event)},
         ))
         await db_session.commit()
 
@@ -7471,6 +7474,8 @@ class TestMessages:
         from app.models import Alert, AlertSeverity
 
         project = await _make_project(db_session)
+        # Use an operator-visible event_type so operator_visible_alert_filter passes.
+        _op_event = "failure_alert"
 
         # ERROR alert — should be counted
         db_session.add(Alert(
@@ -7478,6 +7483,7 @@ class TestMessages:
             severity=AlertSeverity.ERROR,
             title="test error",
             message="test error alert",
+            event_type=_op_event,
         ))
         # WARNING alert — should be counted
         db_session.add(Alert(
@@ -7485,6 +7491,7 @@ class TestMessages:
             severity=AlertSeverity.WARNING,
             title="test warning",
             message="test warning alert",
+            event_type=_op_event,
         ))
         # Dismissed ERROR alert — should NOT be counted
         db_session.add(Alert(
@@ -7492,6 +7499,7 @@ class TestMessages:
             severity=AlertSeverity.ERROR,
             title="dismissed error",
             message="dismissed error alert",
+            event_type=_op_event,
             dismissed_at=datetime.now(timezone.utc).replace(tzinfo=None),
         ))
         # INFO alert — should NOT be counted (only ERROR and WARNING)
@@ -7500,6 +7508,7 @@ class TestMessages:
             severity=AlertSeverity.INFO,
             title="test info",
             message="test info alert",
+            event_type=_op_event,
         ))
         await db_session.commit()
 
@@ -7514,6 +7523,7 @@ class TestMessages:
     async def test_get_message_counts_noise_prefs_muted_event_excluded(self, client: AsyncClient, db_session):
         """high_signal_note excludes NOTE messages whose event_type is muted in operator noise prefs."""
         from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+        from app.message_audience import route_event
 
         project = await _make_project(db_session)
         event_types = list(HIGH_SIGNAL_NOTE_EVENT_TYPES)
@@ -7533,7 +7543,7 @@ class TestMessages:
             from_type="system",
             content="muted high signal note",
             status="open",
-            context={"event_type": muted_event},
+            context={"event_type": muted_event, "audience": route_event(muted_event)},
         ))
         if visible_event != muted_event:
             # NOTE whose event_type is NOT muted — should be included
@@ -7543,7 +7553,7 @@ class TestMessages:
                 from_type="system",
                 content="visible high signal note",
                 status="open",
-                context={"event_type": visible_event},
+                context={"event_type": visible_event, "audience": route_event(visible_event)},
             ))
         await db_session.commit()
 
