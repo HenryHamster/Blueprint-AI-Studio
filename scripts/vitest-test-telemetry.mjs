@@ -1,0 +1,274 @@
+#!/usr/bin/env node
+/**
+ * vitest-test-telemetry.mjs — Generate ranked per-file timing artifacts for
+ * the agent/ and admin-ui/ vitest suites.
+ *
+ * Usage:
+ *   node scripts/vitest-test-telemetry.mjs [--suite agent|admin-ui|all] [--flake-runs N]
+ *
+ * Flags:
+ *   --suite <name>     Which suite(s) to run. Default: all (runs both).
+ *   --flake-runs <N>   Number of vitest runs per suite (default: 1).
+ *                      Set to 2 to enable flake detection: a file is marked
+ *                      flaky=true if its pass/fail outcome differs across runs.
+ *                      NOTE: flake detection doubles wall-clock time (~10 min total
+ *                      for both suites). Use only when you specifically need it.
+ *                      The runtime ranking signal is immediately useful without it.
+ *
+ * Output (committed artifacts):
+ *   agent/.test_durations.json    — per-file timings ranked slowest-first for agent/
+ *   admin-ui/.test_durations.json — per-file timings ranked slowest-first for admin-ui/
+ *
+ * Artifact schema:
+ *   {
+ *     "_meta": {
+ *       "suite": "agent" | "admin-ui",
+ *       "generated": "<ISO-8601>",
+ *       "runs": <number>,
+ *       "flake_detection": <boolean>
+ *     },
+ *     "files": [
+ *       {
+ *         "file": "<relative-path-from-suite-root>",
+ *         "duration_ms": <number>,
+ *         "tests": <number>,
+ *         "flaky": <boolean>
+ *       }
+ *     ]
+ *   }
+ *   Files sorted descending by duration_ms (slowest first = highest cut priority).
+ *
+ * Requirements:
+ *   - Run from the workspace root (the directory containing agent/ and admin-ui/)
+ *   - node_modules must be installed:
+ *       agent/: cd agent && npm ci
+ *       admin-ui/: npm ci   (root; npm workspaces layout)
+ *   - No external test infra required — vitest runs standalone
+ *
+ * Performance notes:
+ *   - agent/ suite: ~4-5 min (5357 tests across 95 files)
+ *   - admin-ui/ suite: ~45-60 s (1400+ tests across 215 files)
+ *   - Total with --flake-runs 1: ~5-6 min
+ *   - Total with --flake-runs 2: ~10-12 min
+ */
+
+import { spawnSync } from 'child_process';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const WORKSPACE_ROOT = path.resolve(__dirname, '..');
+
+// Parse CLI args
+const args = process.argv.slice(2);
+let suiteArg = 'all';
+let flakeRuns = 1;
+for (let i = 0; i < args.length; i++) {
+  if (args[i] === '--suite' && args[i + 1]) suiteArg = args[++i];
+  if (args[i] === '--flake-runs' && args[i + 1]) flakeRuns = parseInt(args[++i], 10);
+}
+if (isNaN(flakeRuns) || flakeRuns < 1) flakeRuns = 1;
+
+const SUITES = {
+  agent: {
+    // vitest runs from agent/ directory (contains vitest.config.ts)
+    cwd: path.join(WORKSPACE_ROOT, 'agent'),
+    // relative paths in the artifact are relative to agent/
+    relativeBase: path.join(WORKSPACE_ROOT, 'agent'),
+    output: path.join(WORKSPACE_ROOT, 'agent', '.test_durations.json'),
+    vitestBin: findBin([
+      path.join(WORKSPACE_ROOT, 'agent', 'node_modules', '.bin', 'vitest'),
+      path.join(WORKSPACE_ROOT, 'node_modules', '.bin', 'vitest'),
+    ]),
+    extraArgs: [],
+  },
+  'admin-ui': {
+    // admin-ui uses npm workspaces — vitest binary lives in root node_modules,
+    // but vitest.config.ts is in admin-ui/. Run from workspace root and pass --config.
+    cwd: WORKSPACE_ROOT,
+    // relative paths in the artifact are relative to admin-ui/
+    relativeBase: path.join(WORKSPACE_ROOT, 'admin-ui'),
+    output: path.join(WORKSPACE_ROOT, 'admin-ui', '.test_durations.json'),
+    vitestBin: findBin([
+      path.join(WORKSPACE_ROOT, 'node_modules', '.bin', 'vitest'),
+      path.join(WORKSPACE_ROOT, 'admin-ui', 'node_modules', '.bin', 'vitest'),
+    ]),
+    extraArgs: ['--config', path.join(WORKSPACE_ROOT, 'admin-ui', 'vitest.config.ts')],
+  },
+};
+
+function findBin(candidates) {
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null; // falls back to npx vitest
+}
+
+function runVitest(suite, suiteConfig, runIndex) {
+  const tmpOut = path.join(
+    os.tmpdir(),
+    `vitest-${suite}-run${runIndex}-${process.pid}.json`,
+  );
+  const vitestArgs = [
+    'run',
+    '--reporter=json',
+    `--outputFile=${tmpOut}`,
+    ...suiteConfig.extraArgs,
+  ];
+
+  const [cmd, cmdArgs] = suiteConfig.vitestBin
+    ? [suiteConfig.vitestBin, vitestArgs]
+    : ['npx', ['vitest', ...vitestArgs]];
+
+  console.log(`[vitest-telemetry] ${suite} run #${runIndex}: ${[cmd, ...cmdArgs].join(' ')}`);
+
+  const result = spawnSync(cmd, cmdArgs, {
+    cwd: suiteConfig.cwd,
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env },
+    // 10-minute per-run cap (agent suite takes ~4-5 min; 10 min gives headroom)
+    timeout: 10 * 60 * 1000,
+  });
+
+  if (result.error) {
+    throw new Error(`Failed to spawn vitest for ${suite}: ${result.error.message}`);
+  }
+
+  // vitest exits non-zero when tests fail — that's expected, we still get timing data
+  if (!fs.existsSync(tmpOut)) {
+    const out = (result.stdout ?? '').slice(-500);
+    throw new Error(
+      `vitest did not write output file for ${suite} (exit ${result.status}).\n${out}`,
+    );
+  }
+
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(tmpOut, 'utf-8'));
+  } finally {
+    try { fs.unlinkSync(tmpOut); } catch { /* ignore */ }
+  }
+  return raw;
+}
+
+/**
+ * Extract per-file stats from a vitest JSON reporter result.
+ * Vitest 2.x emits: {testResults: [{name, startTime, endTime, status, assertionResults}]}
+ * The `name` field is the absolute file path.
+ */
+function parseVitestJson(raw, relativeBase) {
+  const fileMap = {};
+  const testResults = raw.testResults ?? [];
+
+  for (const r of testResults) {
+    // vitest 2.x uses `name`; vitest 4.x / jest compat may use `testFilePath`
+    const absPath = r.testFilePath || r.name || '';
+    const relPath = path.relative(relativeBase, absPath);
+
+    const durationMs =
+      r.endTime != null && r.startTime != null ? r.endTime - r.startTime : 0;
+    const testCount = (r.assertionResults ?? r.tests ?? []).length;
+    const passed = (r.status ?? 'passed') !== 'failed';
+
+    if (!fileMap[relPath]) {
+      fileMap[relPath] = { duration_ms_sum: 0, tests: 0, passed_runs: 0, total_runs: 0 };
+    }
+    fileMap[relPath].duration_ms_sum += durationMs;
+    fileMap[relPath].tests = Math.max(fileMap[relPath].tests, testCount);
+    fileMap[relPath].total_runs += 1;
+    if (passed) fileMap[relPath].passed_runs += 1;
+  }
+
+  return fileMap;
+}
+
+function mergeRuns(accumulated, runMap) {
+  for (const [relPath, stats] of Object.entries(runMap)) {
+    if (!accumulated[relPath]) {
+      accumulated[relPath] = { duration_ms_sum: 0, tests: 0, passed_runs: 0, total_runs: 0 };
+    }
+    accumulated[relPath].duration_ms_sum += stats.duration_ms_sum;
+    accumulated[relPath].tests = Math.max(accumulated[relPath].tests, stats.tests);
+    accumulated[relPath].passed_runs += stats.passed_runs;
+    accumulated[relPath].total_runs += stats.total_runs;
+  }
+}
+
+async function generateArtifact(suite, suiteConfig) {
+  console.log(`\n[vitest-telemetry] Suite: ${suite}`);
+  console.log(`  runs: ${flakeRuns}, flake_detection: ${flakeRuns > 1}`);
+
+  const accumulated = {};
+  for (let i = 1; i <= flakeRuns; i++) {
+    const raw = runVitest(suite, suiteConfig, i);
+    const runMap = parseVitestJson(raw, suiteConfig.relativeBase);
+    mergeRuns(accumulated, runMap);
+  }
+
+  const files = Object.entries(accumulated)
+    .map(([file, stats]) => ({
+      file,
+      duration_ms: Math.round(stats.duration_ms_sum / Math.max(stats.total_runs, 1)),
+      tests: stats.tests,
+      flaky: flakeRuns > 1
+        ? stats.passed_runs > 0 && stats.passed_runs < stats.total_runs
+        : false,
+    }))
+    // Exclude paths that escaped the suite root (e.g. starts with "..")
+    .filter(f => f.file && !f.file.startsWith('..'))
+    .sort((a, b) => b.duration_ms - a.duration_ms);
+
+  const artifact = {
+    _meta: {
+      suite,
+      generated: new Date().toISOString(),
+      runs: flakeRuns,
+      flake_detection: flakeRuns > 1,
+    },
+    files,
+  };
+
+  fs.writeFileSync(suiteConfig.output, JSON.stringify(artifact, null, 2) + '\n');
+  console.log(
+    `[vitest-telemetry] Wrote ${files.length} file entries → ${suiteConfig.output}`,
+  );
+  if (files.length > 0) {
+    const top5 = files.slice(0, 5);
+    console.log('  Top 5 slowest files (cut candidates):');
+    top5.forEach((f, i) =>
+      console.log(`    ${i + 1}. ${f.file} (${f.duration_ms}ms, ${f.tests} tests)`),
+    );
+    if (flakeRuns > 1) {
+      const flaky = files.filter(f => f.flaky);
+      console.log(`  Flaky files detected: ${flaky.length}`);
+      flaky.slice(0, 5).forEach(f => console.log(`    - ${f.file}`));
+    }
+  }
+}
+
+async function main() {
+  const suitesToRun =
+    suiteArg === 'all'
+      ? Object.keys(SUITES)
+      : suiteArg.split(',').map(s => s.trim());
+
+  for (const suite of suitesToRun) {
+    if (!SUITES[suite]) {
+      console.error(`Unknown suite: ${suite}. Valid: ${Object.keys(SUITES).join(', ')}`);
+      process.exit(1);
+    }
+    await generateArtifact(suite, SUITES[suite]);
+  }
+
+  console.log(
+    '\n[vitest-telemetry] Done. Commit the updated .test_durations.json files to the repo.',
+  );
+}
+
+main().catch(err => {
+  console.error('[vitest-telemetry] Fatal:', err.message);
+  process.exit(1);
+});

@@ -1,0 +1,120 @@
+{
+  "_schema": "conversational-workday-protection-manifest-v1",
+  "_purpose": "Machine-checkable boundary between LIVE conversational Workday path tests (protect) and DELETED autonomous-resident tests (safe-to-cut / restore-on-restore). Future test-estate cut subtasks must not touch PROTECT entries without operator sign-off.",
+
+  "protect": [
+    {
+      "path": "backend/testing/test_strategic_session_messages.py",
+      "reason": "Covers the agent-side message-poll endpoint (GET /api/agent/projects/{id}/messages) — the inbound operator-to-agent channel for the conversational Workday session. Removing this leaves zero test coverage on the agent message delivery contract.",
+      "test_ids": [
+        "test_poll_returns_open_user_messages_ascending_with_exact_shape",
+        "test_poll_since_cursor_returns_only_newer",
+        "test_poll_since_accepts_tz_aware_cursor",
+        "test_poll_filters_from_type_and_status",
+        "test_poll_limit_caps_and_keeps_oldest_first",
+        "test_poll_limit_out_of_range_rejected",
+        "test_poll_invalid_since_returns_400",
+        "test_poll_rejects_cross_project",
+        "test_poll_requires_agent_token",
+        "test_poll_server_time_round_trips_as_next_cursor",
+        "test_poll_since_is_inclusive_of_boundary",
+        "test_poll_max_created_at_cursor_redelivers_boundary",
+        "test_poll_session_id_is_accepted_but_no_longer_scopes"
+      ]
+    },
+    {
+      "path": "backend/testing/test_strategic_state.py",
+      "reason": "Covers the admin-side conversational-session endpoints (GET /api/admin/projects/{id}/strategic-session and /strategic-conversation) and the session-snapshot sanitization logic. The listed test_ids are the session/conversation-specific ones; other tests in the file cover orthogonal surfaces and may be pruned independently.",
+      "test_ids": [
+        "test_session_snapshot_coerces_retired_interaction_modes_to_chat",
+        "test_strategic_session_snapshot_preserves_canonical_context_target_fields",
+        "test_strategic_session_endpoint_resumes_persisted_state_and_outputs",
+        "test_strategic_session_conversation_marks_more_history",
+        "test_strategic_session_includes_requested_older_message_once",
+        "test_strategic_session_conversation_filters_routine_before_limit",
+        "test_strategic_session_conversation_resolves_message_selected_refs",
+        "test_strategic_conversation_endpoint_returns_cursor_page",
+        "test_strategic_conversation_cursor_is_sequence_stable_and_excludes_activity",
+        "test_strategic_conversation_after_sequence_closes_realtime_gap",
+        "test_strategic_conversation_target_and_identity_lookup_are_bounded",
+        "test_strategic_conversation_endpoint_enforces_member_access",
+        "test_strategic_conversation_endpoint_passes_include_message_id"
+      ]
+    },
+    {
+      "path": "backend/testing/test_admin_routers.py",
+      "reason": "Covers the operator message-create endpoint (POST /api/admin/projects/{id}/strategic-session/messages), session settings persistence, and workbench-state session_started_at decay — all live conversational-Workday contracts.",
+      "test_ids": [
+        "test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast",
+        "test_strategic_session_message_persists_workbench_snapshot_and_arms",
+        "test_strategic_session_message_allows_attachment_only_content",
+        "test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at",
+        "test_strategic_session_settings",
+        "test_strategic_session_settings_persist_across_sync"
+      ]
+    },
+    {
+      "path": "backend/testing/test_agent_strategic_fetch.py",
+      "reason": "Covers the agent-side message-create and message-fetch endpoints used during a conversational Workday session (POST and GET under /api/agent/projects/{id}/strategic/*).",
+      "test_ids": [
+        "test_strategic_create_message_absent_citation_is_flagged",
+        "test_strategic_create_message_present_citation_not_flagged",
+        "test_strategic_create_message_mixed_present_citation_is_flagged",
+        "test_strategic_create_message_note_type_not_grounded",
+        "test_strategic_create_message_broadcasts_workbench_envelope"
+      ]
+    },
+    {
+      "path": "backend/testing/test_operator_workbench_contracts.py",
+      "reason": "test_operator_workbench_current_state_contract_surfaces validates the strategic_session surface on the workbench event contract; losing it would allow silent drift in the admin-UI data contract for conversational state.",
+      "test_ids": [
+        "test_operator_workbench_current_state_contract_surfaces"
+      ]
+    }
+  ],
+
+  "deleted_frontend": [
+    {
+      "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
+      "status": "RESTORE-ON-RESTORE",
+      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
+      "reason": "Covered the StrategicSessionControl component — the operator UI for starting, stopping, and messaging into a conversational Workday session. Must be re-added when the component is restored."
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
+      "status": "RESTORE-ON-RESTORE",
+      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
+      "reason": "Viewport snapshot test for StrategicSessionControl. Must be re-added with the component."
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
+      "status": "RESTORE-ON-RESTORE",
+      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
+      "reason": "Covered the StrategicSessionEvents component — the live event feed for a conversational session. Must be re-added when the component is restored."
+    },
+    {
+      "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
+      "status": "RESTORE-ON-RESTORE",
+      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
+      "reason": "Covered the useStrategicSession hook — the primary React hook for conversational Workday session state management. Must be re-added when the hook is restored."
+    },
+    {
+      "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
+      "status": "RESTORE-ON-RESTORE",
+      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
+      "reason": "Covered the strategicSessionLive utility — live-streaming helpers for the conversational session. Must be re-added when the utility is restored."
+    },
+    {
+      "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
+      "status": "SAFE-TO-CUT",
+      "deleted_in": "#15949 (cut(resident): remove all resident strategic code)",
+      "reason": "Covered ToolResidentHandoffControls — UI for handing off control to the autonomous resident agent. The resident subsystem is fully removed and will not be restored; this test is permanently dead."
+    },
+    {
+      "path": "admin-ui/src/components/ToolResidentHandoffControls.viewport.test.tsx",
+      "status": "SAFE-TO-CUT",
+      "deleted_in": "#15949 (cut(resident): remove all resident strategic code)",
+      "reason": "Viewport snapshot test for ToolResidentHandoffControls. Permanently dead — the resident subsystem is fully removed."
+    }
+  ]
+}

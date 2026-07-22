@@ -7,6 +7,7 @@ Runs under --noconftest (no DB, no conftest fixtures).
 import glob
 import json
 import re
+import warnings
 from pathlib import Path
 
 BACKEND_ROOT = Path(__file__).parents[1]
@@ -94,4 +95,60 @@ def test_durations_coverage_fraction_within_threshold() -> None:
         f"({len(covered)}/{len(all_test_files)}), below the {MIN_COVERAGE_FRACTION:.0%} threshold. "
         f"Regenerate via scripts/store-backend-durations.sh. "
         f"Uncovered files ({len(uncovered)}): {uncovered[:10]}"
+    )
+
+
+# Ratchet floor: how many *distinct* duration values the committed file must have.
+# TODAY: floor=2 matches the known synthetic placeholder (exactly 2 values: 0.1 and 0.5).
+# After committing a real measured baseline (scripts/store-backend-durations.sh), bump
+# this to ≥50 to hard-block any future regression back to synthetic/degenerate values.
+_DISTINCT_VALUE_FLOOR = 2
+
+# Warn threshold: ≤ this many distinct values triggers a loud regeneration notice.
+# The warning surfaces in pytest's warnings summary without failing the blocking suite.
+_DEGENERATE_WARN_THRESHOLD = 5
+
+
+def test_durations_are_not_degenerate_synthetic_placeholders() -> None:
+    """
+    Catch synthetic placeholder files (e.g. all values equal 0.1 or 0.5).
+
+    Two-tier response:
+    1. WARN loudly when distinct_count <= _DEGENERATE_WARN_THRESHOLD — visible in
+       pytest's warnings summary right now, but does NOT fail the blocking CI gate
+       while the file is a known placeholder.
+    2. HARD-FAIL when distinct_count < _DISTINCT_VALUE_FLOOR — today floor=2 so the
+       synthetic file passes (2 >= 2).  Once a real measured baseline is committed,
+       bump _DISTINCT_VALUE_FLOOR to >=50 to block future regressions.
+
+    Regenerating a real baseline:
+        bash scripts/store-backend-durations.sh   # ~15-20 min, requires Docker+Postgres
+        git add backend/.test_durations && git commit
+    Then bump _DISTINCT_VALUE_FLOOR in this file to >=50 to activate the hard gate.
+    """
+    data = _load_durations()
+    if not data:
+        return
+
+    distinct_count = len(set(data.values()))
+
+    if distinct_count <= _DEGENERATE_WARN_THRESHOLD:
+        warnings.warn(
+            f"\n\n"
+            f"  SYNTHETIC .test_durations DETECTED: only {distinct_count} distinct duration "
+            f"value(s) across {len(data)} entries.\n"
+            f"  CI pytest-split is falling back to COUNT-BASED shard balancing — shards "
+            f"will be time-imbalanced.\n"
+            f"\n"
+            f"  To fix: bash scripts/store-backend-durations.sh  (Docker+Postgres, ~15-20 min)\n"
+            f"  Commit the result, then bump _DISTINCT_VALUE_FLOOR in\n"
+            f"  backend/testing/test_test_durations_freshness.py to >=50.\n",
+            stacklevel=2,
+        )
+
+    assert distinct_count >= _DISTINCT_VALUE_FLOOR, (
+        f"backend/.test_durations has regressed to a synthetic/degenerate state: "
+        f"only {distinct_count} distinct duration value(s) across {len(data)} entries "
+        f"(floor={_DISTINCT_VALUE_FLOOR}). "
+        f"Regenerate via: bash scripts/store-backend-durations.sh"
     )

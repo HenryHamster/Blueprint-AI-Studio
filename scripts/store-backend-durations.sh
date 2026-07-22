@@ -13,8 +13,12 @@
 #     (TestTestDurationsCommittedAndFresh) fails with a staleness warning
 #   - Periodically (e.g. after merging a large feature branch) to keep time-balancing accurate
 #
-# After running: commit the updated backend/.test_durations to version control so CI shards
-# can auto-detect it and switch from count-based to time-based splitting.
+# After running:
+#   1. Commit the updated backend/.test_durations to version control so CI shards
+#      can auto-detect it and switch from count-based to time-based splitting.
+#   2. Bump _DISTINCT_VALUE_FLOOR in backend/testing/test_test_durations_freshness.py
+#      to >=50 to activate the hard gate that blocks future regressions to synthetic
+#      placeholder values (the warning-only guard becomes a hard assertion).
 #
 # Requirements:
 #   - Docker with access to the backend deps image
