@@ -129,11 +129,10 @@ def upgrade() -> None:
             "ALTER TABLE task DROP COLUMN IF EXISTS "
             "strategic_operation_receipt_id CASCADE"
         )
-        op.execute("DROP INDEX IF EXISTS ix_projectmessage_project_session_created")
-        op.execute(
-            "ALTER TABLE projectmessage DROP COLUMN IF EXISTS "
-            "resident_session_id CASCADE"
-        )
+        # resident_session_id and its composite index are intentionally kept:
+        # migration 0671 restores the Workday conversational session linkage that
+        # this column carries, so dropping it here would silently wipe data on
+        # any production DB that runs both migrations in a single `alembic upgrade head`.
 
         # 4. Drop the standalone resident functions.
         for function in _PG_FUNCTIONS:
@@ -153,11 +152,10 @@ def upgrade() -> None:
             op.execute(
                 "ALTER TABLE task DROP COLUMN strategic_operation_receipt_id"
             )
-        op.execute("DROP INDEX IF EXISTS ix_projectmessage_project_session_created")
-        if "resident_session_id" in _sqlite_columns("projectmessage"):
-            op.execute(
-                "ALTER TABLE projectmessage DROP COLUMN resident_session_id"
-            )
+        # resident_session_id and its composite index are intentionally kept:
+        # migration 0671 restores the Workday conversational session linkage that
+        # this column carries, so dropping it here would silently wipe data on
+        # any production DB that runs both migrations in a single `alembic upgrade head`.
 
         # 3. Drop the resident tables (child-first).
         for table in _RESIDENT_TABLES:

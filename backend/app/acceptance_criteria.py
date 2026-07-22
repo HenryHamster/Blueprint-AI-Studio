@@ -425,13 +425,16 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         return True
     if e.source_kind == "walkthrough_e2e":
         # A live-stack walkthrough that ran against a specific candidate SHA.
-        # Covering iff: (a) the row is fresh within WALKTHROUGH_E2E_WINDOW_DAYS
-        # and (b) ``detail["candidate_sha"]`` is present (prevents a bare or
-        # malformed row from granting trust).  The ingestion endpoint only ever
-        # writes a row for a criterion the walkthrough marked passing, so the
-        # covering predicate is SHA-pinned + fresh — no separate ``verdict``
-        # field is stored.  A stale or SHA-less row decays to the underlying
-        # (partial/uncovered) state — fail-closed.
+        # Covering iff: (a) the row is fresh within WALKTHROUGH_E2E_WINDOW_DAYS,
+        # (b) ``detail["candidate_sha"]`` is present, and (c) if a legacy
+        # ``verdict`` field is present it must be "PASS" (FAIL/DEAD_END/None must
+        # not cover even if the SHA is pinned — fail-closed).  The autonomous
+        # ingestion endpoint only writes rows for passing criteria and omits the
+        # ``verdict`` key entirely; a present-but-non-PASS verdict indicates a
+        # legacy row that must not be treated as machine-verified.
+        detail = e.detail if isinstance(e.detail, dict) else {}
+        if "verdict" in detail and detail.get("verdict") != "PASS":
+            return False
         return _evidence_is_walkthrough_e2e_covered(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
