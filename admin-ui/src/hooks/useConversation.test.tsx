@@ -1,7 +1,7 @@
 import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ProjectMessage } from '../types/messages';
-import { mergeConversationPages, useConversation } from './useConversation';
+import { CONVERSATION_INITIAL_WINDOW, mergeConversationPages, useConversation } from './useConversation';
 
 const { fetchStrategicConversation } = vi.hoisted(() => ({
   fetchStrategicConversation: vi.fn(),
@@ -430,5 +430,104 @@ describe('conversation pagination', () => {
     expect(fetchStrategicConversation).not.toHaveBeenCalled();
 
     vi.useRealTimers();
+  });
+});
+
+describe('initial window and newest-message pinning', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); });
+
+  test('initial fetch uses CONVERSATION_INITIAL_WINDOW as the limit', async () => {
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { has_more: false, next_before_sequence: null, items: [] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { result } = renderHook(() => useConversation({
+      enabled: true,
+      projectId: 'project-1',
+      actorUserId: 'actor-1',
+      includeMessageId: null,
+      getMessages: () => messages,
+      setMessages,
+      onLoadingChange: vi.fn(),
+      onError: vi.fn(),
+    }));
+
+    await act(async () => { await result.current.refresh(); });
+
+    expect(fetchStrategicConversation).toHaveBeenCalledTimes(1);
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      limit: CONVERSATION_INITIAL_WINDOW,
+    });
+    expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('afterSequence');
+    expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('beforeSequence');
+    expect(fetchStrategicConversation.mock.calls[0][1]).not.toHaveProperty('search');
+  });
+
+  test('CONVERSATION_INITIAL_WINDOW is between 15 and 25 messages', () => {
+    expect(CONVERSATION_INITIAL_WINDOW).toBeGreaterThanOrEqual(15);
+    expect(CONVERSATION_INITIAL_WINDOW).toBeLessThanOrEqual(25);
+  });
+
+  test('hasMore is true when server has older messages beyond the initial window', async () => {
+    const initialMessages = Array.from({ length: CONVERSATION_INITIAL_WINDOW }, (_, i) =>
+      message(i + 1));
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: {
+        has_more: true,
+        next_before_sequence: 1,
+        items: initialMessages,
+      },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { result } = renderHook(() => useConversation({
+      enabled: true,
+      projectId: 'project-1',
+      actorUserId: 'actor-1',
+      includeMessageId: null,
+      getMessages: () => messages,
+      setMessages,
+      onLoadingChange: vi.fn(),
+      onError: vi.fn(),
+    }));
+
+    await act(async () => { await result.current.refresh(); });
+
+    // hasMore=true means a "load older" affordance appears, enabling incremental history load
+    expect(result.current.hasMore).toBe(true);
+    // The initial window loaded newest-first: exactly CONVERSATION_INITIAL_WINDOW messages
+    expect(messages).toHaveLength(CONVERSATION_INITIAL_WINDOW);
+  });
+
+  test('target navigation still uses limit 30 (not capped to initial window)', async () => {
+    let messages: ProjectMessage[] = [];
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { has_more: false, next_before_sequence: null, items: [message(7)] },
+    });
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const { result } = renderHook(() => useConversation({
+      enabled: true,
+      projectId: 'project-1',
+      actorUserId: 'actor-1',
+      includeMessageId: 'message-7',
+      getMessages: () => messages,
+      setMessages,
+      onLoadingChange: vi.fn(),
+      onError: vi.fn(),
+    }));
+
+    await act(async () => { await result.current.refresh(); });
+
+    expect(fetchStrategicConversation.mock.calls[0][1]).toMatchObject({
+      includeMessageId: 'message-7',
+      limit: 30,
+    });
   });
 });

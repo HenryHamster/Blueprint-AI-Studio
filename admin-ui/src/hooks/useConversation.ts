@@ -7,6 +7,9 @@ import type { ProjectMessage } from '../types/messages';
 import { parseTimestamp } from '../utils/time';
 import { messageHasClientIdentity } from '../utils/conversationMessageIdentity';
 
+/** Mobile-first initial window: load only the most recent N messages on open. */
+export const CONVERSATION_INITIAL_WINDOW = 20;
+
 export function compareConversationMessages(a: ProjectMessage, b: ProjectMessage): number {
   if (a.sequence != null || b.sequence != null) {
     if (a.sequence == null) return -1;
@@ -161,7 +164,7 @@ export function useConversation({
           ? { search: normalizedSearch, limit: 30 }
           : forwardFrom != null
           ? { afterSequence: forwardFrom, limit: 30 }
-          : { includeMessageId: requestedTargetId, limit: 30 },
+          : { includeMessageId: requestedTargetId, limit: CONVERSATION_INITIAL_WINDOW },
         controller.signal,
         forwardFrom == null ? etagRef.current : null,
       );
