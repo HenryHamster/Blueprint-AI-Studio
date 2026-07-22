@@ -300,6 +300,7 @@ from app.release_readiness import (
 from app.shared_state import (
     get_project_integration_branch,
     resolve_project_promotion_enabled,
+    resolve_project_walkthrough_e2e_enabled,
     runtime_config as _runtime_config,
 )
 from app.time_utils import _utcnow
@@ -2905,12 +2906,11 @@ async def run_qualification(
     # gate — per-project build_config override, then the fleet runtime_config
     # flag (default True).  The spawned child produces SHA-pinned
     # CriterionEvidence and NEVER cascades a fix on failure (evidence-only).
-    walkthrough_e2e_enabled = bool(
-        (project.build_config or {}).get(
-            "walkthrough_e2e_enabled",
-            _runtime_config.get("walkthrough_e2e_enabled"),
-        )
-    )
+    _walkthrough_build_override = (project.build_config or {}).get("walkthrough_e2e_enabled")
+    if _walkthrough_build_override is not None:
+        walkthrough_e2e_enabled = bool(_walkthrough_build_override)
+    else:
+        walkthrough_e2e_enabled = resolve_project_walkthrough_e2e_enabled(project.id)
     # Slice 3 (design 245212a4): the DEPLOYED-side env-preflight judge ships
     # DARK — env_preflight_enabled defaults False.  Resolve with the same source
     # precedence as the promotion rubric: per-project build_config override, then

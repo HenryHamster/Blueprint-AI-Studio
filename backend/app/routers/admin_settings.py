@@ -188,6 +188,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
         "smoketest_enabled",
+        "walkthrough_e2e_enabled_by_project",
         "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
@@ -799,6 +800,12 @@ async def get_settings(
             ).items()
         },
         "smoketest_enabled": bool(_runtime_config.get("smoketest_enabled", False)),
+        "walkthrough_e2e_enabled_by_project": {
+            str(k): bool(v)
+            for k, v in (
+                _runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
+            ).items()
+        },
         "merge_grade_block_threshold": float(
             _runtime_config.get("merge_grade_block_threshold", 0.0) or 0.0
         ),
@@ -1475,6 +1482,29 @@ async def _apply_settings(
         _runtime_config["promotion_enabled"] = bool(payload["promotion_enabled"])
     if "smoketest_enabled" in payload:
         _runtime_config["smoketest_enabled"] = bool(payload["smoketest_enabled"])
+    if "walkthrough_e2e_enabled_by_project" in payload:
+        raw = payload["walkthrough_e2e_enabled_by_project"]
+        if not isinstance(raw, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "walkthrough_e2e_enabled_by_project must be a mapping of "
+                    "project-id strings to booleans"
+                ),
+            )
+        cleaned_walkthrough: dict[str, bool] = {}
+        for key, value in raw.items():
+            sid = str(key).strip()
+            if not sid:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "walkthrough_e2e_enabled_by_project keys must be "
+                        "non-empty project ids"
+                    ),
+                )
+            cleaned_walkthrough[sid] = bool(value)
+        _runtime_config["walkthrough_e2e_enabled_by_project"] = cleaned_walkthrough
     if "no_ci_test_gate_enabled" in payload:
         _runtime_config["no_ci_test_gate_enabled"] = bool(
             payload["no_ci_test_gate_enabled"]

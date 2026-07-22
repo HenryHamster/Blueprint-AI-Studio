@@ -1111,6 +1111,40 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     return "partial"
 
 
+def _evidence_providing_source_kind(evidence: list[CriterionEvidence]) -> str | None:
+    """Return the ``source_kind`` providing the highest-priority coverage, or ``None``.
+
+    Follows the same priority chain as :func:`compute_criterion_coverage`::
+
+        covered > attested > backfilled > probed > partial > uncovered
+
+    For ``covered`` this pinpoints which machine-verified evidence kind proved the
+    criterion (e.g. ``"walkthrough_e2e"`` vs ``"task_merge"``).  For the
+    lower-confidence tiers it returns the first matching source_kind within that
+    tier.  For ``uncovered`` (empty evidence list) it returns ``None``.
+
+    Callers use this to label *why* a criterion achieved its current tier without
+    re-deriving the logic.
+    """
+    if not evidence:
+        return None
+    for e in evidence:
+        if _evidence_proves_covered(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_attested(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_backfilled(e):
+            return e.source_kind
+    for e in evidence:
+        if _evidence_is_probed(e):
+            return e.source_kind
+    # Partial: evidence exists but none qualifies at any tier — return the
+    # first entry's source_kind so callers see what kind of evidence is present.
+    return evidence[0].source_kind
+
+
 def _compute_attestation_expires_at(evidence: list[CriterionEvidence]) -> str | None:
     """Return the ISO-8601 expiry timestamp of the latest valid attestation, or None.
 
@@ -2610,6 +2644,155 @@ async def record_walkthrough_e2e_evidence(
     }
 
 
+async def record_operator_walkthrough_evidence(
+    session: AsyncSession,
+    version: Any,
+    candidate_sha: str,
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Record operator-run walkthrough results as covered-tier evidence.
+
+    Mirrors :func:`record_walkthrough_e2e_evidence` but skips the SHA match
+    against ``version.last_qualification.candidate_sha``. The operator has
+    intentionally run the walkthrough against a specific commit and asserts the
+    SHA is the correct pinned commit — the function validates only that the
+    provided ``candidate_sha`` is non-empty.
+
+    Each entry in ``results`` is a ``{criterion_key, passed, notes}`` dict. For
+    every entry whose ``passed`` is truthy, this resolves ``criterion_key`` to an
+    ACTIVE criterion on ``version`` and writes one covering
+    :data:`WALKTHROUGH_E2E_EVIDENCE_KIND` :class:`CriterionEvidence` row with
+    ``detail = {candidate_sha, evaluated_at, criterion_key, passed[, notes]}``
+    and a ``source_id`` keyed on the operator-run SHA + criterion (so a re-run
+    against the same SHA is a no-op via the dedup unique index).
+
+    **SAFETY:** covered-tier evidence is written ONLY when the posted
+    ``candidate_sha`` is non-empty. A missing/empty SHA writes NOTHING and is
+    reported as ``rejected``. Only ``passed=True`` results are written;
+    failing/absent results are skipped.
+
+    Returns a summary dict::
+
+        {"status": "recorded" | "rejected",
+         "rejected_reason": str | None,  # only when status == "rejected"
+         "recorded": int,                # rows newly written
+         "skipped_not_passed": int,      # results with passed falsy
+         "unmatched_keys": list[str],    # keys not resolving to an active criterion
+         "candidate_sha": str}
+
+    Best-effort per-row: a failure recording one criterion's evidence is logged
+    and does not abort the others.
+    """
+    posted_sha = str(candidate_sha or "").strip()
+    if not posted_sha:
+        logger.warning(
+            "record_operator_walkthrough_evidence: missing candidate_sha for "
+            "version %s — rejecting (no coverage written)",
+            getattr(version, "id", None),
+        )
+        return {
+            "status": "rejected",
+            "rejected_reason": "missing_candidate_sha",
+            "recorded": 0,
+            "skipped_not_passed": 0,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    project_id = version.project_id
+    release_version_id = version.id
+
+    # Only passed=True results are eligible; collect their keys (preserving order,
+    # de-duplicating) so a single query resolves all criteria at once.
+    passed_keys: list[str] = []
+    skipped_not_passed = 0
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if not key:
+            continue
+        if entry.get("passed") is True:
+            if key not in passed_keys:
+                passed_keys.append(key)
+        else:
+            skipped_not_passed += 1
+
+    if not passed_keys:
+        return {
+            "status": "recorded",
+            "rejected_reason": None,
+            "recorded": 0,
+            "skipped_not_passed": skipped_not_passed,
+            "unmatched_keys": [],
+            "candidate_sha": posted_sha,
+        }
+
+    criteria = await get_criteria_by_keys(
+        session, project_id, passed_keys, release_version_id=release_version_id
+    )
+    active_by_key = {c.criterion_key: c for c in criteria if c.status == "active"}
+    unmatched_keys = [k for k in passed_keys if k not in active_by_key]
+
+    # Look up the notes for each passed key from the first matching result.
+    notes_by_key: dict[str, Any] = {}
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        key = str(entry.get("criterion_key") or "").strip()
+        if key and entry.get("passed") is True and key not in notes_by_key:
+            notes_by_key[key] = entry.get("notes")
+
+    evaluated_at = _utcnow().isoformat()
+    recorded = 0
+    for key, criterion in active_by_key.items():
+        detail: dict[str, Any] = {
+            "candidate_sha": posted_sha,
+            "evaluated_at": evaluated_at,
+            "criterion_key": key,
+            "passed": True,
+        }
+        notes = notes_by_key.get(key)
+        if notes:
+            detail["notes"] = notes
+        source_id = f"operator_walkthrough:{posted_sha}:{key}"
+        try:
+            await record_evidence(
+                session,
+                criterion_id=criterion.id,
+                project_id=project_id,
+                source_kind=WALKTHROUGH_E2E_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        except Exception:
+            logger.exception(
+                "record_operator_walkthrough_evidence: failed to record evidence "
+                "for criterion %s (version %s)",
+                key,
+                getattr(version, "id", None),
+            )
+
+    logger.info(
+        "record_operator_walkthrough_evidence: version=%s candidate_sha=%s "
+        "recorded=%d skipped_not_passed=%d unmatched=%s",
+        getattr(version, "id", None),
+        posted_sha[:12],
+        recorded,
+        skipped_not_passed,
+        unmatched_keys,
+    )
+    return {
+        "status": "recorded",
+        "rejected_reason": None,
+        "recorded": recorded,
+        "skipped_not_passed": skipped_not_passed,
+        "unmatched_keys": unmatched_keys,
+        "candidate_sha": posted_sha,
+    }
+
+
 async def record_acceptance_window_coverage_evidence(
     session: AsyncSession,
     version: Any,
@@ -3150,6 +3333,7 @@ async def get_version_coverage_summary(
                     'criterion_key': str,
                     'text': str,
                     'coverage': 'covered' | 'attested' | 'backfilled' | 'probed' | 'partial' | 'uncovered',
+                    'covered_by': str | None,  # source_kind providing coverage, e.g. 'walkthrough_e2e'
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'evidence_truncated': bool,
@@ -3180,6 +3364,11 @@ async def get_version_coverage_summary(
     of uncovered active criteria whose ``stuck_reason`` is non-``None`` — i.e.
     criteria that need direction remapping or operator attestation to ever
     become covered.
+
+    ``covered_by`` pinpoints the exact ``source_kind`` that provides the
+    criterion's current coverage (e.g. ``"walkthrough_e2e"`` vs
+    ``"task_merge"`` vs ``"reachability"``).  For ``"uncovered"`` criteria —
+    or any tier whose evidence list is empty — this is ``None``.
     """
     counts: dict[str, int] = {
         "covered": 0,
@@ -3276,6 +3465,16 @@ async def get_version_coverage_summary(
     for criterion in criteria_in_order:
         evidence = evidence_by_criterion.get(criterion.id, [])
         coverage = coverage_by_criterion[criterion.id]
+        # When corroboration failed and downgraded coverage to 'partial',
+        # the evidence that earned the higher tier is no longer trusted.
+        # Report covered_by as None so it aligns with the effective 'partial'
+        # coverage — the prior source_kind is no longer providing coverage.
+        covered_by = _evidence_providing_source_kind(evidence)
+        if (
+            coverage == "partial"
+            and criterion.criterion_key in failed_corroboration
+        ):
+            covered_by = None
         stuck_reason = stuck_reasons.get(criterion.criterion_key)
         if stuck_reason is not None:
             stuck_count += 1
@@ -3285,6 +3484,7 @@ async def get_version_coverage_summary(
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
                 "coverage": coverage,
+                "covered_by": covered_by,
                 "status": criterion.status,
                 "evidence_count": len(evidence),
                 "evidence_truncated": evidence_truncated,

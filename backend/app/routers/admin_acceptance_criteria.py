@@ -542,6 +542,72 @@ async def ingest_walkthrough_e2e_evidence(
     }
 
 
+@router.post(
+    "/projects/{project_id}/acceptance-criteria/operator-walkthrough-evidence"
+)
+async def ingest_operator_walkthrough_evidence(
+    project_id: uuid.UUID,
+    body: WalkthroughE2EEvidenceRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Ingest operator-run walkthrough results as covered-tier evidence.
+
+    Unlike the qualifier-spawned ``walkthrough_e2e`` endpoint, this accepts a
+    ``candidate_sha`` that does NOT need to match the version's qualifying SHA
+    — the operator has intentionally pinned the walkthrough against a chosen
+    commit and asserts the SHA is correct. Only a missing/empty SHA is rejected.
+
+    Each result maps a ``criterion_key`` to a pass/fail; passing criteria earn a
+    covering :data:`app.acceptance_criteria.WALKTHROUGH_E2E_EVIDENCE_KIND`
+    evidence row on the open release version.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    summary = await ac.record_operator_walkthrough_evidence(
+        session,
+        open_version,
+        candidate_sha=body.candidate_sha,
+        results=[r.model_dump() for r in body.results],
+    )
+    if summary.get("status") == "rejected":
+        # Empty/missing SHA: reject loudly so an unpinned walkthrough cannot
+        # silently forge coverage.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "operator_walkthrough_sha_rejected",
+                "reason": summary.get("rejected_reason"),
+                "candidate_sha": summary.get("candidate_sha"),
+            },
+        )
+
+    logger.info(
+        "[AC] operator walkthrough evidence ingested: project=%s version=%s "
+        "recorded=%d skipped_not_passed=%d unmatched=%s",
+        project_id,
+        open_version.id,
+        summary.get("recorded"),
+        summary.get("skipped_not_passed"),
+        summary.get("unmatched_keys"),
+    )
+    return {
+        "status": "ok",
+        "release_version_id": str(open_version.id),
+        "recorded": summary.get("recorded", 0),
+        "skipped_not_passed": summary.get("skipped_not_passed", 0),
+        "unmatched_keys": summary.get("unmatched_keys", []),
+        "candidate_sha": summary.get("candidate_sha"),
+    }
+
+
 class ReconcileBackfillRequest(BaseModel):
     direction_key: str | None = Field(
         None,

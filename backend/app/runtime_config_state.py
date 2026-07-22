@@ -1143,6 +1143,12 @@ runtime_config: Dict = {
     # Failure is evidence-only (never cascades a fix).  Operator-tunable via
     # runtime_config_json; persisted across restarts.
     "walkthrough_e2e_enabled": True,
+    # Per-project walkthrough_e2e enablement overrides ({project_id: bool}).
+    # An EMPTY map (the default) means every project falls back to the fleet-wide
+    # ``walkthrough_e2e_enabled`` above.  A per-project entry can HOLD the
+    # walkthrough evidence lane for one project without touching the fleet default.
+    # Mirrors ``promotion_enabled_by_project``.
+    "walkthrough_e2e_enabled_by_project": {},
     # env_preflight_enabled gates the boot-prerequisite hard gate (Slice 3).
     # Armed True: a new candidate must declare its required boot-time env vars;
     # missing or absent declarations block promotion.  This gate was built to
@@ -2645,6 +2651,42 @@ def resolve_project_promotion_enabled(project_id) -> bool:
     if sid in per_project:
         return per_project[sid]
     return bool(runtime_config.get("promotion_enabled"))
+
+
+def walkthrough_e2e_enabled_by_project_map() -> Dict[str, bool]:
+    """Per-project walkthrough_e2e overrides, as ``{project_id: bool}``.
+
+    Read from the durable ``walkthrough_e2e_enabled_by_project`` runtime-config
+    value. Normalizes to trimmed, non-empty string project-id keys mapping to
+    bools, silently dropping malformed entries. An EMPTY map (the default) means
+    every project falls back to the fleet-wide ``walkthrough_e2e_enabled``.
+    Parallel to :func:`promotion_enabled_by_project_map`.
+    """
+    raw = runtime_config.get("walkthrough_e2e_enabled_by_project") or {}
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, bool] = {}
+    for key, value in raw.items():
+        sid = str(key).strip()
+        if not sid:
+            continue
+        out[sid] = bool(value)
+    return out
+
+
+def resolve_project_walkthrough_e2e_enabled(project_id) -> bool:
+    """A project's EFFECTIVE walkthrough_e2e gate.
+
+    Returns the project's explicit per-project value from
+    ``walkthrough_e2e_enabled_by_project`` when one is set, otherwise falls back
+    to the fleet-wide ``walkthrough_e2e_enabled`` default (True).  Mirrors
+    :func:`resolve_project_promotion_enabled` for the walkthrough evidence lane.
+    """
+    per_project = walkthrough_e2e_enabled_by_project_map()
+    sid = str(project_id)
+    if sid in per_project:
+        return per_project[sid]
+    return bool(runtime_config.get("walkthrough_e2e_enabled"))
 
 
 def resolve_project_concurrency_cap(project_id) -> int | None:
