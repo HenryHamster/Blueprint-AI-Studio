@@ -27,7 +27,16 @@ import pytest
 # Repository layout helpers
 # ---------------------------------------------------------------------------
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+def _resolve_repo_root() -> Path:
+    """Resolve repo root with /repo fallback for Docker-shard runs."""
+    candidates = (Path(__file__).resolve().parents[2], Path("/repo"))
+    for candidate in candidates:
+        if (candidate / "scripts" / "blueprint.py").is_file():
+            return candidate
+    return candidates[0]
+
+
+REPO_ROOT = _resolve_repo_root()
 BLUEPRINT_CLI = REPO_ROOT / "scripts" / "blueprint.py"
 RUNNER_INSTALL_DOC = REPO_ROOT / "docs" / "runner-install.md"
 ADMIN_RUNNERS_MODULE = REPO_ROOT / "backend" / "app" / "routers" / "admin_runners.py"
