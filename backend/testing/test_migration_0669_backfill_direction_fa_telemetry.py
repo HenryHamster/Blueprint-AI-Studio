@@ -11,7 +11,7 @@ INSERT must be serialized with ``json.dumps()``, NOT Python's ``str()``.
 aborting ``alembic upgrade head`` for any project carrying this key.
 
 Because the migration executes PostgreSQL-specific SQL operators (``->``, ``?``,
-``::jsonb``), these tests use a mock connection that intercepts SQL execution
+``CAST(... AS jsonb)``), these tests use a mock connection that intercepts SQL execution
 and captures INSERT parameters — the same pattern used by
 ``test_migration_0532_message_backlog.py``.
 
@@ -21,7 +21,7 @@ Properties tested:
   (c) None value in SELECT result → row silently skipped;
   (d) empty SELECT result → upgrade is a clean no-op;
   (e) second upgrade call is idempotent (no exception);
-  (f) downgrade issues a DELETE with the correct key.
+  (f) downgrade preserves rows whose migration-versus-writer origin is unknowable.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from pathlib import Path
 
 
 # ── loader ────────────────────────────────────────────────────────────────────
+
 
 def _load_migration():
     path = (
@@ -50,6 +51,7 @@ def _load_migration():
 
 # ── mock connection ───────────────────────────────────────────────────────────
 
+
 class _MockResult:
     """Minimal result proxy returned by execute()."""
 
@@ -66,14 +68,18 @@ class _MockConn:
     def __init__(self, select_rows=()):
         # Each entry is a tuple (project_id, value) matching the migration SELECT.
         self._select_rows = list(select_rows)
+        self.captured_select_sql: list[str] = []
+        self.captured_insert_sql: list[str] = []
         self.captured_inserts: list[dict] = []
         self.captured_deletes: list[dict] = []
 
     def execute(self, stmt, params=None):
         sql = str(stmt).upper()
         if "SELECT" in sql:
+            self.captured_select_sql.append(str(stmt))
             return _MockResult(self._select_rows)
         if "INSERT" in sql:
+            self.captured_insert_sql.append(str(stmt))
             self.captured_inserts.append(params or {})
             return _MockResult()
         if "DELETE" in sql:
@@ -98,6 +104,7 @@ def _run_downgrade(mig, conn):
 
 
 # ── tests ─────────────────────────────────────────────────────────────────────
+
 
 def test_dict_value_serialized_as_valid_json(monkeypatch):
     """(a) A dict returned from design_doc -> key must bind as valid JSON text.
@@ -124,9 +131,7 @@ def test_dict_value_serialized_as_valid_json(monkeypatch):
     parsed = json.loads(raw_value)
 
     # Round-trip equality: parsed JSON must equal the original dict.
-    assert parsed == fa_dict, (
-        f"round-trip mismatch — bound value was: {raw_value!r}"
-    )
+    assert parsed == fa_dict, f"round-trip mismatch — bound value was: {raw_value!r}"
 
     # Specifically reject Python repr artifacts (single quotes are illegal JSON).
     assert "'" not in raw_value, (
@@ -164,8 +169,15 @@ def test_insert_params_contain_correct_project_and_key(monkeypatch):
     params = conn.captured_inserts[0]
     assert params["project_id"] == str(project_id), "project_id must match seeded row"
     assert params["key"] == _KEY, "key must be direction_first_attempt_feedback"
-    assert "id" in params, "INSERT must bind a fresh uuid as id"
-    assert "updated_at" in params, "INSERT must bind updated_at"
+    assert isinstance(params["id"], uuid.UUID), "INSERT must bind a typed UUID"
+    assert "updated_at" not in params, "database timestamp must be authoritative"
+    insert_sql = conn.captured_insert_sql[0]
+    assert "CAST(:id AS uuid)" in insert_sql
+    assert "CAST(:project_id AS uuid)" in insert_sql
+    assert "CAST(:value AS jsonb)" in insert_sql
+    assert "DO NOTHING" in insert_sql
+    assert "DO UPDATE" not in insert_sql
+    assert "ORDER BY id" in conn.captured_select_sql[0]
 
 
 def test_none_value_row_is_skipped(monkeypatch):
@@ -231,26 +243,22 @@ def test_multiple_projects_each_get_an_insert(monkeypatch):
         assert parsed == rows[i][1], f"row {i}: round-trip mismatch"
 
 
-def test_downgrade_issues_delete_with_correct_key(monkeypatch):
-    """(f) downgrade() must DELETE project_telemetry rows for the backfilled key."""
+def test_downgrade_preserves_indistinguishable_live_writer_rows(monkeypatch):
+    """Downgrade cannot identify which rows came from migration versus writers."""
     mig = _load_migration()
     conn = _MockConn(select_rows=[])
 
     monkeypatch.setattr(mig.op, "get_bind", lambda: conn)
     mig.downgrade()
 
-    assert len(conn.captured_deletes) == 1, "expected exactly one DELETE on downgrade"
-    assert conn.captured_deletes[0].get("key") == _KEY, (
-        f"DELETE must target key={_KEY!r}, got {conn.captured_deletes[0]!r}"
-    )
+    assert conn.captured_deletes == []
 
 
-def test_str_value_is_valid_json(monkeypatch):
-    """A plain string value must also serialize as valid JSON (json.dumps wraps it in quotes)."""
+def test_json_looking_string_value_preserves_string_type(monkeypatch):
+    """JSON-looking logical strings must not be decoded into other JSON types."""
     mig = _load_migration()
     project_id = str(uuid.uuid4())
-    # Unusual but valid: the JSON key value is itself a string.
-    fa_string = "unexpected_string_value"
+    fa_string = "[1]"
     conn = _MockConn(select_rows=[(project_id, fa_string)])
 
     monkeypatch.setattr(mig.op, "get_bind", lambda: conn)

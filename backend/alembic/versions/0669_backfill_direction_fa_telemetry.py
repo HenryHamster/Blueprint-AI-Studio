@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
 
 import sqlalchemy as sa
 from alembic import op
@@ -33,13 +32,13 @@ _KEY = "direction_first_attempt_feedback"
 
 def upgrade() -> None:
     conn = op.get_bind()
-    now = datetime.now(tz=timezone.utc)
 
     rows = conn.execute(
         sa.text(
             "SELECT id, design_doc -> :key AS value"
             " FROM project"
             " WHERE design_doc ? :key"
+            " ORDER BY id"
         ),
         {"key": _KEY},
     ).fetchall()
@@ -55,23 +54,27 @@ def upgrade() -> None:
         conn.execute(
             sa.text(
                 "INSERT INTO project_telemetry (id, project_id, key, value, updated_at)"
-                " VALUES (:id, :project_id, :key, :value::jsonb, :updated_at)"
+                " VALUES (CAST(:id AS uuid), CAST(:project_id AS uuid), :key,"
+                " CAST(:value AS jsonb), CURRENT_TIMESTAMP)"
                 " ON CONFLICT ON CONSTRAINT uq_project_telemetry_project_key"
-                " DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at"
+                " DO NOTHING"
             ),
             {
-                "id": str(uuid.uuid4()),
-                "project_id": str(project_id),
+                "id": uuid.uuid4(),
+                "project_id": project_id,
                 "key": _KEY,
-                "value": json.dumps(value),
-                "updated_at": now,
+                "value": json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
             },
         )
 
 
 def downgrade() -> None:
-    conn = op.get_bind()
-    conn.execute(
-        sa.text("DELETE FROM project_telemetry WHERE key = :key"),
-        {"key": _KEY},
-    )
+    # Rows for this key may have been created or updated by the live dual writer,
+    # and the schema does not record migration provenance. Deleting by key would
+    # therefore erase authoritative telemetry that 0669 did not create.
+    pass

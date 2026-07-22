@@ -142,6 +142,12 @@ def test_resident_session_id_survives_0657_then_0671():
             "resident_session_id for msg-2 lost after 0671"
         )
         assert by_id_after["msg-3"] is None
+        index_names = {
+            index["name"] for index in sa.inspect(conn).get_indexes("projectmessage")
+        }
+        assert "ix_projectmessage_project_session_created" in index_names, (
+            "the canonical revision-0396 composite index must survive"
+        )
 
 
 def test_0671_idempotent_when_column_already_exists():
@@ -188,24 +194,33 @@ def test_0671_adds_column_when_absent():
         assert val is None, "re-added column must default to NULL for existing rows"
 
 
-def test_0671_downgrade_removes_column():
-    """downgrade removes the column and index when they were added by 0671."""
+def test_0671_downgrade_preserves_canonical_column_and_index():
+    """Downgrade cannot delete revision-0396 schema or Workday history."""
     mig0671 = _load("0671_restore_workday_message_session_id.py")
 
     engine = sa.create_engine("sqlite:///:memory:")
     with engine.begin() as conn:
         _create_projectmessage_without_session_id(conn)
+        conn.execute(
+            sa.text(
+                "INSERT INTO projectmessage (id, project_id, created_at) "
+                "VALUES ('msg-x', 'proj-c', '2026-01-05')"
+            )
+        )
 
         mig0671.op = _ops(conn)
         mig0671.upgrade()
-
-        inspector = sa.inspect(conn)
-        cols = {c["name"] for c in inspector.get_columns("projectmessage")}
-        assert "resident_session_id" in cols
+        conn.execute(
+            sa.text(
+                "UPDATE projectmessage SET resident_session_id = 'sentinel' "
+                "WHERE id = 'msg-x'"
+            )
+        )
 
         mig0671.downgrade()
-        inspector2 = sa.inspect(conn)
-        cols2 = {c["name"] for c in inspector2.get_columns("projectmessage")}
-        assert "resident_session_id" not in cols2, (
-            "downgrade must remove resident_session_id"
-        )
+        inspector = sa.inspect(conn)
+        columns = {column["name"] for column in inspector.get_columns("projectmessage")}
+        indexes = {index["name"] for index in inspector.get_indexes("projectmessage")}
+        assert "resident_session_id" in columns
+        assert "ix_projectmessage_project_session_created" in indexes
+        assert _session_ids(conn)["msg-x"] == "sentinel"

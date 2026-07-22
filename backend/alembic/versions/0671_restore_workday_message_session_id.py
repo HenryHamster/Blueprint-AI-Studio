@@ -1,4 +1,4 @@
-"""Restore persistent Workday conversation identity on project messages.
+"""Ensure persistent Workday conversation identity on project messages.
 
 Revision ID: 0671
 Revises: 0670
@@ -38,8 +38,8 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        "ix_projectmessage_project_session_created",
-        table_name="projectmessage",
-    )
-    op.drop_column("projectmessage", "resident_session_id")
+    # The canonical amended chain preserves this revision-0396 column and index
+    # through 0657, so 0671 normally creates nothing. There is no durable marker
+    # proving that this revision created either object on a partially upgraded
+    # nonproduction database; removing them would destroy valid Workday history.
+    pass

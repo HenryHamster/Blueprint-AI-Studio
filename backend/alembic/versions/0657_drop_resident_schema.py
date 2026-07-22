@@ -1,14 +1,15 @@
 """Drop the strategic-resident (shadow-turn) schema.
 
+Revision ID: 0657
+Revises: 0656
+
 The strategic-resident subsystem was rolled back after failing in the field.
 This migration removes every database object it created, so the migration-head
 schema matches the SQLModel metadata once the resident model classes are gone.
 
-Dropped objects (created by revisions 0396, 0611, 0627, 0631, 0632, 0635, 0636,
+Dropped objects (created by revisions 0611, 0627, 0631, 0632, 0635, 0636,
 0637 and 0640):
 
-* ``projectmessage.resident_session_id`` column + the
-  ``ix_projectmessage_project_session_created`` composite index (0396).
 * ``task.strategic_operation_receipt_id`` column, its
   ``fk_task_strategic_operation_receipt`` foreign key and
   ``ix_task_strategic_operation_receipt_id`` index (0636).
@@ -22,6 +23,10 @@ Dropped objects (created by revisions 0396, 0611, 0627, 0631, 0632, 0635, 0636,
 
 The surviving ``ix_strategiccycle_project_terminal_updated`` index (added by
 0635 but still declared on the ``StrategicCycle`` model) is intentionally kept.
+The ``projectmessage.resident_session_id`` column and
+``ix_projectmessage_project_session_created`` index (added by revision 0396)
+are also intentionally kept because they carry the persistent conversational
+Workday identity and are not part of the removed shadow-turn control plane.
 
 This is a one-way drop: the resident tables carried only rolled-back subsystem
 state, so ``downgrade`` re-creating them is not supported.
@@ -149,9 +154,7 @@ def upgrade() -> None:
         #    guard on the live schema (idempotent across partial states).
         op.execute("DROP INDEX IF EXISTS ix_task_strategic_operation_receipt_id")
         if "strategic_operation_receipt_id" in _sqlite_columns("task"):
-            op.execute(
-                "ALTER TABLE task DROP COLUMN strategic_operation_receipt_id"
-            )
+            op.execute("ALTER TABLE task DROP COLUMN strategic_operation_receipt_id")
         # resident_session_id and its composite index are intentionally kept:
         # migration 0671 restores the Workday conversational session linkage that
         # this column carries, so dropping it here would silently wipe data on
