@@ -5,7 +5,8 @@ export type PrimaryTab =
   | 'chat'
   | 'pipeline'
   | 'project'
-  | 'runtime';
+  | 'runtime'
+  | 'fleet';
 
 export type LegacyPrimaryTab =
   | 'cockpit'
@@ -29,6 +30,7 @@ export function resolvePrimaryTabTarget(value?: string | null): PrimaryTabTarget
   if (value === 'pipeline') return { tab: 'pipeline' };
   if (value === 'project') return { tab: 'project' };
   if (value === 'runtime') return { tab: 'runtime' };
+  if (value === 'fleet') return { tab: 'fleet' };
   if (value === 'cockpit') return { tab: 'project', projectSection: 'running-update' };
   if (value === 'directions') return { tab: 'project', projectSection: 'directions' };
   if (value === 'home') return { tab: 'runtime', runtimeSection: 'health' };

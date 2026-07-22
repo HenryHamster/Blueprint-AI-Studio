@@ -49,7 +49,9 @@ async def compute_fresh_reviewer_trend(
     ``approval_rate_lift`` — each with ``current``, ``previous``, ``delta``,
     and ``trend`` (stable / improving / regressing).
 
-    **Side effect**: writes result to ``project.design_doc["fresh_reviewer_trend"]``.
+    **Side effect**: writes result to
+    ``ProjectSRAnalytics.data["fresh_reviewer_trend"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked`.
     """
     now = _utcnow()
 
@@ -322,7 +324,8 @@ async def compute_sr_reviewer_disagreements(
     ``passed: true``.
 
     **Side effect**: writes the result to
-    ``project.design_doc["sr_reviewer_disagreements"]`` so downstream readers
+    ``ProjectSRAnalytics.data["sr_reviewer_disagreements"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked` so downstream readers
     (admin digest, agent project-context) can access pre-computed data without
     re-scanning tasks.
 
@@ -406,10 +409,11 @@ async def compute_edges_trend(
     classified as ``'improving'`` | ``'regressing'`` | ``'stable'`` relative to the
     previous bucket using ``_TREND_DELTA_THRESHOLD``.
 
-    **Side effect**: writes result to ``project.design_doc['edges_trend']`` and
-    maintains a top-level ``rate_history`` list (capped at 5 entries).  Append
-    rule mirrors ``sr_catch_rate_trends``: in cycle mode append on new
-    ``current_cycle_id``; in calendar mode append when ≥14 days since last
+    **Side effect**: writes result to ``ProjectSRAnalytics.data['edges_trend']``
+    via :func:`~app.task_locking.with_sr_analytics_locked` and maintains a
+    top-level ``rate_history`` list (capped at 5 entries).  Append rule mirrors
+    ``sr_catch_rate_trends``: in cycle mode append on new ``current_cycle_id``;
+    in calendar mode append when ≥14 days since last
     ``computed_at``.
     """
     now = _utcnow()

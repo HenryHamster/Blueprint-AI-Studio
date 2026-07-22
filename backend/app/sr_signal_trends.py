@@ -57,7 +57,8 @@ async def compute_sr_regression_risk_test_signal_trends(
     and the :data:`_MIN_SR_SAMPLE` floor.
 
     **Side effect**: writes the result to
-    ``project.design_doc["sr_regression_risk_test_signal_trends"]``.
+    ``ProjectSRAnalytics.data["sr_regression_risk_test_signal_trends"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked`.
     """
     from app.sr_blind_spots import is_skipped_sr_outcome
 
@@ -269,7 +270,8 @@ async def compute_sr_false_attestation_trends(
     Mirrors :func:`compute_sr_regression_risk_test_signal_trends` cycle-vs-calendar bucketing.
 
     **Side effect**: writes the result to
-    ``project.design_doc["sr_false_attestation_trends"]`` and emits a WARNING Alert when
+    ``ProjectSRAnalytics.data["sr_false_attestation_trends"]``
+    via :func:`~app.task_locking.with_sr_analytics_locked`, and emits a WARNING Alert when
     any category's false attestation rate exceeds _FALSE_ATTESTATION_RATE_THRESHOLD.
     """
     from app.sr_blind_spots import (

@@ -31,6 +31,9 @@ TELEMETRY_KEYS: frozenset[str] = frozenset(
         "retired_diagnoses_archive",
         "playbook_archive",
         "proposed_changes",
+        # Per-direction first-attempt review feedback tallies.  Writers dual-write
+        # to both design_doc and this table; readers fall back to design_doc.
+        "direction_first_attempt_feedback",
     }
 )
 

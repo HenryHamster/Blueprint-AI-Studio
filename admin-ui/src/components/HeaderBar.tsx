@@ -100,7 +100,7 @@ export const PrimaryTabNav = memo(function PrimaryTabNav({
       className={navClassName}
       aria-label="Primary workbench sections"
     >
-      {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
+      {(['chat', 'pipeline', 'project', 'runtime', 'fleet'] as const).map(tab => {
         const isActive = activeTab === tab;
         const chatBadgeCount = tab === 'chat'
           ? Math.max(openMessageCount, newSinceLastVisitCount)

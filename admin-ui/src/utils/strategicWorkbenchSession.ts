@@ -19,6 +19,7 @@ export function workbenchSurfaceForTab(tab: PrimaryTab): StrategicWorkbenchState
   if (tab === 'pipeline') return 'pipeline';
   if (tab === 'project') return 'project';
   if (tab === 'runtime') return 'runtime';
+  // 'fleet' has no strategic workbench surface
   return null;
 }
 

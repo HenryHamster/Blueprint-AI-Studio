@@ -28,6 +28,7 @@ import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs
 const TaskDetailDrawer = lazy(() => import('./components/TaskDetailDrawer').then(m => ({ default: m.TaskDetailDrawer })));
 import { ToastContainer } from './components/Toasts';
 const FleetDetailDrawer = lazy(() => import('./components/FleetDetailDrawer').then(m => ({ default: m.FleetDetailDrawer })));
+const FleetRunnersDashboard = lazy(() => import('./components/FleetRunnersDashboard').then(m => ({ default: m.FleetRunnersDashboard })));
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import { useStrategicSession } from './hooks/useStrategicSession';
@@ -1540,6 +1541,12 @@ export default function App() {
             versionLifecycleRefreshing={versionLifecycleRefreshing}
             refreshVersionLifecycle={refreshVersionLifecycle}
           />
+          </Suspense>
+        </ErrorBoundary>
+      ) : activeTab === 'fleet' ? (
+        <ErrorBoundary level="panel">
+          <Suspense fallback={<WorkspaceSkeleton />}>
+          <FleetRunnersDashboard />
           </Suspense>
         </ErrorBoundary>
       ) : (
