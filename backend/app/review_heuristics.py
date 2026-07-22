@@ -710,7 +710,7 @@ def classify_iteration_lane(task: "Task") -> str:  # type: ignore[name-defined] 
 
     Used to compute per-lane iteration counts so sub-caps can be applied
     alongside the global cap. The classifier is a pure function of the task's
-    payload type and ``review_loop.fix_reason``.
+    ``review_loop.fix_reason``.
     """
     fix_reason = (
         (task.context or {}).get("review_loop", {}).get("fix_reason", "code_review")

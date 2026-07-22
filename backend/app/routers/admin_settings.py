@@ -187,9 +187,6 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "residual_audit_defer_escalation_threshold",
         "residual_remediation_cooldown_hours",
         "rollup_merge_queue_enabled",
-        "review_second_opinion_gate_enabled",
-        "blind_multi_reviewer_gate_enabled",
-        "review_second_opinion_sample_rate",
         "smoketest_enabled",
         "spend_approval_timeout_hours",
         "strategic_max_interval_minutes",
@@ -818,15 +815,6 @@ async def get_settings(
         ),
         "rollup_merge_queue_enabled": bool(
             _runtime_config.get("rollup_merge_queue_enabled", True)
-        ),
-        "review_second_opinion_gate_enabled": bool(
-            _runtime_config.get("review_second_opinion_gate_enabled", True)
-        ),
-        "blind_multi_reviewer_gate_enabled": bool(
-            _runtime_config.get("blind_multi_reviewer_gate_enabled", True)
-        ),
-        "review_second_opinion_sample_rate": float(
-            _runtime_config.get("review_second_opinion_sample_rate", 1.0)
         ),
         "cochange_decomposition_enabled": bool(
             _runtime_config.get("cochange_decomposition_enabled", False)
@@ -1842,36 +1830,6 @@ async def _apply_settings(
                 detail="rollup_merge_queue_enabled must be a boolean",
             )
         _runtime_config["rollup_merge_queue_enabled"] = val
-    if "review_second_opinion_gate_enabled" in payload:
-        val = payload["review_second_opinion_gate_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_gate_enabled must be a boolean",
-            )
-        _runtime_config["review_second_opinion_gate_enabled"] = val
-    if "blind_multi_reviewer_gate_enabled" in payload:
-        val = payload["blind_multi_reviewer_gate_enabled"]
-        if not isinstance(val, bool):
-            raise HTTPException(
-                status_code=400,
-                detail="blind_multi_reviewer_gate_enabled must be a boolean",
-            )
-        _runtime_config["blind_multi_reviewer_gate_enabled"] = val
-    if "review_second_opinion_sample_rate" in payload:
-        try:
-            fval = float(payload["review_second_opinion_sample_rate"])
-        except (ValueError, TypeError):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_sample_rate must be a number",
-            )
-        if not (0.0 <= fval <= 1.0):
-            raise HTTPException(
-                status_code=400,
-                detail="review_second_opinion_sample_rate must be between 0.0 and 1.0",
-            )
-        _runtime_config["review_second_opinion_sample_rate"] = round(fval, 4)
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -3615,16 +3573,6 @@ async def _apply_settings(
                     # reverts to the True default).
                     "rollup_merge_queue_enabled": bool(
                         _runtime_config.get("rollup_merge_queue_enabled", True)
-                    ),
-                    # Persist the second-opinion gate flag so an operator
-                    # disable survives a Cloud Run restart (config-sync reads it
-                    # back on boot; otherwise the in-memory value reverts to the
-                    # True default).
-                    "review_second_opinion_gate_enabled": bool(
-                        _runtime_config.get("review_second_opinion_gate_enabled", True)
-                    ),
-                    "review_second_opinion_sample_rate": float(
-                        _runtime_config.get("review_second_opinion_sample_rate", 1.0)
                     ),
                     "cochange_decomposition_enabled": bool(
                         _runtime_config.get("cochange_decomposition_enabled", False)

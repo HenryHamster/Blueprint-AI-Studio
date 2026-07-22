@@ -2038,28 +2038,6 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "rollup_merge_queue_enabled",
                         bool(config_json["rollup_merge_queue_enabled"]),
                     )
-                if "review_second_opinion_gate_enabled" in config_json:
-                    _set(
-                        "review_second_opinion_gate_enabled",
-                        bool(config_json["review_second_opinion_gate_enabled"]),
-                    )
-                if "blind_multi_reviewer_gate_enabled" in config_json:
-                    _set(
-                        "blind_multi_reviewer_gate_enabled",
-                        bool(config_json["blind_multi_reviewer_gate_enabled"]),
-                    )
-                if "review_second_opinion_sample_rate" in config_json:
-                    try:
-                        _rate = max(
-                            0.0,
-                            min(
-                                1.0,
-                                float(config_json["review_second_opinion_sample_rate"]),
-                            ),
-                        )
-                        _set("review_second_opinion_sample_rate", _rate)
-                    except (TypeError, ValueError):
-                        pass
                 if "evergreen_fill_deferred_memo_enrollment" in config_json:
                     _set(
                         "evergreen_fill_deferred_memo_enrollment",

@@ -4269,12 +4269,6 @@ async def test_approve_branch_does_not_propagate_warm_target(tl_db, mocker):
     the spawn must pass suppress_warm_handoff=True so no warm-target pin
     lands on the new task. We verify by patching _spawn_pipeline_task and
     asserting on the call kwargs."""
-    # This test asserts the synchronous APPROVE-CI-failure fix spawn; disable
-    # the default-on second-opinion gate so that path runs directly.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     # Skip rollup; we don't actually need it for this test.
     mocker.patch("app.task_lifecycle._check_and_trigger_rollup", new_callable=AsyncMock)
 
@@ -4418,14 +4412,6 @@ async def _run_request_changes_branch(tl_db, mocker, *, verdict_json, ci_check_r
         captured_spawn_kwargs.append(kwargs)
         return (None, False)
 
-    # This helper drives the SYNCHRONOUS verification-only-downgrade /
-    # REQUEST_CHANGES-fix mechanics. The default-on second-opinion gate would
-    # park + challenge first; disable it so the synchronous path under test runs
-    # directly (the gate-off / operator-rollback path).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     # APPROVE-path merge cluster (only exercised when the verdict flips to
     # APPROVE on a verification-only + green-CI PR). Harmless for the
@@ -5061,13 +5047,6 @@ async def test_residual_remediation_case_merged_on_merge(tl_db, mocker):
     from app.models import ResidualRemediationCase, ResidualCaseStatus
     from datetime import datetime, timezone
 
-    # Asserts the synchronous APPROVE→merge path; disable the default-on
-    # second-opinion gate so the merge runs directly.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
-
     session, factory = tl_db
     project = await _make_project(session)
 
@@ -5263,14 +5242,6 @@ def payload_for(review_task):
 
 def _patch_approve_merge_env(mocker):
     """Mocks shared by the APPROVE inline-merge tests (CI green, PR open)."""
-    # These tests assert the SYNCHRONOUS review-finalization mechanics (inline
-    # merge, dual-head guard). The default-on second-opinion gate would instead
-    # park + spawn a challenger first; disable it so the synchronous path under
-    # test runs directly (it is exactly the operator-rollback / gate-off path).
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch(
         "app.routers.agent.get_github_token_for_task",
         new_callable=AsyncMock,
@@ -9904,10 +9875,6 @@ async def _run_stale_head_branch(
         captured_spawn_calls.append((args, kwargs))
         return (None, False)
 
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
         "app.task_lifecycle._merge_with_retry",
@@ -10157,10 +10124,6 @@ async def test_stale_head_backward_compat_no_reviewed_head_sha(tl_db, mocker):
         captured_spawn_calls.append((args, kwargs))
         return (None, False)
 
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
     mocker.patch("app.task_lifecycle._spawn_pipeline_task", side_effect=_capture_spawn)
     mocker.patch(
         "app.task_lifecycle._merge_with_retry",

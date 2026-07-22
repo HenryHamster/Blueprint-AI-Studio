@@ -126,49 +126,6 @@ class TestMaxActiveDirectionsFallbacks:
         )
 
 
-class TestBlindMultiReviewerGateFallback:
-    """blind_multi_reviewer_gate_enabled read-site must match the registered default (True)."""
-
-    def test_registered_default_is_true(self):
-        from app.runtime_config_state import runtime_config as _defaults
-
-        assert _defaults.get("blind_multi_reviewer_gate_enabled") is True, (
-            "Registered default for blind_multi_reviewer_gate_enabled changed — update "
-            "read-site fallbacks and this test."
-        )
-
-    def test_no_stale_false_fallback_in_source(self):
-        """No production source file may use .get('blind_multi_reviewer_gate_enabled', False)."""
-        offenders = []
-        for pyfile in _all_py_files():
-            if pyfile.name.startswith("test_"):
-                continue
-            for lineno, fallback in _collect_get_fallbacks(
-                pyfile, "blind_multi_reviewer_gate_enabled"
-            ):
-                if fallback is not True:
-                    offenders.append(
-                        f"{pyfile.relative_to(BACKEND_APP.parent)}:{lineno} fallback={fallback!r}"
-                    )
-
-        assert not offenders, (
-            "Read-sites with wrong fallback for blind_multi_reviewer_gate_enabled "
-            "(expected True, registered default):\n" + "\n".join(offenders)
-        )
-
-    def test_task_lifecycle_fallback_is_true(self):
-        filepath = BACKEND_APP / "task_lifecycle.py"
-        if not filepath.exists():
-            pytest.skip("task_lifecycle.py not found")
-        fallbacks = _collect_get_fallbacks(filepath, "blind_multi_reviewer_gate_enabled")
-        assert fallbacks, "No .get('blind_multi_reviewer_gate_enabled', ...) found in task_lifecycle.py"
-        wrong = [(ln, v) for ln, v in fallbacks if v is not True]
-        assert not wrong, (
-            "Stale fallback in task_lifecycle.py: "
-            + ", ".join(f"line {ln} value={v!r}" for ln, v in wrong)
-        )
-
-
 class TestAllRegisteredDefaultsMatchReadSiteFallbacks:
     """For every registered key with a simple type, verify no read-site passes
     a hardcoded fallback that silently diverges from the registered default.

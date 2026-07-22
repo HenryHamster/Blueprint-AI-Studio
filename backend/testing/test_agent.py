@@ -21929,13 +21929,6 @@ async def test_hotfix_backmerge_trigger_commits_conflict_alert_and_task(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
     mocker.patch("app.github.get_pr_files", new=AsyncMock(return_value=[]))
-    # Keep this test focused on the back-merge commit contract; the new
-    # default-on second-opinion gate would otherwise park the review before the
-    # merge path under test runs.
-    mocker.patch.dict(
-        "app.task_lifecycle._runtime_config",
-        {"review_second_opinion_gate_enabled": False},
-    )
 
     # open_backmerge_pr mocked to REPLICATE its real conflict path: session.add
     # an ERROR Alert + a high-priority conflict-resolution Task, then flush() —
