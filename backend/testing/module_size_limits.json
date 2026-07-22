@@ -154,11 +154,8 @@
     "migration_apply_gate.py": 2150,
     "capability_registry.py": 1750,
     "storage.py": 1750,
-    "strategic_operation_authority.py": 100,
     "strategic_operation_authority_execution.py": 500,
-    "strategic_operation_authority_validation.py": 950,
-    "strategic_operation_result_bounds.py": 250,
-    "routers/agent_resident_turn.py": 450
+    "strategic_operation_authority_validation.py": 950
   },
   "agent": {
     "index.ts": 4600,
