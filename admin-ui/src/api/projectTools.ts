@@ -31,9 +31,6 @@ export interface UpdateProjectToolPayload {
   enabled?: boolean;
 }
 
-/** Placements the backend accepts (mirrors _VALID_PLACEMENTS server-side). */
-export const TOOL_PLACEMENTS = ['project_section', 'toolbar', 'sidebar'] as const;
-
 export interface FetchProjectToolsResult {
   tools: ProjectTool[];
   total_count: number;
