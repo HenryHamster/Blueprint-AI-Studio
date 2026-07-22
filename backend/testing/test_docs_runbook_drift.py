@@ -1,5 +1,5 @@
-"""Drift guard: docs/RUNNER_RUNBOOK.md stays in sync with RunnerPreset definitions
-and the shipped blueprint-runner CLI.
+"""Drift guard: docs/RUNNER_RUNBOOK.md and docs/runner-install.md stay in sync
+with RunnerPreset definitions and the shipped blueprint-runner CLI.
 
 ``RunnerPreset`` in ``backend/app/routers/admin_runners.py`` is a ``Literal``
 of valid preset names. This file ensures the runbook covers every preset and
@@ -11,6 +11,11 @@ are authoritative for what the CLI ships.  ``test_first_launch_matches_shipped_c
 ensures the runbook documents each first-launch command and the correct Node.js
 minimum version so that runbook-only edits cannot silently diverge from the
 launcher source.
+
+``test_runner_install_first_launch_matches_shipped_cli`` applies the same guard
+to ``docs/runner-install.md`` so that its Section 2 first-launch instructions
+stay aligned with ``FIRST_LAUNCH_COMMANDS`` and do not revert to the legacy
+``python3 scripts/local_runner.py`` invocation.
 """
 
 from __future__ import annotations
@@ -30,6 +35,7 @@ if not (_REPO_ROOT / "docs").is_dir() and (Path("/repo") / "docs").is_dir():
     _REPO_ROOT = Path("/repo")
 
 _RUNBOOK_PATH = _REPO_ROOT / "docs" / "RUNNER_RUNBOOK.md"
+_RUNNER_INSTALL_PATH = _REPO_ROOT / "docs" / "runner-install.md"
 _BLUEPRINT_RUNNER = _REPO_ROOT / "scripts" / "blueprint_runner.py"
 
 # RunnerPreset = Literal["default", "strategic", "strategic_local"]
@@ -136,4 +142,47 @@ def test_first_launch_matches_shipped_cli() -> None:
         f"MIN_NODE_MAJOR={node_major} in scripts/blueprint_runner.py but "
         f"docs/RUNNER_RUNBOOK.md does not mention 'v{node_major}' or '>= {node_major}' — "
         "update the runbook's Prerequisites table to match."
+    )
+
+
+def test_runner_install_first_launch_matches_shipped_cli() -> None:
+    """docs/runner-install.md Section 2 must use the shipped blueprint-runner CLI.
+
+    Reads ``FIRST_LAUNCH_COMMANDS`` from ``scripts/blueprint_runner.py`` (the
+    source of truth for first-launch subcommands) and asserts that:
+
+    1. Each first-launch subcommand appears as ``blueprint-runner <cmd>`` in
+       ``docs/runner-install.md``, so a renamed or removed subcommand surfaces
+       immediately.
+    2. The legacy ``python3 scripts/local_runner.py`` invocation does not appear
+       in Section 2 (## 2. First launch), preventing regression to the old path
+       that predated the ``blueprint-runner`` CLI wrapper.
+
+    This test intentionally parses the source rather than importing it so
+    the backend test suite does not depend on the scripts/ Python path.
+    """
+    import re as _re
+
+    doc = _RUNNER_INSTALL_PATH.read_text()
+    commands = _extract_first_launch_commands()
+
+    for cmd in commands:
+        assert f"blueprint-runner {cmd}" in doc, (
+            f"'blueprint-runner {cmd}' not found in docs/runner-install.md — "
+            f"update the install doc or remove '{cmd}' from FIRST_LAUNCH_COMMANDS "
+            f"in scripts/blueprint_runner.py"
+        )
+
+    # Extract Section 2 to scope the legacy-invocation check.
+    section2_match = _re.search(
+        r"##\s*2\.\s*First launch.*?(?=##\s*\d\.|\Z)",
+        doc,
+        _re.IGNORECASE | _re.DOTALL,
+    )
+    section2 = section2_match.group() if section2_match else doc
+    assert "python3 scripts/local_runner.py" not in section2, (
+        "docs/runner-install.md Section 2 still references the legacy "
+        "'python3 scripts/local_runner.py' invocation. "
+        "Use 'blueprint-runner start' instead — the CLI wrapper is the "
+        "canonical first-launch path."
     )

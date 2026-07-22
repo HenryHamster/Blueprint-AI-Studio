@@ -1,9 +1,9 @@
 # Local Fleet Runner — Install and Service Setup
 
-The local runner (`scripts/local_runner.py`) lets you attach your own machine to
-Blueprint as a task executor. This guide covers enrolling a runner, persisting its
-credentials, and wiring it into systemd so it survives reboots and restarts
-automatically on crash.
+The `blueprint-runner` CLI lets you attach your own machine to Blueprint as a
+task executor. This guide covers enrolling a runner, persisting its credentials,
+and wiring it into systemd so it survives reboots and restarts automatically on
+crash.
 
 Agent-capable runners need Node.js 22+, Claude Code, and Codex CLI 0.144.1 or
 newer. Install the fleet-approved Codex build with optional native packages
@@ -72,19 +72,18 @@ again.
 
 ## 2. First launch (credential persistence)
 
-Set the token and orchestrator URL for the first run:
+Set the orchestrator URL and pass the token on the first run:
 
 ```bash
 export BLUEPRINT_ORCHESTRATOR_URL=https://your-orchestrator.example.com
-export BLUEPRINT_RUNNER_TOKEN=<paste token here>
-python3 scripts/local_runner.py
+blueprint-runner start --token <paste token here>
 ```
 
 On startup the runner automatically saves the token to `~/.blueprint/runner_token`
-(permissions `0600`). After this file exists you can omit `BLUEPRINT_RUNNER_TOKEN`
-from your environment — the runner reads it from the credential file on every
-subsequent start, so a reboot or crash-restart does **not** require re-enrolling
-(which would create a new runner identity and lose history).
+(permissions `0600`). After this file exists you can omit `--token` on subsequent
+invocations — the runner reads it from the credential file on every subsequent
+start, so a reboot or crash-restart does **not** require re-enrolling (which
+would create a new runner identity and lose history).
 
 To check the saved credential location:
 
@@ -258,7 +257,7 @@ journalctl --user -u blueprint-runner.service -b
 
 ```bash
 # Run the built-in preflight check (no work claimed)
-python3 scripts/local_runner.py --check
+blueprint-runner check
 ```
 
 Exit code `0` means the orchestrator is reachable, the token is valid, and at
