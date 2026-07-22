@@ -116,6 +116,93 @@ def test_no_protect_path_is_also_safe_to_cut():
     )
 
 
+def test_all_protect_test_ids_exist_in_their_files():
+    """Every test_id listed in a protect entry must exist as a real function.
+
+    A test can be deleted or renamed with the path guard still green — this
+    check closes that gap by scanning the file for a matching def/async-def
+    line. If a protected test is removed, this fails before CI can proceed
+    without coverage for that seam.
+    """
+    import re
+
+    manifest = _load_manifest()
+    missing = []
+    for entry in manifest["protect"]:
+        full_path = REPO_ROOT / entry["path"]
+        if not full_path.exists():
+            # test_all_protect_paths_exist already covers this; skip here
+            continue
+        # Only validate test_ids for Python files — TypeScript/TSX test suites
+        # use describe/it/test() patterns, not def, so the ids in those entries
+        # are descriptive labels rather than function names.
+        if not entry["path"].endswith(".py"):
+            continue
+        source = full_path.read_text(encoding="utf-8")
+        for test_id in entry["test_ids"]:
+            pattern = re.compile(
+                r"^\s*(?:async\s+)?def\s+" + re.escape(test_id) + r"\s*\(",
+                re.MULTILINE,
+            )
+            if not pattern.search(source):
+                missing.append(f"{entry['path']}::{test_id}")
+
+    assert not missing, (
+        "The following PROTECT-listed test_ids no longer exist as function "
+        "definitions in their files. Either restore the test or update the "
+        "manifest (with operator sign-off):\n"
+        + "\n".join(f"  - {m}" for m in missing)
+    )
+
+
+def test_removed_backend_resident_seams_are_absent():
+    """Deleted shadow-turn ORM classes must not reappear in models.py.
+
+    Migration 0657 dropped the eight strategic-resident tables. If a bad
+    restore reintroduces any of these as a SQLModel class definition, this
+    test fails immediately — before any migration chain is run and before
+    any CI job proceeds.
+    """
+    import re
+
+    # Class names corresponding to the tables dropped in migration 0657.
+    # SQLModel class names == PascalCase of the table name.
+    DELETED_RESIDENT_CLASSES = (
+        "StrategicResident",
+        "StrategicResidentCheckpoint",
+        "StrategicOperationReceipt",
+        "StrategicWorkerMemoryProposal",
+        "StrategicOperationApproval",
+        "StrategicResidentSweepState",
+        "StrategicResidentTaskTerminalEvent",
+        "StrategicResidentOrdinaryTaskTerminalEvent",
+    )
+
+    models_path = REPO_ROOT / "backend" / "app" / "models.py"
+    assert models_path.exists(), f"models.py not found at {models_path}"
+    source = models_path.read_text(encoding="utf-8")
+
+    reintroduced = []
+    for class_name in DELETED_RESIDENT_CLASSES:
+        # Match "class StrategicResident(" or "class StrategicResident:" but
+        # not substrings of longer names (e.g. StrategicResidentCheckpoint
+        # must not match a StrategicResidentCheckpointSomething guard).
+        pattern = re.compile(
+            r"^\s*class\s+" + re.escape(class_name) + r"\s*[\(:]",
+            re.MULTILINE,
+        )
+        if pattern.search(source):
+            reintroduced.append(class_name)
+
+    assert not reintroduced, (
+        "The following shadow-turn ORM classes were reintroduced into "
+        "backend/app/models.py. These belong to the autonomous resident "
+        "control plane that was permanently removed in migration 0657. "
+        "Remove the class definitions or revert the restore:\n"
+        + "\n".join(f"  - {c}" for c in reintroduced)
+    )
+
+
 def test_deleted_frontend_paths_are_absent():
     """Files deleted as part of the resident removal must NOT exist in the tree.
 

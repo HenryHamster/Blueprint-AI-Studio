@@ -19,7 +19,7 @@
         "test_poll_server_time_round_trips_as_next_cursor",
         "test_poll_since_is_inclusive_of_boundary",
         "test_poll_max_created_at_cursor_redelivers_boundary",
-        "test_poll_session_id_is_accepted_but_no_longer_scopes"
+        "test_poll_session_id_scopes_to_session_plus_legacy_rows"
       ]
     },
     {
@@ -70,39 +70,46 @@
       "test_ids": [
         "test_operator_workbench_current_state_contract_surfaces"
       ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
+      "reason": "Covers the StrategicSessionControl component — the operator UI for the conversational Workday session lifecycle. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "test_ids": [
+        "StrategicSessionControl_lifecycle_authority_keeps_legacy_fallback"
+      ]
+    },
+    {
+      "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
+      "reason": "Viewport snapshot test for StrategicSessionControl. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "test_ids": [
+        "StrategicSessionControl_viewport_375px",
+        "StrategicSessionControl_viewport_768px"
+      ]
+    },
+    {
+      "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
+      "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "test_ids": [
+        "useStrategicSession_liveness_fallback_resolves_mode_and_session_fields",
+        "useStrategicSession_liveness_fallback_heavy_model_takes_precedence"
+      ]
+    },
+    {
+      "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
+      "reason": "Covers strategicSessionLive streaming utility — live-streaming helpers for the conversational Workday session. Restored in #16075; guard ensures this test file is not silently deleted again.",
+      "test_ids": [
+        "strategicSessionLive_isStrategicReplyDelta_reply_vs_activity",
+        "strategicSessionLive_computeStrategicStreamingTurn_builds_from_reply_deltas"
+      ]
     }
   ],
 
   "deleted_frontend": [
     {
-      "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
-      "status": "RESTORE-ON-RESTORE",
-      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
-      "reason": "Covered the StrategicSessionControl component — the operator UI for starting, stopping, and messaging into a conversational Workday session. Must be re-added when the component is restored."
-    },
-    {
-      "path": "admin-ui/src/components/StrategicSessionControl.viewport.test.tsx",
-      "status": "RESTORE-ON-RESTORE",
-      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
-      "reason": "Viewport snapshot test for StrategicSessionControl. Must be re-added with the component."
-    },
-    {
       "path": "admin-ui/src/components/StrategicSessionEvents.test.tsx",
       "status": "RESTORE-ON-RESTORE",
       "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
       "reason": "Covered the StrategicSessionEvents component — the live event feed for a conversational session. Must be re-added when the component is restored."
-    },
-    {
-      "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
-      "status": "RESTORE-ON-RESTORE",
-      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
-      "reason": "Covered the useStrategicSession hook — the primary React hook for conversational Workday session state management. Must be re-added when the hook is restored."
-    },
-    {
-      "path": "admin-ui/src/utils/strategicSessionLive.test.ts",
-      "status": "RESTORE-ON-RESTORE",
-      "deleted_in": "#16030 (refactor: cut resident strategic session architecture)",
-      "reason": "Covered the strategicSessionLive utility — live-streaming helpers for the conversational session. Must be re-added when the utility is restored."
     },
     {
       "path": "admin-ui/src/components/ToolResidentHandoffControls.test.tsx",
