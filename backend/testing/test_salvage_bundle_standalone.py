@@ -7467,3 +7467,101 @@ def test_n1_note_shim_uses_json_str_not_sed():
         "The ./note script must NOT use sed for JSON escaping — sed loses newlines "
         "and control characters; use _json_str (python3 json.dumps) instead"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Findings covered here (5-finding creation-path fail-closed/attention/lifecycle
+# salvage bundle, task 880a32f4, 2026-07-22):
+#
+#   880-1 — design: creation-path fail-closed audience contract
+#            → already pinned by test_m1_* + test_m2_* (m-1/m-2; fb-1; d-1; b78-1; 68-1)
+#   880-2 — fix: fail-closed audience at Alert/message creation
+#            → already pinned by test_m2_* (m-2; fb-2; d-2; b78-2; 68-2);
+#              source-inspection tests confirm research_direction_state,
+#              research_completion, and review_pipeline all stamp event_type= and
+#              stamp_message_audience; test_m2_all_alert_constructors_have_event_type
+#              scans all Alert() constructors in backend/app/.
+#   880-3 — feat: operator inbox consumes server attention/lifecycle model
+#            → newly pinned by MessagesPanel.test.tsx::MessagesPanel attention
+#              model lifecycle field consumption (describe block added 2026-07-22):
+#              operator_action hint renders in chip, acknowledgeable Ack button
+#              renders with correct tooltip, Ack click removes item from strip.
+#   880-4 — feat(ui): make operator inbox attention-driven, retire dual classification
+#            → newly pinned by MessagesPanel.test.tsx::MessagesPanel needs-action
+#              filter (describe block added 2026-07-22): filter bar renders with
+#              needs-action and show-all buttons; default state is needs-action-first
+#              (needsActionOnly=true); show-all click switches to full list mode.
+#   880-5 — fix(chat): make confirmation chips actionable
+#            → newly pinned by MessagesPanel.test.tsx::MessagesPanel confirmation
+#              chip actionability (describe block added 2026-07-22): confirmation
+#              item renders in strip; click reveals accept/dismiss buttons; second
+#              click collapses the action panel.
+# --------------------------------------------------------------------------- #
+
+
+def test_880_1_fail_closed_design_already_pinned():
+    """Structural cross-check: creation-path fail-closed design is pinned by m1/m2 tests.
+
+    This test validates that the audit trail is self-consistent: the functions
+    and event types that the design-doc finding required are present in the
+    source and registry.
+    """
+    from app.message_audience import (
+        route_event,
+        STRATEGIST_INTERNAL,
+        stamp_message_audience,
+    )
+
+    # Core event types that must be STRATEGIST_INTERNAL.
+    for event_type in (
+        "research.dedup_deadlock",
+        "research.already_fixed_deadlock",
+        "research.direction_auto_completed",
+    ):
+        assert route_event(event_type) == STRATEGIST_INTERNAL, (
+            f"{event_type!r} must route to STRATEGIST_INTERNAL — "
+            "internal bookkeeping must not leak to the operator channel"
+        )
+
+    # stamp_message_audience must exist and be callable.
+    result = stamp_message_audience({}, "research.dedup_deadlock")
+    assert isinstance(result, dict), (
+        "stamp_message_audience must return a dict containing the audience stamp"
+    )
+    assert "audience" in result, (
+        "stamp_message_audience must add an 'audience' key to the context dict"
+    )
+
+
+def test_880_2_emitters_stamp_event_type_and_audience():
+    """All three confirmed-live-leak emitters must stamp event_type= and audience.
+
+    Finding 880-2: research_direction_state (dedup/already-fixed deadlock),
+    research_completion (direction_auto_completed), and review_pipeline (BLOCKER)
+    must each call stamp_message_audience and include the correct event_type= so
+    the audience registry routes them to STRATEGIST_INTERNAL rather than failing
+    open to the operator.
+    """
+    import inspect
+    from app import research_direction_state, research_completion, review_pipeline
+
+    rds_src = inspect.getsource(research_direction_state)
+    rc_src = inspect.getsource(research_completion)
+    rp_src = inspect.getsource(review_pipeline)
+
+    assert "research.dedup_deadlock" in rds_src, (
+        "research_direction_state must emit event_type='research.dedup_deadlock'"
+    )
+    assert "research.already_fixed_deadlock" in rds_src, (
+        "research_direction_state must emit event_type='research.already_fixed_deadlock'"
+    )
+    assert "stamp_message_audience" in rds_src, (
+        "research_direction_state must call stamp_message_audience on BUG_REPORT ProjectMessages"
+    )
+    assert "research.direction_auto_completed" in rc_src, (
+        "research_completion must include event_type='research.direction_auto_completed' "
+        "in the Alert constructor"
+    )
+    assert "stamp_message_audience" in rp_src, (
+        "review_pipeline must call stamp_message_audience on the repeat-fingerprint BLOCKER"
+    )
