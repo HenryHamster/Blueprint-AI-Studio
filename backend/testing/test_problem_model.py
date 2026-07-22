@@ -6087,3 +6087,61 @@ def test_auto_clear_empty_model_is_noop():
     )
     assert cleared == []
     assert model.model_dump() == before
+
+
+def test_apply_agent_update_poisoned_current_raw_with_truncated_self_heals():
+    """A stored problem_model containing 'truncated': true at the top level
+    (a stale packer marker that was somehow persisted) must not block every
+    subsequent agent write with 400.  apply_agent_update strips unknown extra
+    top-level keys from current_raw before parsing so the write succeeds and
+    the persisted output contains no marker keys."""
+    current = {
+        "revision": 5,
+        "truncated": True,  # poisoning marker
+        "intent": {"purpose": "Some purpose.", "current_focus": ""},
+    }
+    proposed = {
+        "intent": {"purpose": "Updated purpose.", "current_focus": "Focus."},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-07-21T10:00:00")
+    # Write succeeds; revision incremented from 5
+    assert new_raw["revision"] == 6
+    assert new_raw["intent"]["purpose"] == "Updated purpose."
+    # Marker key must not appear in the persisted output
+    assert "truncated" not in new_raw
+
+
+def test_apply_agent_update_proposed_with_truncated_stripped_not_rejected():
+    """An agent that echoes back a packer-truncated view (carrying 'truncated':
+    true in proposed_raw) must have the key silently stripped rather than
+    receiving a permanent 400."""
+    current = {
+        "revision": 2,
+        "intent": {"purpose": "Stable purpose.", "current_focus": ""},
+    }
+    proposed = {
+        "truncated": True,  # agent echoed back packer view marker
+        "intent": {"purpose": "Stable purpose.", "current_focus": "New focus."},
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-07-21T10:00:00")
+    assert new_raw["revision"] == 3
+    assert "truncated" not in new_raw
+
+
+def test_apply_agent_update_both_current_and_proposed_poisoned_succeeds():
+    """When both the stored model AND the proposed payload carry 'truncated': true
+    (worst-case: poisoned DB row + agent echoing the truncated view), both are
+    sanitized and the write succeeds with a clean output model."""
+    current = {
+        "revision": 10,
+        "truncated": True,
+        "intent": {"purpose": "Old purpose.", "current_focus": ""},
+    }
+    proposed = {
+        "truncated": True,
+        "intent": {"purpose": "Fresh purpose.", "current_focus": ""},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, "2026-07-21T11:00:00")
+    assert new_raw["revision"] == 11
+    assert new_raw["intent"]["purpose"] == "Fresh purpose."
+    assert "truncated" not in new_raw
