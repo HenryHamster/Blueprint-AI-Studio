@@ -54,6 +54,7 @@ _total_badge_invisible: int = 0
 _total_info_alert_noise: int = 0
 _total_remediated: int = 0
 _total_reply_audience_quarantined: int = 0
+_total_reply_audience_healed: int = 0
 
 # ── Persistence / escalation constants ────────────────────────────────────
 
@@ -65,6 +66,12 @@ _DEDUPE_KEY_PREFIX = "operator_inbox_leak:"
 
 _ESCALATION_EVENT_TYPE = "operator_inbox_leak_persistent"
 """Event type registered as STRATEGIST_INTERNAL — never reaches the operator channel."""
+
+_QUARANTINE_ALERT_DEDUPE_PREFIX = "reply_quarantine_unhealed:"
+"""Stable dedupe-key prefix for once-per-episode operator-visible quarantine alert."""
+
+_QUARANTINE_ALERT_EVENT_TYPE = "delivery.reply_quarantine_unhealed"
+"""Event type registered as OPERATOR_ACTION_NEEDED — surfaces in the operator channel."""
 
 
 class LivenessResult(NamedTuple):
@@ -78,6 +85,7 @@ class LivenessResult(NamedTuple):
     detail: str
     remediated_count: int = 0
     reply_audience_quarantined: int = 0
+    reply_audience_healed: int = 0
 
 
 # ── Durable persistence helpers ────────────────────────────────────────────
@@ -292,6 +300,125 @@ async def _resolve_open_escalation(
         )
 
 
+# ── Quarantine alert helpers ──────────────────────────────────────────────
+
+
+async def _find_open_quarantine_alert(
+    session: Any,
+    project_id: str,
+) -> Any:
+    """Return the open operator-visible quarantine alert for *project_id*, or None."""
+    try:
+        from app.models import ProjectMessage
+
+        dedupe_key = f"{_QUARANTINE_ALERT_DEDUPE_PREFIX}{project_id}"
+        result = await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == "open",
+                ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+            )
+            .limit(1)
+        )
+        return result.scalars().first()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Quarantine alert dedup lookup failed for %s",
+            project_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _escalate_reply_quarantine_alert(
+    session: Any,
+    result: "LivenessResult",
+) -> None:
+    """Create or update an OPERATOR_ACTION_NEEDED alert for reply-audience quarantine.
+
+    Unlike the persistent-leak escalation (which requires >= 3 consecutive flagged
+    ticks and routes STRATEGIST_INTERNAL), this alert fires on the FIRST tick a
+    quarantined reply is detected and routes to OPERATOR_ACTION_NEEDED so the
+    operator immediately sees that their reply was dropped.  A stable dedupe_key
+    prevents duplicate alerts within a single episode; subsequent ticks update the
+    existing open alert in place.  Auto-resolved by ``_resolve_reply_quarantine_alert``
+    when the quarantine count reaches zero on a clean tick.
+    """
+    try:
+        import uuid as _uuid
+
+        existing = await _find_open_quarantine_alert(session, result.project_id)
+        if existing is not None:
+            ctx = dict(existing.context or {})
+            ctx["reply_audience_quarantined"] = result.reply_audience_quarantined
+            ctx["reply_audience_healed"] = result.reply_audience_healed
+            ctx["tick_number"] = _total_ticks
+            existing.content = (
+                f"[OPERATOR_INBOX_LIVENESS] Reply-audience quarantine detected "
+                f"for project {result.project_id}: "
+                f"{result.reply_audience_quarantined} operator-directed reply/replies "
+                f"stamped with a non-operator audience (quarantined — not delivered). "
+                f"Healed this tick: {result.reply_audience_healed}. "
+                f"Re-check if this alert persists."
+            )
+            existing.context = ctx
+            session.add(existing)
+            return
+
+        from app.notification_dispatch import post_event_message
+
+        dedupe_key = f"{_QUARANTINE_ALERT_DEDUPE_PREFIX}{result.project_id}"
+        summary = (
+            f"Operator-directed reply(ies) quarantined (never delivered) "
+            f"for project {result.project_id}: "
+            f"{result.reply_audience_quarantined} message(s) stamped with a "
+            f"non-operator audience (strategist-internal or pipeline-log) instead "
+            f"of the expected operator-fyi audience. "
+            f"A heal was attempted this tick ({result.reply_audience_healed} healed). "
+            f"Detail: {result.detail[:400]}"
+        )
+        ctx = {
+            "reply_audience_quarantined": result.reply_audience_quarantined,
+            "reply_audience_healed": result.reply_audience_healed,
+            "tick_number": _total_ticks,
+            "dedupe_key": dedupe_key,
+        }
+        await post_event_message(
+            session,
+            project_id=_uuid.UUID(result.project_id),
+            event_type=_QUARANTINE_ALERT_EVENT_TYPE,
+            summary=summary,
+            context=ctx,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to create quarantine alert for %s",
+            result.project_id,
+            exc_info=True,
+        )
+
+
+async def _resolve_reply_quarantine_alert(
+    session: Any,
+    project_id: str,
+) -> None:
+    """Resolve any open quarantine alert for *project_id* on a clean tick."""
+    try:
+        existing = await _find_open_quarantine_alert(session, project_id)
+        if existing is None:
+            return
+        existing.status = "resolved"
+        existing.resolution = "auto-resolved (zero quarantined replies)"
+        session.add(existing)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[OPERATOR_INBOX_LIVENESS] Failed to resolve quarantine alert for %s",
+            project_id,
+            exc_info=True,
+        )
+
+
 # ── Remediation helper ────────────────────────────────────────────────────
 
 
@@ -324,6 +451,44 @@ def _remediate_forward_leaked_messages(session: Any, msgs: list) -> int:
     return count
 
 
+async def _heal_quarantined_replies(
+    session: Any,
+    msgs: list,
+    project_id: str,
+) -> int:
+    """Re-stamp quarantined reply messages with an operator-visible audience.
+
+    Each row is re-stamped via ``stamp_message_audience`` with event_type
+    ``'question_answer'`` — the reply default fixed in #16040 that resolves to
+    OPERATOR_FYI — and ``delivered_at`` is set so the durable receipt records
+    that the heal closed the delivery gap.  Each healed row is broadcast so the
+    reply surfaces in the operator chat immediately without a page refresh.
+
+    Returns the number of rows successfully healed.  Error-isolated per-message
+    so a single malformed row never aborts the tick.  Does NOT re-stamp rows
+    whose audience is already operator-visible (the fetch filter guarantees this).
+    """
+    from app.message_audience import stamp_message_audience
+    from app.broadcast import broadcast_to_project
+    from app.project_message_projection import message_updated_event_payload
+
+    count = 0
+    for msg in msgs:
+        with contextlib.suppress(Exception):
+            ctx = dict(msg.context or {})
+            new_ctx = stamp_message_audience(ctx, "question_answer")
+            msg.context = new_ctx
+            msg.delivered_at = _utcnow()
+            session.add(msg)
+            await broadcast_to_project(
+                project_id,
+                "message_updated",
+                message_updated_event_payload(msg),
+            )
+            count += 1
+    return count
+
+
 # ── Main liveness check ────────────────────────────────────────────────────
 
 
@@ -350,7 +515,7 @@ async def run_operator_inbox_liveness_check(
     """
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
-    global _total_reply_audience_quarantined
+    global _total_reply_audience_quarantined, _total_reply_audience_healed
 
     if now is None:
         now = _utcnow()
@@ -487,10 +652,35 @@ async def run_operator_inbox_liveness_check(
                 f"{info_alert_count} INFO alert(s) in operator-visible "
                 "alert channel (non-actionable alert noise)"
             )
+        # Heal: fetch and re-stamp quarantined reply rows so they surface in the
+        # operator chat immediately.  The pre-heal count is preserved in
+        # reply_audience_quarantined for observability; healed_count records the
+        # durable re-deliveries made this tick.
+        healed_count = 0
+        if quarantined_reply_count > 0:
+            quarantined_msgs = (
+                await session.execute(
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.reply_to_message_id.isnot(None),
+                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                        ProjectMessage.context["audience"].as_string().in_(
+                            _NON_OPERATOR_AUDIENCES
+                        ),
+                    )
+                    .limit(sample_limit)
+                )
+            ).scalars().all()
+            healed_count = await _heal_quarantined_replies(
+                session, quarantined_msgs, pid
+            )
+
         if quarantined_reply_count:
+            heal_note = f", {healed_count} healed this tick" if healed_count else ""
             parts.append(
                 f"{quarantined_reply_count} reply message(s) quarantined in "
-                "non-operator audience (reply-audience quarantine)"
+                f"non-operator audience (reply-audience quarantine{heal_note})"
             )
 
         status = "flagged" if delta > 0 else "ok"
@@ -513,6 +703,7 @@ async def run_operator_inbox_liveness_check(
                 detail=detail,
                 remediated_count=remediated,
                 reply_audience_quarantined=quarantined_reply_count,
+                reply_audience_healed=healed_count,
             )
         )
 
@@ -521,6 +712,7 @@ async def run_operator_inbox_liveness_check(
         _total_info_alert_noise += info_alert_count
         _total_remediated += remediated
         _total_reply_audience_quarantined += quarantined_reply_count
+        _total_reply_audience_healed += healed_count
 
     _total_ticks += 1
     tick_forward = sum(r.forward_leaked for r in results)
@@ -528,6 +720,7 @@ async def run_operator_inbox_liveness_check(
     tick_alerts = sum(r.info_alert_noise for r in results)
     tick_remediated = sum(r.remediated_count for r in results)
     tick_quarantined = sum(r.reply_audience_quarantined for r in results)
+    tick_healed = sum(r.reply_audience_healed for r in results)
     flagged = [r for r in results if r.status == "flagged"]
     tick_summary: Dict[str, Any] = {
         "tick": _total_ticks,
@@ -538,6 +731,7 @@ async def run_operator_inbox_liveness_check(
         "info_alert_noise": tick_alerts,
         "remediated": tick_remediated,
         "reply_audience_quarantined": tick_quarantined,
+        "reply_audience_healed": tick_healed,
     }
     _observability_ring.append(tick_summary)
 
@@ -562,6 +756,19 @@ async def run_operator_inbox_liveness_check(
     for result in results:
         with contextlib.suppress(Exception):
             await _persist_observation(session, result, _total_ticks, now)
+
+    # ── Reply-quarantine operator alert ────────────────────────────────────
+    # Fire an OPERATOR_ACTION_NEEDED alert on first detection of quarantined
+    # replies; resolve it when the quarantine count reaches zero.  This alert
+    # fires immediately (no persistence threshold), making the dropped-reply bug
+    # class operator-visible on the first tick rather than only after >= 3 ticks.
+    for result in results:
+        if result.reply_audience_quarantined > 0:
+            with contextlib.suppress(Exception):
+                await _escalate_reply_quarantine_alert(session, result)
+        elif result.status in ("ok", "skipped"):
+            with contextlib.suppress(Exception):
+                await _resolve_reply_quarantine_alert(session, result.project_id)
 
     for result in flagged:
         with contextlib.suppress(Exception):
@@ -603,6 +810,7 @@ def get_operator_inbox_liveness_observability() -> Dict[str, Any]:
         "total_info_alert_noise": _total_info_alert_noise,
         "total_remediated": _total_remediated,
         "total_reply_audience_quarantined": _total_reply_audience_quarantined,
+        "total_reply_audience_healed": _total_reply_audience_healed,
         "recent_ticks": list(_observability_ring),
     }
 
@@ -611,7 +819,7 @@ def _reset_liveness_for_tests() -> None:
     """Test helper — clear process-local counters and cadence gate."""
     global _last_liveness_check, _total_ticks
     global _total_forward_leaked, _total_badge_invisible, _total_info_alert_noise, _total_remediated
-    global _total_reply_audience_quarantined
+    global _total_reply_audience_quarantined, _total_reply_audience_healed
     _last_liveness_check = None
     _total_ticks = 0
     _total_forward_leaked = 0
@@ -619,4 +827,5 @@ def _reset_liveness_for_tests() -> None:
     _total_info_alert_noise = 0
     _total_remediated = 0
     _total_reply_audience_quarantined = 0
+    _total_reply_audience_healed = 0
     _observability_ring.clear()

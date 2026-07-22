@@ -1352,3 +1352,188 @@ def test_liveness_observability_snapshot_includes_reply_audience_quarantined_key
     assert snapshot2["total_reply_audience_quarantined"] == 5
 
     _liveness_mod._reset_liveness_for_tests()
+
+
+# ---------------------------------------------------------------------------
+# Heal + zero-quarantine invariant tests
+# ---------------------------------------------------------------------------
+
+
+async def _get_quarantine_alert_messages(session, project_id: str) -> list:
+    """Return ProjectMessages carrying the quarantine-alert dedupe_key."""
+    from app.models import ProjectMessage
+    from sqlmodel import select
+
+    dedupe_key = f"reply_quarantine_unhealed:{project_id}"
+    result = await session.execute(
+        select(ProjectMessage).where(
+            ProjectMessage.project_id == _uuid.UUID(project_id),
+            ProjectMessage.context["dedupe_key"].as_string() == dedupe_key,
+        )
+    )
+    return list(result.scalars().all())
+
+
+@pytest.mark.asyncio
+async def test_quarantined_reply_is_healed_audience_restamped_and_delivered(db_session):
+    """A quarantined reply is healed within the liveness tick: its audience is
+    re-stamped to an operator-visible value and delivered_at is set.
+
+    This is the acceptance test for the re-delivery heal feature (part A).
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL, is_operator_visible
+    from app.models import ProjectMessage
+    from sqlmodel import select as _select
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "heal-reply-test")
+    reply_id, _ = await _create_reply_message(
+        db_session, project_id, audience=STRATEGIST_INTERNAL
+    )
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+
+    # Heal count must be reported in the result
+    assert r.reply_audience_healed >= 1, (
+        f"Expected reply_audience_healed >= 1, got {r.reply_audience_healed}"
+    )
+
+    # The row must now have an operator-visible audience
+    msg = (
+        await db_session.execute(
+            _select(ProjectMessage).where(
+                ProjectMessage.id == _uuid.UUID(reply_id)
+            )
+        )
+    ).scalars().first()
+    assert msg is not None
+
+    healed_audience = (msg.context or {}).get("audience")
+    assert is_operator_visible(healed_audience), (
+        f"Healed reply must have operator-visible audience, got {healed_audience!r}"
+    )
+    # Durable receipt: delivered_at must be stamped
+    assert msg.delivered_at is not None, (
+        "Healed reply must have delivered_at stamped as durable delivery receipt"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_reply_audience_healed_in_observability_snapshot(db_session):
+    """total_reply_audience_healed increments in the observability snapshot
+    after a tick that heals quarantined replies."""
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "healed-obs-test")
+    await _create_reply_message(db_session, project_id, audience=STRATEGIST_INTERNAL)
+
+    await _liveness_mod.run_operator_inbox_liveness_check(db_session, _force=True)
+
+    snapshot = _liveness_mod.get_operator_inbox_liveness_observability()
+    assert "total_reply_audience_healed" in snapshot, (
+        "Observability snapshot must include total_reply_audience_healed"
+    )
+    assert snapshot["total_reply_audience_healed"] >= 1, (
+        f"Expected total_reply_audience_healed >= 1 after heal tick, "
+        f"got {snapshot['total_reply_audience_healed']}"
+    )
+    # Tick summary must also carry the heal count
+    assert snapshot["recent_ticks"], "recent_ticks must be non-empty after a run"
+    last_tick = snapshot["recent_ticks"][-1]
+    assert last_tick.get("reply_audience_healed", 0) >= 1, (
+        f"Tick summary must record reply_audience_healed, got {last_tick}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_nonzero_reply_quarantine_alerts_operator_and_blocks_clean_tick(db_session):
+    """A detected reply-audience quarantine:
+      (1) blocks the tick from being reported clean (status='flagged'), and
+      (2) creates an OPERATOR_ACTION_NEEDED alert (not STRATEGIST_INTERNAL).
+
+    After the heal clears the quarantine, the next tick is reported clean and
+    the operator alert is auto-resolved.
+
+    This is the named acceptance test for the zero-quarantine clean-tick invariant.
+    """
+    import app.operator_inbox_liveness as _liveness_mod
+    from app.message_audience import STRATEGIST_INTERNAL, is_operator_visible
+
+    _liveness_mod._reset_liveness_for_tests()
+    project_id = await _create_test_project(db_session, "quarantine-invariant-test")
+
+    # Tick 1: quarantined reply detected → tick is flagged + operator-visible alert fires.
+    await _create_reply_message(db_session, project_id, audience=STRATEGIST_INTERNAL)
+
+    results = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results is not None
+
+    proj = [r for r in results if r.project_id == project_id]
+    assert proj, f"No result for project {project_id}"
+    r = proj[0]
+
+    # Tick must be flagged — nonzero quarantine blocks clean tick.
+    assert r.status == "flagged", (
+        f"Tick with quarantined reply must be flagged (blocks clean), got {r.status!r}"
+    )
+    assert r.reply_audience_quarantined == 1, (
+        f"Expected reply_audience_quarantined=1, got {r.reply_audience_quarantined}"
+    )
+
+    # Operator-visible alert must exist (dedupe_key in context).
+    alert_msgs = await _get_quarantine_alert_messages(db_session, project_id)
+    assert len(alert_msgs) >= 1, (
+        "An operator-visible quarantine alert must be created on first detection"
+    )
+    alert = next(m for m in alert_msgs if m.status == "open")
+
+    # Alert must be OPERATOR-visible — NOT strategist-internal.
+    alert_audience = (alert.context or {}).get("audience")
+    assert is_operator_visible(alert_audience), (
+        f"Quarantine alert must have an operator-visible audience, got {alert_audience!r} "
+        f"(must NOT be strategist-internal)"
+    )
+
+    # Tick 2: heal succeeded on tick 1 → quarantined_reply_count=0 → clean tick.
+    results2 = await _liveness_mod.run_operator_inbox_liveness_check(
+        db_session, _force=True
+    )
+    assert results2 is not None
+
+    proj2 = [r for r in results2 if r.project_id == project_id]
+    if proj2:
+        assert proj2[0].reply_audience_quarantined == 0, (
+            f"reply_audience_quarantined must be 0 after heal, "
+            f"got {proj2[0].reply_audience_quarantined}"
+        )
+        assert proj2[0].status in ("ok", "skipped"), (
+            f"Tick must be clean after all replies healed, got {proj2[0].status!r}"
+        )
+
+    # Quarantine alert must be auto-resolved on clean tick.
+    await db_session.refresh(alert)
+    assert alert.status == "resolved", (
+        f"Quarantine alert must be auto-resolved after clean tick, "
+        f"got status={alert.status!r}"
+    )
+    assert alert.resolution == "auto-resolved (zero quarantined replies)", (
+        f"Unexpected resolution text: {alert.resolution!r}"
+    )
+
+    _liveness_mod._reset_liveness_for_tests()

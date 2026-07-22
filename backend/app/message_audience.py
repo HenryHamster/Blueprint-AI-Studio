@@ -335,6 +335,12 @@ _EVENT_AUDIENCE_REGISTRY: dict[str, str] = {
     # forward-leak / alert-noise signal reaches the strategist surface without
     # creating new operator-facing noise (the very bug this signal detects).
     "operator_inbox_leak_persistent": STRATEGIST_INTERNAL,
+    # delivery.reply_quarantine_unhealed: an operator-directed reply was stamped
+    # with a non-operator audience (quarantined / never delivered to the operator).
+    # Fires once per episode when the liveness checker detects quarantined replies;
+    # OPERATOR_ACTION_NEEDED so the operator sees that their reply was dropped and
+    # a heal was attempted.  Auto-resolves when the quarantine count reaches zero.
+    "delivery.reply_quarantine_unhealed": OPERATOR_ACTION_NEEDED,
 }
 
 # Set of audiences that reach the operator through normal channels.
