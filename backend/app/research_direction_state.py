@@ -1137,13 +1137,24 @@ async def apply_post_spawn_state(
             if _pending_archived_diagnoses:
                 session.expire(project, ["design_doc"])
 
+                _captured_diagnoses_archive: dict = {}
+
                 def _apply_archived_diagnoses(doc: dict) -> None:
                     for _d_snap, _did in _pending_archived_diagnoses:
                         _append_archived_diagnosis(doc, _d_snap, _did)
+                    _captured_diagnoses_archive["value"] = doc.get("retired_diagnoses_archive")
 
                 await with_design_doc_locked(
                     session, task.project_id, _apply_archived_diagnoses
                 )
+                if _captured_diagnoses_archive.get("value") is not None:
+                    from app.project_telemetry import set_project_telemetry
+                    await set_project_telemetry(
+                        session,
+                        task.project_id,
+                        "retired_diagnoses_archive",
+                        _captured_diagnoses_archive["value"],
+                    )
                 await session.commit()
 
                 # Reconcile problem-model gaps for the directions auto-completed

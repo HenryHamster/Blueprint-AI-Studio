@@ -303,6 +303,7 @@ async def persist_version_lane_baseline(
     }
 
     result: Dict[str, Any] = {"stored": None, "skipped": False}
+    _captured_baselines: dict = {}
     version_key = str(version_number)
 
     def _store_baseline(doc: dict) -> None:
@@ -324,8 +325,12 @@ async def persist_version_lane_baseline(
                 del baselines[old_key]
         doc[DESIGN_DOC_KEY] = baselines
         result["stored"] = slimmed
+        _captured_baselines.update(baselines)
 
     applied = await with_lane_baseline_locked(session, project_id, _store_baseline)
+    if applied and _captured_baselines:
+        from app.project_telemetry import set_project_telemetry
+        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, dict(_captured_baselines))
     if not applied:
         logger.warning(
             "[LANE_BASELINE] project %s not found; v%d baseline not persisted",

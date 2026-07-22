@@ -6137,3 +6137,35 @@ class ProjectSRAnalytics(SQLModel, table=True):
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )
 
+
+class ProjectTelemetry(SQLModel, table=True):
+    """Per-project telemetry blobs moved out of design_doc to reduce row contention.
+
+    Each row holds one reserved key (e.g. ``efficiency_baseline``) for a
+    project.  Writers dual-write to both design_doc and this table during the
+    transition; readers continue to use design_doc until migrated.
+    """
+
+    __tablename__ = "project_telemetry"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        )
+    )
+    key: str = Field(sa_column=Column(String(100), nullable=False))
+    value: Any = Field(sa_column=Column(JSONB, nullable=True))
+    updated_at: datetime = Field(
+        sa_column=Column(NaiveUTCDateTime, nullable=False)
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id", "key", name="uq_project_telemetry_project_key"
+        ),
+        Index("ix_project_telemetry_project_id", "project_id"),
+    )
+

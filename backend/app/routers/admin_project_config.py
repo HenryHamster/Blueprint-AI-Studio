@@ -1694,6 +1694,9 @@ async def update_playbook_entry(
     project.design_doc = doc
     flag_modified(project, "design_doc")
     session.add(project)
+    if action == "archive" and doc.get("playbook_archive") is not None:
+        from app.project_telemetry import set_project_telemetry
+        await set_project_telemetry(session, project.id, "playbook_archive", doc["playbook_archive"])
     await session.commit()
 
     if action == "archive":

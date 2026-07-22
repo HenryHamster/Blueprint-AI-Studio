@@ -3960,6 +3960,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "status": "pending",
             }
 
+            _captured_proposals: dict = {}
+
             def _add_obs_proposal(doc: dict) -> None:
                 proposals = doc.get("proposed_changes", [])
                 # Dedup: skip if identical observation already exists
@@ -3971,8 +3973,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 if not existing:
                     proposals.append(_obs_entry)
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
+                _captured_proposals["value"] = doc["proposed_changes"]
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
+            if _captured_proposals.get("value") is not None:
+                from app.project_telemetry import set_project_telemetry
+                await set_project_telemetry(
+                    session, task.project_id, "proposed_changes", _captured_proposals["value"]
+                )
             type_filtered_count += 1
             _tf_did = finding.get("direction_id") or _parent_direction_id
             if _tf_did:

@@ -3094,6 +3094,9 @@ async def write_snapshot(
         flag_modified(eff_row, "data")
         session.add(eff_row)
 
+    from app.project_telemetry import set_project_telemetry
+    await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, container)
+
     logger.info(
         "[EFFICIENCY_SNAPSHOT] project=%s captured_at=%s axes=%s",
         project_id,
@@ -4020,11 +4023,15 @@ async def maybe_alert_pool_payoff_transition(
             return
         container[LAST_ALERTED_PAYOFF_KEY] = state
         changed["fire"] = True
+        changed["container"] = container
 
     wrote_marker = await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if wrote_marker and changed["fire"]:
+        from app.project_telemetry import set_project_telemetry
+        if "container" in changed:
+            await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
         await session.commit()
     else:
         await session.rollback()
@@ -4095,10 +4102,14 @@ async def maybe_alert_unpriced_models_coverage(
             return  # no transition — leave the marker untouched
         container[LAST_ALERTED_UNPRICED_KEY] = new_state
         changed["fire"] = degraded  # only the degraded crossing raises an alert
+        changed["container"] = container
 
     await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
+    if changed.get("container") is not None:
+        from app.project_telemetry import set_project_telemetry
+        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
     if not changed["fire"]:
         return None
 
@@ -4181,10 +4192,14 @@ async def maybe_alert_self_repair_burn_share(
             return  # no transition — leave the marker untouched
         container[LAST_ALERTED_SELF_REPAIR_BURN_SHARE_KEY] = new_state
         changed["fire"] = elevated  # only the elevated crossing raises an alert
+        changed["container"] = container
 
     await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
+    if changed.get("container") is not None:
+        from app.project_telemetry import set_project_telemetry
+        await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
     if not changed["fire"]:
         return None
 
@@ -4290,11 +4305,15 @@ async def maybe_alert_provider_routing_transition(
             return
         container[LAST_ALERTED_ROUTING_KEY] = state
         changed["fire"] = True
+        changed["container"] = container
 
     wrote_marker = await with_efficiency_snapshot_locked(
         session, project_id, _advance_marker, skip_locked=False
     )
     if wrote_marker and changed["fire"]:
+        from app.project_telemetry import set_project_telemetry
+        if "container" in changed:
+            await set_project_telemetry(session, project_id, DESIGN_DOC_KEY, changed["container"])
         await session.commit()
     else:
         await session.rollback()

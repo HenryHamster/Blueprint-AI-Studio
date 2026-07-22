@@ -752,6 +752,15 @@ async def extract_review_feedback_to_playbook(
         flag_modified(project, "design_doc")
         session.add(project)
 
+        if module_profiles_updated:
+            from app.project_telemetry import set_project_telemetry
+            await set_project_telemetry(
+                session,
+                task.project_id,
+                _MODULE_FEEDBACK_KEY,
+                dict(doc.get(_MODULE_FEEDBACK_KEY) or {}),
+            )
+
         if created_keys:
             logger.info(
                 "[REVIEW_PLAYBOOK] project=%s PR #%d iteration=%d created entries: %s",

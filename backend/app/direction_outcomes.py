@@ -2678,13 +2678,26 @@ async def _update_direction_research_outcomes(
         # clobber the newly-added research_history metrics in the same session.
         await session.flush()
         session.expire(project, ["design_doc"])
-        await with_design_doc_locked(
-            session,
-            project_id,
-            lambda doc: _apply_cochange_to_doc(
-                doc, merged_files_lists, pr_keys=merged_pr_keys
-            ),
-        )
+        _cochange_captured: dict = {}
+
+        def _cochange_mutate(doc: dict) -> None:
+            _apply_cochange_to_doc(doc, merged_files_lists, pr_keys=merged_pr_keys)
+            _cochange_captured["cochange_index"] = doc.get("cochange_index")
+            _cochange_captured["cochange_applied_prs"] = doc.get("cochange_applied_prs")
+
+        await with_design_doc_locked(session, project_id, _cochange_mutate)
+        from app.project_telemetry import set_project_telemetry
+        if _cochange_captured.get("cochange_index") is not None:
+            await set_project_telemetry(
+                session, project_id, "cochange_index", _cochange_captured["cochange_index"]
+            )
+        if _cochange_captured.get("cochange_applied_prs") is not None:
+            await set_project_telemetry(
+                session,
+                project_id,
+                "cochange_applied_prs",
+                _cochange_captured["cochange_applied_prs"],
+            )
 
     await session.commit()
 

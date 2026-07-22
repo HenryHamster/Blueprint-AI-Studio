@@ -2927,6 +2927,17 @@ async def claim_task(
                         _pb_proj.design_doc = doc
                         flag_modified(_pb_proj, "design_doc")
                         session.add(_pb_proj)
+                        if doc.get("playbook_archive") is not None:
+                            try:
+                                from app.project_telemetry import set_project_telemetry
+                                await set_project_telemetry(
+                                    session,
+                                    _pb_proj.id,
+                                    "playbook_archive",
+                                    doc["playbook_archive"],
+                                )
+                            except Exception:  # noqa: BLE001 — best-effort
+                                logger.debug("[AGENT] playbook_archive telemetry dual-write skipped")
                 # Store shown playbook keys in task context for outcome tracking at completion
                 task_ctx = dict(task.context or {})
                 task_ctx["_shown_playbook_keys"] = list(playbook_entries.keys())
