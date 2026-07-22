@@ -3615,6 +3615,15 @@ class ProjectMessage(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Server-stamped when at least one WS client acknowledges delivery of the
+    # broadcast frame (message_ack). NULL for messages that were never delivered
+    # or whose ack was lost — this IS the durable diagnostic record of a
+    # delivery gap when a message exists with non-NULL created_at but NULL
+    # delivered_at.
+    delivered_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # TIMESTAMPTZ + server_default (migration 0061 / audit H-S4 + H-S5).
     # NaiveUTCDateTime strips tz on read (round 2 audit / C3 + H1).
     created_at: datetime = Field(

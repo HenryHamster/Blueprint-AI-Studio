@@ -1046,6 +1046,7 @@ export const MessagesPanel = memo(function MessagesPanel({ selectedProjectId, gi
       status: 'open' as ProjectMessage['status'],
       resolution: null,
       resolved_at: null,
+      delivered_at: null,
       created_at: optimisticSend.created_at,
       reply_to_message_id: optimisticSend.reply_to_message_id ?? null,
       idempotency_key: optimisticSend.key,

@@ -54,6 +54,7 @@
     "DashboardMetricCardsPrimitives": "Dependency-free presentational primitives (Skeleton, FAILURE_CLASS_COLORS) extracted from DashboardMetricCards to break the recharts dependency in the main bundle; never rendered standalone — all consumers are sub-components covered by their own viewport tests.",
     "AttachmentPreviewModal": "Fixed-position dialog overlay for attachment preview (image/PDF/download); rendered conditionally only when a user clicks an attachment — overflow is handled by the modal's internal overflow-auto scroll container and max-h/max-w viewport constraints.",
     "FleetRunnerConfigPanel": "Runner config editor (max-concurrent, GPU allowlist, per-job GPU count, task-type allowlist) rendered exclusively inside FleetRunnersPanel's expanded runner row; never rendered standalone — viewport coverage is provided by FleetRunnersPanel.viewport.test.tsx which composes it inline via the runner config block.",
+    "FleetRunnersDashboard": "Full-page dashboard for fleet-runner management; rendered as a routed page-level component inside the App shell. Layout is handled by the parent App layout container with overflow-y-auto; viewport coverage deferred to integration-level gate.",
     "MessageAttachments": "Attachment chip list rendered exclusively inside MessageBubble; viewport coverage is provided by MessagesPanel.viewport.test.tsx which exercises message bubbles with attachments inline."
   }
 }

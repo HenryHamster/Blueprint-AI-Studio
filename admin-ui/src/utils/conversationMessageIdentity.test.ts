@@ -6,7 +6,7 @@ function message(id: string, identity: string, content = 'same text'): ProjectMe
   return {
     id, project_id: 'project-1', message_type: 'FEEDBACK', from_type: 'user',
     from_task_id: null, content, context: {}, status: 'open', resolution: null,
-    resolved_at: null, created_at: null, idempotency_key: identity,
+    resolved_at: null, delivered_at: null, created_at: null, idempotency_key: identity,
   };
 }
 

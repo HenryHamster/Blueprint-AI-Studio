@@ -15,7 +15,7 @@ function message(sequence: number): ProjectMessage {
   return {
     id: `message-${sequence}`, project_id: 'project-1', message_type: 'NOTE',
     from_type: 'strategic', from_task_id: null, content: String(sequence), context: {},
-    status: 'open', resolution: null, resolved_at: null,
+    status: 'open', resolution: null, resolved_at: null, delivered_at: null,
     created_at: `2026-07-15T00:00:${String(sequence % 60).padStart(2, '0')}Z`,
     sequence, surface: 'conversation',
   };
@@ -529,5 +529,99 @@ describe('initial window and newest-message pinning', () => {
       includeMessageId: 'message-7',
       limit: 30,
     });
+  });
+});
+
+describe('sendAck callback', () => {
+  afterEach(() => { cleanup(); vi.clearAllMocks(); });
+
+  test('calls sendAck with the realtime message id when a conversation message is merged', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    const msg = message(5);
+    rerender({ realtimeMessage: msg });
+
+    expect(sendAck).toHaveBeenCalledTimes(1);
+    expect(sendAck).toHaveBeenCalledWith(msg.id);
+  });
+
+  test('does not call sendAck for non-conversation surface messages', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    const sendAck = vi.fn();
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+    });
+    const { rerender } = renderHook(
+      ({ realtimeMessage }) => useConversation({
+        enabled: true,
+        projectId: 'project-1',
+        actorUserId: 'actor-1',
+        includeMessageId: null,
+        realtimeMessage,
+        sendAck,
+        getMessages: () => messages,
+        setMessages,
+        onLoadingChange: vi.fn(),
+        onError: vi.fn(),
+      }),
+      { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+    );
+
+    const activityMsg = { ...message(6), surface: 'activity' };
+    rerender({ realtimeMessage: activityMsg });
+
+    expect(sendAck).not.toHaveBeenCalled();
+  });
+
+  test('does not throw when sendAck is omitted', () => {
+    let messages: ProjectMessage[] = [];
+    const setMessages = vi.fn(update => {
+      messages = typeof update === 'function' ? update(messages) : update;
+    });
+    fetchStrategicConversation.mockResolvedValue({
+      conversation: { limit: 100, has_more: false, next_before_sequence: null, items: [] },
+    });
+    expect(() => {
+      const { rerender } = renderHook(
+        ({ realtimeMessage }) => useConversation({
+          enabled: true,
+          projectId: 'project-1',
+          actorUserId: 'actor-1',
+          includeMessageId: null,
+          realtimeMessage,
+          getMessages: () => messages,
+          setMessages,
+          onLoadingChange: vi.fn(),
+          onError: vi.fn(),
+        }),
+        { initialProps: { realtimeMessage: null as ProjectMessage | null } },
+      );
+      rerender({ realtimeMessage: message(7) });
+    }).not.toThrow();
   });
 });

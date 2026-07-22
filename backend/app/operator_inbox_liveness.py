@@ -94,7 +94,7 @@ async def _persist_observation(
     Written for EVERY measured project — not only flagged ones — so that
     non-flagged rows (status ``"ok"`` / ``"skipped"``) break the consecutive
     flagged chain in ``_count_consecutive_flagged`` and correctly detect
-    episode boundaries when a project goes [flagged×3, clean, flagged].
+    episode boundaries when a project goes [flaggedx3, clean, flagged].
     Without clean-tick rows the DB sees an unbroken sequence of flagged rows
     and escalates on the *first* flagged tick of a new episode instead of
     waiting for >= 3 NEW consecutive flagged ticks.
@@ -443,6 +443,7 @@ async def run_operator_inbox_liveness_check(
                     badge_invisible=0,
                     info_alert_noise=0,
                     detail="no open/linked operator-visible messages or INFO alerts",
+                    reply_audience_quarantined=quarantined_reply_count,
                 )
             )
             continue

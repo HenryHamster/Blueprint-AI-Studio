@@ -704,6 +704,78 @@ def test_strategist_reply_to_operator_is_operator_visible():
     assert route_event("strategic_message") == STRATEGIST_INTERNAL
 
 
+def test_strategist_agent_output_reply_audience():
+    """strategic_completion.py's agent-output path defaults to "question_answer"
+    (OPERATOR_FYI) when reply_to is present but event_type is absent — mirroring
+    the admin_agent_ops.py fix.  Without this, strategist replies to operator
+    messages are invisible (STRATEGIST_INTERNAL).
+
+    This replicates the exact default logic from ``_handle_strategic_completion``
+    (strategic_completion.py:~6275) and verifies every combination:
+    reply_to present/absent × event_type present/absent/Nones.
+    """
+    test_cases: list[tuple[dict, str, str, str]] = [
+        # (context, expected_audience, expected_event_type, scenario)
+        (
+            {"reply_to": "m1"},
+            OPERATOR_FYI,
+            "question_answer",
+            "reply_to present, no event_type → question_answer / OPERATOR_FYI",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "question_answer"},
+            OPERATOR_FYI,
+            "question_answer",
+            "reply_to + explicit question_answer preserved",
+        ),
+        (
+            {"reply_to": "m1", "event_type": "auto_fix_escalated"},
+            OPERATOR_ACTION_NEEDED,
+            "auto_fix_escalated",
+            "reply_to + explicit escalation event_type preserved",
+        ),
+        (
+            {},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "no reply_to, no event_type → strategic_message / STRATEGIST_INTERNAL",
+        ),
+        (
+            {"event_type": "pr_merged"},
+            STRATEGIST_INTERNAL,
+            "pr_merged",
+            "routine event_type, no reply_to preserved",
+        ),
+        (
+            {"event_type": "strategic_message"},
+            STRATEGIST_INTERNAL,
+            "strategic_message",
+            "explicit strategic_message preserved",
+        ),
+    ]
+
+    for ctx_dict, expected_audience, expected_event_type, scenario in test_cases:
+        _event_type = ctx_dict.get("event_type")  # same as strategic_completion.py:6275
+        # Replicate the exact default logic from strategic_completion.py:6280-6284
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and ctx_dict.get("reply_to") is not None
+            else "strategic_message"
+        )
+        result = stamp_message_audience(
+            dict(ctx_dict),
+            _event_type or _default_event_type,
+        )
+        assert result["audience"] == expected_audience, (
+            f"audience mismatch — {scenario}: "
+            f"expected={expected_audience}, got={result['audience']}"
+        )
+        assert result["event_type"] == expected_event_type, (
+            f"event_type mismatch — {scenario}: "
+            f"expected={expected_event_type}, got={result['event_type']}"
+        )
+
+
 # ── post_event_message audience gating (via notification_dispatch) ──────
 
 

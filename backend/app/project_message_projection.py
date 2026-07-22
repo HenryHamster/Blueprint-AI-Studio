@@ -208,6 +208,7 @@ def project_message_base(message: ProjectMessage) -> dict[str, Any]:
         "status": enum_value(message.status),
         "resolution": message.resolution,
         "resolved_at": _isoformat(message.resolved_at),
+        "delivered_at": _isoformat(getattr(message, "delivered_at", None)),
         "created_at": _isoformat(message.created_at),
         "updated_at": _isoformat(getattr(message, "updated_at", None)),
     }

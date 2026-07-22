@@ -517,8 +517,16 @@ export function useLogViewer({
         const canonicalRefetchRequired = msg.data?.canonical_refetch_required === true
           || msg.data?.message?.projection_truncated === true
           || msg.data?.message?.context?.projection_truncated === true;
-        if (canonicalMessage) refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
-        else refreshMessages();
+        if (canonicalMessage) {
+          refreshMessagesRef?.current?.(canonicalMessage, canonicalRefetchRequired);
+          // Acknowledge delivery so the backend stamps delivered_at.
+          // Without this, the recovery-on-reconnect path re-sends every
+          // undelivered message from the last 10 minutes, and the liveness
+          // audit reports permanent false-positive undelivered gaps.
+          if (wsRef.current?.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({ type: 'message_ack', message_id: canonicalMessage.id }));
+          }
+        } else refreshMessages();
       }
       if (projectEventApplies && (
         msg.event === 'alert_created'

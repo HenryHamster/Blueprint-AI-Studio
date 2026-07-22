@@ -55,6 +55,7 @@ export function conversationMessagesEqual(a: ProjectMessage, b: ProjectMessage):
     && a.status === b.status
     && a.resolution === b.resolution
     && a.resolved_at === b.resolved_at
+    && a.delivered_at === b.delivered_at
     && a.created_at === b.created_at
     && a.updated_at === b.updated_at
     && a.actor_user_id === b.actor_user_id
@@ -81,6 +82,11 @@ interface UseConversationOptions {
    *  When set, the conversation refresh piggybacks on the strategic-state
    *  poll cadence instead of running its own independent timer. */
   strategicPollEpoch?: number;
+  /** Called with the message id when a realtime message is merged into state.
+   *  The caller is responsible for sending the acknowledgment frame over the
+   *  WebSocket so the backend can stamp delivered_at. Optional — existing
+   *  callers that omit it continue to work with no behavior change. */
+  sendAck?: (messageId: string) => void;
   getMessages: () => ProjectMessage[];
   setMessages: Dispatch<SetStateAction<ProjectMessage[]>>;
   onLoadingChange: (loading: boolean) => void;
@@ -98,6 +104,7 @@ export function useConversation({
   realtimeMessage,
   realtimeMessageRequiresCanonicalRefetch = false,
   strategicPollEpoch,
+  sendAck,
   getMessages,
   setMessages,
   onLoadingChange,
@@ -298,6 +305,7 @@ export function useConversation({
 
   useEffect(() => {
     if (!enabled || !projectId || !realtimeMessage || realtimeMessage.project_id !== projectId || realtimeMessage.surface !== 'conversation') return;
+    sendAck?.(realtimeMessage.id);
     if (normalizedSearch) {
       const timer = window.setTimeout(() => { void refresh(false); }, 100);
       return () => window.clearTimeout(timer);
@@ -315,7 +323,7 @@ export function useConversation({
     setMessages(previous => mergeConversationPages(previous, [realtimeMessage]));
     const timer = window.setTimeout(() => { void refresh(priorMax != null, priorMax); }, 0);
     return () => window.clearTimeout(timer);
-  }, [enabled, getMessages, normalizedSearch, projectId, realtimeMessage, realtimeMessageRequiresCanonicalRefetch, refetchCanonicalMessage, refresh, setMessages]);
+  }, [enabled, getMessages, normalizedSearch, projectId, realtimeMessage, realtimeMessageRequiresCanonicalRefetch, refetchCanonicalMessage, refresh, sendAck, setMessages]);
 
   useEffect(() => {
     if (!enabled || !realtimeRefreshSignal) return;

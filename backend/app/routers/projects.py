@@ -1,6 +1,7 @@
 """Project CRUD, deploy, WebSocket, and status endpoints."""
 
 import asyncio
+import datetime
 import json
 import logging
 import time
@@ -32,6 +33,7 @@ from app.models import (
     ArtifactType,
     Project,
     ProjectMember,
+    ProjectMessage,
     ProjectStatus,
     Task,
     TaskStatus,
@@ -45,7 +47,9 @@ from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
+from app.project_message_projection import message_event_payload
 from app.strategic_events import emit_strategic_session_delta
+from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -561,6 +565,39 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
             await websocket.send_json({"event": "deploy_state", "data": deploy_payload})
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[WS] Failed to send initial deploy state on connect: {e}")
+        # Recover undelivered messages: re-broadcast recent messages whose
+        # delivered_at is still NULL. This catches frames that were broadcast
+        # while this client's socket was open but the frame was lost (or the
+        # previous socket was disconnected before the ack arrived).
+        try:
+            async with AsyncSessionLocal() as recovery_session:
+                cutoff = _utcnow() - datetime.timedelta(minutes=10)
+                stmt = (
+                    select(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == uuid.UUID(project_id),
+                        ProjectMessage.delivered_at.is_(None),
+                        ProjectMessage.created_at >= cutoff,
+                    )
+                    .order_by(ProjectMessage.created_at.asc())
+                )
+                undelivered = (
+                    (await recovery_session.execute(stmt)).scalars().all()
+                )
+            for msg in undelivered:
+                try:
+                    await websocket.send_json(
+                        {
+                            "event": "message_created",
+                            "data": message_event_payload(msg),
+                        }
+                    )
+                except Exception as _delivery_exc:  # noqa: BLE001, PERF203
+                    logger.debug(
+                        f"[WS] Recovery send failed for message {msg.id}: {_delivery_exc}"
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[WS] Recovery query failed: {e}")
         last_message_time = time.time()
         message_count = 0
         while True:
@@ -595,6 +632,29 @@ async def websocket_endpoint(websocket: WebSocket, project_id: str):
                             f"[WS] pong send failed, client disconnected: {_ws_exc}"
                         )
                         return
+                    continue
+                if isinstance(parsed, dict) and parsed.get("type") == "message_ack":
+                    msg_id_raw = parsed.get("message_id")
+                    if msg_id_raw:
+                        try:
+                            msg_uuid = uuid.UUID(str(msg_id_raw))
+                            async with AsyncSessionLocal() as ack_session:
+                                ack_msg = (
+                                    await ack_session.execute(
+                                        select(ProjectMessage).where(
+                                            ProjectMessage.id == msg_uuid,
+                                            ProjectMessage.project_id == uuid.UUID(project_id),
+                                        )
+                                    )
+                                ).scalars().first()
+                                if ack_msg is not None and ack_msg.delivered_at is None:
+                                    ack_msg.delivered_at = _utcnow()
+                                    ack_session.add(ack_msg)
+                                    await ack_session.commit()
+                        except Exception as _ack_exc:  # noqa: BLE001
+                            logger.debug(
+                                f"[WS] message_ack stamp failed for {msg_id_raw}: {_ack_exc}"
+                            )
                     continue
             except (json.JSONDecodeError, AttributeError):
                 pass

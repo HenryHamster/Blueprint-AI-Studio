@@ -6271,8 +6271,17 @@ async def _handle_strategic_completion(
             if warning:
                 _msg_ctx = {**_msg_ctx, "_provenance_warnings": warning}
         _event_type = _msg_ctx.get("event_type")
+        # When replying to a specific message (reply_to present) and no explicit
+        # event_type was supplied, default to "question_answer" (OPERATOR_FYI)
+        # instead of "strategic_message" (STRATEGIST_INTERNAL).  Without this,
+        # the operator never receives a notification that a reply arrived.
+        _default_event_type = (
+            "question_answer"
+            if _event_type is None and _msg_ctx.get("reply_to") is not None
+            else "strategic_message"
+        )
         _msg_ctx = stamp_message_audience(
-            _msg_ctx, _event_type or "strategic_message", message_type=msg_type.value
+            _msg_ctx, _event_type or _default_event_type, message_type=msg_type.value
         )
         _conversation_reply = _event_type not in _ROUTINE_EVENT_TYPES
         _reply_to_id: uuid.UUID | None = None
