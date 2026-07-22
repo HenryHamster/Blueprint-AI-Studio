@@ -16,7 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased, load_only
 from sqlmodel import select
 
-from app.message_convergence import LINKED_STATUS, OPEN_STATUS, derive_needs_action
+from app.message_convergence import (
+    LINKED_STATUS,
+    NEEDS_ACTION_MESSAGE_TYPES,
+    OPEN_STATUS,
+    derive_needs_action,
+)
 from app.acceptance_criteria import (
     UNVERIFIED_MERGE_BACKFILL_EVIDENCE_KIND,
     get_criteria_for_version,
@@ -71,7 +76,9 @@ _HIGH_SIGNAL_MESSAGE_TYPES = (
 )
 # Reserved keys in MessagesNoisePrefs.prefs that are not event-type visibility prefs.
 _PREFS_RESERVED_KEYS = frozenset({"_temp_mutes", "_mute_window", "_strategic_workbench"})
-_NEEDS_OPERATOR_MESSAGE_TYPES = (MessageType.QUESTION, MessageType.BLOCKER)
+_NEEDS_OPERATOR_MESSAGE_TYPES = tuple(
+    mt for mt in MessageType if mt.value in NEEDS_ACTION_MESSAGE_TYPES
+)
 _APPROVAL_TASK_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,

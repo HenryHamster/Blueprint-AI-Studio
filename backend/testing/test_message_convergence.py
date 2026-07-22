@@ -256,8 +256,10 @@ def test_needs_action_message_types_are_question_and_blocker():
 
 
 def test_needs_action_types_parity_with_operator_attention():
-    # Both sets are load-bearing for the operator needs-action badge; a one-sided
-    # edit silently miscounts the badge. This test enforces parity across modules.
+    # operator_attention._NEEDS_OPERATOR_MESSAGE_TYPES now derives from
+    # NEEDS_ACTION_MESSAGE_TYPES, so these two cannot drift at import time.
+    # This test is a regression guard: if someone removes the derivation and
+    # re-introduces a separate definition, it catches the divergence.
     from app.operator_attention import _NEEDS_OPERATOR_MESSAGE_TYPES
 
     assert NEEDS_ACTION_MESSAGE_TYPES == frozenset(
