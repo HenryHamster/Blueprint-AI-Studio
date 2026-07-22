@@ -5710,6 +5710,7 @@ def _load_size_limits() -> dict:
 _SIZE_LIMITS = _load_size_limits()
 MODULE_SIZE_LIMITS = _SIZE_LIMITS["backend"]
 AGENT_SIZE_LIMITS = _SIZE_LIMITS["agent"]
+TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
 
 def _size_breach_message(
     rel_path: str, count: int, limit: int, module_kind: str
@@ -5812,7 +5813,6 @@ class TestAgentModuleSizeGuardrails:
 # ── Frontend File Size Guardrails ─────────────────────────────────────────────
 
 FRONTEND_SIZE_LIMITS = _SIZE_LIMITS["frontend"]
-TESTING_SIZE_LIMITS = _SIZE_LIMITS.get("testing", {})
 
 def _resolve_admin_ui_src_root() -> str | None:
     """Locate ``admin-ui/src`` across local + Docker test environments.
@@ -5916,6 +5916,31 @@ class TestFrontendSizeGuardrails:
 
     def test_sr_unhandled_edges_retrospectives_panel(self):
         self._check_frontend("components/SrUnhandledEdgesRetrospectivesPanel.tsx")
+
+class TestTestFileSizeGuardrails:
+    """Loose upper bounds for backend/testing/ files to catch runaway growth.
+
+    Every key in the ``testing`` section of module_size_limits.json is enforced
+    automatically — adding a key to the JSON is sufficient. These limits exist
+    to grandfather existing large test files and to catch new runaway growth.
+    """
+
+    def _check_test_file(self, relative_path: str) -> None:
+        max_lines = TESTING_SIZE_LIMITS[relative_path]
+        path = os.path.join(os.path.dirname(__file__), relative_path)
+        with open(path, encoding="utf-8") as f:
+            count = len(f.readlines())
+        assert count <= max_lines, _size_breach_message(
+            relative_path, count, max_lines, "testing"
+        )
+
+    @pytest.mark.parametrize("relative_path", sorted(TESTING_SIZE_LIMITS))
+    def test_test_file_within_limit(self, relative_path):
+        """Every key in the ``testing`` section of module_size_limits.json is
+        enforced automatically — adding a key to the JSON is sufficient to
+        enforce its cap, with no per-file test method to maintain."""
+        self._check_test_file(relative_path)
+
 
 # ── Size-Guardrail Coverage (no large file may escape having a cap) ──────────
 #
@@ -6036,31 +6061,6 @@ class TestSizeGuardrailCoverage:
             testing_root, TESTING_SIZE_LIMITS, (".py",), lambda _rel: False
         )
         assert not offenders, _missing_cap_message(offenders, "testing")
-
-class TestTestingSizeGuardrails:
-    """Loose upper bounds to catch runaway test file growth.
-
-    Test files are excluded from the backend section (which only covers
-    ``backend/app``). This class enforces the caps declared under the
-    ``testing`` section of module_size_limits.json so mega test files like
-    test_release_qualifier.py (45K lines) cannot grow without limit.
-    """
-
-    def _check_test_file(self, relative_path: str) -> None:
-        max_lines = TESTING_SIZE_LIMITS[relative_path]
-        path = os.path.join(os.path.dirname(__file__), relative_path)
-        with open(path, encoding="utf-8") as f:
-            count = len(f.readlines())
-        assert count <= max_lines, _size_breach_message(
-            relative_path, count, max_lines, "testing"
-        )
-
-    @pytest.mark.parametrize("relative_path", sorted(TESTING_SIZE_LIMITS))
-    def test_test_files_within_size_limits(self, relative_path):
-        """Every key in the ``testing`` section of module_size_limits.json is
-        enforced automatically — adding a key to the JSON is sufficient to
-        enforce its cap."""
-        self._check_test_file(relative_path)
 
 # ── LLM Token Pricing Coverage ──────────────────────────────────────────────
 

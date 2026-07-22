@@ -68,20 +68,12 @@ vi.mock('ws', () => ({
   },
 }));
 
+
 // ── Imports (after mocks are registered) ─────────────────────────────────────
 import {
-  setupWorkspace,
-  pushAndCreatePR,
-  condensedAnalysisSections,
   missingVmProviderConfigFiles,
-  parseFailingTests,
-  parseFailingTestsFromVitestJson,
-  extractPytestSelectorsFromOutput,
-  normalizePytestSelectorForRunner,
-  buildTargetedPytestRunners,
   recordToolUse,
   snapshotToolTrace,
-  extractInvestigatedFiles,
   clearToolTrace,
   appendToLogBuffer,
   snapshotLogBuffer,
@@ -89,7 +81,7 @@ import {
   replayLogBufferRateLimited,
   getProviderRunner,
   persistAndPostStatus,
-  main,
+
   _consumePendingParkDirectiveForTesting,
   continueWarmContinuation,
   pollForNextRole,
@@ -113,6 +105,7 @@ import {
   _captureBootProviderConfigPresenceForTesting,
   _materializeClaimCredentialStateForTesting,
   _getActiveCredentialStateSourceForTesting,
+  main,
   WORKSPACE,
   type SecretManifest,
   type FailureCategory,
@@ -126,9 +119,21 @@ import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import type WebSocket from 'ws';
 
+/** fetch-shaped vi.fn: Promise-returning implementations satisfy
+ *  @typescript-eslint/no-misused-promises (a bare vi.fn() infers a
+ *  void-returning procedure, which every `.mockImplementation(() => Promise…)`
+ *  call then violates). */
 const makeFetchMock = () => vi.fn<(input: unknown, init?: RequestInit) => Promise<unknown>>();
 type FetchMock = ReturnType<typeof makeFetchMock>;
+
 const initialPoolPriorTaskId = '00000000-0000-0000-0000-000000000000';
+
+function mockJwtWithVmInstanceId(vmInstanceId: string): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ sub: 'test-task', vm_instance_id: vmInstanceId })).toString('base64url');
+  return `${header}.${payload}.fakesig`;
+}
+
 
 beforeEach(() => {
   // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
@@ -168,477 +173,6 @@ beforeEach(() => {
   refreshRuntimeState();
 });
 
-function mockJwtWithVmInstanceId(vmInstanceId: string): string {
-  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({ sub: 'test-task', vm_instance_id: vmInstanceId })).toString('base64url');
-  return `${header}.${payload}.fakesig`;
-}
-
-
-describe('failure category classification', () => {
-  beforeEach(() => {
-    vi.mocked(execFileSync).mockReset();
-    vi.mocked(spawn).mockReset();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-  });
-
-  it('setupWorkspace attaches clone_failed when git clone fails', async () => {
-    vi.useFakeTimers();
-    vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
-      const cmdStr = String(cmd);
-      // Allow rm (workspace cleanup) and curl (heartbeat) to succeed
-      if (cmdStr === 'rm' || cmdStr === 'curl') return '';
-      // All git commands fail — simulates persistent clone failure across all retries
-      throw new Error('fatal: Authentication failed');
-    });
-
-    let caughtError: unknown;
-    const promise = setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint')
-      .catch((e: unknown) => { caughtError = e; });
-
-    // Advance past all retry delays (CLONE_MAX_RETRIES=3: 5s + 10s = 15s total)
-    await vi.runAllTimersAsync();
-    await promise;
-
-    expect(caughtError).toBeInstanceOf(Error);
-    expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
-  });
-
-  it('pushAndCreatePR does not embed token in remote set-url', async () => {
-    vi.mocked(execFileSync).mockReturnValue('');
-    vi.mocked(spawn).mockImplementation(() => {
-      const proc = {
-        pid: 123,
-        stderr: { on: vi.fn() },
-        stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => { cb(0); });
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: { token: 'fresh-push-token' } }),
-      })
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: { pr_url: 'https://github.com/owner/repo/pull/1', pr_number: 1 } }),
-      }),
-    );
-
-    await pushAndCreatePR('owner', 'repo', 'task-id', 'blueprint/branch', 'main', 'Title', 'Body', null, { value: '' }, true);
-
-    const setUrlCalls = vi.mocked(execFileSync).mock.calls.filter(
-      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('set-url'),
-    );
-    expect(setUrlCalls.length).toBeGreaterThanOrEqual(1);
-    for (const call of setUrlCalls) {
-      const args = call[1] as string[];
-      const urlInCall = args[args.length - 1];
-      expect(urlInCall).toBe('https://github.com/owner/repo.git');
-      expect(urlInCall).not.toContain('x-access-token');
-      expect(urlInCall).not.toContain('fresh-push-token');
-    }
-  });
-
-  it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
-    // Allow all execFileSync calls (git remote set-url, curl heartbeat)
-    vi.mocked(execFileSync).mockReturnValue('');
-    // Mock spawn to make gitAsync push succeed
-    vi.mocked(spawn).mockImplementation(() => {
-      const proc = {
-        pid: 123,
-        stderr: { on: vi.fn() },
-        stdout: { on: vi.fn() },
-        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-          if (event === 'close') setImmediate(() => { cb(0); });
-        }),
-        kill: vi.fn(),
-      };
-      return proc as unknown as ReturnType<typeof spawn>;
-    });
-    // First fetch: apiGet for fresh GitHub token; second fetch: apiPost for PR creation (403)
-    vi.stubGlobal('fetch', vi.fn()
-      .mockResolvedValueOnce({
-        ok: true,
-        json: () => Promise.resolve({ data: { token: 'fresh-token' } }),
-      })
-      .mockResolvedValueOnce({
-        ok: false,
-        status: 403,
-        headers: { get: () => null },
-        text: () => Promise.resolve('Forbidden'),
-      }),
-    );
-
-    let caughtError: unknown;
-    try {
-      // skipRebase=true avoids git fetch/rebase operations
-      await pushAndCreatePR('owner', 'repo', 'task-id', 'blueprint/branch', 'main', 'Title', 'Body', null, { value: '' }, true);
-    } catch (e) {
-      caughtError = e;
-    }
-
-    expect(caughtError).toBeInstanceOf(Error);
-    expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('pr_creation_failed');
-  });
-});
-
-// ── condensedAnalysisSections ────────────────────────────────────────────────
-describe('condensedAnalysisSections', () => {
-  it('extracts canonical headings exactly as written by the prompt', () => {
-    const ctx = [
-      '**Files to change**',
-      '- a.ts',
-      '',
-      '**Interfaces to preserve**',
-      '- Foo',
-      '',
-      '**Key dependencies**',
-      '- bar.ts → a.ts',
-      '',
-      '**Callers to verify after implementation**',
-      '- caller.ts (uses: foo)',
-      '',
-      '**Tests at risk of breaking**',
-      '- testing/test_x.py — fixture change',
-    ].join('\n');
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Files to change**');
-    expect(out).toContain('**Interfaces to preserve**');
-    expect(out).toContain('**Key dependencies**');
-    expect(out).toContain('**Callers to verify after implementation**');
-    expect(out).toContain('**Tests at risk of breaking**');
-    expect(out).toContain('- testing/test_x.py — fixture change');
-  });
-
-  it('extracts "Tests at risk of breaking" section', () => {
-    const ctx = '**Tests at risk of breaking**\n- testing/test_foo.py — assertion change\n\n**Implementation approach**\n- step';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Tests at risk of breaking**');
-    expect(out).toContain('- testing/test_foo.py — assertion change');
-    expect(out).not.toContain('Implementation approach');
-  });
-
-  it('matches case-insensitively', () => {
-    const ctx = '**FILES TO CHANGE**\n- a.ts\n\n**Implementation Approach**\n- step';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**FILES TO CHANGE**');
-    expect(out).not.toContain('Implementation Approach');
-  });
-
-  it('matches "Files to modify" as a synonym for "Files to change"', () => {
-    const ctx = '**Files to modify**\n- a.ts\n- b.ts';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Files to modify**');
-    expect(out).toContain('- a.ts');
-  });
-
-  it('matches headings with parenthetical suffixes', () => {
-    const ctx = '**Files to change** (in recommended order)\n- a.ts\n\n**Interfaces to preserve** (signatures)\n- Foo';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Files to change** (in recommended order)');
-    expect(out).toContain('**Interfaces to preserve** (signatures)');
-  });
-
-  it('matches "Key dependencies" or just "Dependencies"', () => {
-    const ctx = '**Dependencies**\n- a → b';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Dependencies**');
-    expect(out).toContain('- a → b');
-  });
-
-  it('matches "Callers to verify" with trailing variation', () => {
-    const ctx = '**Callers to verify**\n- caller.ts';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Callers to verify**');
-  });
-
-  it('falls back to truncation when no key headings match', () => {
-    const long = '**Risks**\n' + 'x'.repeat(1000);
-    const out = condensedAnalysisSections(long);
-    expect(out.length).toBeLessThanOrEqual(800);
-    expect(out).toContain('**Risks**');
-  });
-
-  it('does not match unrelated headings that contain a single key term', () => {
-    const ctx = '**Files used**\n- nope\n\n**Files to change**\n- a.ts\n\n**Implementation approach**\n- step';
-    const out = condensedAnalysisSections(ctx);
-    expect(out).toContain('**Files to change**');
-    expect(out).not.toContain('**Files used**');
-    expect(out).not.toContain('**Implementation approach**');
-  });
-});
-
-// ── parseFailingTests ────────────────────────────────────────────────────────
-describe('parseFailingTests', () => {
-  it('parses pytest FAILED lines with full test ID and reason', () => {
-    const output = [
-      'FAILED backend/testing/test_foo.py::test_bar - AssertionError: expected 1 got 2',
-      'FAILED backend/testing/test_baz.py::test_qux - ValueError',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result).toEqual(new Set([
-      'backend/testing/test_foo.py::test_bar',
-      'backend/testing/test_baz.py::test_qux',
-    ]));
-  });
-
-  it('parses vitest failure markers (✕, ✗, ×) with descriptions', () => {
-    const output = [
-      '✕ should render component correctly',
-      '✗ handles empty input',
-      '× rejects invalid payload',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result).toEqual(new Set([
-      'should render component correctly',
-      'handles empty input',
-      'rejects invalid payload',
-    ]));
-  });
-
-  it('handles mixed pytest and vitest output in the same string', () => {
-    const output = [
-      'Running tests...',
-      'FAILED backend/testing/test_foo.py::test_bar - AssertionError',
-      '✕ frontend renders nav',
-      'PASSED backend/testing/test_ok.py::test_ok',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result).toEqual(new Set([
-      'backend/testing/test_foo.py::test_bar',
-      'frontend renders nav',
-    ]));
-  });
-
-  it('returns an empty Set for output with no test failures', () => {
-    const output = [
-      'All tests passed!',
-      'PASSED backend/testing/test_ok.py::test_ok',
-      '✓ everything works',
-      '',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result.size).toBe(0);
-  });
-
-  it('handles pytest lines where the test ID contains special characters and parametrize brackets', () => {
-    const output = [
-      'FAILED backend/testing/test_p.py::test_param[case-1] - AssertionError',
-      'FAILED backend/testing/test_p.py::test_unicode_ünîcødé - RuntimeError',
-      'FAILED backend/testing/test_q.py::test_with_space description - fail',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result.has('backend/testing/test_p.py::test_param[case-1]')).toBe(true);
-    expect(result.has('backend/testing/test_p.py::test_unicode_ünîcødé')).toBe(true);
-    expect(result.has('backend/testing/test_q.py::test_with_space description')).toBe(true);
-  });
-
-  it('parses vitest "FAIL  path > suite > test" stdout lines (default reporter)', () => {
-    // Regression: prior parser missed vitest's " FAIL " format and
-    // returned 0 failures for a real 125-failure vitest run on main —
-    // which then leaked into the fix loop as "newly broken by the
-    // agent's changes."
-    const output = [
-      ' FAIL  src/handlers/standard.test.ts > renders the right CLI name',
-      ' FAIL  src/prompt.test.ts > appends DEFAULT_TOOL_GUIDANCE',
-      ' PASS  src/index.test.ts > parses options',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result.has('src/handlers/standard.test.ts > renders the right CLI name')).toBe(true);
-    expect(result.has('src/prompt.test.ts > appends DEFAULT_TOOL_GUIDANCE')).toBe(true);
-    expect(result.size).toBe(2);
-  });
-
-  it('does NOT match single-space "FAIL reason:" (test-output false positive)', () => {
-    // A test that verifies failure-formatting logic can print lines like
-    // `FAIL reason: expected X got Y` from its own stdout. Those must
-    // not be treated as baseline failures. The tighter "FAIL + 2+
-    // spaces" regex guards against this.
-    const output = [
-      'FAIL reason: expected true got false',
-      'FAIL: some output from a passing test',
-      ' FAIL something (only one trailing space)',
-    ].join('\n');
-    const result = parseFailingTests(output);
-    expect(result.size).toBe(0);
-  });
-
-  it('matches vitest "⨯" (U+2A2F) marker in addition to ✕/✗/×', () => {
-    const output = '⨯ some test failed';
-    const result = parseFailingTests(output);
-    expect(result).toEqual(new Set(['some test failed']));
-  });
-});
-
-describe('pytest CI selector extraction', () => {
-  it('extracts pytest selectors from CI FAILED lines and normalizes backend script args', () => {
-    const output = [
-      'FAILED backend/testing/test_models.py::test_create - AssertionError',
-      'FAILED testing/test_pipeline.py::test_queue[case-1] - RuntimeError',
-      'PASSED backend/testing/test_ok.py::test_ok',
-    ].join('\n');
-
-    const selectors = extractPytestSelectorsFromOutput(output);
-    expect(selectors).toEqual([
-      'backend/testing/test_models.py::test_create',
-      'testing/test_pipeline.py::test_queue[case-1]',
-    ]);
-
-    const runner = {
-      cmd: 'bash',
-      args: ['scripts/test-backend.sh', '--postgres'],
-      cwd: '/tmp/workspace',
-      label: 'pytest (backend pyproject)',
-    };
-    expect(normalizePytestSelectorForRunner(selectors[0], runner)).toBe('testing/test_models.py::test_create');
-
-    const directScriptRunner = {
-      cmd: 'scripts/test-backend.sh',
-      args: ['--postgres'],
-      cwd: '/tmp/workspace',
-      label: 'pytest (backend direct script)',
-    };
-    expect(normalizePytestSelectorForRunner(selectors[0], directScriptRunner)).toBe('testing/test_models.py::test_create');
-  });
-
-  it('builds targeted pytest runners by appending selectors only to pytest-compatible runners', () => {
-    const runners = [
-      { cmd: 'bash', args: ['scripts/test-backend.sh', '--postgres'], cwd: '/tmp/workspace', label: 'backend' },
-      { cmd: 'npm', args: ['test'], cwd: '/tmp/workspace/agent', label: 'agent' },
-    ];
-
-    const targeted = buildTargetedPytestRunners(runners, ['backend/testing/test_models.py::test_create']);
-
-    expect(targeted).toHaveLength(1);
-    expect(targeted[0].args).toEqual([
-      'scripts/test-backend.sh',
-      '--postgres',
-      'testing/test_models.py::test_create',
-    ]);
-  });
-});
-
-describe('extractInvestigatedFiles', () => {
-  it('extracts repo-relative paths from Read/Edit/Grep input previews and dedupes', () => {
-    const trace = [
-      { t: '1', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.tsx","offset":180,"limit":20}' },
-      { t: '2', tool: 'Grep',  input_preview: '{"pattern":"total_operator_action","path":"/tmp/workspace/admin-ui/src","output_mode":"content"}' },
-      { t: '3', tool: 'Edit',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.test.tsx","old_string":"x","new_string":"y"}' },
-      { t: '4', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/admin-ui/src/components/DirectionCard.tsx","offset":200,"limit":40}' },
-      { t: '5', tool: 'Bash',  input_preview: '{"command":"ls","description":"list"}' },
-    ];
-    expect(extractInvestigatedFiles(trace)).toEqual([
-      'admin-ui/src/components/DirectionCard.tsx',
-      'admin-ui/src',
-      'admin-ui/src/components/DirectionCard.test.tsx',
-    ]);
-  });
-
-  it('returns paths in first-seen order, preserves Grep directories, ignores non-investigation tools', () => {
-    const trace = [
-      { t: '1', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/backend/app/foo.py"}' },
-      { t: '2', tool: 'Bash',  input_preview: '{"command":"echo hi"}' },
-      { t: '3', tool: 'Grep',  input_preview: '{"pattern":"x","path":"/tmp/workspace/backend/app"}' },
-      { t: '4', tool: 'Read',  input_preview: '{"file_path":"/tmp/workspace/backend/app/foo.py"}' },
-    ];
-    expect(extractInvestigatedFiles(trace)).toEqual([
-      'backend/app/foo.py',
-      'backend/app',
-    ]);
-  });
-
-  it('handles JSON-truncated input previews via regex fallback', () => {
-    const trace = [
-      { t: '1', tool: 'Read', input_preview: '{"file_path":"/tmp/workspace/agent/src/handlers/review-fix.ts","offset":1,"limit":2000,"some_other_field":"...truncated' },
-    ];
-    expect(extractInvestigatedFiles(trace)).toEqual(['agent/src/handlers/review-fix.ts']);
-  });
-});
-
-// ── parseFailingTestsFromVitestJson ─────────────────────────────────────────
-describe('parseFailingTestsFromVitestJson', () => {
-  it('extracts fullName of every failed assertion', () => {
-    const json = JSON.stringify({
-      testResults: [
-        {
-          name: '/path/foo.test.ts',
-          assertionResults: [
-            { fullName: 'describe A > does X', status: 'failed' },
-            { fullName: 'describe A > does Y', status: 'passed' },
-            { fullName: 'describe A > does Z', status: 'failed' },
-          ],
-        },
-        {
-          name: '/path/bar.test.ts',
-          assertionResults: [
-            { fullName: 'describe B > does W', status: 'failed' },
-          ],
-        },
-      ],
-    });
-    expect(parseFailingTestsFromVitestJson(json)).toEqual(new Set([
-      'describe A > does X',
-      'describe A > does Z',
-      'describe B > does W',
-    ]));
-  });
-
-  it('falls back to title when fullName is missing', () => {
-    const json = JSON.stringify({
-      testResults: [{
-        assertionResults: [
-          { title: 'legacy test', status: 'failed' },
-        ],
-      }],
-    });
-    expect(parseFailingTestsFromVitestJson(json)).toEqual(new Set(['legacy test']));
-  });
-
-  it('ignores passed/skipped/pending assertions', () => {
-    const json = JSON.stringify({
-      testResults: [{
-        assertionResults: [
-          { fullName: 'A', status: 'passed' },
-          { fullName: 'B', status: 'skipped' },
-          { fullName: 'C', status: 'pending' },
-          { fullName: 'D', status: 'todo' },
-        ],
-      }],
-    });
-    expect(parseFailingTestsFromVitestJson(json).size).toBe(0);
-  });
-
-  it('returns empty Set on malformed JSON', () => {
-    expect(parseFailingTestsFromVitestJson('not json').size).toBe(0);
-    expect(parseFailingTestsFromVitestJson('').size).toBe(0);
-  });
-
-  it('ignores simulated failure output in stdout — no false positives from mocked test bodies', () => {
-    // This is the whole point: stdout from a passing vitest test whose body
-    // prints something like "✕ simulated failure" would fool parseFailingTests.
-    // The JSON reporter only records real failures.
-    const json = JSON.stringify({
-      testResults: [{
-        assertionResults: [
-          {
-            fullName: 'testFixLoop > handles simulated failure output',
-            status: 'passed',
-          },
-        ],
-      }],
-    });
-    expect(parseFailingTestsFromVitestJson(json).size).toBe(0);
-  });
-});
 
 // ── recordToolUse ────────────────────────────────────────────────────────────
 describe('recordToolUse', () => {
@@ -2770,4 +2304,3 @@ describe('main non-pool startup OAuth rotation', () => {
   });
 });
 
-// ── child-PID registration in runProviderAgent / execFileAsync ───────────────

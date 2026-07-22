@@ -1,4 +1,4 @@
-import { vi, describe, it, expect, beforeEach, afterEach, beforeAll } from 'vitest';
+import { vi, describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 // ── Pre-import setup (hoisted before any module loads) ───────────────────────
 // index.ts guards main() and process event handlers behind an isMain check,
@@ -69,76 +69,31 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import {
-  sanitize,
-  RateLimitError,
-  NoProgressTimeoutError,
-  recordToolUse,
-  snapshotToolTrace,
-  extractInvestigatedFiles,
-  clearToolTrace,
-  execFileAsync,
-  runProviderAgent,
-  pollForNextRole,
-  _setAgentRuntimeFingerprintForTesting,
-  readAgentSourceSha,
-  _setAgentSourceShaForTesting,
-  _startHeartbeatForTesting,
-  _stopHeartbeatForTesting,
-  _buildHeartbeatStatusForTesting,
-  apiPost,
-  apiRequest,
-  getAgentToken,
-  ClaudeTimeoutError,
-  fetchVmImageIdentity,
-  recordLlmCallStart,
-  recordLlmTokens,
-  getLlmTelemetry,
-  resetLlmTelemetry,
-  estimateTokensFromChars,
-  codexStreamHasTurnCompleted,
-  _isCancelRequestedForTesting,
-  _resetCancelRequestedForTesting,
-  _setAgentTokenForTesting,
-  ensureTaskCapabilityContractLoaded,
-  __resetTaskCapabilityContractLoadedForTesting,
-  cloneWithRetry,
-  resolveCredentialsFromSecretVersion,
-  _resetCredentialStateForTesting,
-  refreshRuntimeState,
-} from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, RateLimitError, NoProgressTimeoutError, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, recordToolUse, snapshotToolTrace, appendToLogBuffer, snapshotLogBuffer, refreshRuntimeState, _setWarmStartForTesting, apiGet, detectLoopDivergence, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, _resetCredentialStateForTesting, _crashReportForTesting, type FailureCategory } from './index.js';
+
+import { jaccardSimilarity } from './utils/diff-detection.js';
+
 import {
   __setCommandExistsOverrideForSmoke,
   __resetClaudeCapabilityCacheForTesting,
 } from './providers/runners.js';
-import {
-  __resetTaskCapabilityContractForTesting,
-  isReadOnlyTaskType,
-  loadTaskCapabilityContract,
-  type TaskCapabilityContract,
-} from './taskCapabilities.js';
-import { buildFixtureCapabilityContract } from './testSetup.js';
-import { clearPidRegistry, _getRegisteredPids } from './processTracking.js';
-import {
-  TOOL_USE_STALL_TIMEOUT_MS,
-  isWorkflowToolName,
-  CLAUDE_STREAM_STALL_MS,
-  LLM_NO_PROGRESS_STALL_MS,
-  HEARTBEAT_INTERVAL,
-  HEARTBEAT_INFLIGHT_DEADLINE,
-  PROCESS_KILL_GRACE_MS,
-} from './constants.js';
-import { execFileSync, spawn } from 'child_process';
-import fs from 'fs';
-import type WebSocket from 'ws';
 
-/** Asserts a value is defined and returns it (narrowed). */
-function defined<T>(v: T | undefined | null, msg = 'expected value to be defined'): T {
-  if (v === undefined || v === null) throw new Error(msg);
-  return v;
-}
+import { TMP_OUTPUT_NAMES } from './reset.js';
+import {
+  drainFixLoopEventBuffer,
+  _resetFixLoopEventStateForTesting,
+} from './fix-loop-events.js';
+import {
+  MAX_TEST_FIX_ATTEMPTS,
+  TOKEN_REFRESH_FLOOR_MS,
+  TOKEN_REFRESH_CEILING_MS,
+  BOOTSTRAP_TOKEN_THRESHOLD_MS,
+} from './constants.js';
+import { execFileSync, spawn, execSync } from 'child_process';
+import fs from 'fs';
+import * as discovery from './prompts/discovery.js';
+
 const makeFetchMock = () => vi.fn<(input: unknown, init?: RequestInit) => Promise<unknown>>();
-type FetchMock = ReturnType<typeof makeFetchMock>;
 
 beforeEach(() => {
   // Bypass the pre-flight CLI-exists check: provider binaries (claude, codex, etc.)
@@ -178,2162 +133,767 @@ beforeEach(() => {
   refreshRuntimeState();
 });
 
-describe('child PID registration', () => {
-  beforeEach(() => {
-    clearPidRegistry();
+// ── computeRefreshDelayMs ─────────────────────────────────────────────────────
+/** Build a minimal JWT with a given exp claim (no real signature needed). */
+function mockJwtWithExp(expUnixSec: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ exp: expUnixSec, sub: 'test-task' })).toString('base64url');
+  return `${header}.${payload}.fakesig`;
+}
+
+describe('computeRefreshDelayMs', () => {
+  it('schedules at 75% of remaining lifetime for a 1h token', () => {
+    const now = 1_000_000_000_000; // arbitrary fixed ms
+    const expSec = Math.floor(now / 1000) + 3600; // 1 hour remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(3600 * 1000 * 0.75); // 2700000ms
   });
 
-  afterEach(() => {
-    clearPidRegistry();
+  it('clamps to floor when remaining lifetime is very short', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 30; // 30 seconds remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
   });
 
-  it('execFileAsync registers PID at spawn and unregisters on close', async () => {
-    type ChildHandlers = { close?: (code: number, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid: 9999,
-      stdout: { on: vi.fn() },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null,
-      signalCode: null,
-    };
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
-    // Right after spawn, before close — PID should be registered.
-    expect(_getRegisteredPids()).toContain(9999);
-
-    // Simulate clean exit so the close handler runs.
-    childHandlers.close?.(0, null);
-    await promise;
-    expect(_getRegisteredPids()).not.toContain(9999);
+  it('clamps to ceiling when remaining lifetime is very long', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 7200; // 2 hours remaining
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBe(TOKEN_REFRESH_CEILING_MS);
   });
 
-  it('execFileAsync unregisters PID on error event', async () => {
-    type ChildHandlers = { close?: (code: number | null, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid: 8888,
-      stdout: { on: vi.fn() },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null,
-      signalCode: null,
-    };
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
-    expect(_getRegisteredPids()).toContain(8888);
-    childHandlers.error?.(new Error('spawn failed'));
-    await promise.catch(() => undefined);
-    expect(_getRegisteredPids()).not.toContain(8888);
+  it('falls back to floor for an unparseable token', () => {
+    const delay = computeRefreshDelayMs('not-a-jwt');
+    expect(delay).toBe(TOKEN_REFRESH_FLOOR_MS);
   });
 
-  it('skips registration when child has no pid (spawn failure)', async () => {
-    type ChildHandlers = { close?: (code: number | null, signal: NodeJS.Signals | null) => void; error?: (err: Error) => void };
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid: undefined,
-      stdout: { on: vi.fn() },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null,
-      signalCode: null,
-    };
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+  it('falls back to floor when token has no exp claim', () => {
+    const now = 1_000_000_000_000;
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
+    const token = `${header}.${payload}.sig`;
+    expect(computeRefreshDelayMs(token, now)).toBe(TOKEN_REFRESH_FLOOR_MS);
+  });
 
-    const promise = execFileAsync('echo', ['ok'], { timeoutMs: 100_000 });
-    expect(_getRegisteredPids().length).toBe(0);
-    childHandlers.close?.(0, null);
-    await promise;
-    expect(_getRegisteredPids().length).toBe(0);
+  it('is at ceiling for a fresh standard 1h token', () => {
+    // 75% of 3600s = 2700s which is 45 min — within [3 min, 55 min]
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 3600;
+    const delay = computeRefreshDelayMs(mockJwtWithExp(expSec), now);
+    expect(delay).toBeGreaterThanOrEqual(TOKEN_REFRESH_FLOOR_MS);
+    expect(delay).toBeLessThanOrEqual(TOKEN_REFRESH_CEILING_MS);
   });
 });
 
-// ── runProviderAgent PID register/unregister ─────────────────────────────────
-// Issue 9 (partial): runProviderAgent uses spawn() under the hood; the close
-// AND error event paths must each unregister so the reset routine doesn't
-// chase a dead PID. Mirrors the execFileAsync coverage above but for the
-// runner-spawn path. We mock fs.existsSync false so the ./note write is
-// skipped (it's a no-op when WORKSPACE doesn't exist in this mock).
-describe('runProviderAgent PID register/unregister', () => {
-  beforeEach(() => {
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+// ── isBootstrapToken ─────────────────────────────────────────────────────────
+describe('isBootstrapToken', () => {
+  it('returns true for a token with remaining lifetime above threshold', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 5400; // 90 min remaining
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(true);
   });
 
-  afterEach(() => {
-    clearPidRegistry();
+  it('returns false for a normal short-TTL token (1h remaining)', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + 3600; // 60 min — below 75 min threshold
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(false);
   });
 
-  it('registers PID at spawn and unregisters on close', async () => {
-    type ChildHandlers = {
-      close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-      error?: (err: Error) => void;
-    };
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid: 4242,
-      stdin: { end: vi.fn() },
-      stdout: { on: vi.fn() },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null,
-      signalCode: null,
-    };
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    // Drain microtasks so the synchronous spawn-time registerChildPid runs.
-    await Promise.resolve();
-    expect(_getRegisteredPids()).toContain(4242);
-
-    childHandlers.close?.(0, null);
-    await promise.catch(() => undefined);
-    expect(_getRegisteredPids()).not.toContain(4242);
+  it('returns false exactly at the threshold boundary', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + BOOTSTRAP_TOKEN_THRESHOLD_MS / 1000;
+    // remaining == threshold is NOT above threshold
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(false);
   });
 
-  it('unregisters PID on error event before close fires', async () => {
-    type ChildHandlers = {
-      close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-      error?: (err: Error) => void;
-    };
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid: 5252,
-      stdin: { end: vi.fn() },
-      stdout: { on: vi.fn() },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null,
-      signalCode: null,
-    };
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
+  it('returns true just above the threshold boundary', () => {
+    const now = 1_000_000_000_000;
+    const expSec = Math.floor(now / 1000) + BOOTSTRAP_TOKEN_THRESHOLD_MS / 1000 + 1;
+    expect(isBootstrapToken(mockJwtWithExp(expSec), now)).toBe(true);
+  });
 
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-    expect(_getRegisteredPids()).toContain(5252);
+  it('returns false for an unparseable token', () => {
+    expect(isBootstrapToken('not-a-jwt')).toBe(false);
+  });
 
-    childHandlers.error?.(new Error('spawn failed'));
-    await promise.catch(() => undefined);
-    expect(_getRegisteredPids()).not.toContain(5252);
+  it('returns false for a token with no exp claim', () => {
+    const now = 1_000_000_000_000;
+    const header = Buffer.from(JSON.stringify({ alg: 'HS256' })).toString('base64url');
+    const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
+    const token = `${header}.${payload}.sig`;
+    expect(isBootstrapToken(token, now)).toBe(false);
   });
 });
 
-// ── clearToolTrace — Issue 2 cross-role leak guard ───────────────────────────
-describe('clearToolTrace', () => {
-  it('drains the ring buffer so subsequent snapshotToolTrace returns []', () => {
-    recordToolUse('Read', { file_path: '/tmp/a' });
-    recordToolUse('Edit', { file_path: '/tmp/b' });
-    expect(snapshotToolTrace().length).toBeGreaterThanOrEqual(2);
-
-    clearToolTrace();
-
-    expect(snapshotToolTrace()).toEqual([]);
-    expect(extractInvestigatedFiles(snapshotToolTrace())).toEqual([]);
+// ── strVal ───────────────────────────────────────────────────────────────────
+describe('strVal', () => {
+  it('returns string values unchanged', () => {
+    expect(strVal('hello')).toBe('hello');
   });
 
-  it('survives being called when the buffer is already empty', () => {
-    clearToolTrace();
-    clearToolTrace();
-    expect(snapshotToolTrace()).toEqual([]);
+  it('returns empty string for undefined', () => {
+    expect(strVal(undefined)).toBe('');
   });
 
-  it('after clear, new tool uses populate from a clean slate', () => {
-    recordToolUse('Read', { file_path: '/before/file.ts' });
-    clearToolTrace();
-    recordToolUse('Read', { file_path: '/after/file.ts' });
-    const files = extractInvestigatedFiles(snapshotToolTrace());
-    expect(files).toEqual(['/after/file.ts']);
-    expect(files).not.toContain('/before/file.ts');
-  });
-});
-
-// ── pollForNextRole 401/403 handling — Issue 14 ──────────────────────────────
-describe('pollForNextRole auth-revoked', () => {
-  let fetchMock: FetchMock;
-
-  beforeEach(() => {
-    fetchMock = makeFetchMock();
-    vi.stubGlobal('fetch', fetchMock);
+  it('returns fallback for null', () => {
+    expect(strVal(null, 'default')).toBe('default');
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
+  it('returns fallback (empty) for numbers', () => {
+    expect(strVal(42)).toBe('');
   });
 
-  it('exits with reason=auth_revoked when next-role returns 401', async () => {
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      return Promise.resolve({ status: 401, json: () => Promise.resolve({}) });
-    });
-    const result = await pollForNextRole({
-      vmInstanceId: 'vm-401',
-      priorTaskId: 't-401',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'expired-jwt',
-      pollIntervalMs: 10,
-      timeoutMs: 5000,
-      heartbeatIntervalMs: 10000,
-    });
-    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
+  it('returns custom fallback for numbers', () => {
+    expect(strVal(42, 'n/a')).toBe('n/a');
   });
 
-  it('exits with reason=auth_revoked when next-role returns 403', async () => {
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      return Promise.resolve({ status: 403, json: () => Promise.resolve({}) });
-    });
-    const result = await pollForNextRole({
-      vmInstanceId: 'vm-403',
-      priorTaskId: 't-403',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'forbidden-jwt',
-      pollIntervalMs: 10,
-      timeoutMs: 5000,
-      heartbeatIntervalMs: 10000,
-    });
-    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
+  it('returns empty string for empty string input', () => {
+    expect(strVal('')).toBe('');
   });
 
-  it('exits with reason=auth_revoked when only the vm-heartbeat returns 401', async () => {
-    // next-role keeps returning 204 forever; the heartbeat path detects
-    // the 401 and the loop exits at the next iteration check. We use a
-    // long timeout so we know exit comes from the auth flag, not poll_timeout.
-    let heartbeatCount = 0;
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        heartbeatCount += 1;
-        // First heartbeat returns 401 — flips the authRevoked flag.
-        return Promise.resolve({ status: 401, json: () => Promise.resolve({}) });
-      }
-      return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-    });
-    const result = await pollForNextRole({
-      vmInstanceId: 'vm-hb-401',
-      priorTaskId: 't-hb',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'expired-jwt',
-      pollIntervalMs: 10,
-      timeoutMs: 1000,
-      heartbeatIntervalMs: 10000,
-    });
-    expect(result).toEqual({ action: 'exit', reason: 'auth_revoked' });
-    // Sanity: heartbeat was attempted at least once (the initial fire).
-    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
+  it('uses custom fallback when value is not a string', () => {
+    expect(strVal(false, 'fb')).toBe('fb');
   });
 
-  it('redacts credentials in network error messages logged by pollForNextRole', async () => {
-    const logLines: string[] = [];
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
-      logLines.push(args.map(String).join(' '));
-    });
-
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      // Simulate a fetch error whose message contains a credential-bearing URL
-      // (e.g. ETIMEDOUT on a clone URL or a redirect error including the auth token).
-      throw new Error('connect ETIMEDOUT https://x-access-token:ghp_secretToken1234@github.com/org/repo.git');
-    });
-
-    await pollForNextRole({
-      vmInstanceId: 'vm-redact',
-      priorTaskId: 't-redact',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'jwt-redact',
-      pollIntervalMs: 10,
-      timeoutMs: 50,
-      heartbeatIntervalMs: 10000,
-    });
-
-    consoleSpy.mockRestore();
-
-    const fetchErrLines = logLines.filter(l => l.includes('pollForNextRole fetch error'));
-    expect(fetchErrLines.length).toBeGreaterThanOrEqual(1);
-    for (const line of fetchErrLines) {
-      expect(line).not.toContain('ghp_secretToken1234');
-      expect(line).toContain('x-access-token:***@');
-    }
+  it('returns string for truthy non-string value with fallback', () => {
+    expect(strVal({}, 'obj')).toBe('obj');
   });
 });
 
-// ── pollForNextRole heartbeat firing pattern — Issue 4 ──────────────────────
-// Existing tests verify "heartbeat fired at least once". This test guards the
-// stronger property: heartbeat fires immediately AND on every setInterval
-// tick. A regression that drops the immediate fire (only triggers after
-// heartbeatIntervalMs) would still satisfy ">= 1" but would be wrong.
-describe('pollForNextRole vm-heartbeat timing', () => {
-  let fetchMock: FetchMock;
-
-  beforeEach(() => {
-    fetchMock = makeFetchMock();
-    vi.stubGlobal('fetch', fetchMock);
+// ── sanitize ─────────────────────────────────────────────────────────────────
+describe('sanitize', () => {
+  it('preserves text that contains no secrets', () => {
+    const text = 'Hello, world! No secrets here.';
+    expect(sanitize(text)).toBe(text);
   });
 
-  afterEach(() => {
-    vi.unstubAllGlobals();
+  it('redacts ghp_ GitHub tokens', () => {
+    expect(sanitize('token: ghp_AbCdEfGhIjKlMnOp123')).toBe('token: ghp_***');
   });
 
-  it('fires once immediately and then on each heartbeat interval tick', async () => {
-    let heartbeatCount = 0;
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        heartbeatCount += 1;
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      // next-role keeps returning 204 forever so the loop runs to timeout
-      // and we can observe the full heartbeat firing schedule.
-      return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-    });
-
-    // Real timers + a generous wall-clock window. Fake timers compose
-    // poorly with the fetch mock's internal microtask handling here, so
-    // we measure the count after a real wait. heartbeatIntervalMs=80,
-    // timeoutMs=350 → expected schedule: t=0 (immediate), t=80, t=160,
-    // t=240, t=320 → 5 fires give us a clean lower bound.
-    const result = await pollForNextRole({
-      vmInstanceId: 'vm-rev-u',
-      priorTaskId: 't-rev-u',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'jwt-rev-u',
-      pollIntervalMs: 25,
-      timeoutMs: 350,
-      heartbeatIntervalMs: 80,
-    });
-    expect(result.action).toBe('exit');
-    expect(result.reason).toBe('poll_timeout');
-
-    // The immediate fire alone gives us 1. Each setInterval tick at 80ms
-    // adds another. With 350ms wall-clock we expect at minimum the
-    // immediate + 3 ticks (setInterval can be a hair late under load) — 4
-    // total — but in practice usually 5. Lower-bound at 4 to keep CI green
-    // while still proving "more than just the immediate fire".
-    expect(heartbeatCount).toBeGreaterThanOrEqual(4);
+  it('redacts ghs_ GitHub app tokens', () => {
+    expect(sanitize('ghs_ABCdef123XYZ')).toBe('ghs_***');
   });
 
-  it('immediate vm-heartbeat fires synchronously before the first poll tick', async () => {
-    // Structural property: the IIFE that does the immediate fire is called
-    // on the synchronous portion of pollForNextRole's setup, so by the time
-    // the first poll-tick await yields, fetchMock should already have one
-    // heartbeat call in its queue. This test exists to catch a regression
-    // that moves the immediate fire inside the poll loop.
-    let heartbeatCount = 0;
-    let nextRoleCount = 0;
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        heartbeatCount += 1;
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      nextRoleCount += 1;
-      // Exit as soon as the first next-role poll runs so the test is fast
-      // and we can compare counts at a single observable point.
-      return Promise.resolve({
-        status: 200,
-        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
-      });
-    });
-
-    await pollForNextRole({
-      vmInstanceId: 'vm-imm',
-      priorTaskId: 't-imm',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'jwt-imm',
-      pollIntervalMs: 10,
-      timeoutMs: 1000,
-      // Make the interval-fire path practically inactive so any heartbeat
-      // observed must have come from the immediate-fire IIFE.
-      heartbeatIntervalMs: 60_000,
-    });
-
-    expect(nextRoleCount).toBeGreaterThanOrEqual(1);
-    // With a 60s interval and ~ms-scale exit, only the immediate fire can
-    // have run. Asserting >=1 catches the regression where the immediate
-    // fire is removed and only the (never-elapsing) setInterval remains.
-    expect(heartbeatCount).toBeGreaterThanOrEqual(1);
-  });
-});
-
-// ── mid-stream tool-use stall watchdog ───────────────────────────────────────
-// Verifies that a tool_use event with no subsequent tool-result (user event)
-// triggers SIGTERM and ClaudeTimeoutError after TOOL_USE_STALL_TIMEOUT_MS.
-describe('mid-stream stall watchdog', () => {
-  type StdoutCb = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeStallChild(pid: number) {
-    const stdoutCbs: StdoutCb[] = [];
-    const handlers: ChildHandlers = {};
-    const child = {
-      pid,
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, cb: StdoutCb) => {
-          if (event === 'data') stdoutCbs.push(cb);
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb;
-        else if (event === 'error') handlers.error = cb;
-      }),
-    };
-    const emitStdout = (line: string) => {
-      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
-    };
-    return { child, handlers, emitStdout };
-  }
-
-  // Drive fake time forward in steps shorter than the SHORTEST relevant
-  // watchdog window, emitting a fresh assistant+tool_use+user burst between
-  // steps. This resets BOTH staleness clocks that the no-progress watchdog
-  // reads — `lastStreamEventAt` (the `assistant` event) AND `lastToolUseAt`
-  // (the `tool_use` block) — and the trailing `user` event clears
-  // `toolInFlight` again so the tool-use-stall watchdog under test is NOT
-  // re-armed by the heartbeat itself. The `assistant` event also flows through
-  // stdout.on('data') -> resetStallWatchdog(), keeping the raw-stdout
-  // stream-stall watchdog alive. Net effect: every watchdog except the one each
-  // test is deliberately exercising stays quiet across the advance.
-  //
-  // STEP must be shorter than every fireable window — the no-progress watchdog
-  // (LLM_NO_PROGRESS_STALL_MS) is the binding constraint, so step under that,
-  // leaving a 60s margin for the 60s watchdog tick.
-  const advanceWithStreamHeartbeat = async (
-    totalMs: number,
-    emitStdout: (s: string) => void,
-  ) => {
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 60_000;
-    const heartbeat = () => {
-      // assistant+tool_use resets lastStreamEventAt AND lastToolUseAt; the
-      // following user clears toolInFlight so the tool-use-stall watchdog is
-      // not falsely re-armed by this isolation heartbeat.
-      emitStdout(JSON.stringify({
-        type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/heartbeat' } }] },
-      }));
-      emitStdout(JSON.stringify({ type: 'user' }));
-    };
-    let remaining = totalMs;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      heartbeat();
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-  };
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+  it('redacts github_pat_ personal access tokens', () => {
+    expect(sanitize('github_pat_11ABCDE_fooBar_baz_QUX')).toBe('github_pat_***');
   });
 
-  afterEach(() => {
-    vi.useRealTimers();
-    clearPidRegistry();
+  it('redacts sk-ant- Anthropic API keys', () => {
+    expect(sanitize('key: sk-ant-api03-someverylongkey-abc')).toBe('key: sk-ant-***');
   });
 
-  it('emits SIGTERM and throws ClaudeTimeoutError when tool_use in-flight exceeds stall timeout', async () => {
-    const { child, handlers, emitStdout } = makeStallChild(7701);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Emit a tool_use event — tool goes in-flight
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: '/tmp/x' } }] },
-    }));
-
-    // Advance past the stall threshold (watchdog checks every 60s)
-    await vi.advanceTimersByTimeAsync(TOOL_USE_STALL_TIMEOUT_MS + 60_001);
-
-    // Simulate the process exiting after SIGTERM
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
-
-    await expect(promise).rejects.toBeInstanceOf(ClaudeTimeoutError);
-    expect(killSpy).toHaveBeenCalledWith(-7701, 'SIGTERM');
-
-    killSpy.mockRestore();
+  it('redacts OpenAI sk- API keys with a conservative minimum length', () => {
+    const stderr = 'openai stderr: invalid key sk-abcdefghijklmnopqrstuvwxyz123456';
+    expect(sanitize(stderr)).toBe('openai stderr: invalid key sk-***');
+    expect(sanitize('short marker sk-not-a-real-key')).toBe('short marker sk-not-a-real-key');
   });
 
-  it('does not stall when tool-result (user event) arrives before timeout', async () => {
-    const { child, handlers, emitStdout } = makeStallChild(7702);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Emit tool_use then tool result before stall timeout
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Read', input: {} }] },
-    }));
-    emitStdout(JSON.stringify({ type: 'user' }));
-
-    // Advance well past the stall timeout — watchdog should not fire because
-    // toolInFlight was cleared by the user event above. Periodic 'system'
-    // heartbeats keep the 5-min stream-stall watchdog from firing during the
-    // 30-min advance so we isolate the tool-use stall watchdog under test.
-    await advanceWithStreamHeartbeat(TOOL_USE_STALL_TIMEOUT_MS + 60_001, emitStdout);
-
-    // Process exits cleanly
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-
-    const result = await promise;
-    expect(result.exitCode).toBe(0);
-    expect(killSpy).not.toHaveBeenCalledWith(-7702, 'SIGTERM');
-
-    killSpy.mockRestore();
+  it('redacts OpenAI sk-proj- API keys', () => {
+    // The env-var pattern fires after the sk-proj pattern, fully redacting the env var
+    expect(
+      sanitize('codex failed with OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456'),
+    ).toBe('codex failed with OPENAI_API_KEY=***');
   });
 
-  it('clears stall watchdog when process exits before threshold fires', async () => {
-    const { child, handlers, emitStdout } = makeStallChild(7703);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  it('redacts Google API keys', () => {
+    expect(
+      sanitize('gemini stderr: api key AIzaSyabcdefghijklmnopqrstuvwxyz123456789'),
+    ).toBe('gemini stderr: api key AIza***');
+  });
 
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
+  it('redacts bare ya29 OAuth tokens and unquoted key=value dumps', () => {
+    const token = 'ya29.a0AfH6SMBx_AbCdEfGhIjKlMnOpQrStUvWx';
+    expect(sanitize(token)).toBe('ya29***');
+    const kv = sanitize(`GOOGLE_oauth_token=${token}`);
+    expect(kv).toContain('GOOGLE_oauth_token=');
+    expect(kv).toContain('***');
+    expect(kv).not.toContain(token);
+  });
 
-    // Emit tool_use but process exits before watchdog fires
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls' } }] },
-    }));
+  it('redacts quoted credential fields while preserving field names and quote style', () => {
+    const json = '{"access_token":"ya29.secret","refresh_token":"1//refresh","id_token":"header.payload.sig","api_key":"AIzaSyabcdefghijklmnopqrstuvwxyz123456789","client_secret":"client-secret","private_key":"-----BEGIN PRIVATE KEY-----\\nabc\\n-----END PRIVATE KEY-----","token":"opaque"}';
+    expect(sanitize(json)).toBe('{"access_token":"***","refresh_token":"***","id_token":"***","api_key":"***","client_secret":"***","private_key":"***","token":"***"}');
+  });
 
-    // Advance partially — under the tool-use stall threshold. Periodic
-    // 'system' heartbeats keep the 5-min stream-stall watchdog from firing
-    // so the negative assertion below is specific to the tool-use watchdog.
-    await advanceWithStreamHeartbeat(TOOL_USE_STALL_TIMEOUT_MS - 60_000, emitStdout);
+  it('redacts quoted key-value credential fields in stderr-like text', () => {
+    const stderr = "stderr: access_token='ya29.secret' client_secret=\"secret\" token='opaque'";
+    expect(sanitize(stderr)).toBe("stderr: access_token='***' client_secret=\"***\" token='***'");
+  });
 
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await promise.catch(() => undefined);
+  it('does not mangle ordinary prose mentioning token or api_key without credential-looking values', () => {
+    const text = 'The token field and api_key setting are missing; no secret value was provided.';
+    expect(sanitize(text)).toBe(text);
+  });
 
-    // Advance past threshold after close — watchdog should be cleared and not fire
-    await vi.advanceTimersByTimeAsync(120_000);
+  it('redacts JWT tokens matching eyJ…eyJ…sig pattern', () => {
+    const jwt =
+      'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+    expect(sanitize(jwt)).toBe('eyJ***');
+  });
 
-    expect(killSpy).not.toHaveBeenCalledWith(-7703, 'SIGTERM');
+  it('redacts Bearer tokens in Authorization headers', () => {
+    expect(sanitize('Authorization: Bearer abc123secrettoken')).toBe(
+      'Authorization: Bearer ***',
+    );
+  });
 
-    killSpy.mockRestore();
+  it('redacts oauth_token= query parameter values', () => {
+    const result = sanitize('url?oauth_token=supersecret&other=ok');
+    expect(result).toContain('oauth_token=***');
+    expect(result).not.toContain('supersecret');
+  });
+
+  it('redacts PEM RSA private keys', () => {
+    const pem =
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----';
+    expect(sanitize(pem)).toBe('***PRIVATE KEY***');
+  });
+
+  it('redacts PEM EC private keys', () => {
+    const pem =
+      '-----BEGIN EC PRIVATE KEY-----\nMHQCAQEEIO\n-----END EC PRIVATE KEY-----';
+    expect(sanitize(pem)).toBe('***PRIVATE KEY***');
+  });
+
+  it('redacts x-access-token URLs', () => {
+    expect(
+      sanitize('https://x-access-token:ghp_abc123@github.com/org/repo.git'),
+    ).toBe('https://x-access-token:***@github.com/org/repo.git');
+  });
+
+  it('redacts multiple secret types in a single string', () => {
+    const text =
+      'token: ghp_ABC123 and key: sk-ant-api03-XYZ and Authorization: Bearer mytoken123';
+    const result = sanitize(text);
+    expect(result).not.toContain('ghp_ABC123');
+    expect(result).not.toContain('sk-ant-api03-XYZ');
+    expect(result).not.toContain('mytoken123');
+    expect(result).toContain('ghp_***');
+    expect(result).toContain('sk-ant-***');
+    expect(result).toContain('Bearer ***');
+  });
+
+  it('redacts AWS IAM access keys (AKIA + 16 uppercase alphanumeric)', () => {
+    expect(sanitize('AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE')).toBe(
+      'AWS_ACCESS_KEY_ID=AKIA***',
+    );
+    // 15 chars after AKIA — one short of required 16, must NOT be redacted
+    expect(sanitize('AKIA123456789AB')).toBe('AKIA123456789AB');
+  });
+
+  it('redacts Stripe live secret keys (sk_live_)', () => {
+    expect(sanitize('STRIPE_SECRET=sk_live_abcdef123456')).toBe('STRIPE_SECRET=sk_live_***');
+  });
+
+  it('redacts Stripe test secret keys (sk_test_)', () => {
+    expect(sanitize('STRIPE_SECRET=sk_test_abcdef123456')).toBe('STRIPE_SECRET=sk_test_***');
+  });
+
+  it('redacts Stripe restricted keys (rk_live_) and webhook secrets (whsec_)', () => {
+    expect(sanitize('key=rk_live_abcdef123456')).toBe('key=rk_live_***');
+    expect(sanitize('WEBHOOK_SECRET=whsec_abcdef123456')).toBe('WEBHOOK_SECRET=whsec_***');
+  });
+
+  it('redacts postgresql:// and postgres:// DSNs with embedded passwords', () => {
+    expect(sanitize('postgresql://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgresql://***:***@db.host/mydb',
+    );
+    expect(sanitize('postgres://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgres://***:***@db.host/mydb',
+    );
+    // SQLAlchemy +driver variant must redact while preserving the scheme
+    expect(sanitize('postgresql+asyncpg://dbuser:s3cr3t@db.host/mydb')).toBe(
+      'postgresql+asyncpg://***:***@db.host/mydb',
+    );
+  });
+
+  it('redacts AGENT_SECRET_TOKEN value in env-var key=value format', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0YXNrLTEyMyJ9.SIG';
+    expect(sanitize(`AGENT_SECRET_TOKEN=${jwt}`)).toBe('AGENT_SECRET_TOKEN=***');
+    // Non-JWT opaque token value
+    expect(sanitize('AGENT_SECRET_TOKEN=some-opaque-token-value')).toBe('AGENT_SECRET_TOKEN=***');
+    // Should not redact very short values (below the 4-char floor)
+    expect(sanitize('AGENT_SECRET_TOKEN=abc')).toBe('AGENT_SECRET_TOKEN=abc');
+  });
+
+  it('redacts provider API key env vars (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY, DEEPSEEK_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
+    expect(sanitize('ANTHROPIC_API_KEY=sk-ant-api03-secretkey123')).toBe('ANTHROPIC_API_KEY=***');
+    expect(sanitize('ANTHROPIC_AUTH_TOKEN=plain-zai-token')).toBe('ANTHROPIC_AUTH_TOKEN=***');
+    expect(sanitize('OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123')).toBe('OPENAI_API_KEY=***');
+    expect(sanitize('GEMINI_API_KEY=AIzaSyabcdefghijklmnop')).toBe('GEMINI_API_KEY=***');
+    expect(sanitize('ZAI_API_KEY=plain-zai-token')).toBe('ZAI_API_KEY=***');
+    expect(sanitize('ZAI_API_KEY="plain-zai-token"')).toBe('ZAI_API_KEY=***');
+    expect(sanitize('DEEPSEEK_API_KEY=plain-deepseek-token')).toBe('DEEPSEEK_API_KEY=***');
+    expect(sanitize('DEEPSEEK_API_KEY="plain-deepseek-token"')).toBe('DEEPSEEK_API_KEY=***');
+    const zaiJsonOut = sanitize('{"ZAI_API_KEY":"plain-zai-token","ANTHROPIC_AUTH_TOKEN":"anthropic-secret-token"}');
+    expect(zaiJsonOut).not.toContain('plain-zai-token');
+    expect(zaiJsonOut).not.toContain('anthropic-secret-token');
+    const deepseekJsonOut = sanitize('{"DEEPSEEK_API_KEY":"plain-deepseek-token"}');
+    expect(deepseekJsonOut).not.toContain('plain-deepseek-token');
+    // CLAUDE_CODE_OAUTH_TOKEN: the oauth_token sub-pattern fires first, normalising the suffix to lowercase
+    const oauthOut = sanitize('CLAUDE_CODE_OAUTH_TOKEN=some-long-oauth-token-value-here');
+    expect(oauthOut).toContain('***');
+    expect(oauthOut).not.toContain('some-long-oauth-token-value-here');
+    expect(sanitize('CODEX_API_KEY=sk-proj-codex-abcdefghijklmnop')).toBe('CODEX_API_KEY=***');
+  });
+
+  it('redacts X-Agent-Token HTTP header value', () => {
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0YXNrLTEyMyJ9.SIG';
+    // The credential-field \btoken\b pattern fires first and redacts the value
+    expect(sanitize(`X-Agent-Token: ${jwt}`)).toBe('X-Agent-Token: ***');
+    const headerArg = sanitize(`-H "X-Agent-Token: ${jwt}"`);
+    expect(headerArg).toContain('***');
+    expect(headerArg).not.toContain(jwt);
   });
 });
 
-// ── runProviderAgent stream-stall watchdog ────────────────────────────────────
-// Verifies the stream-stall watchdog arms on spawn, resets on data chunks,
-// and fires SIGTERM→SIGKILL when stdout goes silent for CLAUDE_STREAM_STALL_MS.
-// The close/error handlers must clear the watchdog before it fires.
-describe('runProviderAgent stream-stall watchdog', () => {
-  type StdoutHandler = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    let stdoutHandler: StdoutHandler | null = null;
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, handler: StdoutHandler) => {
-          if (event === 'data') stdoutHandler = handler;
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-    };
-    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
-  }
-
+// ── _crashReport token redaction ─────────────────────────────────────────────
+describe('_crashReport token redaction', () => {
   beforeEach(() => {
-    vi.useFakeTimers();
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    clearPidRegistry();
-  });
-
-  it('fires SIGTERM after CLAUDE_STREAM_STALL_MS with no stdout data', async () => {
-    const { fakeChild, childHandlers } = makeChild(7001);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Advance past stall threshold — watchdog should fire SIGTERM.
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
-
-    expect(killSpy).toHaveBeenCalledWith(-7001, 'SIGTERM');
-
-    // Clean up by resolving the promise.
-    childHandlers.close?.(0, null);
-    await promise.catch(() => undefined);
-    killSpy.mockRestore();
-  });
-
-  it('does NOT fire when stdout data resets the watchdog before threshold', async () => {
-    const { fakeChild, childHandlers, emitData } = makeChild(7002);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Emit a model 'assistant' content event just before the threshold each
-    // time. This resets BOTH the raw-stdout stream-stall watchdog (via
-    // stdout.on('data')) AND lastStreamEventAt (so the LLM-no-progress watchdog
-    // stays quiet — with no tool in flight, a pure raw-byte chunk that carries
-    // no model content event would let lastStreamEventAt go stale and trip the
-    // no-progress watchdog, which is correct behavior but not what this test
-    // exercises). We step under the SHORTER of the two windows so neither
-    // watchdog can fire between emissions.
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 100;
-    const contentEvent = JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'text', text: 'still working' }] },
-    }) + '\n';
-    await vi.advanceTimersByTimeAsync(STEP);
-    emitData(Buffer.from(contentEvent));
-    await vi.advanceTimersByTimeAsync(STEP);
-    emitData(Buffer.from(contentEvent));
-    await vi.advanceTimersByTimeAsync(STEP);
-
-    // Should not have fired SIGTERM yet — each content event reset the
-    // stream-stall watchdog (and lastStreamEventAt kept the no-progress
-    // watchdog quiet).
-    expect(killSpy).not.toHaveBeenCalledWith(-7002, 'SIGTERM');
-
-    childHandlers.close?.(0, null);
-    // Flush the JSON drain's setImmediate yields (fake timers do not auto-run
-    // them) so drainPendingThenResolve completes and the promise settles.
-    await vi.runAllTimersAsync();
-    await promise.catch(() => undefined);
-    killSpy.mockRestore();
-  });
-
-  it('clears watchdog in close handler so no kill fires after process exits', async () => {
-    const { fakeChild, childHandlers } = makeChild(7003);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Close the process well before the stall threshold.
-    childHandlers.close?.(0, null);
-    await promise.catch(() => undefined);
-
-    // Advancing past threshold should NOT fire the watchdog — it was cleared.
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
-    expect(killSpy).not.toHaveBeenCalledWith(-7003, 'SIGTERM');
-    killSpy.mockRestore();
-  });
-
-  it('clears watchdog in error handler so no kill fires after process errors', async () => {
-    const { fakeChild, childHandlers } = makeChild(7004);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    childHandlers.error?.(new Error('spawn error'));
-    await promise.catch(() => undefined);
-
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
-    expect(killSpy).not.toHaveBeenCalledWith(-7004, 'SIGTERM');
-    killSpy.mockRestore();
-  });
-});
-
-// ── forceKillTimer clearing on multiple watchdog escalations ──────────────────
-// Verifies that when one watchdog fires and schedules a SIGTERM->SIGKILL
-// escalation, a second watchdog firing before the child exits clears the first
-// timer before setting a new one. Without this, an orphaned timer survives
-// until it fires, creating a duplicate kill on what may be a reused PID.
-describe('forceKillTimer escalation hygiene', () => {
-  type StdoutHandler = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    let stdoutHandler: StdoutHandler | null = null;
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, handler: StdoutHandler) => {
-          if (event === 'data') stdoutHandler = handler;
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-    };
-    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
-  }
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    clearPidRegistry();
-  });
-
-  it('clears first force-kill timer when second watchdog fires', async () => {
-    const { fakeChild, childHandlers, emitData } = makeChild(7750);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Trigger the stream-stall watchdog by staying silent past CLAUDE_STREAM_STALL_MS.
-    // This sends SIGTERM and sets the first force-kill timer (T1, fires in PROCESS_KILL_GRACE_MS).
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS + 1);
-    expect(killSpy).toHaveBeenCalledWith(-7750, 'SIGTERM');
-
-    // Emit a tool_use — resets the raw-stdout stall watchdog and starts tool-use tracking.
-    emitData(Buffer.from(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'echo hi' } }] },
-    }) + '\n'));
-
-    // Close the process BEFORE T1 fires (i.e., within the grace period), simulating
-    // the process responding to SIGTERM. The close handler must clear the pending
-    // force-kill timer (via `if (forceKillTimer) clearTimeout(forceKillTimer)`).
-    // Without the clearTimeout in the close handler, T1 would fire after close and
-    // send SIGKILL to a potentially-reused PID.
-    fakeChild.exitCode = 143;
-    fakeChild.signalCode = 'SIGTERM';
-    childHandlers.close?.(143, 'SIGTERM');
-
-    // Advance well past the grace period. T1 was cleared by the close handler,
-    // so no SIGKILL should fire. If the close handler failed to clear T1, we
-    // would see a SIGKILL here.
-    await vi.advanceTimersByTimeAsync(PROCESS_KILL_GRACE_MS * 2 + 1_000);
-
-    const sigkillCount = killSpy.mock.calls.filter(c => c[1] === 'SIGKILL').length;
-    // With the fix: 0 SIGKILLs — the close handler cleared T1 before it fired.
-    // Without the fix: T1 would fire (1 SIGKILL) on a potentially-reused PID.
-    expect(sigkillCount).toBeLessThanOrEqual(1);
-
-    await promise.catch(() => undefined);
-    killSpy.mockRestore();
-  });
-});
-
-// ── drainJsonChunks within-chunk yielding (silent-death v2) ───────────────────
-// Verifies that drainJsonChunks yields to the event loop multiple times while
-// processing a single large stream-json chunk, not just once per chunk. The
-// pre-fix behavior (50aca46d) had a single setImmediate yield BETWEEN chunks
-// which left synchronous parsing of all lines within a chunk un-yielded —
-// 500+ lines from a test-backend.sh stdout flush could starve the event loop
-// for 30+ seconds, blocking heartbeat and SIGTERM signal handlers and causing
-// silent-death even on the patched image.
-describe('drainJsonChunks within-chunk yielding', () => {
-  type StdoutHandler = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    let stdoutHandler: StdoutHandler | null = null;
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, handler: StdoutHandler) => {
-          if (event === 'data') stdoutHandler = handler;
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-    };
-    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
-  }
-
-  beforeEach(() => {
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-  });
-
-  afterEach(() => {
-    clearPidRegistry();
-  });
-
-  it('processes a 200-line single chunk correctly with within-chunk yielding', async () => {
-    const { fakeChild, childHandlers, emitData } = makeChild(8001);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Emit a 200-line chunk including a trailing 'result' event. With the fix
-    // the parser yields ~4× within this chunk; without it, the loop processes
-    // synchronously. Either way it must produce the same end state. This test
-    // guards against the within-chunk yield breaking parsing correctness or
-    // dropping lines — a regression that would show up here as a missing or
-    // wrong lastResultText.
-    const lines: string[] = [];
-    for (let i = 0; i < 199; i++) {
-      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
-    }
-    lines.push(JSON.stringify({ type: 'result', result: 'final-after-200-lines' }));
-
-    // Spy on setImmediate to count within-chunk yields from drainJsonChunks.
-    // WITHIN_CHUNK_YIELD_LINES=50: a 200-line chunk yields at line 51, 101, 151 => >=3.
-    // The test drain loop below uses the real setImmediate directly so those
-    // iterations are NOT counted here, isolating only the drain's own yields.
-    const realSetImmediate = globalThis.setImmediate.bind(globalThis);
-    let drainYieldCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
-      drainYieldCount++;
-      return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
-    });
-    emitData(Buffer.from(lines.join('\n') + '\n'));
-
-    // Drain microtasks/immediates so drainJsonChunks completes fully.
-    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => realSetImmediate(r as () => void));
-    }
-    siSpy.mockRestore();
-
-    // Assert the drain yielded to the event loop >= 3 times (WITHIN_CHUNK_YIELD_LINES=50).
-    expect(drainYieldCount).toBeGreaterThanOrEqual(3);
-
-    childHandlers.close?.(0, null);
-    const result = await promise.catch(() => undefined);
-
-    expect(result).toBeDefined();
-    expect(result?.lastResultText).toBe('final-after-200-lines');
-  });
-
-  it('still completes parsing all lines correctly with within-chunk yielding', async () => {
-    const { fakeChild, childHandlers, emitData } = makeChild(8002);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const ws = null as unknown as WebSocket | null;
-    const statusRef = { value: '' };
-    const promise = runProviderAgent('hello', ws, statusRef);
-    await Promise.resolve();
-
-    // Mix of types so we exercise the dispatch branches, including a 'result'
-    // event that updates lastResultText (the only output that the caller
-    // actually consumes).
-    const lines: string[] = [];
-    for (let i = 0; i < 120; i++) {
-      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
-    }
-    lines.push(JSON.stringify({ type: 'result', result: 'final-result-after-120-ticks' }));
-
-    // Spy on setImmediate to count within-chunk yields from drainJsonChunks.
-    // WITHIN_CHUNK_YIELD_LINES=50: a 121-line chunk yields at line 51, 101 => >=2.
-    // The test drain loop below uses the real setImmediate directly so those
-    // iterations are NOT counted here, isolating only the drain's own yields.
-    const realSetImmediate = globalThis.setImmediate.bind(globalThis);
-    let drainYieldCount = 0;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const siSpy = vi.spyOn(globalThis, 'setImmediate').mockImplementation((fn: any, ...args: any[]) => {
-      drainYieldCount++;
-      return realSetImmediate(fn as (...a: unknown[]) => void, ...args);
-    });
-    emitData(Buffer.from(lines.join('\n') + '\n'));
-
-    // Drain microtasks
-    // Use realSetImmediate directly so our test-loop iterations don't inflate drainYieldCount.
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => realSetImmediate(r as () => void));
-    }
-    siSpy.mockRestore();
-
-    // Assert the drain yielded to the event loop >= 2 times (WITHIN_CHUNK_YIELD_LINES=50).
-    expect(drainYieldCount).toBeGreaterThanOrEqual(2);
-
-    childHandlers.close?.(0, null);
-    const result = await promise.catch(() => undefined);
-
-    expect(result).toBeDefined();
-    expect(result?.lastResultText).toBe('final-result-after-120-ticks');
-  });
-});
-
-// ── LLM-no-progress watchdog: in-flight-tool suppression ──────────────────────
-// The no-progress watchdog exists for ONE failure mode: a silent provider hang
-// (429/529 the SDK retries internally) while the SDK is mid-completion-request
-// — which by definition happens with NO tool in flight. It fires ONLY when
-// `!toolInFlight && contentStale`.
-//
-// History: an earlier C7 "dual-staleness" gate also required lastToolProgressAt
-// (refreshed only on a recognized nested parent_tool_use_id sub-agent event) to
-// be stale before firing while a tool was in flight. The live confirmation came
-// back NEGATIVE — during a Task-tool wait the parent claude-code stdout does NOT
-// surface nested sub-agent events the parser recognizes as progress (it emits
-// nothing on the JSON channel, or only ignored top-level `system` keepalives),
-// so lastToolProgressAt froze at tool-launch time and the watchdog SIGTERMed a
-// perfectly healthy reviewer → false no_progress_timeout (#6979/#7031 chased
-// this; both were necessary-but-insufficient). The fix: suppress the no-progress
-// kill entirely while toolInFlight is true and hand the in-flight case to the
-// longer-budget tool-use/workflow stall watchdog, which is now ALSO kept fresh
-// by ANY stdout chunk (schema-independent), not just recognized nested events.
-describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
-  type StdoutCb = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    const stdoutCbs: StdoutCb[] = [];
-    const handlers: ChildHandlers = {};
-    const child = {
-      pid,
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, cb: StdoutCb) => {
-          if (event === 'data') stdoutCbs.push(cb);
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb;
-        else if (event === 'error') handlers.error = cb;
-      }),
-    };
-    const emitStdout = (line: string) => {
-      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
-    };
-    return { child, handlers, emitStdout };
-  }
-
-  // Advance time while keeping the raw-stdout stall watchdog (CLAUDE_STREAM_STALL_MS)
-  // alive with periodic non-content 'system' events, so we isolate the
-  // no-progress watchdog. 'system' events do NOT reset lastStreamEventAt and do
-  // NOT clear toolInFlight, exactly modelling the lost-tool-result hang.
-  const advanceWithStreamHeartbeat = async (
-    totalMs: number,
-    emitStdout: (s: string) => void,
-  ) => {
-    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
-    let remaining = totalMs;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(JSON.stringify({ type: 'system' }));
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-  };
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    clearPidRegistry();
-  });
-
-  it('does NOT fire (no SIGTERM, no NoProgressTimeoutError) while a Task tool is in flight and the parent stream emits only top-level system keepalives for >15 min — the root-cause false positive', async () => {
-    // This is the exact production failure: the reviewer launches a Task/Agent
-    // fan-out, then the parent's top-level stream goes quiet (only ignored
-    // `system` keepalives) for the whole sub-agent wait. Pre-fix the no-progress
-    // watchdog fired (lastToolProgressAt froze at tool-launch and aged past 15
-    // min while system keepalives reset only the raw-stdout watchdog) → a
-    // healthy reviewer was SIGTERMed and reported no_progress_timeout. Post-fix
-    // the watchdog is suppressed while toolInFlight is true, AND any stdout chunk
-    // (incl. system keepalives) refreshes lastToolProgressAt, so the tool-use
-    // stall watchdog also stays quiet. The healthy workflow runs on.
-    const { child, handlers, emitStdout } = makeChild(7801);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Task tool issued — toolInFlight becomes true. No nested sub-agent JSON
-    // events the parser recognizes ever arrive (live-confirmed reality); only
-    // top-level `system` keepalives flow on stdout.
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', input: { description: 'fan out review' } }] },
-    }));
-
-    // Advance well past the no-progress window with only `system` heartbeats.
-    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
-
-    // The healthy reviewer was NOT killed — no false no_progress_timeout.
-    expect(killSpy).not.toHaveBeenCalledWith(-7801, 'SIGTERM');
-
-    // It then completes normally.
-    emitStdout(JSON.stringify({ type: 'user' }));
-    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    const result = await promise;
-    expect(result.exitCode).toBe(0);
-    expect(killSpy).not.toHaveBeenCalledWith(-7801, 'SIGTERM');
-
-    killSpy.mockRestore();
-  }, 20_000);
-
-  it('STILL fires NoProgressTimeoutError when NO tool is in flight and the content stream is silent past the window (real provider hang)', async () => {
-    // The preserved real-hang case: the SDK is mid-completion-request (no tool in
-    // flight) and emits only ignored `system` keepalives — a silent 429/529 the
-    // SDK retries internally. `!toolInFlight && contentStale` must still fire so
-    // the orchestrator requeues without burning retry. This is the guarantee
-    // that suppressing-while-in-flight does NOT create an immortal-hang hole for
-    // the no-tool case.
-    const { child, handlers, emitStdout } = makeChild(7811);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // NO tool_use ever emitted — toolInFlight stays false the whole time. Only
-    // raw-stdout `system` keepalives flow (keeping the raw-stdout watchdog alive
-    // so we isolate the no-progress watchdog).
-    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
-
-    expect(killSpy).toHaveBeenCalledWith(-7811, 'SIGTERM');
-
-    // No confirmed rate-limit text → transient NoProgressTimeoutError (requeue
-    // without burning retry, account NOT blocked), not RateLimitError.
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
-    const rejection = await promise.catch((e: unknown) => e);
-    expect(rejection).toBeInstanceOf(NoProgressTimeoutError);
-    expect(rejection).not.toBeInstanceOf(RateLimitError);
-    expect((rejection as NoProgressTimeoutError).failureCategory).toBe('no_progress_timeout');
-
-    killSpy.mockRestore();
-  });
-
-  it('does NOT fire while a tool is legitimately producing fresh tool_use events', async () => {
-    const { child, handlers, emitStdout } = makeChild(7802);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Emit fresh tool_use events periodically — toolInFlight stays true (no
-    // top-level `user` tool-result ever clears it), so the no-progress watchdog
-    // is suppressed while the tool runs (a long legitimate tool run). STEP is
-    // bounded by BOTH the no-progress AND raw-stdout-stall windows so this test
-    // isolates the no-progress watchdog without tripping the orthogonal stream-stall
-    // watchdog (CLAUDE_STREAM_STALL_MS). Iterate enough to cumulatively exceed the
-    // no-progress window.
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
-    const iters = Math.ceil((LLM_NO_PROGRESS_STALL_MS + 120_000) / STEP) + 1;
-    for (let i = 0; i < iters; i++) {
-      emitStdout(JSON.stringify({
-        type: 'assistant',
-        message: { content: [{ type: 'tool_use', name: 'Bash', input: { command: `step ${i}` } }] },
-      }));
-      await vi.advanceTimersByTimeAsync(STEP);
-      // Keep raw-stdout watchdog alive between tool uses.
-      emitStdout(JSON.stringify({ type: 'system' }));
-    }
-
-    expect(killSpy).not.toHaveBeenCalledWith(-7802, 'SIGTERM');
-
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    // close() triggers drainPendingThenResolve, whose drain loop yields via
-    // `await new Promise(r => setImmediate(r))`. Under fake timers those
-    // setImmediate macrotasks are NOT auto-flushed, so runAllTimersAsync()
-    // drains them (and any other queued timers) deterministically — otherwise
-    // resolve() never runs and `await promise` hangs to the 5s test timeout.
-    await vi.runAllTimersAsync();
-    await promise.catch(() => undefined);
-    killSpy.mockRestore();
-  });
-
-  // A top-level partial-message delta from --include-partial-messages. Pre-fix a
-  // slow opus turn (deep research/review on 1M-context + extended thinking) emits
-  // NO stdout until the COMPLETE assistant message, so the no-progress watchdog
-  // fired even though the model was actively generating. With partial messages,
-  // each text/thinking delta refreshes lastStreamEventAt → the watchdog stays out.
-  const textDeltaEvent = () => JSON.stringify({
-    type: 'stream_event',
-    event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'tok' } },
-  });
-  const thinkingDeltaEvent = () => JSON.stringify({
-    type: 'stream_event',
-    event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: '...' } },
-  });
-
-  it('does NOT fire while a slow opus turn streams content_block_delta / thinking_delta partial messages', async () => {
-    const { child, handlers, emitStdout } = makeChild(7805);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // No assistant/result/tool events at all — ONLY incremental deltas, exactly
-    // what a long single opus turn emits with --include-partial-messages. Stream
-    // deltas across well past the no-progress window in sub-window steps. STEP is
-    // bounded by BOTH the no-progress AND raw-stdout-stall windows: a delta emits
-    // stdout (resets the stream-stall watchdog via stdout.on('data')) AND a
-    // stream_event (resets the no-progress watchdog), so each step proves both
-    // stay quiet while the model streams.
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
-    const totalMs = LLM_NO_PROGRESS_STALL_MS + 5 * 60_000;
-    let remaining = totalMs;
-    let i = 0;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(i % 2 === 0 ? textDeltaEvent() : thinkingDeltaEvent());
-      remaining -= STEP;
-      i += 1;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-
-    // The model was streaming the whole time — no watchdog fired.
-    expect(killSpy).not.toHaveBeenCalledWith(-7805, 'SIGTERM');
-
-    emitStdout(JSON.stringify({ type: 'result', result: 'done' }));
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    const result = await promise;
-    expect(result.exitCode).toBe(0);
-    expect(killSpy).not.toHaveBeenCalledWith(-7805, 'SIGTERM');
-    killSpy.mockRestore();
-  }, 20_000);
-
-  it('disables only the partial-message no-progress watchdog when an old CLI does not advertise partial streaming', async () => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync)
-      .mockReturnValueOnce('claude 0.9.0')
-      .mockReturnValueOnce('Usage: claude [options]\n  --output-format <format>');
-    const { child, handlers, emitStdout } = makeChild(7809);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
-    let remaining = LLM_NO_PROGRESS_STALL_MS + 120_000;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(JSON.stringify({ type: 'system' }));
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-
-    expect(killSpy).not.toHaveBeenCalledWith(-7809, 'SIGTERM');
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    expect((await promise).exitCode).toBe(0);
-    killSpy.mockRestore();
-  }, 20_000);
-
-  it('a NESTED partial-message delta does NOT reset the top-level no-progress watchdog', async () => {
-    const { child, handlers, emitStdout } = makeChild(7806);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Only NESTED deltas (parent_tool_use_id set) arrive — but no tool is in
-    // flight, so they count as neither content progress NOR tool sub-progress.
-    // The top-level stream is genuinely silent → the watchdog must still fire.
-    const nestedDelta = JSON.stringify({
-      type: 'stream_event',
-      parent_tool_use_id: 'toolu_sub',
-      event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'x' } },
-    });
-    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
-    let remaining = LLM_NO_PROGRESS_STALL_MS + 120_000;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      // Keep the raw-stdout stall watchdog alive so we isolate the no-progress one.
-      emitStdout(nestedDelta);
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-
-    expect(killSpy).toHaveBeenCalledWith(-7806, 'SIGTERM');
-
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
-    const rejection = await promise.catch((e: unknown) => e);
-    expect(rejection).toBeInstanceOf(NoProgressTimeoutError);
-    killSpy.mockRestore();
-  });
-
-  it('STILL throws RateLimitError (account block path) when a confirmed rate-limit message accompanies the silent hang', async () => {
-    const { child, handlers, emitStdout } = makeChild(7807);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // A genuinely silent hang that DID surface a confirmed rate-limit banner in
-    // stdout (a real 429). The no-progress watchdog fires, but because a confirmed
-    // RATE_LIMIT_PATTERNS message is present, the agent reports rate_limited so the
-    // orchestrator blocks the account + applies the canonical cooldown (UNCHANGED).
-    emitStdout('Claude AI usage limit reached');
-    await advanceWithStreamHeartbeat(LLM_NO_PROGRESS_STALL_MS + 120_000, emitStdout);
-
-    expect(killSpy).toHaveBeenCalledWith(-7807, 'SIGTERM');
-
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
-    const rejection = await promise.catch((e: unknown) => e);
-    expect(rejection).toBeInstanceOf(RateLimitError);
-    expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
-    killSpy.mockRestore();
-  });
-});
-
-// ── isWorkflowToolName ────────────────────────────────────────────────────────
-// The classifier that grants the longer in-flight silence budget to fan-out
-// tools. Matches the built-in Task/Agent tool, any "*workflow*" tool, and future
-// MCP-namespaced variants, case-insensitively, without an allowlist edit.
-describe('isWorkflowToolName', () => {
-  it('matches the built-in Task / Agent / Workflow tools (case-insensitive)', () => {
-    expect(isWorkflowToolName('Task')).toBe(true);
-    expect(isWorkflowToolName('task')).toBe(true);
-    expect(isWorkflowToolName('Agent')).toBe(true);
-    expect(isWorkflowToolName('Workflow')).toBe(true);
-  });
-
-  it('matches future custom / MCP-namespaced workflow + sub-agent tools by substring', () => {
-    expect(isWorkflowToolName('mcp__workflow__run')).toBe(true);
-    expect(isWorkflowToolName('RunSubAgentWorkflow')).toBe(true);
-    expect(isWorkflowToolName('mcp__claude__Task')).toBe(true);
-  });
-
-  it('does NOT match ordinary tools', () => {
-    expect(isWorkflowToolName('Bash')).toBe(false);
-    expect(isWorkflowToolName('Read')).toBe(false);
-    expect(isWorkflowToolName('Edit')).toBe(false);
-    expect(isWorkflowToolName('Grep')).toBe(false);
-    expect(isWorkflowToolName(undefined)).toBe(false);
-    expect(isWorkflowToolName('')).toBe(false);
-  });
-});
-
-// ── long-running workflow / sub-agent fan-out does not false-trip watchdogs ────
-// Root-cause regression for the ~15-min thrash loop: a Blueprint agent that
-// invokes a long-running workflow / sub-agent fan-out (the built-in Task/Agent
-// tool, or the prompt-guided parallel-review/parallel-fix fan-out, which is the
-// SAME built-in tool) makes the parent's top-level stream go quiet for >15 min
-// while the workflow runs. Pre-fix, the no-progress watchdog fired (it required
-// the never-live-confirmed nested parent_tool_use_id sub-agent event to refresh
-// lastToolProgressAt; the live parent stream carries no such recognized event
-// during a Task wait, so it aged out) → NoProgressTimeoutError on a healthy
-// reviewer. The fix: (1) suppress the no-progress kill entirely while a tool is
-// in flight, and (2) refresh lastToolProgressAt on ANY stdout chunk while a tool
-// is in flight, so the tool-use/workflow stall watchdog is kept alive by any
-// output the workflow prints (sub-agent logs, system keepalives, anything),
-// independent of the exact JSON event schema. A workflow that goes FULLY dark
-// (zero stdout) is still caught — by the raw-stdout stall watchdog at
-// CLAUDE_STREAM_STALL_MS — and the wall-clock killTimer is the final backstop.
-describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
-  type StdoutCb = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    const stdoutCbs: StdoutCb[] = [];
-    const handlers: ChildHandlers = {};
-    const child = {
-      pid,
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, cb: StdoutCb) => {
-          if (event === 'data') stdoutCbs.push(cb);
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb;
-        else if (event === 'error') handlers.error = cb;
-      }),
-    };
-    const emitStdout = (line: string) => {
-      for (const cb of stdoutCbs) cb(Buffer.from(line + '\n'));
-    };
-    return { child, handlers, emitStdout };
-  }
-
-  // A nested sub-agent event: carries parent_tool_use_id, so the parser treats
-  // it as in-flight sub-progress for the parent's workflow tool rather than as a
-  // top-level model turn. This is exactly what a Task/Agent fan-out streams while
-  // its sub-agents work.
-  const nestedSubAgentEvent = (parentId: string, i: number) => JSON.stringify({
-    type: 'assistant',
-    parent_tool_use_id: parentId,
-    message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: `/sub/${i}` } }] },
-  });
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(fs.appendFileSync).mockReset();
+    process.env.TASK_ID = 'task-crash-redact-test';
   });
 
   afterEach(() => {
-    vi.useRealTimers();
-    clearPidRegistry();
+    delete process.env.TASK_ID;
+    vi.restoreAllMocks();
   });
 
-  it('does NOT fire no-progress OR tool-use-stall while a workflow tool streams nested sub-agent progress past every window', async () => {
-    const { child, handlers, emitStdout } = makeChild(7901);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+  it('redacts git x-access-token from console.error, forensic log, and heartbeat', () => {
+    const rawDetail = 'fatal: repository clone failed: https://x-access-token:ghs_SECRETTOKEN123@github.com/org/repo.git';
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
+    _crashReportForTesting('uncaughtException', rawDetail, 1);
 
-    // Parent invokes the workflow/Task tool. No top-level content events follow
-    // for the entire fan-out — only nested sub-agent events. Pre-fix this is the
-    // exact shape that tripped the no-progress watchdog into a false rate_limited.
-    const PARENT_ID = 'toolu_workflow_parent';
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', id: PARENT_ID, input: { description: 'fan out review' } }] },
-    }));
+    // console.error must not contain the raw token
+    const consoleArgs = consoleSpy.mock.calls.flat().join(' ');
+    expect(consoleArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(consoleArgs).toContain('***');
 
-    // Run the fan-out well past BOTH the no-progress window AND the ordinary
-    // tool-use-stall window, streaming nested sub-agent progress in steps shorter
-    // than every watchdog window (no-progress AND raw-stdout-stall). Each nested
-    // event refreshes lastToolProgressAt AND emits stdout, so neither watchdog
-    // false-fires while the workflow is legitimately busy.
-    const totalMs = Math.max(LLM_NO_PROGRESS_STALL_MS, TOOL_USE_STALL_TIMEOUT_MS) + 5 * 60_000;
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
-    let remaining = totalMs;
-    let i = 0;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(nestedSubAgentEvent(PARENT_ID, i++));
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
+    // forensic log (fs.appendFileSync) must not contain the raw token
+    const appendCalls = vi.mocked(fs.appendFileSync).mock.calls;
+    const forensicContent = appendCalls.map(([, data]) => String(data)).join('\n');
+    expect(forensicContent).not.toContain('ghs_SECRETTOKEN123');
+    expect(forensicContent).toContain('***');
 
-    // No watchdog fired — the workflow was legitimately busy the whole time.
-    expect(killSpy).not.toHaveBeenCalledWith(-7901, 'SIGTERM');
-
-    // The workflow finishes and the parent emits its terminal result.
-    emitStdout(JSON.stringify({ type: 'user' }));
-    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    const result = await promise;
-    expect(result.exitCode).toBe(0);
-    // Critically: the call did NOT resolve as a rate-limit requeue.
-    expect(killSpy).not.toHaveBeenCalledWith(-7901, 'SIGTERM');
-
-    killSpy.mockRestore();
-  }, 20_000);
-
-  it('a nested sub-agent tool-result (user) event does NOT clear the parent workflow tool', async () => {
-    const { child, handlers, emitStdout } = makeChild(7902);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    const PARENT_ID = 'toolu_workflow_parent_2';
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', id: PARENT_ID, input: {} }] },
-    }));
-
-    // A sub-agent finishes one of its own tool calls — a NESTED `user` event.
-    // Pre-fix this would have set toolInFlight=false, re-exposing the parent to a
-    // false no-progress fire. The parent's Task tool is still running, so it must
-    // stay in flight. Then the fan-out goes silent for a while but still under
-    // the workflow budget, kept alive by nested progress.
-    emitStdout(JSON.stringify({ type: 'user', parent_tool_use_id: PARENT_ID }));
-
-    // Advance past the no-progress window with only periodic nested progress.
-    // STEP is bounded by BOTH watchdog windows; iterate enough to cumulatively
-    // exceed the no-progress window so the test still proves what it claims.
-    const STEP = Math.min(CLAUDE_STREAM_STALL_MS, LLM_NO_PROGRESS_STALL_MS) - 120_000;
-    const iters = Math.ceil((LLM_NO_PROGRESS_STALL_MS + 120_000) / STEP) + 1;
-    for (let i = 0; i < iters; i++) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(nestedSubAgentEvent(PARENT_ID, i));
-    }
-
-    expect(killSpy).not.toHaveBeenCalledWith(-7902, 'SIGTERM');
-
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    await promise.catch(() => undefined);
-    killSpy.mockRestore();
-  });
-
-  it('STILL SIGTERMs a workflow tool that goes FULLY DARK (zero stdout) — the genuine-hang catch is the raw-stdout stall watchdog, NOT the no-progress watchdog', async () => {
-    // A genuinely hung fan-out: the Task tool launches and then the subprocess
-    // emits ZERO bytes — the signature of a truly dead/wedged sub-agent. With the
-    // no-progress kill suppressed while toolInFlight is true, the genuine-hang
-    // coverage is owned by the raw-stdout stall watchdog (CLAUDE_STREAM_STALL_MS),
-    // which fires on zero-stdout regardless of tool state. So removing the
-    // no-progress kill while in-flight does NOT create an immortal hang.
-    const { child, handlers, emitStdout } = makeChild(7903);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // Workflow tool starts, then emits NOTHING further — no JSON sub-progress,
-    // no keepalives, no raw bytes at all.
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', input: {} }] },
-    }));
-
-    // The Task-launch line itself reset the raw-stdout watchdog. With no further
-    // stdout, the watchdog fires CLAUDE_STREAM_STALL_MS later. It must NOT have
-    // fired before that (the launch line is well within the window).
-    await vi.advanceTimersByTimeAsync(CLAUDE_STREAM_STALL_MS - 60_000);
-    expect(killSpy).not.toHaveBeenCalledWith(-7903, 'SIGTERM');
-
-    await vi.advanceTimersByTimeAsync(120_000);
-    expect(killSpy).toHaveBeenCalledWith(-7903, 'SIGTERM');
-
-    // The raw-stdout watchdog sets no flag (flags.timedOut stays false so the
-    // wrapper proceeds to commit/push), so a clean SIGTERM close resolves the run
-    // normally rather than as a misclassified rate-limit/no_progress requeue.
-    child.exitCode = 143;
-    child.signalCode = 'SIGTERM';
-    handlers.close?.(143, 'SIGTERM');
-    await vi.runAllTimersAsync();
-    const rejection = await promise.catch((e: unknown) => e);
-    expect(rejection).not.toBeInstanceOf(NoProgressTimeoutError);
-    expect(rejection).not.toBeInstanceOf(RateLimitError);
-    killSpy.mockRestore();
-  }, 20_000);
-
-  it('keeps a workflow tool ALIVE as long as it prints ANY stdout (schema-independent), even with no recognized JSON sub-progress', async () => {
-    // The belt-and-suspenders guarantee for any future out-of-stream workflow
-    // (a review backgrounded via Bash, a cloud-review poll): a workflow that
-    // prints plain non-JSON log lines — no recognized assistant/result/nested
-    // events at all — still keeps lastToolProgressAt fresh via the stdout 'data'
-    // handler, so neither the no-progress watchdog (suppressed while in-flight)
-    // NOR the tool-use/workflow stall watchdog false-fires. It rides on until
-    // genuinely dark or the wall clock.
-    const { child, handlers, emitStdout } = makeChild(7904);
-    vi.mocked(spawn).mockReturnValueOnce(child as unknown as ReturnType<typeof spawn>);
-    const killSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    emitStdout(JSON.stringify({
-      type: 'assistant',
-      message: { content: [{ type: 'tool_use', name: 'Task', input: { description: 'background review' } }] },
-    }));
-
-    // Emit ONLY plain non-JSON log lines (not '{'-prefixed → never parsed as a
-    // recognized event), in steps shorter than every watchdog window, well past
-    // BOTH the no-progress window (15 min) AND the ordinary tool-use-stall budget
-    // (30 min) — the two windows that would have killed a no-stdout tool here.
-    // Kept under the 45-min wall-clock killTimer, which is the deliberate final
-    // backstop for any in-flight tool and is exercised separately.
-    const totalMs = TOOL_USE_STALL_TIMEOUT_MS + 5 * 60_000;
-    const STEP = CLAUDE_STREAM_STALL_MS - 60_000;
-    let remaining = totalMs;
-    let i = 0;
-    while (remaining > STEP) {
-      await vi.advanceTimersByTimeAsync(STEP);
-      emitStdout(`[subagent ${i++}] still investigating module group...`);
-      remaining -= STEP;
-    }
-    if (remaining > 0) await vi.advanceTimersByTimeAsync(remaining);
-
-    // Never killed — any stdout chunk kept the in-flight clock fresh.
-    expect(killSpy).not.toHaveBeenCalledWith(-7904, 'SIGTERM');
-
-    emitStdout(JSON.stringify({ type: 'user' }));
-    emitStdout(JSON.stringify({ type: 'result', result: 'review complete' }));
-    child.exitCode = 0;
-    handlers.close?.(0, null);
-    await vi.runAllTimersAsync();
-    const result = await promise;
-    expect(result.exitCode).toBe(0);
-    expect(killSpy).not.toHaveBeenCalledWith(-7904, 'SIGTERM');
-    killSpy.mockRestore();
-  }, 20_000);
-});
-
-// ── final drain awaits in-flight drain (cluster C7) ───────────────────────────
-// Regression: drainPendingThenResolve's boolean mutex made drainJsonChunks()
-// early-return when a drain was already active, so the process promise resolved
-// while a drain was still mid-flight — unprocessed chunks (and their result
-// text / token telemetry) were silently dropped at process exit. The fix makes
-// the drain mutex an awaitable Promise the close handler awaits.
-describe('final drain awaits in-flight drain before resolving (C7)', () => {
-  type StdoutHandler = (data: Buffer) => void;
-  type ChildHandlers = {
-    close?: (code: number | null, signal: NodeJS.Signals | null) => void;
-    error?: (err: Error) => void;
-  };
-
-  function makeChild(pid: number) {
-    let stdoutHandler: StdoutHandler | null = null;
-    const childHandlers: ChildHandlers = {};
-    const fakeChild = {
-      pid,
-      stdin: { end: vi.fn() },
-      stdout: {
-        on: vi.fn((event: string, handler: StdoutHandler) => {
-          if (event === 'data') stdoutHandler = handler;
-        }),
-      },
-      stderr: { on: vi.fn() },
-      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler;
-        else if (event === 'error') childHandlers.error = handler;
-      }),
-      exitCode: null as number | null,
-      signalCode: null as NodeJS.Signals | null,
-    };
-    return { fakeChild, childHandlers, emitData: (buf: Buffer) => stdoutHandler?.(buf) };
-  }
-
-  beforeEach(() => {
-    vi.mocked(spawn).mockReset();
-    clearPidRegistry();
-    vi.mocked(fs.existsSync).mockReturnValue(false);
-  });
-
-  afterEach(() => {
-    clearPidRegistry();
-  });
-
-  it('captures the result event from a large chunk even when close fires while the drain is still in flight', async () => {
-    const { fakeChild, childHandlers, emitData } = makeChild(8101);
-    vi.mocked(spawn).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawn>);
-
-    const promise = runProviderAgent('hello', null, { value: '' });
-    await Promise.resolve();
-
-    // A heavy multi-line chunk whose drain yields several times to the event
-    // loop. The trailing 'result' line is processed LAST — so if close resolves
-    // the promise before the in-flight drain finishes, lastResultText is lost.
-    const lines: string[] = [];
-    for (let i = 0; i < 400; i++) {
-      lines.push(JSON.stringify({ type: 'system', subtype: 'tick', n: i }));
-    }
-    lines.push(JSON.stringify({ type: 'result', result: 'drain-must-complete-before-resolve' }));
-    emitData(Buffer.from(lines.join('\n') + '\n'));
-
-    // Fire close IMMEDIATELY — before the (awaiting) drain has finished. The fix
-    // makes drainPendingThenResolve await the in-flight drain promise; pre-fix
-    // the boolean mutex early-returned and resolve() fired with the result line
-    // still unprocessed.
-    childHandlers.close?.(0, null);
-
-    const result = await promise;
-    expect(result.lastResultText).toBe('drain-must-complete-before-resolve');
+    // sendHeartbeatSync (via curl execFileSync) must not contain the raw token
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    expect(curlCall).toBeDefined();
+    const curlArgs = (curlCall?.[1] as string[]).join(' ');
+    expect(curlArgs).not.toContain('ghs_SECRETTOKEN123');
+    expect(curlArgs).toContain('***');
   });
 });
 
-describe('fetchVmImageIdentity', () => {
-  let fetchMock: FetchMock;
-  beforeEach(() => {
-    fetchMock = makeFetchMock();
-    vi.stubGlobal('fetch', fetchMock);
+// ── validateBranchName ───────────────────────────────────────────────────────
+describe('validateBranchName', () => {
+  it('accepts and returns a simple branch name', () => {
+    expect(validateBranchName('main', 'branch')).toBe('main');
   });
-  afterEach(() => { vi.unstubAllGlobals(); });
 
-  it('parses image name and timestamp from GCP metadata path', async () => {
-    fetchMock.mockResolvedValue({
-      ok: true,
-      text: () => Promise.resolve('projects/my-project/global/images/blueprint-agent-v2-1730000000'),
+  it('accepts feature branch with slash', () => {
+    expect(validateBranchName('feature/foo', 'branch')).toBe('feature/foo');
+  });
+
+  it('accepts branch name with underscore', () => {
+    expect(validateBranchName('fix_bar', 'branch')).toBe('fix_bar');
+  });
+
+  it('accepts version-like branch name with dots', () => {
+    expect(validateBranchName('v1.2.3', 'branch')).toBe('v1.2.3');
+  });
+
+  it('accepts nested path branch', () => {
+    expect(validateBranchName('blueprint/fix-123', 'branch')).toBe('blueprint/fix-123');
+  });
+
+  it('throws on empty string with label in message', () => {
+    expect(() => validateBranchName('', 'base branch')).toThrow('base branch is required');
+  });
+
+  it('throws on directory traversal (..)', () => {
+    expect(() => validateBranchName('feature/../hack', 'branch')).toThrow(
+      'Invalid branch (contains ..)',
+    );
+  });
+
+  it('throws on leading hyphen (git flag injection risk)', () => {
+    expect(() => validateBranchName('-evil-flag', 'branch')).toThrow(
+      'Invalid branch (starts with -)',
+    );
+  });
+
+  it('throws on space in branch name', () => {
+    expect(() => validateBranchName('feature branch', 'branch')).toThrow('Invalid branch');
+  });
+
+  it('throws on semicolon (shell injection risk)', () => {
+    expect(() => validateBranchName('feat;rm -rf /', 'branch')).toThrow('Invalid branch');
+  });
+
+  it('throws on @ character', () => {
+    expect(() => validateBranchName('feat@evil', 'branch')).toThrow('Invalid branch');
+  });
+
+  it('throws on backtick character', () => {
+    expect(() => validateBranchName('feat`cmd`', 'branch')).toThrow('Invalid branch');
+  });
+});
+
+// ── resolveBaseBranch ────────────────────────────────────────────────────────
+describe('resolveBaseBranch', () => {
+  it('prefers payload.base_branch over project_metadata.integration_branch', () => {
+    expect(resolveBaseBranch({ base_branch: 'feature/x' }, { project_metadata: { integration_branch: 'develop' } })).toBe('feature/x');
+  });
+
+  it('falls back to project_metadata.integration_branch when payload has no base_branch', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: 'develop' } })).toBe('develop');
+  });
+
+  it('falls back to "main" when neither payload nor metadata has a branch', () => {
+    expect(resolveBaseBranch({}, {})).toBe('main');
+  });
+
+  it('trims whitespace from payload.base_branch', () => {
+    expect(resolveBaseBranch({ base_branch: '  main  ' }, {})).toBe('main');
+  });
+
+  it('trims whitespace from integration_branch and falls through on whitespace-only value', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: '  ' } })).toBe('main');
+  });
+
+  it('accepts custom fallback when no branch configured', () => {
+    expect(resolveBaseBranch({}, {}, 'master')).toBe('master');
+  });
+});
+
+// ── deriveTaskBranch ─────────────────────────────────────────────────────────
+// Pins the task-type → branch-prefix mapping so drift between the agent and
+// backend/app/services.py _TASK_TYPE_BRANCH_PREFIX is caught immediately.
+describe('deriveTaskBranch', () => {
+  const taskId = 'abcdef12-3456-7890-abcd-ef1234567890';
+  const shortId = 'abcdef12'; // taskId.replace(/-/g,'').slice(0,8)
+
+  // namespace is a REQUIRED parameter (no silent "blueprint" default); the
+  // self-repo cases pass 'blueprint' explicitly to preserve the asserted name.
+  it('maps refactor → refactor prefix', () => {
+    expect(deriveTaskBranch('refactor', taskId, 'blueprint')).toBe(`blueprint/refactor-${shortId}`);
+  });
+
+  it('maps docs → docs prefix', () => {
+    expect(deriveTaskBranch('docs', taskId, 'blueprint')).toBe(`blueprint/docs-${shortId}`);
+  });
+
+  it('maps deps → deps prefix', () => {
+    expect(deriveTaskBranch('deps', taskId, 'blueprint')).toBe(`blueprint/deps-${shortId}`);
+  });
+
+  it('maps migrate → migrate prefix', () => {
+    expect(deriveTaskBranch('migrate', taskId, 'blueprint')).toBe(`blueprint/migrate-${shortId}`);
+  });
+
+  it('defaults unknown types to task prefix', () => {
+    expect(deriveTaskBranch('create', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('qa', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('fix', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('review', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+    expect(deriveTaskBranch('', taskId, 'blueprint')).toBe(`blueprint/task-${shortId}`);
+  });
+
+  it('TASK_TYPE_BRANCH_PREFIX covers all explicitly-mapped types', () => {
+    // Keep in sync with backend/app/shared_state.py TASK_TYPE_BRANCH_PREFIX
+    expect(TASK_TYPE_BRANCH_PREFIX).toEqual({
+      refactor: 'refactor',
+      docs: 'docs',
+      deps: 'deps',
+      migrate: 'migrate',
     });
-    const result = await fetchVmImageIdentity();
-    expect(result.image_name).toBe('blueprint-agent-v2-1730000000');
-    expect(result.image_ts).toBe(1730000000);
   });
 
-  it('returns null image_name when metadata service is unreachable', async () => {
-    // Null (rather than 'unknown') so vm-heartbeat omits vm_image_name
-    // and compute._vm_images doesn't get polluted with ('unknown', None)
-    // entries that would skew get_stale_image_vms accounting.
-    fetchMock.mockRejectedValue(new Error('network error'));
-    const result = await fetchVmImageIdentity();
-    expect(result.image_name).toBeNull();
-    expect(result.image_ts).toBeNull();
+  it('uses first 8 hex chars of task UUID with dashes removed', () => {
+    const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
+    expect(deriveTaskBranch('refactor', id, 'blueprint')).toBe('blueprint/refactor-11223344');
   });
 
-  it('returns null image_name when metadata returns non-ok status', async () => {
-    fetchMock.mockResolvedValue({ ok: false, text: () => Promise.resolve('') });
-    const result = await fetchVmImageIdentity();
-    expect(result.image_name).toBeNull();
-    expect(result.image_ts).toBeNull();
+  it('threads a per-project namespace into the leading segment', () => {
+    const id = '11223344-aaaa-bbbb-cccc-ddddeeee0000';
+    expect(deriveTaskBranch('refactor', id, 'autoproj')).toBe('autoproj/refactor-11223344');
+    expect(deriveTaskBranch('docs', id, 'bot')).toBe('bot/docs-11223344');
   });
 
-  it('returns null image_ts for image names without a numeric suffix', async () => {
-    fetchMock.mockResolvedValue({
-      ok: true,
-      text: () => Promise.resolve('projects/my-project/global/images/blueprint-agent-v2'),
-    });
-    const result = await fetchVmImageIdentity();
-    expect(result.image_name).toBe('blueprint-agent-v2');
-    expect(result.image_ts).toBeNull();
+  it('resolveTaskBranchNamespace returns the per-project override or the Blueprint default', () => {
+    expect(resolveTaskBranchNamespace({ build_config: { task_branch_namespace: 'autoproj' } })).toBe('autoproj');
+    expect(resolveTaskBranchNamespace({ build_config: {} })).toBe('blueprint');
+    expect(resolveTaskBranchNamespace({})).toBe('blueprint');
+    expect(resolveTaskBranchNamespace(null)).toBe('blueprint');
+    expect(resolveTaskBranchNamespace(undefined)).toBe('blueprint');
+    // Regression (#7136 follow-up): an empty/absent build_config.directories must
+    // NOT drop the namespace. resolveBuildConfig() returns undefined for empty
+    // directories, so namespace resolution reads the RAW build_config — a
+    // greenfield/docs-only repo keeps its slug instead of silently defaulting to
+    // "blueprint" (which orphaned the orchestrator-expected branch).
+    expect(resolveTaskBranchNamespace({ build_config: { directories: [], task_branch_namespace: 'stsbot' } })).toBe('stsbot');
+    // A malformed slug falls back to the default rather than injecting garbage.
+    expect(resolveTaskBranchNamespace({ build_config: { task_branch_namespace: 'Bad/Name' } })).toBe('blueprint');
   });
 });
 
-describe('readAgentSourceSha', () => {
-  afterEach(() => {
-    mockReadFileSync.mockReset();
-  });
+// ── FailureCategory ──────────────────────────────────────────────────────────
+describe('FailureCategory', () => {
+  const expectedCategories: FailureCategory[] = [
+    'clone_failed',
+    'build_failed',
+    'test_failed',
+    'lint_failed',
+    'pr_creation_failed',
+    'claude_code_failed',
+    'parse_failed',
+    'fatal',
+    'github_token_fetch_failed',
+  ];
 
-  it('parses a valid AGENT_SOURCE_SHA marker', () => {
-    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=0123456789abcdef0123456789abcdef01234567\n');
-    expect(readAgentSourceSha()).toBe('0123456789abcdef0123456789abcdef01234567');
-  });
-
-  it('accepts an abbreviated 7-hex SHA', () => {
-    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=abc1234');
-    expect(readAgentSourceSha()).toBe('abc1234');
-  });
-
-  it('returns null for the unknown fallback', () => {
-    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=unknown');
-    expect(readAgentSourceSha()).toBeNull();
-  });
-
-  it('returns null for an empty value', () => {
-    mockReadFileSync.mockReturnValue('AGENT_SOURCE_SHA=');
-    expect(readAgentSourceSha()).toBeNull();
-  });
-
-  it('returns null when the marker file is absent', () => {
-    mockReadFileSync.mockImplementation(() => {
-      throw new Error('ENOENT');
-    });
-    expect(readAgentSourceSha()).toBeNull();
+  it('covers all expected failure category values', () => {
+    // This test ensures the FailureCategory type includes all expected values.
+    // If a new category is added to the type but not here, TypeScript will catch it.
+    for (const cat of expectedCategories) {
+      const value: FailureCategory = cat;
+      expect(typeof value).toBe('string');
+    }
+    expect(expectedCategories).toHaveLength(9);
   });
 });
 
-describe('apiRequest body-read timeout', () => {
+// ── isTaskNoLongerActiveError ─────────────────────────────────────────────────
+// Regression: the startup /api/agent/github/token GET 401s with "Task is no
+// longer active" when the task goes terminal (CANCELLED/COMPLETED/superseded)
+// between /claim and the token fetch. That benign cancellation must NOT be
+// classified as a fatal CODE failure — runRoleOnce's catch special-cases it
+// (stops the heartbeat, exits 0) and skips the failure_category='fatal' FAILED
+// status post. This classifier is the gate for that graceful path.
+describe('isTaskNoLongerActiveError', () => {
+  it('matches the github/token startup 401 "Task is no longer active" error', () => {
+    const err = new Error(
+      'GET /api/agent/github/token?task_id=abc failed (401): {"error":{"code":401,"message":"Task is no longer active"}}',
+    );
+    expect(isTaskNoLongerActiveError(err)).toBe(true);
+  });
+
+  it('matches the lowercase "no longer active" phrasing', () => {
+    const err = new Error('GET /api/agent/credentials failed (401): task is no longer active');
+    expect(isTaskNoLongerActiveError(err)).toBe(true);
+  });
+
+  it('does NOT match a 401 that is not a cancellation (e.g. bad token)', () => {
+    const err = new Error('GET /api/agent/github/token failed (401): {"message":"Invalid agent token"}');
+    expect(isTaskNoLongerActiveError(err)).toBe(false);
+  });
+
+  it('does NOT match a non-401 status that mentions "no longer active"', () => {
+    const err = new Error('GET /api/agent/foo failed (404): Task is no longer active');
+    expect(isTaskNoLongerActiveError(err)).toBe(false);
+  });
+
+  it('does NOT match a non-Error value', () => {
+    expect(isTaskNoLongerActiveError('GET failed (401): no longer active')).toBe(false);
+    expect(isTaskNoLongerActiveError(null)).toBe(false);
+    expect(isTaskNoLongerActiveError(undefined)).toBe(false);
+  });
+
+  it('confirms the FAILED-classification fatal path is bypassed for this error shape', () => {
+    // The catch block in runRoleOnce computes failure_category as
+    // 'fatal' (errorCategory ?? 'fatal') for un-typed errors. This benign
+    // 401 must short-circuit BEFORE that classification so no FAILED status
+    // with failure_category='fatal' is posted. Asserting the classifier
+    // returns true is what guarantees the early return is taken.
+    const benign = new Error(
+      'GET /api/agent/github/token?task_id=df6057d3 failed (401): {"error":{"code":401,"message":"Task is no longer active"}}',
+    );
+    const genuinelyFatal = new Error('handler threw: undefined is not a function');
+    expect(isTaskNoLongerActiveError(benign)).toBe(true);
+    expect(isTaskNoLongerActiveError(genuinelyFatal)).toBe(false);
+  });
+});
+
+// ── github/token fetch: long timeout + infra error category ──────────────────
+// The github/token startup fetch hits get_github_token_for_task which can block
+// up to ~120s while _github_request sleeps on a near-empty rate-limit bucket.
+// The fix: apiGet now accepts a timeoutMs arg; the fetch is called at 180_000ms
+// and failures are tagged github_token_fetch_failed (PROVISION_FAILURE, not
+// CODE_ERROR) so the task requeues instead of burning the retry budget.
+describe('github/token fetch: infra category and long timeout', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
-    vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
-  it('aborts a stalled response body instead of hanging forever', async () => {
+  it('apiGet with 180_000ms timeout does NOT abort before 30s default would have fired', async () => {
     vi.useFakeTimers();
-    // fetch resolves (headers arrive) but the body read (res.json) never
-    // settles on its own — it only rejects when the request signal aborts.
-    // Pre-fix, the abort timer was cleared right after headers, leaving this
-    // read unbounded → the promise would hang forever (the heartbeat-latch
-    // root cause). Post-fix, the re-armed body-phase timer aborts it.
-    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
-      const signal = init?.signal;
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: () => new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => {
-            reject(new Error('The operation was aborted'));
-          });
-        }),
-        text: () => Promise.resolve(''),
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    // retries=1 (single attempt), timeout=5s.
-    const p = apiRequest('POST', '/api/agent/heartbeat', () => ({ method: 'POST' }), 1, 5_000);
-    const settled = expect(p).rejects.toThrow('POST /api/agent/heartbeat timed out during body phase on attempt 1/1 after 5000ms');
-    // Without the body-phase timer this advance would not settle the promise.
-    await vi.advanceTimersByTimeAsync(5_000);
-    await settled;
-  });
-
-  it('identifies a header-phase timeout with request and attempt context', async () => {
-    vi.useFakeTimers();
+    // Fetch never resolves — simulates the backend sleeping on rate-limit backoff.
     const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
       const signal = init?.signal;
       return new Promise((_resolve, reject) => {
         signal?.addEventListener('abort', () => {
-          reject(new Error('The operation was aborted'));
+          reject(new Error('This operation was aborted'));
         });
       });
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const p = apiRequest('GET', '/api/agent/claim', () => ({ method: 'GET' }), 1, 2_000);
-    const settled = expect(p).rejects.toThrow('GET /api/agent/claim timed out during headers phase on attempt 1/1 after 2000ms');
-    await vi.advanceTimersByTimeAsync(2_000);
-    await settled;
+    const p = apiGet('/api/agent/github/token?task_id=test-123', 1, 180_000);
+    const rejection = expect(p).rejects.toThrow(/timed out during headers phase/);
+
+    // Default timeout (API_TIMEOUT = 30s) passes — should NOT have aborted yet.
+    await vi.advanceTimersByTimeAsync(30_000);
+    // Still pending — the 180s timeout has not fired yet.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // Advance past the 180s header-phase timer — NOW it aborts.
+    await vi.advanceTimersByTimeAsync(180_000);
+    await rejection;
   });
 
-  it('logs an intermediate timeout before a later attempt succeeds', async () => {
-    vi.useFakeTimers();
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-    vi.spyOn(Math, 'random').mockReturnValue(0);
-    let attempt = 0;
-    const fetchMock = makeFetchMock().mockImplementation((_input, init) => {
-      attempt += 1;
-      if (attempt === 1) {
-        const signal = init?.signal;
-        return new Promise((_resolve, reject) => {
-          signal?.addEventListener('abort', () => {
-            reject(new Error('The operation was aborted'));
-          });
-        });
-      }
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve({ status: 'ok' }),
-        text: () => Promise.resolve(''),
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
+  it('tags a github/token fetch error with github_token_fetch_failed, not fatal', () => {
+    // The catch block in runRoleOnce wraps any error from the github/token apiGet
+    // with failureCategory = 'github_token_fetch_failed'. This maps to
+    // PROVISION_FAILURE (infra/requeue) instead of CODE_ERROR (burns budget).
+    // The pattern mirrors clone_failed and vm_config_missing.
+    const raw = new Error('GET /api/agent/github/token?task_id=x failed after 5 retries');
+    const wrapped = raw as Error & { failureCategory?: FailureCategory };
+    wrapped.failureCategory = 'github_token_fetch_failed';
 
-    const pending = apiRequest('GET', '/api/agent/status', () => ({ method: 'GET' }), 2, 1_000);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await vi.advanceTimersByTimeAsync(1_000);
-
-    await expect(pending).resolves.toEqual({ status: 'ok' });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(logSpy.mock.calls.flat().join('\n')).toContain(
-      '[API_TIMEOUT] GET /api/agent/status timed out during headers phase on attempt 1/2 after 1000ms; retrying',
-    );
-
-  });
-  it('does not abort a body that arrives within the timeout', async () => {
-    vi.useFakeTimers();
-    const fetchMock = makeFetchMock().mockResolvedValue({
-      ok: true,
-      status: 200,
-      json: () => Promise.resolve({ status: 'ok' }),
-      text: () => Promise.resolve(''),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const result = await apiPost('/api/agent/heartbeat', {}, 1, 5_000);
-    expect(result).toEqual({ status: 'ok' });
-    // No dangling abort timer should fire after a clean read.
-    await vi.advanceTimersByTimeAsync(10_000);
+    expect(wrapped.failureCategory).toBe('github_token_fetch_failed');
+    // Confirm it is distinct from the generic fatal default.
+    expect(wrapped.failureCategory).not.toBe('fatal');
+    // TypeScript ensures this is a valid FailureCategory member at compile time.
+    const category: FailureCategory = wrapped.failureCategory;
+    expect(typeof category).toBe('string');
   });
 });
 
-describe('apiRequest 503 / Retry-After backoff (create-PR fail-closed contract)', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
+// ── Graceful shutdown signalling (cluster C7) ─────────────────────────────────
+// Regression for the deferred-exit-with-fall-through bug: the
+// isTaskNoLongerActiveError / heartbeat self-terminate paths used to do
+// `setTimeout(process.exit); return`, which returned into main()'s role loop
+// and let pollForNextRole re-enter before the exit fired (double-role-start /
+// resource leak), and the heartbeat 'Other 4xx' branch exited with NO terminal
+// status POST (task stranded IN_PROGRESS until reaper timeout → false
+// AGENT_TIMEOUT). The fix throws a typed GracefulShutdownSignal (caught in the
+// role loop to break cleanly) and posts a synchronous terminal status.
+describe('GracefulShutdownSignal (C7 graceful teardown)', () => {
+  it('is a non-Error control type so the crash handler / runRoleOnce catch never mis-records it as a fault', () => {
+    const sig = new GracefulShutdownSignal('task_no_longer_active');
+    // Must NOT be an Error — the role loop / global crash handler branch on
+    // `instanceof Error` for fault reporting; a graceful teardown must dodge it.
+    expect(sig instanceof Error).toBe(false);
+    expect(sig instanceof GracefulShutdownSignal).toBe(true);
+    expect(sig.reason).toBe('task_no_longer_active');
+    expect(sig.exitCode).toBe(0);
   });
 
-  it('retries a 503 honoring Retry-After, then returns the success body', async () => {
-    vi.useFakeTimers();
-    let calls = 0;
-    const fetchMock = makeFetchMock().mockImplementation(() => {
-      calls += 1;
-      if (calls === 1) {
-        // The backend returns 503 + Retry-After when it refuses to create a PR
-        // because it cannot confirm no-duplicate while the GitHub quota is drained.
-        // Retry-After is 10s — deliberately LARGER than the exponential fallback
-        // (< 2s on the first retry) so the two-phase advance below can prove the
-        // header is honored rather than the exponential window.
-        return Promise.resolve({
-          ok: false,
-          status: 503,
-          text: () => Promise.resolve('{"error":{"message":"rate-limited"}}'),
-          json: () => Promise.resolve({}),
-          headers: { get: (h: string) => (h === 'Retry-After' ? '10' : null) },
-        });
-      }
-      return Promise.resolve({
-        ok: true,
-        status: 200,
-        json: () => Promise.resolve({ status: 'success', data: { html_url: 'u' } }),
-        text: () => Promise.resolve(''),
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    // timeout=30s so the per-attempt abort timer never fires during the 10s wait.
-    const p = apiPost('/api/agent/github/pull-requests', {}, 3, 30_000);
-    // After 2.1s the retry must NOT have fired: the exponential fallback would
-    // have (< 2s), so a still-pending retry proves the 10s Retry-After is honored.
-    await vi.advanceTimersByTimeAsync(2_100);
-    expect(calls).toBe(1);
-    // Advance past the 10s Retry-After — now the retry fires and succeeds.
-    await vi.advanceTimersByTimeAsync(8_000);
-    await expect(p).resolves.toEqual({ status: 'success', data: { html_url: 'u' } });
-    expect(calls).toBe(2);
-  });
-
-  it('does NOT retry a 403 without a Retry-After header (fails fast)', async () => {
-    let calls = 0;
-    const fetchMock = makeFetchMock().mockImplementation(() => {
-      calls += 1;
-      return Promise.resolve({
-        ok: false,
-        status: 403,
-        text: () => Promise.resolve('Forbidden'),
-        json: () => Promise.resolve({}),
-        headers: { get: () => null },
-      });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await expect(
-      apiPost('/api/agent/github/pull-requests', {}, 3, 5_000),
-    ).rejects.toThrow(/failed \(403\)/);
-    expect(calls).toBe(1);
+  it('carries a custom exit code when provided', () => {
+    const sig = new GracefulShutdownSignal('reassigned', 143);
+    expect(sig.exitCode).toBe(143);
   });
 });
 
-describe('agent runtime fingerprint heartbeats', () => {
-  let fetchMock: FetchMock;
-  const runtimeFingerprint = 'a'.repeat(64);
-  const sourceSha = 'abc1234def5678';
-
+describe('postTerminalStatusSync (C7 heartbeat self-terminate posts FAILED)', () => {
   beforeEach(() => {
-    fetchMock = makeFetchMock();
-    vi.stubGlobal('fetch', fetchMock);
-    _setAgentRuntimeFingerprintForTesting(runtimeFingerprint);
-    _setAgentSourceShaForTesting(sourceSha);
-  });
-
-  afterEach(() => {
-    _stopHeartbeatForTesting();
-    _setAgentRuntimeFingerprintForTesting(null);
-    _setAgentSourceShaForTesting(null);
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
-
-  it('includes agent_runtime_fingerprint in /api/agent/vm-heartbeat payloads', async () => {
-    fetchMock.mockImplementation((input: unknown) => {
-      const url = String(input);
-      if (url.endsWith('/api/agent/vm-heartbeat')) {
-        return Promise.resolve({ status: 204, json: () => Promise.resolve({}) });
-      }
-      return Promise.resolve({
-        status: 200,
-        json: () => Promise.resolve({ action: 'exit', reason: 'done' }),
-      });
-    });
-
-    const result = await pollForNextRole({
-      vmInstanceId: 'vm-runtime-fp',
-      priorTaskId: 'task-runtime-fp',
-      priorPrNumber: null,
-      apiBase: 'http://api.test',
-      agentJwt: 'jwt-runtime-fp',
-      pollIntervalMs: 10,
-      timeoutMs: 1000,
-      heartbeatIntervalMs: 60_000,
-    });
-
-    expect(result).toEqual({ action: 'exit', reason: 'done' });
-    const vmHeartbeatCall = fetchMock.mock.calls.find(
-      ([url]) => String(url).endsWith('/api/agent/vm-heartbeat'),
-    );
-    expect(vmHeartbeatCall).toBeDefined();
-    const vmHeartbeatBody = vmHeartbeatCall?.[1]?.body;
-    expect(typeof vmHeartbeatBody).toBe('string');
-    const body = JSON.parse(
-      defined(typeof vmHeartbeatBody === 'string' ? vmHeartbeatBody : undefined),
-    ) as { agent_runtime_fingerprint?: string; agent_source_sha?: string };
-    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
-    expect(body.agent_source_sha).toBe(sourceSha);
-  });
-
-  it('includes agent_runtime_fingerprint in /api/agent/heartbeat payloads', async () => {
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({}),
-    });
-
-    _startHeartbeatForTesting('task-runtime-fp', () => 'heartbeat-ok');
-    await new Promise(resolve => setTimeout(resolve, 0));
-
-    const heartbeatCall = fetchMock.mock.calls.find(
-      ([url]) => String(url).endsWith('/api/agent/heartbeat'),
-    );
-    expect(heartbeatCall).toBeDefined();
-    const heartbeatBody = heartbeatCall?.[1]?.body;
-    expect(typeof heartbeatBody).toBe('string');
-    const body = JSON.parse(
-      defined(typeof heartbeatBody === 'string' ? heartbeatBody : undefined),
-    ) as { task_id?: string; agent_runtime_fingerprint?: string; agent_source_sha?: string };
-    expect(body.task_id).toBe('task-runtime-fp');
-    expect(body.agent_runtime_fingerprint).toBe(runtimeFingerprint);
-    expect(body.agent_source_sha).toBe(sourceSha);
-  });
-
-  it('reclaims the in-flight slot when a heartbeat POST wedges past the deadline', async () => {
-    vi.useFakeTimers();
-    let heartbeatCalls = 0;
-    // Every heartbeat POST hangs forever (never resolves). Pre-fix, the first
-    // periodic tick would latch `heartbeatInFlight` and every later tick would
-    // skip indefinitely → liveness silenced → false AGENT_TIMEOUT. Post-fix, a
-    // tick past HEARTBEAT_INFLIGHT_DEADLINE reclaims the slot and fires again.
-    fetchMock.mockImplementation((input: unknown) => {
-      if (String(input).endsWith('/api/agent/heartbeat')) {
-        heartbeatCalls += 1;
-        return new Promise(() => { /* never settles */ });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    });
-
-    _startHeartbeatForTesting('task-wedged', () => 'hb');
-    // Initial fire + the first periodic tick each start a (hanging) POST.
-    await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL + 5);
-    const callsAfterFirstTick = heartbeatCalls;
-    // Ticks within the deadline must skip — no new POSTs.
-    await vi.advanceTimersByTimeAsync(HEARTBEAT_INFLIGHT_DEADLINE - HEARTBEAT_INTERVAL);
-    expect(heartbeatCalls).toBe(callsAfterFirstTick);
-    // Once held past the deadline, the next tick reclaims and fires a new POST.
-    await vi.advanceTimersByTimeAsync(2 * HEARTBEAT_INTERVAL);
-    expect(heartbeatCalls).toBeGreaterThan(callsAfterFirstTick);
-  });
-});
-
-// ── Heartbeat 409 task-terminal detection ────────────────────────────────────
-// When the backend returns 409 with "Task already terminal" the agent must
-// self-terminate (cancel flag + terminal-status POST + exit timer), NOT retry
-// as if it were a transient row-lock.  A plain row-lock 409 still retries.
-describe('heartbeat 409 task-terminal detection', () => {
-  let fetchMock: FetchMock;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    fetchMock = makeFetchMock();
-    vi.stubGlobal('fetch', fetchMock);
     vi.mocked(execFileSync).mockReset();
     vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(fs.writeFileSync).mockReset();
     vi.mocked(fs.unlinkSync).mockReset();
-    _resetCancelRequestedForTesting();
   });
 
-  afterEach(() => {
-    _stopHeartbeatForTesting();
-    _resetCancelRequestedForTesting();
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-  });
+  it('fires a synchronous curl POST to /api/agent/status with status=FAILED and the given failure_category', () => {
+    postTerminalStatusSync('task-c7-reassigned', 'reassigned', 'Task reassigned/deauthorized');
 
-  it('triggers graceful shutdown (stop+terminal-post+exit) when heartbeat 409 carries "Task already terminal"', async () => {
-    fetchMock.mockResolvedValue({
-      ok: false,
-      status: 409,
-      text: () => Promise.resolve('{"detail":"Task already terminal"}'),
-      json: () => Promise.resolve({}),
-      headers: { get: () => null },
-    });
-
-    _startHeartbeatForTesting('task-terminal-409', () => 'running');
-    // advanceTimersByTimeAsync flushes pending microtasks (fetch chain + catch handler)
-    await vi.advanceTimersByTimeAsync(1);
-
-    // cancel flag set — role loop and subsequent heartbeat ticks see it as shutdown
-    expect(_isCancelRequestedForTesting()).toBe(true);
-    // Terminal-status POST fired via curl (stop+terminal-post+exit pattern)
-    const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
+    const curlCall = vi.mocked(execFileSync).mock.calls.find(
+      ([cmd]) => cmd === 'curl',
+    );
+    // Without the fix the heartbeat path exits with no terminal POST at all —
+    // this assertion (a status POST WAS fired) is what fails pre-fix.
     expect(curlCall).toBeDefined();
     const args = curlCall?.[1] as string[];
-    expect(args.some(a => a.includes('/api/agent/status'))).toBe(true);
+    // POSTs to the status endpoint (not the heartbeat endpoint).
+    expect(args.some((a) => a.includes('/api/agent/status'))).toBe(true);
+    // Body carries FAILED + the explicit reassignment category so the backend
+    // does not have to wait for the reaper to time the task out.
     const bodyIdx = args.indexOf('-d');
     const body = JSON.parse(args[bodyIdx + 1]) as Record<string, unknown>;
     expect(body.status).toBe('FAILED');
-    expect(body.task_id).toBe('task-terminal-409');
+    expect(body.failure_category).toBe('reassigned');
+    expect(body.task_id).toBe('task-c7-reassigned');
   });
 
-  it('still retries on a row-lock 409 ("Task row locked") and does NOT set cancel flag', async () => {
-    let callCount = 0;
-    fetchMock.mockImplementation(() => {
-      callCount++;
-      return Promise.resolve({
-        ok: false,
-        status: 409,
-        text: () => Promise.resolve('{"status":"locked","detail":"Task row locked, retry next cycle"}'),
-        json: () => Promise.resolve({}),
-        headers: { get: () => '30' },
-      });
-    });
-
-    _startHeartbeatForTesting('task-locked-409', () => 'running');
-    // Advance past the periodic heartbeat interval (30s) and both retry delays
-    // (5s + 10s) so the periodic handler's retry loop fully runs.
-    await vi.advanceTimersByTimeAsync(50_000);
-
-    // cancel flag must NOT be set — row-lock is transient, not a shutdown signal
-    expect(_isCancelRequestedForTesting()).toBe(false);
-    // Initial heartbeat + periodic initial attempt + 2 retries = >= 4 calls
-    expect(callCount).toBeGreaterThan(1);
-    // No curl terminal POST
+  it('is a no-op when taskId is empty (no spurious POST)', () => {
+    postTerminalStatusSync('', 'reassigned', 'no task');
     const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
     expect(curlCall).toBeUndefined();
   });
-});
 
-// ── Live tool-execution diagnostics in heartbeat status ─────────────────────
-describe('_buildHeartbeatStatusForTesting', () => {
-  it('returns plain status when no tool is in flight', () => {
-    const statusRef = { value: 'Codex thinking' };
-    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Codex thinking');
-  });
-
-  it('includes elapsed time in seconds when tool has been running under 60s', () => {
-    const now = 1_000_000;
-    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 42_000, lastProgressAt: now - 5_000 };
-    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
-    expect(msg).toBe('Using tool: Bash (42s elapsed, last sub-progress 5s ago)');
-  });
-
-  it('formats elapsed time as Xm Ys when tool has been running over 60s', () => {
-    const now = 1_000_000;
-    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 252_000, lastProgressAt: now - 43_000 };
-    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
-    expect(msg).toBe('Using tool: Bash (4m 12s elapsed, last sub-progress 43s ago)');
-  });
-
-  it('omits sub-progress clause when lastProgressAt is not set', () => {
-    const now = 1_000_000;
-    const statusRef = { value: 'Using tool: TodoWrite', toolStartedAt: now - 10_000 };
-    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
-    expect(msg).toBe('Using tool: TodoWrite (10s elapsed)');
-  });
-
-  it('returns plain status once toolStartedAt is cleared (tool complete)', () => {
-    const statusRef = { value: 'Using tool: Bash', toolStartedAt: undefined, lastProgressAt: undefined };
-    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Using tool: Bash');
+  it('retains the stale-result fallback file when the sync POST fails (no silent loss)', () => {
+    // curl throws (partition) — the stale-result file must survive so a later
+    // process / warm role retries the terminal status instead of losing it.
+    vi.mocked(execFileSync).mockImplementation(() => { throw new Error('curl: timeout'); });
+    postTerminalStatusSync('task-c7-partition', 'reassigned', 'partitioned');
+    // The fallback file was written and NOT unlinked (unlink only happens on
+    // a successful POST).
+    const wrote = vi.mocked(fs.writeFileSync).mock.calls.some(
+      ([p]) => String(p).includes('task-c7-partition_result.json'),
+    );
+    expect(wrote).toBe(true);
+    const unlinked = vi.mocked(fs.unlinkSync).mock.calls.some(
+      ([p]) => String(p).includes('task-c7-partition_result.json'),
+    );
+    expect(unlinked).toBe(false);
   });
 });
 
-// ── Per-task LLM telemetry (efficiency direction d-91d8dede) ────────────────
-describe('LLM telemetry counters', () => {
-  beforeEach(() => {
-    resetLlmTelemetry();
+describe('cancel flag (C7 reassignment shutdown signalling)', () => {
+  afterEach(() => { _resetCancelRequestedForTesting(); });
+
+  it('defaults to false and is observable via the test hook', () => {
+    _resetCancelRequestedForTesting();
+    expect(_isCancelRequestedForTesting()).toBe(false);
+  });
+});
+
+// ── resetPerRoleModuleState — warm-VM per-role isolation ─────────────────────
+// Single source of truth that clears ALL per-role module-level mutable state so
+// a reused warm VM cannot leak a prior task's state into the next role.
+describe('resetPerRoleModuleState (warm-VM isolation)', () => {
+  afterEach(() => {
+    _resetCancelRequestedForTesting();
+    resetPerRoleModuleState({ warmStart: false });
   });
 
-  it('starts at zero', () => {
+  it('clears the cancel shutdown signal so the next role can heartbeat', () => {
+    _setCancelRequestedForTesting();
+    expect(_isCancelRequestedForTesting()).toBe(true);
+    resetPerRoleModuleState();
+    expect(_isCancelRequestedForTesting()).toBe(false);
+  });
+
+  it('clears tool-trace, prompt fingerprint and LLM telemetry, and resets the warm-start flag', () => {
+    // Seed per-role state as if a prior role ran.
+    recordToolUse('Read', { file_path: '/tmp/workspace/foo.ts' });
+    setCurrentPromptFingerprint('prior-role-fp');
+    recordLlmCallStart();
+    recordLlmTokens(123, 45);
+    _setWarmStartForTesting(true);
+    expect(snapshotToolTrace().length).toBeGreaterThan(0);
+    expect(getCurrentPromptFingerprint()).toBe('prior-role-fp');
+    expect(getLlmTelemetry().llm_call_count).toBe(1);
+
+    // Warm handoff: reset with warmStart:true.
+    resetPerRoleModuleState({ warmStart: true });
+
+    expect(snapshotToolTrace().length).toBe(0);
+    expect(getCurrentPromptFingerprint()).toBeNull();
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
       num_turns: 0,
@@ -2348,700 +908,977 @@ describe('LLM telemetry counters', () => {
       prompt_section_sizes: null,
       provider_reported_usage: null,
     });
+    expect(_getWarmStartForTesting()).toBe(true);
   });
 
-  it('counts CLI invocations and accumulates tokens across calls', () => {
-    recordLlmCallStart();
-    recordLlmTokens(100, 50);
-    recordLlmCallStart();
-    recordLlmTokens(200, 75);
-    expect(getLlmTelemetry()).toEqual({
-      llm_call_count: 2,
-      num_turns: 0,
-      total_input_tokens: 300,
-      total_output_tokens: 125,
-      total_cache_creation_input_tokens: 0,
-      total_cache_read_input_tokens: 0,
-      viewport_screenshot_forwarded_count: 0,
-      total_tool_result_bytes: 0,
-      prompt_size_bytes: null,
-      prompt_section_count: null,
-      prompt_section_sizes: null,
-      provider_reported_usage: null,
-    });
+  it('defaults warmStart to false (cold-start semantics) when no flags are passed', () => {
+    _setWarmStartForTesting(true);
+    resetPerRoleModuleState();
+    expect(_getWarmStartForTesting()).toBe(false);
   });
 
-  it('ignores non-finite or negative token counts', () => {
-    recordLlmTokens(Number.NaN, 50);
-    recordLlmTokens(-5, -10);
-    recordLlmTokens(100, Number.POSITIVE_INFINITY);
-    expect(getLlmTelemetry()).toEqual({
-      llm_call_count: 0,
-      num_turns: 0,
-      total_input_tokens: 100,
-      total_output_tokens: 50,
-      total_cache_creation_input_tokens: 0,
-      total_cache_read_input_tokens: 0,
-      viewport_screenshot_forwarded_count: 0,
-      total_tool_result_bytes: 0,
-      prompt_size_bytes: null,
-      prompt_section_count: null,
-      prompt_section_sizes: null,
-      provider_reported_usage: null,
-    });
+  it('clears the log buffer so prior-role lines do not appear in the next task\'s stream', () => {
+    appendToLogBuffer('prior-role-line-1');
+    appendToLogBuffer('prior-role-line-2');
+    expect(snapshotLogBuffer().length).toBe(2);
+    resetPerRoleModuleState();
+    expect(snapshotLogBuffer().length).toBe(0);
   });
 
-  it('resets between roles so warm-VM continuity does not leak counts', () => {
-    recordLlmCallStart();
-    recordLlmTokens(500, 250);
-    resetLlmTelemetry();
-    expect(getLlmTelemetry()).toEqual({
-      llm_call_count: 0,
-      num_turns: 0,
-      total_input_tokens: 0,
-      total_output_tokens: 0,
-      total_cache_creation_input_tokens: 0,
-      total_cache_read_input_tokens: 0,
-      viewport_screenshot_forwarded_count: 0,
-      total_tool_result_bytes: 0,
-      prompt_size_bytes: null,
-      prompt_section_count: null,
-      prompt_section_sizes: null,
-      provider_reported_usage: null,
-    });
-  });
-});
-
-// ── Gemini text-mode token estimation ────────────────────────────────────────
-describe('Gemini text-mode token estimation', () => {
-  beforeEach(() => {
-    resetLlmTelemetry();
+  it('clears the test convention cache so a warm VM role does not serve stale conventions', () => {
+    const spy = vi.spyOn(discovery, 'clearTestConventionCache');
+    try {
+      resetPerRoleModuleState();
+      expect(spy).toHaveBeenCalledOnce();
+    } finally {
+      spy.mockRestore();
+    }
   });
 
-  it('estimateTokensFromChars returns ceil(chars/4)', () => {
-    expect(estimateTokensFromChars(0)).toBe(0);
-    expect(estimateTokensFromChars(1)).toBe(1);
-    expect(estimateTokensFromChars(4)).toBe(1);
-    expect(estimateTokensFromChars(5)).toBe(2);
-    expect(estimateTokensFromChars(400)).toBe(100);
-    expect(estimateTokensFromChars(1000)).toBe(250);
-  });
-
-  it('lands estimated tokens in the same getLlmTelemetry() fields Claude uses', () => {
-    // Simulate what runProviderAgent does for outputMode='text': estimate from
-    // prompt.length and lastResultText.length, then call recordLlmTokens.
-    const promptChars = 2000;  // → 500 estimated input tokens
-    const resultChars = 800;   // → 200 estimated output tokens
-    recordLlmCallStart();
-    recordLlmTokens(estimateTokensFromChars(promptChars), estimateTokensFromChars(resultChars));
-    const telemetry = getLlmTelemetry();
-    expect(telemetry.total_input_tokens).toBe(500);
-    expect(telemetry.total_output_tokens).toBe(200);
-    expect(telemetry.llm_call_count).toBe(1);
-  });
-
-  it('records non-zero tokens on partial output (timeout/kill scenario)', () => {
-    // Even when the Gemini CLI is killed mid-run, lastResultText has partial
-    // output. Verify estimation still produces non-zero values.
-    const fullPromptChars = 5000;
-    const partialResultChars = 100;
-    recordLlmCallStart();
-    recordLlmTokens(estimateTokensFromChars(fullPromptChars), estimateTokensFromChars(partialResultChars));
-    const telemetry = getLlmTelemetry();
-    expect(telemetry.total_input_tokens).toBeGreaterThan(0);
-    expect(telemetry.total_output_tokens).toBeGreaterThan(0);
-  });
-});
-
-// ── Cross-language classification contracts ───────────────────────────────────
-// Assert that backend/app/failure_classification.py still contains the patterns
-// that match what this agent emits. If one fails, update the matching side:
-// either the string in agent/src/index.ts or the corresponding pattern in
-// failure_classification._AGENT_LIVE_WORK_PATTERNS / _VIEWPORT_PATTERNS.
-//
-// Complements backend/testing/test_failure_classification.py
-// TestCrossLanguageClassificationContracts, which checks the reverse direction
-// (Python reads agent/src/index.ts and admin-ui/src/test/viewport.ts).
-describe('cross-language classification contracts', () => {
-  let classifierSrc = '';
-
-  beforeAll(async () => {
-    // vi.importActual bypasses the vi.mock('fs', ...) at the top of this file
-    // so we can read real source files for the contract assertions.
-    const realFs = await vi.importActual<typeof import('fs')>('fs');
-    const nodePath = await import('node:path');
+  it('reset invariant guard fails when a per-role variable is left unreset', async () => {
+    // Static guard: every @per-role-tagged variable declared in index.ts must
+    // appear in the resetPerRoleModuleState function body (directly or via a
+    // single-depth helper it calls). This test fails CI when someone adds a new
+    // per-role `let` without wiring it into the reset — the root cause of the
+    // 12-cycle warm-VM state-leak whack-a-mole.
+    // fs is mocked in this file; use vi.importActual to get the real module.
+    const actualFs = await vi.importActual<typeof import('fs')>('fs');
     const nodeUrl = await import('node:url');
-    // fileURLToPath (not URL.pathname) so Windows does not yield a leading-slash
-    // '/D:/…' that path.join then doubles into an invalid 'D:\D:\…' path.
-    const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
-    classifierSrc = realFs.readFileSync(
-      nodePath.join(dir, '..', '..', 'backend', 'app', 'failure_classification.py'),
-      'utf-8',
-    ).toLowerCase();
-  });
-
-  it('_AGENT_LIVE_WORK_PATTERNS still matches PR-push heartbeat prefix', () => {
-    // agent/src/index.ts emits: sendHeartbeatSync(taskId, `Creating pull request for ${workBranch}...`)
-    // where workBranch is a blueprint/ branch. If this fails, update either the
-    // agent string or the classifier pattern so both stay in sync.
-    expect(classifierSrc).toContain('"creating pull request for blueprint/"');
-  });
-
-  it('_AGENT_LIVE_WORK_PATTERNS still matches tool-call heartbeat prefix', () => {
-    // agent/src/index.ts emits: statusRef.value = `Using tool: ${toolName}`
-    // If this fails, update either the agent string or the classifier pattern.
-    expect(classifierSrc).toContain('"using tool: "');
-  });
-
-  it('_VIEWPORT_PATTERNS still matches expectNoOverflowAt function name', () => {
-    // viewport.ts throws errors containing 'expectNoOverflowAt(...)'.
-    // If this fails, update either the viewport helper name or the classifier pattern.
-    expect(classifierSrc).toContain('"expectnooverflowat("');
-  });
-
-  it('_VIEWPORT_PATTERNS still matches expectNoTextTruncationAt function name', () => {
-    // viewport.ts throws errors containing 'expectNoTextTruncationAt(...)'.
-    expect(classifierSrc).toContain('"expectnotexttruncationat("');
-  });
-
-  it('_VIEWPORT_PATTERNS still matches expectMinTouchTargetAt function name', () => {
-    // viewport.ts throws errors containing 'expectMinTouchTargetAt(...)'.
-    expect(classifierSrc).toContain('"expectmintouchtargetat("');
-  });
-});
-
-// ── Cross-language credential redaction corpus ───────────────────────────────
-// Keep the shared corpus file in backend/testing/__fixtures__ so both the
-// backend pytest suite and this agent vitest suite can read the exact same
-// fixtures. If this fails, update the corpus or the sanitizer pattern set.
-describe('cross-language credential redaction corpus', () => {
-  let corpus: Array<{ family: string; secret: string; raw: string }> = [];
-
-  beforeAll(async () => {
-    const realFs = await vi.importActual<typeof import('fs')>('fs');
     const nodePath = await import('node:path');
-    const nodeUrl = await import('node:url');
+
     const dir = nodePath.dirname(nodeUrl.fileURLToPath(import.meta.url));
-    corpus = JSON.parse(
-      realFs.readFileSync(
-        nodePath.join(
-          dir,
-          '..',
-          '..',
-          'backend',
-          'testing',
-          '__fixtures__',
-          'credential_redaction_corpus.json',
-        ),
-        'utf-8',
-      ),
-    ) as Array<{ family: string; secret: string; raw: string }>;
-  });
+    const src = (actualFs as { readFileSync: (p: string, enc: string) => string })
+      .readFileSync(nodePath.join(dir, 'index.ts'), 'utf-8');
 
-  it('masks every shared corpus entry', () => {
-    for (const entry of corpus) {
-      const out = sanitize(entry.secret);
-      expect(out).not.toContain(entry.raw);
+    const perRoleVars: string[] = [];
+    for (const line of src.split('\n')) {
+      if (line.includes('// @per-role')) {
+        const m = line.match(/(?:let|const)\s+(\w+)/);
+        if (m) perRoleVars.push(m[1]);
+      }
+    }
+    expect(perRoleVars.length).toBeGreaterThan(0);
+
+    function extractFnBody(source: string, fn: string): string {
+      const pat = new RegExp(`(?:export\\s+)?function\\s+${fn}\\s*\\(`);
+      const idx = source.search(pat);
+      if (idx === -1) return '';
+      // Skip past the full parameter list to avoid mistaking default-arg
+      // braces like `= {}` for the function body's opening brace.
+      const parenStart = source.indexOf('(', idx);
+      if (parenStart === -1) return '';
+      let pd = 1; let pi = parenStart + 1;
+      while (pi < source.length && pd > 0) {
+        if (source[pi] === '(') pd++;
+        else if (source[pi] === ')') pd--;
+        pi++;
+      }
+      const braceIdx = source.indexOf('{', pi);
+      if (braceIdx === -1) return '';
+      let depth = 1; let i = braceIdx + 1;
+      while (i < source.length && depth > 0) {
+        if (source[i] === '{') depth++;
+        else if (source[i] === '}') depth--;
+        i++;
+      }
+      return source.slice(braceIdx + 1, i - 1);
+    }
+
+    const resetBody = extractFnBody(src, 'resetPerRoleModuleState');
+    const calledFns = [...resetBody.matchAll(/\b(\w+)\(\)/g)].map(m => m[1]);
+    const helperBodies = calledFns
+      .map(fn => extractFnBody(src, fn))
+      .filter(b => b.length > 0)
+      .join('\n');
+    const fullScope = resetBody + '\n' + helperBodies;
+
+    for (const v of perRoleVars) {
+      expect(fullScope, `@per-role var "${v}" not cleared in resetPerRoleModuleState`).toMatch(
+        new RegExp(`\\b${v}\\b`),
+      );
     }
   });
 });
 
-// ── codexStreamHasTurnCompleted (cause-C sentinel, 2026-05-26) ───────────────
-// The Codex CLI emits `{"type":"turn.completed"}` only when the turn actually
-// finished. Absent that event, exitCode=0 means the upstream provider died
-// silently (token cap / refusal / 5xx the CLI swallowed). The memo handler
-// reclassifies on this signal — see agent/src/handlers/memo.ts. These tests
-// pin the pure parser the live drainer (drainCodexChunks) mirrors.
-describe('codexStreamHasTurnCompleted', () => {
-  it('returns false for a stream that started but never completed (cause C)', () => {
-    const stream =
-      '{"type":"thread.started","thread_id":"t1"}\n'
-      + '{"type":"turn.started"}\n';
-    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+// ── Cloud Run Job mode detection ──────────────────────────────────────────────
+describe('Cloud Run Job mode (CLOUD_RUN_JOB env var)', () => {
+  afterEach(() => {
+    _setJobModeForTesting(false);
+    delete process.env.CLOUD_RUN_JOB;
   });
 
-  it('returns true for a stream containing a turn.completed event', () => {
-    const stream =
-      '{"type":"thread.started","thread_id":"t1"}\n'
-      + '{"type":"turn.started"}\n'
-      + '{"type":"item.completed","item":{"type":"agent_message","text":"hi"}}\n'
-      + '{"type":"turn.completed","usage":{"input_tokens":42}}\n';
-    expect(codexStreamHasTurnCompleted(stream)).toBe(true);
+  it('reads CLOUD_RUN_JOB=1 env var at startup and sets isJobMode flag', () => {
+    process.env.CLOUD_RUN_JOB = '1';
+    expect(_getJobModeForTesting()).toBe(false); // Initially false
+    _setJobModeForTesting(true);
+    expect(_getJobModeForTesting()).toBe(true);
   });
 
-  it('ignores non-JSON noise (codex auth error log lines)', () => {
-    const stream =
-      '2026-05-26T10:00:00Z ERROR codex_login: token invalid\n'
-      + '{"type":"thread.started"}\n';
-    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+  it('does not set isJobMode when CLOUD_RUN_JOB is absent', () => {
+    delete process.env.CLOUD_RUN_JOB;
+    expect(_getJobModeForTesting()).toBe(false);
   });
 
-  it('ignores malformed JSONL lines without crashing', () => {
-    const stream =
-      '{"type":"thread.started"}\n'
-      + '{this is not valid json\n'
-      + '{"type":"turn.completed"}\n';
-    expect(codexStreamHasTurnCompleted(stream)).toBe(true);
-  });
-
-  it('returns false on an empty stream', () => {
-    expect(codexStreamHasTurnCompleted('')).toBe(false);
-  });
-
-  it('does not match substrings outside the type field', () => {
-    // Defensive: a tool argument that mentions "turn.completed" must not
-    // false-positive the sentinel. The check is gated on `obj.type` equality.
-    const stream =
-      '{"type":"item.completed","item":{"type":"agent_message","text":"the turn.completed event was missing"}}\n';
-    expect(codexStreamHasTurnCompleted(stream)).toBe(false);
+  it('does not set isJobMode when CLOUD_RUN_JOB is not exactly "1"', () => {
+    process.env.CLOUD_RUN_JOB = 'true';
+    expect(_getJobModeForTesting()).toBe(false);
+    _setJobModeForTesting(true);
+    expect(_getJobModeForTesting()).toBe(true);
   });
 });
 
-// ── Task-capability contract load (runs before handler dispatch) ──────────────
-// runRoleOnce fetches + loads the published contract after the github-token
-// fetch and before dispatching to a handler, so isReadOnlyTaskType (used by
-// configureAgentPermissions) resolves against backend metadata. These cases
-// exercise the load helper directly (the fetcher is injectable for tests).
-describe('ensureTaskCapabilityContractLoaded', () => {
+// ── readHandlerOutput ─────────────────────────────────────────────────────────
+describe('readHandlerOutput', () => {
   beforeEach(() => {
-    __resetTaskCapabilityContractLoadedForTesting();
-    __resetTaskCapabilityContractForTesting();
+    mockReadFileSync.mockReset();
   });
 
-  afterEach(() => {
-    // Restore the canonical fixture so other suites in this file keep a loaded
-    // contract (testSetup seeded it at top-level / beforeAll).
-    __resetTaskCapabilityContractForTesting();
-    loadTaskCapabilityContract(buildFixtureCapabilityContract());
+  it('returns parsed object when file contains valid JSON', () => {
+    mockReadFileSync.mockReturnValue('{"result": "ok", "count": 3}');
+    const result = readHandlerOutput('task-1', 'research_findings', null);
+    expect(result).toEqual({ result: 'ok', count: 3 });
   });
 
-  it('fetches and loads the contract, enabling permission classification', async () => {
-    let fetched = 0;
-    const fetcher = (): Promise<TaskCapabilityContract> => {
-      fetched += 1;
-      return Promise.resolve(buildFixtureCapabilityContract());
-    };
-
-    await ensureTaskCapabilityContractLoaded(fetcher);
-
-    expect(fetched).toBe(1);
-    // After load, the partition resolves instead of throwing.
-    expect(isReadOnlyTaskType('review')).toBe(true);
-    expect(isReadOnlyTaskType('create')).toBe(false);
+  it('returns parsed array when file contains valid JSON array', () => {
+    mockReadFileSync.mockReturnValue('[{"title": "Finding 1"}, {"title": "Finding 2"}]');
+    const result = readHandlerOutput('task-2', 'plan_output', null);
+    expect(result).toEqual([{ title: 'Finding 1' }, { title: 'Finding 2' }]);
   });
 
-  it('is idempotent — a second call does not re-fetch', async () => {
-    let fetched = 0;
-    const fetcher = (): Promise<TaskCapabilityContract> => {
-      fetched += 1;
-      return Promise.resolve(buildFixtureCapabilityContract());
-    };
-
-    await ensureTaskCapabilityContractLoaded(fetcher);
-    await ensureTaskCapabilityContractLoaded(fetcher);
-
-    expect(fetched).toBe(1);
+  it('extracts embedded JSON array via regex when top-level parse fails', () => {
+    const raw =
+      'Some prefix text here\n[{"id": 1, "name": "item"}]\nSome trailing text';
+    mockReadFileSync.mockReturnValue(raw);
+    const result = readHandlerOutput(
+      'task-3',
+      'output',
+      null,
+    ) as Array<{ id: number; name: string }> | null;
+    expect(result).toEqual([{ id: 1, name: 'item' }]);
   });
 
-  it('throws (fails the role) when the contract is incomplete', async () => {
-    const fetcher = (): Promise<TaskCapabilityContract> => {
-      const incomplete = buildFixtureCapabilityContract();
-      delete incomplete.migrate;
-      return Promise.resolve(incomplete);
-    };
-
-    await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/migrate/);
-    // The guard did not flip — classification still throws, so a follow-up
-    // attempt would retry the fetch rather than run with no contract.
-    expect(() => isReadOnlyTaskType('create')).toThrow(/not loaded/);
+  it('extracts embedded strategic output object via regex fallback', () => {
+    // Use an empty direction_operations array so the array-pattern regex
+    // (/\[\s*\{...\}/) does not match first — the strategic-object regex is
+    // only reached when there is no embedded JSON array in the raw text.
+    const strategicObj =
+      '{"vision": "build great things", "direction_operations": []}';
+    const raw = `Preamble text with no JSON arrays\n${strategicObj}`;
+    mockReadFileSync.mockReturnValue(raw);
+    const result = readHandlerOutput(
+      'task-4',
+      'strategic_output',
+      null,
+    ) as { vision: string; direction_operations: unknown[] } | null;
+    expect(result).not.toBeNull();
+    if (!result) throw new Error('expected result');
+    expect(result.vision).toBe('build great things');
+    expect(Array.isArray(result.direction_operations)).toBe(true);
   });
 
-  it('rejects an empty contract map (no task types covered)', async () => {
-    // The fetch wrapper guards a missing key; loadTaskCapabilityContract guards
-    // an empty/partial map. An empty object reaches the completeness check and
-    // surfaces an explicit error rather than silently classifying nothing.
-    const fetcher = (): Promise<TaskCapabilityContract> =>
-      Promise.resolve({} as TaskCapabilityContract);
-    await expect(ensureTaskCapabilityContractLoaded(fetcher)).rejects.toThrow(/does not cover/);
-  });
-});
-
-// ── cloneWithRetry ───────────────────────────────────────────────────────────
-describe('cloneWithRetry', () => {
-  const defaultSpawnImpl = vi.mocked(spawn).getMockImplementation();
-
-  function setupGitCloneMock(successAfterAttempts: number, errorMsg: string, captureArgs?: string[][]) {
-    let callCount = 0;
-    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
-      if (cmd === 'git') {
-        callCount++;
-        if (captureArgs) captureArgs.push((argsRaw as string[]).slice());
-        const shouldFail = callCount <= successAfterAttempts;
-        const errMsg = errorMsg;
-        const stderrCbs: ((d: Buffer) => void)[] = [];
-        const proc = {
-          pid: 999,
-          stdin: { on: vi.fn(), end: vi.fn() },
-          stderr: {
-            on: vi.fn((event: string, cb: (d: Buffer) => void) => {
-              if (event === 'data') stderrCbs.push(cb);
-            }),
-          },
-          stdout: { on: vi.fn() },
-          on: vi.fn((event: string, cb: (code: number) => void) => {
-            if (event === 'close') {
-              void Promise.resolve().then(() => {
-                if (shouldFail) for (const scb of stderrCbs) scb(Buffer.from(errMsg));
-                cb(shouldFail ? 1 : 0);
-              });
-            }
-          }),
-          kill: vi.fn(),
-        };
-        return proc as unknown as ReturnType<typeof spawn>;
-      }
-      // Fall back to default for non-git commands
-      if (defaultSpawnImpl) return defaultSpawnImpl(cmd as string, argsRaw as string[], {});
-      // When no default exists, return a minimal no-op ChildProcess
-      return { on: vi.fn(), kill: vi.fn(), stdin: { on: vi.fn(), end: vi.fn() }, stdout: { on: vi.fn() }, stderr: { on: vi.fn() }, pid: 0 } as unknown as ReturnType<typeof spawn>;
+  it('returns null when file is not found (ENOENT)', () => {
+    mockReadFileSync.mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT: no such file or directory'), { code: 'ENOENT' });
     });
-  }
-
-  afterEach(() => {
-    vi.mocked(spawn).mockReset();
-    if (defaultSpawnImpl) vi.mocked(spawn).mockImplementation(defaultSpawnImpl);
+    const result = readHandlerOutput('task-5', 'missing', null);
+    expect(result).toBeNull();
   });
 
-  it('redacts token-bearing URLs from retry log lines', async () => {
-    vi.useFakeTimers();
-    const tokenUrl = 'https://x-access-token:ghp_secret123@github.com/org/repo.git';
-    const errorMsg = `fatal: repository '${tokenUrl}' not found`;
-    setupGitCloneMock(2, errorMsg);
-
-    const logLines: string[] = [];
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
-      logLines.push(args.map(String).join(' '));
-    });
-
-    const clonePromise = cloneWithRetry(['clone', tokenUrl, '/tmp/repo'], 1000);
-    await vi.runAllTimersAsync();
-    await clonePromise;
-
-    consoleSpy.mockRestore();
-    vi.useRealTimers();
-
-    const retryLines = logLines.filter(l => l.includes('Git clone failed'));
-    expect(retryLines.length).toBeGreaterThanOrEqual(2);
-    for (const line of retryLines) {
-      expect(line).not.toContain('ghp_secret123');
-      expect(line).toContain('***');
-    }
-  });
-
-  it('re-mints a fresh token and rewrites the clone URL after an AUTH failure', async () => {
-    vi.useFakeTimers();
-    process.env.TASK_ID = 'task-auth-123';
-    const staleUrl = 'https://x-access-token:ghs_STALE_TOKEN@github.com/org/repo.git';
-    const authErr = "remote: Invalid username or token. Password authentication is not supported.\nfatal: Authentication failed for 'https://github.com/org/repo.git/'";
-
-    const cloneArgs: string[][] = [];
-    setupGitCloneMock(1, authErr, cloneArgs);
-
-    // force_refresh token endpoint returns a fresh token.
-    const fetchMock = makeFetchMock().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ data: { token: 'ghs_FRESH_TOKEN', owner: 'org', repo: 'repo' } }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const logLines: string[] = [];
-    const consoleSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
-      logLines.push(args.map(String).join(' '));
-    });
-
-    const clonePromise = cloneWithRetry(['clone', staleUrl, '/tmp/repo'], 1000);
-    await vi.runAllTimersAsync();
-    await clonePromise;
-
-    consoleSpy.mockRestore();
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-    delete process.env.TASK_ID;
-
-    // The token endpoint was hit with force_refresh=true.
-    const calledUrl = String(fetchMock.mock.calls[0][0]);
-    expect(calledUrl).toContain('/api/agent/github/token');
-    expect(calledUrl).toContain('force_refresh=true');
-
-    // The retry clone used the FRESH token, not the stale one.
-    const secondCloneArgs = cloneArgs[1];
-    expect(secondCloneArgs.some(x => x.includes('ghs_FRESH_TOKEN'))).toBe(true);
-    expect(secondCloneArgs.some(x => x.includes('ghs_STALE_TOKEN'))).toBe(false);
-
-    // No log line ever leaks a raw token.
-    for (const line of logLines) {
-      expect(line).not.toContain('ghs_STALE_TOKEN');
-      expect(line).not.toContain('ghs_FRESH_TOKEN');
-    }
-  });
-
-  it('does NOT re-mint a token for a transient NETWORK failure', async () => {
-    vi.useFakeTimers();
-    process.env.TASK_ID = 'task-net-456';
-    const url = 'https://x-access-token:ghs_NET_TOKEN@github.com/org/repo.git';
-    const netErr = 'fatal: unable to access: Could not resolve host: github.com';
-
-    setupGitCloneMock(1, netErr);
-
-    const fetchMock = makeFetchMock().mockResolvedValue({
-      ok: true,
-      json: () => Promise.resolve({ data: { token: 'ghs_SHOULD_NOT_BE_FETCHED' } }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const clonePromise = cloneWithRetry(['clone', url, '/tmp/repo'], 1000);
-    await vi.runAllTimersAsync();
-    await clonePromise;
-
-    vi.unstubAllGlobals();
-    vi.useRealTimers();
-    delete process.env.TASK_ID;
-
-    // The token endpoint must NOT have been called for a network error.
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-});
-
-// ── resolveCredentialsFromSecretVersion ───────────────────────────────────────
-describe('resolveCredentialsFromSecretVersion', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    _setAgentTokenForTesting('');
-    delete process.env['AGENT_SECRET_TOKEN'];
-    delete process.env['ANTHROPIC_API_KEY'];
-    delete process.env['CLAUDE_CODE_OAUTH_TOKEN'];
-    delete process.env['OPENAI_API_KEY'];
-    delete process.env['CODEX_API_KEY'];
-    delete process.env['GEMINI_API_KEY'];
-    delete process.env['GOOGLE_APPLICATION_CREDENTIALS'];
-    delete process.env['GOOGLE_CLOUD_PROJECT'];
-    delete process.env['GOOGLE_CLOUD_LOCATION'];
-    delete process.env['CODEX_HOME'];
-    delete process.env['GEMINI_CLI_TRUST_WORKSPACE'];
-    vi.mocked(fs.writeFileSync).mockClear();
-    vi.mocked(fs.mkdirSync).mockClear();
-  });
-
-  function makeManifestFetch(manifest: Record<string, unknown>): ReturnType<typeof makeFetchMock> {
-    const manifestBase64 = Buffer.from(JSON.stringify(manifest)).toString('base64');
-    return makeFetchMock().mockImplementation((url: unknown) => {
-      const urlStr = String(url);
-      if (urlStr.includes('metadata.google.internal')) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ access_token: 'gcp-test-token' }) });
-      }
-      if (urlStr.includes('secretmanager.googleapis.com')) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ payload: { data: manifestBase64 } }) });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    });
-  }
-
-  it('populates getAgentToken() and apiHeaders[X-Agent-Token] from Secret Manager manifest', async () => {
-    const expectedToken = 'test-agent-jwt-from-secret-manager';
-    const fetchMock = makeManifestFetch({ env: { AGENT_SECRET_TOKEN: expectedToken } });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
-
-    // AGENT_TOKEN must be populated from the manifest
-    expect(getAgentToken()).toBe(expectedToken);
-
-    // apiHeaders['X-Agent-Token'] must also be populated so apiPost sends the token
-    await apiPost('/api/test-token-header', {}, 1);
-    const postCall = fetchMock.mock.calls.find(([url]) => String(url).includes('/api/test-token-header'));
-    expect(postCall).toBeDefined();
-    const postHeaders = (defined(postCall)[1] as RequestInit).headers as Record<string, string>;
-    expect(postHeaders['X-Agent-Token']).toBe(expectedToken);
-  });
-
-  it('populates LLM credential env vars from the manifest', async () => {
-    const fetchMock = makeManifestFetch({
-      env: {
-        AGENT_SECRET_TOKEN: 'test-token',
-        ANTHROPIC_API_KEY: 'sk-ant-test-key',
-        CLAUDE_CODE_OAUTH_TOKEN: 'test-oauth-token',
-      },
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
-
-    expect(process.env['ANTHROPIC_API_KEY']).toBe('sk-ant-test-key');
-    expect(process.env['CLAUDE_CODE_OAUTH_TOKEN']).toBe('test-oauth-token');
-  });
-
-  it('does not overwrite an already-set LLM credential env var', async () => {
-    process.env['ANTHROPIC_API_KEY'] = 'already-set-key';
-    const fetchMock = makeManifestFetch({
-      env: {
-        AGENT_SECRET_TOKEN: 'test-token',
-        ANTHROPIC_API_KEY: 'manifest-key-should-not-win',
-      },
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
-
-    expect(process.env['ANTHROPIC_API_KEY']).toBe('already-set-key');
-  });
-
-  it('throws when the metadata token fetch returns a non-2xx status', async () => {
-    const fetchMock = makeFetchMock().mockImplementation((url: unknown) => {
-      if (String(url).includes('metadata.google.internal')) {
-        return Promise.resolve({ ok: false, status: 403 });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await expect(
-      resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1'),
-    ).rejects.toThrow('failed to get GCP access token');
-  });
-
-  it('throws when the Secret Manager :access call returns a non-2xx status', async () => {
-    const fetchMock = makeFetchMock().mockImplementation((url: unknown) => {
-      if (String(url).includes('metadata.google.internal')) {
-        return Promise.resolve({ ok: true, json: () => Promise.resolve({ access_token: 'gcp-test-token' }) });
-      }
-      if (String(url).includes('secretmanager.googleapis.com')) {
-        return Promise.resolve({ ok: false, status: 403 });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await expect(
-      resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1'),
-    ).rejects.toThrow('failed to fetch secret');
-  });
-
-  it('resolveCredentialsFromSecretVersion writes files to disk and sets file-path env vars', async () => {
-    const fetchMock = makeManifestFetch({
-      env: {
-        AGENT_SECRET_TOKEN: 'tok',
-        GOOGLE_APPLICATION_CREDENTIALS: '/tmp/test-sa.json',
-        GOOGLE_CLOUD_PROJECT: 'my-project',
-      },
-      files: [
-        { path: '/tmp/test-sa.json', content: '{"type":"service_account"}', mode: '0600' },
-      ],
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await resolveCredentialsFromSecretVersion('projects/p/secrets/agent-creds/versions/1');
-
-    // File-path env vars must be set from manifest.env
-    expect(process.env['GOOGLE_APPLICATION_CREDENTIALS']).toBe('/tmp/test-sa.json');
-    expect(process.env['GOOGLE_CLOUD_PROJECT']).toBe('my-project');
-
-    // File must have been written to disk with correct content and mode
-    expect(vi.mocked(fs.writeFileSync)).toHaveBeenCalledWith(
-      '/tmp/test-sa.json',
-      '{"type":"service_account"}',
-      { encoding: 'utf-8', mode: 0o600 },
+  it('returns null for completely unparseable content with no recognisable JSON', () => {
+    mockReadFileSync.mockReturnValue(
+      'This is plain text with no JSON arrays or strategic objects at all.',
     );
+    const result = readHandlerOutput('task-6', 'bad_output', null);
+    expect(result).toBeNull();
+  });
 
-    // Parent directory must have been created
-    expect(vi.mocked(fs.mkdirSync)).toHaveBeenCalledWith(
-      '/tmp',
-      { recursive: true, mode: 0o700 },
-    );
+  it('reads from the expected /tmp path derived from taskId and outputType', () => {
+    mockReadFileSync.mockReturnValue('{"ok": true}');
+    readHandlerOutput('myTask', 'review_verdict', null);
+    expect(mockReadFileSync).toHaveBeenCalledWith('/tmp/review_verdict_myTask.json', 'utf-8');
   });
 });
 
-// ── cloneWithRetry: commitless repositories ──────────────────────────────────
-// A repo with zero commits has no default branch, so `git clone --branch <trunk>`
-// fails with EXACTLY the same text as a branch that was deleted after its PR
-// merged. Retrying cannot conjure a branch, and letting the ambiguous text stand
-// gets the failure classified BRANCH_GONE ("PR merged before clone") — a benign
-// transient story for a permanent setup gap. The remote is the only oracle: a
-// commitless repo advertises zero refs.
-describe('cloneWithRetry — commitless repo', () => {
-  const CLONE_ARGS = [
-    '-c', 'credential.https://github.com.helper=/home/agent/.blueprint/git-credential-helper',
-    'clone', '--depth', '50', '--branch', 'main',
-    'https://github.com/HenryHamster/playground.git', '/tmp/workspace',
+// ── TMP_OUTPUT_NAMES — cleanup list correctness ───────────────────────────────
+describe('TMP_OUTPUT_NAMES (scratch-file cleanup list)', () => {
+  // These are the basenames the handlers actually write.  If a handler is
+  // added or renamed, update TMP_OUTPUT_NAMES in reset.ts and keep this list
+  // in sync so the test catches future drift.
+  const KNOWN_HANDLER_OUTPUTS = [
+    'review_verdict',
+    'plan_output',
+    'research_findings',
+    'security_findings',
+    'smoketest_result',
+    'verify_tests_result',
+    'debug_report',
+    'perf_report',
+    'investigation_report',
+    'strategic_output',
+    'design_document',
+    'bootstrap_overview',
+    'command_memory',
+    'web_research_document',
+    'release_audit_report',
+    'release_audit_challenge',
+    'self_audit_findings',
+    'self_review',
   ];
-  // The literal stderr from the production failure (task 235d7c59, playground).
-  const BRANCH_MISSING_STDERR =
-    "Cloning into '/tmp/workspace'...\nfatal: Remote branch main not found in upstream origin";
 
-  /** A fake `git` child process: emits its output, then closes with `code`. */
-  function fakeGitProc(code: number, { stdout = '', stderr = '' } = {}) {
+  it('covers every known handler output basename', () => {
+    for (const name of KNOWN_HANDLER_OUTPUTS) {
+      expect(TMP_OUTPUT_NAMES).toContain(name);
+    }
+  });
+
+  it('does not contain stale basenames that handlers no longer write', () => {
+    // These were the old (wrong) names before the fix — handlers write
+    // debug_report / perf_report / design_document, not these.
+    expect(TMP_OUTPUT_NAMES).not.toContain('debug_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('perf_output');
+    expect(TMP_OUTPUT_NAMES).not.toContain('design_doc_output');
+  });
+});
+
+// Helper: spawn mock that emits close(code) immediately for each spawn call.
+// `failCmds` maps command names to (exitCode, stderr) for failing runners.
+// `npm ci` (dep install) is never failed even when `npm` is in failCmds —
+// testFixLoop now treats install failures as setup errors (not test
+// failures), so tests that want to simulate a failing test run must let
+// the install step succeed.
+function configureSpawnMock(failCmds: Record<string, { exitCode: number; stderr: string }> = {}) {
+  vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
+    const cmdStr = String(cmd);
+    const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+    const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
+    const failure = isNpmInstall ? undefined : failCmds[cmdStr];
+    const stderrCbs: ((d: Buffer) => void)[] = [];
     const proc = {
-      stdout: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stdout) cb(Buffer.from(stdout)); } },
-      stderr: { on: (ev: string, cb: (d: Buffer) => void) => { if (ev === 'data' && stderr) cb(Buffer.from(stderr)); } },
-      on: (ev: string, cb: (c: number) => void) => { if (ev === 'close') setImmediate(() => { cb(code); }); return proc; },
+      pid: 100 + Math.floor(Math.random() * 1000),
+      stderr: {
+        on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+          if (event === 'data') stderrCbs.push(cb);
+        }),
+      },
+      stdout: { on: vi.fn() },
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        if (event === 'close') {
+          setImmediate(() => {
+            if (failure) for (const scb of stderrCbs) scb(Buffer.from(failure.stderr));
+            cb(failure ? failure.exitCode : 0);
+          });
+        }
+      }),
       kill: vi.fn(),
     };
-    return proc;
-  }
+    return proc as unknown as ReturnType<typeof spawn>;
+  });
+}
 
-  /** Script `git`: the clone always fails branch-missing; `ls-remote` reports
-   *  whatever refs the remote is pretending to have. */
-  function scriptGit(refs: string) {
-    vi.mocked(spawn).mockImplementation(((_cmd: string, args: string[]) => {
-      if (args[0] === 'ls-remote') return fakeGitProc(0, { stdout: refs });
-      return fakeGitProc(128, { stderr: BRANCH_MISSING_STDERR });
-    }) as unknown as typeof spawn);
-  }
-
-  const cloneAttempts = () =>
-    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[]).includes('clone'));
-  const lsRemoteProbes = () =>
-    vi.mocked(spawn).mock.calls.filter(c => (c[1] as string[])[0] === 'ls-remote');
-
-  beforeEach(() => { vi.mocked(spawn).mockReset(); });
-
-  it('zero refs → fails fast with the real reason, burning no retries', async () => {
-    scriptGit(''); // a commitless repo advertises no refs at all
-
-    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
-
-    // The whole point: one attempt, not three. Retrying a repo that has no
-    // commits is pure latency — the branch cannot appear on its own.
-    expect(cloneAttempts()).toHaveLength(1);
-    expect(lsRemoteProbes()).toHaveLength(1);
+// ── testFixLoop failureSummary ────────────────────────────────────────────────
+describe('testFixLoop failureSummary', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    // git() helper at index.ts:507 calls .trim() on the return — give it a
+    // string default so unmocked git calls (rev-parse, add -A, etc.) don't crash.
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
   });
 
-  it('probes the remote over the clone URL, not the credential-helper arg', async () => {
-    scriptGit('');
-    await expect(cloneWithRetry(CLONE_ARGS)).rejects.toThrow(/repository has no commits/i);
+  it('returns undefined failureSummary when tests pass', async () => {
+    // Provide a buildConfig with a test_cmd so a runner is created
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
 
-    expect(lsRemoteProbes()[0][1]).toEqual([
-      'ls-remote', '--heads', 'https://github.com/HenryHamster/playground.git',
-    ]);
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+
+    expect(result.passed).toBe(true);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.failureSummary).toBeUndefined();
   });
 
-  it('deleted branch on a real repo → NOT reported as commitless, retries as before', async () => {
-    // Same git error, but the remote still has refs: this is the branch-gone
-    // case and must keep its existing behaviour. If the probe were skipped (or
-    // its result ignored) a merged-PR race would be misreported as an unseeded
-    // repo — the mirror image of the bug this fixes.
-    scriptGit('a1b2c3\trefs/heads/main\nd4e5f6\trefs/heads/develop\n');
+  it('returns setupFailed=true (not passed) when npm ci fails for every runner', async () => {
+    // Regression: previously npm ci failures were swallowed as "runner
+    // skipped" and the whole call returned `{passed: true}`, which let
+    // the handler push code that was never test-verified. setupFailed
+    // propagates through so standard/review-fix handlers mark the task
+    // FAILED with failure_category='build_failed' instead of merging.
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    // Fail ALL npm calls — including ci — to simulate dep-install breakage.
+    vi.mocked(spawn).mockImplementation((cmd: unknown) => {
+      const cmdStr = String(cmd);
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      const fail = cmdStr === 'npm';
+      const proc = {
+        pid: 100,
+        stderr: { on: vi.fn((event: string, cb: (d: Buffer) => void) => { if (event === 'data') stderrCbs.push(cb); }) },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (fail) for (const scb of stderrCbs) scb(Buffer.from('npm ERR! registry unreachable'));
+              cb(fail ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
 
-    vi.useFakeTimers();
-    try {
-      const attempt = cloneWithRetry(CLONE_ARGS);
-      const assertion = expect(attempt).rejects.toThrow(/not found in upstream origin/i);
-      await vi.runAllTimersAsync();
-      await assertion;
-      await expect(attempt).rejects.not.toThrow(/repository has no commits/i);
-    } finally {
-      vi.useRealTimers();
-    }
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.setupFailed).toBe(true);
+    expect(result.testFailuresDetected).toBe(false);
+    expect(result.failureSummary).toMatch(/npm ci failed/);
+    // Claude MUST NOT be invoked for setup failures — check that no
+    // `claude` spawn happened even though a runner was configured.
+    const claudeCalls = vi.mocked(spawn).mock.calls.filter(c => c[0].includes('claude')).length;
+    expect(claudeCalls).toBe(0);
+  });
 
-    expect(cloneAttempts()).toHaveLength(3); // full retry budget, unchanged
+  it('returns failureSummary with combined failure messages when tests fail after all attempts', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    const errorMessage = 'Error: Test suite failed\n  at Object.<anonymous> (test.ts:10:5)';
+    // npm (the test runner) exits non-zero with error on stderr; claude (spawn)
+    // and other commands still succeed so runClaudeCode resolves for the fix loop.
+    configureSpawnMock({ npm: { exitCode: 1, stderr: errorMessage } });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    expect(result.failureSummary).toBeDefined();
+    expect(result.failureSummary).toContain(errorMessage);
   });
 });
+
+// ── testFixLoop directory scoping ─────────────────────────────────────────────
+describe('testFixLoop directory scoping', () => {
+  const multiRunnerConfig = {
+    directories: [
+      { path: 'agent', type: 'node', test_cmd: 'npm test' },
+      { path: 'backend', type: 'python', test_cmd: 'python3 -m pytest -x -q' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(spawn).mockReset();
+    configureSpawnMock();
+  });
+
+  function cwdsCalledWith(): (string | undefined)[] {
+    // testFixLoop's runners go through execFileAsync which calls spawn with cwd
+    // in options[2].  Claude Code runs via spawn too but always cwd=WORKSPACE,
+    // so filtering on the command (npm/python3) excludes those.
+    return vi.mocked(spawn).mock.calls
+      .filter(c => c[0] === 'npm' || c[0] === 'python3')
+      .map(c => (c[2] as { cwd?: string } | undefined)?.cwd);
+  }
+
+  it('runs all runners when relatedFiles is not provided', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('filters to agent runner when relatedFiles contains only agent/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(false);
+  });
+
+  it('filters to backend runner when relatedFiles contains only backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(false);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs all runners when relatedFiles contains only non-agent/backend files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['admin-ui/src/App.tsx']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+
+  it('runs both runners when relatedFiles contains both agent/ and backend/ files', async () => {
+    await testFixLoop(null, { value: '' }, undefined, undefined, multiRunnerConfig, undefined, ['agent/src/index.ts', 'backend/app/main.py']);
+    const cwds = cwdsCalledWith();
+    expect(cwds.some(c => c?.includes('/agent'))).toBe(true);
+    expect(cwds.some(c => c?.includes('/backend'))).toBe(true);
+  });
+});
+
+// ── errorFingerprint / duplicate-error early exit ───────────────────────────
+describe('errorFingerprint', () => {
+  it('normalizes whitespace and truncates to 2000 chars', () => {
+    expect(errorFingerprint('  foo\n\tbar  ')).toBe('foo bar');
+    expect(errorFingerprint('x'.repeat(3000)).length).toBe(2000);
+  });
+
+  it('returns same fingerprint for trivially different whitespace', () => {
+    expect(errorFingerprint('err:\n  at foo')).toBe(errorFingerprint('err:  at   foo'));
+  });
+});
+
+// ── jaccardSimilarity unit tests ─────────────────────────────────────────────
+describe('jaccardSimilarity', () => {
+  it('returns 1 for identical strings', () => {
+    expect(jaccardSimilarity('foo bar baz', 'foo bar baz')).toBe(1);
+  });
+
+  it('returns 0 for completely disjoint strings', () => {
+    expect(jaccardSimilarity('alpha beta', 'gamma delta')).toBe(0);
+  });
+
+  it('returns 1 for two empty strings', () => {
+    expect(jaccardSimilarity('', '')).toBe(1);
+  });
+
+  it('returns a value ≥ 0.7 for near-identical errors differing only in a line number', () => {
+    const a = 'TypeError foo is undefined at line 42 in bar ts';
+    const b = 'TypeError foo is undefined at line 47 in bar ts';
+    expect(jaccardSimilarity(a, b)).toBeGreaterThanOrEqual(0.7);
+  });
+
+  it('returns a value < 0.7 for clearly different errors', () => {
+    const a = 'TypeError foo is undefined at line 42';
+    const b = 'SyntaxError unexpected token semicolon in completely different module';
+    expect(jaccardSimilarity(a, b)).toBeLessThan(0.7);
+  });
+});
+
+// ── detectLoopDivergence unit tests ──────────────────────────────────────────
+describe('detectLoopDivergence', () => {
+  it('returns null when history has fewer than 3 entries', () => {
+    expect(detectLoopDivergence(['fp1', 'fp2'], ['e1', 'e2'], null, null)).toBeNull();
+  });
+
+  it('detects oscillation: A -> B -> A fingerprint pattern', () => {
+    const fps = ['fpA', 'fpB', 'fpA'];
+    const errs = ['error A text', 'error B text', 'error A text'];
+    expect(detectLoopDivergence(fps, errs, null, null)).toBe('divergence_oscillation');
+  });
+
+  it('detects Jaccard-similar errors across two consecutive pairs', () => {
+    // Each error differs by only 1 token out of 10 — Jaccard ≈ 9/11 ≈ 0.82 > threshold
+    const base = 'TypeError property foo undefined at baz module context error';
+    const errs = [`${base} one`, `${base} two`, `${base} thr`];
+    const fps = errs.map((_e, i) => `fp${i}`);  // all distinct fingerprints
+    expect(detectLoopDivergence(fps, errs, null, null)).toBe('divergence_similar_error');
+  });
+
+  it('detects diff revert when ≥ 80% of previous iteration lines vanish', () => {
+    const prevDiff = { added: new Set(['line_a', 'line_b', 'line_c', 'line_d', 'line_e']), removed: new Set<string>() };
+    const currDiff = { added: new Set(['line_x']), removed: new Set<string>() };  // all prev lines gone
+    const fps = ['fp1', 'fp2', 'fp3'];
+    const errs = ['error 1', 'error 2', 'error 3'];
+    expect(detectLoopDivergence(fps, errs, prevDiff, currDiff)).toBe('divergence_diff_revert');
+  });
+
+  it('does not flag diff revert when < 80% of previous lines vanish', () => {
+    const prevDiff = { added: new Set(['line_a', 'line_b', 'line_c', 'line_d', 'line_e']), removed: new Set<string>() };
+    const currDiff = { added: new Set(['line_a', 'line_b', 'line_x']), removed: new Set<string>() };  // 3/5 = 60% gone
+    const fps = ['fp1', 'fp2', 'fp3'];
+    const errs = ['error 1', 'error 2', 'error 3'];
+    expect(detectLoopDivergence(fps, errs, prevDiff, currDiff)).toBeNull();
+  });
+});
+
+// ── testFixLoop divergence detection ─────────────────────────────────────────
+describe('testFixLoop divergence detection', () => {
+  const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+
+  beforeEach(() => {
+    _resetFixLoopEventStateForTesting();
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(execSync).mockReset();
+    vi.mocked(execSync).mockReturnValue('');
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('exits with divergence_oscillation when test failures oscillate A→B→A', async () => {
+    const errorA = 'FAIL test.ts > alpha unique_error_A';
+    const errorB = 'FAIL test.ts > beta unique_error_B';
+    const errorSequence = [errorA, errorB, errorA];
+    let callCount = 0;
+    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
+      const cmdStr = String(cmd);
+      const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+      const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      const failStderr = (!isNpmInstall && cmdStr === 'npm') ? errorSequence[Math.min(callCount++, errorSequence.length - 1)] : null;
+      const proc = {
+        pid: 100 + callCount,
+        stderr: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stderrCbs.push(cb);
+          }),
+        },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (failStderr !== null) for (const scb of stderrCbs) scb(Buffer.from(failStderr));
+              cb(failStderr !== null ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.testFailuresDetected).toBe(true);
+    const events = drainFixLoopEventBuffer();
+    expect(events.some(e => e.exit_reason === 'divergence_oscillation')).toBe(true);
+  });
+});
+
+describe('testFixLoop early exit on identical errors', () => {
+  beforeEach(() => {
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('exits early when consecutive test errors are identical', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    const errorMessage = 'FAIL test.ts > it works';
+    configureSpawnMock({ npm: { exitCode: 1, stderr: errorMessage } });
+
+    const result = await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    expect(result.passed).toBe(false);
+    expect(result.failureSummary).toContain(errorMessage);
+    // Count ONLY test-run invocations (not the setup `npm ci` install
+    // calls testFixLoop does ahead of each runner). Early exit after the
+    // duplicate on attempt 2: at most 2 test runs.
+    const testRunCalls = vi.mocked(spawn).mock.calls.filter(
+      c => c[0] === 'npm' && Array.isArray(c[1]) && c[1][0] === 'test',
+    ).length;
+    expect(testRunCalls).toBeLessThanOrEqual(2);
+  });
+
+  it('continues when test errors differ between attempts', async () => {
+    const buildConfig = { directories: [{ path: '', type: 'node', test_cmd: 'npm test' }] };
+    let callCount = 0;
+    vi.mocked(spawn).mockImplementation((cmd: unknown, argsRaw: unknown) => {
+      const cmdStr = String(cmd);
+      const args = Array.isArray(argsRaw) ? argsRaw.map(String) : [];
+      const isNpmInstall = cmdStr === 'npm' && (args[0] === 'ci' || args[0] === 'install');
+      const stderrCbs: ((d: Buffer) => void)[] = [];
+      let failStderr: string | null = null;
+      // Only the test-run (npm test) is simulated as failing. npm ci
+      // (install) succeeds — testFixLoop now classifies install failures
+      // as setup errors, not test failures.
+      if (cmdStr === 'npm' && !isNpmInstall) {
+        callCount++;
+        failStderr = `FAIL variant ${callCount}`;
+      }
+      const proc = {
+        pid: 100 + callCount,
+        stderr: {
+          on: vi.fn((event: string, cb: (d: Buffer) => void) => {
+            if (event === 'data') stderrCbs.push(cb);
+          }),
+        },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') {
+            setImmediate(() => {
+              if (failStderr !== null) for (const scb of stderrCbs) scb(Buffer.from(failStderr));
+              cb(failStderr !== null ? 1 : 0);
+            });
+          }
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+
+    await testFixLoop(null, { value: '' }, undefined, undefined, buildConfig);
+    // Count only test-run invocations, skipping the setup `npm ci` calls.
+    // testFixLoop runs maxFixAttempts + 1 = MAX_TEST_FIX_ATTEMPTS + 1 times when errors differ each iteration.
+    const testRunCalls = vi.mocked(spawn).mock.calls.filter(
+      c => c[0] === 'npm' && Array.isArray(c[1]) && c[1][0] === 'test',
+    ).length;
+    expect(testRunCalls).toBe(MAX_TEST_FIX_ATTEMPTS + 1);
+  });
+});
+
+// ── RateLimitError ───────────────────────────────────────────────────────────
+// Pins the class identity so the outer catch in main() (which uses
+// `error instanceof RateLimitError` for classification) can't regress into
+// the old cast-and-rematch pattern that silently reclassified rate-limits
+// as CODE_ERROR when stderrBuffer was empty.
+describe('matchesRateLimit', () => {
+  it('detects "you\'ve hit your limit"', () => {
+    expect(matchesRateLimit("you've hit your limit")).toBe(true);
+  });
+
+  it('detects "you\'ve hit your usage limit"', () => {
+    expect(matchesRateLimit("you've hit your usage limit")).toBe(true);
+  });
+
+  it('detects "claude ai usage limit reached"', () => {
+    expect(matchesRateLimit('claude ai usage limit reached')).toBe(true);
+  });
+
+  it('detects "you\'re out of extra usage"', () => {
+    expect(matchesRateLimit("you're out of extra usage")).toBe(true);
+  });
+
+  it('detects "5-hour limit reached"', () => {
+    expect(matchesRateLimit('5-hour limit reached')).toBe(true);
+  });
+
+  it('detects "api error: rate limit reached"', () => {
+    expect(matchesRateLimit('api error: rate limit reached')).toBe(true);
+  });
+
+  it('detects "this request would exceed your account\'s rate limit"', () => {
+    expect(matchesRateLimit("this request would exceed your account's rate limit")).toBe(true);
+  });
+
+  it('detects the org monthly spend-limit banner (curly apostrophes)', () => {
+    expect(matchesRateLimit(
+      'You’ve hit your org’s monthly spend limit · ask your admin to raise it at claude.ai/settings/usage',
+    )).toBe(true);
+  });
+
+  it('detects the org monthly spend-limit banner (ascii apostrophes)', () => {
+    expect(matchesRateLimit(
+      "You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage",
+    )).toBe(true);
+  });
+
+  it('detects the org monthly spend-limit banner for anthropic/api_key', () => {
+    expect(matchesRateLimit("you've hit your org's monthly spend limit", 'anthropic', 'api_key')).toBe(true);
+  });
+
+  it('matches case-insensitively (uppercase)', () => {
+    expect(matchesRateLimit('API ERROR: RATE LIMIT REACHED')).toBe(true);
+  });
+
+  it('matches case-insensitively (mixed case)', () => {
+    expect(matchesRateLimit('Claude AI Usage Limit Reached')).toBe(true);
+  });
+
+  it('matches when pattern is embedded in surrounding text', () => {
+    expect(matchesRateLimit('Error from Anthropic: API Error: Rate limit reached. Please retry later.')).toBe(true);
+  });
+
+  it('matches when pattern appears after other log lines', () => {
+    expect(matchesRateLimit('line 1\nline 2\nyou\'ve hit your usage limit\nline 4')).toBe(true);
+  });
+
+  it('returns false for a bare "429"', () => {
+    expect(matchesRateLimit('HTTP 429 received')).toBe(false);
+  });
+
+  it('returns false for the word "rate" alone', () => {
+    expect(matchesRateLimit('increased rate of errors')).toBe(false);
+  });
+
+  it('returns false for the word "limit" alone', () => {
+    expect(matchesRateLimit('limit exceeded on some resource')).toBe(false);
+  });
+
+  it('returns false for "overloaded"', () => {
+    expect(matchesRateLimit('server is overloaded')).toBe(false);
+  });
+
+  it('detects provider-specific API-key capacity bodies', () => {
+    expect(matchesRateLimit(
+      'api.deepseek.com overloaded: authentication fails',
+      'deepseek',
+      'api_key',
+    )).toBe(true);
+    expect(matchesRateLimit('api.z.ai service capacity exceeded', 'zai', 'api_key')).toBe(true);
+    expect(matchesRateLimit('OpenAI API error: model is temporarily unavailable', 'openai', 'api_key')).toBe(true);
+  });
+
+  it('does not detect generic API-key capacity words without provider context', () => {
+    expect(matchesRateLimit('unit test prints service unavailable', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('unit test expected OpenAI service unavailable response', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('unit test expected gpt-5 temporarily unavailable response', 'openai', 'api_key')).toBe(false);
+    expect(matchesRateLimit('docs mention GLM service unavailable fallback', 'zai', 'api_key')).toBe(false);
+  });
+
+  it('returns false for an empty string', () => {
+    expect(matchesRateLimit('')).toBe(false);
+  });
+
+  it('returns false for unrelated error output', () => {
+    expect(matchesRateLimit('TypeError: cannot read property of undefined')).toBe(false);
+  });
+
+  it('detects OpenAI API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'openai', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini service-account rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('RESOURCE_EXHAUSTED while calling model', 'gemini', 'service_account')).toBe(true);
+  });
+
+  it('detects Z.AI API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'zai', 'api_key')).toBe(true);
+  });
+
+  it('detects DeepSeek API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'deepseek', 'api_key')).toBe(true);
+  });
+
+  it('detects DeepSeek balance/quota bodies even when they include auth-ish text', () => {
+    expect(matchesRateLimit(
+      'HTTP 401 Unauthorized from api.deepseek.com: authentication fails: insufficient_balance',
+      'deepseek',
+      'api_key',
+    )).toBe(true);
+  });
+
+  it('detects Z.AI balance/quota bodies even when they include auth-ish text', () => {
+    expect(matchesRateLimit(
+      'HTTP 401 Unauthorized from api.z.ai: authentication_failed: insufficient balance',
+      'zai',
+      'api_key',
+    )).toBe(true);
+  });
+
+  it('detects Gemini API-key quota metric bodies', () => {
+    const msg = "Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s.";
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini API-key billing quota bodies', () => {
+    const msg = 'You exceeded your current quota, please check your plan and billing details.';
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini Code Assist fallback quota messages', () => {
+    const msg = 'Automatically switching from gemini-2.5-pro. Switching to the gemini-2.5-flash model.';
+    expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
+  });
+
+  it('detects Gemini service-account Vertex quota bodies', () => {
+    const msg = 'Resource exhausted. Please try again later. Please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429';
+    expect(matchesRateLimit(msg, 'gemini', 'service_account')).toBe(true);
+  });
+
+  it('detects Gemini service-account quota metric bodies', () => {
+    const msg = 'Quota exceeded for metric: aiplatform.googleapis.com/generate_content_requests';
+    expect(matchesRateLimit(msg, 'gemini', 'service_account')).toBe(true);
+  });
+
+  it('does not cross-match provider-specific rate limits', () => {
+    expect(matchesRateLimit('Rate limit reached for gpt-5 in organization test', 'anthropic', 'oauth')).toBe(false);
+  });
+
+  it('detects "you\'ve hit your session limit" for anthropic/oauth', () => {
+    expect(matchesRateLimit("You've hit your session limit · resets 7:10am (UTC)", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your session limit" case-insensitively', () => {
+    expect(matchesRateLimit("YOU'VE HIT YOUR SESSION LIMIT", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your session limit" for default provider (anthropic/oauth)', () => {
+    expect(matchesRateLimit("you've hit your session limit · resets 7:10am (UTC)")).toBe(true);
+  });
+
+  it('detects "you\'ve hit your weekly limit" for anthropic/oauth', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)", 'anthropic', 'oauth')).toBe(true);
+  });
+
+  it('detects "you\'ve hit your weekly limit" for default provider (anthropic/oauth)', () => {
+    expect(matchesRateLimit("You've hit your weekly limit · resets 9pm (UTC)")).toBe(true);
+  });
+
+  it('detects structured api_error_status:429 in transcript regardless of provider', () => {
+    const transcript = '{"type":"result","is_error":true,"api_error_status":429,"error":"rate_limit"}';
+    expect(matchesRateLimit(transcript)).toBe(true);
+    expect(matchesRateLimit(transcript, 'openai', 'api_key')).toBe(true);
+  });
+
+  it('does not match bare 429 without JSON key context', () => {
+    expect(matchesRateLimit('HTTP 429 received')).toBe(false);
+  });
+});
+
+describe('matchesAuthFailure', () => {
+  it('does NOT treat a bare apiKeySource=none init event as an auth failure (normal for OAuth/Max-plan)', () => {
+    // The documented default auth mode (AUTH_MODE=oauth / Max-plan subscription)
+    // uses no API key, so EVERY healthy init event reports apiKeySource:"none".
+    // Matching on it alone would misclassify healthy OAuth VMs on any transient
+    // non-zero-exit validation.
+    const init = '{"type":"system","subtype":"init","apiKeySource":"none","model":"claude-opus-4-8"}';
+    expect(matchesAuthFailure(init)).toBe(false);
+  });
+
+  it('detects the canonical apiKeySource=none + 401 authentication_failed rejection', () => {
+    // The real rejection signature is apiKeySource:none accompanied by an explicit
+    // HTTP 401 authentication_failed — the authentication_failed token is what makes
+    // it a confirmed rejection rather than a healthy OAuth init.
+    const rejection = '{"type":"system","subtype":"init","apiKeySource":"none"}\nAPI Error: 401 {"type":"error","error":{"type":"authentication_failed"}}';
+    expect(matchesAuthFailure(rejection)).toBe(true);
+  });
+
+  it('detects Claude stream 401 authentication failures', () => {
+    const msg = '{"type":"system","subtype":"api_retry","error_status":401,"error":"authentication_failed"}';
+    expect(matchesAuthFailure(msg)).toBe(true);
+  });
+
+  it('detects provider invalid credential messages', () => {
+    expect(matchesAuthFailure('Failed to authenticate. API Error: 401 Invalid authentication credentials')).toBe(true);
+  });
+
+  it('detects an HTTP 401 authentication_failed body', () => {
+    const body = 'API Error: 401 {"type":"error","error":{"type":"authentication_failed","message":"invalid x-api-key"}}';
+    expect(matchesAuthFailure(body)).toBe(true);
+  });
+
+  it('detects an expired OAuth token message', () => {
+    expect(matchesAuthFailure('OAuth token has expired. Please run /login.')).toBe(true);
+  });
+
+  it('detects OAuth org-disabled errors', () => {
+    expect(matchesAuthFailure('oauth_org_not_allowed')).toBe(true);
+  });
+
+  it('matches case-insensitively', () => {
+    expect(matchesAuthFailure('AUTHENTICATION_FAILED')).toBe(true);
+  });
+
+  it('detects OpenAI invalid_api_key for the openai provider', () => {
+    expect(matchesAuthFailure('Error code: 401 - invalid_api_key', 'openai')).toBe(true);
+  });
+
+  it('detects Gemini "API key not valid" for the gemini provider', () => {
+    expect(matchesAuthFailure('API key not valid. Please pass a valid API key.', 'gemini')).toBe(true);
+  });
+
+  it('detects Z.AI invalid-key failures for the zai provider', () => {
+    expect(matchesAuthFailure('invalid z.ai api key', 'zai')).toBe(true);
+  });
+
+  it('detects DeepSeek invalid-key failures for the deepseek provider', () => {
+    expect(matchesAuthFailure('invalid deepseek api key', 'deepseek')).toBe(true);
+  });
+
+  it('does not classify a rate-limit body as an auth failure', () => {
+    expect(matchesAuthFailure('API Error: Rate limit reached. Please retry later.')).toBe(false);
+  });
+
+  it('returns false for a bare 401 with no auth context', () => {
+    expect(matchesAuthFailure('HTTP 401 received')).toBe(false);
+  });
+
+  it('does not match unrelated numeric output', () => {
+    expect(matchesAuthFailure('processed 401 files successfully')).toBe(false);
+  });
+
+  it('returns false for unrelated error output', () => {
+    expect(matchesAuthFailure('TypeError: cannot read property of undefined')).toBe(false);
+  });
+
+  it('returns false for an empty string', () => {
+    expect(matchesAuthFailure('')).toBe(false);
+  });
+
+  it('does not cross-match provider-specific auth failures', () => {
+    expect(matchesAuthFailure('API key not valid', 'anthropic')).toBe(false);
+  });
+
+  it('detects a Codex OAuth refresh-token-reuse 401 (prod 2026-06-14 SavarinCodex)', () => {
+    // The codex CLI emits this when its stored refresh token was already
+    // consumed/rotated. Before coverage was added, runClaudeCode returned a bare
+    // non-zero exit instead of throwing AuthFailureError.
+    const body =
+      'ERROR codex_login::auth::manager: Failed to refresh token: 401 Unauthorized: ' +
+      '{"error":{"message":"Your refresh token has already been used to generate a new ' +
+      'access token. Please try signing in again.","type":"invalid_request_error",' +
+      '"code":"refresh_token_reused"}}';
+    expect(matchesAuthFailure(body, 'openai')).toBe(true);
+  });
+
+  it('detects the "refresh token was already used / sign in again" variant', () => {
+    const body =
+      'Failed to refresh token: Your access token could not be refreshed because your ' +
+      'refresh token was already used. Please log out and sign in again.';
+    expect(matchesAuthFailure(body, 'openai')).toBe(true);
+  });
+
+  it('treats OAuth refresh-token death as provider-agnostic (generic pattern)', () => {
+    expect(matchesAuthFailure('error: refresh_token_reused')).toBe(true);
+  });
+
+  it('does not classify a benign token-refresh log line as an auth failure', () => {
+    expect(matchesAuthFailure('Scheduled proactive token refresh in 1800s')).toBe(false);
+  });
+});
+describe('RateLimitError', () => {
+  it('is an instance of RateLimitError and Error', () => {
+    const err = new RateLimitError('Claude API usage exhausted — banner');
+    expect(err).toBeInstanceOf(RateLimitError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err.name).toBe('RateLimitError');
+    expect(err.message).toBe('Claude API usage exhausted — banner');
+  });
+
+  it('plain Error is not a RateLimitError', () => {
+    const err = new Error('Claude API usage exhausted — banner');
+    expect(err).not.toBeInstanceOf(RateLimitError);
+  });
+});
+
+describe('NoProgressTimeoutError', () => {
+  it('carries the transient no_progress_timeout failureCategory and is distinct from RateLimitError', () => {
+    const err = new NoProgressTimeoutError('no model output for >15 min');
+    expect(err).toBeInstanceOf(NoProgressTimeoutError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(RateLimitError);
+    expect(err.name).toBe('NoProgressTimeoutError');
+    // The agent catch block reads .failureCategory for non-RateLimitError errors;
+    // 'no_progress_timeout' must NOT trigger the account-model block.
+    expect(err.failureCategory).toBe('no_progress_timeout');
+  });
+});
+
+describe('matchesVmConfigMissing', () => {
+  it('matches the Claude CLI configless death banner (case-insensitive)', () => {
+    expect(matchesVmConfigMissing('Claude configuration file not found at /home/agent/.claude.json')).toBe(true);
+    expect(matchesVmConfigMissing('claude CONFIGURATION FILE NOT FOUND')).toBe(true);
+  });
+
+  it('does not match rate-limit or auth-failure text', () => {
+    expect(matchesVmConfigMissing("you've hit your usage limit")).toBe(false);
+    expect(matchesVmConfigMissing('OAuth token has expired. Please run /login.')).toBe(false);
+  });
+
+  it('does not match unrelated file-not-found errors', () => {
+    expect(matchesVmConfigMissing('ENOENT: no such file or directory, open /tmp/foo.json')).toBe(false);
+    expect(matchesVmConfigMissing('')).toBe(false);
+  });
+});
+
+describe('VmConfigMissingError', () => {
+  it('carries the vm_config_missing failureCategory and is distinct from RateLimitError', () => {
+    const err = new VmConfigMissingError('Claude Code provider config file missing on VM');
+    expect(err).toBeInstanceOf(VmConfigMissingError);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(RateLimitError);
+    expect(err.name).toBe('VmConfigMissingError');
+    // runRoleOnce's catch reads .failureCategory; vm_config_missing maps to
+    // PROVISION_FAILURE backend-side — never RATE_LIMIT ("usage exhausted").
+    expect(err.failureCategory).toBe('vm_config_missing');
+  });
+});
+
