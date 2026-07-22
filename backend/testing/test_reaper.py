@@ -16624,6 +16624,7 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     )
     assert len(alerts) == 1
     assert alerts[0].severity == AlertSeverity.WARNING
+    assert alerts[0].event_type == "deployment.wake_delivery_stalled"
 
     # Second call with delivery still stalled → deduped, no new Alert row.
     created2 = await sweep_wake_delivery_stall_alerts(

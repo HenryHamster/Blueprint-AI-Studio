@@ -1815,7 +1815,7 @@ async def _maybe_create_wake_delivery_stall_alert(
         severity=severity,
         title=title,
         message=msg,
-        event_type="migration.chain_blocked",
+        event_type="deployment.wake_delivery_stalled",
     )
     session.add(alert)
     await broadcast_to_project(

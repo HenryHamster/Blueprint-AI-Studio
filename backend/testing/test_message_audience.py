@@ -121,6 +121,22 @@ def test_route_event_alert_types_mapped():
     assert route_event("migration.slot_contention") == STRATEGIST_INTERNAL
 
 
+def test_deployment_wake_delivery_stalled_is_operator_action_needed():
+    """deployment.wake_delivery_stalled must route OPERATOR_ACTION_NEEDED and be operator-visible.
+
+    Non-regression: migration.chain_blocked (the wrong event_type previously stamped on
+    wake-delivery stall alerts) remains STRATEGIST_INTERNAL and must NOT be in the
+    operator-visible set.
+    """
+    assert route_event("deployment.wake_delivery_stalled") == OPERATOR_ACTION_NEEDED
+    operator_types = get_operator_event_types()
+    assert "deployment.wake_delivery_stalled" in operator_types
+    # The old wrong event_type is internal — wake-delivery stall alerts must not use it.
+    non_operator = get_non_operator_event_types()
+    assert "migration.chain_blocked" in non_operator
+    assert "migration.chain_blocked" not in operator_types
+
+
 def test_route_event_self_hosted_fleet_health_alert_types_are_operator_visible():
     """Every self-hosted fleet health incident has its intended audience."""
     action_needed = {
