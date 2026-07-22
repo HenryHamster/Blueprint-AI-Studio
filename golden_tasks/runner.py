@@ -61,7 +61,6 @@ VALID_TASK_TYPES: set[str] = {
     "plan",
     "research",
     "strategic_review",
-    "strategic_resident_turn",
     "design_doc_update",
     "security_audit",
     "qa",
@@ -85,6 +84,7 @@ VALID_TASK_TYPES: set[str] = {
     "repo_bootstrap",
     "salvage_bundle",
     "capability_proof_trial",
+    "walkthrough_e2e",
 }
 
 VALID_EFFORTS: set[str] = {"low", "medium", "high", "max"}
