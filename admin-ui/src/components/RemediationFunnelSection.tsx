@@ -770,6 +770,7 @@ export function RemediationFunnelSection({ funnel, conversion, loading, projectI
                     <button
                       data-viewport-allow-small-target
                       type="button"
+                      aria-pressed={!showIgnored}
                       onClick={() => setShowIgnored(v => !v)}
                       className="text-ui-sm text-neutral-500 hover:text-neutral-300 underline underline-offset-2"
                     >
