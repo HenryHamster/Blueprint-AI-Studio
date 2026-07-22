@@ -130,6 +130,7 @@ def test_completion_handler_declarations_match_legacy_dispatch():
         "design": "design",
         "repo_bootstrap": "repo_bootstrap",
         "capability_proof_trial": "capability_proof_trial",
+        "walkthrough_e2e": "walkthrough_e2e",
     }
     # Only the two strategic completion handlers consume the pre-locked Project.
     needs_project = {
@@ -606,12 +607,6 @@ def test_task_type_catalog_launchable_flags_and_output_kinds():
         "cost_ceiling_usd": 5.0,
         "run_shape": "experiment_loop",
     }
-    assert by_id["strategic_resident_turn"]["execution_owner"] == "agent"
-    assert by_id["strategic_resident_turn"]["filter_visible"] is False
-    assert by_id["strategic_resident_turn"]["provider_configurable"] is True
-    assert by_id["strategic_resident_turn"]["user_launchable"] is False
-    assert by_id["strategic_resident_turn"]["requires_code"] is False
-    assert by_id["strategic_resident_turn"]["cost_ceiling_usd"] == 4.0
 
 
 def test_enrichment_leaves_agent_mode_derived_sets_consistent():

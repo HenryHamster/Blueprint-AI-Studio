@@ -1394,3 +1394,137 @@ Also read any detected build/CI manifests you find.
     logs,
   });
 }
+
+// ── Handler: Walkthrough E2E (qualifier-spawned live-stack walkthrough) ──────
+export async function handleWalkthroughE2e(
+  taskId: string, payload: Record<string, unknown>, task: Record<string, unknown>,
+  ghToken: string, owner: string, repo: string, ws: WebSocket | null, statusRef: { value: string },
+  model?: string, effort?: string
+) {
+  const rawBaseBranch = resolveBaseBranch(payload, task);
+  const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
+  const candidateSha = resolveCandidateSha(payload, task);
+
+  statusRef.value = `Cloning ${owner}/${repo}...`;
+  sendLog(
+    ws,
+    candidateSha
+      ? `Cloning ${owner}/${repo} @ ${baseBranch}, pinning candidate ${candidateSha.slice(0, 12)} for walkthrough e2e...\n`
+      : `Cloning ${owner}/${repo} @ ${baseBranch} for walkthrough e2e...\n`,
+  );
+  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+  await prepareWorkspaceForRole({
+    workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
+    branch: baseBranch, baseBranch, depth: candidateSha ? 0 : 100,
+  });
+
+  if (candidateSha) {
+    sendLog(ws, `Fetching + checking out candidate commit ${candidateSha.slice(0, 12)}...\n`);
+    try {
+      execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+      execFileSync('git', ['checkout', '--detach', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+      sendLog(ws, `Checked out candidate commit ${candidateSha.slice(0, 12)} (detached HEAD).\n`);
+    } catch (e) {
+      const detail = sanitizeError(e);
+      sendLog(ws, `[ERROR] Could not check out candidate commit ${candidateSha}: ${detail}\n`);
+      await persistAndPostStatus(taskId, {
+        task_id: taskId,
+        status: 'FAILED',
+        artifact_type: 'ERROR_LOG',
+        failure_category: 'clone_failed',
+        logs: sanitize(
+          `Qualifier walkthrough e2e aborted: could not check out the pinned ` +
+          `candidate commit ${candidateSha}. Detail: ${detail}`,
+        ),
+      });
+      return;
+    }
+  }
+
+  writePlaybookHelper(taskId);
+  writeMessagesHelper(taskId);
+  const fetchGuidance = provisionFetchHelper(taskId, task);
+  const disallowedTools = configureAgentPermissions('smoketest');
+
+  const retryContext = buildRetryContext(task);
+  const contextPrefix = buildContextPrefix(task);
+  const contextSection = contextPrefix ? `${contextPrefix}\n` : '';
+  const candidateShaClause = candidateSha
+    ? `The walkthrough runs against the pinned candidate SHA: ${candidateSha}. Verify the SHA is real with \`git cat-file -t ${candidateSha}\` before writing any evidence.`
+    : 'No candidate SHA pinned — run the walkthrough against the current HEAD.';
+
+  const coreBody = `You are a walkthrough e2e agent. Your job is to run the live-stack walkthrough harness and write a structured result file.
+
+${candidateShaClause}
+
+## Steps
+
+1. **Seed fixture data** — run \`python3 scripts/walkthrough/seed_test_data.py\` to idempotently seed the fixture project and owner membership so ADMIN_API_KEY can drive project-scoped endpoints.
+
+2. **Run the walkthrough harness** — run \`node scripts/walkthrough/v26-live-walkthrough.cjs\`. The harness tests live enrollment, heartbeat, and project-tool token flows. Capture its stdout/stderr.
+
+3. **Parse per-flow verdicts** — the harness reports each flow as PASS / FAIL / DEAD_END. Extract these into a structured list.
+
+4. **Write the result file** — write \`/tmp/walkthrough_e2e_result_${taskId}.json\` with this shape:
+\`\`\`json
+{
+  "flows": [
+    {
+      "flow": "<criterion_key e.g. c-dfdc9d82>",
+      "verdict": "PASS",
+      "candidate_sha": "<40-char sha>",
+      "screenshot_md5": ["<md5>", "..."],
+      "heartbeat_confirmed": true,
+      "ran_at": "<iso timestamp>"
+    }
+  ],
+  "harness_exit_code": 0,
+  "summary": "brief summary"
+}
+\`\`\`
+Only include a flow entry if the harness explicitly tested it. Set verdict to FAIL or DEAD_END when it did not pass. Only PASS flows receive CriterionEvidence rows; FAIL/DEAD_END leave the criterion uncovered — fail-closed.
+
+IMPORTANT: Always write /tmp/walkthrough_e2e_result_${taskId}.json, including when the harness cannot run. Never leave the file unwritten.`;
+
+  const fetchBlock = `\n\n${fetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const fullPrompt = `${contextSection}${retryContext}${coreBody}${fetchBlock}${PLAYBOOK_GUIDANCE}`;
+
+  statusRef.value = 'Running walkthrough e2e harness...';
+  const fingerprint = computePromptFingerprint('walkthrough_e2e');
+  setCurrentPromptFingerprint(fingerprint);
+  sendHeartbeatSync(taskId, statusRef.value, { prompt_fingerprint: fingerprint });
+  const { exitCode, allOutput } = await runClaudeCode(fullPrompt, ws, statusRef, model, effort, disallowedTools);
+
+  const rawResult = exitCode === 0 ? readHandlerOutput(taskId, 'walkthrough_e2e_result', ws) : null;
+  const result = rawResult && typeof rawResult === 'object' && Array.isArray((rawResult as Record<string, unknown>).flows)
+    ? rawResult as { flows: unknown[]; harness_exit_code?: number; summary?: string }
+    : null;
+
+  const taskContext = task.context && typeof task.context === 'object'
+    ? task.context as Record<string, unknown>
+    : {};
+  const qualifierWalkthrough = taskContext.qualifier_walkthrough_e2e === true;
+
+  if (exitCode === 0 && result) {
+    const passCount = result.flows.filter(
+      (f) => typeof f === 'object' && f !== null && (f as Record<string, unknown>).verdict === 'PASS'
+    ).length;
+    const summary = result.summary ?? `Walkthrough e2e: ${passCount}/${result.flows.length} flows PASS`;
+    sendLog(ws, `\n${summary}\n`);
+    const terminalStatus = passCount > 0 || qualifierWalkthrough ? 'COMPLETED' : 'FAILED';
+    await persistAndPostStatus(taskId, {
+      task_id: taskId,
+      status: terminalStatus,
+      artifact_type: 'WALKTHROUGH_E2E_RESULT',
+      logs: JSON.stringify(result),
+      repo_url: `https://github.com/${owner}/${repo}`,
+    });
+  } else {
+    const unparseable = exitCode === 0;
+    await persistAndPostStatus(taskId, {
+      task_id: taskId, status: 'FAILED', artifact_type: 'ERROR_LOG',
+      logs: sanitize(allOutput.slice(-10_000)),
+      failure_category: matchesRateLimit(allOutput) ? 'rate_limited' : (unparseable ? 'walkthrough_result_unparseable' : 'claude_code_failed'),
+    });
+  }
+}

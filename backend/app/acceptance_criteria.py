@@ -309,6 +309,17 @@ ATTESTATION_WINDOW_DAYS = 7
 #: carry no attestation timestamp), so a stale probe decays to ``partial``.
 MACHINE_PROBE_WINDOW_DAYS = 14
 
+#: Coverage-tier constant: how long a ``walkthrough_e2e`` evidence row (a
+#: qualifier-spawned live-stack walkthrough that proved a specific flow on the
+#: candidate SHA) counts as full ``'covered'`` tier before it expires and the
+#: criterion falls back to its underlying evidence state.  The window is shorter
+#: than :data:`ATTESTATION_WINDOW_DAYS` (7 d) because e2e evidence is
+#: machine-verifiable on re-run and the release cycle is short — a stale row
+#: should decay quickly so the next qualification attempt re-verifies.  Measured
+#: from ``recorded_at``; a row with no ``recorded_at`` cannot grant perpetual
+#: trust and returns ``False`` in :func:`_evidence_is_walkthrough_e2e`.
+WALKTHROUGH_E2E_WINDOW_DAYS = 14
+
 #: ``source_kind`` set for machine-probe coverage evidence — a mechanism-ran
 #: signal that grants the lower-confidence, time-bounded ``'probed'`` tier via
 #: :func:`_evidence_is_probed` rather than full ``'covered'`` parity.
@@ -359,6 +370,14 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
         # (backfill citing the resolving commit). Treated as covering so the
         # criterion is satisfied once the backfill writes the evidence row.
         return True
+    if e.source_kind == "walkthrough_e2e":
+        # A live-stack walkthrough that ran against a specific candidate SHA and
+        # passed.  Covering iff: (a) the row is fresh within
+        # WALKTHROUGH_E2E_WINDOW_DAYS, (b) ``detail["candidate_sha"]`` is present
+        # (prevents a bare or malformed row from granting trust), and (c) the
+        # ``detail["verdict"]`` is ``"PASS"``.  A stale, SHA-less, or non-PASS
+        # row decays to the underlying (partial/uncovered) state — fail-closed.
+        return _evidence_is_walkthrough_e2e(e)
     # Unverified-merge backfill evidence is deliberately NOT covering here.  The
     # evidence only proves that the declared named_test was in the PR's changed
     # files — i.e. the test shipped — not that the merge was CI-verified or that
@@ -487,6 +506,41 @@ def _evidence_is_probed(e: CriterionEvidence) -> bool:
     return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
         days=MACHINE_PROBE_WINDOW_DAYS
     )
+
+
+def _evidence_is_walkthrough_e2e(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record is a fresh, SHA-pinned walkthrough_e2e PASS.
+
+    Returns ``True`` only when ALL of the following hold:
+
+    * ``source_kind == "walkthrough_e2e"``
+    * ``detail["candidate_sha"]`` is a non-empty string — prevents a bare or
+      malformed row from granting trust; every row written by the harness must
+      declare which exact commit it verified.
+    * ``detail["verdict"] == "PASS"`` — the harness explicitly reported success;
+      a ``FAIL`` or ``DEAD_END`` verdict must not cover the criterion.
+    * ``recorded_at`` is within :data:`WALKTHROUGH_E2E_WINDOW_DAYS` of now — a
+      stale walkthrough row decays to the underlying (partial/uncovered) state so
+      the next qualification attempt must re-verify rather than coasting on old
+      evidence.  A row with no ``recorded_at`` cannot grant perpetual trust and
+      returns ``False``.
+
+    This function is the single gating predicate for the ``walkthrough_e2e``
+    source_kind; :func:`_evidence_proves_covered` delegates here.
+    """
+    if e.source_kind != "walkthrough_e2e":
+        return False
+    detail = e.detail if isinstance(e.detail, dict) else {}
+    if not detail.get("candidate_sha"):
+        return False
+    if detail.get("verdict") != "PASS":
+        return False
+    if e.recorded_at is None:
+        return False
+    return (_utcnow() - _coerce_naive_utc(e.recorded_at)) <= timedelta(
+        days=WALKTHROUGH_E2E_WINDOW_DAYS
+    )
+
 
 
 MAX_CRITERIA_PER_VERSION = 50

@@ -29,6 +29,7 @@ export const AGENT_TASK_TYPE_IDS = [
   'docs',
   'migrate',
   'smoketest',
+  'walkthrough_e2e',
   'refactor',
   'debug',
   'perf',

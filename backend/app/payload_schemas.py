@@ -788,6 +788,17 @@ class SmokestestPayload(_SystemPopulated):
     health_check_urls: list[str] | None = None
 
 
+class WalkthroughE2ePayload(_SystemPopulated):
+    """Payload for the qualifier-spawned ``walkthrough_e2e`` task.
+
+    Like ``SmokestestPayload``, the task carries the integration branch plus
+    the snapshotted ``candidate_sha`` so the handler can check out the exact
+    commit before running the live-stack walkthrough harness.
+    """
+
+    candidate_sha: str | None = None
+
+
 class VerifyTestsPayload(_SystemPopulated):
     """Payload for the verify_tests merge-gate task.
 
@@ -1266,6 +1277,7 @@ _MODEL_FOR_TYPE: dict[TaskType, type[BasePayload]] = {
     # salvage_bundle). The bounded caps are enforced at enrollment + in the agent
     # handler, not by the schema.
     TaskType.capability_proof_trial: BasePayload,
+    TaskType.walkthrough_e2e: WalkthroughE2ePayload,
 }
 
 

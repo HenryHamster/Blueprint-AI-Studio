@@ -58,7 +58,7 @@ export const PR_INELIGIBLE_TASK_TYPES = [
   'release_audit', 'release_audit_challenge', 'release_merge_grade',
   'repo_bootstrap', 'research', 'review', 'security_audit',
   'self_audit', 'smoketest', 'strategic_review', 'verify_tests',
-  'web_research',
+  'walkthrough_e2e', 'web_research',
 ] as const;
 export {
   formatCochangeHints,

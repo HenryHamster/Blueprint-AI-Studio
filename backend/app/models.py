@@ -363,6 +363,11 @@ class ArtifactType(str, Enum):
     # agent launched and monitored. Like MERGE_TEST_RESULT, the column is a plain
     # String so no migration is needed.
     COMPUTE_RESULT = "COMPUTE_RESULT"
+    # Result of a walkthrough_e2e task: per-flow verdicts (PASS/FAIL/DEAD_END)
+    # from the live-stack harness. Read by the completion handler to write
+    # CriterionEvidence rows. ArtifactType is a plain String column so no
+    # migration is needed.
+    WALKTHROUGH_E2E_RESULT = "WALKTHROUGH_E2E_RESULT"
 
 
 class SourceKind(str, Enum):

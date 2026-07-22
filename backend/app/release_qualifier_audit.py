@@ -531,6 +531,63 @@ async def _spawn_qualifier_smoketest_task(
     return task
 
 
+async def _spawn_qualifier_walkthrough_task(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    qualification_attempt_id: uuid.UUID | str,
+) -> Task:
+    """Create + queue a qualify-time ``walkthrough_e2e`` task on the candidate commit."""
+    project = await session.get(Project, project_id)
+    integration_branch, _promotion_target = _lts_branch_names(project)
+    payload: dict[str, Any] = {
+        "type": "walkthrough_e2e",
+        "base_branch": integration_branch,
+        "candidate_sha": candidate_sha,
+        "qualification_attempt_id": str(qualification_attempt_id),
+    }
+    try:
+        payload = validate_internal_payload(payload, "release_qualifier:walkthrough_e2e")
+    except PayloadTooLargeError:
+        raise
+
+    task = Task(
+        project_id=project_id,
+        title=f"Qualifier walkthrough e2e: candidate {candidate_sha[:8]}",
+        description=(
+            f"Qualify-time live-stack walkthrough of release candidate {candidate_sha}"
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "release_version_id": str(version_id),
+            "qualifier_walkthrough_e2e": True,
+            "candidate_sha": candidate_sha,
+            "qualification_attempt_id": str(qualification_attempt_id),
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "RELEASE_QUALIFIER",
+                "task_type": "walkthrough_e2e",
+                "qualifier_walkthrough_e2e": True,
+                "release_version_id": str(version_id),
+                "qualification_attempt_id": str(qualification_attempt_id),
+            },
+        )
+    )
+    return task
+
+
 async def _spawn_release_merge_grade_task(
     session: AsyncSession,
     project_id: uuid.UUID,

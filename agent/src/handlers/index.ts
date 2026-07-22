@@ -24,7 +24,7 @@ import { handleStrategic } from './strategic.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleReleaseMergeGrade } from './merge-grade.js';
-import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate, handleRepoBootstrap } from './specialized.js';
+import { handleMigrate, handleSmoketest, handleDebug, handlePerf, handleInvestigate, handleRepoBootstrap, handleWalkthroughE2e } from './specialized.js';
 import { handleDesignDocUpdate } from './design-doc.js';
 import { handleMemo } from './memo.js';
 import { handleVerifyTests } from './verify-tests.js';
@@ -98,6 +98,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   repo_bootstrap: handleRepoBootstrap,
   salvage_bundle: handleSalvageBundle,
   capability_proof_trial: handleCapabilityProofTrial,
+  walkthrough_e2e: handleWalkthroughE2e,
 };
 
 // ── Contract-driven handler resolution ───────────────────────────────────────

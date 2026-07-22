@@ -650,6 +650,99 @@ def test_stale_machine_probe_falls_back_to_partial():
 
 
 # ---------------------------------------------------------------------------
+# _evidence_is_walkthrough_e2e + walkthrough_e2e coverage tier
+# ---------------------------------------------------------------------------
+
+
+def test_walkthrough_e2e_fresh_pass_is_covered():
+    """A fresh, SHA-pinned walkthrough_e2e PASS row grants full 'covered' tier."""
+    ev = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(ev) is True
+    assert ac._evidence_proves_covered(ev) is True
+    assert ac.compute_criterion_coverage([ev]) == "covered"
+
+
+def test_walkthrough_e2e_stale_decays():
+    """A walkthrough_e2e row older than WALKTHROUGH_E2E_WINDOW_DAYS decays to 'partial'."""
+    stale = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS", "flow": "c-dfdc9d82"},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS + 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e(stale) is False
+    assert ac._evidence_proves_covered(stale) is False
+    assert ac.compute_criterion_coverage([stale]) == "partial"
+
+
+def test_walkthrough_e2e_no_recorded_at_not_trusted():
+    """A walkthrough_e2e row with no recorded_at cannot grant perpetual trust."""
+    ev = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "abc123", "verdict": "PASS"},
+        recorded_at=None,
+    )
+    assert ac._evidence_is_walkthrough_e2e(ev) is False
+    assert ac._evidence_proves_covered(ev) is False
+
+
+def test_walkthrough_e2e_missing_candidate_sha_not_trusted():
+    """A walkthrough_e2e row without a candidate_sha is not trusted."""
+    no_sha = _make_evidence(
+        "walkthrough_e2e",
+        detail={"verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(no_sha) is False
+    assert ac._evidence_proves_covered(no_sha) is False
+
+    empty_sha = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "", "verdict": "PASS", "flow": "c-dfdc9d82"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(empty_sha) is False
+
+
+def test_walkthrough_e2e_fail_verdict_not_covered():
+    """A walkthrough_e2e row with a FAIL or DEAD_END verdict does not cover."""
+    for verdict in ("FAIL", "DEAD_END", None):
+        ev = _make_evidence(
+            "walkthrough_e2e",
+            detail={"candidate_sha": "abc123", "verdict": verdict, "flow": "c-dfdc9d82"},
+        )
+        assert ac._evidence_is_walkthrough_e2e(ev) is False, f"verdict={verdict!r} should not grant trust"
+        assert ac._evidence_proves_covered(ev) is False
+
+
+def test_walkthrough_e2e_wrong_source_kind_rejected():
+    """_evidence_is_walkthrough_e2e returns False for non-walkthrough_e2e source_kinds."""
+    not_walkthrough = _make_evidence(
+        "operator_attestation",
+        detail={"candidate_sha": "abc123", "verdict": "PASS"},
+    )
+    assert ac._evidence_is_walkthrough_e2e(not_walkthrough) is False
+
+
+def test_walkthrough_e2e_fresh_inside_window():
+    """A row recorded just inside the window boundary is still valid."""
+    fresh = _make_evidence(
+        "walkthrough_e2e",
+        detail={"candidate_sha": "deadbeef", "verdict": "PASS", "flow": "c-5214996f"},
+        recorded_at=_utcnow() - timedelta(days=ac.WALKTHROUGH_E2E_WINDOW_DAYS - 1),
+    )
+    assert ac._evidence_is_walkthrough_e2e(fresh) is True
+    assert ac.compute_criterion_coverage([fresh]) == "covered"
+
+
+def test_walkthrough_e2e_none_detail_not_trusted():
+    """A walkthrough_e2e row with None detail is not trusted."""
+    ev = _make_evidence("walkthrough_e2e", detail=None)
+    assert ac._evidence_is_walkthrough_e2e(ev) is False
+    assert ac._evidence_proves_covered(ev) is False
+
+
+# ---------------------------------------------------------------------------
 # criterion_evidence_status (pure function, Component 1)
 # ---------------------------------------------------------------------------
 

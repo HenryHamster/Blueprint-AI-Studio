@@ -43,6 +43,7 @@ class TaskType(str, Enum):
     repo_bootstrap = "repo_bootstrap"
     salvage_bundle = "salvage_bundle"
     capability_proof_trial = "capability_proof_trial"
+    walkthrough_e2e = "walkthrough_e2e"
 
 
 AgentMode = Literal["write", "read_only"]
@@ -738,6 +739,24 @@ TASK_CAPABILITIES: tuple[TaskCapability, ...] = (
         evaluation="none",
         run_shape="single_agent",
     ),
+    TaskCapability(
+        TaskType.walkthrough_e2e,
+        "Walkthrough E2E",
+        "read_only",
+        default_category="ops",
+        user_launchable=False,
+        description=(
+            "Qualifier-spawned live-stack walkthrough that writes SHA-pinned "
+            "CriterionEvidence for operator-tools acceptance criteria."
+        ),
+        run_shape="single_agent",
+        output_kind="verdict",
+        requires_compute=True,
+        evaluation_strategy="metric",
+        cost_ceiling_usd=4.0,
+        completion_handler="walkthrough_e2e",
+        evaluation="none",
+    ),
 )
 
 TASK_CAPABILITY_BY_TYPE: dict[TaskType, TaskCapability] = {
@@ -1005,6 +1024,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.self_audit.value,
         TaskType.salvage_bundle.value,
         TaskType.capability_proof_trial.value,
+        TaskType.walkthrough_e2e.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
