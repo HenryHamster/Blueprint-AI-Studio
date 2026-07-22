@@ -1187,6 +1187,41 @@ def _byte_evictable(model: ProblemModel) -> bool:
     return floor_bytes <= PROBLEM_MODEL_BYTE_BUDGET
 
 
+def _diagnose_live_core_oversize(model: ProblemModel) -> str:
+    """Name the largest live section dominating the byte oversize.
+
+    Called after full eviction when the model is still over budget. The only
+    remaining state is the unevictable live core (active gaps, live capabilities,
+    active friction). Returns a human-readable description of the dominant section
+    so the caller's error message is actionable.
+    """
+    sections = [
+        (
+            "active_gaps",
+            len(json.dumps([g.model_dump() for g in model.gaps], default=str)),
+            len(model.gaps),
+        ),
+        (
+            "live_capabilities",
+            len(json.dumps(
+                [c.model_dump() for c in model.capabilities if not _is_evictable_capability(c)],
+                default=str,
+            )),
+            sum(1 for c in model.capabilities if not _is_evictable_capability(c)),
+        ),
+        (
+            "active_friction",
+            len(json.dumps(
+                [f.model_dump() for f in model.friction if not _is_evictable_friction(f)],
+                default=str,
+            )),
+            sum(1 for f in model.friction if not _is_evictable_friction(f)),
+        ),
+    ]
+    name, size, count = max(sections, key=lambda x: x[1])
+    return f"{name} ({count} items, ~{size} bytes)"
+
+
 def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     """Structurally bound the durable model so it round-trips in a single pass.
 
@@ -1213,13 +1248,11 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
        ``planned`` capabilities) until the model fits. This guards models whose
        bulk is large individual entries or accumulated terminal cap/friction
        despite being under the count caps, so the durable model stays writable
-       back through the strategic op endpoint. The byte pass is gated on
-       :func:`_byte_evictable`: it runs ONLY when emptying the evictable
-       reference-only/terminal collections and reducing active tails to the
-       durable floor could actually bring the model under budget. A healthy
-       within-caps model can carry enough live state to exceed the budget on its
-       own, and the byte pass cannot touch that live state — so evicting
-       reference history there is futile destruction and is skipped.
+       back through the strategic op endpoint. If the model is STILL over budget
+       after all eviction (the live core alone exceeds the budget), raises
+       ``ValueError`` naming the dominant oversize section — ``active_gaps``,
+       ``live_capabilities``, or ``active_friction`` — so the caller surfaces an
+       actionable error instead of silently committing an oversized model.
 
     It deliberately does NOT touch active gaps, live capabilities
     (``working``/``partial``), active friction, or pending confirmations — those
@@ -1259,27 +1292,11 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     capabilities_evicted.extend(_cap_count_cap(model))
     friction_evicted.extend(_friction_count_cap(model))
 
-    # Byte cap: only re-order/evict when we are genuinely over budget so the
-    # no-op path leaves the model byte-identical (no spurious archived re-sort).
+    # Byte cap: evict reference-only / terminal state when over budget, then
+    # raise loudly if the live core alone is still too large.  Always attempt
+    # eviction first — do NOT skip because _byte_evictable returned False.
     ledger_trimmed = 0
-    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and not _byte_evictable(
-        model
-    ):
-        # The live core alone (active gaps + live capabilities + active friction)
-        # exceeds the budget — evicting reference-only history cannot help.  This
-        # is the exact mechanism behind the rev-1367 wipe: the oversized model is
-        # committed to the durable store and the packer truncates the agent view
-        # next cycle.  Signal loudly so operators can intervene before that
-        # truncation / wipe cycle occurs.
-        import logging as _logging
-        _logging.getLogger(__name__).error(
-            "gc_problem_model: live core exceeds PROBLEM_MODEL_BYTE_BUDGET (%d bytes) "
-            "— byte eviction cannot help; model committed oversized. "
-            "Investigate problem model size on this project.",
-            PROBLEM_MODEL_BYTE_BUDGET,
-        )
-        summary["live_core_exceeds_budget"] = True
-    elif _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
+    if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
         # Oldest-first so list.pop(0) drops the oldest archived gap.
         model.archived_gaps = sorted(model.archived_gaps, key=_archived_gap_recency_key)
         while _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET and (
@@ -1307,6 +1324,18 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
                 capabilities_evicted.append(ident)
             else:
                 friction_evicted.append(ident)
+        # After all eviction, if still over budget the live core itself is too
+        # large.  Raise loudly so the caller surfaces an actionable error instead
+        # of silently committing an oversized model to the durable store.
+        if _serialized_model_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET:
+            section = _diagnose_live_core_oversize(model)
+            raise ValueError(
+                f"gc_problem_model: live core exceeds PROBLEM_MODEL_BYTE_BUDGET "
+                f"({PROBLEM_MODEL_BYTE_BUDGET} bytes) after full eviction — "
+                f"oversize section: {section}. Reduce the size of active state "
+                f"(active gaps, live capabilities, or active friction) to bring "
+                f"the model under the byte budget."
+            )
 
     if evicted_ids:
         summary["archived_gaps_evicted"] = evicted_ids
@@ -3151,13 +3180,9 @@ def apply_agent_update(
     gc_summary = gc_problem_model(proposed)
     if gc_summary:
         diff.update(gc_summary)
-    # Report when the model is still over budget after GC — the byte pass may
-    # skip when the live core alone exceeds the budget (_byte_evictable=False),
-    # leaving the model oversized in the durable store. This diagnostic makes
-    # that condition observable in the revision log so the operator knows the
-    # durable problem model may be truncated on the next strategic read.
-    if _serialized_model_bytes(proposed) > PROBLEM_MODEL_BYTE_BUDGET:
-        diff["model_over_budget"] = True
+    # gc_problem_model raises ValueError when the live core alone exceeds the
+    # byte budget after full eviction; that error propagates here so the caller
+    # gets an actionable failure rather than a silently oversized durable model.
 
     append_revision_log(proposed, summary=_diff_summary(diff), changes=diff)
 

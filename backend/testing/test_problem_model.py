@@ -1463,12 +1463,11 @@ def test_gc_problem_model_byte_aware_runs_when_capfriction_are_bulk():
     assert {g.id for g in model.gaps} == {"g-live"}
 
 
-def test_gc_never_drops_live_core_over_budget():
+def test_gc_raises_when_live_core_over_budget():
     """When a problem_model's live core (active gaps + live capabilities + active
-    friction) alone exceeds PROBLEM_MODEL_BYTE_BUDGET, gc_problem_model's byte pass
-    is skipped (_byte_evictable returns False) — the oversized model stays in the
-    durable store rather than dropping live state. Verify that live state survives
-    and the model remains parseable/writable through apply_agent_update."""
+    friction) alone exceeds PROBLEM_MODEL_BYTE_BUDGET, gc_problem_model evicts
+    all reference-only state then raises ValueError naming the dominant oversize
+    section — the loud failure instead of a silent no-op or silent commit."""
     big = "x" * 6_000
 
     gaps = [
@@ -1489,33 +1488,11 @@ def test_gc_never_drops_live_core_over_budget():
 
     model = ProblemModel(gaps=gaps, capabilities=capabilities, friction=friction)
     assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
-        "test setup: must exceed budget to exercise the byte-pass skip"
+        "test setup: must exceed budget to trigger the loud-failure path"
     )
 
-    summary = gc_problem_model(model)
-
-    # Byte pass skipped — no evictable state exists. All live entries preserved.
-    assert summary == {}, f"expected no-op but got: {summary}"
-    assert len(model.gaps) == 6
-    assert len(model.capabilities) == 6
-    assert len(model.friction) == 6
-
-    # The model remains parseable and writable through apply_agent_update.
-    # Proposed must carry the large gaps too because the merge preserves current
-    # fields only when they exist in the proposed gap (omission = intentional clear).
-    model_raw = model.model_dump()
-    updated, diff = apply_agent_update(
-        model_raw,
-        {"gaps": [g.model_dump() for g in model.gaps]},
-        "2026-07-22T12:00:00",
-    )
-    assert updated["revision"] == 1
-    assert len(updated["gaps"]) == 6
-    assert len(updated["capabilities"]) == 6
-    assert len(updated["friction"]) == 6
-    # The diff signals the model is still over budget after GC (the diagnostic
-    # added in apply_agent_update for observability).
-    assert diff.get("model_over_budget") is True
+    with pytest.raises(ValueError, match="live core exceeds PROBLEM_MODEL_BYTE_BUDGET"):
+        gc_problem_model(model)
 
 
 def test_gc_problem_model_caps_capabilities_and_friction_count():
@@ -1566,10 +1543,9 @@ def test_gc_problem_model_count_cap_never_evicts_all_live():
     summary = gc_problem_model(model)
 
     # No live entry evicted even though both collections exceed their caps.
-    # If the resulting model is over the byte budget with an unevictable live
-    # core, the live_core_exceeds_budget flag is set — that is acceptable; the
-    # cap collections alone (with no archived/terminal entries) may push a large
-    # model over budget.  What must NOT happen is eviction of any live entry.
+    # The cap collections alone (with no archived/terminal entries) keep this
+    # model under the byte budget, so no ValueError is raised.  What must NOT
+    # happen regardless is eviction of any live entry.
     assert "capabilities_evicted" not in summary
     assert "friction_evicted" not in summary
     assert len(model.capabilities) == CAPABILITIES_DURABLE_MAX + 10
@@ -6579,36 +6555,72 @@ def _make_oversized_live_core_model() -> ProblemModel:
 
 
 def test_oversized_live_core_signals_loudly():
-    """gc_problem_model sets live_core_exceeds_budget when the live core alone
-    exceeds PROBLEM_MODEL_BYTE_BUDGET and eviction cannot help.
+    """gc_problem_model raises ValueError naming the oversize section when the
+    live core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction.
 
-    This is the acceptance test for the rev-1367 loud-failure guard.
-    The model must remain intact (no live entries dropped) and the summary
-    must carry the flag so callers can fire an alert.
+    This is the acceptance test for the rev-1367 loud-failure guard: the error
+    must name the dominant section (active_gaps, live_capabilities, or
+    active_friction) so the operator knows exactly what to reduce.
     """
     model = _make_oversized_live_core_model()
-    original_cap_count = len(model.capabilities)
-    original_gap_count = len(model.gaps)
 
-    summary = gc_problem_model(model)
+    with pytest.raises(ValueError) as exc_info:
+        gc_problem_model(model)
 
-    assert summary.get("live_core_exceeds_budget") is True, (
-        "Expected live_core_exceeds_budget=True in gc_problem_model summary "
-        f"for an all-live oversized model; got {summary}"
+    msg = str(exc_info.value)
+    assert "live core exceeds PROBLEM_MODEL_BYTE_BUDGET" in msg
+    # The error message must name one of the live sections.
+    assert any(section in msg for section in ("active_gaps", "live_capabilities", "active_friction")), (
+        f"Expected error to name an oversize section; got: {msg}"
     )
-    # No live state was destroyed.
-    assert len(model.capabilities) == original_cap_count
-    assert len(model.gaps) == original_gap_count
-    # No eviction keys — nothing was actually removed.
-    assert "archived_gaps_evicted" not in summary
-    assert "capabilities_evicted" not in summary
-    assert "friction_evicted" not in summary
 
 
-def test_gc_problem_model_evictable_model_does_not_set_live_core_flag():
+def test_gc_live_core_oversize_evicts_first_then_raises():
+    """Regression: when the live core exceeds the byte budget, gc_problem_model
+    still evicts all available reference-only state (archived gaps, terminal
+    caps/friction) before raising — it does NOT silently no-op.
+
+    Construct a model that has BOTH a large live core AND evictable archived
+    gaps.  After gc_problem_model raises, the archived gaps must be gone
+    (eviction ran) and the error must name the oversize section.
+    """
+    big = "x" * 8_000
+    # Live core — cannot be evicted.
+    live_gaps = [
+        Gap(id=f"g-live-{i}", name=f"live gap {i}", status="active", description=big)
+        for i in range(12)
+    ]
+    # Reference-only archived gaps — should be evicted before raising.
+    archived = [
+        Gap(id=f"g-arch-{i}", name=f"archived {i}", status="closed",
+            closed=f"2026-0{(i % 9) + 1}-01T00:00:00")
+        for i in range(5)
+    ]
+    model = ProblemModel(gaps=live_gaps, archived_gaps=archived)
+    assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET, (
+        "test setup: model must exceed budget"
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        gc_problem_model(model)
+
+    msg = str(exc_info.value)
+    # Error must name the oversize section.
+    assert "active_gaps" in msg or "live_capabilities" in msg or "active_friction" in msg, (
+        f"Expected error to name an oversize section; got: {msg}"
+    )
+    # Eviction ran before raising — archived gaps must be gone.
+    assert model.archived_gaps == [], (
+        "Expected archived_gaps evicted before raise, but some remain"
+    )
+    # Live gaps must be untouched.
+    assert len(model.gaps) == len(live_gaps)
+
+
+def test_gc_problem_model_evictable_model_does_not_raise():
     """A model that IS evictable (has terminal caps/archived gaps pushing it
-    over budget) must NOT set live_core_exceeds_budget — the byte eviction
-    pass runs instead and brings it under the cap.
+    over budget) must NOT raise — the byte eviction pass runs and brings it
+    under the cap. No ValueError is raised when eviction succeeds.
     """
     big = "w" * 5_000
     # Terminal / evictable entries that push the model over budget.
@@ -6620,18 +6632,18 @@ def test_gc_problem_model_evictable_model_does_not_set_live_core_flag():
     model = ProblemModel(capabilities=[*planned_caps, live_cap])
     assert _serialized_bytes(model) > PROBLEM_MODEL_BYTE_BUDGET
 
-    summary = gc_problem_model(model)
+    gc_problem_model(model)
 
-    assert "live_core_exceeds_budget" not in summary
     assert _serialized_bytes(model) <= PROBLEM_MODEL_BYTE_BUDGET
     # The live working capability survived eviction.
     assert any(c.name == "cap-working" for c in model.capabilities)
 
 
-def test_apply_agent_update_propagates_live_core_exceeds_budget():
-    """apply_agent_update propagates live_core_exceeds_budget from gc_problem_model
-    into its returned diff so callers (admin_agent_ops, strategic_completion) can
-    fire the appropriate alert without re-computing the condition.
+def test_apply_agent_update_raises_when_live_core_exceeds_budget():
+    """apply_agent_update raises ValueError when gc_problem_model finds the live
+    core alone exceeds PROBLEM_MODEL_BYTE_BUDGET after full eviction — the error
+    propagates so the caller surfaces an actionable failure instead of silently
+    committing an oversized model.
     """
     big = "x" * 5_000
     # Build a current model whose live core is over budget (all working/active).
@@ -6648,9 +6660,5 @@ def test_apply_agent_update_propagates_live_core_exceeds_budget():
     }
     proposed = {"gaps": current_raw["gaps"]}
 
-    _new_raw, diff = apply_agent_update(current_raw, proposed, "2026-07-22T12:00:00")
-
-    assert diff.get("live_core_exceeds_budget") is True, (
-        "Expected live_core_exceeds_budget propagated into apply_agent_update diff; "
-        f"got diff keys: {list(diff.keys())}"
-    )
+    with pytest.raises(ValueError, match="live core exceeds PROBLEM_MODEL_BYTE_BUDGET"):
+        apply_agent_update(current_raw, proposed, "2026-07-22T12:00:00")
