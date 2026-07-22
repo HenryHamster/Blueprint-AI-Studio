@@ -7,7 +7,7 @@
       "path": "admin-ui/src/components/StrategicSessionControl.test.tsx",
       "reason": "Covers the StrategicSessionControl component — operator UI for starting, stopping, and messaging into a conversational Workday session. Restored in d8b2468/#16075.",
       "test_ids": [
-        "StrategicSessionControl lifecycle authority > keeps the legacy active fallback when lifecycle state is absent"
+        "keeps the legacy active fallback when lifecycle state is absent"
       ]
     },
     {
@@ -21,7 +21,7 @@
       "path": "admin-ui/src/hooks/useStrategicSession.test.tsx",
       "reason": "Covers the useStrategicSession hook — primary React hook for conversational Workday session state. Restored in d8b2468/#16075.",
       "test_ids": [
-        "useStrategicSession liveness fallback > resolves mode + session fields from the liveness probe before the read model lands"
+        "resolves mode + session fields from the liveness probe before the read model lands"
       ]
     },
     {
@@ -144,7 +144,15 @@
       "reason": "Covers the strategic dispatch gate (isResidentSessionTask / dispatchStrategic) — the agent-side entry seam that routes marked strategic_review tasks to the conversational Workday session handler vs. one-shot strategic. Removing or neutering these tests leaves the dispatch gate unguarded.",
       "test_ids": [
         "handlers.strategic_review writes the strategic helper to the workspace",
-        "handlers.research with research_mode=\"strategic\" routes to handleStrategic (writes strategic helper)"
+        "handlers.research with research_mode=\"strategic\" routes to handleStrategic (writes strategic helper)",
+        "returns false when payload.type is not strategic_review",
+        "returns true when payload.resident_session is true and type is strategic_review",
+        "returns true when task.context._resident_session is true and type is strategic_review",
+        "returns false when neither resident flag is set",
+        "returns false when task.context is an array",
+        "routes resident_session=true to handleStrategicResident, not handleStrategic",
+        "routes context._resident_session=true to handleStrategicResident",
+        "routes plain strategic_review (no flags) to handleStrategic, not handleStrategicResident"
       ]
     },
     {

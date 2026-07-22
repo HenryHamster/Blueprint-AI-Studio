@@ -33,6 +33,13 @@ vi.mock('../workspacePrep.js', () => ({
 // handlers/index.ts imports the three audit handlers from ./audits.js.
 // Mock them here so the registry tests are isolated from the audit handler
 // implementation; the implementations are exercised in audits.test.ts.
+
+// handleStrategicResident is stubbed so dispatchStrategic gate tests can assert
+// which branch was taken without running the real session loop.
+vi.mock('./strategic-resident.js', () => ({
+  handleStrategicResident: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock('./audits.js', () => ({
   handleSecurityAudit: vi.fn().mockResolvedValue(undefined),
   handleSelfAudit: vi.fn().mockResolvedValue(undefined),
@@ -91,12 +98,14 @@ import {
   resolveHandler,
   resolveGenericRunner,
   resolveTaskCapabilityContract,
+  isResidentSessionTask,
   type TaskCapabilityContract,
 } from './index.js';
 import { DISPATCHER_MEMO_SYNTHESIZER_KINDS } from './memo.js';
 import { persistAndPostStatus } from '../index.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
+import { handleStrategicResident } from './strategic-resident.js';
 
 // ── Handler registry tests ────────────────────────────────────────────────────
 describe('handlers registry', () => {
@@ -459,6 +468,32 @@ describe('task type class classification — cross-cutting invariants', () => {
   });
 });
 
+// ── isResidentSessionTask unit ─────────────────────────────────────────────────
+// Validates the gate function that determines whether a strategic_review task
+// should route to the conversational Workday session (handleStrategicResident)
+// vs. the one-shot strategic handler (handleStrategic).
+describe('isResidentSessionTask unit', () => {
+  it('returns false when payload.type is not strategic_review', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'research', resident_session: true })).toBe(false);
+  });
+
+  it('returns true when payload.resident_session is true and type is strategic_review', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'strategic_review', resident_session: true })).toBe(true);
+  });
+
+  it('returns true when task.context._resident_session is true and type is strategic_review', () => {
+    expect(isResidentSessionTask({ context: { _resident_session: true } }, { type: 'strategic_review' })).toBe(true);
+  });
+
+  it('returns false when neither resident flag is set', () => {
+    expect(isResidentSessionTask({ context: {} }, { type: 'strategic_review' })).toBe(false);
+  });
+
+  it('returns false when task.context is an array', () => {
+    expect(isResidentSessionTask({ context: [] }, { type: 'strategic_review', resident_session: false })).toBe(false);
+  });
+});
+
 // ── Strategic dispatch smoke ──────────────────────────────────────────────────
 // Locks in the contract that handlers.research forwards strategic-mode payloads
 // to handleStrategic, and that handlers.strategic_review goes directly to it.
@@ -499,6 +534,51 @@ describe('strategic dispatch smoke', () => {
     const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
     const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
     expect(strategicHelperWritten, 'research dispatch must reach handleStrategic and write the strategic helper').toBe(true);
+  });
+
+  // ── Dispatch gate: resident vs one-shot ───────────────────────────────────
+  // These three tests guard the isResidentSessionTask → handleStrategicResident
+  // branch at the most critical seam: a marked strategic_review must enter the
+  // conversational Workday session handler, NOT the one-shot strategic handler.
+
+  it('routes resident_session=true to handleStrategicResident, not handleStrategic', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { type: 'strategic_review', base_branch: 'main', resident_session: true };
+    const task = { title: 'Resident', description: '', context: {} };
+    await handlers.strategic_review('smoke-resident-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must be called when resident_session=true').toHaveBeenCalledOnce();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'handleStrategic must NOT run when resident path is taken').toBe(false);
+  });
+
+  it('routes context._resident_session=true to handleStrategicResident', async () => {
+    const payload = { type: 'strategic_review', base_branch: 'main' };
+    const task = { title: 'Resident ctx', description: '', context: { _resident_session: true } };
+    await handlers.strategic_review('smoke-resident-002', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must be called when context._resident_session=true').toHaveBeenCalledOnce();
+  });
+
+  it('routes plain strategic_review (no flags) to handleStrategic, not handleStrategicResident', async () => {
+    const { runClaudeCode } = await import('../index.js');
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    const fs = (await import('fs')).default;
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+
+    const payload = { type: 'strategic_review', base_branch: 'main' };
+    const task = { title: 'One-shot', description: '', context: {} };
+    await handlers.strategic_review('smoke-oneshot-001', payload, task, '', 'owner', 'repo', null, { value: '' });
+
+    expect(vi.mocked(handleStrategicResident), 'resident handler must NOT be called on plain strategic_review').not.toHaveBeenCalled();
+    const writeCalls = vi.mocked(fs.writeFileSync).mock.calls as unknown as [string, string][];
+    const strategicHelperWritten = writeCalls.some(([path]) => path.endsWith('/strategic'));
+    expect(strategicHelperWritten, 'handleStrategic must write the strategic helper for plain strategic_review').toBe(true);
   });
 });
 

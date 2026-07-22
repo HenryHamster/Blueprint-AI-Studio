@@ -293,3 +293,115 @@ def test_deleted_frontend_paths_are_absent():
             "If these files were intentionally restored, move them to the 'protect' "
             "section of conversational_workday_manifest.json:\n" + lines
         )
+
+
+# ---------------------------------------------------------------------------
+# R1 / R3 guards — removed autonomous control-plane seams
+# ---------------------------------------------------------------------------
+
+
+def test_removed_authority_modules_are_absent():
+    """R1: Deleted authority execution/validation modules must not reappear.
+
+    Migration 0657 permanently removed the autonomous resident control plane,
+    including the strategic-operation authority execution and validation modules.
+    If either file reappears as a module under backend/app/, a bad restore is
+    in progress. Additionally, strategic_authority_locks.py must stay a stub
+    without code references to the removed StrategicResident class (the
+    docstring's historical mention is tolerated).
+    """
+    import re
+
+    backend_app_dir = REPO_ROOT / "backend" / "app"
+    assert backend_app_dir.is_dir(), f"backend/app/ not found at {backend_app_dir}"
+
+    # The two deleted authority modules must not exist as files on disk.
+    DELETED_AUTHORITY_MODULES = (
+        "strategic_operation_authority_execution.py",
+        "strategic_operation_authority_validation.py",
+    )
+    reappeared = []
+    for module_name in DELETED_AUTHORITY_MODULES:
+        path = backend_app_dir / module_name
+        if path.exists():
+            reappeared.append(f"backend/app/{module_name}")
+
+    assert not reappeared, (
+        "The following authority modules from the removed autonomous resident "
+        "control plane have reappeared on disk. These were permanently removed "
+        "in migration 0657 — remove them:\n"
+        + "\n".join(f"  - {m}" for m in reappeared)
+    )
+
+    # strategic_authority_locks.py must exist and must not contain code
+    # references to StrategicResident (the docstring's historical mentions
+    # are allowed context; actual imports or instantiation would signal a
+    # partial restore of the authority plane).
+    locks_path = backend_app_dir / "strategic_authority_locks.py"
+    assert locks_path.exists(), (
+        "strategic_authority_locks.py no longer exists — it should remain as "
+        "a stub for legacy import compatibility."
+    )
+    source = locks_path.read_text(encoding="utf-8")
+
+    assert not re.search(r"StrategicResident\(", source), (
+        "strategic_authority_locks.py contains a StrategicResident instantiation "
+        "call — this class was removed in migration 0657. Keep the file as a "
+        "docstring-only stub."
+    )
+    assert not re.search(r"(?:from|import)\s+.*StrategicResident", source), (
+        "strategic_authority_locks.py imports StrategicResident — "
+        "this class was removed in migration 0657. Keep the file as a "
+        "docstring-only stub."
+    )
+
+
+def test_no_removed_resident_strategic_backend_modules():
+    """R3: No strategic_resident_*.py modules beyond the kept session file.
+
+    Migration 0657 deleted every strategic_resident_*.py backend module (~70
+    files). Only strategic_resident_session.py was restored as part of the
+    conversational Workday path (PR #16075). Any other strategic_resident_*.py
+    file reappearing under backend/app/ signals a partial restore of the
+    autonomous resident subsystem.
+    """
+    backend_app_dir = REPO_ROOT / "backend" / "app"
+    assert backend_app_dir.is_dir(), f"backend/app/ not found at {backend_app_dir}"
+
+    # The only strategic_resident_*.py module intentionally kept for the
+    # conversational Workday session path. All others stay permanently deleted.
+    KEPT_RESIDENT_MODULES = {"strategic_resident_session.py"}
+
+    resident_files = sorted(backend_app_dir.glob("strategic_resident_*.py"))
+    unexpected = [f.name for f in resident_files if f.name not in KEPT_RESIDENT_MODULES]
+
+    assert not unexpected, (
+        "Unexpected strategic_resident_*.py module(s) found under backend/app/. "
+        "Only strategic_resident_session.py is kept for the conversational "
+        "Workday path. These belong to the deleted autonomous resident "
+        "subsystem (migration 0657) and must be removed:\n"
+        + "\n".join(f"  - {m}" for m in unexpected)
+    )
+
+
+def test_no_removed_resident_task_type_in_task_capabilities():
+    """R3: The strategic_resident_turn TaskType must not reappear.
+
+    Migration 0657 removed the strategic_resident_turn task type along with the
+    autonomous resident subsystem. If this TaskType value is re-added to the
+    TaskType enum in task_capabilities.py (or referenced anywhere in the
+    module), a bad restore could resurrect resident-turn processing with all
+    file-based guards still green.
+    """
+    task_cap_path = REPO_ROOT / "backend" / "app" / "task_capabilities.py"
+    assert task_cap_path.exists(), (
+        f"task_capabilities.py not found at {task_cap_path}"
+    )
+    source = task_cap_path.read_text(encoding="utf-8")
+
+    assert "strategic_resident_turn" not in source, (
+        "strategic_resident_turn was found in task_capabilities.py. "
+        "This TaskType belonged to the autonomous resident control plane "
+        "removed in migration 0657. Remove it to prevent reinstating the "
+        "resident turn processing path."
+    )

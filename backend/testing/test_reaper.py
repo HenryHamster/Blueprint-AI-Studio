@@ -7537,6 +7537,27 @@ def test_classify_orphan_non_resident_strategic_review_still_reaped():
     assert _classify_orphan(t, now, has_open_pr=False) is True
 
 
+def test_classify_orphan_resident_session_exempt_from_progress_staleness():
+    """A warm-idle resident session with a fresh heartbeat is NOT reaped even when
+    last_tool_use_at is stale well past the 1500s thinking-heavy budget.
+
+    The carve-out in _classify_orphan delegates to _classify_resident_session for
+    any IN_PROGRESS task with context["_resident_session"]==True.  Being idle
+    between operator turns is normal for a resident; progress-staleness must not
+    trigger a false reap."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=now - timedelta(minutes=30),  # far past 1500s budget
+        started_at=now - timedelta(hours=2),  # long-running resident session
+        context={"_resident_session": True},
+        first_payload={"type": "strategic_review"},
+    )
+    # Fresh heartbeat → resident session is live, must NOT be reaped.
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
 def test_classify_orphan_step1_and_step2_predicate_agree():
     """FIX a regression guard: the helper IS the predicate both Step 1 and Step 2
     call, so by construction they cannot drift. This asserts the helper returns a

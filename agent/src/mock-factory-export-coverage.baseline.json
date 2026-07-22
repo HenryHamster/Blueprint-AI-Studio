@@ -547,6 +547,17 @@
       "resetWorkspacePrepOutcome",
       "resolveReferenceRepo"
     ],
+    "./strategic-resident.js": [
+      "SessionStreamer",
+      "installResidentReplyKeyAtPath",
+      "installResidentReplyReceiptAtPaths",
+      "oldestStableInboundMessageId",
+      "readResidentStagedReplyAtPath",
+      "recloneResidentWorkspace",
+      "refreshResidentGitReadToken",
+      "removeResidentReplyArtifactsAtPaths",
+      "removeResidentReplyKeyAtPath"
+    ],
     "./audits.js": [
       "designDocAdvertisement",
       "fetchCandidateCommitWithRetry",

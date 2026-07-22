@@ -863,8 +863,9 @@ async def _compute_resident_work_state(
     This is DELIBERATELY cheap (a handful of indexed ``max()``/``count()``
     aggregates) and STRICTLY read-only: it never reads or mutates the lease,
     the continuation freshness marker, or the session blob, so surfacing it on
-    the heartbeat cannot extend the dead-man's switch (contract pinned by
-    ``test_heartbeat_liveness_only_does_not_extend_lease``).
+    the heartbeat cannot extend the dead-man's switch (reaper uses only
+    last_heartbeat; ``_classify_resident_session`` in reaper_orphan_classify.py
+    ignores this read-model path).
     """
     # One bounded recursive CTE aggregates the strategist task subtree without
     # a Python-side walk or cycle risk.
@@ -3033,9 +3034,9 @@ async def renew_resident_session_lease(
     # READ-ONLY work-state signal for the agent's state-gated pacing. Computed
     # once, up front, from cheap aggregate queries; additive to every return
     # branch below. It NEVER touches lease/freshness/session state, so it cannot
-    # extend the dead-man's switch (pinned by
-    # test_heartbeat_liveness_only_does_not_extend_lease). Older agents ignore
-    # the extra fields.
+    # extend the dead-man's switch (reaper uses only last_heartbeat; this path
+    # is not consulted by _classify_resident_session). Older agents ignore the
+    # extra fields.
     work_state_rev, work_state_summary = await _compute_resident_work_state(
         session, project.id, resident_session_id=session_id
     )
