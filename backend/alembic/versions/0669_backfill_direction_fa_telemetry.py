@@ -16,6 +16,7 @@ No schema changes — ``project_telemetry`` was created by migration 0659.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -62,7 +63,7 @@ def upgrade() -> None:
                 "id": str(uuid.uuid4()),
                 "project_id": str(project_id),
                 "key": _KEY,
-                "value": value if isinstance(value, str) else str(value),
+                "value": json.dumps(value),
                 "updated_at": now,
             },
         )
