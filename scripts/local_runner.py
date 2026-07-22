@@ -7180,7 +7180,7 @@ def main() -> None:
                 file=sys.stderr,
             )
             print(
-                "  Re-enroll: create a runner in the admin UI (Settings → Runners) to get a new token.",
+                "  Re-enroll: open the Runtime tab → Devices and runners in the admin UI and click Enroll runner.",
                 file=sys.stderr,
             )
             print(

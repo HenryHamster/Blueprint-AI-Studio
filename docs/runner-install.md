@@ -63,9 +63,10 @@ rate-limit classification.
 ## 1. Enroll a runner
 
 In the admin UI, open the **Runtime** tab and the **Devices and runners**
-section, then click **Enroll runner**. Choose a preset (`default` or
-`strategic_local`) and enroll the runner. Copy the one-time token shown — it is
-never displayed again.
+section. Click **Enroll runner** to register a standard runner (default preset),
+or **Strategic runner** to register a runner restricted to strategic review tasks
+(strategic_local preset). Copy the one-time token shown — it is never displayed
+again.
 
 ---
 

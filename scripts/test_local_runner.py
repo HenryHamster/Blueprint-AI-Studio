@@ -9488,3 +9488,151 @@ class TestProgressTail(unittest.TestCase):
             self.assertEqual(result["count"], 1)
         finally:
             os.unlink(path)
+
+
+class TestRunnerEnrollmentDocumentation(unittest.TestCase):
+    """Invariant tests: runner-install.md and local_runner error messages
+    must accurately describe the shipped two-button enrollment UI, not a
+    post-click preset chooser that was never shipped."""
+
+    _DOCS_ROOT = Path(__file__).resolve().parents[1] / "docs"
+    _RUNNER_INSTALL_MD = _DOCS_ROOT / "runner-install.md"
+    _SCRIPTS_ROOT = Path(__file__).resolve().parent
+    _LOCAL_RUNNER_PY = _SCRIPTS_ROOT / "local_runner.py"
+
+    def _section1_text(self) -> str:
+        """Return the text of Section 1 (Enroll a runner) from runner-install.md."""
+        content = self._RUNNER_INSTALL_MD.read_text()
+        # Extract between "## 1. Enroll a runner" and the next "---" or "## 2."
+        import re
+        m = re.search(
+            r"## 1\. Enroll a runner(.*?)(?=\n---|\n## 2\.)",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "Could not locate '## 1. Enroll a runner' section")
+        return m.group(1)
+
+    # ── docs/runner-install.md: Section 1 ─────────────────────────────────────
+
+    def test_section1_does_not_describe_preset_chooser(self):
+        """Section 1 must not claim a post-click preset chooser dialog exists."""
+        text = self._section1_text()
+        self.assertNotIn(
+            "Choose a preset",
+            text,
+            "runner-install.md Section 1 incorrectly describes a preset chooser "
+            "dialog that does not exist in the shipped UI. The UI ships two "
+            "separate buttons: 'Enroll runner' and 'Strategic runner'.",
+        )
+
+    def test_section1_mentions_enroll_runner_button(self):
+        """Section 1 must mention the 'Enroll runner' button (default preset)."""
+        text = self._section1_text()
+        self.assertIn(
+            "Enroll runner",
+            text,
+            "runner-install.md Section 1 must describe the 'Enroll runner' button "
+            "for the default preset.",
+        )
+
+    def test_section1_mentions_strategic_runner_button(self):
+        """Section 1 must mention the 'Strategic runner' button (strategic_local preset)."""
+        text = self._section1_text()
+        self.assertIn(
+            "Strategic runner",
+            text,
+            "runner-install.md Section 1 must describe the 'Strategic runner' button "
+            "for the strategic_local preset.",
+        )
+
+    def test_section1_references_runtime_tab(self):
+        """Section 1 must reference the Runtime tab, not a Settings or Runners menu."""
+        text = self._section1_text()
+        self.assertIn(
+            "Runtime",
+            text,
+            "runner-install.md Section 1 must reference the 'Runtime' tab where "
+            "the enrollment buttons live.",
+        )
+
+    def test_section1_references_devices_and_runners(self):
+        """Section 1 must reference the 'Devices and runners' section."""
+        text = self._section1_text()
+        self.assertIn(
+            "Devices and runners",
+            text,
+            "runner-install.md Section 1 must name the 'Devices and runners' section "
+            "under the Runtime tab where the enrollment buttons live.",
+        )
+
+    # ── scripts/local_runner.py: re-enroll error message ──────────────────────
+
+    def test_reenroll_message_does_not_cite_settings_runners(self):
+        """The re-enroll error message must not reference the stale 'Settings → Runners' path."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        self.assertNotIn(
+            "Settings → Runners",
+            content,
+            "local_runner.py re-enroll message cites 'Settings → Runners', which is "
+            "stale. The enrollment UI lives under the Runtime tab > Devices and runners.",
+        )
+
+    def test_reenroll_message_references_runtime_tab(self):
+        """The re-enroll error message must reference the Runtime tab."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        # Find the re-enroll print statement and check it references Runtime
+        import re
+        # Extract the block around the Re-enroll print call
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Runtime",
+            reenroll_line,
+            f"local_runner.py re-enroll message does not reference the Runtime tab: "
+            f"{reenroll_line!r}",
+        )
+
+    def test_reenroll_message_references_devices_and_runners(self):
+        """The re-enroll error message must reference 'Devices and runners'."""
+        content = self._LOCAL_RUNNER_PY.read_text()
+        import re
+        m = re.search(r"Re-enroll[^\n]*\n", content)
+        self.assertIsNotNone(m, "Could not find Re-enroll message in local_runner.py")
+        reenroll_line = m.group(0)
+        self.assertIn(
+            "Devices and runners",
+            reenroll_line,
+            f"local_runner.py re-enroll message does not reference 'Devices and runners': "
+            f"{reenroll_line!r}",
+        )
+
+    # ── docs/runner-install.md: Section 8 consistency ─────────────────────────
+
+    def test_section8_reenroll_matches_two_button_flow(self):
+        """Section 8 re-enrollment must reference the Runtime tab and Devices and runners."""
+        content = self._RUNNER_INSTALL_MD.read_text()
+        import re
+        m = re.search(
+            r"## 8\. Re-enrollment(.*?)$",
+            content,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(m, "Could not locate '## 8. Re-enrollment' section")
+        section8 = m.group(1)
+        self.assertIn(
+            "Runtime",
+            section8,
+            "runner-install.md Section 8 must reference the Runtime tab.",
+        )
+        self.assertIn(
+            "Devices and runners",
+            section8,
+            "runner-install.md Section 8 must reference the 'Devices and runners' section.",
+        )
+        self.assertIn(
+            "Enroll runner",
+            section8,
+            "runner-install.md Section 8 must mention the 'Enroll runner' button.",
+        )
