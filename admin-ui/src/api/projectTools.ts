@@ -29,7 +29,6 @@ export interface UpdateProjectToolPayload {
   title?: string;
   config?: Record<string, unknown>;
   enabled?: boolean;
-  placement?: string;
 }
 
 /** Placements the backend accepts (mirrors _VALID_PLACEMENTS server-side). */

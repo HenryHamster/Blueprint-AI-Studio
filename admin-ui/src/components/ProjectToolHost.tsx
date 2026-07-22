@@ -8,7 +8,6 @@ import {
   fetchProjectToolManifest,
   seedProjectTools as seedProjectToolsApi,
   fetchComputeImageStatus,
-  TOOL_PLACEMENTS,
   type ProjectTool,
   type ProjectToolManifestEntry,
   type ProjectSkillManifestEntry,
@@ -34,7 +33,6 @@ interface Props {
 
 interface ConfigDraft {
   title: string;
-  placement: string;
   config: Record<string, string>;
 }
 
@@ -337,7 +335,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     for (const [key, val] of Object.entries(existing)) {
       config[key] = typeof val === 'string' ? val : JSON.stringify(val);
     }
-    setConfigDraft({ title: tool.title, placement: tool.placement, config });
+    setConfigDraft({ title: tool.title, config });
     setConfiguringId(tool.id);
     setConfiguringProjectId(requestedProjectId);
   }
@@ -362,7 +360,6 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
       }
       await updateProjectToolApi(requestedProjectId, tool.id, {
         title,
-        placement: configDraft.placement,
         ...(schemaPropsForKind(tool.kind).length > 0 ? { config } : {}),
       });
       if (!isCurrentProject(requestedProjectId)) return;
@@ -615,7 +612,7 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
     );
   }
 
-  // Owner-only inline rename + placement + schema-driven config editor.
+  // Owner-only inline rename + schema-driven config editor.
   function renderConfigPanel(tool: ProjectTool): ReactNode {
     if (configuringId !== tool.id || configuringProjectId !== projectId || !configDraft) return null;
     const schemaProps = schemaPropsForKind(tool.kind);
@@ -629,18 +626,6 @@ export function ProjectToolHost({ projectId, myRole }: Props) {
             onChange={e => setConfigDraft(d => (d ? { ...d, title: e.target.value } : d))}
             className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
           />
-        </div>
-        <div>
-          <label className="block text-xs font-medium text-neutral-400">Placement</label>
-          <select
-            value={configDraft.placement}
-            onChange={e => setConfigDraft(d => (d ? { ...d, placement: e.target.value } : d))}
-            className="mt-1 w-full rounded border border-neutral-700 bg-neutral-900 px-2 py-1.5 text-sm text-neutral-200"
-          >
-            {TOOL_PLACEMENTS.map(p => (
-              <option key={p} value={p}>{p}</option>
-            ))}
-          </select>
         </div>
         {schemaProps.map(([key, spec]) => (
           <div key={key}>

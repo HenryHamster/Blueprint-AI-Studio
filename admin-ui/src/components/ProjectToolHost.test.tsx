@@ -166,17 +166,14 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      { title: 'Renamed Widget', placement: 'project_section', config: {} },
+      { title: 'Renamed Widget', config: {} },
     );
   });
 
-  test('configure shows placement dropdown and sends coerced schema config', async () => {
+  test('configure shows schema config fields and sends coerced config', async () => {
     await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
     await act(async () => { requireButton('Configure').click(); });
     await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-    // Placement dropdown is present so changing placement has an observable effect.
-    expect(h().querySelector('select')).toBeTruthy();
-    expect(h().querySelector('select')!.value).toBe('project_section');
     // The title input is first; the `threshold` config field is second.
     const inputs = h().querySelectorAll('input[type="text"]');
     const thresholdInput = inputs[1] as HTMLInputElement;
@@ -185,7 +182,7 @@ describe('ProjectToolHost — configure / rename / role gating', () => {
     expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
       'proj-a',
       'tool-1',
-      { title: 'My Widget', placement: 'project_section', config: { threshold: 42 } },
+      { title: 'My Widget', config: { threshold: 42 } },
     );
   });
 
@@ -642,8 +639,6 @@ describe('ProjectToolHost — delete confirmation gate', () => {
 // Placement surface routing: acceptance criterion c-5214996f
 // "Tool placement control must actually move the tool"
 //
-// The Configure dialog exposes a placement <select> (TOOL_PLACEMENTS).
-// Changing placement and saving calls updateProjectTool with the new value.
 // The rendered tool list routes project_section tools to the main grid and
 // toolbar/sidebar tools to the "Other surfaces" section.
 // ---------------------------------------------------------------------------
@@ -693,30 +688,6 @@ describe('ProjectToolHost — placement routes tool to correct surface (c-521499
     expect(h().textContent).toContain('Toolbar Widget content');
   });
 
-  test('Configure dialog placement dropdown change persists new placement via updateProjectTool', async () => {
-    vi.mocked(fetchProjectTools).mockResolvedValue(RESULT);
-    vi.mocked(updateProjectTool).mockResolvedValue({ ...TOOL, placement: 'toolbar' });
-    await mount(<ProjectToolHost projectId="proj-a" myRole="owner" />);
-    await act(async () => { requireButton('Configure').click(); });
-    await act(async () => await new Promise(resolve => setTimeout(resolve, 30)));
-
-    // Placement <select> is present and starts at project_section
-    const sel = h().querySelector('select') as HTMLSelectElement;
-    expect(sel).toBeTruthy();
-    expect(sel.value).toBe('project_section');
-
-    // Change placement to toolbar
-    const selectSetter = Object.getOwnPropertyDescriptor(window.HTMLSelectElement.prototype, 'value')?.set;
-    selectSetter?.call(sel, 'toolbar');
-    sel.dispatchEvent(new Event('change', { bubbles: true }));
-
-    await act(async () => { requireButton('Save').click(); });
-    expect(vi.mocked(updateProjectTool)).toHaveBeenCalledWith(
-      'proj-a',
-      'tool-1',
-      { title: 'My Widget', placement: 'toolbar', config: {} },
-    );
-  });
 });
 
 describe('ProjectToolHost — project-scoped async actions', () => {

@@ -722,14 +722,12 @@ class _ToolCreate(BaseModel):
     slug: Optional[str] = None
     title: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
-    placement: Optional[str] = None
 
 
 class _ToolUpdate(BaseModel):
     title: Optional[str] = None
     enabled: Optional[bool] = None
     config: Optional[Dict[str, Any]] = None
-    placement: Optional[str] = None
 
 
 class _ToolContentSave(BaseModel):
@@ -914,14 +912,7 @@ async def register_project_tool(
     title = (payload.title or spec["default_title"]).strip()
     if not title:
         title = spec["default_title"]
-    placement = (payload.placement or spec["default_placement"]).strip()
-    if not placement:
-        placement = spec["default_placement"]
-    if placement not in _VALID_PLACEMENTS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
-        )
+    placement = spec["default_placement"]
     config = payload.config if isinstance(payload.config, dict) else {}
     _validate_config(kind, config, spec)
 
@@ -991,16 +982,6 @@ async def update_project_tool(
         tool.title = title
     if payload.enabled is not None:
         tool.enabled = payload.enabled
-    if payload.placement is not None:
-        placement = payload.placement.strip()
-        if not placement:
-            raise HTTPException(status_code=400, detail="placement must not be empty")
-        if placement not in _VALID_PLACEMENTS:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid placement '{placement}'. Must be one of: {sorted(_VALID_PLACEMENTS)}",
-            )
-        tool.placement = placement
     if payload.config is not None:
         if not isinstance(payload.config, dict):
             raise HTTPException(status_code=400, detail="config must be an object")
