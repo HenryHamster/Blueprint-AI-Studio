@@ -2379,6 +2379,8 @@ def _score_smoketest(result: dict[str, Any] | None) -> float | None:
     """
     if not isinstance(result, dict):
         return None
+    if type(result.get("passed")) is not bool:
+        return None
 
     suites = result.get("suites")
     if isinstance(suites, dict):

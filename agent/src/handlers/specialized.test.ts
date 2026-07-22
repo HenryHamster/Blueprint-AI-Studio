@@ -504,6 +504,21 @@ describe('handleSmoketest — URL health checks', () => {
     expect(call.failure_category).toBe('smoketest_result_unparseable');
   });
 
+  it('rejects a non-boolean top-level passed value as unparseable', async () => {
+    vi.mocked(readHandlerOutput).mockReturnValue({
+      passed: 'false',
+      tests: [{ name: 'health', status: 'pass', message: '' }],
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: 'wrote malformed result', lastResultText: '' });
+
+    await handleSmoketest(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.artifact_type).toBe('ERROR_LOG');
+    expect(call.failure_category).toBe('smoketest_result_unparseable');
+  });
+
   it('sets failure_category to claude_code_failed when exitCode≠0 and result file is missing', async () => {
     vi.mocked(readHandlerOutput).mockReturnValue(null);
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 1, allOutput: 'agent crashed', lastResultText: '' });

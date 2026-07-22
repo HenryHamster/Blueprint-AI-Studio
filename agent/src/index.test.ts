@@ -4152,9 +4152,9 @@ describe('pollForNextRole', () => {
     fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     const originalClearInterval = globalThis.clearInterval;
-    clearIntervalSpy = vi.fn((...args: Parameters<typeof clearInterval>) =>
-      originalClearInterval(...args),
-    );
+    clearIntervalSpy = vi.fn((...args: Parameters<typeof clearInterval>) => {
+      originalClearInterval(...args);
+    });
     vi.stubGlobal('clearInterval', clearIntervalSpy);
   });
 

@@ -441,9 +441,9 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
     expect(failedCalls).toHaveLength(0);
   });
 
-  it('preserves task-specific text at the tail of a long production prompt', async () => {
+  it('preserves dedicated task text surrounded by large production prompt sections', async () => {
     const taskRequest = 'TASK-SPECIFIC: preserve the acceptance criteria';
-    const longPrompt = `${'generic stable guidance '.repeat(500)}\n${taskRequest}`;
+    const longPrompt = `${'generic stable guidance '.repeat(500)}\n${taskRequest}\n${'repo map and artifact context '.repeat(500)}`;
     let continued = false;
     vi.mocked(runClaudeCode)
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'waiting', lastResultText: '' })
@@ -458,11 +458,12 @@ describe('runCodeChangeTask forced terminal-verb continuation', () => {
       String(path) === prUrlMarker ? validPrUrl : '',
     );
 
-    await runCodeChangeTask({ ...baseOpts, prompt: longPrompt });
+    await runCodeChangeTask({ ...baseOpts, prompt: longPrompt, taskPrompt: taskRequest });
 
     const continuationPrompt = vi.mocked(runClaudeCode).mock.calls[1][0];
     expect(continuationPrompt).toContain(taskRequest);
-    expect(continuationPrompt).toContain('[bounded middle omitted]');
+    expect(continuationPrompt).not.toContain('generic stable guidance');
+    expect(continuationPrompt).not.toContain('repo map and artifact context');
   });
 
   it('does NOT finalize COMPLETED when a PR-URL marker is present but base..HEAD nets to zero effective diff', async () => {

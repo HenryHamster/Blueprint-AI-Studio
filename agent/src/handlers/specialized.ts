@@ -347,6 +347,7 @@ ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   await runCodeChangeTask({
     taskId,
     prompt: finalMigratePrompt,
+    taskPrompt: migratePrompt,
     ws,
     statusRef,
     workBranch,
@@ -510,7 +511,12 @@ ${smoketestFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
   const { exitCode, allOutput } = await runClaudeCode(smoketestFullPrompt, ws, statusRef, model, effort, disallowedTools);
 
   // Read result file written by Claude
-  const smoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> } | null;
+  const rawSmoketestResult = readHandlerOutput(taskId, 'smoketest_result', ws) as Record<string, unknown> | null;
+  const smoketestResult = rawSmoketestResult
+    && typeof rawSmoketestResult.passed === 'boolean'
+    && Array.isArray(rawSmoketestResult.tests)
+    ? rawSmoketestResult as { passed: boolean; tests: Array<{ name: string; status: string; message: string }> }
+    : null;
 
   if (exitCode === 0 && smoketestResult) {
     // Live endpoint checks

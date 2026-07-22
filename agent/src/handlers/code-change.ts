@@ -38,6 +38,10 @@ import { buildTaskCheckpointCommitMessage } from '../task-checkpoint.js';
 export interface CodeChangeTaskOpts {
   taskId: string;
   prompt: string;
+  /** Task-specific request/acceptance text, before repository and helper
+   *  enrichment. Used by the one-shot continuation so prompt bounding cannot
+   *  discard the actual task. Falls back to prompt for legacy callers. */
+  taskPrompt?: string;
   ws: WebSocket | null;
   statusRef: { value: string };
   workBranch: string;
@@ -538,7 +542,7 @@ export async function runCodeChangeTask(opts: CodeChangeTaskOpts): Promise<void>
     } catch {
       // The continuation still has task/routing identity if local inspection fails.
     }
-    const sanitizedPrompt = sanitize(opts.prompt).trim();
+    const sanitizedPrompt = sanitize(opts.taskPrompt ?? opts.prompt).trim();
     const originalTask = sanitizedPrompt.length > 8_000
       ? `${sanitizedPrompt.slice(0, 4_000)}\n...[bounded middle omitted]...\n${sanitizedPrompt.slice(-4_000)}`
       : sanitizedPrompt || '<unavailable>';

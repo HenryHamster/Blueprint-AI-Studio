@@ -6009,6 +6009,13 @@ class TestScoreSmoketest:
         }
         assert rq._score_smoketest(result) is None
 
+    def test_non_boolean_passed_is_unavailable_evidence(self):
+        result = {
+            "passed": "false",
+            "tests": [{"name": "health", "status": "pass"}],
+        }
+        assert rq._score_smoketest(result) is None
+
 
 class TestExtractTestErosionDetail:
     def test_deleted_test_file_present(self):
